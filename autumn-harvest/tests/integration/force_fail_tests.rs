@@ -26,7 +26,7 @@ use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::store;
 use autumn_harvest::timeout::force_fail_activity;
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
-use chrono::Utc;
+use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
@@ -113,7 +113,7 @@ async fn seed_scheduled_activity_history(
         &[
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!({}),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -908,7 +908,7 @@ async fn late_retryable_error_cannot_resurrect_failed_row() {
     let late = queue::requeue_for_retry(
         &mut conn,
         task_id,
-        chrono::Duration::seconds(1),
+        jiff::SignedDuration::from_secs(1),
         "late transient error",
     )
     .await;

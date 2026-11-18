@@ -37,7 +37,7 @@ use autumn_harvest::testing::{
     HistorySnapshot, NonDeterminismKind, ReplayDriftReport, ReplayVerifier,
 };
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
@@ -83,7 +83,7 @@ fn reordered_workflow<'a>(
 fn started_event() -> WorkflowEvent {
     WorkflowEvent::WorkflowStarted {
         input: Value::Null,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -159,7 +159,7 @@ fn write(dir: &Path, name: &str, contents: &str) {
 /// A manifest claiming complete, untruncated, failure-free coverage.
 fn complete_manifest(workflow_name: &str, sampled: u64, in_flight_total: u64) -> SampleManifest {
     SampleManifest {
-        generated_at: Utc::now(),
+        generated_at: Timestamp::now(),
         status: SampleStatus::Complete,
         states: vec!["RUNNING".into(), "PAUSED".into()],
         per_workflow: vec![SampleWorkflowCoverage {
@@ -510,7 +510,7 @@ async fn bundle_manifest_coverage_is_surfaced_on_the_report() {
     write(dir.path(), "a.json", &in_flight_snapshot_json("wf"));
 
     let manifest = SampleManifest {
-        generated_at: Utc::now(),
+        generated_at: Timestamp::now(),
         status: SampleStatus::Complete,
         states: vec!["RUNNING".into(), "PAUSED".into()],
         per_workflow: vec![SampleWorkflowCoverage {
@@ -566,7 +566,7 @@ async fn a_size_truncated_bundle_blocks_the_gate() {
     write(dir.path(), "a.json", &in_flight_snapshot_json("wf"));
 
     let manifest = SampleManifest {
-        generated_at: Utc::now(),
+        generated_at: Timestamp::now(),
         status: SampleStatus::Complete,
         states: vec!["RUNNING".into()],
         per_workflow: vec![SampleWorkflowCoverage {
@@ -626,7 +626,7 @@ async fn an_export_that_dropped_candidates_blocks_the_gate() {
     write(dir.path(), "a.json", &in_flight_snapshot_json("wf"));
 
     let manifest = SampleManifest {
-        generated_at: Utc::now(),
+        generated_at: Timestamp::now(),
         status: SampleStatus::Complete,
         states: vec!["RUNNING".into()],
         per_workflow: vec![SampleWorkflowCoverage {
@@ -681,7 +681,7 @@ async fn partial_shard_coverage_can_block_the_gate() {
     write(dir.path(), "a.json", &in_flight_snapshot_json("wf"));
 
     let manifest = SampleManifest {
-        generated_at: Utc::now(),
+        generated_at: Timestamp::now(),
         status: SampleStatus::Partial,
         states: vec!["RUNNING".into()],
         per_workflow: vec![SampleWorkflowCoverage {
@@ -972,7 +972,7 @@ async fn a_divergence_outranks_the_coverage_rungs() {
     write(dir.path(), "drifted.json", &drifted);
 
     let manifest = SampleManifest {
-        generated_at: Utc::now(),
+        generated_at: Timestamp::now(),
         status: SampleStatus::Partial,
         states: vec!["RUNNING".into()],
         per_workflow: vec![SampleWorkflowCoverage {
@@ -1378,7 +1378,7 @@ async fn a_bundle_missing_manifest_declared_fixtures_blocks_the_gate() {
     write(dir.path(), "a.json", &in_flight_snapshot_json("wf"));
     // ...but the manifest says three were exported.
     let manifest = SampleManifest {
-        generated_at: Utc::now(),
+        generated_at: Timestamp::now(),
         status: SampleStatus::Complete,
         states: vec!["RUNNING".into()],
         per_workflow: vec![SampleWorkflowCoverage {
@@ -1477,7 +1477,7 @@ async fn a_workflow_type_sampled_zero_times_fails_a_complete_coverage_claim() {
     write(dir.path(), "a.json", &in_flight_snapshot_json("wf"));
 
     let manifest = SampleManifest {
-        generated_at: Utc::now(),
+        generated_at: Timestamp::now(),
         status: SampleStatus::Complete,
         states: vec!["RUNNING".into()],
         per_workflow: vec![
@@ -1810,7 +1810,7 @@ async fn an_empty_bundle_from_a_failed_export_is_not_licensed_by_allow_empty_bun
     let dir = tempfile::tempdir().unwrap();
     // No fixtures, and a manifest reporting that no shard could be read.
     let manifest = SampleManifest {
-        generated_at: Utc::now(),
+        generated_at: Timestamp::now(),
         status: SampleStatus::Unavailable,
         states: vec!["RUNNING".into()],
         per_workflow: vec![],
@@ -1854,7 +1854,7 @@ async fn an_empty_bundle_from_a_failed_export_is_not_licensed_by_allow_empty_bun
 async fn an_empty_bundle_from_a_partial_export_is_not_licensed_either() {
     let dir = tempfile::tempdir().unwrap();
     let manifest = SampleManifest {
-        generated_at: Utc::now(),
+        generated_at: Timestamp::now(),
         status: SampleStatus::Partial,
         states: vec!["RUNNING".into()],
         per_workflow: vec![],
@@ -1890,7 +1890,7 @@ async fn an_empty_bundle_from_a_partial_export_is_not_licensed_either() {
 async fn an_empty_bundle_with_complete_coverage_is_still_licensed() {
     let dir = tempfile::tempdir().unwrap();
     let manifest = SampleManifest {
-        generated_at: Utc::now(),
+        generated_at: Timestamp::now(),
         status: SampleStatus::Complete,
         states: vec!["RUNNING".into()],
         per_workflow: vec![],
@@ -3026,7 +3026,7 @@ fn manifest_with_identities(entries: Vec<(&str, Vec<ExecutionId>)>) -> SampleMan
         .collect();
     let sampled_total = per_workflow.iter().map(|entry| entry.sampled).sum();
     SampleManifest {
-        generated_at: Utc::now(),
+        generated_at: Timestamp::now(),
         status: SampleStatus::Complete,
         states: vec!["RUNNING".into()],
         per_workflow,

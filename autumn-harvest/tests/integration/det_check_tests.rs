@@ -2741,7 +2741,7 @@ async fn fan_out_all(ctx: &WorkflowContext) {
     assert!(matches!(finding.severity, DetSeverity::Error));
 }
 
-// Exact column: `Utc::now()` in `let _t = chrono::Utc::now();` starts at
+// Exact column: `Timestamp::now()` in `let _t = jiff::Timestamp::now();` starts at
 // column 18 (after `let _t = chrono::`).
 #[test]
 fn finding_column_is_exact() {

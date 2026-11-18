@@ -13,7 +13,7 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -75,7 +75,7 @@ pub struct EnqueueParams {
     /// Hard ceiling on retry attempts before the task is moved to the DLQ.
     pub max_attempts: i32,
     /// Earliest time at which this task may be claimed.
-    pub scheduled_at: DateTime<Utc>,
+    pub scheduled_at: Timestamp,
     /// Heartbeat timeout copied through to the worker for activity-side use.
     pub heartbeat_timeout: Option<Duration>,
     /// Start-to-close timeout copied through to the worker.
@@ -108,7 +108,7 @@ impl EnqueueParams {
             input,
             priority: 0,
             max_attempts: 3,
-            scheduled_at: Utc::now(),
+            scheduled_at: Timestamp::now(),
             heartbeat_timeout: None,
             start_to_close: None,
             schedule_to_start: None,
@@ -153,7 +153,7 @@ pub struct TaskEnvelope {
     #[serde(default)]
     pub attempt: i32,
     /// Earliest time at which this task became claimable.
-    pub scheduled_at: DateTime<Utc>,
+    pub scheduled_at: Timestamp,
     /// Heartbeat timeout in seconds (preserved as integer for portability).
     #[serde(default)]
     pub heartbeat_timeout_secs: Option<i64>,
@@ -171,7 +171,7 @@ pub struct TaskEnvelope {
     pub sticky_worker_id: Option<String>,
     /// Sticky deadline as ISO-8601 timestamp.
     #[serde(default)]
-    pub sticky_until: Option<DateTime<Utc>>,
+    pub sticky_until: Option<Timestamp>,
     /// Sticky timeout in milliseconds.
     #[serde(default)]
     pub sticky_timeout_ms: Option<u64>,
@@ -185,10 +185,10 @@ impl TaskEnvelope {
     pub(crate) fn from_params(params: EnqueueParams, task_id: Uuid) -> RedisAdapterResult<Self> {
         let sticky_until = match (params.sticky_worker_id.as_ref(), params.sticky_timeout) {
             (Some(_), Some(timeout)) => {
-                let chrono_timeout = chrono::Duration::from_std(timeout).map_err(|e| {
+                let chrono_timeout = jiff::SignedDuration::try_from(timeout).map_err(|e| {
                     RedisAdapterError::DurationOutOfRange(format!("sticky_timeout: {e}"))
                 })?;
-                Some(Utc::now() + chrono_timeout)
+                Some(Timestamp::now() + chrono_timeout)
             }
             _ => None,
         };

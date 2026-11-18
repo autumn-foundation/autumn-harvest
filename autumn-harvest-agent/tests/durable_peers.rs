@@ -619,7 +619,7 @@ async fn a_reply_after_the_deadline_is_not_waited_for() {
     sqlite::drive(&mut rt, &triage()).await.unwrap();
     // The researcher does not run. The deadline passes.
     let exec = sqlite::current_run(&rt, &triage()).unwrap().unwrap();
-    let later = autumn_harvest::chrono::Utc::now() + chrono::Duration::seconds(120);
+    let later = autumn_harvest::jiff::Timestamp::now() + jiff::SignedDuration::from_secs(120);
     rt.run_until_blocked_as_of(exec, later).await.unwrap();
     let answer = state(&rt, &triage()).await.last_answer.unwrap();
     assert!(answer.contains("no reply arrived within 60s"), "{answer}");
@@ -994,7 +994,7 @@ async fn a_peer_segment_with_a_failed_fan_out_child_keeps_its_later_sibling() {
 }
 
 /// Drive `agent` at the drive clock `at`, through each checkpoint.
-async fn drive_at(rt: &mut SqliteRuntime, agent: &AgentId, at: DateTime<Utc>) -> RunState {
+async fn drive_at(rt: &mut SqliteRuntime, agent: &AgentId, at: Timestamp) -> RunState {
     let mut exec = sqlite::current_run(rt, agent).unwrap().unwrap();
     loop {
         match rt.run_until_blocked_as_of(exec, at).await.unwrap() {
@@ -1115,13 +1115,13 @@ async fn a_heartbeat_tick_cannot_write_through_a_durable_peer() {
         .mandate(Mandate::new("triage").peers(["researcher"]));
     let mut rt = runtime(&db, writable_researcher(&model, &recorder, sender));
     start(&mut rt, &research()).await;
-    let begin = Utc::now();
+    let begin = Timestamp::now();
     sqlite::send(&mut rt, &triage(), &AgentOp::Control(Control::Resume), None).unwrap();
     drive_at(&mut rt, &triage(), begin).await;
     // The tick is due at 60 seconds. It sends to the researcher and waits.
-    drive_at(&mut rt, &triage(), begin + chrono::Duration::seconds(90)).await;
+    drive_at(&mut rt, &triage(), begin + jiff::SignedDuration::from_secs(90)).await;
     sqlite::drive(&mut rt, &research()).await.unwrap();
-    drive_at(&mut rt, &triage(), begin + chrono::Duration::seconds(91)).await;
+    drive_at(&mut rt, &triage(), begin + jiff::SignedDuration::from_secs(91)).await;
 
     assert_eq!(state(&rt, &triage()).await.ticks, 1);
     assert_read_only(&rt, &model, &recorder);
@@ -1138,13 +1138,13 @@ async fn a_followup_segment_cannot_write_through_a_durable_peer() {
         .mandate(Mandate::new("triage").peers(["researcher"]));
     let mut rt = runtime(&db, writable_researcher(&model, &recorder, sender));
     start(&mut rt, &research()).await;
-    let begin = Utc::now();
+    let begin = Timestamp::now();
     sqlite::send(&mut rt, &triage(), &AgentOp::message("go"), None).unwrap();
     drive_at(&mut rt, &triage(), begin).await;
-    let woken = begin + chrono::Duration::minutes(3);
+    let woken = begin + jiff::SignedDuration::from_mins(3);
     drive_at(&mut rt, &triage(), woken).await;
     sqlite::drive(&mut rt, &research()).await.unwrap();
-    drive_at(&mut rt, &triage(), woken + chrono::Duration::seconds(1)).await;
+    drive_at(&mut rt, &triage(), woken + jiff::SignedDuration::from_secs(1)).await;
 
     assert_eq!(state(&rt, &triage()).await.chain, 1, "the follow-up ran");
     assert_read_only(&rt, &model, &recorder);
@@ -1266,13 +1266,13 @@ async fn a_woken_agent_loop_segment_cannot_write_through_a_durable_peer() {
         .followups(Followups::new(Duration::from_secs(3_600)))
         .mandate(Mandate::new("triage").peers(["researcher"]));
     let exec = sqlite::start(&mut rt, &task).unwrap();
-    let begin = Utc::now();
+    let begin = Timestamp::now();
     rt.run_until_blocked_as_of(exec, begin).await.unwrap();
-    let woken = begin + chrono::Duration::minutes(3);
+    let woken = begin + jiff::SignedDuration::from_mins(3);
     rt.run_until_blocked_as_of(exec, woken).await.unwrap();
     sqlite::drive(&mut rt, &research()).await.unwrap();
     let ended = rt
-        .run_until_blocked_as_of(exec, woken + chrono::Duration::seconds(1))
+        .run_until_blocked_as_of(exec, woken + jiff::SignedDuration::from_secs(1))
         .await
         .unwrap();
 
@@ -1518,7 +1518,7 @@ async fn a_durable_peer_timeout_is_a_named_verdict_with_the_message_key() {
     let exec = sqlite::start(&mut rt, &one_shot_ask()).unwrap();
     rt.run_until_blocked(exec).await.unwrap();
     // The researcher does not run. The deadline passes.
-    let later = Utc::now() + chrono::Duration::seconds(120);
+    let later = Timestamp::now() + jiff::SignedDuration::from_secs(120);
     let ended = report(rt.run_until_blocked_as_of(exec, later).await.unwrap());
 
     let [record] = ended.delegations.as_slice() else {
@@ -1629,7 +1629,7 @@ async fn the_reply_verdict_gate_keeps_the_old_text_on_replay() {
     start(&mut rt, &research()).await;
     let exec = sqlite::start(&mut rt, &one_shot_ask()).unwrap();
     rt.run_until_blocked(exec).await.unwrap();
-    let later = Utc::now() + chrono::Duration::seconds(120);
+    let later = Timestamp::now() + jiff::SignedDuration::from_secs(120);
     report(rt.run_until_blocked_as_of(exec, later).await.unwrap());
     let events = rt.load_history(exec).unwrap();
     assert_eq!(events.iter().filter(|event| is_marker(event)).count(), 1);

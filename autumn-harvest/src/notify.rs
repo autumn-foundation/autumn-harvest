@@ -46,11 +46,12 @@
 //! [`send_failures`] counts lost wakes.
 
 use std::collections::HashMap;
+use jiff_diesel::ToDiesel;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use deadpool::managed::WeakPool;
 use diesel::sql_types::Text;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -999,7 +1000,7 @@ struct Fingerprint {
     /// `current_database()`.
     database: String,
     /// `pg_postmaster_start_time()`.
-    started_at: DateTime<Utc>,
+    started_at: Timestamp,
 }
 
 /// The database of a sender and when the sender last read it.
@@ -1356,7 +1357,8 @@ pub(crate) struct Stamp {
     database: String,
     /// `pg_postmaster_start_time()`.
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    started_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    started_at: Timestamp,
 }
 
 crate::const_sql! {
@@ -1832,7 +1834,8 @@ struct GateRow {
     database: String,
     /// `pg_postmaster_start_time()`.
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    started_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    started_at: Timestamp,
     /// `pg_notification_queue_usage()`.
     #[diesel(sql_type = diesel::sql_types::Double)]
     queue_usage: f64,
@@ -1931,7 +1934,7 @@ async fn read_gate(
     diesel::sql_query(GATE_AND_SEND_SQL)
         .bind::<Array<BigInt>, _>(txids)
         .bind::<Nullable<Text>, _>(server.as_ref().map(|fp| fp.database.as_str()))
-        .bind::<Nullable<Timestamptz>, _>(server.as_ref().map(|fp| fp.started_at))
+        .bind::<Nullable<Timestamptz>, _>(server.as_ref().map(|fp| fp.started_at).to_diesel())
         .bind::<Array<Text>, _>(channels)
         .bind::<Array<Text>, _>(payloads)
         .cache_prepared()
@@ -3934,7 +3937,7 @@ mod tests {
     fn test_note() -> (Arc<Fingerprint>, Vec<Note>) {
         let fingerprint = Fingerprint {
             database: "unused".into(),
-            started_at: DateTime::<Utc>::UNIX_EPOCH,
+            started_at: Timestamp::UNIX_EPOCH,
         };
         let note = Note::Task {
             channel: queue_channel("q"),
@@ -4015,7 +4018,7 @@ mod tests {
     async fn a_flush_waits_for_a_peer_sender_on_the_same_database() {
         let fingerprint = Fingerprint {
             database: "flush_peer_test".into(),
-            started_at: DateTime::<Utc>::UNIX_EPOCH,
+            started_at: Timestamp::UNIX_EPOCH,
         };
         let (_own_pool, own) = lazy_sink();
         let (_peer_pool, peer) = lazy_sink();
@@ -4096,7 +4099,7 @@ mod tests {
             txid: Some(7),
             fingerprint: Arc::new(Fingerprint {
                 database: database.into(),
-                started_at: DateTime::<Utc>::UNIX_EPOCH,
+                started_at: Timestamp::UNIX_EPOCH,
             }),
             queued_at: Instant::now(),
             note,

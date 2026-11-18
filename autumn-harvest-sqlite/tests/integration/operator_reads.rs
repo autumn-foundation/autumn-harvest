@@ -133,7 +133,7 @@ async fn a_count_groups_by_state_and_name_and_applies_the_filters() {
     assert_eq!(rows[0].count, 1);
 
     let future = CountFilter {
-        started_after: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        started_after: Some(jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1)),
         ..CountFilter::default()
     };
     assert_eq!(reader.count_executions(&future).unwrap().len(), 0);
@@ -206,7 +206,7 @@ async fn pending_work_lists_tasks_timers_and_buffered_signals() {
     assert_eq!(task.attempt, 1, "one attempt was consumed");
     assert_eq!(task.max_attempts, Some(3));
     assert_eq!(task.last_error.as_deref(), Some("down"));
-    assert!(task.run_at > chrono::Utc::now(), "the retry waits");
+    assert!(task.run_at > jiff::Timestamp::now(), "the retry waits");
     assert_eq!(work.timers.len(), 1, "{work:?}");
     assert_eq!(work.timers[0].timer_id, "nap");
     assert_eq!(work.signals.len(), 1, "{work:?}");
@@ -287,7 +287,7 @@ async fn no_policy_stores_no_line_and_a_purge_removes_the_lines() {
     assert_eq!(reader.count_workflow_logs(logged).unwrap(), 3);
 
     rt.terminate(logged, "stop").unwrap();
-    let later = chrono::Utc::now() + chrono::Duration::days(2);
+    let later = jiff::Timestamp::now() + autumn_harvest::time::days(2);
     rt.purge_terminal_as_of(later, Duration::from_secs(60))
         .unwrap();
     assert_eq!(reader.count_workflow_logs(logged).unwrap(), 0);

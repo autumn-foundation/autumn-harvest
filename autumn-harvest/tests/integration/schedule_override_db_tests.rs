@@ -21,7 +21,7 @@ use autumn_harvest::scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, ensure_dag_schedule, tick_once,
 };
 use autumn_harvest::worker::HandlerRegistry;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
@@ -157,8 +157,8 @@ async fn tick(url: &str, dag: &RegisteredDag) {
 struct Row {
     schedule_expr: Option<String>,
     max_active_runs: i32,
-    next_run_at: Option<DateTime<Utc>>,
-    updated_at: DateTime<Utc>,
+    next_run_at: Option<Timestamp>,
+    updated_at: Timestamp,
     workflow_name: Option<String>,
 }
 
@@ -177,8 +177,8 @@ async fn dag_row(conn: &mut AsyncPgConnection, dag_name: &str) -> Row {
             .first::<(
                 Option<String>,
                 i32,
-                Option<DateTime<Utc>>,
-                DateTime<Utc>,
+                Option<Timestamp>,
+                Timestamp,
                 Option<String>,
             )>(conn)
             .await
@@ -221,13 +221,13 @@ async fn an_override_wins_over_code_and_survives_a_restart() {
     )
     .await
     .expect("set override");
-    let before = Utc::now();
+    let before = Timestamp::now();
     tick(&db.url, &code).await;
     let row = dag_row(&mut conn, "etl").await;
     assert_eq!(row.schedule_expr.as_deref(), Some("interval:60"));
     let next = row.next_run_at.expect("next_run_at");
     assert!(
-        next > before && next <= before + chrono::Duration::seconds(61),
+        next > before && next <= before + jiff::SignedDuration::from_secs(61),
         "next_run_at {next} must be re-anchored inside the new 60 s cadence"
     );
 

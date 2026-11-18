@@ -35,7 +35,7 @@ use autumn_harvest::models::NewCompletionDelivery;
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::schema::harvest_completion_deliveries;
 use autumn_harvest::worker::DbPool;
-use chrono::Utc;
+use jiff::Timestamp;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use serde_json::json;
@@ -193,7 +193,7 @@ async fn seed_rows(conn: &mut AsyncPgConnection, rows: &[Row]) {
             payload: r.payload.clone(),
             max_attempts: r.max_attempts,
             retry_policy: r.retry_policy.clone(),
-            next_attempt_at: Utc::now() - chrono::Duration::seconds(1),
+            next_attempt_at: Timestamp::now() - jiff::SignedDuration::from_secs(1),
         })
         .collect();
     diesel::insert_into(harvest_completion_deliveries::table)

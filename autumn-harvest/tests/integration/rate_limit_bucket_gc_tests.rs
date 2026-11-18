@@ -32,6 +32,7 @@
 //! fresh testcontainers Postgres boots with the full migration bundle.
 
 use std::collections::BTreeMap;
+use jiff_diesel::ToDiesel;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -40,7 +41,7 @@ use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::DbPool;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use diesel::sql_types::{BigInt, Double, Nullable, Text, Timestamptz};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
@@ -171,9 +172,9 @@ async fn insert_bucket_at(
     refill_rate: f64,
     burst: f64,
     tokens: f64,
-    last_refilled_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-    created_at: DateTime<Utc>,
+    last_refilled_at: Timestamp,
+    updated_at: Timestamp,
+    created_at: Timestamp,
 ) {
     diesel::sql_query(
         "INSERT INTO harvest_rate_limit_buckets
@@ -193,16 +194,16 @@ async fn insert_bucket_at(
 }
 
 /// A full bucket whose every activity column is `age` old.
-async fn insert_idle_bucket(conn: &mut AsyncPgConnection, key: &str, age: chrono::Duration) {
-    let at = Utc::now() - age;
+async fn insert_idle_bucket(conn: &mut AsyncPgConnection, key: &str, age: jiff::SignedDuration) {
+    let at = Timestamp::now() - age;
     insert_bucket_at(conn, key, 1.0, 10.0, 10.0, at, at, at).await;
 }
 
 async fn set_override(
     conn: &mut AsyncPgConnection,
     key: &str,
-    expires_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
+    expires_at: Timestamp,
+    updated_at: Timestamp,
 ) {
     diesel::sql_query(
         "UPDATE harvest_rate_limit_buckets
@@ -258,7 +259,8 @@ struct KeyRow {
 #[derive(diesel::QueryableByName)]
 struct TsRow {
     #[diesel(sql_type = Timestamptz)]
-    updated_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    updated_at: Timestamp,
 }
 
 #[derive(diesel::QueryableByName)]
@@ -293,7 +295,7 @@ async fn bucket_exists(conn: &mut AsyncPgConnection, key: &str) -> bool {
         > 0
 }
 
-async fn bucket_updated_at(conn: &mut AsyncPgConnection, key: &str) -> DateTime<Utc> {
+async fn bucket_updated_at(conn: &mut AsyncPgConnection, key: &str) -> Timestamp {
     diesel::sql_query("SELECT updated_at FROM harvest_rate_limit_buckets WHERE key = $1")
         .bind::<Text, _>(key)
         .get_result::<TsRow>(conn)
@@ -305,11 +307,12 @@ async fn bucket_updated_at(conn: &mut AsyncPgConnection, key: &str) -> DateTime<
 async fn bucket_last_registered_at(
     conn: &mut AsyncPgConnection,
     key: &str,
-) -> Option<DateTime<Utc>> {
+) -> Option<Timestamp> {
     #[derive(diesel::QueryableByName)]
     struct MaybeTsRow {
         #[diesel(sql_type = Nullable<Timestamptz>)]
-        last_registered_at: Option<DateTime<Utc>>,
+        #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+        last_registered_at: Option<Timestamp>,
     }
     diesel::sql_query("SELECT last_registered_at FROM harvest_rate_limit_buckets WHERE key = $1")
         .bind::<Text, _>(key)
@@ -444,8 +447,8 @@ const fn collected(result: &autumn_harvest::retention::RetentionTickResult) -> u
 
 const WINDOW: Duration = Duration::from_hours(24);
 
-const fn day_old() -> chrono::Duration {
-    chrono::Duration::hours(48)
+const fn day_old() -> jiff::SignedDuration {
+    jiff::SignedDuration::from_hours(48)
 }
 
 // ---------------------------------------------------------------------------
@@ -490,7 +493,7 @@ async fn a_bucket_that_never_drained_is_collected_once_it_is_idle() {
     let mut conn = connect(&url).await;
     scrub(&mut conn).await;
 
-    let at = Utc::now() - day_old();
+    let at = Timestamp::now() - day_old();
     insert_bucket_at(&mut conn, "dyn-rate:t:full", 5.0, 20.0, 20.0, at, at, at).await;
 
     let result = run_one_tick(pool, gc_only(WINDOW), Arc::new(CapturingMetrics::default())).await;
@@ -506,8 +509,8 @@ async fn a_recently_used_bucket_is_retained() {
     let mut conn = connect(&url).await;
     scrub(&mut conn).await;
 
-    let recent = Utc::now() - chrono::Duration::minutes(5);
-    let old = Utc::now() - day_old();
+    let recent = Timestamp::now() - jiff::SignedDuration::from_mins(5);
+    let old = Timestamp::now() - day_old();
     // Idle by `updated_at`/`created_at`, but debited five minutes ago.
     insert_bucket_at(
         &mut conn,
@@ -557,7 +560,7 @@ async fn a_partially_drained_bucket_is_retained() {
     let mut conn = connect(&url).await;
     scrub(&mut conn).await;
 
-    let at = Utc::now() - day_old();
+    let at = Timestamp::now() - day_old();
     insert_bucket_at(&mut conn, "dyn-rate:t:drained", 0.0, 10.0, 3.0, at, at, at).await;
 
     let result = run_one_tick(pool, gc_only(WINDOW), Arc::new(CapturingMetrics::default())).await;
@@ -645,12 +648,12 @@ async fn a_live_override_pins_its_bucket_and_an_expired_one_does_not() {
     let mut conn = connect(&url).await;
     scrub(&mut conn).await;
 
-    let old = Utc::now() - day_old();
+    let old = Timestamp::now() - day_old();
     insert_idle_bucket(&mut conn, "dyn-rate:t:live", day_old()).await;
     set_override(
         &mut conn,
         "dyn-rate:t:live",
-        Utc::now() + chrono::Duration::hours(2),
+        Timestamp::now() + jiff::SignedDuration::from_hours(2),
         old,
     )
     .await;
@@ -659,7 +662,7 @@ async fn a_live_override_pins_its_bucket_and_an_expired_one_does_not() {
     set_override(
         &mut conn,
         "dyn-rate:t:lapsed",
-        Utc::now() - chrono::Duration::hours(2),
+        Timestamp::now() - jiff::SignedDuration::from_hours(2),
         old,
     )
     .await;
@@ -695,7 +698,7 @@ async fn bounded_static_activity_buckets_are_never_collected() {
         "dyn-rate",
         "start-throttler:x",
     ] {
-        insert_idle_bucket(&mut conn, key, chrono::Duration::days(400)).await;
+        insert_idle_bucket(&mut conn, key, autumn_harvest::time::days(400)).await;
     }
 
     let result = run_one_tick(pool, gc_only(WINDOW), Arc::new(CapturingMetrics::default())).await;
@@ -715,7 +718,7 @@ async fn the_configured_window_is_honoured() {
     let mut conn = connect(&url).await;
     scrub(&mut conn).await;
 
-    insert_idle_bucket(&mut conn, "dyn-rate:t:a", chrono::Duration::hours(3)).await;
+    insert_idle_bucket(&mut conn, "dyn-rate:t:a", jiff::SignedDuration::from_hours(3)).await;
 
     // A 24h window retains a 3h-idle bucket.
     let result = run_one_tick(
@@ -865,7 +868,7 @@ async fn ensuring_a_stale_bucket_touches_it_so_the_sweep_cannot_race_the_enqueue
     let registered_after = bucket_last_registered_at(&mut conn, key)
         .await
         .expect("a stale bucket must be touched");
-    assert!(registered_after > Utc::now() - chrono::Duration::minutes(1));
+    assert!(registered_after > Timestamp::now() - jiff::SignedDuration::from_mins(1));
     assert_eq!(
         bucket_updated_at(&mut conn, key).await,
         updated_before,
@@ -1001,14 +1004,14 @@ async fn a_bucket_with_an_operator_written_baseline_is_retained() {
     scrub(&mut conn).await;
 
     insert_idle_bucket(&mut conn, "dyn-rate:t:clamped", day_old()).await;
-    let old = Utc::now() - day_old();
+    let old = Timestamp::now() - day_old();
     diesel::sql_query(
         "UPDATE harvest_rate_limit_buckets
             SET refill_rate = 0.5, baseline_set_at = $2, updated_at = $2
           WHERE key = $1",
     )
     .bind::<Text, _>("dyn-rate:t:clamped")
-    .bind::<Timestamptz, _>(old)
+    .bind::<Timestamptz, _>(old.to_diesel())
     .execute(&mut conn)
     .await
     .expect("operator baseline");
@@ -1074,7 +1077,7 @@ async fn a_slowly_refilling_bucket_below_burst_is_retained() {
     let mut conn = connect(&url).await;
     scrub(&mut conn).await;
 
-    let at = Utc::now() - day_old();
+    let at = Timestamp::now() - day_old();
     // 0.001 tokens/s over 48h accrues ~172 of a 100_000 burst.
     insert_bucket_at(
         &mut conn,
@@ -1105,7 +1108,7 @@ async fn re_ensuring_a_live_bucket_never_disturbs_its_pacing_state() {
     scrub(&mut conn).await;
 
     let key = "dyn-rate:t:live";
-    let at = Utc::now() - day_old();
+    let at = Timestamp::now() - day_old();
     insert_bucket_at(&mut conn, key, 1.0, 10.0, 3.0, at, at, at).await;
     let updated_before = bucket_updated_at(&mut conn, key).await;
 
@@ -1520,7 +1523,7 @@ async fn the_migration_preserves_an_operator_baseline_that_predates_the_column()
     let mut conn = connect(&url).await;
     scrub(&mut conn).await;
 
-    let old = Utc::now() - chrono::Duration::days(9);
+    let old = Timestamp::now() - autumn_harvest::time::days(9);
     // An operator-written row: `updated_at` moved after creation, which before
     // #1127 only an operator or config write could do.
     insert_bucket_at(
@@ -1530,7 +1533,7 @@ async fn the_migration_preserves_an_operator_baseline_that_predates_the_column()
         1.0,
         1.0,
         old,
-        Utc::now() - chrono::Duration::days(3),
+        Timestamp::now() - autumn_harvest::time::days(3),
         old,
     )
     .await;
@@ -1561,7 +1564,7 @@ async fn the_migration_preserves_an_operator_baseline_that_predates_the_column()
     // Set them old here, so this test isolates the operator-intent backfill.
     // The test above covers the grace itself.
     diesel::sql_query("UPDATE harvest_rate_limit_buckets SET last_registered_at = $1 WHERE TRUE")
-        .bind::<Timestamptz, _>(old)
+        .bind::<Timestamptz, _>(old.to_diesel())
         .execute(&mut conn)
         .await
         .expect("age past the upgrade grace");
@@ -1592,7 +1595,7 @@ async fn the_migration_grants_every_pre_upgrade_bucket_one_full_window_of_grace(
     scrub(&mut conn).await;
 
     // Idle for over a year, and by every other clock instantly collectable.
-    insert_idle_bucket(&mut conn, "dyn-rate:t:ancient", chrono::Duration::days(400)).await;
+    insert_idle_bucket(&mut conn, "dyn-rate:t:ancient", autumn_harvest::time::days(400)).await;
 
     // Replay the real upgrade on the real table: drop the column back to its
     // pre-#1127 shape, then re-add it with the migration's OWN statements. That
@@ -1636,7 +1639,7 @@ async fn the_migration_grants_every_pre_upgrade_bucket_one_full_window_of_grace(
     // The grace is one-time, not permanent: once the window has elapsed the row
     // ages normally, so abandoned per-tenant buckets are still reclaimed.
     diesel::sql_query("UPDATE harvest_rate_limit_buckets SET last_registered_at = $1")
-        .bind::<Timestamptz, _>(Utc::now() - chrono::Duration::days(2))
+        .bind::<Timestamptz, _>((Timestamp::now() - autumn_harvest::time::days(2)).to_diesel())
         .execute(&mut conn)
         .await
         .expect("elapse the grace");

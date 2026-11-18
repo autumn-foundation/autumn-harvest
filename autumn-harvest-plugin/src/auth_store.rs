@@ -12,7 +12,7 @@
 //!
 //! [`SqliteAuthStore`]: autumn_harvest_sqlite::SqliteAuthStore
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use uuid::Uuid;
 
 use autumn_harvest::HarvestError;
@@ -87,7 +87,7 @@ impl AuthStore {
                 Ok(crate::api_token::touch_last_used(&mut conn, id).await?)
             }
             #[cfg(feature = "sqlite")]
-            Self::Sqlite(store) => blocking(store, move |s| s.touch_token(id, Utc::now())).await,
+            Self::Sqlite(store) => blocking(store, move |s| s.touch_token(id, Timestamp::now())).await,
         }
     }
 
@@ -150,7 +150,7 @@ impl AuthSession {
         &mut self,
         name: &str,
         scope: TokenScope,
-        expires_at: Option<DateTime<Utc>>,
+        expires_at: Option<Timestamp>,
         created_by: &str,
         tenant: Option<&str>,
     ) -> StoreResult<MintResult> {
@@ -171,7 +171,7 @@ impl AuthSession {
                         name: &name,
                         token_hash: &hash,
                         scope: scope.as_str(),
-                        created_at: Utc::now(),
+                        created_at: Timestamp::now(),
                         expires_at,
                         created_by: &created_by,
                         tenant: tenant.as_deref(),
@@ -205,7 +205,7 @@ impl AuthSession {
         match self {
             Self::Postgres(conn) => Ok(crate::api_token::revoke_token(conn, id).await?),
             #[cfg(feature = "sqlite")]
-            Self::Sqlite(store) => blocking(store, move |s| s.revoke_token(id, Utc::now())).await,
+            Self::Sqlite(store) => blocking(store, move |s| s.revoke_token(id, Timestamp::now())).await,
         }
     }
 
@@ -246,7 +246,7 @@ mod sqlite {
     use autumn_harvest::audit::AuditFilters;
     use autumn_harvest::models::{ApiToken, AuditRecord, NewAuditRecord};
     use autumn_harvest_sqlite::{AuditFilter, AuditRow, NewAuditRow, StoredToken};
-    use chrono::{DateTime, Utc};
+    use jiff::Timestamp;
 
     pub(super) fn to_api_token(row: StoredToken) -> ApiToken {
         let StoredToken {
@@ -325,7 +325,7 @@ mod sqlite {
     /// An audit row that owns its fields, so it can cross to the blocking
     /// pool.
     pub(super) struct OwnedAudit {
-        occurred_at: DateTime<Utc>,
+        occurred_at: Timestamp,
         actor: String,
         operation: String,
         target_type: String,
@@ -343,7 +343,7 @@ mod sqlite {
         /// Copy `record`. The time is now, as the Postgres column default.
         pub(super) fn of(record: &NewAuditRecord<'_>) -> Self {
             Self {
-                occurred_at: Utc::now(),
+                occurred_at: Timestamp::now(),
                 actor: record.actor.to_owned(),
                 operation: record.operation.to_owned(),
                 target_type: record.target_type.to_owned(),

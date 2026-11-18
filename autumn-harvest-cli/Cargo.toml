@@ -63,6 +63,7 @@ path = "src/bin/harvest_replay.rs"
 # Already in the graph via `autumn-harvest`; a dev-dep so the integration test
 # binaries can stamp a `RestoreVerifyReport::generated_at` directly.
 chrono = { workspace = true }
+jiff = { workspace = true }
 tempfile = "3"
 
 [[test]]

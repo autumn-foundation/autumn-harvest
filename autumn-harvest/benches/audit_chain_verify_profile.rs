@@ -33,7 +33,7 @@
 use autumn_harvest::audit_chain::{ChainRow, ChainVerifier, GENESIS, link};
 use autumn_harvest::audit_export::AuditExportRecord;
 use autumn_harvest::completion_callback::CallbackSecret;
-use chrono::{DateTime, TimeZone, Utc};
+use jiff::Timestamp;
 use uuid::Uuid;
 
 fn env_usize(key: &str, default: usize) -> usize {
@@ -45,9 +45,7 @@ fn env_usize(key: &str, default: usize) -> usize {
 
 fn record(i: usize) -> AuditExportRecord {
     let n = i64::try_from(i).unwrap_or(0);
-    let at: DateTime<Utc> = Utc
-        .timestamp_opt(1_780_000_000 + n, 123_456_000)
-        .single()
+    let at: Timestamp = Timestamp::new(1_780_000_000 + n, 123_456_000).ok()
         .unwrap_or_default();
     AuditExportRecord {
         shard: 3,
@@ -77,7 +75,7 @@ fn main() {
 
     let mut rows = Vec::with_capacity(n);
     let mut prev = GENESIS;
-    let mut newest: Option<DateTime<Utc>> = None;
+    let mut newest: Option<Timestamp> = None;
     for i in 0..n {
         let rec = record(i);
         let hash = link(&key, &prev, newest, &rec);

@@ -63,7 +63,7 @@ pub const MAX_OVERLAY_BYTES: usize = 64 * 1024;
 ///
 /// The embedder sets it, never a caller of a store method. So a refine run
 /// cannot pick the day of its cap. A test sets a fixed clock.
-pub type StoreClock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
+pub type StoreClock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
 
 fn system_clock() -> StoreClock {
     Arc::new(Utc::now)
@@ -218,7 +218,7 @@ pub struct StoredOverlay {
     bytes: Vec<u8>,
     overlay: ProfileOverlay,
     provenance: Provenance,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
 }
 
 impl StoredOverlay {
@@ -254,7 +254,7 @@ impl StoredOverlay {
 
     /// The time of the put.
     #[must_use]
-    pub const fn created_at(&self) -> DateTime<Utc> {
+    pub const fn created_at(&self) -> Timestamp {
         self.created_at
     }
 
@@ -285,7 +285,7 @@ pub struct Activation {
     from: Option<OverlayVersion>,
     to: OverlayVersion,
     actor: Provenance,
-    activated_at: DateTime<Utc>,
+    activated_at: Timestamp,
 }
 
 impl Activation {
@@ -321,7 +321,7 @@ impl Activation {
 
     /// The time of the move.
     #[must_use]
-    pub const fn activated_at(&self) -> DateTime<Utc> {
+    pub const fn activated_at(&self) -> Timestamp {
         self.activated_at
     }
 
@@ -364,7 +364,7 @@ pub struct PolicyLogEntry {
     old: Option<RefinePolicy>,
     new: Option<RefinePolicy>,
     actor: Provenance,
-    changed_at: DateTime<Utc>,
+    changed_at: Timestamp,
 }
 
 impl PolicyLogEntry {
@@ -400,7 +400,7 @@ impl PolicyLogEntry {
 
     /// The time of the change.
     #[must_use]
-    pub const fn changed_at(&self) -> DateTime<Utc> {
+    pub const fn changed_at(&self) -> Timestamp {
         self.changed_at
     }
 
@@ -1440,7 +1440,7 @@ impl InMemoryOverlayStore {
             body: bytes,
             author_kind: provenance.author_kind().to_owned(),
             author: provenance.author(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
         };
         let stored = StoredOverlay::from_row(kind, row)?;
         let version = stored.version;
@@ -1472,7 +1472,7 @@ impl InMemoryOverlayStore {
             old: last.and_then(|last| last.new.clone()),
             new: policy.cloned(),
             actor,
-            changed_at: Utc::now(),
+            changed_at: Timestamp::now(),
         };
         log.policies.push(entry.clone());
         drop(kinds);
@@ -1522,7 +1522,7 @@ impl InMemoryOverlayStore {
             body: bytes,
             author_kind: provenance.author_kind().to_owned(),
             author: provenance.author(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
         };
         let stored = StoredOverlay::from_row(kind, row.clone())?;
         let seq = log.moves.last().map_or(1, |last| last.seq + 1);
@@ -1569,7 +1569,7 @@ impl InMemoryOverlayStore {
                                 from: log.active,
                                 to: version,
                                 actor: actor.clone(),
-                                activated_at: Utc::now(),
+                                activated_at: Timestamp::now(),
                             });
                             log.active = Some(version);
                         }
@@ -2367,7 +2367,7 @@ mod tests {
             body: body.to_vec(),
             author_kind: author_kind.to_owned(),
             author: author.to_owned(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
         };
         for bad in [
             row(0, b"{}", AUTHOR_OPERATOR, "ops"),

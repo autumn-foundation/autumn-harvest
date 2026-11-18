@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use autumn_harvest::{ExecutionId, WorkflowEvent};
 use autumn_harvest_sqlite::{LogFilter, RunState, SqliteReader, SqliteRuntime};
-use chrono::{DateTime, TimeDelta, Utc};
+use jiff::{SignedDuration, Timestamp};
 use rhai_scripts::bridge::MAX_OPERATIONS;
 use rhai_scripts::{Echo, ScriptInput, WORKFLOW};
 use serde_json::{Value, json};
@@ -147,11 +147,11 @@ async fn sleep_is_a_durable_timer() {
     let dir = scratch();
     let mut rt = rhai_scripts::open(db(&dir)).expect("open");
     let exec = start(&mut rt, &dir, r#"sleep(60); sh("echo after")"#);
-    let t0 = DateTime::<Utc>::from_timestamp(1_800_000_000, 0).expect("a time");
+    let t0 = Timestamp::from_second(1_800_000_000).ok().expect("a time");
 
     let state = rt.run_until_blocked_as_of(exec, t0).await.expect("drive");
     assert!(matches!(state, RunState::WaitingTimer), "got {state:?}");
-    let early = t0 + TimeDelta::seconds(30);
+    let early = t0 + SignedDuration::from_secs(30);
     let state = rt
         .run_until_blocked_as_of(exec, early)
         .await
@@ -159,7 +159,7 @@ async fn sleep_is_a_durable_timer() {
     assert!(matches!(state, RunState::WaitingTimer), "got {state:?}");
     assert!(scheduled(&db(&dir), exec).is_empty(), "no step runs early");
 
-    let due = t0 + TimeDelta::seconds(61);
+    let due = t0 + SignedDuration::from_secs(61);
     let state = rt.run_until_blocked_as_of(exec, due).await.expect("drive");
     assert!(
         matches!(state, RunState::Completed(ref v) if v == &json!("after")),

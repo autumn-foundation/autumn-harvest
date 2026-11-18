@@ -258,7 +258,7 @@ fn concurrent_await_two_timers_workflow<'a>(
         let slow = ctx.start_timer("slow", 10);
         let fast = ctx.start_timer("fast", 1);
         let (s, f) = tokio::join!(slow.await_fire(), fast.await_fire());
-        let now_elapsed_secs = (ctx.now() - start).num_seconds();
+        let now_elapsed_secs = (ctx.now() - start).as_secs();
         Ok(json!({
             "slow": format!("{:?}", s.map_err(|e| e.to_string())?),
             "fast": format!("{:?}", f.map_err(|e| e.to_string())?),
@@ -326,7 +326,7 @@ fn reset_via_ctx_then_await_handle_workflow<'a>(
         // duration stays 300 while the authoritative armed duration becomes 600.
         ctx.reset_timer("idle", 600).map_err(|e| e.to_string())?;
         let outcome = handle.await_fire().await.map_err(|e| e.to_string())?;
-        let now = ctx.now().timestamp();
+        let now = ctx.now().as_second();
         Ok(json!({ "outcome": format!("{outcome:?}"), "now": now }))
     })
 }
@@ -339,7 +339,7 @@ fn side_effect_then_activity_workflow<'a>(
     _input: Value,
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
-        let captured_at = ctx.system_now().timestamp_millis();
+        let captured_at = ctx.system_now().as_millisecond();
         let result = ctx
             .execute_activity_raw("send_email", json!({"to": "user@example.com"}), "default")
             .await
@@ -740,7 +740,7 @@ async fn test_concurrent_awaited_timers_fire_in_deadline_order() {
         "ctx.now() after both concurrent timers fire must advance by MAX(10,1)=10, not 11"
     );
     assert_eq!(
-        outcome.elapsed().num_seconds(),
+        outcome.elapsed().as_secs(),
         10,
         "final_now/elapsed must reconstruct the MAX deadline (10s), not the sum (11s)"
     );
@@ -904,7 +904,7 @@ async fn test_await_fire_uses_current_reset_duration_not_stale_handle() {
     let v = outcome.result.as_ref().unwrap();
     let now = v["now"].as_i64().unwrap();
     assert_eq!(
-        now - start.timestamp(),
+        now - start.as_second(),
         600,
         "ctx.now() must advance by the current armed 600, not the stale handle 300"
     );
@@ -912,13 +912,13 @@ async fn test_await_fire_uses_current_reset_duration_not_stale_handle() {
     // final_now()/elapsed() (the harness virtual clock) must AGREE with the
     // workflow-observed ctx.now() and count only the fired 600 — not 300+600.
     assert_eq!(
-        outcome.final_now().timestamp(),
+        outcome.final_now().as_second(),
         now,
         "final_now() must match the workflow-observed ctx.now()"
     );
     assert_eq!(
         outcome.elapsed(),
-        chrono::Duration::seconds(600),
+        jiff::SignedDuration::from_secs(600),
         "elapsed() must be the fired 600, not the cancelled+fired sum (900)"
     );
 
@@ -944,11 +944,11 @@ async fn test_final_now_counts_only_fired_arm_not_cancelled_reset_arm() {
     assert_eq!(outcome.result, Ok(json!("Fired")));
     assert_eq!(
         outcome.elapsed(),
-        chrono::Duration::seconds(300),
+        jiff::SignedDuration::from_secs(300),
         "virtual clock must advance only for the FIRED arm (300), not the \
          cancelled-arm + fired-arm sum (600)"
     );
-    assert_eq!(outcome.final_now(), start + chrono::Duration::seconds(300));
+    assert_eq!(outcome.final_now(), start + jiff::SignedDuration::from_secs(300));
 }
 
 /// Issue #768: a cancelled timer never fired, so the
@@ -962,7 +962,7 @@ async fn test_final_now_does_not_advance_for_a_cancelled_never_fired_timer() {
     assert_eq!(outcome.result, Ok(json!("cancelled")));
     assert_eq!(
         outcome.elapsed(),
-        chrono::Duration::zero(),
+        jiff::SignedDuration::ZERO,
         "a cancelled (never-fired) timer must not advance the virtual clock"
     );
     assert_eq!(outcome.final_now(), start);
@@ -2167,7 +2167,7 @@ fn scheduled_time_reader_workflow<'a>(
     _input: Value,
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
-        let slot: Option<String> = ctx.scheduled_time().map(|t| t.to_rfc3339());
+        let slot: Option<String> = ctx.scheduled_time().map(|t| autumn_harvest::time::rfc3339(t));
         Ok(json!({ "scheduled_time": slot }))
     })
 }
@@ -2184,8 +2184,8 @@ async fn test_scheduled_time_none_by_default() {
 /// Seeded `scheduled_time` is returned by the accessor.
 #[tokio::test]
 async fn test_scheduled_time_seeded_value() {
-    use chrono::{TimeZone as _, Utc};
-    let slot = Utc.with_ymd_and_hms(2026, 3, 15, 0, 0, 0).unwrap();
+    use jiff::Timestamp;
+    let slot = autumn_harvest::time::utc_ymd_hms(2026, 3, 15, 0, 0, 0).unwrap();
     let outcome = WorkflowTestEnv::new()
         .with_scheduled_time(slot)
         .run(scheduled_time_reader_workflow, json!(null))
@@ -2202,8 +2202,8 @@ async fn test_scheduled_time_seeded_value() {
 /// Replay determinism: the seeded `scheduled_time` replays identically.
 #[tokio::test]
 async fn test_scheduled_time_replays_deterministically() {
-    use chrono::{TimeZone as _, Utc};
-    let slot = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+    use jiff::Timestamp;
+    let slot = autumn_harvest::time::utc_ymd_hms(2026, 6, 1, 0, 0, 0).unwrap();
     let outcome = WorkflowTestEnv::new()
         .with_scheduled_time(slot)
         .run(scheduled_time_reader_workflow, json!(null))
@@ -2224,11 +2224,11 @@ fn clock_after_timer_workflow<'a>(
     _input: Value,
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
-        let t0 = ctx.now().timestamp();
+        let t0 = ctx.now().as_second();
         ctx.timer("sleep30d", 30 * 24 * 3600)
             .await
             .map_err(|e| e.to_string())?;
-        let t1 = ctx.now().timestamp();
+        let t1 = ctx.now().as_second();
         Ok(json!({ "t0": t0, "t1": t1, "diff_secs": t1 - t0 }))
     })
 }
@@ -2262,12 +2262,12 @@ fn sleep_until_future_workflow<'a>(
     _input: Value,
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
-        let t0 = ctx.now().timestamp();
-        let deadline = chrono::DateTime::from_timestamp(SLEEP_UNTIL_FUTURE_DEADLINE_TS, 0).unwrap();
+        let t0 = ctx.now().as_second();
+        let deadline = jiff::Timestamp::from_second(SLEEP_UNTIL_FUTURE_DEADLINE_TS).ok().unwrap();
         ctx.sleep_until("wake", deadline)
             .await
             .map_err(|e| e.to_string())?;
-        let t1 = ctx.now().timestamp();
+        let t1 = ctx.now().as_second();
         Ok(json!({ "delta": t1 - t0 }))
     })
 }
@@ -2279,7 +2279,7 @@ fn sleep_until_past_workflow<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
         // 2000-01-01T00:00:00Z — firmly in the past.
-        let deadline = chrono::DateTime::from_timestamp(946_684_800, 0).unwrap();
+        let deadline = jiff::Timestamp::from_second(946_684_800).ok().unwrap();
         ctx.sleep_until("wake", deadline)
             .await
             .map_err(|e| e.to_string())?;
@@ -2322,12 +2322,12 @@ async fn sleep_until_resolves_in_test_env_without_real_sleep() {
         })
         .expect("a TimerStarted event must be recorded");
 
-    let frozen_now = chrono::DateTime::from_timestamp_millis(frozen_millis)
+    let frozen_now = jiff::Timestamp::from_millisecond(frozen_millis).ok()
         .expect("frozen millis must be a valid instant");
-    let deadline = chrono::DateTime::from_timestamp(SLEEP_UNTIL_FUTURE_DEADLINE_TS, 0).unwrap();
-    let delta = deadline.signed_duration_since(frozen_now);
+    let deadline = jiff::Timestamp::from_second(SLEEP_UNTIL_FUTURE_DEADLINE_TS).ok().unwrap();
+    let delta = deadline.duration_since(frozen_now);
     let expected =
-        u64::try_from(delta.num_seconds() + i64::from(delta.subsec_nanos() > 0)).unwrap();
+        u64::try_from(delta.as_secs() + i64::from(delta.subsec_nanos() > 0)).unwrap();
     assert_eq!(
         timer_secs, expected,
         "recorded timer duration must equal remaining_secs_until(deadline, frozen_now)"
@@ -2369,11 +2369,11 @@ fn two_timers_workflow<'a>(
     _input: Value,
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
-        let t0 = ctx.now().timestamp();
+        let t0 = ctx.now().as_second();
         ctx.timer("hour1", 3600).await.map_err(|e| e.to_string())?;
-        let t1 = ctx.now().timestamp();
+        let t1 = ctx.now().as_second();
         ctx.timer("hour2", 7200).await.map_err(|e| e.to_string())?;
-        let t2 = ctx.now().timestamp();
+        let t2 = ctx.now().as_second();
         Ok(json!({ "t0": t0, "t1": t1, "t2": t2 }))
     })
 }
@@ -2401,11 +2401,11 @@ fn activity_then_now_workflow<'a>(
     _input: Value,
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
-        let t0 = ctx.now().timestamp();
+        let t0 = ctx.now().as_second();
         ctx.execute_activity_raw("noop", json!(null), "default")
             .await
             .map_err(|e| e.to_string())?;
-        let t1 = ctx.now().timestamp();
+        let t1 = ctx.now().as_second();
         Ok(json!({ "diff_secs": t1 - t0 }))
     })
 }
@@ -2430,7 +2430,7 @@ fn signal_or_timer_now_workflow<'a>(
     _input: Value,
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
-        let t0 = ctx.now().timestamp();
+        let t0 = ctx.now().as_second();
         let won = match ctx
             .wait_for_signal_timeout("approve", std::time::Duration::from_hours(720))
             .await
@@ -2439,7 +2439,7 @@ fn signal_or_timer_now_workflow<'a>(
             Ok(None) => "timer",
             Err(e) => return Err(e.to_string()),
         };
-        let t1 = ctx.now().timestamp();
+        let t1 = ctx.now().as_second();
         Ok(json!({ "won": won, "diff_secs": t1 - t0 }))
     })
 }
@@ -2465,15 +2465,15 @@ fn billing_loop_workflow<'a>(
     _input: Value,
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
-        let t_start = ctx.now().timestamp();
+        let t_start = ctx.now().as_second();
         ctx.timer("cycle1", 30 * 24 * 3600)
             .await
             .map_err(|e| e.to_string())?;
-        let t_after_first = ctx.now().timestamp();
+        let t_after_first = ctx.now().as_second();
         ctx.timer("cycle2", 30 * 24 * 3600)
             .await
             .map_err(|e| e.to_string())?;
-        let t_after_second = ctx.now().timestamp();
+        let t_after_second = ctx.now().as_second();
         Ok(json!({
             "t_start": t_start,
             "t_after_first": t_after_first,
@@ -2505,7 +2505,7 @@ async fn test_billing_loop_dates_and_elapsed() {
         "second 30d accumulates to 60d"
     );
 
-    let sixty_days = chrono::Duration::days(60);
+    let sixty_days = autumn_harvest::time::days(60);
     assert_eq!(
         outcome.final_now(),
         start + sixty_days,
@@ -2517,7 +2517,7 @@ async fn test_billing_loop_dates_and_elapsed() {
         "outcome.elapsed() must be 60 days"
     );
     assert_eq!(
-        outcome.final_now().timestamp(),
+        outcome.final_now().as_second(),
         t_after_second,
         "outcome.final_now() must match workflow-observed ctx.now()"
     );
@@ -2557,7 +2557,7 @@ async fn test_365_days_under_50ms() {
     );
     assert_eq!(
         outcome.final_now(),
-        start + chrono::Duration::days(365),
+        start + autumn_harvest::time::days(365),
         "outcome.final_now() must be start + 365 days"
     );
 }
@@ -3223,7 +3223,7 @@ async fn deadline_aware_run_replay_check_carries_execution_timeout() {
     use autumn_harvest::event::SideEffectKind;
 
     let outcome = WorkflowTestEnv::new()
-        .with_execution_timeout(chrono::Duration::hours(24))
+        .with_execution_timeout(jiff::SignedDuration::from_hours(24))
         .run(deadline_aware_workflow, json!(null))
         .await;
 
@@ -3277,16 +3277,16 @@ fn deadline_trip_workflow<'a>(
 
 /// Issue #772: in a live `WorkflowTestEnv::with_execution_timeout` run, the
 /// deadline probe must read the ADVANCING virtual clock of the context, not
-/// the host `Utc::now()`. Then a workflow that spends its deadline budget on
+/// the host `Timestamp::now()`. Then a workflow that spends its deadline budget on
 /// durable timers trips the deadline continue-as-new branch under test.
-/// Before the fix, the probe read `Utc::now()` (≈ `start_time`, ~zero
+/// Before the fix, the probe read `Timestamp::now()` (≈ `start_time`, ~zero
 /// elapsed). Almost none of the budget looked consumed, and the branch never
 /// tripped in the harness. So the test env could not validate the long-lived
 /// low-event workflows that the feature serves.
 #[tokio::test]
 async fn deadline_probe_reads_advancing_clock_and_trips_in_test_env() {
     let outcome = WorkflowTestEnv::new()
-        .with_execution_timeout(chrono::Duration::seconds(100))
+        .with_execution_timeout(jiff::SignedDuration::from_secs(100))
         .run(deadline_trip_workflow, json!(null))
         .await;
     assert_eq!(
@@ -3317,7 +3317,7 @@ fn deadline_no_trip_workflow<'a>(
 #[tokio::test]
 async fn deadline_probe_does_not_trip_below_fraction_in_test_env() {
     let outcome = WorkflowTestEnv::new()
-        .with_execution_timeout(chrono::Duration::seconds(100))
+        .with_execution_timeout(jiff::SignedDuration::from_secs(100))
         .run(deadline_no_trip_workflow, json!(null))
         .await;
     assert_eq!(
@@ -4075,7 +4075,7 @@ fn business_day_workflow<'a>(
             .timer_business_days("sla", 2, "biz")
             .await
             .map_err(|e| e.to_string())?;
-        Ok(json!(deadline.to_rfc3339()))
+        Ok(json!(autumn_harvest::time::rfc3339(deadline)))
     })
 }
 
@@ -4145,7 +4145,7 @@ async fn test_business_day_run_replays_frozen_under_a_hostile_calendar() {
     //     A recompute would land on Tue 07-07; the frozen record must win.
     let hostile = autumn_harvest::calendar::BusinessCalendars::new().with_calendar(
         "biz",
-        [chrono::NaiveDate::from_ymd_opt(2026, 7, 6).expect("valid date")],
+        [autumn_harvest::time::date_ymd(2026, 7, 6).expect("valid date")],
     );
     let hostile_report = autumn_harvest::testing::WorkflowReplayer::new()
         .with_state(hostile)

@@ -549,7 +549,7 @@ impl MeshSpend for SpentBudget {
     fn spent<'a>(
         &'a self,
         _mesh: &'a str,
-        _since: DateTime<Utc>,
+        _since: Timestamp,
     ) -> BoxFuture<'a, Result<Spend, AgentError>> {
         let read = self.reads.fetch_add(1, Ordering::SeqCst) + 1;
         let spend = if read <= self.max_reads {

@@ -55,10 +55,10 @@
 use autumn_harvest::stall_diagnosis::{
     BlockingCircuitPhase, DiagnosisInputs, PendingActivityFacts, classify_execution,
 };
-use chrono::{DateTime, TimeZone, Utc};
+use jiff::Timestamp;
 
-fn now() -> DateTime<Utc> {
-    Utc.timestamp_opt(1_800_000_000, 0).unwrap()
+fn now() -> Timestamp {
+    Timestamp::new(1_800_000_000, 0).unwrap()
 }
 
 const QUEUES: [&str; 4] = ["payments", "email", "webhooks", "inventory"];
@@ -78,7 +78,7 @@ const DOWNSTREAM_ERRORS: [&str; 3] = [
 /// It is the most common shape in a real stalled fan-out. It forces
 /// `classify_pending_activity` down its most allocation-heavy branch:
 /// `ActivityRetrying` clones both `activity_name` and `last_error`.
-fn retrying_activity(idx: usize, now: DateTime<Utc>) -> PendingActivityFacts {
+fn retrying_activity(idx: usize, now: Timestamp) -> PendingActivityFacts {
     PendingActivityFacts {
         activity_name: Some(ACTIVITIES[idx % ACTIVITIES.len()].to_string()),
         queue: QUEUES[idx % QUEUES.len()].to_string(),
@@ -86,7 +86,7 @@ fn retrying_activity(idx: usize, now: DateTime<Utc>) -> PendingActivityFacts {
         attempt: 2 + i32::try_from(idx % 4).unwrap_or(i32::MAX),
         last_error: Some(DOWNSTREAM_ERRORS[idx % DOWNSTREAM_ERRORS.len()].to_string()),
         scheduled_at: now
-            + chrono::Duration::seconds(30 + i64::try_from(idx % 60).unwrap_or(i64::MAX)),
+            + jiff::SignedDuration::from_secs(30 + i64::try_from(idx % 60).unwrap_or(i64::MAX)),
         rate_limit_key: None,
         concurrency_key: None,
         queue_paused: false,
@@ -103,14 +103,14 @@ fn retrying_activity(idx: usize, now: DateTime<Utc>) -> PendingActivityFacts {
 }
 
 /// A due, unimpeded row — the healthy minority in a mostly-degraded fan-out.
-fn healthy_activity(idx: usize, now: DateTime<Utc>) -> PendingActivityFacts {
+fn healthy_activity(idx: usize, now: Timestamp) -> PendingActivityFacts {
     PendingActivityFacts {
         activity_name: Some(ACTIVITIES[idx % ACTIVITIES.len()].to_string()),
         queue: QUEUES[idx % QUEUES.len()].to_string(),
         task_state: "PENDING".to_string(),
         attempt: 1,
         last_error: None,
-        scheduled_at: now - chrono::Duration::seconds(5),
+        scheduled_at: now - jiff::SignedDuration::from_secs(5),
         rate_limit_key: None,
         concurrency_key: None,
         queue_paused: false,
@@ -127,10 +127,10 @@ fn healthy_activity(idx: usize, now: DateTime<Utc>) -> PendingActivityFacts {
 }
 
 /// An open-breaker row — the second most common "actually a problem" shape.
-fn circuit_open_activity(idx: usize, now: DateTime<Utc>) -> PendingActivityFacts {
+fn circuit_open_activity(idx: usize, now: Timestamp) -> PendingActivityFacts {
     PendingActivityFacts {
         circuit_phase: Some(BlockingCircuitPhase::Open),
-        circuit_cooldown_until: Some(now + chrono::Duration::seconds(30)),
+        circuit_cooldown_until: Some(now + jiff::SignedDuration::from_secs(30)),
         ..retrying_activity(idx, now)
     }
 }
@@ -138,7 +138,7 @@ fn circuit_open_activity(idx: usize, now: DateTime<Utc>) -> PendingActivityFacts
 /// The genuine, permanent root cause: nothing polls this queue at all. The
 /// caller never places it at index 0 or N-1. So a fold that checks only the
 /// ends of the collection cannot pass by accident.
-fn no_worker_activity(idx: usize, now: DateTime<Utc>) -> PendingActivityFacts {
+fn no_worker_activity(idx: usize, now: Timestamp) -> PendingActivityFacts {
     PendingActivityFacts {
         has_live_worker: false,
         ..healthy_activity(idx, now)
@@ -157,7 +157,7 @@ fn no_worker_index(n: usize) -> usize {
 ///
 /// It is ~70% retry backoff, ~20% healthy and ~9% open-breaker. Exactly one
 /// `activity_no_worker` row sits two-thirds of the way through.
-fn build_inputs(n: usize, now: DateTime<Utc>) -> DiagnosisInputs {
+fn build_inputs(n: usize, now: Timestamp) -> DiagnosisInputs {
     let no_worker_index = no_worker_index(n);
     let activities: Vec<PendingActivityFacts> = (0..n)
         .map(|idx| {

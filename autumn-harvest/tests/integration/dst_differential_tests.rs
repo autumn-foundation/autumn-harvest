@@ -14,6 +14,7 @@
 //! describes the harness.
 
 use std::collections::BTreeMap;
+use jiff_diesel::ToDiesel;
 
 use autumn_harvest::dst::{
     self, Claim, Fencing, Invariant, Op, Orphan, Outcome, Row, SeedPlan, SimConfig, SimReport,
@@ -28,7 +29,7 @@ use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::store;
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
 use autumn_harvest::worker::{append_activity_started_for_test, finalize_activity_completion};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel::sql_types::{Array, BigInt, Integer, Jsonb, Nullable, Text, Timestamptz};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
@@ -83,7 +84,7 @@ struct PgStore<'c> {
     stale_after_secs: i64,
     /// Virtual time 0. Liveness stamps and the reclaimer's clock are
     /// `epoch + now_ms`, so the reclaimer sees the simulated clock.
-    epoch: DateTime<Utc>,
+    epoch: Timestamp,
     /// The prefix that makes worker ids unique to this run.
     prefix: String,
     tasks: Vec<PgTask>,
@@ -153,7 +154,7 @@ impl<'c> PgStore<'c> {
             conn,
             fencing: config.fencing,
             stale_after_secs,
-            epoch: Utc::now(),
+            epoch: Timestamp::now(),
             prefix,
             tasks,
             claims: BTreeMap::new(),
@@ -161,8 +162,8 @@ impl<'c> PgStore<'c> {
         }
     }
 
-    fn at(&self, ms: u64) -> DateTime<Utc> {
-        self.epoch + chrono::Duration::milliseconds(i64::try_from(ms).expect("time"))
+    fn at(&self, ms: u64) -> Timestamp {
+        self.epoch + jiff::SignedDuration::from_millis(i64::try_from(ms).expect("time"))
     }
 
     fn worker(&self, sim_id: &str) -> String {
@@ -215,7 +216,7 @@ impl<'c> PgStore<'c> {
              ON CONFLICT (worker_id) DO UPDATE SET last_heartbeat_at = EXCLUDED.last_heartbeat_at",
         )
         .bind::<Text, _>(self.worker(worker))
-        .bind::<Timestamptz, _>(self.at(at_ms))
+        .bind::<Timestamptz, _>(self.at(at_ms).to_diesel())
         .execute(self.conn)
         .await
         .expect("beat");
@@ -411,7 +412,7 @@ impl<'c> PgStore<'c> {
         let ids: Vec<Uuid> = self.tasks.iter().map(|task| task.task_id).collect();
         let rows: Vec<OrphanRow> = diesel::sql_query(sql)
             .bind::<BigInt, _>(self.stale_after_secs)
-            .bind::<Timestamptz, _>(self.at(now_ms))
+            .bind::<Timestamptz, _>(self.at(now_ms).to_diesel())
             .bind::<Array<diesel::sql_types::Uuid>, _>(ids)
             .load(self.conn)
             .await
@@ -448,7 +449,7 @@ impl<'c> PgStore<'c> {
                     .bind::<Integer, _>(strikes)
                     .bind::<Integer, _>(strikes + 1)
                     .bind::<BigInt, _>(stale)
-                    .bind::<Timestamptz, _>(now)
+                    .bind::<Timestamptz, _>(now.to_diesel())
                     .execute(conn)
                     .await
             })
@@ -516,7 +517,7 @@ async fn seed_task(conn: &mut AsyncPgConnection, queue: &str) -> PgTask {
         &[
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!({}),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -537,7 +538,7 @@ async fn seed_task(conn: &mut AsyncPgConnection, queue: &str) -> PgTask {
     params.activity_name = Some(ACTIVITY.to_string());
     params.activity_id = Some(activity_id.as_uuid());
     params.max_attempts = 1_000;
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
     let task_id = queue::enqueue(conn, &params).await.expect("enqueue");
     PgTask {
         queue: queue.to_string(),

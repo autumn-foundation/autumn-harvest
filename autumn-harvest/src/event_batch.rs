@@ -8,12 +8,13 @@
 
 #[cfg(feature = "db")]
 use crate::cached_stmt::CachePreparedDsl as _;
+use jiff_diesel::ToDiesel;
 use crate::debounce::DebounceStartOptions;
 #[cfg(feature = "db")]
 use crate::error::{HarvestError, HarvestResult};
 #[cfg(feature = "db")]
 use crate::types::ExecutionId;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 #[cfg(feature = "db")]
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
@@ -42,7 +43,7 @@ pub struct AdmitBatchParams {
 pub struct BatchAdmitOutcome {
     pub batch_key: String,
     pub workflow_id: String,
-    pub fire_at: DateTime<Utc>,
+    pub fire_at: Timestamp,
     pub pending_count: i32,
     pub max_size: usize,
     pub is_flushed: bool,
@@ -58,10 +59,10 @@ pub struct PendingEventBatchRecord {
     pub queue_name: String,
     pub current_size: i32,
     pub max_size: i32,
-    pub fire_at: DateTime<Utc>,
+    pub fire_at: Timestamp,
     pub shard_id: i32,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 #[cfg(feature = "db")]
@@ -80,7 +81,8 @@ struct UpsertBatchRow {
     #[diesel(sql_type = diesel::sql_types::Jsonb)]
     start_options: serde_json::Value,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    fire_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    fire_at: Timestamp,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     max_size: i32,
     #[diesel(sql_type = diesel::sql_types::Integer)]
@@ -110,7 +112,8 @@ struct FireDueBatchRow {
     #[diesel(sql_type = diesel::sql_types::Jsonb)]
     start_options: serde_json::Value,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    fire_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    fire_at: Timestamp,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     max_size: i32,
     #[diesel(sql_type = diesel::sql_types::Integer)]
@@ -165,10 +168,10 @@ pub async fn admit_batched_start_with_codecs(
         return Err(HarvestError::EmptyWorkflowId);
     }
 
-    let now = Utc::now();
-    let max_wait_chrono = chrono::Duration::from_std(params.max_wait)
-        .unwrap_or_else(|_| chrono::Duration::days(365 * 100));
-    let initial_fire_at = now.checked_add_signed(max_wait_chrono).unwrap_or(now);
+    let now = Timestamp::now();
+    let max_wait_chrono = jiff::SignedDuration::try_from(params.max_wait)
+        .unwrap_or_else(|_| crate::time::days(365 * 100));
+    let initial_fire_at = now.checked_add(max_wait_chrono).ok().unwrap_or(now);
 
     let new_id = uuid::Uuid::new_v4();
     let start_options_json = serde_json::to_value(&params.start_options)
@@ -255,7 +258,7 @@ pub async fn admit_batched_start_with_codecs(
                 .bind::<diesel::sql_types::Text, _>(&queue_name)
                 .bind::<diesel::sql_types::Jsonb, _>(payload)
                 .bind::<diesel::sql_types::Jsonb, _>(start_options_json)
-                .bind::<diesel::sql_types::Timestamptz, _>(initial_fire_at)
+                .bind::<diesel::sql_types::Timestamptz, _>(initial_fire_at.to_diesel())
                 .bind::<diesel::sql_types::Integer, _>(max_size as i32)
                 .bind::<diesel::sql_types::Integer, _>(shard_id)
                 .get_result(conn)
@@ -290,7 +293,7 @@ pub async fn admit_batched_start_with_codecs(
                         );
                         // The row keeps its elements. A short deadline lets the
                         // scanner retry once the key returns.
-                        let retry_at = Utc::now() + UNDECODABLE_REDEFER_BACKOFF;
+                        let retry_at = Timestamp::now() + UNDECODABLE_REDEFER_BACKOFF;
                         pull_in_event_batch_row(conn, row.id, retry_at).await?;
                         effective_fire_at = effective_fire_at.min(retry_at);
                         None
@@ -537,11 +540,11 @@ fn decode_buffered_payloads(
 async fn redefer_event_batch_row(
     conn: &mut AsyncPgConnection,
     row_id: uuid::Uuid,
-    new_fire_at: DateTime<Utc>,
+    new_fire_at: Timestamp,
 ) -> HarvestResult<()> {
     diesel::sql_query("UPDATE harvest_event_batches SET fire_at = $2 WHERE id = $1")
         .bind::<diesel::sql_types::Uuid, _>(row_id)
-        .bind::<diesel::sql_types::Timestamptz, _>(new_fire_at)
+        .bind::<diesel::sql_types::Timestamptz, _>(new_fire_at.to_diesel())
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -556,13 +559,13 @@ async fn redefer_event_batch_row(
 async fn pull_in_event_batch_row(
     conn: &mut AsyncPgConnection,
     row_id: uuid::Uuid,
-    latest: DateTime<Utc>,
+    latest: Timestamp,
 ) -> HarvestResult<()> {
     diesel::sql_query(
         "UPDATE harvest_event_batches SET fire_at = LEAST(fire_at, $2) WHERE id = $1",
     )
     .bind::<diesel::sql_types::Uuid, _>(row_id)
-    .bind::<diesel::sql_types::Timestamptz, _>(latest)
+    .bind::<diesel::sql_types::Timestamptz, _>(latest.to_diesel())
     .execute(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -626,7 +629,7 @@ async fn fire_due_on_conn(
     // the next due row, so a bad row cannot hold up a healthy one (issue #2043).
     let moved_back = std::sync::atomic::AtomicBool::new(false);
     loop {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let processed: Option<(
             String,
             Vec<crate::completion_trigger::DeferredTriggerStart>,
@@ -635,7 +638,7 @@ async fn fire_due_on_conn(
         )> = Box::pin(conn.transaction(async |conn| {
             let due_rows: Vec<FireDueBatchRow> = if let Some(sid) = shard_id {
                 diesel::sql_query(due_sql)
-                    .bind::<diesel::sql_types::Timestamptz, _>(now)
+                    .bind::<diesel::sql_types::Timestamptz, _>(now.to_diesel())
                     .bind::<diesel::sql_types::BigInt, _>(1i64)
                     .bind::<diesel::sql_types::Integer, _>(sid)
                     .cache_prepared()
@@ -644,7 +647,7 @@ async fn fire_due_on_conn(
                     .map_err(crate::error::database_error)?
             } else {
                 diesel::sql_query(due_sql)
-                    .bind::<diesel::sql_types::Timestamptz, _>(now)
+                    .bind::<diesel::sql_types::Timestamptz, _>(now.to_diesel())
                     .bind::<diesel::sql_types::BigInt, _>(1i64)
                     .cache_prepared()
                     .load(conn)
@@ -726,7 +729,7 @@ async fn fire_claimed_batch_row(
                 error_kind = crate::codec_rotation::sweep_error_kind(&error),
                 "batch payload or headers could not be decoded; the row moves back"
             );
-            redefer_event_batch_row(conn, row.id, Utc::now() + UNDECODABLE_REDEFER_BACKOFF).await?;
+            redefer_event_batch_row(conn, row.id, Timestamp::now() + UNDECODABLE_REDEFER_BACKOFF).await?;
             moved_back.store(true, std::sync::atomic::Ordering::SeqCst);
             return Ok(None);
         }
@@ -878,7 +881,7 @@ async fn fire_claimed_batch_row(
             limit,
             current,
         }) => {
-            let now = Utc::now();
+            let now = Timestamp::now();
             redefer_event_batch_row(conn, row_id, now + QUOTA_REDEFER_BACKOFF).await?;
             tracing::debug!(
                 workflow_name = %quota_workflow_name,
@@ -1052,15 +1055,18 @@ pub async fn list_pending_event_batches(
         #[diesel(sql_type = diesel::sql_types::Jsonb)]
         buffered_payloads: serde_json::Value,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        fire_at: DateTime<Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        fire_at: Timestamp,
         #[diesel(sql_type = diesel::sql_types::Integer)]
         max_size: i32,
         #[diesel(sql_type = diesel::sql_types::Integer)]
         shard_id: i32,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        created_at: DateTime<Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        created_at: Timestamp,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        updated_at: DateTime<Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        updated_at: Timestamp,
     }
 
     let records: Vec<DbRecord> = diesel::sql_query(

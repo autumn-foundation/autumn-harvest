@@ -27,7 +27,7 @@ pub struct TypedWorkflowResult<T> {
     /// Present only for failed/cancelled/timed-out/terminated states.
     pub error: Option<String>,
     /// Timestamp when the execution entered a terminal state.
-    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub completed_at: Option<jiff::Timestamp>,
     /// Stable error-type class from a typed
     /// [`WorkflowFailure`](crate::failure::WorkflowFailure) (issue #767).
     ///
@@ -232,11 +232,11 @@ pub struct TypedStartOptions {
     /// on rotates claims across keys. `None` takes the run's quota key.
     pub fairness_key: Option<String>,
     /// Queue scheduled start at time.
-    pub start_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub start_at: Option<jiff::Timestamp>,
     /// Queue start delay duration.
-    pub delay: Option<chrono::Duration>,
+    pub delay: Option<jiff::SignedDuration>,
     /// Maximum allowed delay before starting.
-    pub max_workflow_start_delay: Option<chrono::Duration>,
+    pub max_workflow_start_delay: Option<jiff::SignedDuration>,
     /// Per-execution context headers propagated automatically to activities and children.
     pub context_headers: Option<std::collections::HashMap<String, String>>,
     /// Soft SLA duration: emits `harvest.workflow.sla_breached` once when the run exceeds this

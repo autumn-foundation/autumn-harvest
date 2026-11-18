@@ -21,7 +21,7 @@ use autumn_harvest::schedule_patch::{
     workflow_fields_are_empty,
 };
 use autumn_harvest::schedule_plan;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -51,9 +51,9 @@ pub struct ScheduleSummary {
     /// The reason of the pause, while paused (issue #2471).
     pub pause_reason: Option<String>,
     /// The next slot. `None` never fires.
-    pub next_run_at: Option<DateTime<Utc>>,
+    pub next_run_at: Option<Timestamp>,
     /// The slot of the last started run.
-    pub last_run_at: Option<DateTime<Utc>>,
+    pub last_run_at: Option<Timestamp>,
 }
 
 /// A due schedule, read inside its fire transaction.
@@ -158,9 +158,9 @@ pub struct ScheduleOverride {
     /// The actor that last changed the override.
     pub updated_by: String,
     /// When the override was first stored.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// When the override last changed.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 /// The stored form of the override fields that this backend honors.
@@ -547,7 +547,7 @@ pub fn active_runs(conn: &Connection, workflow_name: &str, now: i64) -> SqliteRe
 pub fn advance(conn: &Connection, due: &Due, now: i64, dispatched: bool) -> SqliteResult<()> {
     let slot = to_time(due.slot);
     let next = schedule_plan::next_slot_after_fire(&due.schedule, slot, to_time(now))
-        .map(|at| at.timestamp_millis());
+        .map(|at| at.as_millisecond());
     conn.execute(
         "UPDATE harvest_schedules SET next_run_at = ?2, \
            last_run_at = CASE WHEN ?3 THEN ?4 ELSE last_run_at END \
@@ -700,7 +700,7 @@ fn check_supported(schedule: &WorkflowSchedule) -> SqliteResult<()> {
 
 /// The first slot of `schedule` after `now`, in epoch milliseconds.
 fn first_slot(schedule: &Schedule, now: i64) -> Option<i64> {
-    schedule_plan::next_fire_after(schedule, to_time(now)).map(|at| at.timestamp_millis())
+    schedule_plan::next_fire_after(schedule, to_time(now)).map(|at| at.as_millisecond())
 }
 
 fn parse_spec(spec: &str) -> SqliteResult<Schedule> {
@@ -708,8 +708,8 @@ fn parse_spec(spec: &str) -> SqliteResult<Schedule> {
 }
 
 /// An epoch-millisecond time. A value out of range reads as the epoch.
-fn to_time(millis: i64) -> DateTime<Utc> {
-    DateTime::from_timestamp_millis(millis).unwrap_or_default()
+fn to_time(millis: i64) -> Timestamp {
+    Timestamp::from_millisecond(millis).ok().unwrap_or_default()
 }
 
 #[cfg(test)]

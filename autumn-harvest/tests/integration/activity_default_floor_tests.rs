@@ -33,7 +33,7 @@ use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{RetryPolicy, WorkflowContext, store};
 
-use chrono::Utc;
+use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
@@ -371,7 +371,7 @@ async fn seed_workflow(
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -383,7 +383,7 @@ async fn seed_workflow(
 
     let mut params = EnqueueParams::new(queue, TaskType::Workflow, input);
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     queue::enqueue(conn, &params)
         .await
         .expect("enqueue workflow task");
@@ -466,7 +466,7 @@ async fn seed_local_activity_in_progress(
         &[
             WorkflowEvent::WorkflowStarted {
                 input: input.clone(),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -492,7 +492,7 @@ async fn seed_local_activity_in_progress(
 
     let mut params = EnqueueParams::new(queue, TaskType::Workflow, input);
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     queue::enqueue(conn, &params)
         .await
         .expect("enqueue resume workflow task");
@@ -1705,7 +1705,7 @@ async fn regular_activity_under_builder_default_gets_start_to_close() {
 
     assert_eq!(
         task.start_to_close,
-        Some(chrono::Duration::seconds(30)),
+        Some(jiff::SignedDuration::from_secs(30)),
         "the builder-default start_to_close (30s) must reach the enqueued \
          regular activity task's start_to_close column"
     );
@@ -1759,7 +1759,7 @@ async fn call_site_stc_override_wins_over_builder_default_stc() {
 
     assert_eq!(
         task.start_to_close,
-        Some(chrono::Duration::seconds(5)),
+        Some(jiff::SignedDuration::from_secs(5)),
         "the call-site start_to_close override (5s) must win over the \
          builder-default STC (30s)"
     );
@@ -1816,7 +1816,7 @@ async fn declared_activity_stc_wins_over_builder_default_stc() {
 
     assert_eq!(
         task.start_to_close,
-        Some(chrono::Duration::seconds(7)),
+        Some(jiff::SignedDuration::from_secs(7)),
         "the activity's own declared start_to_close (7s) must win over the \
          builder-default STC (30s)"
     );

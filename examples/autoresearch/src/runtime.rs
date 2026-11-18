@@ -652,9 +652,9 @@ pub fn purge(rt: &mut SqliteRuntime, older_than: Duration) -> Result<u64, String
     // The cutoff of `purge_terminal`. The purge holds the writer lock, so no
     // run closes between the two reads of the clock. A window past the
     // clock purges nothing.
-    if let Some(cutoff) = chrono::TimeDelta::from_std(older_than)
+    if let Some(cutoff) = jiff::SignedDuration::try_from(older_than)
         .ok()
-        .and_then(|window| chrono::Utc::now().checked_sub_signed(window))
+        .and_then(|window| jiff::Timestamp::now().checked_sub(window).ok())
     {
         check_purge(rt, cutoff)?;
     }
@@ -663,7 +663,7 @@ pub fn purge(rt: &mut SqliteRuntime, older_than: Duration) -> Result<u64, String
 
 /// Fail when a purge with `cutoff` would remove a run above an unfinished
 /// run.
-fn check_purge(rt: &SqliteRuntime, cutoff: chrono::DateTime<chrono::Utc>) -> Result<(), String> {
+fn check_purge(rt: &SqliteRuntime, cutoff: jiff::Timestamp) -> Result<(), String> {
     let filter = ExecutionFilter::new().state("RUNNING").limit(1000);
     let page = rt.list_executions(&filter).map_err(|e| e.to_string())?;
     for run in &page.executions {

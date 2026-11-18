@@ -401,7 +401,7 @@ mod tests {
                 name: WORKFLOW_NAME.to_owned(),
                 events: vec![WorkflowEvent::WorkflowStarted {
                     input,
-                    timestamp: Utc::now(),
+                    timestamp: Timestamp::now(),
                     last_completion_result: None,
                     last_error: None,
                     scheduled_time: None,

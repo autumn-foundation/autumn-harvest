@@ -10,6 +10,7 @@ publish = false
 autumn-harvest = { version = "0.10.0", path = "../../autumn-harvest", features = ["db", "owner-disk-cache"] }
 autumn-harvest-sqlite = { version = "0.10.0", path = "../../autumn-harvest-sqlite" }
 chrono = { workspace = true }
+jiff = { workspace = true }
 diesel = { workspace = true }
 diesel-async = { workspace = true }
 rusqlite = { workspace = true }

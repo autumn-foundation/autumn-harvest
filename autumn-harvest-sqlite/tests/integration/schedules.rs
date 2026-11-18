@@ -20,7 +20,7 @@ use autumn_harvest::prelude::*;
 use autumn_harvest_sqlite::{
     ExecutionFilter, ExecutionSummary, SqliteError, SqliteRuntime, Stored,
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::json;
 
 #[workflow]
@@ -74,7 +74,7 @@ const MINUTE: i64 = 60_000;
 /// Make the clock of `rt` read `clock`, in epoch milliseconds.
 fn follow(rt: &mut SqliteRuntime, clock: &Arc<AtomicI64>) {
     let clock = clock.clone();
-    rt.set_clock(move || DateTime::from_timestamp_millis(clock.load(Ordering::SeqCst)).unwrap());
+    rt.set_clock(move || Timestamp::from_millisecond(clock.load(Ordering::SeqCst)).ok().unwrap());
 }
 
 /// A runtime whose clock reads `clock`, with every test workflow registered.
@@ -106,7 +106,7 @@ fn runs(rt: &SqliteRuntime, workflow: &str) -> Vec<ExecutionSummary> {
 
 fn started_at(row: &ExecutionSummary) -> i64 {
     match &row.started_at {
-        Stored::Value(at) => at.timestamp_millis(),
+        Stored::Value(at) => at.as_millisecond(),
         other => panic!("no start time: {other:?}"),
     }
 }
@@ -125,7 +125,7 @@ fn next_run_at(rt: &SqliteRuntime, workflow: &str) -> Option<i64> {
         .find(|s| s.workflow_name == workflow)
         .expect("the schedule exists")
         .next_run_at
-        .map(|at| at.timestamp_millis())
+        .map(|at| at.as_millisecond())
 }
 
 // AC1: an interval schedule starts runs on time across a reopen. The app
@@ -435,7 +435,7 @@ async fn unsupported_fields_are_rejected_by_name() {
         }),
         ("end_at", {
             let mut s = base();
-            s.end_at = Some(Utc::now());
+            s.end_at = Some(Timestamp::now());
             s
         }),
         ("max_runs", {
@@ -519,7 +519,7 @@ async fn poll_once_as_of_fires_due_schedules() {
     let clock = Arc::new(AtomicI64::new(T0));
     let mut rt = runtime_at(&dir.path().join("asof.db"), &clock);
     rt.upsert_schedule(&every_minute("tick")).unwrap();
-    let at = DateTime::<Utc>::from_timestamp_millis(T0 + MINUTE).unwrap();
+    let at = Timestamp::from_millisecond(T0 + MINUTE).ok().unwrap();
     assert!(rt.poll_once_as_of(at).await.unwrap());
     assert_eq!(runs(&rt, "tick").len(), 1);
 }
@@ -531,7 +531,7 @@ fn last_run_at(rt: &SqliteRuntime, workflow: &str) -> Option<i64> {
         .find(|s| s.workflow_name == workflow)
         .expect("the schedule exists")
         .last_run_at
-        .map(|at| at.timestamp_millis())
+        .map(|at| at.as_millisecond())
 }
 
 // A late fire keeps the cadence: the next slot counts from the slot, not
@@ -678,7 +678,7 @@ async fn run_until_idle_quiesces_on_a_fast_clock() {
     let clock = Arc::new(AtomicI64::new(T0 + 1_000));
     let ticks = clock.clone();
     rt.set_clock(move || {
-        DateTime::from_timestamp_millis(ticks.fetch_add(1_000, Ordering::SeqCst)).unwrap()
+        Timestamp::from_millisecond(ticks.fetch_add(1_000, Ordering::SeqCst)).ok().unwrap()
     });
     rt.run_until_idle().await.expect("the call quiesces");
     assert_eq!(runs(&rt, "tick").len(), 1);

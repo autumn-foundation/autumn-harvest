@@ -20,6 +20,7 @@
 #![allow(clippy::too_many_lines, clippy::similar_names)]
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
+use jiff_diesel::ToDiesel;
 use autumn_harvest::table_split::SetExt;
 use std::sync::Arc;
 
@@ -38,7 +39,7 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{DateTime, Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
@@ -131,8 +132,8 @@ async fn seed_run(
     conn: &mut AsyncPgConnection,
     workflow_id: &str,
     state: &str,
-    started_at: DateTime<Utc>,
-    completed_at: Option<DateTime<Utc>>,
+    started_at: Timestamp,
+    completed_at: Option<Timestamp>,
     continued_from: Option<ExecutionId>,
     first: Option<ExecutionId>,
 ) -> ExecutionId {
@@ -231,7 +232,7 @@ async fn insert_continue_event(
             harvest_events::event_id.eq(event_id),
             harvest_events::event_type.eq(event_type),
             harvest_events::event_data.eq(data),
-            harvest_events::timestamp.eq(Utc::now()),
+            harvest_events::timestamp.eq(Timestamp::now().to_diesel()),
         ))
         .execute(conn)
         .await
@@ -311,14 +312,14 @@ async fn run_chain_three_can_transitions_from_head_middle_and_tail() {
     let app = build_app(&pool);
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
 
-    let t0 = Utc::now() - Duration::seconds(400);
+    let t0 = Timestamp::now() - SignedDuration::from_secs(400);
     // run0 = origin; run1, run2 = middle; run3 = live tail.
     let run0 = seed_run(
         &mut conn,
         "chain-run-0",
         "CONTINUED_AS_NEW",
         t0,
-        Some(t0 + Duration::seconds(10)),
+        Some(t0 + SignedDuration::from_secs(10)),
         None,
         None,
     )
@@ -327,8 +328,8 @@ async fn run_chain_three_can_transitions_from_head_middle_and_tail() {
         &mut conn,
         "chain-run-1",
         "CONTINUED_AS_NEW",
-        t0 + Duration::seconds(100),
-        Some(t0 + Duration::seconds(110)),
+        t0 + SignedDuration::from_secs(100),
+        Some(t0 + SignedDuration::from_secs(110)),
         Some(run0),
         Some(run0),
     )
@@ -337,8 +338,8 @@ async fn run_chain_three_can_transitions_from_head_middle_and_tail() {
         &mut conn,
         "chain-run-2",
         "CONTINUED_AS_NEW",
-        t0 + Duration::seconds(200),
-        Some(t0 + Duration::seconds(210)),
+        t0 + SignedDuration::from_secs(200),
+        Some(t0 + SignedDuration::from_secs(210)),
         Some(run1),
         Some(run0),
     )
@@ -347,7 +348,7 @@ async fn run_chain_three_can_transitions_from_head_middle_and_tail() {
         &mut conn,
         "chain-run-3",
         "RUNNING",
-        t0 + Duration::seconds(300),
+        t0 + SignedDuration::from_secs(300),
         None,
         Some(run2),
         Some(run0),
@@ -410,13 +411,13 @@ async fn run_chain_standalone_run_is_single_entry() {
     let app = build_app(&pool);
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
 
-    let t0 = Utc::now() - Duration::seconds(30);
+    let t0 = Timestamp::now() - SignedDuration::from_secs(30);
     let run = seed_run(
         &mut conn,
         "standalone",
         "COMPLETED",
         t0,
-        Some(t0 + Duration::seconds(5)),
+        Some(t0 + SignedDuration::from_secs(5)),
         None,
         None,
     )
@@ -445,14 +446,14 @@ async fn run_chain_post_feature_chain_with_deleted_middle_flags_gap() {
     let app = build_app(&pool);
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
 
-    let t0 = Utc::now() - Duration::seconds(300);
+    let t0 = Timestamp::now() - SignedDuration::from_secs(300);
     // head = origin; middle is deleted (never seeded); tail is the live run.
     let head = seed_run(
         &mut conn,
         "gap-run-head",
         "CONTINUED_AS_NEW",
         t0,
-        Some(t0 + Duration::seconds(10)),
+        Some(t0 + SignedDuration::from_secs(10)),
         None,
         None,
     )
@@ -463,7 +464,7 @@ async fn run_chain_post_feature_chain_with_deleted_middle_flags_gap() {
         &mut conn,
         "gap-run-tail",
         "RUNNING",
-        t0 + Duration::seconds(200),
+        t0 + SignedDuration::from_secs(200),
         None,
         Some(middle), // real predecessor, absent from the gathered set
         Some(head),   // shares the chain origin so the seed query gathers it
@@ -503,14 +504,14 @@ async fn run_chain_legacy_chain_flags_head_unknown() {
     let app = build_app(&pool);
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
 
-    let t0 = Utc::now() - Duration::seconds(300);
+    let t0 = Timestamp::now() - SignedDuration::from_secs(300);
     // Legacy rows: continued_from + first_exec_id are both NULL.
     let run0 = seed_run(
         &mut conn,
         "legacy-run-0",
         "CONTINUED_AS_NEW",
         t0,
-        Some(t0 + Duration::seconds(10)),
+        Some(t0 + SignedDuration::from_secs(10)),
         None,
         None,
     )
@@ -519,8 +520,8 @@ async fn run_chain_legacy_chain_flags_head_unknown() {
         &mut conn,
         "legacy-run-1",
         "CONTINUED_AS_NEW",
-        t0 + Duration::seconds(100),
-        Some(t0 + Duration::seconds(110)),
+        t0 + SignedDuration::from_secs(100),
+        Some(t0 + SignedDuration::from_secs(110)),
         None,
         None,
     )
@@ -529,7 +530,7 @@ async fn run_chain_legacy_chain_flags_head_unknown() {
         &mut conn,
         "legacy-run-2",
         "RUNNING",
-        t0 + Duration::seconds(200),
+        t0 + SignedDuration::from_secs(200),
         None,
         None,
         None,
@@ -572,14 +573,14 @@ async fn run_chain_legacy_middle_run_flags_head_unknown() {
     let app = build_app(&pool);
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
 
-    let t0 = Utc::now() - Duration::seconds(300);
+    let t0 = Timestamp::now() - SignedDuration::from_secs(300);
     // Legacy rows: continued_from + first_exec_id are both NULL.
     let run0 = seed_run(
         &mut conn,
         "legacy-mid-run-0",
         "CONTINUED_AS_NEW",
         t0,
-        Some(t0 + Duration::seconds(10)),
+        Some(t0 + SignedDuration::from_secs(10)),
         None,
         None,
     )
@@ -588,8 +589,8 @@ async fn run_chain_legacy_middle_run_flags_head_unknown() {
         &mut conn,
         "legacy-mid-run-1",
         "CONTINUED_AS_NEW",
-        t0 + Duration::seconds(100),
-        Some(t0 + Duration::seconds(110)),
+        t0 + SignedDuration::from_secs(100),
+        Some(t0 + SignedDuration::from_secs(110)),
         None,
         None,
     )
@@ -598,7 +599,7 @@ async fn run_chain_legacy_middle_run_flags_head_unknown() {
         &mut conn,
         "legacy-mid-run-2",
         "RUNNING",
-        t0 + Duration::seconds(200),
+        t0 + SignedDuration::from_secs(200),
         None,
         None,
         None,
@@ -648,7 +649,7 @@ async fn run_chain_legacy_chain_from_tail_reconstructs_predecessors() {
     let app = build_app(&pool);
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
 
-    let t0 = Utc::now() - Duration::seconds(400);
+    let t0 = Timestamp::now() - SignedDuration::from_secs(400);
     // Legacy rows: continued_from + first_exec_id both NULL. They are seeded
     // under distinct ids to dodge the uniqueness index, then joined to a shared
     // workflow_id. A real pre-feature continue-as-new chain has that shape on disk.
@@ -657,7 +658,7 @@ async fn run_chain_legacy_chain_from_tail_reconstructs_predecessors() {
         "legacy-tail-0",
         "CONTINUED_AS_NEW",
         t0,
-        Some(t0 + Duration::seconds(10)),
+        Some(t0 + SignedDuration::from_secs(10)),
         None,
         None,
     )
@@ -666,8 +667,8 @@ async fn run_chain_legacy_chain_from_tail_reconstructs_predecessors() {
         &mut conn,
         "legacy-tail-1",
         "CONTINUED_AS_NEW",
-        t0 + Duration::seconds(100),
-        Some(t0 + Duration::seconds(110)),
+        t0 + SignedDuration::from_secs(100),
+        Some(t0 + SignedDuration::from_secs(110)),
         None,
         None,
     )
@@ -677,8 +678,8 @@ async fn run_chain_legacy_chain_from_tail_reconstructs_predecessors() {
         &mut conn,
         "legacy-tail-2",
         "COMPLETED",
-        t0 + Duration::seconds(200),
-        Some(t0 + Duration::seconds(205)),
+        t0 + SignedDuration::from_secs(200),
+        Some(t0 + SignedDuration::from_secs(205)),
         None,
         None,
     )
@@ -735,13 +736,13 @@ async fn run_chain_legacy_id_reuse_not_contaminated() {
     let app = build_app(&pool);
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
 
-    let t0 = Utc::now() - Duration::seconds(400);
+    let t0 = Timestamp::now() - SignedDuration::from_secs(400);
     let run0 = seed_run(
         &mut conn,
         "reuse-0",
         "CONTINUED_AS_NEW",
         t0,
-        Some(t0 + Duration::seconds(10)),
+        Some(t0 + SignedDuration::from_secs(10)),
         None,
         None,
     )
@@ -750,8 +751,8 @@ async fn run_chain_legacy_id_reuse_not_contaminated() {
         &mut conn,
         "reuse-1",
         "CONTINUED_AS_NEW",
-        t0 + Duration::seconds(100),
-        Some(t0 + Duration::seconds(110)),
+        t0 + SignedDuration::from_secs(100),
+        Some(t0 + SignedDuration::from_secs(110)),
         None,
         None,
     )
@@ -760,8 +761,8 @@ async fn run_chain_legacy_id_reuse_not_contaminated() {
         &mut conn,
         "reuse-2",
         "COMPLETED",
-        t0 + Duration::seconds(200),
-        Some(t0 + Duration::seconds(205)),
+        t0 + SignedDuration::from_secs(200),
+        Some(t0 + SignedDuration::from_secs(205)),
         None,
         None,
     )
@@ -777,8 +778,8 @@ async fn run_chain_legacy_id_reuse_not_contaminated() {
         &mut conn,
         "reuse-unrelated",
         "CONTINUED_AS_NEW",
-        t0 + Duration::seconds(300),
-        Some(t0 + Duration::seconds(305)),
+        t0 + SignedDuration::from_secs(300),
+        Some(t0 + SignedDuration::from_secs(305)),
         None,
         None,
     )

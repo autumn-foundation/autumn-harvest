@@ -600,13 +600,12 @@ async fn wait_for_cache(
 fn stored(row: &TaskQueueItem) -> (i32, Duration, Duration, Duration, Duration, Duration) {
     let policy: RetryPolicy =
         serde_json::from_value(row.retry_policy.clone().expect("a policy")).expect("decode");
-    let std = |d: Option<chrono::Duration>| d.expect("a value").to_std().expect("positive");
+    let std = |d: Option<jiff::SignedDuration>| std::time::Duration::try_from(d.expect("a value")).expect("positive");
     let created = row.created_at.expect("created_at");
     // The worker clock sets the deadline and the database clock sets
     // `created_at`. Round to 10 seconds, which is far below the 600 s gap
     // between the code value and the override.
-    let millis = (row.schedule_to_close_at.expect("a deadline") - created)
-        .num_milliseconds()
+    let millis = autumn_harvest::time::num_milliseconds((row.schedule_to_close_at.expect("a deadline") - created))
         .max(0)
         .unsigned_abs();
     let to_close = Duration::from_secs((millis + 5_000) / 10_000 * 10);

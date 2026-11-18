@@ -697,7 +697,7 @@ async fn deferred_cancel_keeps_an_update_result_of_the_failing_cycle() {
             update_id,
             name: "rename".into(),
             input: Value::Null,
-            timestamp: chrono::Utc::now(),
+            timestamp: jiff::Timestamp::now(),
         }],
         next_id,
     )

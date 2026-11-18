@@ -83,7 +83,7 @@ async fn a_session_checks_the_inbox_answers_a_ticket_and_waits_for_approval() {
     let (_dir, desk) = fresh();
     let config = MeshConfig::default();
     let live = Arc::new(Recorder::default());
-    let t0: DateTime<Utc> = Utc::now();
+    let t0: Timestamp = Timestamp::now();
 
     // Start the mesh, then let the heartbeat of the triage agent fire.
     let mut rt = runtime(&desk, &config, &live);
@@ -154,7 +154,7 @@ async fn a_rejected_reply_is_never_filed() {
     let (_dir, desk) = fresh();
     let config = MeshConfig::default();
     let live = Arc::new(Recorder::default());
-    let t0 = Utc::now();
+    let t0 = Timestamp::now();
     let mut rt = runtime(&desk, &config, &live);
     mesh::start(&mut rt, t0).await.unwrap();
     let ticket = desk.ticket("T-2").unwrap().unwrap();
@@ -192,7 +192,7 @@ async fn a_spent_budget_parks_the_mesh_until_the_next_day() {
         ..MeshConfig::default()
     };
     let live = Arc::new(Recorder::default());
-    let t0: DateTime<Utc> = "2026-10-23T08:00:00Z".parse().unwrap();
+    let t0: Timestamp = "2026-10-23T08:00:00Z".parse().unwrap();
     let mut rt = runtime(&desk, &config, &live);
     mesh::start(&mut rt, t0).await.unwrap();
     let mut t1 = t0;
@@ -216,7 +216,7 @@ async fn a_spent_budget_parks_the_mesh_until_the_next_day() {
     assert!(spent.tokens <= u64::from(TOKENS_PER_CALL) * 7, "{spent:?}");
 
     // The next day opens the budget. The held message runs then.
-    let t2: DateTime<Utc> = "2026-10-24T00:01:00Z".parse().unwrap();
+    let t2: Timestamp = "2026-10-24T00:01:00Z".parse().unwrap();
     let settled = mesh::settle(&mut rt, t2).await.unwrap();
     assert!(
         settled.approval.is_some(),

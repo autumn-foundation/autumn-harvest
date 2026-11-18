@@ -24,7 +24,7 @@ use autumn_harvest::backup_verify::{
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::testing::WorkflowReplayer;
 use autumn_harvest::types::{ExecutionId, ShardId};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use diesel_async::SimpleAsyncConnection;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde_json::json;
@@ -1532,7 +1532,7 @@ async fn a_replayed_workflow_failure_is_not_counted_clean() {
         exec,
         1,
         "WorkflowStarted",
-        json!({ "input": {}, "timestamp": chrono::Utc::now().to_rfc3339() }),
+        json!({ "input": {}, "timestamp": autumn_harvest::time::rfc3339(jiff::Timestamp::now()) }),
     )
     .await;
 
@@ -1583,7 +1583,7 @@ async fn a_replayed_workflow_that_succeeds_is_still_clean() {
         exec,
         1,
         "WorkflowStarted",
-        json!({ "input": {}, "timestamp": chrono::Utc::now().to_rfc3339() }),
+        json!({ "input": {}, "timestamp": autumn_harvest::time::rfc3339(jiff::Timestamp::now()) }),
     )
     .await;
 
@@ -2363,7 +2363,7 @@ async fn seed_completion_trigger_fire(
     conn: &mut AsyncPgConnection,
     source_exec_id: ExecutionId,
     trigger_id: Uuid,
-    fired_at: DateTime<Utc>,
+    fired_at: Timestamp,
     outcome: Option<&str>,
 ) {
     diesel::sql_query(
@@ -2387,7 +2387,7 @@ async fn seed_completion_trigger_fire_with_target(
     conn: &mut AsyncPgConnection,
     source_exec_id: ExecutionId,
     trigger_id: Uuid,
-    fired_at: DateTime<Utc>,
+    fired_at: Timestamp,
     target_shard: i32,
     target_workflow_name: &str,
 ) {
@@ -2440,7 +2440,7 @@ async fn append_event_at(
     event_id: i32,
     event_type: &str,
     data: serde_json::Value,
-    timestamp: DateTime<Utc>,
+    timestamp: Timestamp,
 ) {
     let payload = json!({ "type": event_type, "data": data });
     diesel::sql_query(
@@ -2504,7 +2504,7 @@ async fn detects_a_lost_cross_shard_completion_trigger_fire() {
     let mut b = connect(&url_b).await;
 
     let (source, trigger_id, _target_id) = find_fire_targeting("child_flow", 1);
-    let fired_at = Utc::now() - chrono::Duration::hours(1);
+    let fired_at = Timestamp::now() - jiff::SignedDuration::from_hours(1);
 
     seed_execution(&mut a, source, "parent_flow", "ct-lost-1", "COMPLETED", 0).await;
     seed_completion_trigger(&mut a, trigger_id, "parent_flow", "child_flow").await;
@@ -2520,7 +2520,7 @@ async fn detects_a_lost_cross_shard_completion_trigger_fire() {
         1,
         "WorkflowStarted",
         json!({ "input": {} }),
-        fired_at - chrono::Duration::hours(1),
+        fired_at - jiff::SignedDuration::from_hours(1),
     )
     .await;
 
@@ -2551,7 +2551,7 @@ async fn a_fire_still_pending_relay_is_not_probed() {
     let mut b = connect(&url_b).await;
 
     let (source, trigger_id, target_id) = find_fire_targeting("child_flow", 1);
-    let fired_at = Utc::now() - chrono::Duration::hours(1);
+    let fired_at = Timestamp::now() - jiff::SignedDuration::from_hours(1);
 
     seed_execution(
         &mut a,
@@ -2579,7 +2579,7 @@ async fn a_fire_still_pending_relay_is_not_probed() {
         1,
         "WorkflowStarted",
         json!({ "input": {} }),
-        fired_at - chrono::Duration::hours(1),
+        fired_at - jiff::SignedDuration::from_hours(1),
     )
     .await;
 
@@ -2611,7 +2611,7 @@ async fn an_absent_completion_trigger_target_past_the_fire_is_unproven() {
     let mut b = connect(&url_b).await;
 
     let (source, trigger_id, _target_id) = find_fire_targeting("child_flow", 1);
-    let fired_at = Utc::now() - chrono::Duration::hours(1);
+    let fired_at = Timestamp::now() - jiff::SignedDuration::from_hours(1);
 
     seed_execution(
         &mut a,
@@ -2635,7 +2635,7 @@ async fn an_absent_completion_trigger_target_past_the_fire_is_unproven() {
         1,
         "WorkflowStarted",
         json!({ "input": {} }),
-        fired_at + chrono::Duration::minutes(30),
+        fired_at + jiff::SignedDuration::from_mins(30),
     )
     .await;
 
@@ -2666,7 +2666,7 @@ async fn a_delivered_completion_trigger_fire_stays_silent() {
     let mut b = connect(&url_b).await;
 
     let (source, trigger_id, target_id) = find_fire_targeting("child_flow", 1);
-    let fired_at = Utc::now() - chrono::Duration::hours(1);
+    let fired_at = Timestamp::now() - jiff::SignedDuration::from_hours(1);
 
     seed_execution(&mut a, source, "parent_flow", "ct-ok-1", "COMPLETED", 0).await;
     seed_completion_trigger(&mut a, trigger_id, "parent_flow", "child_flow").await;
@@ -2702,7 +2702,7 @@ async fn a_batch_of_fires_on_one_shard_adjudicates_each_independently() {
     let mut a = connect(&url_a).await;
     let mut b = connect(&url_b).await;
 
-    let fired_at = Utc::now() - chrono::Duration::hours(1);
+    let fired_at = Timestamp::now() - jiff::SignedDuration::from_hours(1);
 
     let (delivered_source, delivered_trigger, delivered_target_id) =
         find_fire_targeting("child_flow", 1);
@@ -2749,7 +2749,7 @@ async fn a_batch_of_fires_on_one_shard_adjudicates_each_independently() {
         1,
         "WorkflowStarted",
         json!({ "input": {} }),
-        fired_at - chrono::Duration::hours(1),
+        fired_at - jiff::SignedDuration::from_hours(1),
     )
     .await;
 
@@ -2783,7 +2783,7 @@ async fn an_absent_completion_trigger_target_with_a_summary_stays_silent() {
     let mut b = connect(&url_b).await;
 
     let (source, trigger_id, target_id) = find_fire_targeting("child_flow", 1);
-    let fired_at = Utc::now() - chrono::Duration::hours(1);
+    let fired_at = Timestamp::now() - jiff::SignedDuration::from_hours(1);
 
     seed_execution(
         &mut a,
@@ -2805,7 +2805,7 @@ async fn an_absent_completion_trigger_target_with_a_summary_stays_silent() {
         1,
         "WorkflowStarted",
         json!({ "input": {} }),
-        fired_at - chrono::Duration::hours(1),
+        fired_at - jiff::SignedDuration::from_hours(1),
     )
     .await;
     exec_sql(
@@ -2846,7 +2846,7 @@ async fn a_same_shard_completion_trigger_fire_with_a_live_target_is_clean() {
     let mut a = connect(&url_a).await;
 
     let (source, trigger_id, target_id) = find_fire_targeting("child_flow", 0);
-    let fired_at = Utc::now() - chrono::Duration::hours(1);
+    let fired_at = Timestamp::now() - jiff::SignedDuration::from_hours(1);
 
     seed_execution(&mut a, source, "parent_flow", "ct-same-1", "COMPLETED", 0).await;
     seed_completion_trigger(&mut a, trigger_id, "parent_flow", "child_flow").await;
@@ -2889,7 +2889,7 @@ async fn a_same_shard_fire_whose_target_migrated_away_is_unproven() {
     let mut a = connect(&url_a).await;
 
     let (source, trigger_id, target_id) = find_fire_targeting("child_flow", 0);
-    let fired_at = Utc::now() - chrono::Duration::hours(1);
+    let fired_at = Timestamp::now() - jiff::SignedDuration::from_hours(1);
 
     seed_execution(
         &mut a,
@@ -2944,7 +2944,7 @@ async fn a_reconstructed_pre_migration_same_shard_pick_is_unproven() {
     let mut a = connect(&url_a).await;
 
     let (source, trigger_id, _target_id) = find_fire_targeting("child_flow", 0);
-    let fired_at = Utc::now() - chrono::Duration::hours(1);
+    let fired_at = Timestamp::now() - jiff::SignedDuration::from_hours(1);
 
     seed_execution(&mut a, source, "parent_flow", "ct-same-2", "COMPLETED", 0).await;
     seed_completion_trigger(&mut a, trigger_id, "parent_flow", "child_flow").await;
@@ -2991,7 +2991,7 @@ async fn missing_trigger_definitions_are_reported_with_a_bounded_sample() {
         .await;
         // No `seed_completion_trigger` row for this `trigger_id`: the join
         // that would supply `trigger_target_workflow_name` finds nothing.
-        seed_completion_trigger_fire(&mut a, source, trigger_id, Utc::now(), None).await;
+        seed_completion_trigger_fire(&mut a, source, trigger_id, Timestamp::now(), None).await;
     }
 
     let report = verify_restore(&one_shard(&url_a), &opts(), &WorkflowReplayer::new()).await;
@@ -3039,7 +3039,7 @@ async fn a_persisted_target_shard_from_a_historical_drain_is_honored() {
     let mut b = connect(&url_b).await;
 
     let (source, trigger_id, _target_id) = find_fire_targeting("child_flow", 0);
-    let fired_at = Utc::now() - chrono::Duration::hours(1);
+    let fired_at = Timestamp::now() - jiff::SignedDuration::from_hours(1);
 
     seed_execution(&mut a, source, "parent_flow", "ct-drain-1", "COMPLETED", 0).await;
     seed_completion_trigger(&mut a, trigger_id, "parent_flow", "child_flow").await;
@@ -3054,7 +3054,7 @@ async fn a_persisted_target_shard_from_a_historical_drain_is_honored() {
         1,
         "WorkflowStarted",
         json!({ "input": {} }),
-        fired_at - chrono::Duration::hours(1),
+        fired_at - jiff::SignedDuration::from_hours(1),
     )
     .await;
 
@@ -3085,7 +3085,7 @@ async fn a_persisted_target_name_survives_a_later_trigger_update() {
     let mut b = connect(&url_b).await;
 
     let (source, trigger_id, target_id) = find_fire_targeting("child_flow_v1", 1);
-    let fired_at = Utc::now() - chrono::Duration::hours(1);
+    let fired_at = Timestamp::now() - jiff::SignedDuration::from_hours(1);
 
     seed_execution(&mut a, source, "parent_flow", "ct-rename-1", "COMPLETED", 0).await;
     // The trigger definition has since been updated to a new target name.
@@ -3126,7 +3126,7 @@ async fn a_resolved_completion_trigger_fire_is_not_probed() {
     let mut a = connect(&url_a).await;
 
     let (source, trigger_id, _target_id) = find_fire_targeting("child_flow", 1);
-    let fired_at = Utc::now() - chrono::Duration::hours(1);
+    let fired_at = Timestamp::now() - jiff::SignedDuration::from_hours(1);
 
     seed_execution(&mut a, source, "parent_flow", "ct-skip-1", "COMPLETED", 0).await;
     seed_completion_trigger(&mut a, trigger_id, "parent_flow", "child_flow").await;
@@ -3165,7 +3165,7 @@ async fn a_payload_too_large_completion_trigger_fire_is_not_probed() {
     let mut a = connect(&url_a).await;
 
     let (source, trigger_id, _target_id) = find_fire_targeting("child_flow", 1);
-    let fired_at = Utc::now() - chrono::Duration::hours(1);
+    let fired_at = Timestamp::now() - jiff::SignedDuration::from_hours(1);
 
     seed_execution(
         &mut a,

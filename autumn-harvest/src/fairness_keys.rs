@@ -15,7 +15,8 @@
 //! Each shard keeps its own weights. These functions write the shard of the
 //! connection that you pass. The admin HTTP routes write every shard.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 
 use crate::error::{HarvestError, HarvestResult};
@@ -36,7 +37,7 @@ pub struct FairnessWeight {
     /// Who set the override.
     pub updated_by: String,
     /// When the override was set.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 /// The claim state of one key, for operators.
@@ -53,7 +54,7 @@ pub struct FairnessKeyState {
     /// `max(pass, V) - V`. The claim serves keys with a smaller lag first.
     pub lag: f64,
     /// When a claim or prune last wrote the row.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 #[derive(diesel::QueryableByName)]
@@ -67,7 +68,8 @@ struct WeightRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     updated_by: String,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    updated_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    updated_at: Timestamp,
 }
 
 impl From<WeightRow> for FairnessWeight {
@@ -220,7 +222,8 @@ pub async fn list_fairness_state(
         #[diesel(sql_type = diesel::sql_types::Double)]
         lag: f64,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        updated_at: DateTime<Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        updated_at: Timestamp,
     }
     let rows: Vec<Row> = diesel::sql_query(
         "SELECT s.queue_name, s.fairness_key, s.pass, s.last_start, \
@@ -281,7 +284,7 @@ pub const MAX_PRUNE_BATCHES: usize = 10;
 pub async fn prune_fairness_state(
     conn: &mut AsyncPgConnection,
     queue_name: Option<&str>,
-    cutoff: DateTime<Utc>,
+    cutoff: Timestamp,
     batch_size: usize,
     preview: bool,
 ) -> HarvestResult<u64> {
@@ -397,7 +400,7 @@ async fn delete_prune_batches(
     state: &str,
     active: &str,
     queue_name: Option<&str>,
-    cutoff: DateTime<Utc>,
+    cutoff: Timestamp,
     batch: i64,
 ) -> Result<u64, diesel::result::Error> {
     #[derive(diesel::QueryableByName)]
@@ -418,7 +421,7 @@ async fn delete_prune_batches(
     let mut total = 0u64;
     for _ in 0..MAX_PRUNE_BATCHES {
         let count: Count = diesel::sql_query(&sql)
-            .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
+            .bind::<diesel::sql_types::Timestamptz, _>(cutoff.to_diesel())
             .bind::<diesel::sql_types::BigInt, _>(batch)
             .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(queue_name)
             .get_result(conn)

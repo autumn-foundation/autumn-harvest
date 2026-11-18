@@ -9,6 +9,7 @@
 #![allow(clippy::too_many_lines)]
 
 use std::sync::Arc;
+use jiff_diesel::ToDiesel;
 
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
 use autumn_harvest::schema::{harvest_events, harvest_workflow_executions};
@@ -26,7 +27,7 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::Utc;
+use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
@@ -220,7 +221,7 @@ async fn mark_completed(conn: &mut AsyncPgConnection, exec_id: ExecutionId, outp
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             harvest_workflow_executions::output.eq(Some(output)),
         ))
         .execute(conn)
@@ -233,7 +234,7 @@ async fn mark_ended(conn: &mut AsyncPgConnection, exec_id: ExecutionId, state: &
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq(state),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             harvest_workflow_executions::error.eq(Some(error)),
         ))
         .execute(conn)
@@ -259,7 +260,7 @@ async fn mark_continued_as_new(
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
         ))
         .execute(conn)
         .await
@@ -380,7 +381,7 @@ async fn test_get_update_result_orphaned() {
         update_id,
         name: "test_update".to_string(),
         input: Value::Null,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
     }];
     store::append_events(&mut conn, exec_id, &events, history.next_event_id)
         .await
@@ -434,7 +435,7 @@ async fn test_poll_update_result_orphaned() {
         update_id,
         name: "test_update".to_string(),
         input: Value::Null,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
     }];
     store::append_events(&mut conn, exec_id, &events, history.next_event_id)
         .await
@@ -485,7 +486,7 @@ async fn test_get_update_result_orphaned_timed_out() {
         update_id,
         name: "test_update".to_string(),
         input: Value::Null,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
     }];
     store::append_events(&mut conn, exec_id, &events, history.next_event_id)
         .await
@@ -495,7 +496,7 @@ async fn test_get_update_result_orphaned_timed_out() {
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("TIMED_OUT"),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             harvest_workflow_executions::error.eq(Some(
                 "timeout: workflow exceeded execution timeout".to_string(),
             )),

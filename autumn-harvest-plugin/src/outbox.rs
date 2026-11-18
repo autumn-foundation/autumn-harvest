@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use autumn_web::AppState;
 use autumn_web::error::AutumnError;
-use chrono::NaiveDateTime;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use serde::{Deserialize, Serialize};
@@ -68,11 +67,15 @@ struct HarvestWorkflowOutboxRow {
     delivery_attempts: i64,
     last_error: Option<String>,
     delivered_execution_id: Option<String>,
-    delivered_at: Option<NaiveDateTime>,
-    next_attempt_at: NaiveDateTime,
-    claimed_at: Option<NaiveDateTime>,
+    #[diesel(deserialize_as = jiff_diesel::NullableDateTime)]
+    delivered_at: Option<jiff::civil::DateTime>,
+    #[diesel(deserialize_as = jiff_diesel::DateTime)]
+    next_attempt_at: jiff::civil::DateTime,
+    #[diesel(deserialize_as = jiff_diesel::NullableDateTime)]
+    claimed_at: Option<jiff::civil::DateTime>,
     claimed_by: Option<String>,
-    created_at: NaiveDateTime,
+    #[diesel(deserialize_as = jiff_diesel::DateTime)]
+    created_at: jiff::civil::DateTime,
 }
 
 #[derive(diesel::Insertable)]
@@ -616,11 +619,11 @@ pub(crate) async fn dispatch_workflow_start_request(
     let max_workflow_attempts_ceiling = registry_ext
         .as_ref()
         .and_then(|registry| registry.max_workflow_attempts_ceiling);
-    let sla = info_sla.and_then(|d| chrono::Duration::from_std(d).ok());
+    let sla = info_sla.and_then(|d| jiff::SignedDuration::try_from(d).ok());
     // The start clamps the timeout to the fleet ceiling, and the SLA to the
     // timeout, as on the API start path.
     let to_chrono =
-        |d: std::time::Duration| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX);
+        |d: std::time::Duration| jiff::SignedDuration::try_from(d).unwrap_or(jiff::SignedDuration::MAX);
     let execution_timeout = info_execution_timeout.map(to_chrono);
     let max_execution_timeout_ceiling = registry_ext
         .as_ref()
@@ -629,7 +632,7 @@ pub(crate) async fn dispatch_workflow_start_request(
     // Issue #2406: an outbox start begins a new chain. It takes the chain cap
     // of the type, the operator override and the fleet chain ceiling, as the
     // API start does.
-    let to_chrono_opt = |d: std::time::Duration| chrono::Duration::from_std(d).ok();
+    let to_chrono_opt = |d: std::time::Duration| jiff::SignedDuration::try_from(d).ok();
     let chain_execution_timeout = registry_ext
         .as_ref()
         .and_then(|registry| registry.chain_execution_timeout(&request.workflow_name))
@@ -885,8 +888,7 @@ pub(crate) fn retry_delay_for_attempts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
-
+    
     /// `outbox_mark_flush_remaining` picks the soonest of its three
     /// candidate deadlines (issue #1620). The fixed bound, the earliest
     /// failed-row deadline, and the claim deadline -- the last one only
@@ -1031,10 +1033,10 @@ mod tests {
             last_error: None,
             delivered_execution_id: None,
             delivered_at: None,
-            next_attempt_at: Utc::now().naive_utc(),
+            next_attempt_at: autumn_harvest::time::utc_datetime(jiff::Timestamp::now()),
             claimed_at: None,
             claimed_by: None,
-            created_at: Utc::now().naive_utc(),
+            created_at: autumn_harvest::time::utc_datetime(jiff::Timestamp::now()),
         };
 
         assert_eq!(retry_delay_ms(&config, &row), 10_000);
@@ -1214,7 +1216,8 @@ mod tests {
             #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
             last_error: Option<String>,
             #[diesel(sql_type = diesel::sql_types::Timestamp)]
-            next_attempt_at: chrono::NaiveDateTime,
+            #[diesel(deserialize_as = jiff_diesel::DateTime)]
+            next_attempt_at: jiff::civil::DateTime,
         }
 
         let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") else {

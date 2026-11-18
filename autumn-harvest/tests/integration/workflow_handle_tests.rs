@@ -1,6 +1,7 @@
 //! `WorkflowHandle` request/response embedding tests.
 
 use std::time::Duration;
+use jiff_diesel::ToDiesel;
 
 use autumn_harvest::error::{HarvestError, TimeoutType};
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
@@ -166,7 +167,7 @@ async fn mark_completed(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
             .set((
                 dsl::state.eq("COMPLETED"),
                 dsl::output.eq(Some(output)),
-                dsl::completed_at.eq(Some(chrono::Utc::now())),
+                dsl::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
             ))
             .execute(conn)
             .await

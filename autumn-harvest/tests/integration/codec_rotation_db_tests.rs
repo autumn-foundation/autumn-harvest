@@ -73,6 +73,7 @@
 //! because the rotation census is shard-wide by design.
 
 use std::sync::{Arc, Mutex};
+use jiff_diesel::ToDiesel;
 use std::time::Duration;
 
 use autumn_harvest::aead_codec::{AeadCodec, DataKey};
@@ -96,7 +97,7 @@ use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics};
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest::types::{ExecutionId, ShardId};
 
-use chrono::Utc;
+use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use serde_json::{Value, json};
@@ -290,7 +291,7 @@ async fn append_under_key(
 fn started(input: Value) -> WorkflowEvent {
     WorkflowEvent::WorkflowStarted {
         input,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -1030,7 +1031,7 @@ async fn continue_as_new_decodes_the_carried_codec_envelope_before_reencoding_it
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: json!({}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: Some(secret_output.clone()),
             last_error: None,
             scheduled_time: None,
@@ -1043,7 +1044,7 @@ async fn continue_as_new_decodes_the_carried_codec_envelope_before_reencoding_it
 
     let mut enqueue = EnqueueParams::new("default", TaskType::Workflow, json!({}));
     enqueue.workflow_exec_id = Some(exec_id.as_uuid());
-    enqueue.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    enqueue.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     queue::enqueue(&mut conn, &enqueue)
         .await
         .expect("enqueue task");
@@ -1054,7 +1055,7 @@ async fn continue_as_new_decodes_the_carried_codec_envelope_before_reencoding_it
     .set((
         harvest_task_queue::state.eq("RUNNING"),
         harvest_task_queue::worker_id.eq(Some("worker-a")),
-        harvest_task_queue::started_at.eq(Some(Utc::now())),
+        harvest_task_queue::started_at.eq(Some(Timestamp::now()).to_diesel()),
     ))
     .execute(&mut conn)
     .await
@@ -3648,7 +3649,7 @@ async fn a_fresh_pass_under_a_different_key_arms_its_own_deadline() {
         .next_revalidation_at
         .expect("a completed pass must have an armed deadline");
     assert!(
-        deadline > Utc::now(),
+        deadline > Timestamp::now(),
         "a fresh pass under a different key must arm its own deadline, not \
          inherit the previous key's stale one; got {deadline:?}"
     );

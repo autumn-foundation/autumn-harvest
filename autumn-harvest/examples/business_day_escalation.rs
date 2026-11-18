@@ -10,13 +10,13 @@
 //! reimplementing weekend/holiday arithmetic in every workflow:
 //!
 //! ```rust,ignore
-//! // Foot-guns: reaching for Utc::now() breaks replay (HVG001); re-reading the
+//! // Foot-guns: reaching for Timestamp::now() breaks replay (HVG001); re-reading the
 //! // calendar on replay lets an operator's holiday edit silently move an
 //! // already-armed deadline.
-//! let mut d = chrono::Utc::now();
+//! let mut d = jiff::Timestamp::now();
 //! let mut left = 2;
-//! while left > 0 { d = d + chrono::Duration::days(1); if is_business(d) { left -= 1; } }
-//! ctx.timer("escalate", (d - chrono::Utc::now()).num_seconds() as u64).await?;
+//! while left > 0 { d = d + autumn_harvest::time::days(1); if is_business(d) { left -= 1; } }
+//! ctx.timer("escalate", (d - jiff::Timestamp::now()).as_secs() as u64).await?;
 //! ```
 //!
 //! ## The solution: `ctx.timer_business_days(id, n, calendar)`
@@ -64,7 +64,7 @@
 
 use autumn_harvest::calendar::BusinessCalendars;
 use autumn_harvest::prelude::*;
-use chrono::NaiveDate;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,7 +86,7 @@ async fn ticket_sla(ctx: &WorkflowContext, ticket: Ticket) -> Result<String, Str
     Ok(format!(
         "ticket {} escalated at {}",
         ticket.id,
-        deadline.to_rfc3339()
+        autumn_harvest::time::rfc3339(deadline)
     ))
 }
 
@@ -106,12 +106,12 @@ async fn two_stage_escalation(ctx: &WorkflowContext, ticket: Ticket) -> Result<S
     Ok(format!(
         "ticket {} escalated to management at {}",
         ticket.id,
-        final_deadline.to_rfc3339()
+        autumn_harvest::time::rfc3339(final_deadline)
     ))
 }
 
-fn holiday(y: i32, m: u32, d: u32) -> NaiveDate {
-    NaiveDate::from_ymd_opt(y, m, d).expect("valid date")
+fn holiday(y: i32, m: u32, d: u32) -> jiff::civil::Date {
+    autumn_harvest::time::date_ymd(y, m, d).expect("valid date")
 }
 
 /// The calendar an embedder would register on `HarvestBuilder::state(..)`.
@@ -153,7 +153,7 @@ mod tests {
     use super::*;
     use autumn_harvest::event::WorkflowEvent;
     use autumn_harvest::testing::WorkflowTestEnv;
-    use chrono::{DateTime, Datelike, Duration, TimeZone, Utc, Weekday};
+    use jiff::Timestamp;
     use serde_json::json;
 
     fn ticket(n: u32) -> Ticket {
@@ -164,8 +164,8 @@ mod tests {
     }
 
     /// Anchor on a Thursday so a 2-business-day SLA must cross the weekend.
-    fn thursday() -> DateTime<Utc> {
-        let anchor = Utc.with_ymd_and_hms(2026, 7, 9, 9, 0, 0).single().unwrap();
+    fn thursday() -> Timestamp {
+        let anchor = autumn_harvest::time::utc_ymd_hms(2026, 7, 9, 9, 0, 0).unwrap();
         assert_eq!(anchor.weekday(), Weekday::Thu, "fixture must be a Thursday");
         anchor
     }
@@ -183,20 +183,20 @@ mod tests {
         assert!(outcome.result.is_ok(), "run failed: {:?}", outcome.result);
 
         // Thu 2026-07-09 + 2 business days = Mon 2026-07-13.
-        let expected = Utc.with_ymd_and_hms(2026, 7, 13, 9, 0, 0).single().unwrap();
+        let expected = autumn_harvest::time::utc_ymd_hms(2026, 7, 13, 9, 0, 0).unwrap();
         assert_eq!(expected.weekday(), Weekday::Mon);
 
         let out = outcome.result.as_ref().unwrap().to_string();
         assert!(
-            out.contains(&expected.to_rfc3339()),
+            out.contains(&autumn_harvest::time::rfc3339(expected)),
             "expected the Monday deadline {expected} in {out}"
         );
 
         // A naive calendar-day wait would have landed on Saturday.
-        let naive = thursday() + Duration::days(2);
+        let naive = thursday() + autumn_harvest::time::days(2);
         assert_eq!(naive.weekday(), Weekday::Sat);
         assert!(
-            !out.contains(&naive.to_rfc3339()),
+            !out.contains(&autumn_harvest::time::rfc3339(naive)),
             "must NOT resolve to the naive calendar-day answer {naive}"
         );
     }
@@ -206,7 +206,7 @@ mod tests {
     /// 07-03 (holiday) and Sat/Sun, landing Tue 07-07.
     #[tokio::test]
     async fn holidays_are_skipped_as_well_as_weekends() {
-        let anchor = Utc.with_ymd_and_hms(2026, 7, 2, 9, 0, 0).single().unwrap();
+        let anchor = autumn_harvest::time::utc_ymd_hms(2026, 7, 2, 9, 0, 0).unwrap();
         assert_eq!(anchor.weekday(), Weekday::Thu);
 
         let outcome = WorkflowTestEnv::new()
@@ -218,10 +218,10 @@ mod tests {
 
         // Fri 07-03 is a holiday, Sat/Sun are weekends → Mon 07-06 is the 1st
         // business day, Tue 07-07 the 2nd.
-        let expected = Utc.with_ymd_and_hms(2026, 7, 7, 9, 0, 0).single().unwrap();
+        let expected = autumn_harvest::time::utc_ymd_hms(2026, 7, 7, 9, 0, 0).unwrap();
         let out = outcome.result.as_ref().unwrap().to_string();
         assert!(
-            out.contains(&expected.to_rfc3339()),
+            out.contains(&autumn_harvest::time::rfc3339(expected)),
             "expected the post-holiday deadline {expected} in {out}"
         );
     }
@@ -268,19 +268,19 @@ mod tests {
             })
             .collect();
         assert_eq!(frozen.len(), 2, "one freeze per business-day wait");
-        let a0: DateTime<Utc> = serde_json::from_value(frozen[0]["anchor"].clone()).unwrap();
-        let d0: DateTime<Utc> = serde_json::from_value(frozen[0]["deadline"].clone()).unwrap();
-        let a1: DateTime<Utc> = serde_json::from_value(frozen[1]["anchor"].clone()).unwrap();
-        let d1: DateTime<Utc> = serde_json::from_value(frozen[1]["deadline"].clone()).unwrap();
+        let a0: Timestamp = serde_json::from_value(frozen[0]["anchor"].clone()).unwrap();
+        let d0: Timestamp = serde_json::from_value(frozen[0]["deadline"].clone()).unwrap();
+        let a1: Timestamp = serde_json::from_value(frozen[1]["anchor"].clone()).unwrap();
+        let d1: Timestamp = serde_json::from_value(frozen[1]["deadline"].clone()).unwrap();
         assert_eq!(a0, thursday(), "first wait anchors at the frozen start");
         assert_eq!(
-            d0.to_rfc3339(),
+            autumn_harvest::time::rfc3339(d0),
             "2026-07-10T09:00:00+00:00",
             "1 business day from Thursday is Friday"
         );
         assert_eq!(a1, d0, "the second window anchors where the first resolved");
         assert_eq!(
-            d1.to_rfc3339(),
+            autumn_harvest::time::rfc3339(d1),
             "2026-07-14T09:00:00+00:00",
             "2 business days from Friday steps over the weekend to Tuesday — \
              re-anchoring at Thursday instead would give Mon 07-13"
@@ -322,7 +322,7 @@ mod tests {
         //     frozen deadline's own date. A recompute would move the deadline
         //     and diverge from the recorded `TimerStarted`; the frozen record
         //     must win instead.
-        let frozen_deadline: DateTime<Utc> = outcome
+        let frozen_deadline: Timestamp = outcome
             .events()
             .iter()
             .find_map(|e| match e {
@@ -333,7 +333,7 @@ mod tests {
             })
             .expect("a business-day freeze must be recorded");
         let hostile = BusinessCalendars::new()
-            .with_calendar("us-support", vec![frozen_deadline.date_naive()]);
+            .with_calendar("us-support", vec![autumn_harvest::time::utc_date(frozen_deadline)]);
         let hostile_report = autumn_harvest::testing::WorkflowReplayer::new()
             .with_state(hostile)
             .register_fn("ticket_sla", ticket_sla_info().handler)

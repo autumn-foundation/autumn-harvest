@@ -1,6 +1,7 @@
 #![cfg(feature = "db")]
 
 use autumn_harvest::event::WorkflowEvent;
+use jiff_diesel::ToDiesel;
 use autumn_harvest::models::{TaskQueueItem, WorkflowExecution};
 use autumn_harvest::queue::{EnqueueParams, TaskType};
 use autumn_harvest::schema::{harvest_task_queue, harvest_workflow_executions};
@@ -426,7 +427,7 @@ async fn signal_insert_waits_for_concurrent_cancellation_lock() {
         .set((
             harvest_workflow_executions::state.eq("CANCELLED"),
             harvest_workflow_executions::error.eq(Some("racing cancel")),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut locker)
         .await

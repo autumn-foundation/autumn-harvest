@@ -15,6 +15,7 @@ path = "src/main.rs"
 autumn-harvest = { version = "0.10.0", path = "../../autumn-harvest", default-features = false }
 autumn-harvest-sqlite = { version = "0.10.0", path = "../../autumn-harvest-sqlite" }
 chrono = { workspace = true }
+jiff = { workspace = true }
 # `no_time` removes `timestamp()`, so a script body cannot read the clock.
 # `serde` converts script values to and from the JSON that history stores.
 rhai = { version = "1.27.0", default-features = false, features = ["std", "no_time", "serde"] }

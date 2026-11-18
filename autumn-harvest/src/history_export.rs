@@ -3,17 +3,17 @@
 use crate::event::WorkflowEvent;
 use crate::payload_codec::{LossyDecodeOutcome, PayloadCodecs};
 use crate::types::ExecutionId;
-use chrono::{DateTime, Utc};
+use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::str::FromStr;
 
-/// Serde adapter for `Option<chrono::Duration>` as `Option<i64>` milliseconds
+/// Serde adapter for `Option<jiff::SignedDuration>` as `Option<i64>` milliseconds
 /// (issue #772).
 ///
-/// `chrono::Duration` (`TimeDelta`) has no serde impl. So `execution_timeout`
+/// `jiff::SignedDuration` (`SignedDuration`) has no serde impl. So `execution_timeout`
 /// in [`HistoryExportDocument`] and `testing::HistorySnapshot` is serialised as
 /// integer milliseconds. That is lossless for the `INTERVAL`-backed column, and
 /// it matches the millisecond granularity of the deadline probe. Both structs
@@ -26,7 +26,7 @@ pub(crate) mod opt_duration_millis {
     // usable here.
     #[allow(clippy::ref_option)]
     pub fn serialize<S: Serializer>(
-        value: &Option<chrono::Duration>,
+        value: &Option<jiff::SignedDuration>,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         value
@@ -37,7 +37,7 @@ pub(crate) mod opt_duration_millis {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
-    ) -> Result<Option<chrono::Duration>, D::Error> {
+    ) -> Result<Option<jiff::SignedDuration>, D::Error> {
         let millis: Option<i64> = Option::deserialize(deserializer)?;
         Ok(millis.map(chrono::Duration::milliseconds))
     }
@@ -167,7 +167,7 @@ pub struct HistoryExportDocument {
     /// Shard that owns the execution.
     pub shard_id: i32,
     /// Wall-clock time when the export document was produced.
-    pub exported_at: DateTime<Utc>,
+    pub exported_at: Timestamp,
     /// Number of history events in `events`.
     pub event_count: usize,
     /// Terminal or in-flight status metadata.
@@ -198,14 +198,14 @@ pub struct HistoryExportDocument {
         skip_serializing_if = "Option::is_none",
         with = "opt_duration_millis"
     )]
-    pub execution_timeout: Option<chrono::Duration>,
+    pub execution_timeout: Option<jiff::SignedDuration>,
     /// The execution's live (pause/resume/redrive-shifted) absolute `deadline_at`
     /// (issue #772). The JSON replay path computes the deadline from it, as the
     /// timeout scanner does, not from the nominal `start + execution_timeout`.
     /// `None` when no absolute deadline was recorded, or a legacy export.
     /// Non-payload operational metadata — never redacted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deadline_at: Option<DateTime<Utc>>,
+    pub deadline_at: Option<Timestamp>,
     /// The spawning parent's execution id (issue #698), sourced from the
     /// `harvest_workflow_executions.parent_id` column.
     ///
@@ -259,7 +259,7 @@ pub struct HistoryExportRequest {
     /// Ordered event history.
     pub events: Vec<WorkflowEvent>,
     /// Wall-clock time to stamp on the export.
-    pub exported_at: DateTime<Utc>,
+    pub exported_at: Timestamp,
     /// Payload emission policy.
     pub payload_policy: HistoryPayloadPolicy,
     /// Optional serialized byte limit. Defaults to
@@ -273,10 +273,10 @@ pub struct HistoryExportRequest {
     /// export so the JSON / `harvest-replay` replay path threads the
     /// deadline-aware continue-as-new budget. `None` for a workflow with no
     /// execution timeout.
-    pub execution_timeout: Option<chrono::Duration>,
+    pub execution_timeout: Option<jiff::SignedDuration>,
     /// The execution's live (pause/resume/redrive-shifted) absolute `deadline_at`
     /// (issue #772). `None` when no absolute deadline was recorded.
-    pub deadline_at: Option<DateTime<Utc>>,
+    pub deadline_at: Option<Timestamp>,
     /// The spawning parent's execution id (issue #698), from the execution
     /// row's `parent_id` column. The JSON and `harvest-replay` replay path
     /// threads it into the replayed `WorkflowContext`. `None` for a top-level
@@ -1266,7 +1266,7 @@ impl MermaidExporter {
 mod tests {
     use super::*;
     use crate::types::ActivityExecId;
-    use chrono::Utc;
+    use jiff::{SignedDuration, Timestamp};
 
     #[test]
     fn test_export_mermaid_sequence_empty() {
@@ -1281,7 +1281,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!({}),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -1329,7 +1329,7 @@ mod tests {
             events: vec![
                 WorkflowEvent::WorkflowStarted {
                     input: serde_json::json!({ "customer": "acme" }),
-                    timestamp: Utc::now(),
+                    timestamp: Timestamp::now(),
                     last_completion_result: None,
                     last_error: None,
                     scheduled_time: None,
@@ -1338,7 +1338,7 @@ mod tests {
                     output: serde_json::json!({ "ok": true }),
                 },
             ],
-            exported_at: Utc::now(),
+            exported_at: Timestamp::now(),
             payload_policy: HistoryPayloadPolicy::Full,
             max_bytes: Some(64 * 1024),
             context_headers: None,
@@ -1378,8 +1378,8 @@ mod tests {
         use crate::types::ExecutionId;
 
         let exec_id = ExecutionId::new();
-        let timeout = chrono::Duration::seconds(1800);
-        let deadline = Utc::now() + chrono::Duration::seconds(3600);
+        let timeout = jiff::SignedDuration::from_secs(1800);
+        let deadline = Timestamp::now() + jiff::SignedDuration::from_secs(3600);
         let document = export_history(HistoryExportRequest {
             workflow_name: "wf".to_string(),
             execution_id: exec_id,
@@ -1387,12 +1387,12 @@ mod tests {
             state: "RUNNING".to_string(),
             events: vec![WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!(null),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
             }],
-            exported_at: Utc::now(),
+            exported_at: Timestamp::now(),
             payload_policy: HistoryPayloadPolicy::Full,
             max_bytes: Some(64 * 1024),
             context_headers: None,
@@ -1447,12 +1447,12 @@ mod tests {
                 state: "RUNNING".to_string(),
                 events: vec![WorkflowEvent::WorkflowStarted {
                     input: serde_json::json!(null),
-                    timestamp: Utc::now(),
+                    timestamp: Timestamp::now(),
                     last_completion_result: None,
                     last_error: None,
                     scheduled_time: None,
                 }],
-                exported_at: Utc::now(),
+                exported_at: Timestamp::now(),
                 payload_policy: policy,
                 max_bytes: Some(64 * 1024),
                 context_headers: None,
@@ -1496,12 +1496,12 @@ mod tests {
             state: "RUNNING".to_string(),
             events: vec![WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!(null),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
             }],
-            exported_at: Utc::now(),
+            exported_at: Timestamp::now(),
             payload_policy: HistoryPayloadPolicy::Full,
             max_bytes: Some(64 * 1024),
             context_headers: None,
@@ -1544,12 +1544,12 @@ mod tests {
             state: "RUNNING".to_string(),
             events: vec![WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!(null),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
             }],
-            exported_at: Utc::now(),
+            exported_at: Timestamp::now(),
             payload_policy: HistoryPayloadPolicy::Full,
             max_bytes: Some(64 * 1024),
             context_headers: None,
@@ -1614,7 +1614,7 @@ mod tests {
                         "card": "4111111111111111",
                         "authorization": "Bearer top-secret"
                     }),
-                    timestamp: Utc::now(),
+                    timestamp: Timestamp::now(),
                     last_completion_result: None,
                     last_error: None,
                     scheduled_time: None,
@@ -1641,7 +1641,7 @@ mod tests {
                     "downstream returned bearer lower-secret".to_string(),
                 ),
             ],
-            exported_at: Utc::now(),
+            exported_at: Timestamp::now(),
             payload_policy: HistoryPayloadPolicy::Redacted,
             max_bytes: Some(64 * 1024),
             context_headers: None,
@@ -1690,7 +1690,7 @@ mod tests {
             events: vec![
                 WorkflowEvent::WorkflowStarted {
                     input: serde_json::json!({}),
-                    timestamp: Utc::now(),
+                    timestamp: Timestamp::now(),
                     last_completion_result: None,
                     last_error: None,
                     scheduled_time: None,
@@ -1704,7 +1704,7 @@ mod tests {
                     value: serde_json::json!({ "token": "super-secret-credential" }),
                 },
             ],
-            exported_at: Utc::now(),
+            exported_at: Timestamp::now(),
             payload_policy: HistoryPayloadPolicy::Redacted,
             max_bytes: Some(64 * 1024),
             context_headers: None,
@@ -1740,12 +1740,12 @@ mod tests {
             state: "COMPLETED".to_string(),
             events: vec![WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!({ "large": "x".repeat(512) }),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
             }],
-            exported_at: Utc::now(),
+            exported_at: Timestamp::now(),
             payload_policy: HistoryPayloadPolicy::Full,
             max_bytes: Some(128),
             context_headers: None,
@@ -1792,7 +1792,7 @@ mod tests {
         let mut exporter = MermaidExporter::new();
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1806,7 +1806,7 @@ mod tests {
         let mut exporter = MermaidExporter::new();
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1820,7 +1820,7 @@ mod tests {
         let mut exporter = MermaidExporter::new();
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1834,7 +1834,7 @@ mod tests {
         let mut exporter = MermaidExporter::new();
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1848,7 +1848,7 @@ mod tests {
         let mut exporter = MermaidExporter::new();
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1862,7 +1862,7 @@ mod tests {
         let mut exporter = MermaidExporter::new();
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1876,7 +1876,7 @@ mod tests {
         let mut exporter = MermaidExporter::new();
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1914,7 +1914,7 @@ mod tests {
             events: vec![WorkflowEvent::WorkflowCompleted {
                 output: envelope.clone(),
             }],
-            exported_at: Utc::now(),
+            exported_at: Timestamp::now(),
             payload_policy: HistoryPayloadPolicy::Full,
             max_bytes: Some(64 * 1024),
             context_headers: None,
@@ -1946,7 +1946,7 @@ mod tests {
             events: vec![WorkflowEvent::WorkflowCompleted {
                 output: codec_envelope_fixture(),
             }],
-            exported_at: Utc::now(),
+            exported_at: Timestamp::now(),
             payload_policy: HistoryPayloadPolicy::Redacted,
             max_bytes: Some(64 * 1024),
             context_headers: None,
@@ -2055,7 +2055,7 @@ mod tests {
             shard_id: 0,
             state: "COMPLETED".to_string(),
             events: vec![WorkflowEvent::WorkflowCompleted { output: envelope }],
-            exported_at: Utc::now(),
+            exported_at: Timestamp::now(),
             payload_policy: HistoryPayloadPolicy::Full,
             max_bytes: Some(max_bytes),
             context_headers: None,

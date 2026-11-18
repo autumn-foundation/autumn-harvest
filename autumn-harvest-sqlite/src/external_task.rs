@@ -23,7 +23,7 @@ use std::fmt;
 use autumn_harvest::{
     ActivityExecId, ExecutionId, ExternalActivityToken, TimeoutType, WorkflowEvent,
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
@@ -197,11 +197,11 @@ pub struct ExternalHandoff {
     /// The state of the handoff.
     pub state: ExternalTaskState,
     /// When the decision cycle recorded the handoff.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// When the state or the deadline last changed.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
     /// The schedule-to-close deadline.
-    pub deadline_at: DateTime<Utc>,
+    pub deadline_at: Timestamp,
 }
 
 /// The fields of one `ScheduleExternalActivity` command.
@@ -228,7 +228,7 @@ pub struct Task {
 /// A longer deadline saturates to it. A later instant has no `DateTime`
 /// form, so the read of its row would fail.
 const fn latest_deadline() -> i64 {
-    DateTime::<Utc>::MAX_UTC.timestamp_millis()
+    Timestamp::MAX.as_millisecond()
 }
 
 /// `deadline_at`, cut to [`latest_deadline`].
@@ -450,7 +450,7 @@ pub fn cancel_pending(conn: &Connection, exec: ExecutionId) -> SqliteResult<()> 
     conn.execute(
         "UPDATE harvest_external_tasks SET state = 'CANCELLED', updated_at = ?2 \
          WHERE exec_id = ?1 AND state = 'PENDING'",
-        params![exec.to_string(), Utc::now().timestamp_millis()],
+        params![exec.to_string(), Timestamp::now().as_millisecond()],
     )?;
     Ok(())
 }
@@ -523,7 +523,7 @@ struct RawHandoff {
 impl RawHandoff {
     fn decode(self) -> SqliteResult<ExternalHandoff> {
         let time = |ms: i64, field: &str| {
-            DateTime::from_timestamp_millis(ms).ok_or_else(|| SqliteError::corrupt(field))
+            Timestamp::from_millisecond(ms).ok().ok_or_else(|| SqliteError::corrupt(field))
         };
         Ok(ExternalHandoff {
             token: self
@@ -575,7 +575,7 @@ mod tests {
     fn a_deadline_stays_in_the_datetime_range() {
         assert_eq!(bounded_deadline(i64::MAX), latest_deadline());
         assert_eq!(bounded_deadline(5), 5);
-        assert!(chrono::DateTime::from_timestamp_millis(latest_deadline()).is_some());
+        assert!(jiff::Timestamp::from_millisecond(latest_deadline()).ok().is_some());
     }
 
     #[test]

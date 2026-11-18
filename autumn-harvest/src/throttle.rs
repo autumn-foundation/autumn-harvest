@@ -98,10 +98,11 @@
 //! trigger-starts.
 
 use std::time::Duration;
+use jiff_diesel::ToDiesel;
 
 #[cfg(feature = "db")]
 use crate::cached_stmt::CachePreparedDsl as _;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 /// Prefix for the per-key token bucket stored in `harvest_rate_limit_buckets`,
 /// namespaced so it can never collide with an activity rate-limit bucket key.
@@ -333,15 +334,15 @@ pub fn bucket_key(workflow_name: &str, resolved_key: &str) -> String {
 /// clamped to a large-but-finite value so this can never panic.
 #[must_use]
 pub fn compute_expiry(
-    deferred_at: DateTime<Utc>,
+    deferred_at: Timestamp,
     schedule_to_start: Option<Duration>,
-) -> Option<DateTime<Utc>> {
+) -> Option<Timestamp> {
     let d = schedule_to_start?;
     let chrono_d =
-        chrono::Duration::from_std(d).unwrap_or_else(|_| chrono::Duration::days(365 * 100));
+        jiff::SignedDuration::try_from(d).unwrap_or_else(|_| crate::time::days(365 * 100));
     Some(
         deferred_at
-            .checked_add_signed(chrono_d)
+            .checked_add(chrono_d).ok()
             .unwrap_or(deferred_at),
     )
 }
@@ -379,7 +380,7 @@ pub struct AdmitThrottleParams<'a> {
 pub struct ThrottleDeferOutcome {
     pub workflow_id: String,
     pub throttle_key: String,
-    pub deferred_at: DateTime<Utc>,
+    pub deferred_at: Timestamp,
     /// `true` when this call durably inserted a brand-new pending row.
     ///
     /// `false` when the idempotency shortcut of `reserve_or_defer` (step 1)
@@ -430,8 +431,8 @@ pub struct PendingThrottleRecord {
     pub throttle_key: String,
     pub workflow_id: String,
     pub queue_name: String,
-    pub deferred_at: DateTime<Utc>,
-    pub expires_at: Option<DateTime<Utc>>,
+    pub deferred_at: Timestamp,
+    pub expires_at: Option<Timestamp>,
     pub shard_id: i32,
 }
 
@@ -451,7 +452,7 @@ pub struct ThrottleBacklogEntry {
     pub workflow_name: String,
     pub throttle_key: String,
     pub deferred_count: i64,
-    pub oldest_deferred_at: DateTime<Utc>,
+    pub oldest_deferred_at: Timestamp,
     pub shard_id: i32,
     /// The declared baseline refill rate (`#[workflow(throttle(rate = ...))]`).
     pub declared_refill_rate: Option<f64>,
@@ -473,7 +474,7 @@ pub struct ThrottleBacklogEntry {
     pub effective_burst: Option<f64>,
     /// When the override expires (or expired); `None` when no override has
     /// ever been set.
-    pub expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<Timestamp>,
 }
 
 /// Resolves the effective-rate-limit view for one throttle backlog row's
@@ -490,8 +491,8 @@ fn resolve_backlog_bucket_state(
     declared_burst: Option<f64>,
     override_refill_rate: Option<f64>,
     override_burst: Option<f64>,
-    override_expires_at: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
+    override_expires_at: Option<Timestamp>,
+    now: Timestamp,
 ) -> (bool, Option<f64>, Option<f64>) {
     match (declared_refill_rate, declared_burst) {
         (Some(refill_rate), Some(burst)) => {
@@ -587,7 +588,8 @@ async fn existing_pending_throttle_for_workflow_id(
         #[diesel(sql_type = diesel::sql_types::Text)]
         throttle_key: String,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        deferred_at: DateTime<Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        deferred_at: Timestamp,
     }
     let row: Option<Row> = diesel::sql_query(
         "SELECT throttle_key, deferred_at FROM harvest_start_throttle \
@@ -615,7 +617,7 @@ async fn insert_pending_throttle_row(
     conn: &mut diesel_async::AsyncPgConnection,
     params: &AdmitThrottleParams<'_>,
     bucket_key: &str,
-    deferred_at: DateTime<Utc>,
+    deferred_at: Timestamp,
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<()> {
     use diesel_async::RunQueryDsl;
@@ -640,7 +642,7 @@ async fn insert_pending_throttle_row(
     .bind::<diesel::sql_types::Text, _>(params.queue_name)
     .bind::<diesel::sql_types::Jsonb, _>(&stored_input)
     .bind::<diesel::sql_types::Jsonb, _>(start_options_json)
-    .bind::<diesel::sql_types::Timestamptz, _>(deferred_at)
+    .bind::<diesel::sql_types::Timestamptz, _>(deferred_at.to_diesel())
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(expires_at)
     .bind::<diesel::sql_types::Integer, _>(params.shard_id)
     .execute(conn)
@@ -909,7 +911,7 @@ async fn admit(
     }
 
     let key = bucket_key(params.workflow_name, params.throttle_key);
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     // (2) Ensure the bucket BEFORE either outcome below, backlog or not.
     //
@@ -990,13 +992,15 @@ struct FireDueRow {
     #[diesel(sql_type = diesel::sql_types::Jsonb)]
     start_options: serde_json::Value,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    expires_at: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    expires_at: Option<Timestamp>,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     shard_id: i32,
     /// When the row was deferred. A backoff moves it into the future (issue
     /// #2043).
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    deferred_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    deferred_at: Timestamp,
 }
 
 /// How far a row that does not decode moves its `deferred_at` (issue #2043).
@@ -1027,7 +1031,7 @@ async fn decode_due_rows(
     conn: &mut diesel_async::AsyncPgConnection,
     rows: Vec<FireDueRow>,
     codecs: &crate::payload_codec::PayloadCodecs,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::HarvestResult<Vec<FireDueRow>> {
     let mut decodable = Vec::with_capacity(rows.len());
     for mut row in rows {
@@ -1127,12 +1131,12 @@ async fn delete_throttle_row(
 async fn redefer_throttle_row(
     conn: &mut diesel_async::AsyncPgConnection,
     row_id: uuid::Uuid,
-    new_deferred_at: DateTime<Utc>,
+    new_deferred_at: Timestamp,
 ) -> crate::error::HarvestResult<()> {
     use diesel_async::RunQueryDsl;
     diesel::sql_query("UPDATE harvest_start_throttle SET deferred_at = $2 WHERE id = $1")
         .bind::<diesel::sql_types::Uuid, _>(row_id)
-        .bind::<diesel::sql_types::Timestamptz, _>(new_deferred_at)
+        .bind::<diesel::sql_types::Timestamptz, _>(new_deferred_at.to_diesel())
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -1161,7 +1165,7 @@ async fn redefer_throttle_row(
 async fn fire_claimed_throttle_row(
     conn: &mut diesel_async::AsyncPgConnection,
     row: FireDueRow,
-    now: DateTime<Utc>,
+    now: Timestamp,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<Option<FiredThrottle>> {
@@ -1600,7 +1604,7 @@ async fn fire_due_on_conn(
             Box::pin(
                 conn.transaction::<Vec<FiredThrottle>, crate::error::HarvestError, _>(
                     async |conn| {
-                        let now = Utc::now();
+                        let now = Timestamp::now();
                         // Per-key-fair claim (issue #607). A flat
                         // `ORDER BY deferred_at ASC LIMIT N` lets one key with a large
                         // backlog monopolize every scanner tick, because its rows are
@@ -1882,9 +1886,11 @@ pub async fn list_pending_throttle(
         #[diesel(sql_type = diesel::sql_types::Text)]
         queue_name: String,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        deferred_at: DateTime<Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        deferred_at: Timestamp,
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-        expires_at: Option<DateTime<Utc>>,
+        #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+        expires_at: Option<Timestamp>,
         #[diesel(sql_type = diesel::sql_types::Integer)]
         shard_id: i32,
     }
@@ -1938,7 +1944,8 @@ pub async fn throttle_backlog_by_key(
         #[diesel(sql_type = diesel::sql_types::BigInt)]
         deferred_count: i64,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        oldest_deferred_at: DateTime<Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        oldest_deferred_at: Timestamp,
         #[diesel(sql_type = diesel::sql_types::Integer)]
         shard_id: i32,
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
@@ -1950,7 +1957,8 @@ pub async fn throttle_backlog_by_key(
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
         override_burst: Option<f64>,
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-        override_expires_at: Option<DateTime<Utc>>,
+        #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+        override_expires_at: Option<Timestamp>,
     }
     let rows: Vec<GroupRow> = diesel::sql_query(
         "SELECT t.workflow_name, t.throttle_key, t.shard_id,
@@ -1969,7 +1977,7 @@ pub async fn throttle_backlog_by_key(
     .load(conn)
     .await
     .map_err(crate::error::database_error)?;
-    let now = Utc::now();
+    let now = Timestamp::now();
     Ok(rows
         .into_iter()
         .map(|r| {
@@ -2128,7 +2136,7 @@ pub async fn pending_throttle_counts_for_workflows(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone as _;
+    use jiff::Timestamp;
 
     #[cfg(feature = "db")]
     #[test]
@@ -2145,14 +2153,14 @@ mod tests {
             start_options: serde_json::json!({ "tenant_id": "wrong" }),
             expires_at: None,
             shard_id: 0,
-            deferred_at: Utc::now(),
+            deferred_at: Timestamp::now(),
         };
         assert_eq!(row.workflow_name(), "wf_a");
         assert_eq!(row.quota_input()["tenant_id"], "t1");
     }
 
-    fn ts(h: u32, m: u32, s: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 7, 6, h, m, s).unwrap()
+    fn ts(h: u32, m: u32, s: u32) -> Timestamp {
+        crate::time::utc_ymd_hms(2026, 7, 6, h, m, s).unwrap()
     }
 
     // ── parse_rate ───────────────────────────────────────────────────────────
@@ -2375,7 +2383,7 @@ mod tests {
     fn compute_expiry_adds_deadline() {
         let deferred = ts(10, 0, 0);
         let got = compute_expiry(deferred, Some(Duration::from_secs(300))).unwrap();
-        assert_eq!(got, deferred + chrono::Duration::seconds(300));
+        assert_eq!(got, deferred + jiff::SignedDuration::from_secs(300));
     }
 
     #[test]
@@ -2409,7 +2417,7 @@ mod tests {
     #[test]
     fn resolve_backlog_bucket_state_active_override() {
         let now = ts(12, 0, 0);
-        let expires = now + chrono::Duration::seconds(60);
+        let expires = now + jiff::SignedDuration::from_secs(60);
         let (active, refill, burst) = resolve_backlog_bucket_state(
             Some(5.0),
             Some(10.0),
@@ -2427,7 +2435,7 @@ mod tests {
     #[test]
     fn resolve_backlog_bucket_state_expired_override_falls_back_to_declared() {
         let now = ts(12, 0, 0);
-        let expired = now - chrono::Duration::seconds(1);
+        let expired = now - jiff::SignedDuration::from_secs(1);
         let (active, refill, burst) = resolve_backlog_bucket_state(
             Some(5.0),
             Some(10.0),
@@ -2473,7 +2481,7 @@ mod tests {
                 start_options: serde_json::json!({}),
                 expires_at: None,
                 shard_id: 0,
-                deferred_at: Utc::now(),
+                deferred_at: Timestamp::now(),
             }
         }
 

@@ -17,11 +17,11 @@ use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest_sqlite::{ActivitySpec, RunState, SqliteRuntime};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::json;
 
-const fn t0() -> DateTime<Utc> {
-    match DateTime::from_timestamp(4_000_000, 0) {
+const fn t0() -> Timestamp {
+    match Timestamp::from_second(4_000_000).ok() {
         Some(t) => t,
         None => unreachable!(),
     }
@@ -77,7 +77,7 @@ async fn run_case(signal: &str, expected_index: i64) {
     let mut at = t0();
     let mut state = RunState::WaitingTimer;
     for _ in 0..5 {
-        at += chrono::Duration::seconds(15);
+        at += jiff::SignedDuration::from_secs(15);
         state = rt.run_until_blocked_as_of(exec, at).await.unwrap();
         if !matches!(state, RunState::WaitingTimer) {
             break;
@@ -205,7 +205,7 @@ async fn an_activity_branch_beside_a_buffered_signal_replays() {
     let mut at = t0();
     let mut state = RunState::WaitingTimer;
     for _ in 0..5 {
-        at += chrono::Duration::seconds(15);
+        at += jiff::SignedDuration::from_secs(15);
         state = rt.run_until_blocked_as_of(exec, at).await.unwrap();
         if !matches!(state, RunState::WaitingTimer) {
             break;

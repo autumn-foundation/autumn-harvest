@@ -15,6 +15,7 @@
 //!   never selected.
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
+use jiff_diesel::ToDiesel;
 use std::sync::Mutex;
 
 use autumn_harvest::event::WorkflowEvent;
@@ -24,7 +25,7 @@ use autumn_harvest::store;
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::timeout;
 use autumn_harvest::types::ExecutionId;
-use chrono::{Duration as ChronoDuration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
@@ -70,10 +71,10 @@ impl MetricsRecorder for SpyRecorder {
 async fn insert_execution(
     conn: &mut AsyncPgConnection,
     state: &str,
-    sla_deadline_at: Option<chrono::DateTime<Utc>>,
+    sla_deadline_at: Option<jiff::Timestamp>,
 ) -> ExecutionId {
     let exec_id = ExecutionId::new();
-    let sla = sla_deadline_at.map(|_| ChronoDuration::hours(2));
+    let sla = sla_deadline_at.map(|_| SignedDuration::from_hours(2));
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&NewWorkflowExecution {
             quota_key: None,
@@ -137,15 +138,15 @@ async fn insert_execution(
 async fn insert_terminal_execution(
     conn: &mut AsyncPgConnection,
     state: &str,
-    sla_deadline_at: Option<chrono::DateTime<Utc>>,
-    completed_at: chrono::DateTime<Utc>,
+    sla_deadline_at: Option<jiff::Timestamp>,
+    completed_at: jiff::Timestamp,
 ) -> ExecutionId {
     let exec_id = insert_execution(conn, state, sla_deadline_at).await;
     diesel::update(
         harvest_workflow_executions::table
             .filter(harvest_workflow_executions::id.eq(exec_id.as_uuid())),
     )
-    .set(harvest_workflow_executions::completed_at.eq(Some(completed_at)))
+    .set(harvest_workflow_executions::completed_at.eq(Some(completed_at).to_diesel()))
     .execute(conn)
     .await
     .expect("set completed_at");
@@ -155,7 +156,7 @@ async fn insert_terminal_execution(
 async fn load_breach_flags(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
-) -> (bool, Option<chrono::DateTime<Utc>>, String) {
+) -> (bool, Option<jiff::Timestamp>, String) {
     harvest_workflow_executions::table
         .filter(harvest_workflow_executions::id.eq(exec_id.as_uuid()))
         .select((
@@ -173,7 +174,7 @@ async fn load_breach_flags(
 #[tokio::test]
 async fn scanner_flips_breach_once_and_is_idempotent() {
     let (mut conn, _c) = setup_db().await;
-    let past = Utc::now() - ChronoDuration::minutes(5);
+    let past = Timestamp::now() - SignedDuration::from_mins(5);
     let exec_id = insert_execution(&mut conn, "RUNNING", Some(past)).await;
 
     let spy = SpyRecorder::default();
@@ -212,7 +213,7 @@ async fn scanner_flips_breach_once_and_is_idempotent() {
 #[tokio::test]
 async fn breached_run_is_not_terminated_and_can_complete() {
     let (mut conn, _c) = setup_db().await;
-    let past = Utc::now() - ChronoDuration::minutes(5);
+    let past = Timestamp::now() - SignedDuration::from_mins(5);
     let exec_id = insert_execution(&mut conn, "RUNNING", Some(past)).await;
 
     timeout::enforce_workflow_sla_breaches(&mut conn, &autumn_harvest::telemetry::NoOpMetrics)
@@ -231,7 +232,7 @@ async fn breached_run_is_not_terminated_and_can_complete() {
     .set((
         harvest_workflow_executions::state.eq("COMPLETED"),
         harvest_workflow_executions::output.eq(Some(serde_json::json!({"ok": true}))),
-        harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+        harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
     ))
     .execute(&mut conn)
     .await
@@ -250,7 +251,7 @@ async fn breached_run_is_not_terminated_and_can_complete() {
 #[tokio::test]
 async fn breach_scan_leaves_harvest_events_untouched() {
     let (mut conn, _c) = setup_db().await;
-    let past = Utc::now() - ChronoDuration::minutes(5);
+    let past = Timestamp::now() - SignedDuration::from_mins(5);
     let exec_id = insert_execution(&mut conn, "RUNNING", Some(past)).await;
 
     store::append_events(
@@ -258,7 +259,7 @@ async fn breach_scan_leaves_harvest_events_untouched() {
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -302,9 +303,9 @@ async fn breach_scan_leaves_harvest_events_untouched() {
 #[tokio::test]
 async fn scanner_eligibility_by_state_and_completion() {
     let (mut conn, _c) = setup_db().await;
-    let past = Utc::now() - ChronoDuration::minutes(10);
-    let recent_past = Utc::now() - ChronoDuration::minutes(1);
-    let future = Utc::now() + ChronoDuration::hours(1);
+    let past = Timestamp::now() - SignedDuration::from_mins(10);
+    let recent_past = Timestamp::now() - SignedDuration::from_mins(1);
+    let future = Timestamp::now() + SignedDuration::from_hours(1);
 
     // RUNNING past its deadline → breaches.
     let running = insert_execution(&mut conn, "RUNNING", Some(past)).await;
@@ -355,8 +356,8 @@ async fn scanner_eligibility_by_state_and_completion() {
 #[tokio::test]
 async fn terminal_row_past_deadline_breaches_once() {
     let (mut conn, _c) = setup_db().await;
-    let deadline = Utc::now() - ChronoDuration::minutes(10);
-    let finished = Utc::now() - ChronoDuration::minutes(1); // after the deadline
+    let deadline = Timestamp::now() - SignedDuration::from_mins(10);
+    let finished = Timestamp::now() - SignedDuration::from_mins(1); // after the deadline
 
     // A run that crossed its SLA deadline and then COMPLETED before any scan ran.
     let exec = insert_terminal_execution(&mut conn, "COMPLETED", Some(deadline), finished).await;

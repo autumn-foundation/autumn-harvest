@@ -109,7 +109,8 @@
 //!
 //! See `docs/audit-export.md` for the full receiver contract.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -177,7 +178,7 @@ pub struct AuditExportRecord {
     /// shard and names the shard it acted on. Exporting only one of them would
     /// silently break a receiver's correlation.
     pub shard_id: Option<i32>,
-    pub occurred_at: DateTime<Utc>,
+    pub occurred_at: Timestamp,
     pub actor: String,
     pub operation: String,
     pub target_type: String,
@@ -199,7 +200,7 @@ pub struct AuditExportRecord {
     /// #1838). The link covers it. Omitted when absent, as
     /// [`Self::chain_prev`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chain_newest_before: Option<DateTime<Utc>>,
+    pub chain_newest_before: Option<Timestamp>,
     /// Lowercase hex of the row's audit-chain link (issue #1838). Omitted
     /// when absent, as [`Self::chain_prev`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -288,14 +289,14 @@ pub fn export_headers(
     shard: i32,
     first_seq: i64,
     last_seq: i64,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Vec<(&'static str, String)> {
     vec![
         (
             SIGNATURE_HEADER,
             crate::completion_callback::sign(secret, body),
         ),
-        (TIMESTAMP_HEADER, now.to_rfc3339()),
+        (TIMESTAMP_HEADER, crate::time::rfc3339(now)),
         (SHARD_HEADER, shard.to_string()),
         (FIRST_SEQ_HEADER, first_seq.to_string()),
         (LAST_SEQ_HEADER, last_seq.to_string()),
@@ -441,7 +442,7 @@ pub enum ExportOutcome {
     /// Anything else — **hold the cursor exactly where it is** and retry at
     /// `next_attempt_at`.
     Backoff {
-        next_attempt_at: DateTime<Utc>,
+        next_attempt_at: Timestamp,
         last_status: Option<u16>,
         last_error: Option<String>,
         consecutive_failures: i32,
@@ -461,7 +462,7 @@ pub fn classify_export_outcome(
     through_seq: i64,
     consecutive_failures: i32,
     backoff: &ExportBackoff,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> ExportOutcome {
     if let Some(status) = attempt.status
         && attempt.is_success()
@@ -482,9 +483,9 @@ pub fn classify_export_outcome(
         u32::try_from(failures).unwrap_or(u32::MAX),
     );
     let next_attempt_at = now
-        + chrono::Duration::from_std(delay).unwrap_or_else(|_| {
-            chrono::Duration::from_std(backoff.max_interval)
-                .unwrap_or_else(|_| chrono::Duration::seconds(60))
+        + jiff::SignedDuration::try_from(delay).unwrap_or_else(|_| {
+            jiff::SignedDuration::try_from(backoff.max_interval)
+                .unwrap_or_else(|_| jiff::SignedDuration::from_secs(60))
         });
 
     ExportOutcome::Backoff {
@@ -881,7 +882,7 @@ impl AuditExportRuntimeConfig {
         &self,
         conn: &mut diesel_async::AsyncPgConnection,
         shard_id: i32,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> crate::error::HarvestResult<Option<ClaimedBatch>> {
         claim_shard_chained(
             conn,
@@ -1146,7 +1147,7 @@ pub struct ClaimedBatch {
     /// attempt's acknowledgement is refused. With sink latency near the lease,
     /// that repeats indefinitely. The cursor never advances and the sink gets
     /// the same batch over and over.
-    pub lease_until: DateTime<Utc>,
+    pub lease_until: Timestamp,
 }
 
 /// Create this shard's cursor row if it does not exist, and heartbeat it if it
@@ -2103,7 +2104,7 @@ pub enum ReactivateOutcome {
 pub async fn decommission_cursor(
     conn: &mut diesel_async::AsyncPgConnection,
     shard_id: i32,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::HarvestResult<DecommissionOutcome> {
     use diesel_async::AsyncConnection;
 
@@ -2158,7 +2159,7 @@ pub async fn decommission_cursor(
 pub async fn decommission_cursor_locked(
     conn: &mut diesel_async::AsyncPgConnection,
     shard_id: i32,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::HarvestResult<DecommissionOutcome> {
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
@@ -2191,10 +2192,10 @@ pub async fn decommission_cursor_locked(
     // read as mid-delivery.
     diesel::update(cur::harvest_audit_export_cursor.find(shard_id))
         .set((
-            cur::retired_at.eq(Some(now)),
+            cur::retired_at.eq(Some(now).to_diesel()),
             cur::updated_at.eq(now),
             cur::claim_epoch.eq(cursor.claim_epoch + 1),
-            cur::lease_until.eq(None::<DateTime<Utc>>),
+            cur::lease_until.eq(None::<Timestamp>),
         ))
         .execute(conn)
         .await
@@ -2214,7 +2215,7 @@ pub async fn decommission_cursor_locked(
 pub async fn reactivate_cursor(
     conn: &mut diesel_async::AsyncPgConnection,
     shard_id: i32,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::HarvestResult<ReactivateOutcome> {
     use diesel_async::AsyncConnection;
 
@@ -2250,7 +2251,7 @@ pub async fn reactivate_cursor(
 pub async fn reactivate_cursor_locked(
     conn: &mut diesel_async::AsyncPgConnection,
     shard_id: i32,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::HarvestResult<ReactivateOutcome> {
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
@@ -2280,7 +2281,7 @@ pub async fn reactivate_cursor_locked(
     // that rule, not a live hazard.
     diesel::update(cur::harvest_audit_export_cursor.find(shard_id))
         .set((
-            cur::retired_at.eq(None::<DateTime<Utc>>),
+            cur::retired_at.eq(None::<Timestamp>),
             cur::updated_at.eq(now),
             cur::claim_epoch.eq(cursor.claim_epoch + 1),
         ))
@@ -2317,7 +2318,7 @@ pub async fn claim_shard(
     shard_id: i32,
     batch_size: i64,
     lease: std::time::Duration,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::HarvestResult<Option<ClaimedBatch>> {
     claim_shard_chained(conn, shard_id, batch_size, lease, now, None).await
 }
@@ -2338,7 +2339,7 @@ pub async fn claim_shard_chained(
     shard_id: i32,
     batch_size: i64,
     lease: std::time::Duration,
-    now: DateTime<Utc>,
+    now: Timestamp,
     chain_key: Option<&crate::audit_chain::AuditChainKey>,
 ) -> crate::error::HarvestResult<Option<ClaimedBatch>> {
     use diesel::prelude::*;
@@ -2350,7 +2351,7 @@ pub async fn claim_shard_chained(
 
     let batch_size = batch_size.clamp(1, MAX_EXPORT_BATCH_SIZE);
     let lease_until =
-        now + chrono::Duration::from_std(lease).unwrap_or_else(|_| chrono::Duration::seconds(60));
+        now + jiff::SignedDuration::try_from(lease).unwrap_or_else(|_| jiff::SignedDuration::from_secs(60));
 
     Box::pin(
         conn.transaction::<Option<ClaimedBatch>, crate::error::HarvestError, _>(async |conn| {
@@ -2529,7 +2530,7 @@ pub async fn claim_shard_chained(
             diesel::update(cur::harvest_audit_export_cursor.find(shard_id))
                 .set((
                     cur::claim_epoch.eq(claim_epoch),
-                    cur::lease_until.eq(Some(lease_until)),
+                    cur::lease_until.eq(Some(lease_until).to_diesel()),
                     cur::updated_at.eq(now),
                 ))
                 .execute(conn)
@@ -2581,7 +2582,7 @@ pub async fn apply_outcome(
     shard_id: i32,
     claim_epoch: i64,
     outcome: &ExportOutcome,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::HarvestResult<bool> {
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
@@ -2603,12 +2604,12 @@ pub async fn apply_outcome(
             diesel::update(target)
                 .set((
                     cur::last_acked_seq.eq(*through_seq),
-                    cur::lease_until.eq(None::<DateTime<Utc>>),
+                    cur::lease_until.eq(None::<Timestamp>),
                     cur::next_attempt_at.eq(now),
                     cur::consecutive_failures.eq(0),
                     cur::last_status.eq(Some(i32::from(*status))),
                     cur::last_error.eq(None::<String>),
-                    cur::last_delivered_at.eq(Some(now)),
+                    cur::last_delivered_at.eq(Some(now).to_diesel()),
                     cur::updated_at.eq(now),
                 ))
                 .execute(conn)
@@ -2627,8 +2628,8 @@ pub async fn apply_outcome(
             // failure" invariant, enforced by simply not writing the column.
             diesel::update(target)
                 .set((
-                    cur::lease_until.eq(None::<DateTime<Utc>>),
-                    cur::next_attempt_at.eq(*next_attempt_at),
+                    cur::lease_until.eq(None::<Timestamp>),
+                    cur::next_attempt_at.eq((*next_attempt_at).to_diesel()),
                     cur::consecutive_failures.eq(*consecutive_failures),
                     cur::last_status.eq(last_status.map(i32::from)),
                     cur::last_error.eq(last_error.clone()),
@@ -2652,7 +2653,7 @@ pub async fn release_claim(
     conn: &mut diesel_async::AsyncPgConnection,
     shard_id: i32,
     claim_epoch: i64,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::HarvestResult<()> {
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
@@ -2665,7 +2666,7 @@ pub async fn release_claim(
             .filter(cur::claim_epoch.eq(claim_epoch)),
     )
     .set((
-        cur::lease_until.eq(None::<DateTime<Utc>>),
+        cur::lease_until.eq(None::<Timestamp>),
         cur::updated_at.eq(now),
     ))
     .execute(conn)
@@ -2684,11 +2685,11 @@ pub async fn release_claim(
 /// with the columns it summarizes.
 #[must_use]
 pub fn delivery_state(
-    lease_until: Option<DateTime<Utc>>,
+    lease_until: Option<Timestamp>,
     consecutive_failures: i32,
-    next_attempt_at: DateTime<Utc>,
-    now: DateTime<Utc>,
-    retired_at: Option<DateTime<Utc>>,
+    next_attempt_at: Timestamp,
+    now: Timestamp,
+    retired_at: Option<Timestamp>,
 ) -> &'static str {
     // A retired cursor's other columns are a frozen snapshot of whatever the
     // exporter last did (issue #953). Deriving IDLE, BACKOFF or RETRYING from
@@ -2738,8 +2739,8 @@ pub struct AuditExportShardStatus {
     pub consecutive_failures: i32,
     pub last_status: Option<i32>,
     pub last_error: Option<String>,
-    pub last_delivered_at: Option<DateTime<Utc>>,
-    pub next_attempt_at: DateTime<Utc>,
+    pub last_delivered_at: Option<Timestamp>,
+    pub next_attempt_at: Timestamp,
 }
 
 /// How many of the lowest-sequence pending rows [`export_lag_seconds`] scans
@@ -2765,7 +2766,8 @@ pub const EXPORT_LAG_LOOKBACK_ROWS: i64 = 1000;
 #[derive(diesel::QueryableByName)]
 struct OldestInWindow {
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    oldest: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    oldest: Option<Timestamp>,
 }
 
 /// Age in seconds of the oldest audit record the sink has not acknowledged,
@@ -2799,17 +2801,17 @@ struct OldestInWindow {
 pub async fn export_lag_seconds(
     conn: &mut diesel_async::AsyncPgConnection,
     last_acked_seq: i64,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::HarvestResult<f64> {
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
 
     use crate::schema::harvest_audit_log::dsl as log;
 
-    let unsequenced: Option<DateTime<Utc>> = log::harvest_audit_log
+    let unsequenced: Option<Timestamp> = log::harvest_audit_log
         .filter(log::export_seq.is_null())
         .select(diesel::dsl::min(log::occurred_at))
-        .first::<Option<DateTime<Utc>>>(conn)
+        .first::<Option<Timestamp>>(conn)
         .await
         .map_err(crate::error::database_error)?;
 
@@ -2837,7 +2839,7 @@ pub async fn export_lag_seconds(
     };
 
     Ok(oldest.map_or(0.0, |oldest| {
-        let secs = (now - oldest).num_milliseconds() as f64 / 1000.0;
+        let secs = crate::time::num_milliseconds((now - oldest)) as f64 / 1000.0;
         if secs.is_finite() && secs > 0.0 {
             secs
         } else {
@@ -2863,7 +2865,7 @@ pub async fn export_lag_seconds(
 pub async fn pending_and_lag(
     conn: &mut diesel_async::AsyncPgConnection,
     last_acked_seq: i64,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::HarvestResult<(i64, f64)> {
     use diesel_async::RunQueryDsl;
 
@@ -2872,7 +2874,8 @@ pub async fn pending_and_lag(
         #[diesel(sql_type = diesel::sql_types::BigInt)]
         pending: i64,
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-        oldest: Option<DateTime<Utc>>,
+        #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+        oldest: Option<Timestamp>,
     }
 
     let row: PendingRow = diesel::sql_query(
@@ -2886,7 +2889,7 @@ pub async fn pending_and_lag(
     .map_err(crate::error::database_error)?;
 
     let lag = row.oldest.map_or(0.0, |oldest| {
-        let secs = (now - oldest).num_milliseconds() as f64 / 1000.0;
+        let secs = crate::time::num_milliseconds((now - oldest)) as f64 / 1000.0;
         if secs.is_finite() && secs > 0.0 {
             secs
         } else {
@@ -2907,7 +2910,7 @@ pub async fn pending_and_lag(
 pub async fn export_status(
     conn: &mut diesel_async::AsyncPgConnection,
     shard_id: i32,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::HarvestResult<Option<AuditExportShardStatus>> {
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
@@ -2972,7 +2975,7 @@ pub enum RewindRequest {
     Seq(i64),
     /// Rewind so that every record that occurred at or after this instant
     /// re-exports.
-    Before(DateTime<Utc>),
+    Before(Timestamp),
 }
 
 /// Rewind a shard's export cursor so already-delivered records re-export
@@ -2999,7 +3002,7 @@ pub async fn rewind_cursor(
     conn: &mut diesel_async::AsyncPgConnection,
     shard_id: i32,
     request: RewindRequest,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::HarvestResult<RewindOutcome> {
     use diesel_async::AsyncConnection;
 
@@ -3030,7 +3033,7 @@ pub async fn rewind_cursor_locked(
     conn: &mut diesel_async::AsyncPgConnection,
     shard_id: i32,
     request: RewindRequest,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::HarvestResult<RewindOutcome> {
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
@@ -3091,7 +3094,7 @@ pub async fn rewind_cursor_locked(
                     // `redrive_window_truncated` reports that case from the
                     // purge watermark (issue #1508).
                     let lowest: Option<Option<i64>> = log::harvest_audit_log
-                        .filter(log::occurred_at.ge(instant))
+                        .filter(log::occurred_at.ge(instant.to_diesel()))
                         .filter(log::export_seq.is_not_null())
                         .select(diesel::dsl::min(log::export_seq))
                         .first(conn)
@@ -3111,7 +3114,7 @@ pub async fn rewind_cursor_locked(
                         cur::last_acked_seq.eq(to),
                         // Invalidate any in-flight delivery's acknowledgement.
                         cur::claim_epoch.eq(cursor.claim_epoch + 1),
-                        cur::lease_until.eq(None::<DateTime<Utc>>),
+                        cur::lease_until.eq(None::<Timestamp>),
                         // Re-export immediately rather than serving out a backoff
                         // that belonged to a since-resolved sink failure.
                         cur::next_attempt_at.eq(now),
@@ -3226,7 +3229,7 @@ pub async fn redrive_window_truncated(
         return Ok(false);
     }
     mark::harvest_audit_purge_watermark
-        .filter(mark::max_purged_occurred_at.ge(instant))
+        .filter(mark::max_purged_occurred_at.ge(instant.to_diesel()))
         .count()
         .get_result::<i64>(conn)
         .await
@@ -3255,10 +3258,9 @@ pub async fn redrive_window_truncated(
 async fn deliver_within_lease(
     config: &AuditExportRuntimeConfig,
     batch: &AuditBatch<'_>,
-    lease_until: DateTime<Utc>,
+    lease_until: Timestamp,
 ) -> SinkAttempt {
-    let remaining = (lease_until - Utc::now())
-        .to_std()
+    let remaining = std::time::Duration::try_from((lease_until - Timestamp::now()))
         .unwrap_or(std::time::Duration::ZERO);
     tokio::time::timeout(remaining, config.sink.deliver(batch))
         .await
@@ -3328,7 +3330,7 @@ async fn export_once_on_conn(
     notice_missing_unexported_index(conn, shard_id).await;
     ensure_cursor_row(conn, shard_id).await?;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     let Some(claim) = config.claim(conn, shard_id, now).await? else {
         // Nothing claimed, but the lag gauge must still be emitted. An
         // operator's "is the export keeping up?" signal must stay live
@@ -3355,7 +3357,7 @@ async fn export_once_on_conn(
                 error = %error,
                 "failed to serialize an audit export batch; holding the cursor"
             );
-            let now = Utc::now();
+            let now = Timestamp::now();
             let outcome = classify_export_outcome(
                 &SinkAttempt::transport_error(format!("batch serialization failed: {error}")),
                 last_seq,
@@ -3373,7 +3375,7 @@ async fn export_once_on_conn(
         }
     };
 
-    let delivered_at = Utc::now();
+    let delivered_at = Timestamp::now();
     let headers = export_headers(
         &config.secret,
         &body,
@@ -3418,10 +3420,10 @@ async fn export_once_on_conn(
         last_seq,
         claim.consecutive_failures,
         &config.backoff,
-        Utc::now(),
+        Timestamp::now(),
     );
 
-    let applied = apply_outcome(conn, shard_id, claim.claim_epoch, &outcome, Utc::now()).await?;
+    let applied = apply_outcome(conn, shard_id, claim.claim_epoch, &outcome, Timestamp::now()).await?;
 
     let delivered = match &outcome {
         ExportOutcome::Advance { .. } if applied => {
@@ -3503,7 +3505,7 @@ async fn emit_lag_and_observed(
         return;
     };
 
-    match export_lag_seconds(conn, acked, Utc::now()).await {
+    match export_lag_seconds(conn, acked, Timestamp::now()).await {
         Ok(lag) => {
             metrics.record_audit_export_observed(shard_u16, true);
             metrics.record_audit_export_lag(shard_u16, lag);
@@ -3850,7 +3852,7 @@ async fn export_once_via_pool(
     let claim = tokio::select! {
         result = async {
             ensure_cursor_row(&mut conn, shard_id).await?;
-            let now = Utc::now();
+            let now = Timestamp::now();
             config.claim(&mut conn, shard_id, now).await
         } => result?,
         () = cancel.cancelled() => {
@@ -3894,7 +3896,7 @@ async fn export_once_via_pool(
                 error = %error,
                 "failed to serialize an audit export batch; holding the cursor"
             );
-            let now = Utc::now();
+            let now = Timestamp::now();
             let outcome = classify_export_outcome(
                 &SinkAttempt::transport_error(format!("batch serialization failed: {error}")),
                 last_seq,
@@ -3919,7 +3921,7 @@ async fn export_once_via_pool(
         }
     };
 
-    let delivered_at = Utc::now();
+    let delivered_at = Timestamp::now();
     let headers = export_headers(
         &config.secret,
         &body,
@@ -3958,7 +3960,7 @@ async fn export_once_via_pool(
     // then always keeps some genuine delivery time.
     let reserve = (SHARD_ACQUIRE_BOUND + ACK_QUERY_BOUND).min(config.lease / 2);
     let delivery_deadline = claim.lease_until
-        - chrono::Duration::from_std(reserve).unwrap_or_else(|_| chrono::Duration::zero());
+        - jiff::SignedDuration::try_from(reserve).unwrap_or_else(|_| jiff::SignedDuration::ZERO);
 
     // The reserve is split between the reacquire below and the
     // acknowledgement query that follows it (PR #1520). The split keeps their
@@ -4038,7 +4040,7 @@ async fn export_once_via_pool(
         last_seq,
         claim.consecutive_failures,
         &config.backoff,
-        Utc::now(),
+        Timestamp::now(),
     );
 
     // Bounded by `ack_bound`, the reserve's own share for this query
@@ -4047,7 +4049,7 @@ async fn export_once_via_pool(
     // lost.
     let applied = match tokio::time::timeout(
         ack_bound,
-        apply_outcome(&mut conn, shard_id, claim.claim_epoch, &outcome, Utc::now()),
+        apply_outcome(&mut conn, shard_id, claim.claim_epoch, &outcome, Timestamp::now()),
     )
     .await
     {
@@ -4339,7 +4341,7 @@ mod tests {
             seq,
             id: Uuid::from_u128(u128::try_from(seq).unwrap_or(0)),
             shard_id: Some(3),
-            occurred_at: DateTime::from_timestamp(1_800_000_000, 0).expect("valid ts"),
+            occurred_at: Timestamp::from_second(1_800_000_000).ok().expect("valid ts"),
             actor: "alice".to_string(),
             operation: "workflow.cancel".to_string(),
             target_type: "workflow".to_string(),
@@ -4463,7 +4465,7 @@ mod tests {
             start_seq: 1,
             head_seq: 1,
             head: crate::audit_chain::GENESIS,
-            newest_at: DateTime::<Utc>::UNIX_EPOCH,
+            newest_at: Timestamp::UNIX_EPOCH,
         };
         let old = CallbackSecret::new(vec![2_u8; 32]);
         let short = CallbackSecret::new(vec![3_u8; 31]);
@@ -4505,7 +4507,7 @@ mod tests {
     fn export_headers_sign_the_exact_body_with_the_605_scheme() {
         let secret = CallbackSecret::new(b"topsecret".to_vec());
         let body = serialize_batch(&[rec(1), rec(2)]).expect("serializes");
-        let now = DateTime::from_timestamp(1_800_000_000, 0).expect("valid ts");
+        let now = Timestamp::from_second(1_800_000_000).ok().expect("valid ts");
         let headers = export_headers(&secret, &body, 3, 1, 2, now);
 
         let signature = headers
@@ -4524,7 +4526,7 @@ mod tests {
     #[test]
     fn export_headers_carry_the_shard_and_sequence_range() {
         let secret = CallbackSecret::new(Vec::new());
-        let now = DateTime::from_timestamp(1_800_000_000, 0).expect("valid ts");
+        let now = Timestamp::from_second(1_800_000_000).ok().expect("valid ts");
         let headers = export_headers(&secret, b"body", 3, 10, 42, now);
         let get = |name: &str| {
             headers
@@ -4535,7 +4537,7 @@ mod tests {
         assert_eq!(get(SHARD_HEADER), "3");
         assert_eq!(get(FIRST_SEQ_HEADER), "10");
         assert_eq!(get(LAST_SEQ_HEADER), "42");
-        assert_eq!(get(TIMESTAMP_HEADER), now.to_rfc3339());
+        assert_eq!(get(TIMESTAMP_HEADER), crate::time::rfc3339(now));
     }
 
     // ── Sink attempt classification ─────────────────────────────────────────
@@ -4555,7 +4557,7 @@ mod tests {
 
     #[test]
     fn a_2xx_advances_the_cursor_through_the_delivered_batch() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let outcome = classify_export_outcome(
             &SinkAttempt::success(202),
             42,
@@ -4574,7 +4576,7 @@ mod tests {
 
     #[test]
     fn a_failure_never_advances_the_cursor() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         for attempt in [
             SinkAttempt::success(500),
             SinkAttempt::success(404),
@@ -4594,7 +4596,7 @@ mod tests {
     // is the compliance artifact. Retry forever, capped.
     #[test]
     fn repeated_failures_keep_backing_off_and_never_give_up() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let backoff = ExportBackoff::default();
         for failures in [1_i32, 5, 50, 5_000, i32::MAX] {
             let outcome =
@@ -4608,7 +4610,7 @@ mod tests {
                     assert!(next_attempt_at >= now, "backoff is always in the future");
                     assert!(
                         next_attempt_at
-                            <= now + chrono::Duration::from_std(backoff.max_interval).unwrap(),
+                            <= now + jiff::SignedDuration::try_from(backoff.max_interval).unwrap(),
                         "backoff is capped at max_interval even after {failures} failures"
                     );
                     assert_eq!(
@@ -4626,7 +4628,7 @@ mod tests {
 
     #[test]
     fn backoff_grows_exponentially_before_the_cap() {
-        let now = DateTime::from_timestamp(1_800_000_000, 0).expect("valid ts");
+        let now = Timestamp::from_second(1_800_000_000).ok().expect("valid ts");
         let backoff = ExportBackoff {
             initial_interval: Duration::from_secs(1),
             backoff_coefficient: 2.0,
@@ -4641,7 +4643,7 @@ mod tests {
         ) {
             ExportOutcome::Backoff {
                 next_attempt_at, ..
-            } => (next_attempt_at - now).num_seconds(),
+            } => (next_attempt_at - now).as_secs(),
             ExportOutcome::Advance { .. } => panic!("not a success"),
         };
         assert_eq!(delay_after(0), 1, "first failure waits initial_interval");
@@ -4653,7 +4655,7 @@ mod tests {
 
     #[test]
     fn a_transport_error_is_recorded_as_the_last_error() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let outcome = classify_export_outcome(
             &SinkAttempt::transport_error("connection refused".to_string()),
             9,
@@ -4735,9 +4737,9 @@ mod tests {
 
     #[test]
     fn delivery_state_reports_every_branch() {
-        let now = DateTime::from_timestamp(1_800_000_000, 0).expect("valid ts");
-        let future = now + chrono::Duration::seconds(30);
-        let past = now - chrono::Duration::seconds(30);
+        let now = Timestamp::from_second(1_800_000_000).ok().expect("valid ts");
+        let future = now + jiff::SignedDuration::from_secs(30);
+        let past = now - jiff::SignedDuration::from_secs(30);
 
         assert_eq!(
             delivery_state(Some(future), 0, past, now, None),
@@ -5027,7 +5029,7 @@ mod tests {
         };
 
         // Most of the lease is already spent: only 50ms remain.
-        let nearly_expired = Utc::now() + chrono::Duration::milliseconds(50);
+        let nearly_expired = Timestamp::now() + jiff::SignedDuration::from_millis(50);
         let attempt = deliver_within_lease(&config, &batch, nearly_expired).await;
         assert!(
             attempt.status.is_none(),
@@ -5036,12 +5038,12 @@ mod tests {
         );
 
         // Ample remainder: the same sink succeeds.
-        let fresh = Utc::now() + chrono::Duration::seconds(5);
+        let fresh = Timestamp::now() + jiff::SignedDuration::from_secs(5);
         let attempt = deliver_within_lease(&config, &batch, fresh).await;
         assert_eq!(attempt.status, Some(200));
 
         // An already-elapsed lease is an immediate timeout, never a skip.
-        let past = Utc::now() - chrono::Duration::seconds(1);
+        let past = Timestamp::now() - jiff::SignedDuration::from_secs(1);
         let attempt = deliver_within_lease(&config, &batch, past).await;
         assert!(attempt.status.is_none());
     }

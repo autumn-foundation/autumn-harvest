@@ -449,7 +449,7 @@ async fn the_batched_attempt_rechecks_the_run_deadline() {
             .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(Some("noop"))
             .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(Vec::<String>::new())
             .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-                None::<chrono::DateTime<chrono::Utc>>,
+                None::<jiff::Timestamp>,
             )
             .bind::<diesel::sql_types::Text, _>("")
             .load(&mut conn)

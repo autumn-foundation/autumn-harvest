@@ -4,6 +4,8 @@
 #![allow(clippy::items_after_statements)]
 
 use autumn_harvest::schema::harvest_task_queue_ext;
+use jiff_diesel::ToDiesel;
+use autumn_harvest::time::sql::ToPgInterval;
 use autumn_harvest::table_split::SetExt;
 use std::any::Any;
 use std::collections::HashMap;
@@ -23,7 +25,7 @@ use autumn_harvest::{
     TraceContextPropagator, WorkflowContext, WorkflowHistoryPolicy, WorkflowResetRequest,
     cancel_workflow_execution, reset_workflow_execution, start_or_load_workflow_execution, timeout,
 };
-use chrono::Utc;
+use jiff::Timestamp;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::SimpleAsyncConnection;
@@ -223,7 +225,7 @@ async fn wait_for_workflow_task_parked(conn: &mut AsyncPgConnection, exec_id: Ex
                 harvest_task_queue::worker_id,
                 harvest_task_queue::started_at,
             ))
-            .first::<(String, Option<String>, Option<chrono::DateTime<Utc>>)>(conn)
+            .first::<(String, Option<String>, Option<jiff::Timestamp>)>(conn)
             .await
             .optional()
             .expect("workflow task query failed")
@@ -417,7 +419,7 @@ async fn insert_detached_child_execution(
         child_exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -952,7 +954,7 @@ async fn detached_spawn_before_local_activity_is_persisted() {
 #[tokio::test]
 async fn detached_child_execution_timeout_does_not_wake_parent() {
     use autumn_harvest::schema::harvest_workflow_executions;
-    use chrono::Utc;
+    use jiff::Timestamp;
     use diesel_async::RunQueryDsl;
 
     let (url, _container) = setup_test_db_url().await;
@@ -968,7 +970,7 @@ async fn detached_child_execution_timeout_does_not_wake_parent() {
     .await;
     let child_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
     let child_workflow_id = child_exec_id.to_string();
-    let timeout = chrono::Duration::milliseconds(1);
+    let timeout = jiff::SignedDuration::from_millis(1);
 
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&NewWorkflowExecution {
@@ -984,7 +986,7 @@ async fn detached_child_execution_timeout_does_not_wake_parent() {
             parent_id: Some(parent_exec_id.as_uuid()),
             queue_name: "default",
             execution_timeout: Some(timeout),
-            deadline_at: Some(Utc::now() - chrono::Duration::seconds(1)),
+            deadline_at: Some(Timestamp::now() - jiff::SignedDuration::from_secs(1)),
             chain_execution_timeout: None,
             chain_deadline_at: None,
             memo: None,
@@ -1020,7 +1022,7 @@ async fn detached_child_execution_timeout_does_not_wake_parent() {
         child_exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1284,10 +1286,10 @@ async fn workflow_task_timeout_cascades_detached_children() {
                 .filter(harvest_task_queue::task_type.eq("workflow")),
         )
         .set((
-            harvest_task_queue::scheduled_at.eq(Utc::now() - chrono::Duration::seconds(5)),
+            harvest_task_queue::scheduled_at.eq((Timestamp::now() - jiff::SignedDuration::from_secs(5)).to_diesel()),
             SetExt(
                 harvest_task_queue_ext::schedule_to_start
-                    .eq(Some(chrono::Duration::milliseconds(1))),
+                    .eq(Some(jiff::SignedDuration::from_millis(1)).to_pg_interval()),
             ),
         ))
         .execute(&mut conn)

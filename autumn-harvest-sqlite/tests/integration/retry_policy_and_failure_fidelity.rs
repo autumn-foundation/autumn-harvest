@@ -35,7 +35,7 @@ use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest_sqlite::{ActivitySpec, RunState, SqliteRuntime};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::json;
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
@@ -46,7 +46,7 @@ fn temp_db() -> (tempfile::TempDir, std::path::PathBuf) {
     (dir, path)
 }
 
-fn fixed_now() -> DateTime<Utc> {
+fn fixed_now() -> Timestamp {
     "2026-07-15T00:00:00Z".parse().unwrap()
 }
 
@@ -225,7 +225,7 @@ async fn retry_policy_backoff_delays_the_requeue() {
         "a poll before the backoff deadline must NOT re-run the body"
     );
 
-    let t0_ms = t0.timestamp_millis();
+    let t0_ms = t0.as_millisecond();
     let run_at = pending_task_run_at(&path, exec).expect("a pending backing-off task");
     assert_eq!(
         run_at,
@@ -234,7 +234,7 @@ async fn retry_policy_backoff_delays_the_requeue() {
     );
 
     let before = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(59))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(59))
         .await
         .unwrap();
     assert!(
@@ -248,7 +248,7 @@ async fn retry_policy_backoff_delays_the_requeue() {
     );
 
     let done = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(61))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(61))
         .await
         .unwrap();
     assert!(
@@ -295,7 +295,7 @@ async fn retry_policy_backoff_anchors_to_failure_time() {
     );
 
     let t0 = fixed_now();
-    let t_fail = t0 + chrono::Duration::seconds(45);
+    let t_fail = t0 + jiff::SignedDuration::from_secs(45);
     let reads = Arc::new(AtomicUsize::new(0));
     let reads_clock = reads.clone();
     rt.set_clock(move || {
@@ -320,7 +320,7 @@ async fn retry_policy_backoff_anchors_to_failure_time() {
     );
 
     let run_at = pending_task_run_at(&path, exec).expect("a pending backing-off task");
-    let t_fail_ms = t_fail.timestamp_millis();
+    let t_fail_ms = t_fail.as_millisecond();
     assert_eq!(
         run_at,
         t_fail_ms + 60_000,
@@ -328,7 +328,7 @@ async fn retry_policy_backoff_anchors_to_failure_time() {
     );
     assert_ne!(
         run_at,
-        t0.timestamp_millis() + 60_000,
+        t0.as_millisecond() + 60_000,
         "pre-fix: run_at was anchored to the cycle-start t0"
     );
     assert!(
@@ -529,13 +529,13 @@ async fn raw_path_falls_back_to_registered_default_retry_policy_backoff() {
     let run_at = pending_task_run_at(&path, exec).expect("a pending backing-off task");
     assert_eq!(
         run_at,
-        t0.timestamp_millis() + 60_000,
+        t0.as_millisecond() + 60_000,
         "the registered fixed(3, 60s) policy must delay the raw-path requeue by 60s, \
          not requeue at now"
     );
 
     let done = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(61))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(61))
         .await
         .unwrap();
     assert!(
@@ -658,14 +658,14 @@ async fn pending_signals_are_consumed_in_arrival_order_not_insertion_order() {
         exec,
         "approval",
         json!("late"),
-        t0 + chrono::Duration::seconds(3700),
+        t0 + jiff::SignedDuration::from_secs(3700),
     )
     .unwrap();
     rt.send_signal_as_of(
         exec,
         "approval",
         json!("ontime"),
-        t0 + chrono::Duration::seconds(10),
+        t0 + jiff::SignedDuration::from_secs(10),
     )
     .unwrap();
 
@@ -678,7 +678,7 @@ async fn pending_signals_are_consumed_in_arrival_order_not_insertion_order() {
     // too, although its `received_at` is after `now`. The ingest ignores `now`,
     // as the old wait path did.
     let done = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(20))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(20))
         .await
         .unwrap();
     assert!(

@@ -555,7 +555,7 @@ pub async fn resets_then_sleeps(ctx: &WorkflowContext, _n: i64) -> Result<String
     let mut gate = ctx.start_timer("gate", 600);
     gate.reset(1).map_err(err)?;
     let fired = gate.await_fire().await.map_err(err)?;
-    let wake = ctx.now() + chrono::Duration::seconds(1);
+    let wake = ctx.now() + jiff::SignedDuration::from_secs(1);
     ctx.sleep_until("wake", wake).await.map_err(err)?;
     Ok(format!("{fired:?}"))
 }

@@ -47,7 +47,7 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::Utc;
+use jiff::Timestamp;
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use serde_json::{Value, json};
@@ -574,7 +574,7 @@ async fn seed_execution_in_state(pool: &DbPool, workflow_name: &str, state: &str
 
     let events = vec![WorkflowEvent::WorkflowStarted {
         input: json!({}),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -610,7 +610,7 @@ async fn seed_update_admitted_event(
         update_id,
         name: update_name.to_string(),
         input: json!({}),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
     }];
     // WorkflowStarted was appended at event_id 0 by the seed helper; continue at 1.
     store::append_events(&mut conn, exec_id, &events, 1)
@@ -1354,7 +1354,7 @@ async fn sws_committed_keyed_replay_bypasses_a_raised_admission_gate() {
         reason: "p1-sws-gate-incident".to_string(),
         message: None,
         created_by: "test".to_string(),
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         expires_at: None,
     }]);
 
@@ -1601,7 +1601,7 @@ async fn uws_committed_keyed_replay_bypasses_a_raised_admission_gate() {
         reason: "p1-gate-incident".to_string(),
         message: None,
         created_by: "test".to_string(),
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         expires_at: None,
     }]);
 

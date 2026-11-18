@@ -19,7 +19,7 @@ use autumn_harvest::error::{HarvestError, TimeoutType};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::replay::HistoryMatcher;
 use autumn_harvest::types::{ActivityExecId, ExecutionId, ExternalActivityToken};
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
@@ -431,7 +431,7 @@ async fn context_replays_completed_external_activity() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -472,7 +472,7 @@ async fn context_replays_failed_external_activity() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -513,7 +513,7 @@ async fn context_replays_timed_out_external_activity() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -556,7 +556,7 @@ async fn context_awaiting_external_re_emits_same_token_idempotently() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -608,7 +608,7 @@ async fn context_execute_activity_external_detects_non_determinism() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -654,7 +654,7 @@ async fn context_double_complete_is_idempotent_replay() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -700,7 +700,7 @@ async fn context_post_restart_while_awaiting_with_deadline_extensions() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,

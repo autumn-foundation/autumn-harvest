@@ -20,6 +20,7 @@
 //      cross-shard routing, the grace window, and self-targeting rejection.
 
 use autumn_harvest::error::HarvestError;
+use jiff_diesel::ToDiesel;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::execution::{self, ByIdCancelOutcome};
 use autumn_harvest::info::WorkflowInfo;
@@ -579,7 +580,7 @@ async fn resolver_picks_most_recent_of_multiple_terminal_runs() {
     let (url, _c) = setup_test_database_url().await;
     let mut conn = connect(&url).await;
 
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let workflow_id = "res-multi-terminal";
 
     let predecessor_a = ExecutionId::new_for_shard(ShardId::new(0)); // inserted 1st, started_at newest -- must win
@@ -590,7 +591,7 @@ async fn resolver_picks_most_recent_of_multiple_terminal_runs() {
     diesel::update(harvest_workflow_executions::table.find(predecessor_a.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"),
-            harvest_workflow_executions::started_at.eq(now - chrono::Duration::hours(1)),
+            harvest_workflow_executions::started_at.eq(now - jiff::SignedDuration::from_hours(1)),
         ))
         .execute(&mut conn)
         .await
@@ -600,7 +601,7 @@ async fn resolver_picks_most_recent_of_multiple_terminal_runs() {
     diesel::update(harvest_workflow_executions::table.find(predecessor_b.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"),
-            harvest_workflow_executions::started_at.eq(now - chrono::Duration::hours(3)),
+            harvest_workflow_executions::started_at.eq(now - jiff::SignedDuration::from_hours(3)),
         ))
         .execute(&mut conn)
         .await
@@ -610,7 +611,7 @@ async fn resolver_picks_most_recent_of_multiple_terminal_runs() {
     diesel::update(harvest_workflow_executions::table.find(terminus.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("FAILED"),
-            harvest_workflow_executions::started_at.eq(now - chrono::Duration::hours(5)),
+            harvest_workflow_executions::started_at.eq(now - jiff::SignedDuration::from_hours(5)),
         ))
         .execute(&mut conn)
         .await
@@ -650,8 +651,8 @@ async fn resolver_never_returns_a_reconciled_seal() {
         .set((
             harvest_workflow_executions::state.eq("MIGRATED"),
             SetExt(harvest_workflow_executions_ext::migrated_to_shard.eq(1)),
-            SetExt(harvest_workflow_executions_ext::migrated_at.eq(chrono::Utc::now())),
-            harvest_workflow_executions::migrated_run_terminal_at.eq(chrono::Utc::now()),
+            SetExt(harvest_workflow_executions_ext::migrated_at.eq(jiff::Timestamp::now().to_diesel())),
+            harvest_workflow_executions::migrated_run_terminal_at.eq(jiff::Timestamp::now().to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -2358,12 +2359,12 @@ async fn cross_shard_cancel_reports_unfinished_handlers_on_the_target_shard() {
         &mut target_conn,
         target_exec_id,
         &[
-            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::workflow_started(serde_json::json!({}), jiff::Timestamp::now()),
             WorkflowEvent::UpdateAdmitted {
                 update_id,
                 name: "approve".to_string(),
                 input: serde_json::Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
             },
         ],
         1,
@@ -2391,7 +2392,7 @@ async fn cross_shard_cancel_reports_unfinished_handlers_on_the_target_shard() {
         &mut caller_conn,
         caller_exec_id,
         &[
-            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::workflow_started(serde_json::json!({}), jiff::Timestamp::now()),
             WorkflowEvent::ExternalCancelRequested {
                 cancel_id,
                 target: autumn_harvest::types::ExternalTarget::WorkflowId {
@@ -2569,12 +2570,12 @@ async fn cross_shard_cancel_target_followups_survive_a_failed_caller_side_commit
         &mut target_conn,
         target_exec_id,
         &[
-            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::workflow_started(serde_json::json!({}), jiff::Timestamp::now()),
             WorkflowEvent::UpdateAdmitted {
                 update_id,
                 name: "approve".to_string(),
                 input: serde_json::Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
             },
         ],
         1,
@@ -2608,7 +2609,7 @@ async fn cross_shard_cancel_target_followups_survive_a_failed_caller_side_commit
         &mut caller_conn,
         caller_exec_id,
         &[
-            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::workflow_started(serde_json::json!({}), jiff::Timestamp::now()),
             WorkflowEvent::ExternalCancelRequested {
                 cancel_id,
                 target: autumn_harvest::types::ExternalTarget::WorkflowId {
@@ -2774,12 +2775,12 @@ async fn cross_shard_cancel_deferred_check_does_not_deadlock_on_unencoded_caller
         &mut conn,
         target_exec_id,
         &[
-            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::workflow_started(serde_json::json!({}), jiff::Timestamp::now()),
             WorkflowEvent::UpdateAdmitted {
                 update_id,
                 name: "approve".to_string(),
                 input: serde_json::Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
             },
         ],
         1,
@@ -2799,7 +2800,7 @@ async fn cross_shard_cancel_deferred_check_does_not_deadlock_on_unencoded_caller
         &mut conn,
         caller_exec_id,
         &[
-            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::workflow_started(serde_json::json!({}), jiff::Timestamp::now()),
             WorkflowEvent::ExternalCancelRequested {
                 cancel_id,
                 target: autumn_harvest::types::ExternalTarget::ExecutionId(target_exec_id),

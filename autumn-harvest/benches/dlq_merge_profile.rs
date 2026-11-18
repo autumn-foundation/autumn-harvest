@@ -70,7 +70,6 @@
 use autumn_harvest::dlq::{
     DlqAggregateParams, DlqAggregatePartial, DlqGroupDimension, DlqRawGroup, merge_dlq_aggregates,
 };
-use chrono::{TimeZone, Utc};
 
 fn env_usize(key: &str, default: usize) -> usize {
     match std::env::var(key) {
@@ -91,12 +90,12 @@ fn env_usize(key: &str, default: usize) -> usize {
 /// `min_instant`/`max_instant` genuinely do comparison work across shards
 /// rather than folding identical values.
 fn build_partial(shard_id: usize, groups: usize, samples_per_group: usize) -> DlqAggregatePartial {
-    let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let base = autumn_harvest::time::utc_ymd_hms(2026, 1, 1, 0, 0, 0).unwrap();
     let count_per_group = 100 + i64::try_from(shard_id).unwrap_or(0);
     let rows: Vec<DlqRawGroup> = (0..groups)
         .map(|g| {
             let failed_at =
-                base + chrono::Duration::seconds(i64::try_from(shard_id * groups + g).unwrap_or(0));
+                base + jiff::SignedDuration::from_secs(i64::try_from(shard_id * groups + g).unwrap_or(0));
             DlqRawGroup {
                 key: vec![
                     Some(format!("workflow_{g}")),
@@ -104,7 +103,7 @@ fn build_partial(shard_id: usize, groups: usize, samples_per_group: usize) -> Dl
                 ],
                 count: count_per_group,
                 first_seen: Some(failed_at),
-                last_seen: Some(failed_at + chrono::Duration::seconds(30)),
+                last_seen: Some(failed_at + jiff::SignedDuration::from_secs(30)),
                 sample_ids: (0..samples_per_group)
                     .map(|s| format!("shard{shard_id}-group{g}-sample{s}"))
                     .collect(),

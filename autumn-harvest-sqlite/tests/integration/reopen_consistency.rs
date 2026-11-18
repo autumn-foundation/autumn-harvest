@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use autumn_harvest::prelude::*;
 use autumn_harvest_sqlite::{ActivitySpec, ExecutionId, ExecutionOutcome, RunState, SqliteRuntime};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::json;
 
 /// Exercises every persist site: a frozen side effect, then an activity, then a
@@ -177,7 +177,7 @@ fn assert_reopen_consistent(rt: &SqliteRuntime, path: &Path, exec: ExecutionId) 
 async fn reopen_consistency_across_every_persist_site() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("harvest.sqlite3");
-    let t0: DateTime<Utc> = DateTime::from_timestamp(2_000_000, 0).unwrap();
+    let t0: Timestamp = Timestamp::from_second(2_000_000).ok().unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
 
     // Stage 1 — start (execution row + WorkflowStarted, one transaction).
@@ -210,7 +210,7 @@ async fn reopen_consistency_across_every_persist_site() {
     {
         let mut rt = build_rt(&path, &calls);
         let state = rt
-            .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(10))
+            .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(10))
             .await
             .unwrap();
         assert!(
@@ -225,7 +225,7 @@ async fn reopen_consistency_across_every_persist_site() {
         let mut rt = build_rt(&path, &calls);
         rt.send_signal(exec, "go", json!("approved")).unwrap();
         let state = rt
-            .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(20))
+            .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(20))
             .await
             .unwrap();
         assert!(matches!(state, RunState::Completed(_)), "got {state:?}");

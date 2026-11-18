@@ -296,7 +296,7 @@ fn comparison_page_links_back_to_the_migration_guide() {
 /// hold up. Picking a cutover timestamp to land on the original phase
 /// assumes the reader can choose the actual insert moment.
 /// `WorkflowSchedule` and its create request take no such anchor.
-/// `Utc::now()` at the real insert sets the phase instead, later still
+/// `Timestamp::now()` at the real insert sets the phase instead, later still
 /// once request and database latency are added in.
 ///
 /// Capturing which engine owns a schedule-driven type's executions,

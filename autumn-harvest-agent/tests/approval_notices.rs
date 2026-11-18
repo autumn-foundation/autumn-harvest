@@ -124,7 +124,7 @@ async fn settle(rt: &mut SqliteRuntime, agent: &AgentId) -> Option<RunState> {
             break;
         }
         let exec = sqlite::current_run(rt, agent).unwrap().unwrap();
-        let at = Utc::now() + autumn_harvest::chrono::Duration::seconds(pass * 5);
+        let at = Timestamp::now() + autumn_harvest::jiff::SignedDuration::from_secs(pass * 5);
         rt.run_until_blocked_as_of(exec, at).await.unwrap();
         state = sqlite::drive(rt, agent).await.unwrap();
     }
@@ -228,10 +228,10 @@ async fn a_gated_call_on_an_agent_sends_one_notice_that_decide_accepts() {
     let model = ScriptedModel::new(script());
     let mut rt = runtime(&db, harness(model, &recorder, &notices));
     let agent = id("acct-1");
-    let before = Utc::now();
+    let before = Timestamp::now();
 
     let signal = park(&mut rt, &agent, "save it").await;
-    let after = Utc::now();
+    let after = Timestamp::now();
     let seen = notices.seen();
     assert_eq!(seen.len(), 1, "one notice for one parked call");
     let notice = &seen[0];
@@ -248,7 +248,7 @@ async fn a_gated_call_on_an_agent_sends_one_notice_that_decide_accepts() {
         notice.key(),
         format!("{}:{exec}:{signal}", notice.call.run_id.as_str())
     );
-    let window = autumn_harvest::chrono::Duration::seconds(600);
+    let window = autumn_harvest::jiff::SignedDuration::from_secs(600);
     assert!(notice.deadline >= before + window, "{notice:?}");
     assert!(notice.deadline <= after + window, "{notice:?}");
     assert!(recorder.runs().is_empty(), "the notice releases nothing");
@@ -434,7 +434,7 @@ async fn a_failed_notice_and_no_decision_deny_the_call() {
 
     // Nobody decides. The 600 s deadline passes.
     let exec = sqlite::current_run(&rt, &agent).unwrap().unwrap();
-    let late = Utc::now() + autumn_harvest::chrono::Duration::seconds(601);
+    let late = Timestamp::now() + autumn_harvest::jiff::SignedDuration::from_secs(601);
     rt.run_until_blocked_as_of(exec, late).await.unwrap();
 
     assert!(recorder.runs().is_empty(), "a timeout runs nothing");
@@ -535,7 +535,7 @@ async fn a_decision_during_the_notice_releases_an_agent_loop_call() {
         harness(ScriptedModel::new(script()), &recorder, &notices),
     );
     let exec = sqlite::start(&mut rt, &AgentTask::new("save it")).unwrap();
-    let start = Utc::now();
+    let start = Timestamp::now();
     let state = rt.run_until_blocked_as_of(exec, start).await.unwrap();
     assert!(matches!(state, RunState::WaitingTimer), "{state:?}");
 
@@ -547,7 +547,7 @@ async fn a_decision_during_the_notice_releases_an_agent_loop_call() {
         if !matches!(state, RunState::WaitingTimer) {
             break;
         }
-        let at = start + autumn_harvest::chrono::Duration::seconds(pass * 5);
+        let at = start + autumn_harvest::jiff::SignedDuration::from_secs(pass * 5);
         state = rt.run_until_blocked_as_of(exec, at).await.unwrap();
     }
     assert!(matches!(state, RunState::Completed(_)), "{state:?}");

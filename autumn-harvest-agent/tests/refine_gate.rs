@@ -27,7 +27,7 @@ use autumn_harvest_agent::{
 use autumn_harvest_sqlite::{
     ExecutionFilter, ExecutionId, ExecutionSummary, RunState, SqliteRuntime,
 };
-use chrono::{DateTime, TimeZone, Utc};
+use jiff::Timestamp;
 use serde_json::json;
 
 const KIND: &str = "support";
@@ -150,8 +150,8 @@ struct Fixture {
 }
 
 /// The start of the test clock.
-fn epoch() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 1, 5, 12, 0, 0).unwrap()
+fn epoch() -> Timestamp {
+    autumn_harvest::time::utc_ymd_hms(2026, 1, 5, 12, 0, 0).unwrap()
 }
 
 fn fixture() -> Fixture {
@@ -167,7 +167,7 @@ fn fixture() -> Fixture {
         .proposer(Arc::clone(&proposer) as Arc<dyn OverlayProposer>)
         .composer(Arc::new(Composer) as Arc<dyn OverlayComposer>)
         .refine_sources(Arc::new(sqlite::Sources::open(&db)));
-    let clock = Arc::new(AtomicI64::new(epoch().timestamp_millis()));
+    let clock = Arc::new(AtomicI64::new(epoch().as_millisecond()));
     let rt = open(&db, &harness, &clock);
     Fixture {
         _dir: dir,
@@ -185,7 +185,7 @@ fn fixture() -> Fixture {
 fn open(db: &std::path::Path, harness: &AgentHarness, clock: &Arc<AtomicI64>) -> SqliteRuntime {
     let mut rt = SqliteRuntime::open(db).unwrap();
     let read = Arc::clone(clock);
-    rt.set_clock(move || DateTime::from_timestamp_millis(read.load(Ordering::SeqCst)).unwrap());
+    rt.set_clock(move || Timestamp::from_millisecond(read.load(Ordering::SeqCst)).ok().unwrap());
     sqlite::register(&mut rt, Arc::new(harness.clone()));
     rt
 }

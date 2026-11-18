@@ -1,4 +1,5 @@
 use autumn_harvest::schema::harvest_workflow_executions_ext;
+use jiff_diesel::ToDiesel;
 use autumn_harvest::table_split::Ext;
 use autumn_web::reexports::axum;
 use autumn_web::reexports::http;
@@ -153,7 +154,7 @@ async fn test_replay_canary_api_endpoint_fails_on_divergence() {
     use autumn_harvest::event::WorkflowEvent;
     use autumn_harvest::schema::{harvest_events, harvest_workflow_executions};
     use autumn_harvest::types::{ActivityExecId, ExecutionId};
-    use chrono::Utc;
+    use jiff::Timestamp;
     use diesel::prelude::*;
     use diesel_async::AsyncConnection;
     use diesel_async::RunQueryDsl;
@@ -177,8 +178,8 @@ async fn test_replay_canary_api_endpoint_fails_on_divergence() {
             harvest_workflow_executions::state.eq("RUNNING".to_string()),
             harvest_workflow_executions::input.eq(json!("hi")),
             harvest_workflow_executions::queue_name.eq("default".to_string()),
-            harvest_workflow_executions::started_at.eq(Utc::now()),
-            harvest_workflow_executions::created_at.eq(Utc::now()),
+            harvest_workflow_executions::started_at.eq(Timestamp::now().to_diesel()),
+            harvest_workflow_executions::created_at.eq(Timestamp::now().to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -186,7 +187,7 @@ async fn test_replay_canary_api_endpoint_fails_on_divergence() {
 
     let start_event = WorkflowEvent::WorkflowStarted {
         input: json!("hi"),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -199,7 +200,7 @@ async fn test_replay_canary_api_endpoint_fails_on_divergence() {
             harvest_events::event_id.eq(1),
             harvest_events::event_type.eq("WorkflowStarted".to_string()),
             harvest_events::event_data.eq(start_json),
-            harvest_events::timestamp.eq(Utc::now()),
+            harvest_events::timestamp.eq(Timestamp::now().to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -220,7 +221,7 @@ async fn test_replay_canary_api_endpoint_fails_on_divergence() {
             harvest_events::event_id.eq(2),
             harvest_events::event_type.eq("ActivityScheduled".to_string()),
             harvest_events::event_data.eq(act_json),
-            harvest_events::timestamp.eq(Utc::now()),
+            harvest_events::timestamp.eq(Timestamp::now().to_diesel()),
         ))
         .execute(&mut conn)
         .await

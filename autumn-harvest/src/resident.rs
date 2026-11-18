@@ -173,8 +173,8 @@ pub(crate) struct ResidentKey {
     queue_name: String,
     shard_id: Option<i64>,
     build_id: Option<String>,
-    execution_timeout: Option<chrono::Duration>,
-    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    execution_timeout: Option<jiff::SignedDuration>,
+    deadline_at: Option<jiff::Timestamp>,
     parent_execution_id: Option<ExecutionId>,
     start_provenance: crate::types::StartProvenance,
     context_headers: HashMap<String, String>,
@@ -809,8 +809,7 @@ mod tests {
     use super::*;
     use crate::context::{WorkflowCommand, WorkflowContext};
     use crate::types::{ActivityExecId, TimerId};
-    use chrono::{TimeZone, Utc};
-    use serde_json::json;
+        use serde_json::json;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -827,9 +826,7 @@ mod tests {
     fn started(input: Value) -> WorkflowEvent {
         WorkflowEvent::WorkflowStarted {
             input,
-            timestamp: Utc
-                .with_ymd_and_hms(2026, 10, 3, 0, 0, 0)
-                .single()
+            timestamp: crate::time::utc_ymd_hms(2026, 10, 3, 0, 0, 0)
                 .expect("valid timestamp"),
             last_completion_result: None,
             last_error: None,
@@ -1488,7 +1485,7 @@ mod tests {
             update_id: crate::types::UpdateId::new(),
             name: "bump".into(),
             input: Value::Null,
-            timestamp: chrono::Utc::now(),
+            timestamp: jiff::Timestamp::now(),
         }
     }
 

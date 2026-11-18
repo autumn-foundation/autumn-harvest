@@ -95,12 +95,12 @@ enum Command {
 
 /// The desk clock: the wall clock, moved on by each `tick`. It never runs
 /// back, so a timer that a tick fired stays fired.
-fn now(desk: &Desk) -> DateTime<Utc> {
+fn now(desk: &Desk) -> Timestamp {
     let offset = std::fs::read_to_string(desk.root().join("clock.txt"))
         .ok()
         .and_then(|text| text.trim().parse::<i64>().ok())
         .unwrap_or(0);
-    Utc::now() + Duration::minutes(offset)
+    Timestamp::now() + Duration::minutes(offset)
 }
 
 fn move_clock(desk: &Desk, minutes: i64) -> std::io::Result<()> {

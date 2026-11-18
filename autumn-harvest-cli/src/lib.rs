@@ -6841,7 +6841,7 @@ pub async fn run_partition(command: &PartitionCommand) -> Result<(), CliError> {
                 "{}",
                 autumn_harvest::partition::migration_plan(
                     &opts,
-                    autumn_harvest::chrono::Utc::now()
+                    autumn_harvest::jiff::Timestamp::now()
                 )
             );
             Ok(())
@@ -6946,7 +6946,7 @@ async fn run_partition_status(shards: &[String], format: DrFormat) -> Result<(),
                     // straggler delete.
                     match autumn_harvest::partition::evaluate(
                         &mut conn,
-                        autumn_harvest::chrono::Utc::now(),
+                        autumn_harvest::jiff::Timestamp::now(),
                         &autumn_harvest::partition::SweepOptions::default(),
                         None,
                     )
@@ -7095,7 +7095,7 @@ async fn run_partition_maintain(
                 autumn_harvest::replication::join_fenced_pass_direct(&target.dsn, &mut conn).await;
             autumn_harvest::partition::maintain(
                 &mut conn,
-                autumn_harvest::chrono::Utc::now(),
+                autumn_harvest::jiff::Timestamp::now(),
                 lookahead_cohorts,
                 &sweep,
                 None,
@@ -7226,9 +7226,9 @@ fn emit_partition_report(
                             "    {:<40} {} .. {}",
                             p.name,
                             p.lower
-                                .map_or_else(|| "MINVALUE".into(), |t| t.to_rfc3339()),
+                                .map_or_else(|| "MINVALUE".into(), |t| autumn_harvest::time::rfc3339(t)),
                             p.upper
-                                .map_or_else(|| "MAXVALUE".into(), |t| t.to_rfc3339()),
+                                .map_or_else(|| "MAXVALUE".into(), |t| autumn_harvest::time::rfc3339(t)),
                         );
                     }
                 }
@@ -11419,7 +11419,7 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
                         "reconciled": reconciled,
                         "failures": failures,
                         "next_scan_cursor": next_cursor.map(|(at, id)| serde_json::json!({
-                            "migrated_at": at.to_rfc3339(),
+                            "migrated_at": autumn_harvest::time::rfc3339(at),
                             "execution_id": id.as_uuid(),
                         })),
                     }))
@@ -11434,7 +11434,7 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
                     println!(
                         "more may remain past this window; resume with:\n  \
                          --after-migrated-at {} --after-execution-id {}",
-                        at.to_rfc3339(),
+                        autumn_harvest::time::rfc3339(at),
                         id.as_uuid()
                     );
                 }
@@ -11478,7 +11478,7 @@ fn format_rebalance_report(
             out,
             "more may remain past this window; resume with:\n  \
              --after-created-at {} --after-execution-id {}",
-            at.to_rfc3339(),
+            autumn_harvest::time::rfc3339(at),
             id.as_uuid()
         );
     }
@@ -13709,7 +13709,7 @@ pub fn build_bootstrap_token_for_tenant(
     // Validate the expiry up front so we never print an INSERT that Postgres
     // rejects at run time.
     if let Some(e) = expires_at {
-        autumn_harvest::chrono::DateTime::parse_from_rfc3339(e).map_err(|source| {
+        autumn_harvest::e.parse::<Timestamp>().map_err(|source| {
             CliError::InvalidInput(format!(
                 "token bootstrap: --expires-at '{e}' is not a valid RFC 3339 timestamp: {source}"
             ))

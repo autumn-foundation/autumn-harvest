@@ -71,7 +71,7 @@ use autumn_harvest::stall_diagnosis;
 use autumn_harvest::store;
 use autumn_harvest::types::{ExecutionId, ShardId};
 
-use chrono::{Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use serde_json::{Value, json};
@@ -308,7 +308,7 @@ async fn insert_execution_with_id(
 fn started(input: Value) -> WorkflowEvent {
     WorkflowEvent::WorkflowStarted {
         input,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -347,7 +347,7 @@ async fn append_more(conn: &mut AsyncPgConnection, exec_id: ExecutionId, events:
 /// A durable timer parked in the future, plus the PENDING workflow task row that
 /// is how a timer-parked execution actually waits.
 async fn park_on_timer(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
-    let fires_at = Utc::now() + Duration::days(7);
+    let fires_at = Timestamp::now() + autumn_harvest::time::days(7);
     diesel::sql_query(
         "INSERT INTO harvest_timers (id, workflow_exec_id, timer_id, fires_at, fired) \
          VALUES ($1, $2, 'wake', $3, FALSE)",
@@ -430,11 +430,11 @@ struct StagedPayload {
 #[allow(clippy::struct_field_names)] // all three genuinely are timestamps
 struct TaskProvenance {
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    scheduled_at: chrono::DateTime<Utc>,
+    scheduled_at: jiff::Timestamp,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    created_at: chrono::DateTime<Utc>,
+    created_at: jiff::Timestamp,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    timer_fires_at: Option<chrono::DateTime<Utc>>,
+    timer_fires_at: Option<jiff::Timestamp>,
 }
 
 #[derive(diesel::QueryableByName)]
@@ -490,7 +490,8 @@ async fn forward_of(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Optio
 #[derive(diesel::QueryableByName)]
 struct ScalarTimestamp {
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    value: Option<chrono::DateTime<Utc>>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+    value: Option<jiff::Timestamp>,
 }
 
 /// `harvest_workflow_executions.legal_hold_set_at`, `NULL` when no hold is
@@ -498,7 +499,7 @@ struct ScalarTimestamp {
 async fn legal_hold_set_at_of(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
-) -> Option<chrono::DateTime<Utc>> {
+) -> Option<jiff::Timestamp> {
     let row: Option<ScalarTimestamp> = diesel::sql_query(
         "SELECT legal_hold_set_at AS value FROM harvest_workflow_executions WHERE id = $1",
     )
@@ -694,8 +695,8 @@ async fn the_llm_ledger_moves_with_the_run() {
     // The sealed source keeps its copy, but only the target reports it.
     let query = autumn_harvest::usage::UsageQuery {
         group_by: autumn_harvest::usage::UsageGroupBy::WorkflowName,
-        from: Utc::now() - Duration::hours(1),
-        to: Utc::now() + Duration::hours(1),
+        from: Timestamp::now() - SignedDuration::from_hours(1),
+        to: Timestamp::now() + SignedDuration::from_hours(1),
     };
     let llm_calls = |rows: Vec<autumn_harvest::usage::UsageShardRow>| {
         rows.iter()
@@ -1598,7 +1599,7 @@ async fn activation_repend_does_not_misattribute_a_stale_timer_to_the_new_signal
     // `staged_task` JSONB captured on the source at stage time, so that
     // payload is rewritten instead. Neither touches the event history
     // verification already checked byte-for-byte.
-    let fires_at = Utc::now() - Duration::hours(2);
+    let fires_at = Timestamp::now() - SignedDuration::from_hours(2);
     diesel::sql_query("UPDATE harvest_timers SET fires_at = $1 WHERE workflow_exec_id = $2")
         .bind::<diesel::sql_types::Timestamptz, _>(fires_at)
         .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
@@ -1617,7 +1618,7 @@ async fn activation_repend_does_not_misattribute_a_stale_timer_to_the_new_signal
         .staged_task
         .expect("a timer-parked execution stages a workflow task row");
     payload["scheduled_at"] = json!(fires_at);
-    payload["created_at"] = json!(fires_at - Duration::hours(1));
+    payload["created_at"] = json!(fires_at - SignedDuration::from_hours(1));
     payload["timer_fires_at"] = json!(fires_at);
     diesel::sql_query(
         "UPDATE harvest_shard_migrations SET staged_task = $1 WHERE execution_id = $2",
@@ -1659,7 +1660,7 @@ async fn activation_repend_does_not_misattribute_a_stale_timer_to_the_new_signal
         "the signal wake must clear the stale timer marker: {row:?}",
     );
     assert!(
-        (row.created_at - row.scheduled_at).num_seconds().abs() < 2,
+        (row.created_at - row.scheduled_at).as_secs().abs() < 2,
         "created_at must be refreshed alongside scheduled_at (issue #1191 \
          fingerprint), so a later saturated-dispatch delay cannot be \
          misread as this stale timer's own wake: {row:?}",
@@ -1683,7 +1684,7 @@ async fn activation_repend_does_not_misattribute_a_stale_timer_to_the_new_signal
         workflow_task: Some(facts),
         ..Default::default()
     };
-    let verdict = stall_diagnosis::classify_execution(&inputs, Utc::now())
+    let verdict = stall_diagnosis::classify_execution(&inputs, Timestamp::now())
         .expect("non-terminal execution must yield a verdict");
     assert_ne!(
         verdict.kind(),
@@ -5119,7 +5120,7 @@ fn fleet_gate_cache(
         reason: reason.to_string(),
         message: None,
         created_by: "test".to_string(),
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         expires_at: None,
     }]);
     cache
@@ -6350,7 +6351,7 @@ async fn a_hold_placed_after_verification_refuses_the_cutover() {
         "litigation hold",
         None,
         "compliance-bot",
-        Utc::now(),
+        Timestamp::now(),
     )
     .await
     .expect("place a hold after the copy was verified");
@@ -6411,7 +6412,7 @@ async fn a_hold_released_after_verification_also_refuses_the_cutover() {
         "under review",
         None,
         "compliance-bot",
-        Utc::now(),
+        Timestamp::now(),
     )
     .await
     .expect("place a hold before staging begins");
@@ -6426,7 +6427,7 @@ async fn a_hold_released_after_verification_also_refuses_the_cutover() {
         .await
         .expect("verify");
 
-    autumn_harvest::release_legal_hold(&mut source, exec_id, Utc::now())
+    autumn_harvest::release_legal_hold(&mut source, exec_id, Timestamp::now())
         .await
         .expect("release the hold after verification");
 
@@ -6466,7 +6467,7 @@ async fn a_hold_placed_between_staging_and_verification_fails_verification() {
         "hold arrived mid-staging",
         None,
         "compliance-bot",
-        Utc::now(),
+        Timestamp::now(),
     )
     .await
     .expect("place a hold after staging but before verification");
@@ -6677,7 +6678,8 @@ struct HoldMarkerRow {
     #[diesel(sql_type = diesel::sql_types::Bool)]
     legal_hold_verified: bool,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    verified_legal_hold_set_at: Option<chrono::DateTime<Utc>>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+    verified_legal_hold_set_at: Option<jiff::Timestamp>,
 }
 
 #[tokio::test]
@@ -6776,7 +6778,7 @@ async fn a_declined_cutover_reports_legal_hold_drift_not_a_wake() {
         "placed after verification",
         None,
         "compliance-bot",
-        Utc::now(),
+        Timestamp::now(),
     )
     .await
     .expect("place a hold after the copy was verified");
@@ -6885,7 +6887,7 @@ async fn set_legal_hold_refuses_a_row_sealed_after_it_resolved_but_before_its_lo
         "queued behind cutover",
         None,
         "compliance-bot",
-        Utc::now(),
+        Timestamp::now(),
     )
     .await;
 
@@ -6926,7 +6928,7 @@ async fn release_legal_hold_refuses_a_sealed_row_instead_of_clearing_it() {
         "under review",
         None,
         "compliance-bot",
-        Utc::now(),
+        Timestamp::now(),
     )
     .await
     .expect("place a hold before migrating");
@@ -6936,7 +6938,7 @@ async fn release_legal_hold_refuses_a_sealed_row_instead_of_clearing_it() {
         .expect("migration must succeed");
 
     let mut source = shards.source().await;
-    let result = autumn_harvest::release_legal_hold(&mut source, exec_id, Utc::now()).await;
+    let result = autumn_harvest::release_legal_hold(&mut source, exec_id, Timestamp::now()).await;
 
     match result {
         Err(HarvestError::ShardUnavailable { shard_id, reason }) => {
@@ -6974,7 +6976,7 @@ async fn set_legal_hold_forwarded_lands_the_hold_on_the_live_copy_after_a_cutove
         "compliance review",
         None,
         "compliance-bot",
-        Utc::now(),
+        Timestamp::now(),
     )
     .await
     .expect("the forwarded write must follow the seal to the live copy");
@@ -7005,7 +7007,7 @@ async fn release_legal_hold_forwarded_clears_the_hold_on_the_live_copy_after_a_c
         "under review",
         None,
         "compliance-bot",
-        Utc::now(),
+        Timestamp::now(),
     )
     .await
     .expect("place a hold before migrating");
@@ -7014,7 +7016,7 @@ async fn release_legal_hold_forwarded_clears_the_hold_on_the_live_copy_after_a_c
         .await
         .expect("migration must succeed");
 
-    let (outcome, shard) = release_legal_hold_forwarded(&shards.pool, exec_id, Utc::now())
+    let (outcome, shard) = release_legal_hold_forwarded(&shards.pool, exec_id, Timestamp::now())
         .await
         .expect("the forwarded release must follow the seal to the live copy");
     assert!(outcome.released);
@@ -7127,7 +7129,7 @@ async fn set_legal_hold_forwarded_recovers_from_a_seal_mid_flight() {
                 "recovers from a mid-flight seal",
                 None,
                 "compliance-bot",
-                Utc::now(),
+                Timestamp::now(),
             )
             .await
         })
@@ -7160,7 +7162,7 @@ async fn release_legal_hold_forwarded_recovers_from_a_seal_mid_flight() {
         "under review",
         None,
         "compliance-bot",
-        Utc::now(),
+        Timestamp::now(),
     )
     .await
     .expect("place a hold before staging");
@@ -7178,7 +7180,7 @@ async fn release_legal_hold_forwarded_recovers_from_a_seal_mid_flight() {
 
     let pool = shards.pool.clone();
     let write_task = seal_mid_flight(&shards, exec_id, || {
-        tokio::spawn(async move { release_legal_hold_forwarded(&pool, exec_id, Utc::now()).await })
+        tokio::spawn(async move { release_legal_hold_forwarded(&pool, exec_id, Timestamp::now()).await })
     })
     .await;
 
@@ -7343,7 +7345,7 @@ async fn a_migrated_cancel_target_s_unfinished_handler_check_reuses_the_held_con
                 update_id,
                 name: "approve".to_string(),
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
             },
         ],
     )
@@ -9197,7 +9199,8 @@ async fn a_fenced_scanner_writes_nothing_on_a_shard_it_lost() {
     #[derive(diesel::QueryableByName)]
     struct Stamp {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        updated_at: chrono::DateTime<Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        updated_at: jiff::Timestamp,
     }
 
     const FROM: ShardId = ShardId::new(40);
@@ -9258,7 +9261,7 @@ async fn a_fenced_scanner_writes_nothing_on_a_shard_it_lost() {
     );
     age_migration(&mut source, exec_id, 7200).await;
 
-    let stamp = async |conn: &mut AsyncPgConnection| -> chrono::DateTime<Utc> {
+    let stamp = async |conn: &mut AsyncPgConnection| -> jiff::Timestamp {
         diesel::sql_query("SELECT updated_at FROM harvest_shard_migrations WHERE execution_id = $1")
             .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
             .get_result::<Stamp>(conn)

@@ -57,7 +57,7 @@ use autumn_harvest::dlq::{
     group_dead_letter_rows,
 };
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
-use chrono::{Duration as ChronoDuration, TimeZone, Utc};
+use jiff::SignedDuration;
 use uuid::Uuid;
 
 /// Reads `key` as a `usize`, using `default` only when the variable is
@@ -148,7 +148,7 @@ fn error_text_for_group(shape: usize, group_index: usize) -> String {
 /// SHAPE_COUNT)`. So the composite key is injective in `group_index` for *any*
 /// `group_count`, not only one below `lcm(previous_fixed_modulus, SHAPE_COUNT)`.
 fn build_rows(n: usize, group_count: usize) -> (Vec<AggregateRow>, HashMap<Uuid, String>) {
-    let base_time = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let base_time = autumn_harvest::time::utc_ymd_hms(2026, 1, 1, 0, 0, 0).unwrap();
     // `i % group_count` for `i in 0..n` produces only the residues
     // `0..group_count.min(n)`. If `n < group_count`, the modulus never wraps,
     // so no row references `n..group_count`. `expected_groups` in `main`
@@ -178,7 +178,7 @@ fn build_rows(n: usize, group_count: usize) -> (Vec<AggregateRow>, HashMap<Uuid,
             Some(format!("charge_card_{}", group % 3)),
             "default".to_string(),
             "activity".to_string(),
-            base_time + ChronoDuration::seconds(i64::try_from(i).unwrap_or(i64::MAX)),
+            base_time + SignedDuration::from_secs(i64::try_from(i).unwrap_or(i64::MAX)),
             error_text_for_group(group % SHAPE_COUNT, group),
         ));
     }

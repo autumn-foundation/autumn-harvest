@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use autumn_harvest::execution::{REACHABILITY_SAMPLE_CAP, non_terminal_counts_by_workflow_name};
 use autumn_harvest::models::NewWorkflowExecution;
 use autumn_harvest::types::{ExecutionId, ShardId};
-use chrono::Utc;
+use jiff::Timestamp;
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde_json::json;
@@ -102,7 +102,7 @@ async fn insert_execution(
     let completed_at = if state == "RUNNING" {
         None
     } else {
-        Some(Utc::now())
+        Some(Timestamp::now())
     };
     diesel::update(
         autumn_harvest::schema::harvest_workflow_executions::table.find(exec_id.as_uuid()),
@@ -184,13 +184,13 @@ async fn non_terminal_counts_samples_are_oldest_first() {
     .await
     .expect("scrub");
 
-    let base: chrono::DateTime<chrono::Utc> = Utc::now();
+    let base: jiff::Timestamp = Timestamp::now();
     // (started_at, id) for each seeded run. started_at = base - n minutes, so a
     // later-inserted row is OLDER — insertion order and started_at order diverge.
-    let mut by_started: Vec<(chrono::DateTime<chrono::Utc>, uuid::Uuid)> = Vec::new();
+    let mut by_started: Vec<(jiff::Timestamp, uuid::Uuid)> = Vec::new();
     for n in 0..6 {
         let id = insert_execution(&mut conn, "reach_order", &format!("ord-{n}"), "RUNNING").await;
-        let started_at = base - chrono::Duration::minutes(i64::from(n));
+        let started_at = base - jiff::SignedDuration::from_mins(i64::from(n));
         diesel::update(
             autumn_harvest::schema::harvest_workflow_executions::table.find(id.as_uuid()),
         )

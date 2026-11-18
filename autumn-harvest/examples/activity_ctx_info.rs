@@ -241,7 +241,7 @@ mod tests {
             }
         });
         let ctx1 = ActivityContext::new_test_with_heartbeat(tx)
-            .with_deadline(Some(chrono::Utc::now() + chrono::Duration::seconds(300)))
+            .with_deadline(Some(jiff::Timestamp::now() + jiff::SignedDuration::from_secs(300)))
             .with_attempt(1)
             .with_max_attempts(3);
         let done = import_rows(&ctx1, ImportRequest { total_rows: 4 })
@@ -269,7 +269,7 @@ mod tests {
         let drain2 = tokio::spawn(async move { while rx2.recv().await.is_some() {} });
         let ctx2 = ActivityContext::new_test_with_heartbeat(tx2)
             .with_heartbeat_details(Some(last))
-            .with_deadline(Some(chrono::Utc::now() + chrono::Duration::seconds(1)))
+            .with_deadline(Some(jiff::Timestamp::now() + jiff::SignedDuration::from_secs(1)))
             .with_attempt(2)
             .with_max_attempts(3);
         assert!(ctx2.is_expiring_within(RESERVE));
@@ -290,7 +290,7 @@ mod tests {
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
         let ctx = ActivityContext::new_test_with_heartbeat(tx)
-            .with_deadline(Some(chrono::Utc::now() + chrono::Duration::seconds(300)));
+            .with_deadline(Some(jiff::Timestamp::now() + jiff::SignedDuration::from_secs(300)));
 
         assert!(!ctx.is_expiring_within(RESERVE));
         let imported = import_rows(&ctx, ImportRequest { total_rows: 5 })

@@ -2,7 +2,7 @@
 
 use autumn_harvest::WorkflowEvent;
 use autumn_harvest::types::ActivityExecId;
-use chrono::{TimeZone, Utc};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -16,9 +16,7 @@ pub fn history(events: usize, payload_bytes: usize) -> Vec<WorkflowEvent> {
     let mut out = Vec::with_capacity(events.max(1));
     out.push(WorkflowEvent::WorkflowStarted {
         input: payload(&pad, 0),
-        timestamp: Utc
-            .timestamp_opt(1_790_000_000, 0)
-            .single()
+        timestamp: Timestamp::new(1_790_000_000, 0).ok()
             .unwrap_or_default(),
         last_completion_result: None,
         last_error: None,

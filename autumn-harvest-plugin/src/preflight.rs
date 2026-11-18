@@ -12,7 +12,7 @@ use autumn_harvest::schema::harvest_schedules;
 use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::DbPool;
 use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, WorkerStatus, list_workers};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use diesel::QueryDsl;
 use diesel::SelectableHelper;
 use diesel::migration::MigrationSource;
@@ -65,7 +65,7 @@ pub struct PreflightCheckResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct PreflightReport {
     pub overall_status: PreflightStatus,
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: Timestamp,
     pub version: PreflightVersion,
     pub checks: Vec<PreflightCheckResult>,
 }
@@ -154,7 +154,7 @@ pub async fn build_preflight_report(api_state: &HarvestApiState) -> PreflightRep
 
     PreflightReport {
         overall_status,
-        observed_at: Utc::now(),
+        observed_at: Timestamp::now(),
         version: PreflightVersion {
             package: env!("CARGO_PKG_NAME"),
             version: env!("CARGO_PKG_VERSION"),
@@ -1962,7 +1962,7 @@ mod tests {
 
     fn worker_row_with_shard_assignments(shard_assignments: &[i64], queues: &[&str]) -> WorkerRow {
         use autumn_harvest::models::HarvestWorker;
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         WorkerRow {
             worker: HarvestWorker {
                 worker_id: "legacy-worker".to_string(),

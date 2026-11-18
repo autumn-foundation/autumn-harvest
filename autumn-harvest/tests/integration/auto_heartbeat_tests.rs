@@ -48,7 +48,7 @@ use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{WorkflowContext, store};
 
-use chrono::Utc;
+use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
@@ -225,7 +225,7 @@ async fn seed_workflow(
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -237,7 +237,7 @@ async fn seed_workflow(
 
     let mut params = EnqueueParams::new("default", TaskType::Workflow, input);
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     queue::enqueue(conn, &params)
         .await
         .expect("enqueue workflow task");
@@ -523,9 +523,9 @@ async fn seed_running_activity(
     params.workflow_exec_id = Some(exec_id.as_uuid());
     params.activity_name = Some("wedge_activity".to_string());
     params.heartbeat_timeout =
-        heartbeat_timeout.map(|d| chrono::Duration::from_std(d).expect("hb interval"));
+        heartbeat_timeout.map(|d| jiff::SignedDuration::try_from(d).expect("hb interval"));
     params.start_to_close =
-        start_to_close.map(|d| chrono::Duration::from_std(d).expect("s2c interval"));
+        start_to_close.map(|d| jiff::SignedDuration::try_from(d).expect("s2c interval"));
     let task_id = queue::enqueue(conn, &params)
         .await
         .expect("enqueue activity");

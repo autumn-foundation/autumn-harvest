@@ -5,6 +5,7 @@
 #![cfg(all(feature = "db", feature = "testing"))]
 
 use autumn_harvest::types::ExecutionId;
+use jiff_diesel::ToDiesel;
 use diesel_async::RunQueryDsl;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -71,13 +72,13 @@ async fn sim_wake_order_matches_the_real_ingest() {
 
     // The clock is 100 s after the anchor. A timer is due at offset 99 or
     // less. It waits at offset 150 or more, so a slow ingest stays exact.
-    let now: chrono::DateTime<chrono::Utc> = diesel::select(diesel::dsl::now)
+    let now: jiff::Timestamp = diesel::select(diesel::dsl::now)
         .get_result::<std::time::SystemTime>(&mut conn)
         .await
         .unwrap()
         .into();
-    let anchor = now - chrono::Duration::seconds(100);
-    let at = |secs: u64| anchor + chrono::Duration::seconds(i64::try_from(secs).unwrap());
+    let anchor = now - jiff::SignedDuration::from_secs(100);
+    let at = |secs: u64| anchor + jiff::SignedDuration::from_secs(i64::try_from(secs).unwrap());
 
     let mut cases: Vec<Case> = vec![
         (vec![("t", 60)], vec![59]),
@@ -112,7 +113,7 @@ async fn sim_wake_order_matches_the_real_ingest() {
             )
             .bind::<Uuid, _>(exec_id.as_uuid())
             .bind::<Text, _>(*id)
-            .bind::<Timestamptz, _>(at(*offset))
+            .bind::<Timestamptz, _>(at(*offset).to_diesel())
             .execute(&mut conn)
             .await
             .unwrap();
@@ -122,7 +123,7 @@ async fn sim_wake_order_matches_the_real_ingest() {
             let name = format!("s{n}");
             let n = i32::try_from(n).unwrap();
             // A microsecond step keeps equal offsets in insert order.
-            let received = at(*offset) + chrono::Duration::microseconds(i64::from(n));
+            let received = at(*offset) + jiff::SignedDuration::from_micros(i64::from(n));
             diesel::sql_query(
                 "INSERT INTO harvest_signals (id, workflow_exec_id, signal_name, payload, received_at, consumed) \
                  VALUES (gen_random_uuid(), $1, $2, jsonb_build_object('n', $3), $4, false)",
@@ -130,7 +131,7 @@ async fn sim_wake_order_matches_the_real_ingest() {
             .bind::<Uuid, _>(exec_id.as_uuid())
             .bind::<Text, _>(&name)
             .bind::<Integer, _>(n)
-            .bind::<Timestamptz, _>(received)
+            .bind::<Timestamptz, _>(received.to_diesel())
             .execute(&mut conn)
             .await
             .unwrap();

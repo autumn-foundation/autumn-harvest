@@ -48,7 +48,7 @@ mod replay_tests {
     use autumn_harvest::event::WorkflowEvent;
     use autumn_harvest::testing::{HistorySnapshot, ReplayStatus, WorkflowReplayer};
     use autumn_harvest::types::{ActivityExecId, ExecutionId};
-    use chrono::Utc;
+    use jiff::Timestamp;
     use serde_json::Value;
 
     fn failing_workflow<'a>(
@@ -89,7 +89,7 @@ mod replay_tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -161,7 +161,7 @@ mod db_tests {
     use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
     use autumn_harvest::{JitterPolicy, RetryPolicy, WorkflowContext, store};
 
-    use chrono::Utc;
+    use jiff::Timestamp;
     use diesel::prelude::*;
     use diesel_async::pooled_connection::AsyncDieselConnectionManager;
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
@@ -591,7 +591,7 @@ mod db_tests {
             exec_id,
             &[WorkflowEvent::WorkflowStarted {
                 input: input.clone(),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -603,7 +603,7 @@ mod db_tests {
 
         let mut params = EnqueueParams::new(queue, TaskType::Workflow, input);
         params.workflow_exec_id = Some(exec_id.as_uuid());
-        params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+        params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
         queue::enqueue(conn, &params)
             .await
             .expect("enqueue workflow task");
@@ -700,7 +700,7 @@ mod db_tests {
         let mut conn = connect(&url).await;
         let exec_id =
             seed_workflow(&mut conn, "wf_one_activity", serde_json::json!({}), queue).await;
-        let t_before = Utc::now();
+        let t_before = Timestamp::now();
 
         // Policy delay would be 999s; max_attempts = 2, so exactly one retry
         // (attempt 1 -> attempt 2) happens before the terminal failure.
@@ -746,8 +746,8 @@ mod db_tests {
         // t_before + 2s (the retry_after hint), not t_before + 999s (policy).
         let observed_delay = task.scheduled_at - t_before;
         assert!(
-            observed_delay > chrono::Duration::milliseconds(500)
-                && observed_delay < chrono::Duration::seconds(30),
+            observed_delay > jiff::SignedDuration::from_millis(500)
+                && observed_delay < jiff::SignedDuration::from_secs(30),
             "expected the retry_after hint (~2s) to govern the retry delay, \
              not the policy's 999s backoff; observed delay = {observed_delay:?}"
         );
@@ -774,7 +774,7 @@ mod db_tests {
         let mut conn = connect(&url).await;
         let exec_id =
             seed_workflow(&mut conn, "wf_one_activity", serde_json::json!({}), queue).await;
-        let t_before = Utc::now();
+        let t_before = Timestamp::now();
 
         // A 1s ceiling; the hint (999s) must be clamped down to ~1s.
         let registry = build_registry(
@@ -805,8 +805,8 @@ mod db_tests {
         let task = load_activity_task(&url, exec_id, "echo").await;
         let observed_delay = task.scheduled_at - t_before;
         assert!(
-            observed_delay > chrono::Duration::milliseconds(200)
-                && observed_delay < chrono::Duration::seconds(30),
+            observed_delay > jiff::SignedDuration::from_millis(200)
+                && observed_delay < jiff::SignedDuration::from_secs(30),
             "a 999s hint against a 1s ceiling must clamp to ~1s, never the raw \
              999s hint and never rejected outright; observed delay = {observed_delay:?}"
         );
@@ -823,7 +823,7 @@ mod db_tests {
         let mut conn = connect(&url).await;
         let exec_id =
             seed_workflow(&mut conn, "wf_one_activity", serde_json::json!({}), queue).await;
-        let t_before = Utc::now();
+        let t_before = Timestamp::now();
 
         // Policy delay is 2s; retry_after is ZERO, so the policy's 2s delay
         // must be honored instead of an immediate/zero-delay retry.
@@ -853,8 +853,8 @@ mod db_tests {
         let task = load_activity_task(&url, exec_id, "echo").await;
         let observed_delay = task.scheduled_at - t_before;
         assert!(
-            observed_delay > chrono::Duration::milliseconds(500)
-                && observed_delay < chrono::Duration::seconds(30),
+            observed_delay > jiff::SignedDuration::from_millis(500)
+                && observed_delay < jiff::SignedDuration::from_secs(30),
             "a zero retry_after hint must fall through to the policy's own 2s \
              delay, not retry immediately; observed delay = {observed_delay:?}"
         );

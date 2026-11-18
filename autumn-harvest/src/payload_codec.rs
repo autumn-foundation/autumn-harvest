@@ -2464,7 +2464,7 @@ mod tests {
 
         let event = crate::event::WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({"user":"alice"}),
-            timestamp: chrono::Utc::now(),
+            timestamp: jiff::Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -2498,7 +2498,7 @@ mod tests {
                 "_harvest_offload_envelope": 1,
                 "secret": "still must be encoded",
             }),
-            timestamp: chrono::Utc::now(),
+            timestamp: jiff::Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -2567,7 +2567,7 @@ mod tests {
         vec![
             WorkflowEvent::WorkflowStarted {
                 input: json!(0),
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: some(),
                 last_error: None,
                 scheduled_time: None,
@@ -2659,7 +2659,7 @@ mod tests {
                 update_id: UpdateId::new(),
                 name: "u".into(),
                 input: json!(0),
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
             },
             WorkflowEvent::UpdateCompleted {
                 update_id: UpdateId::new(),
@@ -3494,7 +3494,7 @@ mod tests {
     fn started(input: Value) -> crate::event::WorkflowEvent {
         crate::event::WorkflowEvent::WorkflowStarted {
             input,
-            timestamp: chrono::Utc::now(),
+            timestamp: jiff::Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -4902,7 +4902,7 @@ mod tests {
         codecs.set_default(Arc::new(NamesItsInput));
         let event = crate::event::WorkflowEvent::WorkflowStarted {
             input: json!("from-input"),
-            timestamp: chrono::Utc::now(),
+            timestamp: jiff::Timestamp::now(),
             last_completion_result: Some(json!("from-carryover")),
             last_error: None,
             scheduled_time: None,

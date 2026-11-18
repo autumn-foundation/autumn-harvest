@@ -696,7 +696,7 @@ async fn resolve_effective_fire_at_pure_matches_resolve_effective_fire_at() {
         .await
         .expect("per-schedule resolve_effective_fire_at");
 
-        let empty: Vec<chrono::NaiveDate> = Vec::new();
+        let empty: Vec<jiff::civil::Date> = Vec::new();
         let actual = s.calendar_name.as_deref().and_then(|cal_name| {
             let excluded = exclusions.get(cal_name).unwrap_or(&empty);
             let exclude_weekends = autumn_harvest::calendar::calendar_excludes_weekends(cal_name);

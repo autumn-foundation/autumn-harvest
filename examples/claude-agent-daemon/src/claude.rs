@@ -187,7 +187,7 @@ impl ModelConfig {
 /// calls no model, so it returns no call.
 pub fn activity_body(
     config: ModelConfig,
-) -> impl Fn(Value, DateTime<Utc>) -> Result<(Value, Vec<LlmCall>), String> + Send + Sync + 'static
+) -> impl Fn(Value, Timestamp) -> Result<(Value, Vec<LlmCall>), String> + Send + Sync + 'static
 {
     move |input, _now| {
         let request: TurnRequest =

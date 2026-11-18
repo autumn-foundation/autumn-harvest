@@ -5,10 +5,12 @@
 //! workers claim the same task.
 
 use crate::schema::harvest_task_queue_ext;
+use jiff_diesel::ToDiesel;
+use crate::time::sql::ToPgInterval;
 use crate::table_split::SetExt;
 use std::time::Duration as StdDuration;
 
-use chrono::{DateTime, Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use diesel::AsChangeset;
 use diesel::BoolExpressionMethods;
 use diesel::ExpressionMethods;
@@ -617,8 +619,8 @@ pub enum TaskType {
 }
 
 const IMMEDIATE_SCHEDULE_SKEW_SECS: i32 = 5;
-const IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE: Duration =
-    Duration::seconds(IMMEDIATE_SCHEDULE_SKEW_SECS as i64);
+const IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE: SignedDuration =
+    SignedDuration::from_secs(IMMEDIATE_SCHEDULE_SKEW_SECS as i64);
 
 /// Convert a retry delay to fractional seconds for `make_interval` (issue
 /// #1389).
@@ -635,7 +637,7 @@ const IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE: Duration =
 /// elapsed backoff by however long that prior work took.
 /// `clock_timestamp()` is volatile and reads the real time at execution.
 ///
-/// A host-computed deadline (`Utc::now() + delay`) can already be due by the
+/// A host-computed deadline (`Timestamp::now() + delay`) can already be due by the
 /// time `claim_task` checks it, when the host clock trails Postgres's.
 /// Computing the deadline on Postgres's own clock removes that mismatch by
 /// construction, for any `delay`.
@@ -644,11 +646,11 @@ const IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE: Duration =
 /// delay is a real, reachable case. Truncating to whole milliseconds would
 /// round such a delay down to zero: an immediate retry instead of a short one.
 #[allow(clippy::cast_precision_loss)] // microsecond delay never approaches 2^53
-fn delay_secs(delay: Duration) -> f64 {
-    delay.num_microseconds().map_or_else(
+fn delay_secs(delay: SignedDuration) -> f64 {
+    crate::time::num_microseconds(delay).map_or_else(
         // Out of `i64` microsecond range (roughly 292,000 years): fall back
         // to millisecond precision, which cannot overflow here either way.
-        || delay.num_milliseconds() as f64 / 1000.0,
+        || crate::time::num_milliseconds(delay) as f64 / 1000.0,
         |us| us as f64 / 1_000_000.0,
     )
 }
@@ -656,7 +658,8 @@ fn delay_secs(delay: Duration) -> f64 {
 #[derive(diesel::QueryableByName)]
 struct ClockTimestampRow {
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    now: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    now: Timestamp,
 }
 
 /// Probe Postgres's own, live clock (issue #1389).
@@ -674,7 +677,7 @@ struct ClockTimestampRow {
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
-pub async fn db_clock_now(conn: &mut AsyncPgConnection) -> HarvestResult<DateTime<Utc>> {
+pub async fn db_clock_now(conn: &mut AsyncPgConnection) -> HarvestResult<Timestamp> {
     diesel::sql_query("SELECT clock_timestamp() AS now")
         .cache_prepared()
         .get_result::<ClockTimestampRow>(conn)
@@ -708,18 +711,17 @@ pub async fn db_clock_now(conn: &mut AsyncPgConnection) -> HarvestResult<DateTim
 /// the task's `started_at` that `claim_task` stamps. So this whole expression
 /// uses one clock, and a host/Postgres skew cannot leak in. The worker then adds
 /// the host-**monotonic** local wait to this value: permit acquisition and setup,
-/// measured with `Instant::elapsed`. It never adds `Utc::now()`, which mixes the
+/// measured with `Instant::elapsed`. It never adds `Timestamp::now()`, which mixes the
 /// host wall clock with the Postgres eligibility timestamps (issue #501 review).
 #[must_use]
 pub fn schedule_to_start_secs(
-    scheduled_at: DateTime<Utc>,
-    created_at: Option<DateTime<Utc>>,
-    claimed_at: DateTime<Utc>,
+    scheduled_at: Timestamp,
+    created_at: Option<Timestamp>,
+    claimed_at: Timestamp,
 ) -> f64 {
     let eligible = created_at.map_or(scheduled_at, |c| scheduled_at.max(c));
-    (claimed_at - eligible)
-        .max(Duration::zero())
-        .to_std()
+    std::time::Duration::try_from((claimed_at - eligible)
+        .max(SignedDuration::ZERO))
         .unwrap_or_default()
         .as_secs_f64()
 }
@@ -917,10 +919,10 @@ pub struct EnqueueParams {
     pub input: SharedJson,
     pub priority: i32,
     pub max_attempts: i32,
-    pub scheduled_at: chrono::DateTime<Utc>,
-    pub heartbeat_timeout: Option<Duration>,
-    pub start_to_close: Option<Duration>,
-    pub schedule_to_start: Option<Duration>,
+    pub scheduled_at: jiff::Timestamp,
+    pub heartbeat_timeout: Option<SignedDuration>,
+    pub start_to_close: Option<SignedDuration>,
+    pub schedule_to_start: Option<SignedDuration>,
     pub retry_policy: Option<serde_json::Value>,
     /// Pin this task to a specific worker for best-effort cache locality.
     ///
@@ -928,7 +930,7 @@ pub struct EnqueueParams {
     /// this worker preferentially for `sticky_timeout` after it becomes
     /// claimable. Once the window expires, any worker may claim it.
     pub sticky_worker_id: Option<String>,
-    /// Duration of the sticky preference window. Stored on the row so that
+    /// SignedDuration of the sticky preference window. Stored on the row so that
     /// [`wake_workflow_task()`] can refresh `sticky_until` to the same value
     /// on each transition back to PENDING without needing external config.
     pub sticky_timeout: Option<StdDuration>,
@@ -955,7 +957,7 @@ pub struct EnqueueParams {
     /// Absolute UTC deadline for the entire activity lifetime across all retry
     /// attempts (issue #378). Computed once at initial enqueue as
     /// `NOW() + schedule_to_close`. NULL = no total deadline.
-    pub schedule_to_close_at: Option<chrono::DateTime<Utc>>,
+    pub schedule_to_close_at: Option<jiff::Timestamp>,
     /// Structured capability requirements JSONB payload (issue #382).
     pub required_capabilities: Option<serde_json::Value>,
     /// Ambient context headers propagated from the parent workflow (issue #481).
@@ -1000,7 +1002,7 @@ impl EnqueueParams {
             // Default immediate tasks slightly into the past to tolerate small
             // host/Postgres clock skew when workers claim with `scheduled_at <= NOW()`.
             // host-clock-ok: the caller builds this value before any connection exists.
-            scheduled_at: Utc::now() - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE,
+            scheduled_at: Timestamp::now() - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE,
             heartbeat_timeout: None,
             start_to_close: None,
             schedule_to_start: None,
@@ -1165,7 +1167,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
     // agrees with the clock used by `claim_task` and `wake_workflow_task`.
     let sticky = match (params.sticky_worker_id.as_deref(), params.sticky_timeout) {
         (Some(worker), Some(timeout)) => {
-            let chrono_timeout = chrono::Duration::from_std(timeout).map_err(|_| {
+            let chrono_timeout = jiff::SignedDuration::try_from(timeout).map_err(|_| {
                 crate::error::HarvestError::Config(
                     "sticky_timeout exceeds chrono duration range".to_string(),
                 )
@@ -1229,7 +1231,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         )
         .bind::<diesel::sql_types::Uuid, _>(task_id)
         .bind::<diesel::sql_types::Text, _>(worker_id)
-        .bind::<diesel::sql_types::Interval, _>(timeout)
+        .bind::<diesel::sql_types::Interval, _>(timeout.to_pg_interval())
         .cache_prepared()
         .execute(conn)
         .await
@@ -1497,7 +1499,7 @@ pub async fn enqueue_batch(
     for (p, &task_id) in params.iter().zip(&task_ids) {
         if let (Some(worker_id), Some(timeout)) = (p.sticky_worker_id.as_deref(), p.sticky_timeout)
         {
-            let chrono_timeout = Duration::from_std(timeout).map_err(|_| {
+            let chrono_timeout = SignedDuration::try_from(timeout).map_err(|_| {
                 crate::error::HarvestError::Config(
                     "sticky_timeout exceeds chrono duration range".to_string(),
                 )
@@ -1511,7 +1513,7 @@ pub async fn enqueue_batch(
             )
             .bind::<diesel::sql_types::Uuid, _>(task_id)
             .bind::<diesel::sql_types::Text, _>(worker_id)
-            .bind::<diesel::sql_types::Interval, _>(chrono_timeout)
+            .bind::<diesel::sql_types::Interval, _>(chrono_timeout.to_pg_interval())
             .cache_prepared()
             .execute(conn)
             .await
@@ -5165,7 +5167,7 @@ pub struct OwnerRow {
     /// The task priority.
     pub priority: i32,
     /// The claim-order due time, with the new-start handicap.
-    pub due_at: DateTime<Utc>,
+    pub due_at: Timestamp,
 }
 
 /// One row of [`owner_scan`].
@@ -5180,7 +5182,8 @@ struct OwnerScanRow {
     #[diesel(sql_type = diesel::sql_types::Integer)]
     eff_priority: i32,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    due_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    due_at: Timestamp,
 }
 
 /// The row filter of [`OWNER_SCAN_SQL`], in each branch.
@@ -5395,7 +5398,7 @@ pub struct DispatchProbe {
     /// The row's `state` column.
     pub state: String,
     /// The time the row becomes claimable.
-    pub scheduled_at: DateTime<Utc>,
+    pub scheduled_at: Timestamp,
     /// True when a worker holds the row.
     pub has_worker: bool,
     /// True when a live sticky pin names another worker (issue #1798).
@@ -5434,7 +5437,8 @@ pub async fn dispatch_probe(
         #[diesel(sql_type = diesel::sql_types::Text)]
         state: String,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        scheduled_at: DateTime<Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        scheduled_at: Timestamp,
         #[diesel(sql_type = diesel::sql_types::Bool)]
         has_worker: bool,
         #[diesel(sql_type = diesel::sql_types::Bool)]
@@ -5549,7 +5553,7 @@ pub struct DispatchCursor {
     /// Priority of the last row of the page.
     pub priority: i32,
     /// Due time of the last row of the page.
-    pub scheduled_at: DateTime<Utc>,
+    pub scheduled_at: Timestamp,
     /// Identifier of the last row of the page.
     pub id: Uuid,
 }
@@ -5597,7 +5601,7 @@ pub async fn due_dispatch_hints_page(
                 .bind::<diesel::sql_types::Text, _>(queue)
                 .bind::<diesel::sql_types::BigInt, _>(capped)
                 .bind::<diesel::sql_types::Integer, _>(cursor.priority)
-                .bind::<diesel::sql_types::Timestamptz, _>(cursor.scheduled_at)
+                .bind::<diesel::sql_types::Timestamptz, _>(cursor.scheduled_at.to_diesel())
                 .bind::<diesel::sql_types::Uuid, _>(cursor.id)
                 .load(conn)
                 .await
@@ -5641,7 +5645,8 @@ struct PendingHintRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     queue_name: String,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    scheduled_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    scheduled_at: Timestamp,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     priority: i32,
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -5705,7 +5710,7 @@ pub const fn pending_hint_rows_query() -> &'static str {
 pub(crate) fn record_pending_hint(
     task_id: Uuid,
     queue_name: &str,
-    scheduled_at: DateTime<Utc>,
+    scheduled_at: Timestamp,
     priority: i32,
     kind: crate::dispatch::DispatchKind,
 ) {
@@ -5833,7 +5838,7 @@ pub async fn queue_task_counts(
     }
 
     let rows: Vec<Row> = diesel::sql_query(QUEUE_TASK_COUNTS_SQL)
-        .bind::<diesel::sql_types::Timestamptz, _>(Utc::now())
+        .bind::<diesel::sql_types::Timestamptz, _>(Timestamp::now().to_diesel())
         .load(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -6268,7 +6273,7 @@ pub(crate) async fn task_deadline_for_claim(
             claim_held(&claim.worker_id, claim.attempt),
             dsl::schedule_to_close_at,
         ))
-        .first::<(Option<String>, Option<bool>, Option<DateTime<Utc>>)>(conn)
+        .first::<(Option<String>, Option<bool>, Option<Timestamp>)>(conn)
         .await
         .optional()
         .map_err(crate::error::database_error)?;
@@ -6287,7 +6292,7 @@ pub(crate) struct TaskDeadline {
     /// Whether the claim is current.
     pub(crate) claim_held: bool,
     /// The row's current `schedule_to_close_at`.
-    pub(crate) schedule_to_close_at: Option<DateTime<Utc>>,
+    pub(crate) schedule_to_close_at: Option<Timestamp>,
 }
 
 /// Whether `claim` is current, read without a lock.
@@ -6373,10 +6378,10 @@ pub(crate) async fn later_claim_shares_strikes(
 /// microsecond precision, the precision of `TIMESTAMPTZ`.
 #[doc(hidden)]
 #[must_use]
-pub fn timed_out_claim_key(attempt: i32, started_at: DateTime<Utc>) -> String {
+pub fn timed_out_claim_key(attempt: i32, started_at: Timestamp) -> String {
     format!(
         "{attempt}@{}",
-        started_at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+        crate::time::rfc3339_opts(started_at, crate::time::SecondsFormat::Micros, true)
     )
 }
 
@@ -6400,7 +6405,7 @@ pub(crate) async fn record_timed_out_claim(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
     attempt: i32,
-    started_at: DateTime<Utc>,
+    started_at: Timestamp,
 ) -> HarvestResult<()> {
     diesel::sql_query(
         "UPDATE harvest_task_queue \
@@ -6431,7 +6436,7 @@ pub(crate) async fn take_timed_out_claim(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
     attempt: i32,
-    started_at: DateTime<Utc>,
+    started_at: Timestamp,
 ) -> HarvestResult<bool> {
     diesel::sql_query(
         "UPDATE harvest_task_queue \
@@ -6576,7 +6581,7 @@ pub async fn fail_claimed_task(
 pub async fn requeue_claimed_task_for_retry(
     conn: &mut AsyncPgConnection,
     claim: &TaskClaim,
-    delay: Duration,
+    delay: SignedDuration,
     previous_error: &str,
 ) -> HarvestResult<ClaimWrite> {
     requeue_for_retry_inner(conn, claim.task_id, Some(claim), delay, previous_error, 0)
@@ -6599,7 +6604,7 @@ pub async fn requeue_claimed_task_for_retry(
 pub(crate) async fn requeue_claimed_task_after_timeout(
     conn: &mut AsyncPgConnection,
     claim: &TaskClaim,
-    delay: Duration,
+    delay: SignedDuration,
     previous_error: &str,
     crash_strikes: i32,
 ) -> HarvestResult<ClaimWrite> {
@@ -6628,7 +6633,7 @@ pub(crate) async fn requeue_claimed_task_after_timeout(
 pub async fn defer_claimed_rate_limited_task(
     conn: &mut AsyncPgConnection,
     claim: &TaskClaim,
-    scheduled_at: chrono::DateTime<Utc>,
+    scheduled_at: jiff::Timestamp,
 ) -> HarvestResult<ClaimWrite> {
     defer_rate_limited_task_inner(conn, claim.task_id, Some(claim), scheduled_at)
         .await
@@ -6653,7 +6658,7 @@ pub async fn defer_claimed_rate_limited_task(
 pub async fn defer_claimed_retry_for_budget(
     conn: &mut AsyncPgConnection,
     claim: &TaskClaim,
-    delay: Duration,
+    delay: SignedDuration,
 ) -> HarvestResult<ClaimWrite> {
     defer_claimed_task(conn, claim, delay).await
 }
@@ -6671,7 +6676,7 @@ pub async fn defer_claimed_retry_for_budget(
 pub async fn defer_claimed_task_for_open_circuit(
     conn: &mut AsyncPgConnection,
     claim: &TaskClaim,
-    delay: Duration,
+    delay: SignedDuration,
 ) -> HarvestResult<ClaimWrite> {
     defer_claimed_task(conn, claim, delay).await
 }
@@ -6682,7 +6687,7 @@ pub async fn defer_claimed_task_for_open_circuit(
 async fn defer_claimed_task(
     conn: &mut AsyncPgConnection,
     claim: &TaskClaim,
-    delay: Duration,
+    delay: SignedDuration,
 ) -> HarvestResult<ClaimWrite> {
     use crate::schema::harvest_task_queue::dsl;
     use diesel::dsl::sql;
@@ -6715,7 +6720,7 @@ async fn defer_claimed_task(
             dsl::scheduled_at,
         ))
         .cache_prepared()
-        .get_result::<(String, i32, String, chrono::DateTime<Utc>)>(conn)
+        .get_result::<(String, i32, String, jiff::Timestamp)>(conn)
         .await
         .optional()
         .map_err(crate::error::database_error)?
@@ -6779,8 +6784,8 @@ pub async fn release_unstarted_claim(
     .set((
         dsl::state.eq("PENDING"),
         dsl::worker_id.eq(None::<String>),
-        dsl::started_at.eq(None::<DateTime<Utc>>),
-        dsl::last_heartbeat_at.eq(None::<DateTime<Utc>>),
+        dsl::started_at.eq(None::<Timestamp>),
+        dsl::last_heartbeat_at.eq(None::<Timestamp>),
         // Undo the claim-time attempt increment. The task did not run.
         dsl::attempt.eq(sql::<Integer>("GREATEST(attempt - 1, 0)")),
         dsl::sticky_worker_id.eq(sql::<Nullable<Text>>(
@@ -6802,7 +6807,7 @@ pub async fn release_unstarted_claim(
             dsl::scheduled_at,
         ))
         .cache_prepared()
-        .get_result::<(String, i32, String, DateTime<Utc>)>(conn)
+        .get_result::<(String, i32, String, Timestamp)>(conn)
         .await
         .optional()
         .map_err(crate::error::database_error)?
@@ -6839,10 +6844,10 @@ pub async fn release_unstarted_claim(
 pub async fn running_claims_of_worker(
     conn: &mut AsyncPgConnection,
     worker_id: &str,
-) -> HarvestResult<Vec<(TaskClaim, Option<DateTime<Utc>>)>> {
+) -> HarvestResult<Vec<(TaskClaim, Option<Timestamp>)>> {
     use crate::schema::harvest_task_queue::dsl;
 
-    let rows: Vec<(Uuid, i32, Option<DateTime<Utc>>)> = dsl::harvest_task_queue
+    let rows: Vec<(Uuid, i32, Option<Timestamp>)> = dsl::harvest_task_queue
         .filter(dsl::state.eq("RUNNING"))
         .filter(dsl::worker_id.eq(worker_id))
         .select((dsl::id, dsl::attempt, dsl::started_at))
@@ -6879,7 +6884,7 @@ pub async fn running_claims_of_worker(
 pub async fn release_abandoned_claim(
     conn: &mut AsyncPgConnection,
     claim: &TaskClaim,
-    started_at: DateTime<Utc>,
+    started_at: Timestamp,
 ) -> HarvestResult<ClaimWrite> {
     use crate::schema::harvest_task_queue::dsl;
 
@@ -6892,10 +6897,10 @@ pub async fn release_abandoned_claim(
     .set((
         dsl::state.eq("PENDING"),
         dsl::worker_id.eq(None::<String>),
-        dsl::started_at.eq(None::<DateTime<Utc>>),
+        dsl::started_at.eq(None::<Timestamp>),
         dsl::sticky_worker_id.eq(None::<String>),
-        dsl::sticky_until.eq(None::<DateTime<Utc>>),
-        dsl::last_heartbeat_at.eq(None::<DateTime<Utc>>),
+        dsl::sticky_until.eq(None::<Timestamp>),
+        dsl::last_heartbeat_at.eq(None::<Timestamp>),
         dsl::error.eq(None::<String>),
         dsl::scheduled_at.eq(db_clock_stamp::<diesel::sql_types::Timestamptz>()),
     ))
@@ -6908,7 +6913,7 @@ pub async fn release_abandoned_claim(
             dsl::scheduled_at,
         ))
         .cache_prepared()
-        .get_result::<(String, i32, String, DateTime<Utc>)>(conn)
+        .get_result::<(String, i32, String, Timestamp)>(conn)
         .await
         .optional()
         .map_err(crate::error::database_error)?
@@ -6979,7 +6984,7 @@ async fn complete_task_inner(
             dsl::output.eq(Some(output)),
             dsl::heartbeat_details.eq(None::<serde_json::Value>),
             dsl::error.eq(None::<String>),
-            dsl::completed_at.eq(Some(Utc::now())),
+            dsl::completed_at.eq(Some(Timestamp::now()).to_diesel()),
         ))
         .into_boxed();
     let updated = fence(update, Some(claim))
@@ -7036,7 +7041,7 @@ async fn fail_task_inner(
         dsl::state.eq("FAILED"),
         dsl::error.eq(Some(error)),
         dsl::heartbeat_details.eq(None::<serde_json::Value>),
-        dsl::completed_at.eq(Some(Utc::now())),
+        dsl::completed_at.eq(Some(Timestamp::now()).to_diesel()),
     ))
     .into_boxed();
     let updated = fence(update, claim)
@@ -7073,7 +7078,7 @@ pub async fn fail_open_tasks_for_execution(
         dsl::state.eq("FAILED"),
         dsl::error.eq(Some(error.to_string())),
         dsl::heartbeat_details.eq(None::<serde_json::Value>),
-        dsl::completed_at.eq(Some(Utc::now())),
+        dsl::completed_at.eq(Some(Timestamp::now()).to_diesel()),
     ))
     .execute(conn)
     .await
@@ -7106,7 +7111,7 @@ pub async fn cancel_open_tasks_for_execution(
         dsl::worker_id.eq(None::<String>),
         dsl::error.eq(Some(reason.to_string())),
         dsl::heartbeat_details.eq(None::<serde_json::Value>),
-        dsl::completed_at.eq(Some(Utc::now())),
+        dsl::completed_at.eq(Some(Timestamp::now()).to_diesel()),
     ))
     .execute(conn)
     .await
@@ -7174,7 +7179,7 @@ pub async fn cancel_activity_task_with_reason(
         dsl::worker_id.eq(None::<String>),
         dsl::error.eq(Some(reason.to_string())),
         dsl::heartbeat_details.eq(None::<serde_json::Value>),
-        dsl::completed_at.eq(Some(Utc::now())),
+        dsl::completed_at.eq(Some(Timestamp::now()).to_diesel()),
     ))
     .returning((dsl::activity_name, dsl::queue_name))
     .get_result::<(Option<String>, String)>(conn)
@@ -7722,7 +7727,7 @@ async fn write_heartbeat(
     let updated = if let Some(details) = details {
         let update = target
             .set((
-                dsl::last_heartbeat_at.eq(stamp),
+                dsl::last_heartbeat_at.eq(stamp.to_diesel()),
                 dsl::heartbeat_details.eq(Some(details)),
             ))
             .into_boxed();
@@ -7731,7 +7736,7 @@ async fn write_heartbeat(
             .execute(conn)
             .await
     } else {
-        let update = target.set(dsl::last_heartbeat_at.eq(stamp)).into_boxed();
+        let update = target.set(dsl::last_heartbeat_at.eq(stamp.to_diesel())).into_boxed();
         fence(update, Some(claim))
             .cache_prepared()
             .execute(conn)
@@ -7756,8 +7761,10 @@ async fn write_heartbeat(
 struct PendingRequeueChangeset {
     state: &'static str,
     worker_id: Option<String>,
-    started_at: Option<chrono::DateTime<Utc>>,
-    last_heartbeat_at: Option<chrono::DateTime<Utc>>,
+    #[diesel(serialize_as = crate::time::sql::NullableTimestamp)]
+    started_at: Option<jiff::Timestamp>,
+    #[diesel(serialize_as = crate::time::sql::NullableTimestamp)]
+    last_heartbeat_at: Option<jiff::Timestamp>,
     crash_strikes: i32,
     /// Issue #804: reset on every shared pending-requeue, because reaching this
     /// path PROVES the claiming worker was capable (it resolved a handler and
@@ -7803,7 +7810,7 @@ impl PendingRequeueChangeset {
 pub async fn requeue_for_retry(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
-    delay: Duration,
+    delay: SignedDuration,
     previous_error: &str,
 ) -> HarvestResult<()> {
     if !requeue_for_retry_inner(conn, task_id, None, delay, previous_error, 0).await? {
@@ -7818,7 +7825,7 @@ async fn requeue_for_retry_inner(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
     claim: Option<&TaskClaim>,
-    delay: Duration,
+    delay: SignedDuration,
     previous_error: &str,
     crash_strikes: i32,
 ) -> HarvestResult<bool> {
@@ -7851,7 +7858,7 @@ async fn requeue_for_retry_inner(
             dsl::scheduled_at,
         ))
         .cache_prepared()
-        .get_result::<(String, i32, String, chrono::DateTime<Utc>)>(conn)
+        .get_result::<(String, i32, String, jiff::Timestamp)>(conn)
         .await
         .optional()
         .map_err(crate::error::database_error)?
@@ -7900,7 +7907,7 @@ async fn requeue_for_retry_inner(
 /// the task was not a claimed (`RUNNING`) workflow task.
 fn finish_workflow_backoff_requeue(
     task_id: Uuid,
-    updated: Vec<(String, i32, chrono::DateTime<Utc>)>,
+    updated: Vec<(String, i32, jiff::Timestamp)>,
 ) -> HarvestResult<()> {
     let Some((queue_name, priority, next_run)) = updated.into_iter().next() else {
         return Err(crate::error::HarvestError::NotFound(format!(
@@ -7929,8 +7936,8 @@ fn finish_workflow_backoff_requeue(
 #[allow(clippy::struct_field_names)]
 struct StickyRelease {
     sticky_worker_id: Option<String>,
-    sticky_until: Option<chrono::DateTime<Utc>>,
-    sticky_timeout: Option<chrono::Duration>,
+    sticky_until: Option<jiff::Timestamp>,
+    sticky_timeout: Option<jiff::SignedDuration>,
 }
 
 impl StickyRelease {
@@ -7964,7 +7971,7 @@ impl StickyRelease {
 ///   must not name a stale timer when the row is due again (issue #1402).
 /// - `sticky` is `Some` to release sticky affinity, `None` to keep it.
 fn workflow_backoff_set(
-    delay: Duration,
+    delay: SignedDuration,
     sticky: Option<StickyRelease>,
 ) -> impl AsChangeset<
     Target = crate::schema::harvest_task_queue::table,
@@ -7982,7 +7989,7 @@ fn workflow_backoff_set(
         ),
         SetExt(harvest_task_queue_ext::wake_requested.eq(false)),
         dsl::activity_name.eq(None::<String>),
-        dsl::timer_fires_at.eq(None::<chrono::DateTime<Utc>>),
+        dsl::timer_fires_at.eq(None::<jiff::Timestamp>),
         sticky,
     )
 }
@@ -8005,7 +8012,7 @@ fn workflow_backoff_set(
 async fn requeue_workflow_task_with_backoff(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
-    delay: Duration,
+    delay: SignedDuration,
     previous_error: &str,
     sticky: Option<StickyRelease>,
 ) -> HarvestResult<()> {
@@ -8022,7 +8029,7 @@ async fn requeue_workflow_task_with_backoff(
         workflow_backoff_set(delay, sticky),
     ))
     .returning((dsl::queue_name, dsl::priority, dsl::scheduled_at))
-    .get_results::<(String, i32, chrono::DateTime<Utc>)>(conn)
+    .get_results::<(String, i32, jiff::Timestamp)>(conn)
     .await
     .map_err(crate::error::database_error)?;
 
@@ -8034,7 +8041,7 @@ async fn requeue_workflow_task_with_backoff(
 #[cfg(test)]
 fn workflow_backoff_sql(
     changeset: PendingRequeueChangeset,
-    delay: Duration,
+    delay: SignedDuration,
     sticky: Option<StickyRelease>,
 ) -> String {
     use crate::schema::harvest_task_queue::dsl;
@@ -8073,7 +8080,7 @@ fn workflow_backoff_sql(
 pub async fn requeue_workflow_task_for_quota_retry(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
-    delay: Duration,
+    delay: SignedDuration,
     previous_error: &str,
 ) -> HarvestResult<()> {
     requeue_workflow_task_with_backoff(conn, task_id, delay, previous_error, None).await
@@ -8094,7 +8101,7 @@ pub async fn requeue_workflow_task_for_quota_retry(
 pub async fn requeue_workflow_task_nd_blocked(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
-    delay: Duration,
+    delay: SignedDuration,
     reason: &str,
 ) -> HarvestResult<()> {
     requeue_workflow_task_with_backoff(conn, task_id, delay, reason, Some(StickyRelease::new()))
@@ -8120,7 +8127,7 @@ pub async fn requeue_workflow_task_nd_blocked(
 pub async fn requeue_workflow_task_after_panic(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
-    delay: chrono::Duration,
+    delay: jiff::SignedDuration,
     reason: &str,
 ) -> HarvestResult<()> {
     requeue_workflow_task_with_backoff(conn, task_id, delay, reason, Some(StickyRelease::new()))
@@ -8142,7 +8149,7 @@ pub async fn requeue_workflow_task_after_panic(
 pub async fn requeue_claimed_workflow_task_after_deadlock(
     conn: &mut AsyncPgConnection,
     claim: &TaskClaim,
-    delay: chrono::Duration,
+    delay: jiff::SignedDuration,
     reason: &str,
 ) -> HarvestResult<bool> {
     requeue_claimed_workflow_task_with_backoff(conn, claim, delay, reason, None).await
@@ -8163,7 +8170,7 @@ pub async fn requeue_claimed_workflow_task_after_deadlock(
 pub async fn requeue_claimed_workflow_task_after_panic(
     conn: &mut AsyncPgConnection,
     claim: &TaskClaim,
-    delay: chrono::Duration,
+    delay: jiff::SignedDuration,
     reason: &str,
 ) -> HarvestResult<bool> {
     requeue_claimed_workflow_task_with_backoff(conn, claim, delay, reason, None).await
@@ -8183,7 +8190,7 @@ pub async fn requeue_claimed_workflow_task_after_panic(
 pub async fn requeue_claimed_workflow_task_after_fence(
     conn: &mut AsyncPgConnection,
     claim: &TaskClaim,
-    delay: chrono::Duration,
+    delay: jiff::SignedDuration,
 ) -> HarvestResult<bool> {
     requeue_claimed_workflow_task_with_backoff(
         conn,
@@ -8212,7 +8219,7 @@ pub async fn requeue_unowned_workflow_task(
     conn: &mut AsyncPgConnection,
     claim: &TaskClaim,
     partition: crate::decision_owner::DecisionPartition,
-    delay: chrono::Duration,
+    delay: jiff::SignedDuration,
 ) -> HarvestResult<bool> {
     requeue_claimed_workflow_task_with_backoff(
         conn,
@@ -8230,7 +8237,7 @@ pub async fn requeue_unowned_workflow_task(
 async fn requeue_claimed_workflow_task_with_backoff(
     conn: &mut AsyncPgConnection,
     claim: &TaskClaim,
-    delay: chrono::Duration,
+    delay: jiff::SignedDuration,
     reason: &str,
     // Issue #2252: the partition to stamp on an unstamped row.
     stamp: Option<i16>,
@@ -8265,11 +8272,11 @@ async fn requeue_claimed_workflow_task_with_backoff(
             .sql(")")),
         ),
         dsl::sticky_worker_id.eq(None::<String>),
-        dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
-        dsl::sticky_timeout.eq(None::<chrono::Duration>),
+        dsl::sticky_until.eq(None::<jiff::Timestamp>),
+        dsl::sticky_timeout.eq(None::<jiff::SignedDuration>),
         SetExt(harvest_task_queue_ext::wake_requested.eq(false)),
         dsl::activity_name.eq(None::<String>),
-        dsl::timer_fires_at.eq(None::<chrono::DateTime<Utc>>),
+        dsl::timer_fires_at.eq(None::<jiff::Timestamp>),
     ))
     .into_boxed();
     let updated = fence(update, Some(claim))
@@ -8281,7 +8288,7 @@ async fn requeue_claimed_workflow_task_with_backoff(
             sql::<diesel::sql_types::Bool>("scheduled_at <= clock_timestamp()"),
         ))
         .cache_prepared()
-        .get_results::<(String, i32, chrono::DateTime<Utc>, Option<Uuid>, bool)>(conn)
+        .get_results::<(String, i32, jiff::Timestamp, Option<Uuid>, bool)>(conn)
         .await
         .map_err(crate::error::database_error)?;
     if updated.is_empty() {
@@ -8318,7 +8325,7 @@ pub struct RetryActivityOutcome {
     /// `true`, this is the database clock value that the update stored. It
     /// passes the `scheduled_at <= NOW()` predicate in `claim_task` on the same
     /// clock. Otherwise it is unchanged.
-    pub scheduled_at: DateTime<Utc>,
+    pub scheduled_at: Timestamp,
     /// `true` when the task's eligibility was advanced (it was backing off);
     /// `false` when the task required no change (see `already_eligible`).
     pub advanced: bool,
@@ -8435,7 +8442,7 @@ pub async fn force_retry_activity_now(
     )
     .set(dsl::scheduled_at.eq(db_clock_stamp::<diesel::sql_types::Timestamptz>()))
     .returning((dsl::queue_name, dsl::scheduled_at))
-    .get_result::<(String, DateTime<Utc>)>(conn)
+    .get_result::<(String, Timestamp)>(conn)
     .await
     .optional()
     .map_err(crate::error::database_error)?;
@@ -8494,15 +8501,18 @@ pub async fn force_retry_activity_now(
 struct CleanContinuationChangeset {
     state: &'static str,
     worker_id: Option<String>,
-    started_at: Option<chrono::DateTime<Utc>>,
-    last_heartbeat_at: Option<chrono::DateTime<Utc>>,
+    #[diesel(serialize_as = crate::time::sql::NullableTimestamp)]
+    started_at: Option<jiff::Timestamp>,
+    #[diesel(serialize_as = crate::time::sql::NullableTimestamp)]
+    last_heartbeat_at: Option<jiff::Timestamp>,
     crash_strikes: i32,
     capability_misses: i32,
     /// Issue #804: cleared alongside `capability_misses`, so that the
     /// distinct-worker set and the total counter can never disagree about
     /// whether the streak was broken.
     capability_miss_workers: Vec<String>,
-    scheduled_at: chrono::DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    scheduled_at: jiff::Timestamp,
 }
 
 /// [`CleanContinuationChangeset`] without `crash_strikes` and `scheduled_at`,
@@ -8513,8 +8523,10 @@ struct CleanContinuationChangeset {
 struct BudgetDeferralChangeset {
     state: &'static str,
     worker_id: Option<String>,
-    started_at: Option<chrono::DateTime<Utc>>,
-    last_heartbeat_at: Option<chrono::DateTime<Utc>>,
+    #[diesel(serialize_as = crate::time::sql::NullableTimestamp)]
+    started_at: Option<jiff::Timestamp>,
+    #[diesel(serialize_as = crate::time::sql::NullableTimestamp)]
+    last_heartbeat_at: Option<jiff::Timestamp>,
     capability_misses: i32,
     capability_miss_workers: Vec<String>,
 }
@@ -8533,7 +8545,7 @@ impl BudgetDeferralChangeset {
 }
 
 impl CleanContinuationChangeset {
-    const fn new(scheduled_at: chrono::DateTime<Utc>) -> Self {
+    const fn new(scheduled_at: jiff::Timestamp) -> Self {
         Self {
             state: "PENDING",
             worker_id: None,
@@ -8569,7 +8581,7 @@ impl CleanContinuationChangeset {
 pub async fn reschedule_task(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
-    scheduled_at: chrono::DateTime<Utc>,
+    scheduled_at: jiff::Timestamp,
 ) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
 
@@ -8580,7 +8592,7 @@ pub async fn reschedule_task(
     )
     .set((
         CleanContinuationChangeset::new(scheduled_at),
-        dsl::timer_fires_at.eq(Some(scheduled_at)),
+        dsl::timer_fires_at.eq(Some(scheduled_at).to_diesel()),
     ))
     .returning((dsl::queue_name, dsl::priority, dsl::task_type))
     .cache_prepared()
@@ -8625,7 +8637,7 @@ pub async fn reschedule_task(
 pub async fn defer_rate_limited_task(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
-    scheduled_at: chrono::DateTime<Utc>,
+    scheduled_at: jiff::Timestamp,
 ) -> HarvestResult<()> {
     if !defer_rate_limited_task_inner(conn, task_id, None, scheduled_at).await? {
         return Err(crate::error::HarvestError::NotFound(format!(
@@ -8639,7 +8651,7 @@ async fn defer_rate_limited_task_inner(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
     claim: Option<&TaskClaim>,
-    scheduled_at: chrono::DateTime<Utc>,
+    scheduled_at: jiff::Timestamp,
 ) -> HarvestResult<bool> {
     use crate::schema::harvest_task_queue::dsl;
 
@@ -8686,7 +8698,7 @@ async fn announce_deferred_task(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
     queue_name: &str,
-    scheduled_at: chrono::DateTime<Utc>,
+    scheduled_at: jiff::Timestamp,
     priority: i32,
     task_type: &str,
 ) -> HarvestResult<()> {
@@ -9633,8 +9645,8 @@ impl<'a> StickyHint<'a> {
         Self { worker_id, timeout }
     }
 
-    fn chrono_timeout(self) -> HarvestResult<chrono::Duration> {
-        chrono::Duration::from_std(self.timeout).map_err(|_| {
+    fn chrono_timeout(self) -> HarvestResult<jiff::SignedDuration> {
+        jiff::SignedDuration::try_from(self.timeout).map_err(|_| {
             crate::error::HarvestError::Config(
                 "sticky_timeout exceeds chrono duration range".to_string(),
             )
@@ -9717,7 +9729,7 @@ pub async fn set_task_sticky_affinity(
         )
         .bind::<diesel::sql_types::Uuid, _>(task_id)
         .bind::<diesel::sql_types::Text, _>(hint.worker_id)
-        .bind::<diesel::sql_types::Interval, _>(timeout)
+        .bind::<diesel::sql_types::Interval, _>(timeout.to_pg_interval())
         .cache_prepared()
         .execute(conn)
         .await
@@ -9727,8 +9739,8 @@ pub async fn set_task_sticky_affinity(
         diesel::update(dsl::harvest_task_queue.find(task_id))
             .set((
                 dsl::sticky_worker_id.eq(None::<String>),
-                dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
-                dsl::sticky_timeout.eq(None::<chrono::Duration>),
+                dsl::sticky_until.eq(None::<jiff::Timestamp>),
+                dsl::sticky_timeout.eq(None::<jiff::SignedDuration>),
             ))
             .execute(conn)
             .await
@@ -9841,7 +9853,7 @@ async fn park_workflow_task_inner(
         diesel::sql_query(park_workflow_task_sticky_query(reset_capability_misses))
             .bind::<diesel::sql_types::Uuid, _>(task_id)
             .bind::<diesel::sql_types::Text, _>(hint.worker_id)
-            .bind::<diesel::sql_types::Interval, _>(timeout)
+            .bind::<diesel::sql_types::Interval, _>(timeout.to_pg_interval())
             .cache_prepared()
             .load(conn)
             .await
@@ -10130,7 +10142,7 @@ pub async fn wake_workflow_task(
            AND scheduled_at <= $2",
     )
     .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-    .bind::<diesel::sql_types::Timestamptz, _>(Utc::now())
+    .bind::<diesel::sql_types::Timestamptz, _>(Timestamp::now().to_diesel())
     .cache_prepared()
     .load(conn)
     .await
@@ -10202,7 +10214,7 @@ async fn primary_repend_workflow_task(
 ) -> HarvestResult<Vec<PendingHintRow>> {
     let rows: Vec<PendingHintRow> = diesel::sql_query(primary_repend_workflow_task_query())
         .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-        .bind::<diesel::sql_types::Timestamptz, _>(Utc::now() - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE)
+        .bind::<diesel::sql_types::Timestamptz, _>((Timestamp::now() - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE).to_diesel())
         .cache_prepared()
         .load(conn)
         .await
@@ -10455,8 +10467,8 @@ pub fn resolve_effective_rate_limit(
     burst: f64,
     override_refill_rate: Option<f64>,
     override_burst: Option<f64>,
-    override_expires_at: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
+    override_expires_at: Option<Timestamp>,
+    now: Timestamp,
 ) -> EffectiveRateLimit {
     let override_active = override_expires_at.is_some_and(|expires| expires > now);
     EffectiveRateLimit {
@@ -11188,7 +11200,7 @@ fn idle_rate_limit_bucket_preview_sql() -> String {
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
 pub async fn sweep_idle_rate_limit_buckets(
     conn: &mut AsyncPgConnection,
-    cutoff: DateTime<Utc>,
+    cutoff: Timestamp,
     batch_size: usize,
     preview: bool,
 ) -> HarvestResult<std::collections::BTreeMap<String, u64>> {
@@ -11213,7 +11225,7 @@ pub async fn sweep_idle_rate_limit_buckets(
 
     for _ in 0..MAX_RATE_LIMIT_SWEEP_BATCHES_PER_TICK {
         let rows: Vec<SweptKey> = diesel::sql_query(&sql)
-            .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
+            .bind::<diesel::sql_types::Timestamptz, _>(cutoff.to_diesel())
             .bind::<diesel::sql_types::BigInt, _>(batch)
             .bind::<diesel::sql_types::Text, _>(cursor.clone())
             .load(conn)
@@ -11406,7 +11418,7 @@ fn terminal_task_preview_sql(after_cursor: bool) -> String {
 /// committed before the failure.
 pub async fn sweep_terminal_tasks(
     conn: &mut AsyncPgConnection,
-    cutoff: DateTime<Utc>,
+    cutoff: Timestamp,
     batch_size: usize,
     preview: bool,
 ) -> HarvestResult<std::collections::BTreeMap<String, u64>> {
@@ -11427,7 +11439,7 @@ pub async fn sweep_terminal_tasks(
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
 pub async fn sweep_terminal_tasks_into(
     conn: &mut AsyncPgConnection,
-    cutoff: DateTime<Utc>,
+    cutoff: Timestamp,
     batch_size: usize,
     preview: bool,
     counts: &mut std::collections::BTreeMap<String, u64>,
@@ -11439,7 +11451,8 @@ pub async fn sweep_terminal_tasks_into(
         #[diesel(sql_type = diesel::sql_types::Text)]
         state: String,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        completed_at: DateTime<Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        completed_at: Timestamp,
     }
 
     // A `batch_size` of 0 would make `LIMIT 0` delete nothing forever.
@@ -11457,7 +11470,7 @@ pub async fn sweep_terminal_tasks_into(
             terminal_task_sweep_sql(true),
         )
     };
-    let mut cursor: Option<(DateTime<Utc>, Uuid)> = None;
+    let mut cursor: Option<(Timestamp, Uuid)> = None;
 
     for _ in 0..MAX_TERMINAL_TASK_SWEEP_BATCHES_PER_TICK {
         let query = diesel::sql_query(if cursor.is_some() {
@@ -11465,12 +11478,12 @@ pub async fn sweep_terminal_tasks_into(
         } else {
             &first_sql
         })
-        .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
+        .bind::<diesel::sql_types::Timestamptz, _>(cutoff.to_diesel())
         .bind::<diesel::sql_types::BigInt, _>(batch);
         let rows: Vec<SweptRow> = match cursor {
             Some((at, id)) => {
                 query
-                    .bind::<diesel::sql_types::Timestamptz, _>(at)
+                    .bind::<diesel::sql_types::Timestamptz, _>(at.to_diesel())
                     .bind::<diesel::sql_types::Uuid, _>(id)
                     .load(conn)
                     .await
@@ -11820,7 +11833,7 @@ pub async fn pending_queue_demand_by_queue_name(
 /// deadline check could reject it. That wastes an entire lock wait on a
 /// candidate that can never claim, regardless of what the lock
 /// protects. [`try_claim_batched_candidate`] now rejects an
-/// already-expired candidate against a fresh `Utc::now()` before
+/// already-expired candidate against a fresh `Timestamp::now()` before
 /// issuing the attempt query at all. It never touches that candidate's
 /// bucket lock.
 ///
@@ -11846,7 +11859,7 @@ pub async fn pending_queue_demand_by_queue_name(
 ///
 /// A fourteenth bug (P2), caught by the same reviewer.
 /// [`try_claim_batched_candidate`]'s twelfth-bug fix above compared
-/// `schedule_to_close_at` against `Utc::now()`: the worker HOST's
+/// `schedule_to_close_at` against `Timestamp::now()`: the worker HOST's
 /// clock, not the database's. If that host clock runs ahead of
 /// Postgres, this fast pre-check can reject a candidate the database's
 /// own `clock_timestamp()` would still consider live. That is the
@@ -12419,9 +12432,11 @@ struct BatchedClaimCandidate {
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     activity_name: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    schedule_to_close_at: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    schedule_to_close_at: Option<Timestamp>,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    claim_due_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    claim_due_at: Timestamp,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     sticky_rank: i32,
     #[diesel(sql_type = diesel::sql_types::Integer)]
@@ -12445,7 +12460,7 @@ struct BatchedClaimCandidate {
 struct BatchCursor {
     sticky_rank: i32,
     effective_priority: i32,
-    claim_due_at: DateTime<Utc>,
+    claim_due_at: Timestamp,
     id: Uuid,
 }
 
@@ -12548,16 +12563,17 @@ async fn fetch_claim_batch(
 
 /// The database's own clock (review finding, fourteenth bug in the
 /// module doc above). A fast deadline pre-check that compared against
-/// the worker host's `Utc::now()` instead could reject a candidate.
+/// the worker host's `Timestamp::now()` instead could reject a candidate.
 /// The database's `clock_timestamp()` is the authoritative source
 /// every other deadline check here trusts. It would still consider
 /// that candidate live, whenever the host clock runs ahead of the
 /// database's. No table access, so this never waits on a lock.
-pub(crate) async fn db_now(conn: &mut AsyncPgConnection) -> HarvestResult<DateTime<Utc>> {
+pub(crate) async fn db_now(conn: &mut AsyncPgConnection) -> HarvestResult<Timestamp> {
     #[derive(diesel::QueryableByName)]
     struct Now {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        now: DateTime<Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        now: Timestamp,
     }
     let row: Now = diesel::sql_query("SELECT clock_timestamp() AS now")
         .cache_prepared()
@@ -15757,7 +15773,7 @@ mod tests {
 
     #[test]
     fn resolve_effective_rate_limit_with_no_override_returns_baseline() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let effective = resolve_effective_rate_limit(5.0, 10.0, None, None, None, now);
         assert_eq!(
             effective,
@@ -15771,8 +15787,8 @@ mod tests {
 
     #[test]
     fn resolve_effective_rate_limit_with_active_override_both_fields() {
-        let now = Utc::now();
-        let expires = now + Duration::seconds(60);
+        let now = Timestamp::now();
+        let expires = now + SignedDuration::from_secs(60);
         let effective =
             resolve_effective_rate_limit(5.0, 10.0, Some(50.0), Some(100.0), Some(expires), now);
         assert_eq!(
@@ -15787,8 +15803,8 @@ mod tests {
 
     #[test]
     fn resolve_effective_rate_limit_only_refill_rate_overridden_burst_falls_back() {
-        let now = Utc::now();
-        let expires = now + Duration::seconds(60);
+        let now = Timestamp::now();
+        let expires = now + SignedDuration::from_secs(60);
         let effective =
             resolve_effective_rate_limit(5.0, 10.0, Some(50.0), None, Some(expires), now);
         assert_eq!(
@@ -15803,8 +15819,8 @@ mod tests {
 
     #[test]
     fn resolve_effective_rate_limit_only_burst_overridden_refill_rate_falls_back() {
-        let now = Utc::now();
-        let expires = now + Duration::seconds(60);
+        let now = Timestamp::now();
+        let expires = now + SignedDuration::from_secs(60);
         let effective =
             resolve_effective_rate_limit(5.0, 10.0, None, Some(100.0), Some(expires), now);
         assert_eq!(
@@ -15819,8 +15835,8 @@ mod tests {
 
     #[test]
     fn resolve_effective_rate_limit_expired_override_falls_back_to_baseline() {
-        let now = Utc::now();
-        let expired = now - Duration::seconds(1);
+        let now = Timestamp::now();
+        let expired = now - SignedDuration::from_secs(1);
         let effective =
             resolve_effective_rate_limit(5.0, 10.0, Some(50.0), Some(100.0), Some(expired), now);
         // Reverting needs no operator action and no background sweeper: a
@@ -15840,7 +15856,7 @@ mod tests {
         // `override_expires_at == now` must NOT be considered active -- the
         // SQL renders a strict `>`, not `>=`, and this pure-Rust mirror must
         // agree exactly at the boundary.
-        let now = Utc::now();
+        let now = Timestamp::now();
         let effective =
             resolve_effective_rate_limit(5.0, 10.0, Some(50.0), Some(100.0), Some(now), now);
         assert_eq!(
@@ -15925,16 +15941,16 @@ mod tests {
             20.0, // baseline burst
             Some(5.0),
             None, // burst not overridden -- falls back to 20.0
-            Some(Utc::now() + Duration::seconds(60)),
-            Utc::now(),
+            Some(Timestamp::now() + SignedDuration::from_secs(60)),
+            Timestamp::now(),
         );
         let shard_b = resolve_effective_rate_limit(
             100.0,
             30.0, // diverged baseline burst
             Some(5.0),
             None, // burst not overridden -- falls back to 30.0
-            Some(Utc::now() + Duration::seconds(60)),
-            Utc::now(),
+            Some(Timestamp::now() + SignedDuration::from_secs(60)),
+            Timestamp::now(),
         );
         assert_eq!(shard_a.override_active, shard_b.override_active);
         // Raw override columns agree (both Some(5.0), None), so a comparison
@@ -17071,7 +17087,7 @@ mod tests {
         use diesel::debug_query;
         use diesel::pg::Pg;
 
-        let changeset = CleanContinuationChangeset::new(chrono::Utc::now());
+        let changeset = CleanContinuationChangeset::new(jiff::Timestamp::now());
 
         // Assert the VALUES, not only the columns. A column-presence check
         // misses a `0 -> n` mutation, which makes both counters cumulative.
@@ -17128,7 +17144,7 @@ mod tests {
         use diesel::debug_query;
         use diesel::pg::Pg;
 
-        let changeset = CleanContinuationChangeset::new(chrono::Utc::now());
+        let changeset = CleanContinuationChangeset::new(jiff::Timestamp::now());
         let query = diesel::update(dsl::harvest_task_queue.filter(dsl::state.eq("RUNNING")))
             .set(&changeset);
         let debug = debug_query::<Pg, _>(&query).to_string();
@@ -17152,7 +17168,7 @@ mod tests {
     #[test]
     fn requeue_after_panic_query_resets_and_unpins_the_task_row() {
         let changeset = PendingRequeueChangeset::new("handler panic: boom".to_string());
-        let sql = workflow_backoff_sql(changeset, Duration::seconds(5), Some(StickyRelease::new()));
+        let sql = workflow_backoff_sql(changeset, SignedDuration::from_secs(5), Some(StickyRelease::new()));
 
         // `debug_query` emits every column as a bound parameter (`= $N`), as
         // in the `pending_requeue_changeset` shape test. The sticky and
@@ -17214,7 +17230,7 @@ mod tests {
     #[test]
     fn requeue_workflow_task_for_quota_retry_query_clears_sentinel_and_wake() {
         let changeset = PendingRequeueChangeset::new("quota exceeded".to_string());
-        let sql = workflow_backoff_sql(changeset, Duration::seconds(5), None);
+        let sql = workflow_backoff_sql(changeset, SignedDuration::from_secs(5), None);
 
         for column in ["wake_requested", "activity_name", "timer_fires_at"] {
             assert!(
@@ -17294,7 +17310,7 @@ mod tests {
         crate::dispatch::uninstall_all();
 
         let task_id = Uuid::new_v4();
-        let updated = vec![("default".to_string(), 5, Utc::now())];
+        let updated = vec![("default".to_string(), 5, Timestamp::now())];
 
         let result = finish_workflow_backoff_requeue(task_id, updated);
 
@@ -17310,7 +17326,7 @@ mod tests {
     fn workflow_backoff_set_carries_the_shared_clears_with_or_without_sticky() {
         for sticky in [None, Some(StickyRelease::new())] {
             let changeset = PendingRequeueChangeset::new("why".to_string());
-            let sql = workflow_backoff_sql(changeset, Duration::seconds(5), sticky);
+            let sql = workflow_backoff_sql(changeset, SignedDuration::from_secs(5), sticky);
 
             assert!(
                 sql.contains("\"scheduled_at\" = clock_timestamp() + make_interval(secs => $"),
@@ -17332,12 +17348,12 @@ mod tests {
         let columns = ["sticky_worker_id", "sticky_until", "sticky_timeout"];
         let kept = workflow_backoff_sql(
             PendingRequeueChangeset::new("why".to_string()),
-            Duration::seconds(5),
+            SignedDuration::from_secs(5),
             None,
         );
         let released = workflow_backoff_sql(
             PendingRequeueChangeset::new("why".to_string()),
-            Duration::seconds(5),
+            SignedDuration::from_secs(5),
             Some(StickyRelease::new()),
         );
 
@@ -17394,7 +17410,7 @@ mod tests {
 
     #[test]
     fn schedule_to_start_uses_eligibility_floor() {
-        let now = Utc::now();
+        let now = Timestamp::now();
 
         // Immediate task: scheduled_at backdated by the skew allowance, created_at is
         // the real insert-time eligibility. Claimed instantly it must report ~0, not
@@ -17408,7 +17424,7 @@ mod tests {
 
         // Immediate task that genuinely waited 10s: enqueued (created) 10s ago, with
         // scheduled_at backdated a further skew. Reports the full 10s (floor = created).
-        let created_10s_ago = now - Duration::seconds(10);
+        let created_10s_ago = now - SignedDuration::from_secs(10);
         let scheduled_backdated = created_10s_ago - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE;
         let secs = schedule_to_start_secs(scheduled_backdated, Some(created_10s_ago), now);
         assert!((secs - 10.0).abs() < 0.05, "expected ~10s wait, got {secs}");
@@ -17416,8 +17432,8 @@ mod tests {
         // Delayed/retried task (issue #501 review): scheduled_at set to an explicit
         // instant 10s ago with NO backdating, created_at long before. The full 10s
         // must be reported — the prior fixed discount would have under-reported it.
-        let scheduled_explicit = now - Duration::seconds(10);
-        let created_long_ago = now - Duration::seconds(300);
+        let scheduled_explicit = now - SignedDuration::from_secs(10);
+        let created_long_ago = now - SignedDuration::from_secs(300);
         let delayed = schedule_to_start_secs(scheduled_explicit, Some(created_long_ago), now);
         assert!(
             (delayed - 10.0).abs() < 0.05,
@@ -17425,7 +17441,7 @@ mod tests {
         );
 
         // Pre-upgrade row (created_at = None) falls back to scheduled_at.
-        let legacy = schedule_to_start_secs(now - Duration::seconds(7), None, now);
+        let legacy = schedule_to_start_secs(now - SignedDuration::from_secs(7), None, now);
         assert!(
             (legacy - 7.0).abs() < 0.05,
             "None created_at must use scheduled_at, got {legacy}"
@@ -17434,8 +17450,8 @@ mod tests {
         // Never negative, even if start precedes the eligibility floor.
         assert!(
             schedule_to_start_secs(
-                now + Duration::seconds(1),
-                Some(now - Duration::seconds(300)),
+                now + SignedDuration::from_secs(1),
+                Some(now - SignedDuration::from_secs(300)),
                 now
             ) < f64::EPSILON
         );
@@ -17445,10 +17461,10 @@ mod tests {
     /// must convert exactly, including sub-second and zero delays.
     #[test]
     fn delay_secs_converts_exactly() {
-        assert!((delay_secs(Duration::seconds(2)) - 2.0).abs() < f64::EPSILON);
-        assert!((delay_secs(Duration::milliseconds(500)) - 0.5).abs() < f64::EPSILON);
-        assert!((delay_secs(Duration::zero()) - 0.0).abs() < f64::EPSILON);
-        assert!((delay_secs(Duration::seconds(-3)) - (-3.0)).abs() < f64::EPSILON);
+        assert!((delay_secs(SignedDuration::from_secs(2)) - 2.0).abs() < f64::EPSILON);
+        assert!((delay_secs(SignedDuration::from_millis(500)) - 0.5).abs() < f64::EPSILON);
+        assert!((delay_secs(SignedDuration::ZERO) - 0.0).abs() < f64::EPSILON);
+        assert!((delay_secs(SignedDuration::from_secs(-3)) - (-3.0)).abs() < f64::EPSILON);
     }
 
     /// `JitterPolicy::Full` can pick a sub-millisecond delay (issue #1389
@@ -17456,8 +17472,8 @@ mod tests {
     /// zero, turning a short retry into an immediate one.
     #[test]
     fn delay_secs_preserves_sub_millisecond_precision() {
-        assert!((delay_secs(Duration::microseconds(500)) - 0.0005).abs() < f64::EPSILON);
-        assert!((delay_secs(Duration::microseconds(1)) - 0.000_001).abs() < f64::EPSILON);
+        assert!((delay_secs(SignedDuration::from_micros(500)) - 0.0005).abs() < f64::EPSILON);
+        assert!((delay_secs(SignedDuration::from_micros(1)) - 0.000_001).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -17518,7 +17534,7 @@ mod tests {
 
     #[test]
     fn enqueue_params_schedule_to_close_at_can_be_set() {
-        let deadline = Utc::now() + Duration::seconds(300);
+        let deadline = Timestamp::now() + SignedDuration::from_secs(300);
         let mut params = EnqueueParams::new("default", TaskType::Activity, serde_json::json!(null));
         params.schedule_to_close_at = Some(deadline);
         assert_eq!(params.schedule_to_close_at, Some(deadline));
@@ -17551,7 +17567,7 @@ mod tests {
             input: serde_json::Value::Null.into(),
             priority: 0,
             max_attempts: 1,
-            scheduled_at: Utc::now(),
+            scheduled_at: Timestamp::now(),
             heartbeat_timeout: None,
             start_to_close: None,
             schedule_to_start: None,
@@ -18048,7 +18064,7 @@ mod tests {
     fn dispatch_probe_reports_pending_only_for_pending_rows() {
         let probe = |state: &str| DispatchProbe {
             state: state.to_string(),
-            scheduled_at: Utc::now(),
+            scheduled_at: Timestamp::now(),
             has_worker: false,
             pinned_elsewhere: false,
             activity_name: None,

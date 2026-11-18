@@ -38,7 +38,7 @@ use std::collections::BTreeMap;
 
 use autumn_harvest::usage::{UsageGroupBy, UsageQuery, UsageShardRow};
 use autumn_harvest::worker::DbPool;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use futures::future::join_all;
 use serde::Serialize;
 
@@ -91,9 +91,9 @@ pub struct UsageResponse {
     /// Cross-shard completeness of this report.
     pub status: UsageReportStatus,
     /// Inclusive lower bound of the aggregation window, as requested.
-    pub from: DateTime<Utc>,
+    pub from: Timestamp,
     /// Inclusive upper bound of the aggregation window, as requested.
-    pub to: DateTime<Utc>,
+    pub to: Timestamp,
     /// The grouping dimension actually used (wire form).
     pub group_by: String,
     /// Records, sorted by `group` ascending.
@@ -149,8 +149,8 @@ fn format_ceiling(d: std::time::Duration) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageParams {
     pub group_by: UsageGroupBy,
-    pub from: DateTime<Utc>,
-    pub to: DateTime<Utc>,
+    pub from: Timestamp,
+    pub to: Timestamp,
 }
 
 impl UsageParams {
@@ -169,11 +169,11 @@ impl UsageParams {
     /// - `group_by` is not a recognized dimension.
     pub fn from_query_pairs(
         pairs: &[(String, String)],
-        now: DateTime<Utc>,
+        now: Timestamp,
         ceiling: std::time::Duration,
     ) -> Result<Self, String> {
-        let mut from: Option<DateTime<Utc>> = None;
-        let mut to: Option<DateTime<Utc>> = None;
+        let mut from: Option<Timestamp> = None;
+        let mut to: Option<Timestamp> = None;
         let mut group_by = UsageGroupBy::WorkflowName;
 
         for (key, value) in pairs {
@@ -195,8 +195,8 @@ impl UsageParams {
             ));
         }
 
-        let window = to.signed_duration_since(from);
-        let ceiling_chrono = chrono::Duration::from_std(ceiling).unwrap_or(chrono::Duration::MAX);
+        let window = to.duration_since(from);
+        let ceiling_chrono = jiff::SignedDuration::try_from(ceiling).unwrap_or(jiff::SignedDuration::MAX);
         if window > ceiling_chrono {
             let ceiling_label = format_ceiling(ceiling);
             return Err(format!(
@@ -221,8 +221,8 @@ impl UsageParams {
 /// `max_groups`, checked after the cross-shard merge but before the
 /// response is constructed (no extra DB round-trip).
 pub fn build_usage_response(
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
+    from: Timestamp,
+    to: Timestamp,
     group_by: &UsageGroupBy,
     observations: Vec<ShardObservation<UsageShardRow>>,
     max_groups: usize,
@@ -377,10 +377,10 @@ pub async fn build_usage_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone as _;
+    use jiff::Timestamp;
 
-    fn at(seconds: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(seconds, 0).unwrap()
+    fn at(seconds: i64) -> Timestamp {
+        Timestamp::new(seconds, 0).unwrap()
     }
 
     fn row(group: &str, starts: i64, completed: i64, failed: i64) -> UsageShardRow {
@@ -506,12 +506,11 @@ mod tests {
 
     #[test]
     fn params_accepts_window_exactly_at_ceiling() {
-        let from = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let to = from + chrono::Duration::from_std(CEILING).unwrap();
+        let from = ("2026-01-01T00:00:00Z").parse::<Timestamp>()
+            .unwrap();
+        let to = from + jiff::SignedDuration::try_from(CEILING).unwrap();
         let params = UsageParams::from_query_pairs(
-            &pairs(&[("from", &from.to_rfc3339()), ("to", &to.to_rfc3339())]),
+            &pairs(&[("from", &autumn_harvest::time::rfc3339(from)), ("to", &autumn_harvest::time::rfc3339(to))]),
             at(0),
             CEILING,
         )
@@ -569,14 +568,13 @@ mod tests {
 
     #[test]
     fn params_accepts_relative_duration_since_now() {
-        let now = DateTime::parse_from_rfc3339("2026-02-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let now = ("2026-02-01T00:00:00Z").parse::<Timestamp>()
+            .unwrap();
         let params =
             UsageParams::from_query_pairs(&pairs(&[("from", "24h"), ("to", "1h")]), now, CEILING)
                 .unwrap();
-        assert_eq!(params.to, now - chrono::Duration::hours(1));
-        assert_eq!(params.from, now - chrono::Duration::hours(24));
+        assert_eq!(params.to, now - jiff::SignedDuration::from_hours(1));
+        assert_eq!(params.from, now - jiff::SignedDuration::from_hours(24));
     }
 
     #[test]

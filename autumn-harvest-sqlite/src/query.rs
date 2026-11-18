@@ -45,8 +45,8 @@ pub struct ReplayInput {
     /// The drive's timeout and deadline, so `ctx.deadline()` matches (issue
     /// #2029).
     deadline: (
-        Option<chrono::Duration>,
-        Option<chrono::DateTime<chrono::Utc>>,
+        Option<jiff::SignedDuration>,
+        Option<jiff::Timestamp>,
     ),
 }
 
@@ -117,8 +117,8 @@ impl ReplayInput {
     pub const fn deadline(
         &self,
     ) -> (
-        Option<chrono::Duration>,
-        Option<chrono::DateTime<chrono::Utc>>,
+        Option<jiff::SignedDuration>,
+        Option<jiff::Timestamp>,
     ) {
         self.deadline
     }

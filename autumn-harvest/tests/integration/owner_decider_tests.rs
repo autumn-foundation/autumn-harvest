@@ -566,7 +566,7 @@ async fn seed_ranked(
     );
     params.workflow_exec_id = Some(exec);
     params.decision_partition = partition.map(|p| DecisionPartition::new(p).expect("in range"));
-    params.scheduled_at = chrono::Utc::now() + chrono::Duration::seconds(due_in_secs);
+    params.scheduled_at = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(due_in_secs);
     params.priority = priority;
     params.new_start = new_start;
     autumn_harvest::queue::enqueue(conn, &params)
@@ -704,8 +704,8 @@ async fn the_key_lookup_ranks_hinted_executions() {
     assert_eq!(got, want, "due workflow rows only");
     let handicap = rows.iter().find(|r| r.exec_id == high).expect("high");
     let plain = rows.iter().find(|r| r.exec_id == low).expect("low");
-    assert!(handicap.due_at > chrono::Utc::now() + chrono::Duration::seconds(20));
-    assert!(plain.due_at < chrono::Utc::now());
+    assert!(handicap.due_at > jiff::Timestamp::now() + jiff::SignedDuration::from_secs(20));
+    assert!(plain.due_at < jiff::Timestamp::now());
     db.drop_db().await;
 }
 

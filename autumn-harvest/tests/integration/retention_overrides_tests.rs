@@ -20,6 +20,7 @@
 //! migration bundle (`autumn_harvest::test_init_sql()`).
 
 use std::sync::{Arc, Mutex};
+use jiff_diesel::ToDiesel;
 use std::time::Duration;
 
 use autumn_harvest::WorkflowEvent;
@@ -31,7 +32,7 @@ use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::DbPool;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use diesel::sql_types::{Nullable, Text, Timestamptz};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
@@ -111,7 +112,7 @@ async fn insert_completed(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
     workflow_id: &str,
-    completed_at: DateTime<Utc>,
+    completed_at: Timestamp,
 ) -> uuid::Uuid {
     let id: uuid::Uuid = diesel::sql_query(
         "INSERT INTO harvest_workflow_executions
@@ -209,7 +210,7 @@ fn history_only(max_age: Option<Duration>) -> RetentionConfig {
 // This catches a `max(override, global)` mutation of `effective_max_age`.
 // Under that mutation `short_wf@2h` resolves to the 1-day global and survives,
 // so the survivor assertion fails.
-// Comfortable 2h-vs-1h/1day margins avoid `Utc::now()` boundary flakiness.
+// Comfortable 2h-vs-1h/1day margins avoid `Timestamp::now()` boundary flakiness.
 #[tokio::test]
 async fn override_longer_survives_shorter_deleted() {
     let (url, _container) = setup_db().await;
@@ -217,9 +218,9 @@ async fn override_longer_survives_shorter_deleted() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let now = Utc::now();
-    let two_days_ago = now - chrono::Duration::days(2);
-    let two_hours_ago = now - chrono::Duration::hours(2);
+    let now = Timestamp::now();
+    let two_days_ago = now - autumn_harvest::time::days(2);
+    let two_hours_ago = now - jiff::SignedDuration::from_hours(2);
     // "long_wf": override 30 days (longer than the 1-day global) -> survives.
     insert_completed(&mut conn, "long_wf", "l1", two_days_ago).await;
     // "short_wf": override 1 hour (shorter than the 1-day global). Both the
@@ -276,7 +277,7 @@ async fn dry_run_reports_per_type_counts_without_deleting() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let old = Utc::now() - chrono::Duration::days(2);
+    let old = Timestamp::now() - autumn_harvest::time::days(2);
     insert_completed(&mut conn, "dry_a", "a1", old).await;
     insert_completed(&mut conn, "dry_a", "a2", old).await;
     insert_completed(&mut conn, "dry_b", "b1", old).await;
@@ -318,19 +319,19 @@ async fn no_overrides_behaves_like_global_only() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     insert_completed(
         &mut conn,
         "compat_old",
         "o1",
-        now - chrono::Duration::days(2),
+        now - autumn_harvest::time::days(2),
     )
     .await;
     insert_completed(
         &mut conn,
         "compat_young",
         "y1",
-        now - chrono::Duration::minutes(5),
+        now - jiff::SignedDuration::from_mins(5),
     )
     .await;
 
@@ -360,7 +361,7 @@ async fn overrides_only_never_deletes_types_without_override() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let old = Utc::now() - chrono::Duration::days(2);
+    let old = Timestamp::now() - autumn_harvest::time::days(2);
     insert_completed(&mut conn, "keep_forever", "k1", old).await;
     insert_completed(&mut conn, "purge_me", "p1", old).await;
 
@@ -411,7 +412,7 @@ async fn not_yet_eligible_backlog_does_not_starve_eligible_deletion() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     // A backlog of `archive_wf` rows, all OLDER than the eligible global_wf row
     // but NONE eligible under the 365-day override. These would sort FIRST under
     // `ORDER BY completed_at ASC` and consume the batch under the old behavior.
@@ -419,21 +420,21 @@ async fn not_yet_eligible_backlog_does_not_starve_eligible_deletion() {
         &mut conn,
         "archive_wf",
         "a60",
-        now - chrono::Duration::days(60),
+        now - autumn_harvest::time::days(60),
     )
     .await;
     insert_completed(
         &mut conn,
         "archive_wf",
         "a45",
-        now - chrono::Duration::days(45),
+        now - autumn_harvest::time::days(45),
     )
     .await;
     insert_completed(
         &mut conn,
         "archive_wf",
         "a30",
-        now - chrono::Duration::days(30),
+        now - autumn_harvest::time::days(30),
     )
     .await;
     // One eligible short-policy row: 2 days > the 1-day global default.
@@ -441,7 +442,7 @@ async fn not_yet_eligible_backlog_does_not_starve_eligible_deletion() {
         &mut conn,
         "global_wf",
         "g1",
-        now - chrono::Duration::days(2),
+        now - autumn_harvest::time::days(2),
     )
     .await;
 
@@ -506,13 +507,13 @@ async fn retention_archive_carries_deadline_metadata() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let now = Utc::now();
-    let two_days_ago = now - chrono::Duration::days(2);
+    let now = Timestamp::now();
+    let two_days_ago = now - autumn_harvest::time::days(2);
     // The live effective deadline the timeout scanner enforced for this run.
     // Whole-second so it round-trips through Postgres `timestamptz` (microsecond
     // precision) with an exact equality check against the archived document.
     let deadline_at =
-        DateTime::from_timestamp(two_days_ago.timestamp() + 30, 0).expect("valid deadline");
+        Timestamp::from_second(two_days_ago.as_second() + 30).ok().expect("valid deadline");
     let exec_id = insert_completed_with_deadline(
         &mut conn,
         "deadline_wf",
@@ -551,7 +552,7 @@ async fn retention_archive_carries_deadline_metadata() {
     assert_eq!(doc.execution_id, exec_id);
     // The archive — the last surviving copy — must carry the deadline budget.
     assert_eq!(
-        doc.execution_timeout.map(|d| d.num_seconds()),
+        doc.execution_timeout.map(|d| d.as_secs()),
         Some(30),
         "archived doc must carry execution_timeout (issue #772 Finding A)"
     );
@@ -590,7 +591,7 @@ async fn retention_archive_carries_parent_execution_id() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let two_days_ago = Utc::now() - chrono::Duration::days(2);
+    let two_days_ago = Timestamp::now() - autumn_harvest::time::days(2);
     // A phantom spawning parent (no FK on `parent_id`, so no parent row is
     // needed). The child is then the SOLE retention candidate. The
     // deleted-parent orphan-nulling path never touches its `parent_id`, so the
@@ -606,7 +607,7 @@ async fn retention_archive_carries_parent_execution_id() {
     )
     .bind::<Text, _>("child_wf")
     .bind::<Text, _>("cw1")
-    .bind::<Timestamptz, _>(two_days_ago)
+    .bind::<Timestamptz, _>(two_days_ago.to_diesel())
     .bind::<diesel::sql_types::Uuid, _>(parent.as_uuid())
     .get_result::<IdRow>(&mut conn)
     .await
@@ -711,9 +712,9 @@ async fn insert_completed_with_deadline(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
     workflow_id: &str,
-    completed_at: DateTime<Utc>,
+    completed_at: Timestamp,
     execution_timeout_secs: i32,
-    deadline_at: DateTime<Utc>,
+    deadline_at: Timestamp,
 ) -> ExecutionId {
     let id: uuid::Uuid = diesel::sql_query(
         "INSERT INTO harvest_workflow_executions
@@ -746,7 +747,7 @@ async fn insert_completed_with_deadline(
         WorkflowEvent::SideEffectRecorded {
             kind: autumn_harvest::SideEffectKind::Now,
             name: Some(autumn_harvest::DEADLINE_PROBE_SIDE_EFFECT_NAME.to_string()),
-            value: serde_json::json!(recorded_now.timestamp_millis()),
+            value: serde_json::json!(recorded_now.as_millisecond()),
         },
     ];
     autumn_harvest::store::append_events(conn, exec_id, &events, 0)
@@ -766,7 +767,7 @@ async fn a_worker_sealed_run_is_a_retention_candidate() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let two_days_ago = Utc::now() - chrono::Duration::days(2);
+    let two_days_ago = Timestamp::now() - autumn_harvest::time::days(2);
     let sealed = insert_completed(&mut conn, "sealed_wf", "w1", two_days_ago).await;
     let leased = insert_completed(&mut conn, "leased_wf", "w2", two_days_ago).await;
     for (id, holder) in [
@@ -808,7 +809,7 @@ async fn insert_completed_for_tenant(
     workflow_name: &str,
     workflow_id: &str,
     tenant: Option<&str>,
-    completed_at: DateTime<Utc>,
+    completed_at: Timestamp,
 ) -> uuid::Uuid {
     let id = insert_completed(conn, workflow_name, workflow_id, completed_at).await;
     diesel::sql_query("UPDATE harvest_workflow_executions SET tenant = $2 WHERE id = $1")
@@ -849,7 +850,7 @@ async fn tenant_override_deletes_only_that_tenants_runs() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let two_hours_ago = Utc::now() - chrono::Duration::hours(2);
+    let two_hours_ago = Timestamp::now() - jiff::SignedDuration::from_hours(2);
     insert_completed_for_tenant(
         &mut conn,
         "plain_wf",
@@ -900,7 +901,7 @@ async fn tenant_override_only_config_keeps_other_tenants() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let old = Utc::now() - chrono::Duration::days(2);
+    let old = Timestamp::now() - autumn_harvest::time::days(2);
     insert_completed_for_tenant(&mut conn, "plain_wf", "acme-old", Some("acme"), old).await;
     insert_completed_for_tenant(&mut conn, "plain_wf", "globex-old", Some("globex"), old).await;
     insert_completed_for_tenant(&mut conn, "plain_wf", "none-old", None, old).await;
@@ -926,7 +927,7 @@ async fn longer_tenant_override_keeps_runs_and_dry_run_deletes_nothing() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let two_days_ago = Utc::now() - chrono::Duration::days(2);
+    let two_days_ago = Timestamp::now() - autumn_harvest::time::days(2);
     insert_completed_for_tenant(
         &mut conn,
         "plain_wf",

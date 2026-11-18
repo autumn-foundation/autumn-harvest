@@ -41,7 +41,7 @@ use autumn_harvest::{
     ActivityContext, ActivityExecId, ActivityHandlerFn, ExecutionId, TimeoutType, TimerId,
     WorkflowCommand, WorkflowEvent, WorkflowHistoryPolicy,
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use rusqlite::Connection;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -385,12 +385,12 @@ fn activity_context(
 /// It is the same rule as the Postgres worker. A non-positive budget is
 /// unbounded, as in [`start_to_close_exceeded`]. `claim_ms` can be a simulated
 /// clock, but `ActivityContext::time_remaining` reads the real clock. So the
-/// result is the remaining span added to `Utc::now()`.
+/// result is the remaining span added to `Timestamp::now()`.
 fn attempt_deadline(
     claim_ms: i64,
     start_to_close_ms: Option<i64>,
     schedule_to_close_at: Option<i64>,
-) -> Option<DateTime<Utc>> {
+) -> Option<Timestamp> {
     let per_attempt = start_to_close_ms
         .filter(|ms| *ms > 0)
         .map(|ms| claim_ms.saturating_add(ms));
@@ -399,8 +399,8 @@ fn attempt_deadline(
         (Some(only), None) | (None, Some(only)) => Some(only),
         (None, None) => None,
     }?;
-    let remaining = chrono::Duration::try_milliseconds(at.saturating_sub(claim_ms))?;
-    Utc::now().checked_add_signed(remaining)
+    let remaining = Some(jiff::SignedDuration::from_millis(at.saturating_sub(claim_ms)))?;
+    Timestamp::now().checked_add(remaining).ok()
 }
 
 /// Await one `#[activity]` handler with its context (issue #2024).
@@ -452,7 +452,7 @@ fn run_ledger_body(
     input: &Value,
     claim_ms: i64,
 ) -> (Result<Value, String>, Vec<LlmCall>) {
-    let at = DateTime::<Utc>::from_timestamp_millis(claim_ms).unwrap_or_else(Utc::now);
+    let at = Timestamp::from_millisecond(claim_ms).ok().unwrap_or_else(Utc::now);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(input.clone(), at)))
         .unwrap_or_else(|payload| {
             Err(handler_panic_activity_envelope(
@@ -1274,9 +1274,9 @@ pub async fn run_local_attempt(
                 run.name.clone(),
                 run.activity_id,
             );
-            let deadline = chrono::Duration::from_std(budget)
+            let deadline = jiff::SignedDuration::try_from(budget)
                 .ok()
-                .and_then(|span| Utc::now().checked_add_signed(span));
+                .and_then(|span| Timestamp::now().checked_add(span).ok());
             let ctx = ActivityContext::new_embedded_local(owner.state.clone(), identity)
                 .with_attempt(attempt)
                 .with_max_attempts(run.max_attempts())
@@ -1861,7 +1861,7 @@ mod tests {
         assert_eq!(rows[0].activity_name, "think");
         assert_eq!(rows[0].cost_usd_micros, Some(30));
         assert_eq!(rows[1].input_tokens, 12);
-        assert_eq!(rows[0].recorded_at.timestamp_millis(), 7);
+        assert_eq!(rows[0].recorded_at.as_millisecond(), 7);
         assert!(matches!(
             store::load_history(&conn, exec).unwrap()[..],
             [autumn_harvest::WorkflowEvent::ActivityCompleted { .. }]
@@ -2004,8 +2004,8 @@ mod tests {
     fn attempt_deadline_takes_the_earlier_clock_on_the_real_clock() {
         // The deadline lies `want` seconds after the real clock, give or take
         // the time the test itself takes.
-        let near = |at: Option<chrono::DateTime<chrono::Utc>>, want: i64| {
-            let secs = (at.expect("a bounded attempt") - chrono::Utc::now()).num_seconds();
+        let near = |at: Option<jiff::Timestamp>, want: i64| {
+            let secs = (at.expect("a bounded attempt") - jiff::Timestamp::now()).as_secs();
             assert!((want - 2..=want).contains(&secs), "{secs}s, want {want}s");
         };
         // A simulated claim at epoch 0 still gives a deadline about 60s away.

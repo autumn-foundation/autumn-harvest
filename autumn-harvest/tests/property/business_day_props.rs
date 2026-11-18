@@ -3,20 +3,19 @@
 //! Contract under test:
 //! - `add_business_days` is monotone in `n`: when `n` resolves, each `m < n`
 //!   resolves too.
-//! - `apply_skip_policy` does not panic, also at the `NaiveDate` range limits.
+//! - `apply_skip_policy` does not panic, also at the `jiff::civil::Date` range limits.
 
 use std::collections::BTreeSet;
 
 use autumn_harvest::policy::SkipPolicy;
 use autumn_harvest::{add_business_days, apply_skip_policy};
-use chrono::{Days, NaiveDate};
 use proptest::prelude::*;
 
 use super::prop_config::config;
 
 /// The first date of the generated calendars.
-const fn origin() -> NaiveDate {
-    NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()
+const fn origin() -> jiff::civil::Date {
+    autumn_harvest::time::date_ymd(2026, 1, 1).unwrap()
 }
 
 /// Holiday closures as `(start offset, length)` pairs, in days from
@@ -25,7 +24,7 @@ fn closures() -> impl Strategy<Value = Vec<(u64, u64)>> {
     prop::collection::vec((0u64..120, 1u64..45), 0..4)
 }
 
-fn calendar(closures: &[(u64, u64)]) -> BTreeSet<NaiveDate> {
+fn calendar(closures: &[(u64, u64)]) -> BTreeSet<jiff::civil::Date> {
     closures
         .iter()
         .flat_map(|&(start, len)| start..start + len)
@@ -66,7 +65,7 @@ proptest! {
         }
     }
 
-    /// The skip scan does not panic near `NaiveDate::MAX` or `NaiveDate::MIN`.
+    /// The skip scan does not panic near `jiff::civil::Date::MAX` or `jiff::civil::Date::MIN`.
     /// The proptest harness makes a panic a failed case.
     #[test]
     fn apply_skip_policy_is_total_at_the_range_limits(
@@ -78,12 +77,12 @@ proptest! {
     ) {
         let at = |o: u64| {
             if near_max {
-                NaiveDate::MAX - Days::new(o)
+                jiff::civil::Date::MAX - Days::new(o)
             } else {
-                NaiveDate::MIN + Days::new(o)
+                jiff::civil::Date::MIN + Days::new(o)
             }
         };
-        let excluded: Vec<NaiveDate> = excluded_offsets.iter().map(|&o| at(o)).collect();
+        let excluded: Vec<jiff::civil::Date> = excluded_offsets.iter().map(|&o| at(o)).collect();
         let _ = apply_skip_policy(at(offset), policy, &excluded, exclude_weekends);
     }
 }

@@ -61,7 +61,7 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use crate::info::ActivityInfo;
 use crate::policy::RetryPolicy;
@@ -281,9 +281,9 @@ pub struct ActivityDefaultOverride {
     /// The actor that last changed the override.
     pub updated_by: String,
     /// The time of the first write.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// When the override last changed.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 #[cfg(feature = "db")]
@@ -297,7 +297,7 @@ mod db {
     };
     use std::time::Duration;
 
-    use chrono::{DateTime, Utc};
+    use jiff::Timestamp;
     use diesel::prelude::*;
     use diesel_async::{AsyncPgConnection, RunQueryDsl};
 
@@ -320,8 +320,10 @@ mod db {
         max_concurrent: Option<i32>,
         reason: Option<String>,
         updated_by: String,
-        created_at: DateTime<Utc>,
-        updated_at: DateTime<Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        created_at: Timestamp,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        updated_at: Timestamp,
     }
 
     impl OverrideRow {
@@ -531,7 +533,7 @@ mod db {
                 return Ok(None);
             }
             check_retry_limits(merged.retry)?;
-            let now = Utc::now();
+            let now = Timestamp::now();
             let retry_max_attempts = merged
                 .retry
                 .max_attempts

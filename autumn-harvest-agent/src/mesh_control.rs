@@ -46,39 +46,31 @@ pub enum BudgetPeriod {
 impl BudgetPeriod {
     /// The start and the end of the period that holds `now`.
     #[must_use]
-    pub fn window(self, now: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
+    pub fn window(self, now: Timestamp) -> (Timestamp, Timestamp) {
         match self {
             Self::Day => {
-                let start = Utc
-                    .with_ymd_and_hms(now.year(), now.month(), now.day(), 0, 0, 0)
-                    .single()
+                let start = autumn_harvest::time::utc_ymd_hms(now.year(), now.month(), now.day(), 0, 0, 0)
                     .unwrap_or(now);
-                (start, start + autumn_harvest::chrono::Duration::days(1))
+                (start, start + autumn_harvest::autumn_harvest::time::days(1))
             }
             Self::Month => {
-                let start = Utc
-                    .with_ymd_and_hms(now.year(), now.month(), 1, 0, 0, 0)
-                    .single()
+                let start = autumn_harvest::time::utc_ymd_hms(now.year(), now.month(), 1, 0, 0, 0)
                     .unwrap_or(now);
                 let (year, month) = if now.month() == 12 {
                     (now.year() + 1, 1)
                 } else {
                     (now.year(), now.month() + 1)
                 };
-                let end = Utc
-                    .with_ymd_and_hms(year, month, 1, 0, 0, 0)
-                    .single()
+                let end = autumn_harvest::time::utc_ymd_hms(year, month, 1, 0, 0, 0)
                     .unwrap_or(now);
                 (start, end)
             }
             Self::Every { secs } => {
                 let len = i64::try_from(secs.max(1)).unwrap_or(i64::MAX);
-                let at = now.timestamp();
+                let at = now.as_second();
                 let start = at - at.rem_euclid(len);
-                let from = Utc.timestamp_opt(start, 0).single().unwrap_or(now);
-                let until = Utc
-                    .timestamp_opt(start.saturating_add(len), 0)
-                    .single()
+                let from = Timestamp::new(start, 0).ok().unwrap_or(now);
+                let until = Timestamp::new(start.saturating_add(len), 0).ok()
                     .unwrap_or(now);
                 (from, until)
             }
@@ -181,7 +173,7 @@ pub trait MeshSpend: Send + Sync + std::fmt::Debug {
     fn spent<'a>(
         &'a self,
         mesh: &'a str,
-        since: DateTime<Utc>,
+        since: Timestamp,
     ) -> BoxFuture<'a, Result<Spend, AgentError>>;
 }
 
@@ -212,7 +204,7 @@ pub struct MeshPause {
 mod tests {
     use super::*;
 
-    fn at(text: &str) -> DateTime<Utc> {
+    fn at(text: &str) -> Timestamp {
         text.parse().unwrap()
     }
 

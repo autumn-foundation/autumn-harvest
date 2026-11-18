@@ -5,9 +5,10 @@
 //! the final resting place for permanently failed tasks.
 
 use crate::schema::harvest_workflow_executions_ext;
+use jiff_diesel::ToDiesel;
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use diesel::ExpressionMethods;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
@@ -58,9 +59,9 @@ pub struct BulkDlqFilter {
     #[serde(default)]
     pub min_attempts: Option<i32>,
     /// Inclusive lower bound on `failed_at`.
-    pub failed_after: Option<chrono::DateTime<chrono::Utc>>,
+    pub failed_after: Option<jiff::Timestamp>,
     /// Exclusive upper bound on `failed_at`.
-    pub failed_before: Option<chrono::DateTime<chrono::Utc>>,
+    pub failed_before: Option<jiff::Timestamp>,
     /// Exact match on the derived [`error_class`] of the entry's error text
     /// (issue #613). Applied as a compute-on-read post-filter.
     #[serde(default)]
@@ -184,9 +185,9 @@ pub struct RedriveFilter {
     /// Exact match on the workflow name of the owning execution.
     pub workflow_name: Option<String>,
     /// Inclusive lower bound on `failed_at`.
-    pub dead_lettered_after: Option<DateTime<Utc>>,
+    pub dead_lettered_after: Option<Timestamp>,
     /// Exclusive upper bound on `failed_at`.
-    pub dead_lettered_before: Option<DateTime<Utc>>,
+    pub dead_lettered_before: Option<Timestamp>,
     /// Case-insensitive substring match on the `error` column.
     pub error_contains: Option<String>,
     /// Explicit set of dead-letter row IDs to target.
@@ -314,10 +315,10 @@ fn spread_offset_nanos(index: u128, count: u128, window: u128, mix: u64) -> u128
 /// each task keeps the default, immediate `scheduled_at`.
 #[must_use]
 pub fn redrive_schedule(
-    now: DateTime<Utc>,
+    now: Timestamp,
     window: std::time::Duration,
     ids: &[Uuid],
-) -> Vec<Option<DateTime<Utc>>> {
+) -> Vec<Option<Timestamp>> {
     if window.is_zero() {
         return vec![None; ids.len()];
     }
@@ -326,9 +327,9 @@ pub fn redrive_schedule(
         .map(|(index, id)| {
             let (high, low) = id.as_u64_pair();
             let offset = redrive_spread_offset(index, ids.len(), window, high ^ low);
-            chrono::Duration::from_std(offset)
+            jiff::SignedDuration::try_from(offset)
                 .ok()
-                .and_then(|offset| now.checked_add_signed(offset))
+                .and_then(|offset| now.checked_add(offset).ok())
         })
         .collect()
 }
@@ -476,7 +477,7 @@ async fn redrive_callback_dead_letter(
     dead_letter_id: Uuid,
     workflow_exec_id: Option<Uuid>,
     original_task_id: Uuid,
-    not_before: Option<DateTime<Utc>>,
+    not_before: Option<Timestamp>,
 ) -> HarvestResult<Uuid> {
     let exec_id = workflow_exec_id
         .map(crate::types::ExecutionId::from_uuid)
@@ -516,13 +517,13 @@ async fn redrive_callback_dead_letter(
 /// compares `next_attempt_at` with the host clock.
 async fn slot_on_host_clock(
     conn: &mut AsyncPgConnection,
-    not_before: Option<DateTime<Utc>>,
-) -> HarvestResult<Option<DateTime<Utc>>> {
+    not_before: Option<Timestamp>,
+) -> HarvestResult<Option<Timestamp>> {
     let Some(at) = not_before else {
         return Ok(None);
     };
     let db_now = crate::queue::db_now(conn).await?;
-    Ok(Some(to_host_clock(at, db_now, Utc::now())))
+    Ok(Some(to_host_clock(at, db_now, Timestamp::now())))
 }
 
 /// Where a redriven run's timeout window starts (issue #1832).
@@ -534,23 +535,23 @@ async fn slot_on_host_clock(
 /// becomes due. Clock skew can only add time to the window.
 #[must_use]
 fn deadline_window_start(
-    slot: DateTime<Utc>,
-    db_now: DateTime<Utc>,
-    host_now: DateTime<Utc>,
-) -> DateTime<Utc> {
+    slot: Timestamp,
+    db_now: Timestamp,
+    host_now: Timestamp,
+) -> Timestamp {
     slot.max(to_host_clock(slot, db_now, host_now))
 }
 
 /// [`deadline_window_start`] for an optional slot, with the clocks read now.
 async fn deadline_slot(
     conn: &mut AsyncPgConnection,
-    not_before: Option<DateTime<Utc>>,
-) -> HarvestResult<Option<DateTime<Utc>>> {
+    not_before: Option<Timestamp>,
+) -> HarvestResult<Option<Timestamp>> {
     let Some(slot) = not_before else {
         return Ok(None);
     };
     let db_now = crate::queue::db_now(conn).await?;
-    Ok(Some(deadline_window_start(slot, db_now, Utc::now())))
+    Ok(Some(deadline_window_start(slot, db_now, Timestamp::now())))
 }
 
 /// Move a database-clock instant onto the host clock (issue #1832).
@@ -558,10 +559,10 @@ async fn deadline_slot(
 /// The result is as far after `host_now` as `at` is after `db_now`.
 #[must_use]
 fn to_host_clock(
-    at: DateTime<Utc>,
-    db_now: DateTime<Utc>,
-    host_now: DateTime<Utc>,
-) -> DateTime<Utc> {
+    at: Timestamp,
+    db_now: Timestamp,
+    host_now: Timestamp,
+) -> Timestamp {
     host_now + (at - db_now)
 }
 
@@ -602,7 +603,7 @@ fn restore_activity_concurrency(
 fn requeue_params(
     entry: DeadLetter,
     task_type: TaskType,
-    not_before: Option<DateTime<Utc>>,
+    not_before: Option<Timestamp>,
     codecs: &PayloadCodecs,
 ) -> (EnqueueParams, bool) {
     let (input, decoded) = match codecs.decode_column(&entry.input) {
@@ -893,7 +894,7 @@ pub async fn replay_dead_letter_at(
     conn: &mut AsyncPgConnection,
     dead_letter_id: Uuid,
     registry: Option<&HandlerRegistry>,
-    not_before: Option<DateTime<Utc>>,
+    not_before: Option<Timestamp>,
 ) -> HarvestResult<Uuid> {
     use crate::schema::harvest_dead_letters::dsl;
 
@@ -1076,10 +1077,10 @@ pub async fn count_bulk_filter_matches(
         query = query.filter(dsl::attempts.ge(min));
     }
     if let Some(after) = filter.failed_after {
-        query = query.filter(dsl::failed_at.ge(after));
+        query = query.filter(dsl::failed_at.ge(after.to_diesel()));
     }
     if let Some(before) = filter.failed_before {
-        query = query.filter(dsl::failed_at.lt(before));
+        query = query.filter(dsl::failed_at.lt(before.to_diesel()));
     }
 
     // Cause dimensions (issue #613) are compute-on-read: load the SQL-filtered
@@ -1145,10 +1146,10 @@ async fn query_dead_letters_for_bulk(
         query = query.filter(dsl::attempts.ge(min));
     }
     if let Some(after) = filter.failed_after {
-        query = query.filter(dsl::failed_at.ge(after));
+        query = query.filter(dsl::failed_at.ge(after.to_diesel()));
     }
     if let Some(before) = filter.failed_before {
-        query = query.filter(dsl::failed_at.lt(before));
+        query = query.filter(dsl::failed_at.lt(before.to_diesel()));
     }
 
     let rows = query
@@ -1258,7 +1259,7 @@ async fn spread_schedule(
     conn: &mut AsyncPgConnection,
     spread_secs: Option<u64>,
     ids: &[Uuid],
-) -> HarvestResult<Vec<Option<DateTime<Utc>>>> {
+) -> HarvestResult<Vec<Option<Timestamp>>> {
     let window = redrive_spread_window(spread_secs, ids.len());
     if window.is_zero() {
         return Ok(vec![None; ids.len()]);
@@ -1419,10 +1420,10 @@ fn apply_redrive_filter<'a>(
         );
     }
     if let Some(after) = filter.dead_lettered_after {
-        query = query.filter(dsl::failed_at.ge(after));
+        query = query.filter(dsl::failed_at.ge(after.to_diesel()));
     }
     if let Some(before) = filter.dead_lettered_before {
-        query = query.filter(dsl::failed_at.lt(before));
+        query = query.filter(dsl::failed_at.lt(before.to_diesel()));
     }
     if let Some(ref needle) = filter.error_contains {
         query = query.filter(dsl::error.ilike(format!("%{}%", escape_like(needle))));
@@ -1518,7 +1519,7 @@ pub async fn redrive_dead_letter_at(
     dead_letter_id: Uuid,
     registry: Option<&HandlerRegistry>,
     reason: Option<&str>,
-    not_before: Option<DateTime<Utc>>,
+    not_before: Option<Timestamp>,
 ) -> HarvestResult<RedriveOutcome> {
     use crate::schema::harvest_dead_letters::dsl;
 
@@ -1979,7 +1980,7 @@ pub enum TimeBucketGranularity {
 impl TimeBucketGranularity {
     /// Format a timestamp into its bucket key.
     #[must_use]
-    pub fn format(self, ts: DateTime<Utc>) -> String {
+    pub fn format(self, ts: Timestamp) -> String {
         match self {
             Self::Hour => ts.format("%Y-%m-%dT%H:00:00Z").to_string(),
             Self::Day => ts.format("%Y-%m-%d").to_string(),
@@ -2003,9 +2004,9 @@ pub struct DlqAggregateParams {
     /// Filter: exact task type (`"activity"` or `"workflow"`, case-insensitive).
     pub task_type: Option<String>,
     /// Filter: inclusive lower bound on `failed_at`.
-    pub since: Option<DateTime<Utc>>,
+    pub since: Option<Timestamp>,
     /// Filter: exclusive upper bound on `failed_at`.
-    pub until: Option<DateTime<Utc>>,
+    pub until: Option<Timestamp>,
     /// Filter: minimum number of attempts.
     pub min_attempts: Option<i32>,
     /// Cap on returned groups; long tail rolls into `_other`.
@@ -2048,7 +2049,7 @@ impl DlqAggregateParams {
     /// value, or when no `group_by` dimension is supplied.
     pub fn from_query_pairs(
         pairs: &[(String, String)],
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<Self, String> {
         let mut params = Self::default();
 
@@ -2150,14 +2151,14 @@ fn set_filter(slot: &mut Option<String>, value: &str) {
 pub fn parse_instant(
     field: &str,
     value: &str,
-    now: DateTime<Utc>,
-) -> Result<DateTime<Utc>, String> {
+    now: Timestamp,
+) -> Result<Timestamp, String> {
     let trimmed = value.trim();
-    if let Ok(parsed) = DateTime::parse_from_rfc3339(trimmed) {
-        return Ok(parsed.with_timezone(&Utc));
+    if let Ok(parsed) = trimmed.parse::<Timestamp>() {
+        return Ok(parsed);
     }
     if let Some(dur) = crate::task_duration(trimmed)
-        && let Ok(chrono_dur) = chrono::Duration::from_std(dur)
+        && let Ok(chrono_dur) = jiff::SignedDuration::try_from(dur)
     {
         return Ok(now - chrono_dur);
     }
@@ -2178,9 +2179,9 @@ pub struct DlqRawGroup {
     /// Number of DLQ rows in this group.
     pub count: i64,
     /// Earliest `failed_at` in the group.
-    pub first_seen: Option<DateTime<Utc>>,
+    pub first_seen: Option<Timestamp>,
     /// Latest `failed_at` in the group.
-    pub last_seen: Option<DateTime<Utc>>,
+    pub last_seen: Option<Timestamp>,
     /// Representative `dead_letter_id`s (capped at `samples_per_group`).
     pub sample_ids: Vec<String>,
 }
@@ -2206,10 +2207,10 @@ pub struct DlqGroup {
     pub count: i64,
     /// Earliest `failed_at` across shards (omitted for the `_other` row).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub first_seen: Option<DateTime<Utc>>,
+    pub first_seen: Option<Timestamp>,
     /// Latest `failed_at` across shards (omitted for the `_other` row).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_seen: Option<DateTime<Utc>>,
+    pub last_seen: Option<Timestamp>,
     /// Representative `dead_letter_id`s, taken from any shard.
     pub sample_dead_letter_ids: Vec<String>,
 }
@@ -2227,7 +2228,7 @@ pub struct DlqAggregateResponse {
     pub truncated: bool,
 }
 
-fn min_instant(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+fn min_instant(a: Option<Timestamp>, b: Option<Timestamp>) -> Option<Timestamp> {
     match (a, b) {
         (Some(x), Some(y)) => Some(x.min(y)),
         (Some(x), None) | (None, Some(x)) => Some(x),
@@ -2235,7 +2236,7 @@ fn min_instant(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Option<Dat
     }
 }
 
-fn max_instant(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+fn max_instant(a: Option<Timestamp>, b: Option<Timestamp>) -> Option<Timestamp> {
     match (a, b) {
         (Some(x), Some(y)) => Some(x.max(y)),
         (Some(x), None) | (None, Some(x)) => Some(x),
@@ -2386,7 +2387,7 @@ pub type AggregateRow = (
     Option<String>,
     String,
     String,
-    DateTime<Utc>,
+    Timestamp,
     String,
 );
 
@@ -2496,10 +2497,10 @@ pub async fn aggregate_dead_letters(
         );
     }
     if let Some(since) = params.since {
-        query = query.filter(dsl::failed_at.ge(since));
+        query = query.filter(dsl::failed_at.ge(since.to_diesel()));
     }
     if let Some(until) = params.until {
-        query = query.filter(dsl::failed_at.lt(until));
+        query = query.filter(dsl::failed_at.lt(until.to_diesel()));
     }
     if let Some(min) = params.min_attempts {
         query = query.filter(dsl::attempts.ge(min));
@@ -2623,7 +2624,7 @@ mod tests {
             input: serde_json::json!({}),
             error: String::new(),
             attempts: 1,
-            failed_at: Utc::now(),
+            failed_at: Timestamp::now(),
             owner: None,
             severity: None,
             workflow_name: None,
@@ -2691,7 +2692,7 @@ mod tests {
         );
         assert!(
             !RedriveFilter {
-                dead_lettered_after: Some(Utc::now()),
+                dead_lettered_after: Some(Timestamp::now()),
                 ..Default::default()
             }
             .is_empty()
@@ -2977,7 +2978,7 @@ mod tests {
     #[test]
     fn bulk_filter_is_not_empty_when_failed_after_set() {
         let filter = BulkDlqFilter {
-            failed_after: Some(chrono::Utc::now()),
+            failed_after: Some(jiff::Timestamp::now()),
             ..BulkDlqFilter::default()
         };
         assert!(!filter.is_empty());
@@ -3004,7 +3005,7 @@ mod tests {
     #[test]
     fn bulk_filter_is_not_empty_when_failed_before_set() {
         let filter = BulkDlqFilter {
-            failed_before: Some(chrono::Utc::now()),
+            failed_before: Some(jiff::Timestamp::now()),
             ..BulkDlqFilter::default()
         };
         assert!(!filter.is_empty());
@@ -3134,32 +3135,30 @@ mod tests {
 
     #[test]
     fn deadline_window_starts_after_the_slot_on_both_clocks() {
-        let db_now = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let slot = db_now + chrono::Duration::seconds(45);
+        let db_now = ("2026-01-01T00:00:00Z").parse::<Timestamp>()
+            .unwrap();
+        let slot = db_now + jiff::SignedDuration::from_secs(45);
         // Host 30 s behind the database: the database-clock slot is later.
-        let behind = db_now - chrono::Duration::seconds(30);
+        let behind = db_now - jiff::SignedDuration::from_secs(30);
         assert_eq!(deadline_window_start(slot, db_now, behind), slot);
         // Host 30 s ahead: the host-clock slot is later.
-        let ahead = db_now + chrono::Duration::seconds(30);
+        let ahead = db_now + jiff::SignedDuration::from_secs(30);
         assert_eq!(
             deadline_window_start(slot, db_now, ahead),
-            ahead + chrono::Duration::seconds(45)
+            ahead + jiff::SignedDuration::from_secs(45)
         );
     }
 
     #[test]
     fn to_host_clock_keeps_the_offset_across_clock_skew() {
-        let db_now = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let db_now = ("2026-01-01T00:00:00Z").parse::<Timestamp>()
+            .unwrap();
         // The host runs 30 s ahead of the database.
-        let host_now = db_now + chrono::Duration::seconds(30);
-        let at = db_now + chrono::Duration::seconds(45);
+        let host_now = db_now + jiff::SignedDuration::from_secs(30);
+        let at = db_now + jiff::SignedDuration::from_secs(45);
         assert_eq!(
             to_host_clock(at, db_now, host_now),
-            host_now + chrono::Duration::seconds(45)
+            host_now + jiff::SignedDuration::from_secs(45)
         );
     }
 
@@ -3167,7 +3166,7 @@ mod tests {
     fn schedule_with_no_window_is_immediate() {
         let ids: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
         assert_eq!(
-            redrive_schedule(Utc::now(), StdDuration::ZERO, &ids),
+            redrive_schedule(Timestamp::now(), StdDuration::ZERO, &ids),
             vec![None; 5]
         );
     }
@@ -3175,7 +3174,7 @@ mod tests {
     #[test]
     fn schedule_of_1000_rows_spreads_across_the_window() {
         // Issue #1832 AC: 1000 redriven tasks spread across the window.
-        let now = Utc::now();
+        let now = Timestamp::now();
         let window = StdDuration::from_secs(60);
         let ids: Vec<Uuid> = (0..1000).map(|_| Uuid::new_v4()).collect();
         let schedule = redrive_schedule(now, window, &ids);
@@ -3185,7 +3184,7 @@ mod tests {
         let mut distinct = std::collections::HashSet::new();
         for at in &schedule {
             let at = at.expect("a non-zero window schedules every row");
-            let offset = (at - now).to_std().expect("never before now");
+            let offset = std::time::Duration::try_from((at - now)).expect("never before now");
             assert!(offset < window, "{offset:?} is past the window");
             buckets[usize::try_from(offset.as_secs() / 6).unwrap()] += 1;
             distinct.insert(at);
@@ -3513,7 +3512,7 @@ mod tests {
     fn params_parse_cause_group_by_and_still_reject_unknown() {
         let p = DlqAggregateParams::from_query_pairs(
             &pairs(&[("group_by", "dlq_reason"), ("group_by", "error_class")]),
-            Utc::now(),
+            Timestamp::now(),
         )
         .expect("valid");
         assert_eq!(
@@ -3522,7 +3521,7 @@ mod tests {
         );
 
         let err =
-            DlqAggregateParams::from_query_pairs(&pairs(&[("group_by", "bogus_dim")]), Utc::now())
+            DlqAggregateParams::from_query_pairs(&pairs(&[("group_by", "bogus_dim")]), Timestamp::now())
                 .expect_err("unknown dim must still error");
         assert!(
             err.contains("dlq_reason"),
@@ -3571,7 +3570,7 @@ mod tests {
     fn params_parse_single_group_by() {
         let p = DlqAggregateParams::from_query_pairs(
             &pairs(&[("group_by", "workflow_name")]),
-            Utc::now(),
+            Timestamp::now(),
         )
         .expect("valid");
         assert_eq!(p.group_by, vec![DlqGroupDimension::WorkflowName]);
@@ -3586,7 +3585,7 @@ mod tests {
                 ("group_by", "workflow_name"),
                 ("group_by", "failure_signature"),
             ]),
-            Utc::now(),
+            Timestamp::now(),
         )
         .expect("valid");
         assert_eq!(
@@ -3602,7 +3601,7 @@ mod tests {
     fn params_dedupe_repeated_group_by() {
         let p = DlqAggregateParams::from_query_pairs(
             &pairs(&[("group_by", "queue_name"), ("group_by", "queue_name")]),
-            Utc::now(),
+            Timestamp::now(),
         )
         .expect("valid");
         assert_eq!(p.group_by, vec![DlqGroupDimension::QueueName]);
@@ -3611,7 +3610,7 @@ mod tests {
     #[test]
     fn params_require_at_least_one_group_by() {
         let err =
-            DlqAggregateParams::from_query_pairs(&pairs(&[("limit_groups", "10")]), Utc::now())
+            DlqAggregateParams::from_query_pairs(&pairs(&[("limit_groups", "10")]), Timestamp::now())
                 .unwrap_err();
         assert!(err.contains("at least one group_by"), "{err}");
     }
@@ -3619,7 +3618,7 @@ mod tests {
     #[test]
     fn params_reject_unknown_group_by() {
         let err =
-            DlqAggregateParams::from_query_pairs(&pairs(&[("group_by", "tenant_id")]), Utc::now())
+            DlqAggregateParams::from_query_pairs(&pairs(&[("group_by", "tenant_id")]), Timestamp::now())
                 .unwrap_err();
         assert!(err.contains("unknown group_by dimension"), "{err}");
     }
@@ -3628,7 +3627,7 @@ mod tests {
     fn params_reject_invalid_time_bucket() {
         let err = DlqAggregateParams::from_query_pairs(
             &pairs(&[("group_by", "time_bucket"), ("time_bucket", "week")]),
-            Utc::now(),
+            Timestamp::now(),
         )
         .unwrap_err();
         assert!(err.contains("invalid time_bucket"), "{err}");
@@ -3638,14 +3637,14 @@ mod tests {
     fn params_reject_limit_groups_out_of_range() {
         let err = DlqAggregateParams::from_query_pairs(
             &pairs(&[("group_by", "queue_name"), ("limit_groups", "9999")]),
-            Utc::now(),
+            Timestamp::now(),
         )
         .unwrap_err();
         assert!(err.contains("limit_groups"), "{err}");
 
         let err_zero = DlqAggregateParams::from_query_pairs(
             &pairs(&[("group_by", "queue_name"), ("limit_groups", "0")]),
-            Utc::now(),
+            Timestamp::now(),
         )
         .unwrap_err();
         assert!(err_zero.contains("limit_groups"), "{err_zero}");
@@ -3655,7 +3654,7 @@ mod tests {
     fn params_reject_samples_per_group_out_of_range() {
         let err = DlqAggregateParams::from_query_pairs(
             &pairs(&[("group_by", "queue_name"), ("samples_per_group", "50")]),
-            Utc::now(),
+            Timestamp::now(),
         )
         .unwrap_err();
         assert!(err.contains("samples_per_group"), "{err}");
@@ -3665,7 +3664,7 @@ mod tests {
     fn params_reject_malformed_duration() {
         let err = DlqAggregateParams::from_query_pairs(
             &pairs(&[("group_by", "queue_name"), ("since", "yesterday")]),
-            Utc::now(),
+            Timestamp::now(),
         )
         .unwrap_err();
         assert!(err.contains("invalid since"), "{err}");
@@ -3673,14 +3672,14 @@ mod tests {
 
     #[test]
     fn params_parse_relative_since_duration() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let p = DlqAggregateParams::from_query_pairs(
             &pairs(&[("group_by", "queue_name"), ("since", "24h")]),
             now,
         )
         .expect("valid");
         let since = p.since.expect("since set");
-        let delta = (now - since).num_seconds();
+        let delta = (now - since).as_secs();
         assert!((86_390..=86_410).contains(&delta), "delta was {delta}");
     }
 
@@ -3691,13 +3690,12 @@ mod tests {
                 ("group_by", "queue_name"),
                 ("since", "2026-05-18T03:00:00Z"),
             ]),
-            Utc::now(),
+            Timestamp::now(),
         )
         .expect("valid");
         assert_eq!(
-            p.since
-                .unwrap()
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            crate::time::rfc3339_opts(p.since
+                .unwrap(), crate::time::SecondsFormat::Secs, true),
             "2026-05-18T03:00:00Z"
         );
     }
@@ -3706,7 +3704,7 @@ mod tests {
     fn params_reject_negative_min_attempts() {
         let err = DlqAggregateParams::from_query_pairs(
             &pairs(&[("group_by", "queue_name"), ("min_attempts", "-1")]),
-            Utc::now(),
+            Timestamp::now(),
         )
         .unwrap_err();
         assert!(err.contains("min_attempts"), "{err}");
@@ -3881,9 +3879,8 @@ mod tests {
 
     #[test]
     fn time_bucket_formats() {
-        let ts = DateTime::parse_from_rfc3339("2026-05-18T03:42:17Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let ts = ("2026-05-18T03:42:17Z").parse::<Timestamp>()
+            .unwrap();
         assert_eq!(
             TimeBucketGranularity::Hour.format(ts),
             "2026-05-18T03:00:00Z"

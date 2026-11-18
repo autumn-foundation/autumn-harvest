@@ -119,7 +119,7 @@ fn payload(i: usize) -> Value {
 fn started() -> WorkflowEvent {
     WorkflowEvent::WorkflowStarted {
         input: json!({}),
-        timestamp: chrono::Utc::now(),
+        timestamp: jiff::Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -194,7 +194,7 @@ mod shapes {
     fn started() -> WorkflowEvent {
         WorkflowEvent::WorkflowStarted {
             input: json!({}),
-            timestamp: chrono::DateTime::from_timestamp(1_790_000_000, 0)
+            timestamp: jiff::Timestamp::from_second(1_790_000_000).ok()
                 .expect("a fixed timestamp is in range"),
             last_completion_result: None,
             last_error: None,

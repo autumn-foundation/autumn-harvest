@@ -20,7 +20,7 @@ use autumn_harvest::overlay_log::{
     AutoMoveDecision, MoveRequest, OverlayRow, PolicyAppend, PolicyRow, PolicyWrite,
     decide_auto_move, logs_activation, next_overlay_version, policy_write_passes, utc_day,
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OptionalExtension as _, Row, TransactionBehavior, params};
 
@@ -462,7 +462,7 @@ fn append_in(
     let Ok(stored) = i64::try_from(version) else {
         return Ok(None);
     };
-    let created_at = from_millis(Utc::now().timestamp_millis())?;
+    let created_at = from_millis(Timestamp::now().as_millisecond())?;
     tx.execute(
         "INSERT INTO harvest_agent_overlay_heads (kind, latest) VALUES (?1, ?2)
          ON CONFLICT (kind) DO UPDATE SET latest = excluded.latest",
@@ -478,7 +478,7 @@ fn append_in(
             body,
             author_kind,
             author,
-            created_at.timestamp_millis()
+            created_at.as_millisecond()
         ],
     )?;
     tx.commit()?;
@@ -524,7 +524,7 @@ fn append_policy_in(
         ));
     };
     let old_body = last.and_then(|row| row.new_body);
-    let changed_at = from_millis(Utc::now().timestamp_millis())?;
+    let changed_at = from_millis(Timestamp::now().as_millisecond())?;
     tx.execute(
         "INSERT INTO harvest_agent_refine_policies
              (kind, seq, old_body, new_body, actor_kind, actor, changed_at_ms)
@@ -536,7 +536,7 @@ fn append_policy_in(
             write.body,
             write.actor_kind,
             write.actor,
-            changed_at.timestamp_millis()
+            changed_at.as_millisecond()
         ],
     )?;
     tx.commit()?;
@@ -584,8 +584,8 @@ fn auto_adopt_in(
                 params![
                     kind,
                     AUTHOR_AUTO,
-                    start.timestamp_millis(),
-                    end.timestamp_millis()
+                    start.as_millisecond(),
+                    end.as_millisecond()
                 ],
                 |row| row.get(0),
             )?;
@@ -604,7 +604,7 @@ fn auto_adopt_in(
     let Ok(stored) = i64::try_from(version) else {
         return Ok(AutoAdoptRaw::Full);
     };
-    let created_at = from_millis(Utc::now().timestamp_millis())?;
+    let created_at = from_millis(Timestamp::now().as_millisecond())?;
     tx.execute(
         "INSERT INTO harvest_agent_overlay_heads (kind, latest) VALUES (?1, ?2)
          ON CONFLICT (kind) DO UPDATE SET latest = excluded.latest",
@@ -620,7 +620,7 @@ fn auto_adopt_in(
             request.body,
             AUTHOR_AUTO,
             request.actor,
-            created_at.timestamp_millis()
+            created_at.as_millisecond()
         ],
     )?;
     tx.execute(
@@ -638,7 +638,7 @@ fn auto_adopt_in(
             stored,
             AUTHOR_AUTO,
             request.actor,
-            request.at.timestamp_millis()
+            request.at.as_millisecond()
         ],
     )?;
     tx.commit()?;
@@ -712,7 +712,7 @@ fn activate_in(
                         stored,
                         request.actor_kind,
                         request.actor,
-                        Utc::now().timestamp_millis()
+                        Timestamp::now().as_millisecond()
                     ],
                 )?;
             }
@@ -794,8 +794,8 @@ fn to_version(stored: i64) -> SqliteResult<u64> {
         .map_err(|_| SqliteError::Unsupported(format!("overlay version {stored} is negative")))
 }
 
-fn from_millis(ms: i64) -> SqliteResult<DateTime<Utc>> {
-    DateTime::from_timestamp_millis(ms)
+fn from_millis(ms: i64) -> SqliteResult<Timestamp> {
+    Timestamp::from_millisecond(ms).ok()
         .ok_or_else(|| SqliteError::Unsupported(format!("overlay time {ms} is out of range")))
 }
 

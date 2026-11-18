@@ -41,7 +41,7 @@ use autumn_harvest::telemetry::{
 use autumn_harvest::testing::{ReplayStatus, WorkflowTestEnv};
 use autumn_harvest::types::ActivityExecId;
 use autumn_harvest::{ExecutionId, WorkflowCommand, WorkflowContext};
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
@@ -1003,7 +1003,7 @@ fn cancel_forward_history() -> Vec<WorkflowEvent> {
     vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1771,7 +1771,7 @@ async fn a_compensator_inherits_no_retry_or_timeout_override_from_its_node() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1849,7 +1849,7 @@ fn interrupted_unwind_history() -> Vec<WorkflowEvent> {
     vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -2442,7 +2442,7 @@ async fn an_oversized_activity_input_still_unwinds_the_succeeded_upstream() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -2556,7 +2556,7 @@ async fn known_limitation_raising_the_cap_mid_unwind_diverges() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,

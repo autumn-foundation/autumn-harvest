@@ -41,10 +41,11 @@
 //! the plaintext.
 
 use std::borrow::Cow;
+use jiff_diesel::ToDiesel;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
@@ -184,9 +185,9 @@ pub struct DagScheduleOverride {
     /// The actor that last changed the override.
     pub updated_by: String,
     /// When the override was first stored.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// When the override last changed.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 /// One stored override of a code-declared workflow schedule (issue #2386).
@@ -204,9 +205,9 @@ pub struct WorkflowScheduleOverride {
     /// The actor that last changed the override.
     pub updated_by: String,
     /// When the override was first stored.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// When the override last changed.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 pub use crate::schedule_patch::{
@@ -246,7 +247,7 @@ struct WorkflowFieldsJson {
         deserialize_with = "present",
         skip_serializing_if = "Option::is_none"
     )]
-    end_at: Option<Option<DateTime<Utc>>>,
+    end_at: Option<Option<Timestamp>>,
     #[serde(
         default,
         deserialize_with = "present",
@@ -354,7 +355,7 @@ pub struct ScheduleOverrideView {
     /// The actor that last changed the override.
     pub updated_by: String,
     /// When the override last changed.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 impl From<&DagScheduleOverride> for ScheduleOverrideView {
@@ -671,8 +672,10 @@ struct OverrideRow {
     buffer_all_max: Option<i32>,
     reason: Option<String>,
     updated_by: String,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp, deserialize_as = jiff_diesel::Timestamp)]
+    created_at: Timestamp,
+    #[diesel(serialize_as = jiff_diesel::Timestamp, deserialize_as = jiff_diesel::Timestamp)]
+    updated_at: Timestamp,
     workflow_fields: serde_json::Value,
     workflow_input: Option<serde_json::Value>,
 }
@@ -860,9 +863,9 @@ pub struct OverrideSummary {
     /// The actor that last changed the override.
     pub updated_by: String,
     /// When the override was first stored.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// When the override last changed.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 impl OverrideRow {
@@ -990,7 +993,7 @@ async fn store_dag_override(
     dag_name: &str,
     fields: &ScheduleOverrideFields,
     who: (&str, Option<&str>),
-    version: DateTime<Utc>,
+    version: Timestamp,
 ) -> HarvestResult<()> {
     if fields.is_empty() {
         delete_override(conn, KIND_DAG, dag_name).await?;
@@ -1021,7 +1024,7 @@ struct StoredOverride<'a> {
     actor: &'a str,
     reason: Option<&'a str>,
     /// The version of the row. A DAG row takes [`next_version`].
-    updated_at: DateTime<Utc>,
+    updated_at: Timestamp,
 }
 
 /// Delete one override row. Returns whether a row was deleted.
@@ -1151,7 +1154,7 @@ pub async fn update_dag_override(
         // Issue #2602: the write retires the stored version. The new version
         // lies above the floor, so a carry never skips it.
         let floor = raise_floor(conn, KIND_DAG, &dag_name, retired).await?;
-        let version = next_version(Utc::now(), floor);
+        let version = next_version(Timestamp::now(), floor);
         if merged.is_empty() {
             // A merge with no field is a clear. It takes a version too.
             raise_floor(conn, KIND_DAG, &dag_name, Some(version)).await?;
@@ -1184,7 +1187,7 @@ pub async fn clear_dag_override(
         crate::scheduler::wait_for_registration_lock(conn).await?;
         let retired = delete_dag_override_returning(conn, dag_name).await?;
         let floor = raise_floor(conn, KIND_DAG, dag_name, retired).await?;
-        let version = next_version(Utc::now(), floor);
+        let version = next_version(Timestamp::now(), floor);
         raise_floor(conn, KIND_DAG, dag_name, Some(version)).await?;
         Ok(retired.is_some())
     }))
@@ -1196,7 +1199,7 @@ pub async fn clear_dag_override(
 async fn delete_dag_override_returning(
     conn: &mut AsyncPgConnection,
     dag_name: &str,
-) -> HarvestResult<Option<DateTime<Utc>>> {
+) -> HarvestResult<Option<Timestamp>> {
     use crate::schema::harvest_schedule_overrides::dsl;
 
     diesel::delete(
@@ -1305,7 +1308,7 @@ pub async fn carry_dag_override(
                 dsl::harvest_schedule_overrides
                     .filter(dsl::kind.eq(KIND_DAG))
                     .filter(dsl::name.eq(dag_name))
-                    .filter(dsl::updated_at.eq(version)),
+                    .filter(dsl::updated_at.eq(version.to_diesel())),
             )
             .execute(from)
             .await
@@ -1331,7 +1334,7 @@ async fn copy_newest(conn: &mut AsyncPgConnection, row: &OverrideRow) -> Harvest
     {
         return Ok(());
     }
-    let held: Option<DateTime<Utc>> = dsl::harvest_schedule_overrides
+    let held: Option<Timestamp> = dsl::harvest_schedule_overrides
         .filter(dsl::kind.eq(&row.kind))
         .filter(dsl::name.eq(&row.name))
         .select(dsl::updated_at)
@@ -1375,12 +1378,12 @@ async fn bound_carry_lock_waits(conn: &mut AsyncPgConnection) -> HarvestResult<(
 /// It is the later of `now` and one microsecond above `floor`, in whole
 /// microseconds, as Postgres stores it. So a skewed clock never gives a
 /// version at or below the floor, and the new row stays near the wall clock.
-fn next_version(now: DateTime<Utc>, floor: Option<DateTime<Utc>>) -> DateTime<Utc> {
-    use chrono::SubsecRound;
+fn next_version(now: Timestamp, floor: Option<Timestamp>) -> Timestamp {
+    use jiff::Timestamp;
 
     let now = now.trunc_subsecs(6);
     floor.map_or(now, |floor| {
-        now.max(floor + chrono::Duration::microseconds(1))
+        now.max(floor + jiff::SignedDuration::from_micros(1))
     })
 }
 
@@ -1390,7 +1393,7 @@ async fn read_floor(
     conn: &mut AsyncPgConnection,
     kind: &str,
     name: &str,
-) -> HarvestResult<Option<DateTime<Utc>>> {
+) -> HarvestResult<Option<Timestamp>> {
     use crate::schema::harvest_schedule_override_receipts::dsl;
 
     dsl::harvest_schedule_override_receipts
@@ -1410,8 +1413,8 @@ async fn raise_floor(
     conn: &mut AsyncPgConnection,
     kind: &str,
     name: &str,
-    retired: Option<DateTime<Utc>>,
-) -> HarvestResult<Option<DateTime<Utc>>> {
+    retired: Option<Timestamp>,
+) -> HarvestResult<Option<Timestamp>> {
     use crate::schema::harvest_schedule_override_receipts::dsl;
 
     let Some(retired) = retired else {
@@ -1421,7 +1424,7 @@ async fn raise_floor(
         .values((
             dsl::kind.eq(kind),
             dsl::name.eq(name),
-            dsl::row_updated_at.eq(retired),
+            dsl::row_updated_at.eq(retired.to_diesel()),
             dsl::received_at.eq(diesel::dsl::now),
         ))
         .on_conflict((dsl::kind, dsl::name))
@@ -1446,7 +1449,7 @@ async fn apply_floor(
     conn: &mut AsyncPgConnection,
     kind: &str,
     name: &str,
-    floor: Option<DateTime<Utc>>,
+    floor: Option<Timestamp>,
 ) -> HarvestResult<()> {
     use crate::schema::harvest_schedule_overrides::dsl;
 
@@ -1457,7 +1460,7 @@ async fn apply_floor(
         dsl::harvest_schedule_overrides
             .filter(dsl::kind.eq(kind))
             .filter(dsl::name.eq(name))
-            .filter(dsl::updated_at.le(floor)),
+            .filter(dsl::updated_at.le(floor.to_diesel())),
     )
     .execute(conn)
     .await
@@ -1471,7 +1474,7 @@ async fn drop_floor(
     conn: &mut AsyncPgConnection,
     kind: &str,
     name: &str,
-    floor: DateTime<Utc>,
+    floor: Timestamp,
 ) -> HarvestResult<usize> {
     use crate::schema::harvest_schedule_override_receipts::dsl;
 
@@ -1479,7 +1482,7 @@ async fn drop_floor(
         dsl::harvest_schedule_override_receipts
             .filter(dsl::kind.eq(kind))
             .filter(dsl::name.eq(name))
-            .filter(dsl::row_updated_at.eq(floor)),
+            .filter(dsl::row_updated_at.eq(floor.to_diesel())),
     )
     .execute(conn)
     .await
@@ -1618,7 +1621,7 @@ pub(crate) async fn store_workflow_override(
         workflow_input,
         actor,
         reason,
-        updated_at: Utc::now(),
+        updated_at: Timestamp::now(),
     };
     upsert_override(conn, &row).await
 }
@@ -1680,8 +1683,8 @@ mod tests {
             fields,
             reason: None,
             updated_by: "ops".to_string(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
         }
     }
 
@@ -1869,8 +1872,8 @@ mod tests {
             fields,
             reason: None,
             updated_by: "ops".to_string(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
         }
     }
 
@@ -2044,7 +2047,7 @@ mod tests {
     fn workflow_fields_json_keeps_absent_and_null_apart() {
         let fields = WorkflowSchedulePatch {
             calendar: Some(None),
-            end_at: Some(Some(Utc::now())),
+            end_at: Some(Some(Timestamp::now())),
             skip_policy: Some(SkipPolicy::RunNextBusinessDay),
             catchup_policy: Some(Some(CatchupPolicy::Window(Duration::from_secs(600)))),
             retry_policy: Some(None),
@@ -2090,9 +2093,9 @@ mod tests {
         assert_eq!(schedule_from_storage("bogus"), None);
     }
 
-    fn at(micros: i64, nanos: u32) -> DateTime<Utc> {
-        DateTime::from_timestamp_micros(micros).expect("a valid time")
-            + chrono::Duration::nanoseconds(i64::from(nanos))
+    fn at(micros: i64, nanos: u32) -> Timestamp {
+        Timestamp::from_microsecond(micros).ok().expect("a valid time")
+            + jiff::SignedDuration::from_nanos(i64::from(nanos))
     }
 
     /// Issue #2602: with no floor, a version is the clock in whole

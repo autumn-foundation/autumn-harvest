@@ -6,6 +6,8 @@
 //! Non-retryable, cancelled and timed-out outcomes never retry.
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
+use jiff_diesel::ToDiesel;
+use autumn_harvest::time::sql::ToPgInterval;
 use autumn_harvest::table_split::SetExt;
 use std::any::TypeId;
 use std::collections::HashMap;
@@ -1579,15 +1581,15 @@ async fn workflow_retry_carries_chain_deadline_verbatim() {
     // Stamp the ORIGIN's chain cap BEFORE the worker fails it: a 7d duration and
     // a FUTURE absolute deadline. The retry successor then does not time out at
     // once. The retry must copy this absolute value verbatim.
-    let origin_chain_deadline = chrono::Utc::now() + chrono::Duration::hours(6);
+    let origin_chain_deadline = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(6);
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             SetExt(
                 harvest_workflow_executions_ext::chain_execution_timeout
-                    .eq(Some(chrono::Duration::days(7))),
+                    .eq(Some(autumn_harvest::time::days(7)).to_pg_interval()),
             ),
             SetExt(
-                harvest_workflow_executions_ext::chain_deadline_at.eq(Some(origin_chain_deadline)),
+                harvest_workflow_executions_ext::chain_deadline_at.eq(Some(origin_chain_deadline).to_diesel()),
             ),
         ))
         .execute(&mut conn)
@@ -1619,8 +1621,8 @@ async fn workflow_retry_carries_chain_deadline_verbatim() {
     assert_eq!(get_attempt(&mut check, retry_exec).await, 2);
 
     let (retry_timeout, retry_deadline): (
-        Option<chrono::Duration>,
-        Option<chrono::DateTime<chrono::Utc>>,
+        Option<jiff::SignedDuration>,
+        Option<jiff::Timestamp>,
     ) = harvest_workflow_executions::table
         .find(retry_exec.as_uuid())
         .select((
@@ -1633,11 +1635,11 @@ async fn workflow_retry_carries_chain_deadline_verbatim() {
 
     assert_eq!(
         retry_timeout,
-        Some(chrono::Duration::days(7)),
+        Some(autumn_harvest::time::days(7)),
         "the retry carries the chain-cap DURATION"
     );
     let dl = retry_deadline.expect("retry chain deadline must be set");
-    let delta = (dl - origin_chain_deadline).num_milliseconds().abs();
+    let delta = autumn_harvest::time::num_milliseconds((dl - origin_chain_deadline)).abs();
     assert!(
         delta < 1000,
         "the retry's chain_deadline_at must equal the origin's ABSOLUTE value \
@@ -1646,7 +1648,7 @@ async fn workflow_retry_carries_chain_deadline_verbatim() {
     // Falsify the re-anchor hypothesis: a re-anchored (now + 7d) deadline would be
     // days in the future; the verbatim value is only ~6h out.
     assert!(
-        dl < chrono::Utc::now() + chrono::Duration::days(1),
+        dl < jiff::Timestamp::now() + autumn_harvest::time::days(1),
         "a re-anchored now+7d deadline would be days out; verbatim is ~6h"
     );
 }

@@ -5,7 +5,6 @@
 //! - `New*` struct (`Insertable`) for inserts — only the fields we supply,
 //!   letting Postgres fill in defaults.
 
-use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use uuid::Uuid;
 
@@ -41,8 +40,10 @@ pub struct HarvestCalendar {
     pub description: Option<String>,
     /// `true` for built-in calendars that operators cannot delete.
     pub built_in: bool,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub created_at: jiff::Timestamp,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub updated_at: jiff::Timestamp,
 }
 
 /// Insert struct for creating a new calendar.
@@ -64,8 +65,10 @@ pub struct NewHarvestCalendar<'a> {
 pub struct HarvestCalendarExclusion {
     pub id: Uuid,
     pub calendar_name: String,
-    pub excluded_date: chrono::NaiveDate,
-    pub created_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Date)]
+    pub excluded_date: jiff::civil::Date,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub created_at: jiff::Timestamp,
 }
 
 /// Insert struct for adding a date to a calendar's exclusion set.
@@ -73,7 +76,8 @@ pub struct HarvestCalendarExclusion {
 #[diesel(table_name = harvest_calendar_exclusions)]
 pub struct NewHarvestCalendarExclusion<'a> {
     pub calendar_name: &'a str,
-    pub excluded_date: chrono::NaiveDate,
+    #[diesel(serialize_as = jiff_diesel::Date)]
+    pub excluded_date: jiff::civil::Date,
 }
 
 // ── WorkflowExecution ─────────────────────────────────────────────────────────
@@ -94,23 +98,23 @@ pub struct WorkflowExecution {
     pub parent_id: Option<Uuid>,
     pub sticky_worker_id: Option<String>,
     pub queue_name: String,
-    pub started_at: DateTime<Utc>,
-    pub completed_at: Option<DateTime<Utc>>,
-    pub execution_timeout: Option<chrono::Duration>,
+    pub started_at: jiff::Timestamp,
+    pub completed_at: Option<jiff::Timestamp>,
+    pub execution_timeout: Option<jiff::SignedDuration>,
     /// Absolute UTC deadline for execution-level timeout (issue #243).
     /// Computed at start as `started_at + execution_timeout`. NULL = no deadline.
-    pub deadline_at: Option<DateTime<Utc>>,
+    pub deadline_at: Option<jiff::Timestamp>,
     /// Chain-scoped lifetime cap DURATION (issue #617). Distinct from the per-run
     /// `execution_timeout`: anchored at the chain-origin start and carried verbatim
     /// across every continue-as-new. `None` = no chain cap configured.
-    pub chain_execution_timeout: Option<chrono::Duration>,
+    pub chain_execution_timeout: Option<jiff::SignedDuration>,
     /// Absolute UTC chain deadline (issue #617). Computed at the chain-origin start
     /// as `started_at + chain_execution_timeout` and copied verbatim into every
     /// continue-as-new successor (never recomputed). `None` = no chain cap.
-    pub chain_deadline_at: Option<DateTime<Utc>>,
+    pub chain_deadline_at: Option<jiff::Timestamp>,
     pub memo: Option<serde_json::Value>,
     pub search_attrs: Option<serde_json::Value>,
-    pub created_at: DateTime<Utc>,
+    pub created_at: jiff::Timestamp,
     /// Build ID assigned at workflow start time (issue #171). `None` = pre-policy.
     pub assigned_build_id: Option<String>,
     /// Parent-close policy for detached children (issue #347). `None` = awaited.
@@ -119,7 +123,7 @@ pub struct WorkflowExecution {
     pub runbook_url: Option<String>,
     pub severity: Option<String>,
     /// Wall-clock instant the active pause was applied (issue #383). `None` = not paused.
-    pub paused_at: Option<DateTime<Utc>>,
+    pub paused_at: Option<jiff::Timestamp>,
     /// Optional operator-supplied pause reason (issue #383).
     pub pause_reason: Option<String>,
     /// Identity that requested the active pause (issue #383).
@@ -135,21 +139,21 @@ pub struct WorkflowExecution {
     pub context_headers: Option<serde_json::Value>,
     /// Optional declared SLA budget for soft breach signal (issue #487).
     /// Stored so continue-as-new / reset can re-anchor per run. `None` = no SLA.
-    pub sla: Option<chrono::Duration>,
+    pub sla: Option<jiff::SignedDuration>,
     /// Absolute UTC deadline for soft SLA enforcement (issue #487).
     /// Computed at start as `started_at + sla`. `None` = no SLA declared.
-    pub sla_deadline_at: Option<DateTime<Utc>>,
+    pub sla_deadline_at: Option<jiff::Timestamp>,
     /// Whether the soft SLA deadline has been breached (issue #487).
     /// Set exactly once by the scanner; never by the workflow engine.
     pub sla_breached: bool,
     /// Wall-clock instant the SLA was first detected as breached (issue #487).
     /// `None` when `sla_breached = false`.
-    pub sla_breached_at: Option<DateTime<Utc>>,
+    pub sla_breached_at: Option<jiff::Timestamp>,
     /// Schedule that fired this execution (issue #488). `None` for manual starts.
     pub schedule_id: Option<Uuid>,
     /// Logical schedule slot this run fires for (issue #488); carryover is ordered by
     /// this, not `completed_at`. `None` for manual starts.
-    pub scheduled_for: Option<DateTime<Utc>>,
+    pub scheduled_for: Option<jiff::Timestamp>,
     /// Attempt number of this execution in its retry chain (issue #523). 1 = first attempt.
     pub workflow_attempt: i32,
     /// Frozen effective retry policy for this execution (issue #523). NULL = no auto-retry.
@@ -161,7 +165,7 @@ pub struct WorkflowExecution {
     pub origin: Option<String>,
     /// Wall-clock of the most recent replay-non-determinism block observation
     /// (issue #603). `None` = not blocked; state stays RUNNING while blocked.
-    pub nd_blocked_at: Option<DateTime<Utc>>,
+    pub nd_blocked_at: Option<jiff::Timestamp>,
     /// Divergence error string from the most recent blocked cycle (issue #603).
     pub nd_block_reason: Option<String>,
     /// Consecutive block entries for the current divergence incident (issue
@@ -182,10 +186,10 @@ pub struct WorkflowExecution {
     /// `None` = no hold. A hold is ACTIVE when this is non-`None` and
     /// `legal_hold_until` is `None` or in the future. An active hold exempts
     /// this execution's history from retention deletion and PII erasure.
-    pub legal_hold_set_at: Option<DateTime<Utc>>,
+    pub legal_hold_set_at: Option<jiff::Timestamp>,
     /// Optional auto-expiry for the legal hold (issue #747). `None` =
     /// indefinite; a past value means the hold is inactive again.
-    pub legal_hold_until: Option<DateTime<Utc>>,
+    pub legal_hold_until: Option<jiff::Timestamp>,
     /// Operator-supplied justification for the legal hold (issue #747).
     pub legal_hold_reason: Option<String>,
     /// Principal that placed the legal hold (issue #747, audit trail).
@@ -207,7 +211,7 @@ pub struct WorkflowExecution {
     /// for this execution's recorded history size (issue #704). `None` = not
     /// yet warned. Never read on replay.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub history_bloat_warned_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub history_bloat_warned_at: Option<jiff::Timestamp>,
     /// Operator-mutable free-text triage note (issue #759). `None` = no note.
     /// Metadata only -- never read on replay, never set at insert time.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -232,13 +236,13 @@ pub struct WorkflowExecution {
     /// Wall-clock of the cutover commit that sealed this row (issue #964).
     /// Non-NULL exactly when `state = 'MIGRATED'`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub migrated_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub migrated_at: Option<jiff::Timestamp>,
     /// Wall-clock a reconciler observed this seal's live copy as terminal
     /// (issue #1317). `None` until observed; non-`None` releases the row
     /// from active-conflict classification without changing `state`, so
     /// retention and erasure keep treating it as a `MIGRATED` seal.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub migrated_run_terminal_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub migrated_run_terminal_at: Option<jiff::Timestamp>,
     /// The shard-rebalance markers (issue #2492).
     ///
     /// They sit outside both `table!` declarations of the table. `flatten`
@@ -379,15 +383,15 @@ pub struct NewWorkflowExecution<'a> {
     pub input: SharedJson,
     pub parent_id: Option<Uuid>,
     pub queue_name: &'a str,
-    pub execution_timeout: Option<chrono::Duration>,
+    pub execution_timeout: Option<jiff::SignedDuration>,
     /// Absolute UTC deadline for execution-level timeout (issue #243).
     /// NULL = no deadline enforced.
-    pub deadline_at: Option<DateTime<Utc>>,
+    pub deadline_at: Option<jiff::Timestamp>,
     /// Chain-scoped lifetime cap DURATION (issue #617). `None` = no chain cap.
-    pub chain_execution_timeout: Option<chrono::Duration>,
+    pub chain_execution_timeout: Option<jiff::SignedDuration>,
     /// Absolute UTC chain deadline (issue #617). Anchored at the chain-origin
     /// start and carried verbatim across continue-as-new. `None` = no chain cap.
-    pub chain_deadline_at: Option<DateTime<Utc>>,
+    pub chain_deadline_at: Option<jiff::Timestamp>,
     pub memo: Option<serde_json::Value>,
     pub search_attrs: Option<serde_json::Value>,
     /// Build ID from the active build policy for this queue at start time.
@@ -400,14 +404,14 @@ pub struct NewWorkflowExecution<'a> {
     /// Ambient context headers (issue #481). `None` = no headers.
     pub context_headers: Option<serde_json::Value>,
     /// Optional declared SLA budget (issue #487). NULL = no SLA.
-    pub sla: Option<chrono::Duration>,
+    pub sla: Option<jiff::SignedDuration>,
     /// Absolute UTC SLA deadline (issue #487). NULL = no SLA.
-    pub sla_deadline_at: Option<DateTime<Utc>>,
+    pub sla_deadline_at: Option<jiff::Timestamp>,
     /// Schedule that fired this execution (issue #488). `None` for manual starts.
     pub schedule_id: Option<Uuid>,
     /// Logical schedule slot this run fires for (issue #488); carryover is ordered by
     /// this, not `completed_at`. `None` for manual starts.
-    pub scheduled_for: Option<DateTime<Utc>>,
+    pub scheduled_for: Option<jiff::Timestamp>,
     /// Attempt number of this execution in its retry chain (issue #523). 1 = first attempt.
     pub workflow_attempt: i32,
     /// Frozen effective retry policy for this execution (issue #523). NULL = no auto-retry.
@@ -460,41 +464,41 @@ crate::split_queryable!(
         parent_id: Option<Uuid>,
         sticky_worker_id: Option<String>,
         queue_name: String,
-        started_at: DateTime<Utc>,
-        completed_at: Option<DateTime<Utc>>,
-        execution_timeout: Option<chrono::Duration>,
-        deadline_at: Option<DateTime<Utc>>,
+        started_at: jiff::Timestamp as jiff_diesel::Timestamp,
+        completed_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
+        execution_timeout: Option<jiff::SignedDuration> as crate::time::sql::NullablePgDuration,
+        deadline_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
         search_attrs: Option<serde_json::Value>,
-        created_at: DateTime<Utc>,
+        created_at: jiff::Timestamp as jiff_diesel::Timestamp,
         parent_close_policy: Option<String>,
         owner: Option<String>,
         severity: Option<String>,
-        paused_at: Option<DateTime<Utc>>,
+        paused_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
         pause_reason: Option<String>,
         pause_actor: Option<String>,
-        sla: Option<chrono::Duration>,
+        sla: Option<jiff::SignedDuration> as crate::time::sql::NullablePgDuration,
         schedule_id: Option<Uuid>,
         retry_of_exec_id: Option<Uuid>,
-        nd_blocked_at: Option<DateTime<Utc>>,
+        nd_blocked_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
         nd_block_count: i32,
-        legal_hold_until: Option<DateTime<Utc>>,
+        legal_hold_until: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
         start_source: Option<String>,
-        migrated_run_terminal_at: Option<chrono::DateTime<chrono::Utc>>,
+        migrated_run_terminal_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
         tenant: Option<String>,
     },
     ext harvest_workflow_executions_ext {
         run_id: Uuid,
-        chain_execution_timeout: Option<chrono::Duration>,
-        chain_deadline_at: Option<DateTime<Utc>>,
+        chain_execution_timeout: Option<jiff::SignedDuration> as crate::time::sql::NullablePgDuration,
+        chain_deadline_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
         memo: Option<serde_json::Value>,
         assigned_build_id: Option<String>,
         runbook_url: Option<String>,
         current_details: Option<String>,
         context_headers: Option<serde_json::Value>,
-        sla_deadline_at: Option<DateTime<Utc>>,
+        sla_deadline_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
         sla_breached: bool,
-        sla_breached_at: Option<DateTime<Utc>>,
-        scheduled_for: Option<DateTime<Utc>>,
+        sla_breached_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
+        scheduled_for: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
         workflow_attempt: i32,
         workflow_retry_policy: Option<serde_json::Value>,
         origin: Option<String>,
@@ -502,16 +506,16 @@ crate::split_queryable!(
         completion_callbacks: Option<serde_json::Value>,
         continued_from_exec_id: Option<Uuid>,
         first_exec_id: Option<Uuid>,
-        legal_hold_set_at: Option<DateTime<Utc>>,
+        legal_hold_set_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
         legal_hold_reason: Option<String>,
         legal_hold_actor: Option<String>,
         start_source_ref: Option<String>,
         started_by: Option<String>,
-        history_bloat_warned_at: Option<chrono::DateTime<chrono::Utc>>,
+        history_bloat_warned_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
         triage_note: Option<String>,
         quota_key: Option<String>,
         migrated_to_shard: Option<i32>,
-        migrated_at: Option<chrono::DateTime<chrono::Utc>>,
+        migrated_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
     },
     embed {
         rebalance: RebalanceMarkers,
@@ -529,13 +533,13 @@ crate::split_insertable!(
         input: SharedJson,
         parent_id: Option<Uuid>,
         queue_name: &'a str,
-        execution_timeout: Option<chrono::Duration>,
-        deadline_at: Option<DateTime<Utc>>,
+        execution_timeout: Option<jiff::SignedDuration> as crate::time::sql::PgDuration,
+        deadline_at: Option<jiff::Timestamp> as jiff_diesel::Timestamp,
         search_attrs: Option<serde_json::Value>,
         parent_close_policy: Option<String>,
         owner: Option<&'a str>,
         severity: Option<&'a str>,
-        sla: Option<chrono::Duration>,
+        sla: Option<jiff::SignedDuration> as crate::time::sql::PgDuration,
         schedule_id: Option<Uuid>,
         retry_of_exec_id: Option<Uuid>,
         start_source: Option<&'a str>,
@@ -543,14 +547,14 @@ crate::split_insertable!(
     },
     ext harvest_workflow_executions_ext {
         run_id: Uuid,
-        chain_execution_timeout: Option<chrono::Duration>,
-        chain_deadline_at: Option<DateTime<Utc>>,
+        chain_execution_timeout: Option<jiff::SignedDuration> as crate::time::sql::PgDuration,
+        chain_deadline_at: Option<jiff::Timestamp> as jiff_diesel::Timestamp,
         memo: Option<serde_json::Value>,
         assigned_build_id: Option<String>,
         runbook_url: Option<&'a str>,
         context_headers: Option<serde_json::Value>,
-        sla_deadline_at: Option<DateTime<Utc>>,
-        scheduled_for: Option<DateTime<Utc>>,
+        sla_deadline_at: Option<jiff::Timestamp> as jiff_diesel::Timestamp,
+        scheduled_for: Option<jiff::Timestamp> as jiff_diesel::Timestamp,
         workflow_attempt: i32,
         workflow_retry_policy: Option<serde_json::Value>,
         origin: Option<&'a str>,
@@ -584,7 +588,8 @@ pub struct HarvestEvent {
     pub event_id: i32,
     pub event_type: String,
     pub event_data: serde_json::Value,
-    pub timestamp: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub timestamp: jiff::Timestamp,
 }
 
 /// Insert struct for appending a new event to a workflow's history.
@@ -608,7 +613,8 @@ pub struct HarvestPayloadRef {
     pub workflow_exec_id: Uuid,
     pub store_id: String,
     pub byte_len: i64,
-    pub created_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub created_at: jiff::Timestamp,
 }
 
 /// Insert struct for recording a new offloaded-payload reference.
@@ -639,24 +645,33 @@ pub struct TaskQueueItem {
     pub worker_id: Option<String>,
     pub attempt: i32,
     pub max_attempts: i32,
-    pub scheduled_at: DateTime<Utc>,
-    pub started_at: Option<DateTime<Utc>>,
-    pub completed_at: Option<DateTime<Utc>>,
-    pub last_heartbeat_at: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub scheduled_at: jiff::Timestamp,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub started_at: Option<jiff::Timestamp>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub completed_at: Option<jiff::Timestamp>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub last_heartbeat_at: Option<jiff::Timestamp>,
     pub heartbeat_details: Option<serde_json::Value>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Interval>)]
-    pub heartbeat_timeout: Option<chrono::Duration>,
+    #[diesel(deserialize_as = crate::time::sql::NullablePgDuration)]
+    pub heartbeat_timeout: Option<jiff::SignedDuration>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Interval>)]
-    pub start_to_close: Option<chrono::Duration>,
+    #[diesel(deserialize_as = crate::time::sql::NullablePgDuration)]
+    pub start_to_close: Option<jiff::SignedDuration>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Interval>)]
-    pub schedule_to_start: Option<chrono::Duration>,
+    #[diesel(deserialize_as = crate::time::sql::NullablePgDuration)]
+    pub schedule_to_start: Option<jiff::SignedDuration>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
     pub retry_policy: Option<serde_json::Value>,
     pub output: Option<serde_json::Value>,
     pub error: Option<String>,
     pub sticky_worker_id: Option<String>,
-    pub sticky_until: Option<DateTime<Utc>>,
-    pub sticky_timeout: Option<chrono::Duration>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub sticky_until: Option<jiff::Timestamp>,
+    #[diesel(deserialize_as = crate::time::sql::NullablePgDuration)]
+    pub sticky_timeout: Option<jiff::SignedDuration>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
     pub trace_context: Option<serde_json::Value>,
     /// Cluster-wide concurrency group key. NULL = no cap enforced.
@@ -679,7 +694,8 @@ pub struct TaskQueueItem {
     /// Absolute UTC deadline for the total activity lifetime across all retry
     /// attempts (issue #378). Set once at initial enqueue; never refreshed on
     /// retry. NULL = no total deadline (unbounded retries).
-    pub schedule_to_close_at: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub schedule_to_close_at: Option<jiff::Timestamp>,
     /// Structured capability requirements JSONB payload (issue #382).
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
     pub required_capabilities: Option<serde_json::Value>,
@@ -694,7 +710,8 @@ pub struct TaskQueueItem {
     /// explicit future `scheduled_at`. The SLI falls back to `scheduled_at`
     /// when this is `None`.
     #[serde(default)]
-    pub created_at: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub created_at: Option<jiff::Timestamp>,
     /// Durable "please wake this task" flag (dropped-wake fix, issue #601 CI
     /// hardening). See `wake_workflow_task`/`park_workflow_task` in `queue.rs`.
     #[serde(default)]
@@ -762,7 +779,8 @@ pub struct TaskQueueItem {
     /// `scheduled_at` drift with the same wake reason. `NULL` when no timer
     /// owns this row, or once a different wake reason repends it.
     #[serde(default)]
-    pub timer_fires_at: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub timer_fires_at: Option<jiff::Timestamp>,
     /// The `attempt` whose activity handler started (issue #1809). Written
     /// with `ActivityStarted`. Equal to `attempt` only after the current
     /// claim started its handler. `NULL` when no attempt started.
@@ -780,7 +798,8 @@ pub struct TaskQueueItem {
     /// A timeout enforcer measures the attempt duration from it.
     #[serde(default)]
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    pub handler_started_at: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub handler_started_at: Option<jiff::Timestamp>,
     /// `true` on the first workflow task of a freshly admitted run (issue
     /// #1824). See [`crate::queue::CLAIM_ORDER_DUE_SQL`].
     #[serde(default)]
@@ -805,15 +824,15 @@ pub struct NewTaskQueueItem<'a> {
     pub input: SharedJson,
     pub priority: i32,
     pub max_attempts: i32,
-    pub scheduled_at: DateTime<Utc>,
-    pub heartbeat_timeout: Option<chrono::Duration>,
-    pub start_to_close: Option<chrono::Duration>,
-    pub schedule_to_start: Option<chrono::Duration>,
+    pub scheduled_at: jiff::Timestamp,
+    pub heartbeat_timeout: Option<jiff::SignedDuration>,
+    pub start_to_close: Option<jiff::SignedDuration>,
+    pub schedule_to_start: Option<jiff::SignedDuration>,
     pub retry_policy: Option<serde_json::Value>,
     pub heartbeat_details: Option<serde_json::Value>,
     pub sticky_worker_id: Option<&'a str>,
-    pub sticky_until: Option<DateTime<Utc>>,
-    pub sticky_timeout: Option<chrono::Duration>,
+    pub sticky_until: Option<jiff::Timestamp>,
+    pub sticky_timeout: Option<jiff::SignedDuration>,
     pub trace_context: Option<serde_json::Value>,
     pub concurrency_key: Option<&'a str>,
     pub concurrency_cap: Option<i32>,
@@ -823,7 +842,7 @@ pub struct NewTaskQueueItem<'a> {
     pub rate_limit_key: Option<&'a str>,
     /// Absolute UTC deadline for the total activity lifetime (issue #378).
     /// NULL = no total deadline enforced.
-    pub schedule_to_close_at: Option<DateTime<Utc>>,
+    pub schedule_to_close_at: Option<jiff::Timestamp>,
     /// Structured capability requirements JSONB payload (issue #382).
     pub required_capabilities: Option<serde_json::Value>,
     /// Ambient context headers propagated from the parent workflow (issue #481).
@@ -856,31 +875,31 @@ crate::split_queryable!(
         worker_id: Option<String>,
         attempt: i32,
         max_attempts: i32,
-        scheduled_at: DateTime<Utc>,
-        started_at: Option<DateTime<Utc>>,
-        completed_at: Option<DateTime<Utc>>,
-        last_heartbeat_at: Option<DateTime<Utc>>,
+        scheduled_at: jiff::Timestamp as jiff_diesel::Timestamp,
+        started_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
+        completed_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
+        last_heartbeat_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
         heartbeat_details: Option<serde_json::Value>,
         output: Option<serde_json::Value>,
         error: Option<String>,
         sticky_worker_id: Option<String>,
-        sticky_until: Option<DateTime<Utc>>,
-        sticky_timeout: Option<chrono::Duration>,
+        sticky_until: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
+        sticky_timeout: Option<jiff::SignedDuration> as crate::time::sql::NullablePgDuration,
         concurrency_key: Option<String>,
         crash_strikes: i32,
-        schedule_to_close_at: Option<DateTime<Utc>>,
+        schedule_to_close_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
         context_headers: Option<serde_json::Value>,
-        created_at: Option<DateTime<Utc>>,
+        created_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
         session_id: Option<Uuid>,
         capability_misses: i32,
         capability_miss_workers: Vec<String>,
-        timer_fires_at: Option<DateTime<Utc>>,
+        timer_fires_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
         handler_started_attempt: Option<i32>,
     },
     ext harvest_task_queue_ext {
-        heartbeat_timeout: Option<chrono::Duration>,
-        start_to_close: Option<chrono::Duration>,
-        schedule_to_start: Option<chrono::Duration>,
+        heartbeat_timeout: Option<jiff::SignedDuration> as crate::time::sql::NullablePgDuration,
+        start_to_close: Option<jiff::SignedDuration> as crate::time::sql::NullablePgDuration,
+        schedule_to_start: Option<jiff::SignedDuration> as crate::time::sql::NullablePgDuration,
         retry_policy: Option<serde_json::Value>,
         trace_context: Option<serde_json::Value>,
         concurrency_cap: Option<i32>,
@@ -890,7 +909,7 @@ crate::split_queryable!(
         wake_requested: bool,
         capability_miss_handler: Option<String>,
         timed_out_claims: Option<Vec<Option<String>>>,
-        handler_started_at: Option<DateTime<Utc>>,
+        handler_started_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
         new_start: bool,
         fairness_key: Option<String>,
     }
@@ -909,20 +928,20 @@ crate::split_insertable!(
         input: SharedJson,
         priority: i32,
         max_attempts: i32,
-        scheduled_at: DateTime<Utc>,
+        scheduled_at: jiff::Timestamp as jiff_diesel::Timestamp,
         heartbeat_details: Option<serde_json::Value>,
         sticky_worker_id: Option<&'a str>,
-        sticky_until: Option<DateTime<Utc>>,
-        sticky_timeout: Option<chrono::Duration>,
+        sticky_until: Option<jiff::Timestamp> as jiff_diesel::Timestamp,
+        sticky_timeout: Option<jiff::SignedDuration> as crate::time::sql::PgDuration,
         concurrency_key: Option<&'a str>,
-        schedule_to_close_at: Option<DateTime<Utc>>,
+        schedule_to_close_at: Option<jiff::Timestamp> as jiff_diesel::Timestamp,
         context_headers: Option<serde_json::Value>,
         session_id: Option<Uuid>,
     },
     ext harvest_task_queue_ext {
-        heartbeat_timeout: Option<chrono::Duration>,
-        start_to_close: Option<chrono::Duration>,
-        schedule_to_start: Option<chrono::Duration>,
+        heartbeat_timeout: Option<jiff::SignedDuration> as crate::time::sql::PgDuration,
+        start_to_close: Option<jiff::SignedDuration> as crate::time::sql::PgDuration,
+        schedule_to_start: Option<jiff::SignedDuration> as crate::time::sql::PgDuration,
         retry_policy: Option<serde_json::Value>,
         trace_context: Option<serde_json::Value>,
         concurrency_cap: Option<i32>,
@@ -955,9 +974,12 @@ pub struct RateLimitBucket {
     pub refill_rate: f64,
     pub burst: f64,
     pub tokens: f64,
-    pub last_refilled_at: DateTime<Utc>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp, deserialize_as = jiff_diesel::Timestamp)]
+    pub last_refilled_at: jiff::Timestamp,
+    #[diesel(serialize_as = jiff_diesel::Timestamp, deserialize_as = jiff_diesel::Timestamp)]
+    pub created_at: jiff::Timestamp,
+    #[diesel(serialize_as = jiff_diesel::Timestamp, deserialize_as = jiff_diesel::Timestamp)]
+    pub updated_at: jiff::Timestamp,
     /// TTL'd operator override refill rate (issue #945); `None` when no
     /// override refill rate has been declared (an override may set only
     /// `override_burst`).
@@ -968,16 +990,19 @@ pub struct RateLimitBucket {
     /// The override is active (and `override_refill_rate`/`override_burst`
     /// take precedence, per-field, over the declared baseline) while this is
     /// set and in the future (issue #945).
-    pub override_expires_at: Option<DateTime<Utc>>,
+    #[diesel(serialize_as = crate::time::sql::NullableTimestamp, deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub override_expires_at: Option<jiff::Timestamp>,
     /// When `queue::ensure_rate_limit_bucket` last (re-)registered this bucket
     /// (issue #1127). Part of the idle-bucket GC's idleness clock; `None` on a
     /// row that has not been registered since the upgrade.
-    pub last_registered_at: Option<DateTime<Utc>>,
+    #[diesel(serialize_as = crate::time::sql::NullableTimestamp, deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub last_registered_at: Option<jiff::Timestamp>,
     /// When an operator last wrote this bucket's permanent baseline through
     /// `POST /admin/rate-limits/{key}` (issue #332). Non-`None` makes the row
     /// **exempt** from the idle-bucket GC (issue #1127), so this is also the
     /// answer to "why is this bucket never collected?".
-    pub baseline_set_at: Option<DateTime<Utc>>,
+    #[diesel(serialize_as = crate::time::sql::NullableTimestamp, deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub baseline_set_at: Option<jiff::Timestamp>,
 }
 
 /// Insert struct for a rate limit bucket.
@@ -988,7 +1013,8 @@ pub struct NewRateLimitBucket<'a> {
     pub refill_rate: f64,
     pub burst: f64,
     pub tokens: f64,
-    pub last_refilled_at: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub last_refilled_at: jiff::Timestamp,
 }
 
 // ── Schedule ──────────────────────────────────────────────────────────────────
@@ -1005,10 +1031,10 @@ pub struct HarvestSchedule {
     pub catchup: bool,
     pub max_active_runs: i32,
     pub is_paused: bool,
-    pub last_run_at: Option<DateTime<Utc>>,
-    pub next_run_at: Option<DateTime<Utc>>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub last_run_at: Option<jiff::Timestamp>,
+    pub next_run_at: Option<jiff::Timestamp>,
+    pub created_at: jiff::Timestamp,
+    pub updated_at: jiff::Timestamp,
     /// Set for workflow-only schedules, NULL for DAG schedules.
     pub workflow_name: Option<String>,
     /// Input JSON passed to each scheduled workflow run.
@@ -1016,7 +1042,7 @@ pub struct HarvestSchedule {
     /// Task queue for workflow dispatches. NULL for DAG schedule rows.
     pub queue_name: Option<String>,
     /// When the schedule was paused. NULL when the schedule is active.
-    pub paused_at: Option<DateTime<Utc>>,
+    pub paused_at: Option<jiff::Timestamp>,
     /// Actor identity that issued the most recent pause. NULL when active.
     pub paused_by: Option<String>,
     /// Free-text reason recorded with the most recent pause. NULL when active or no reason given.
@@ -1039,21 +1065,21 @@ pub struct HarvestSchedule {
     pub fire_claim_token: Option<Uuid>,
     /// UTC expiry for the current claim (issue #350). When past, any replica may re-claim
     /// (crash-recovery path). NULL when `fire_claim_token` is NULL.
-    pub fire_claimed_until: Option<DateTime<Utc>>,
+    pub fire_claimed_until: Option<jiff::Timestamp>,
     /// Auto-pause threshold (issue #360). NULL = auto-pause disabled.
     pub consecutive_failure_limit: Option<i32>,
     /// Running count of consecutive schedule-triggered execution failures (issue #360).
     pub consecutive_failure_count: i32,
     /// Set to the timestamp when the schedule was auto-paused (issue #360). NULL = not auto-paused.
-    pub auto_paused_at: Option<DateTime<Utc>>,
+    pub auto_paused_at: Option<jiff::Timestamp>,
     /// Absolute UTC cutoff for this schedule (issue #478). NULL = no cutoff.
-    pub end_at: Option<DateTime<Utc>>,
+    pub end_at: Option<jiff::Timestamp>,
     /// Total run budget (issue #478). NULL = unlimited.
     pub max_runs: Option<i32>,
     /// Count of executions actually started by this schedule (issue #478).
     pub runs_started: i32,
     /// Set when the schedule transitions to the exhausted state (issue #478). NULL = still active.
-    pub exhausted_at: Option<DateTime<Utc>>,
+    pub exhausted_at: Option<jiff::Timestamp>,
     /// Machine-readable reason for exhaustion: `"end_at_reached"` or `"max_runs_exhausted"` (issue #478).
     pub exhausted_reason: Option<String>,
     /// Catchup policy discriminator for missed fire slots (issue #484).
@@ -1064,7 +1090,7 @@ pub struct HarvestSchedule {
     /// Number of missed slots dropped on the most recent recovery tick (issue #484).
     pub last_catchup_dropped: i32,
     /// Timestamp of the most recent recovery tick that produced drops (issue #484). NULL = none yet.
-    pub last_catchup_at: Option<DateTime<Utc>>,
+    pub last_catchup_at: Option<jiff::Timestamp>,
     /// Default retry policy for runs started by this schedule (issue #523). NULL = no retry.
     pub retry_policy: Option<serde_json::Value>,
 }
@@ -1109,12 +1135,12 @@ crate::split_queryable!(
         catchup: bool,
         max_active_runs: i32,
         is_paused: bool,
-        next_run_at: Option<DateTime<Utc>>,
-        created_at: DateTime<Utc>,
-        updated_at: DateTime<Utc>,
+        next_run_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
+        created_at: jiff::Timestamp as jiff_diesel::Timestamp,
+        updated_at: jiff::Timestamp as jiff_diesel::Timestamp,
         workflow_name: Option<String>,
         queue_name: Option<String>,
-        paused_at: Option<DateTime<Utc>>,
+        paused_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
         paused_by: Option<String>,
         pause_reason: Option<String>,
         jitter_secs: i64,
@@ -1124,23 +1150,23 @@ crate::split_queryable!(
         calendar_name: Option<String>,
         skip_policy: String,
         fire_claim_token: Option<Uuid>,
-        fire_claimed_until: Option<DateTime<Utc>>,
+        fire_claimed_until: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
         consecutive_failure_limit: Option<i32>,
         consecutive_failure_count: i32,
-        auto_paused_at: Option<DateTime<Utc>>,
-        end_at: Option<DateTime<Utc>>,
+        auto_paused_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
+        end_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
         max_runs: Option<i32>,
         runs_started: i32,
-        exhausted_at: Option<DateTime<Utc>>,
+        exhausted_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
         exhausted_reason: Option<String>,
         last_catchup_dropped: i32,
     },
     ext harvest_schedules_ext {
-        last_run_at: Option<DateTime<Utc>>,
+        last_run_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
         workflow_input: Option<serde_json::Value>,
         catchup_policy: Option<String>,
         catchup_window_secs: Option<i64>,
-        last_catchup_at: Option<DateTime<Utc>>,
+        last_catchup_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
         retry_policy: Option<serde_json::Value>,
     }
 );
@@ -1183,7 +1209,8 @@ pub struct HarvestSignal {
     pub workflow_exec_id: Uuid,
     pub signal_name: String,
     pub payload: serde_json::Value,
-    pub received_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub received_at: jiff::Timestamp,
     pub consumed: bool,
     pub idempotency_key: Option<String>,
 }
@@ -1210,7 +1237,8 @@ pub struct HarvestTimer {
     pub id: Uuid,
     pub workflow_exec_id: Uuid,
     pub timer_id: String,
-    pub fires_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub fires_at: jiff::Timestamp,
     pub fired: bool,
 }
 
@@ -1220,7 +1248,8 @@ pub struct HarvestTimer {
 pub struct NewHarvestTimer<'a> {
     pub workflow_exec_id: Uuid,
     pub timer_id: &'a str,
-    pub fires_at: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub fires_at: jiff::Timestamp,
 }
 
 // ── DeadLetter ────────────────────────────────────────────────────────────────
@@ -1241,7 +1270,8 @@ pub struct DeadLetter {
     pub input: serde_json::Value,
     pub error: String,
     pub attempts: i32,
-    pub failed_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub failed_at: jiff::Timestamp,
     pub owner: Option<String>,
     pub severity: Option<String>,
     /// Denormalized workflow type name (issue #946), mirroring the
@@ -1290,10 +1320,13 @@ pub struct ExternalTask {
     pub name: String,
     pub queue: String,
     pub state: String,
-    pub schedule_to_close_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub schedule_to_close_at: jiff::Timestamp,
     pub schedule_to_close_secs: i64,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub created_at: jiff::Timestamp,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub updated_at: jiff::Timestamp,
 }
 
 /// Insert struct for registering a new external activity task.
@@ -1305,7 +1338,8 @@ pub struct NewExternalTask<'a> {
     pub activity_id: Uuid,
     pub name: &'a str,
     pub queue: &'a str,
-    pub schedule_to_close_at: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub schedule_to_close_at: jiff::Timestamp,
     pub schedule_to_close_secs: i64,
 }
 
@@ -1320,8 +1354,10 @@ pub struct NewExternalTask<'a> {
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct HarvestWorker {
     pub worker_id: String,
-    pub started_at: DateTime<Utc>,
-    pub last_heartbeat_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub started_at: jiff::Timestamp,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub last_heartbeat_at: jiff::Timestamp,
     /// JSON array of queue names polled by this worker.
     pub queues: serde_json::Value,
     /// JSON array of `ShardId` integers assigned to this worker.
@@ -1335,7 +1371,8 @@ pub struct HarvestWorker {
     /// Lifecycle status: `Active`, `Draining`, or `Stopped`.
     pub status: String,
     /// When set, the deadline by which this worker must have finished draining.
-    pub drain_deadline_at: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub drain_deadline_at: Option<jiff::Timestamp>,
     /// Immutable build identifier advertised by this worker (issue #171).
     pub build_id: String,
     /// Optional human-readable deployment name (issue #171).
@@ -1389,10 +1426,14 @@ pub struct BatchJob {
     pub completed: i64,
     pub failed: i64,
     pub errors: serde_json::Value,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub started_at: Option<DateTime<Utc>>,
-    pub completed_at: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub created_at: jiff::Timestamp,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub updated_at: jiff::Timestamp,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub started_at: Option<jiff::Timestamp>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub completed_at: Option<jiff::Timestamp>,
     pub idempotency_key: Option<String>,
     pub created_by: Option<String>,
     pub processed_ids: serde_json::Value,
@@ -1422,7 +1463,8 @@ pub struct NewBatchJob<'a> {
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct AuditRecord {
     pub id: Uuid,
-    pub occurred_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub occurred_at: jiff::Timestamp,
     pub actor: String,
     pub operation: String,
     pub target_type: String,
@@ -1465,7 +1507,8 @@ pub struct NewAuditRecord<'a> {
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct AuditExportRow {
     pub id: Uuid,
-    pub occurred_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub occurred_at: jiff::Timestamp,
     pub actor: String,
     pub operation: String,
     pub target_type: String,
@@ -1481,7 +1524,8 @@ pub struct AuditExportRow {
     /// Audit-chain link of the previous row (issue #1838).
     pub chain_prev: Option<Vec<u8>>,
     /// Newest `occurred_at` chained before this row (issue #1838).
-    pub chain_newest_before: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub chain_newest_before: Option<jiff::Timestamp>,
     /// Audit-chain link of this row (issue #1838).
     pub chain_hash: Option<Vec<u8>>,
     /// The shard whose exporter made the links (issue #1838).
@@ -1498,18 +1542,23 @@ pub struct AuditExportCursor {
     pub last_assigned_seq: i64,
     pub last_acked_seq: i64,
     pub claim_epoch: i64,
-    pub lease_until: Option<DateTime<Utc>>,
-    pub next_attempt_at: DateTime<Utc>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub lease_until: Option<jiff::Timestamp>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub next_attempt_at: jiff::Timestamp,
     pub consecutive_failures: i32,
     pub last_status: Option<i32>,
     pub last_error: Option<String>,
-    pub last_delivered_at: Option<DateTime<Utc>>,
-    pub updated_at: DateTime<Utc>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub last_delivered_at: Option<jiff::Timestamp>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub updated_at: jiff::Timestamp,
     /// Set when an operator retired audit export for this shard. The row is
     /// kept rather than deleted, so `last_assigned_seq` outlives the audit rows
     /// themselves. A retired cursor is inert: retention ignores it and a
     /// redrive refuses it.
-    pub retired_at: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub retired_at: Option<jiff::Timestamp>,
     /// Newest audit-chain link on this shard (issue #1838).
     pub chain_head: Option<Vec<u8>>,
     /// First chained `export_seq` on this shard (issue #1838).
@@ -1517,7 +1566,8 @@ pub struct AuditExportCursor {
     /// `export_seq` of the newest chained row (issue #1838).
     pub chain_head_seq: Option<i64>,
     /// Newest `occurred_at` of the chain, through the head (issue #1838).
-    pub chain_newest_at: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub chain_newest_at: Option<jiff::Timestamp>,
     /// Keyed MAC over the checkpoint columns (issue #1838).
     pub chain_mac: Option<Vec<u8>>,
 }
@@ -1539,10 +1589,14 @@ pub struct ApiToken {
     pub name: String,
     pub token_hash: String,
     pub scope: String,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: Option<DateTime<Utc>>,
-    pub last_used_at: Option<DateTime<Utc>>,
-    pub revoked_at: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub created_at: jiff::Timestamp,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub expires_at: Option<jiff::Timestamp>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub last_used_at: Option<jiff::Timestamp>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub revoked_at: Option<jiff::Timestamp>,
     pub created_by: String,
     /// Tenant claim of the token (issue #1977). `None` means not
     /// tenant-bound.
@@ -1559,7 +1613,8 @@ pub struct NewApiToken<'a> {
     pub name: &'a str,
     pub token_hash: &'a str,
     pub scope: &'a str,
-    pub expires_at: Option<DateTime<Utc>>,
+    #[diesel(serialize_as = crate::time::sql::NullableTimestamp)]
+    pub expires_at: Option<jiff::Timestamp>,
     pub created_by: &'a str,
     /// Tenant claim of the token (issue #1977). `None` means not
     /// tenant-bound.
@@ -1592,8 +1647,10 @@ pub struct HarvestBuildPolicy {
     pub queue_name: String,
     pub build_id: String,
     pub deployment_name: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub created_at: jiff::Timestamp,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub updated_at: jiff::Timestamp,
     /// Ramp target build (issue #604). `None` = no ramp configured.
     pub target_build_id: Option<String>,
     /// Ramp percentage 0..=100 (issue #604). `None` = no ramp configured.
@@ -1628,7 +1685,8 @@ pub struct HarvestBuildCompat {
     pub id: Uuid,
     pub build_id: String,
     pub compatible_with: String,
-    pub declared_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub declared_at: jiff::Timestamp,
 }
 
 /// Insert struct for a new compatibility declaration.
@@ -1651,8 +1709,10 @@ pub struct BackfillLogRow {
     pub schedule_id: Uuid,
     pub actor: String,
     pub source: String,
-    pub from_ts: DateTime<Utc>,
-    pub to_ts: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub from_ts: jiff::Timestamp,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub to_ts: jiff::Timestamp,
     pub dry_run: bool,
     pub total: i32,
     pub dispatched: i32,
@@ -1660,8 +1720,10 @@ pub struct BackfillLogRow {
     pub failed: i32,
     pub status: String,
     pub error_summary: Option<String>,
-    pub started_at: DateTime<Utc>,
-    pub completed_at: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub started_at: jiff::Timestamp,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub completed_at: Option<jiff::Timestamp>,
 }
 
 /// Insert struct for a new backfill log entry.
@@ -1672,8 +1734,10 @@ pub struct NewBackfillLogRow {
     pub schedule_id: Uuid,
     pub actor: String,
     pub source: String,
-    pub from_ts: DateTime<Utc>,
-    pub to_ts: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub from_ts: jiff::Timestamp,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub to_ts: jiff::Timestamp,
     pub dry_run: bool,
     pub total: i32,
     pub dispatched: i32,
@@ -1681,8 +1745,10 @@ pub struct NewBackfillLogRow {
     pub failed: i32,
     pub status: String,
     pub error_summary: Option<String>,
-    pub started_at: DateTime<Utc>,
-    pub completed_at: Option<DateTime<Utc>>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub started_at: jiff::Timestamp,
+    #[diesel(serialize_as = crate::time::sql::NullableTimestamp)]
+    pub completed_at: Option<jiff::Timestamp>,
 }
 
 // ── Schedule Decisions ────────────────────────────────────────────────────────
@@ -1701,8 +1767,10 @@ pub struct ScheduleDecision {
     pub decision: String,
     pub reason_code: String,
     pub detail: Option<serde_json::Value>,
-    pub occurred_at: DateTime<Utc>,
-    pub next_fire_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub occurred_at: jiff::Timestamp,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub next_fire_at: jiff::Timestamp,
     pub shard_id: i16,
 }
 
@@ -1717,8 +1785,10 @@ pub struct NewScheduleDecision {
     pub decision: String,
     pub reason_code: String,
     pub detail: Option<serde_json::Value>,
-    pub occurred_at: DateTime<Utc>,
-    pub next_fire_at: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub occurred_at: jiff::Timestamp,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub next_fire_at: jiff::Timestamp,
     pub shard_id: i16,
 }
 
@@ -1738,8 +1808,10 @@ pub struct CompletionTriggerDb {
     pub input_mapping: serde_json::Value,
     pub queue_name: Option<String>,
     pub is_static: bool,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub created_at: jiff::Timestamp,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub updated_at: jiff::Timestamp,
     /// Optional output guard AST (issue #810). NULL = unconditional.
     pub condition: Option<serde_json::Value>,
 }
@@ -1766,7 +1838,8 @@ pub struct NewCompletionTriggerDb {
 pub struct CompletionTriggerFireDb {
     pub source_exec_id: Uuid,
     pub trigger_id: Uuid,
-    pub fired_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub fired_at: jiff::Timestamp,
     /// NULL = fired; `condition_unmet` / `condition_invalid` =
     /// resolved-skipped by the output guard (issue #810).
     pub outcome: Option<String>,
@@ -1812,8 +1885,10 @@ pub struct CompletionTriggerOutboxDb {
     pub concurrency_limit: Option<i32>,
     pub priority: serde_json::Value,
     pub max_workflow_input_bytes: i64,
-    pub created_at: DateTime<Utc>,
-    pub next_attempt_at: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub created_at: jiff::Timestamp,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub next_attempt_at: Option<jiff::Timestamp>,
     /// Tenant of the source run (issue #1977). The target run gets it.
     pub tenant: Option<String>,
 }
@@ -1857,10 +1932,12 @@ pub struct CrossShardChildRow {
     pub workflow_name: String,
     /// A serialized `crate::cross_shard_child::CrossShardChildSpec`.
     pub child_spec: serde_json::Value,
-    pub created_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub created_at: jiff::Timestamp,
     pub attempts: i32,
     pub last_error: Option<String>,
-    pub last_attempt_at: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub last_attempt_at: Option<jiff::Timestamp>,
     /// The reason that the parent gave its cancel. `None` = the generic text.
     pub cancel_reason: Option<String>,
 }
@@ -1898,11 +1975,14 @@ pub struct AdmissionGateRow {
     pub reason: String,
     pub message: Option<String>,
     pub created_by: String,
-    pub created_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub created_at: jiff::Timestamp,
     /// `None` = no expiry; auto-ignored at/after this time.
-    pub expires_at: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub expires_at: Option<jiff::Timestamp>,
     /// `None` = still active; set on lift.
-    pub lifted_at: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub lifted_at: Option<jiff::Timestamp>,
     pub lifted_by: Option<String>,
 }
 
@@ -1916,7 +1996,8 @@ pub struct NewAdmissionGateRow<'a> {
     pub reason: &'a str,
     pub message: Option<&'a str>,
     pub created_by: &'a str,
-    pub expires_at: Option<DateTime<Utc>>,
+    #[diesel(serialize_as = crate::time::sql::NullableTimestamp)]
+    pub expires_at: Option<jiff::Timestamp>,
 }
 
 // ── CompletionDelivery ───────────────────────────────────────────────────────
@@ -1951,12 +2032,16 @@ pub struct CompletionDelivery {
     pub max_attempts: i32,
     /// Frozen `RetryPolicy` JSON at enqueue time.
     pub retry_policy: serde_json::Value,
-    pub next_attempt_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub next_attempt_at: jiff::Timestamp,
     pub last_status: Option<i32>,
     pub last_error: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub delivered_at: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub created_at: jiff::Timestamp,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub updated_at: jiff::Timestamp,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub delivered_at: Option<jiff::Timestamp>,
 }
 
 /// Insert struct for enqueuing a new completion-callback delivery.
@@ -1975,7 +2060,8 @@ pub struct NewCompletionDelivery<'a> {
     pub payload: serde_json::Value,
     pub max_attempts: i32,
     pub retry_policy: serde_json::Value,
-    pub next_attempt_at: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub next_attempt_at: jiff::Timestamp,
 }
 
 /// Changeset applied by the scanner after claiming a batch of due rows.
@@ -1987,8 +2073,10 @@ pub struct NewCompletionDelivery<'a> {
 pub struct CompletionDeliveryClaim {
     pub state: String,
     pub attempt: i32,
-    pub next_attempt_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub next_attempt_at: jiff::Timestamp,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub updated_at: jiff::Timestamp,
 }
 
 /// Changeset applied after a delivery attempt completes, recording the
@@ -1997,11 +2085,14 @@ pub struct CompletionDeliveryClaim {
 #[diesel(table_name = harvest_completion_deliveries)]
 pub struct CompletionDeliveryOutcomeUpdate {
     pub state: String,
-    pub next_attempt_at: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub next_attempt_at: jiff::Timestamp,
     pub last_status: Option<i32>,
     pub last_error: Option<String>,
-    pub updated_at: DateTime<Utc>,
-    pub delivered_at: Option<DateTime<Utc>>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub updated_at: jiff::Timestamp,
+    #[diesel(serialize_as = crate::time::sql::NullableTimestamp)]
+    pub delivered_at: Option<jiff::Timestamp>,
 }
 
 // ── Worker sessions (issue #606) ───────────────────────────────────────────
@@ -2031,11 +2122,15 @@ pub struct HarvestSession {
     pub queue_name: String,
     /// `ACTIVE`, `BROKEN`, or `COMPLETED`.
     pub state: String,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
-    pub broken_at: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub created_at: jiff::Timestamp,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub expires_at: jiff::Timestamp,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub broken_at: Option<jiff::Timestamp>,
     pub broken_reason: Option<String>,
-    pub completed_at: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    pub completed_at: Option<jiff::Timestamp>,
 }
 
 /// Insert struct for a newly acquired worker session.
@@ -2046,7 +2141,8 @@ pub struct NewHarvestSession<'a> {
     pub workflow_exec_id: Uuid,
     pub host_worker_id: &'a str,
     pub queue_name: &'a str,
-    pub expires_at: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub expires_at: jiff::Timestamp,
 }
 
 /// Changeset for refreshing a session's lease (issue #606).
@@ -2057,7 +2153,8 @@ pub struct NewHarvestSession<'a> {
 #[derive(Debug, AsChangeset)]
 #[diesel(table_name = harvest_sessions)]
 pub struct SessionLeaseRefresh {
-    pub expires_at: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub expires_at: jiff::Timestamp,
 }
 
 /// Changeset applied by the broken-session scanner (issue #606).
@@ -2065,7 +2162,8 @@ pub struct SessionLeaseRefresh {
 #[diesel(table_name = harvest_sessions)]
 pub struct SessionBrokenUpdate {
     pub state: String,
-    pub broken_at: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub broken_at: jiff::Timestamp,
     pub broken_reason: String,
 }
 
@@ -2074,7 +2172,8 @@ pub struct SessionBrokenUpdate {
 #[diesel(table_name = harvest_sessions)]
 pub struct SessionCompletedUpdate {
     pub state: String,
-    pub completed_at: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub completed_at: jiff::Timestamp,
 }
 
 // ── Execution summary (issue #752) ──────────────────────────────────────────────
@@ -2099,8 +2198,10 @@ pub struct ExecutionSummary {
     pub workflow_name: String,
     pub workflow_id: String,
     pub state: String,
-    pub started_at: DateTime<Utc>,
-    pub completed_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub started_at: jiff::Timestamp,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub completed_at: jiff::Timestamp,
     pub duration_ms: Option<i64>,
     pub shard_id: i32,
     pub search_attrs: Option<serde_json::Value>,
@@ -2110,7 +2211,8 @@ pub struct ExecutionSummary {
     /// (issue #752). Links a demoted child to its parent for the #495 PII-erase
     /// cascade.
     pub parent_id: Option<Uuid>,
-    pub summarized_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub summarized_at: jiff::Timestamp,
     /// The residence history carried over from the demoted execution row
     /// (issue #964). A cross-residence erasure can then still reach the sealed
     /// source copies after that row is collected. `None` for a run that never
@@ -2128,8 +2230,10 @@ pub struct NewExecutionSummary {
     pub workflow_name: String,
     pub workflow_id: String,
     pub state: String,
-    pub started_at: DateTime<Utc>,
-    pub completed_at: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub started_at: jiff::Timestamp,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub completed_at: jiff::Timestamp,
     pub duration_ms: Option<i64>,
     pub shard_id: i32,
     pub search_attrs: Option<serde_json::Value>,
@@ -2162,7 +2266,8 @@ pub struct HarvestWasmModule {
     pub activity_name: String,
     pub wasm_bytes: Vec<u8>,
     pub active: bool,
-    pub published_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub published_at: jiff::Timestamp,
 }
 
 /// Insert struct for publishing a WASM activity module version (issue #965).
@@ -2197,8 +2302,10 @@ pub struct HarvestMutexLock {
     pub lock_key: String,
     pub holder_exec_id: Uuid,
     pub lock_seq: i64,
-    pub acquired_at: DateTime<Utc>,
-    pub lease_expires_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub acquired_at: jiff::Timestamp,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub lease_expires_at: jiff::Timestamp,
 }
 
 /// Insert struct for granting a durable mutex lock (issue #691).
@@ -2210,7 +2317,8 @@ pub struct NewHarvestMutexLock {
     pub lock_key: String,
     pub holder_exec_id: Uuid,
     pub lock_seq: i64,
-    pub lease_expires_at: DateTime<Utc>,
+    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    pub lease_expires_at: jiff::Timestamp,
 }
 
 /// A FIFO waiter row from `harvest_mutex_waiters` (issue #691). The BIGSERIAL
@@ -2224,7 +2332,8 @@ pub struct HarvestMutexWaiter {
     pub id: i64,
     pub lock_key: String,
     pub waiter_exec_id: Uuid,
-    pub requested_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub requested_at: jiff::Timestamp,
 }
 
 /// Insert struct for enqueuing a durable mutex waiter (issue #691).
@@ -2252,7 +2361,8 @@ pub struct HarvestWorkflowLog {
     pub seq: i64,
     pub level: String,
     pub message: String,
-    pub occurred_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub occurred_at: jiff::Timestamp,
 }
 
 /// Insert struct for one durable workflow log line (issue #790).
@@ -2279,7 +2389,8 @@ pub struct HarvestStreamChunk {
     pub workflow_exec_id: Uuid,
     pub stream_offset: i64,
     pub chunk: serde_json::Value,
-    pub created_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    pub created_at: jiff::Timestamp,
 }
 
 /// Insert struct for one durable output-stream chunk (issue #1974).
@@ -2313,7 +2424,7 @@ mod effective_terminal_state_tests {
             parent_id: None,
             sticky_worker_id: None,
             queue_name: "default".to_string(),
-            started_at: chrono::Utc::now(),
+            started_at: jiff::Timestamp::now(),
             completed_at: None,
             execution_timeout: None,
             deadline_at: None,
@@ -2321,7 +2432,7 @@ mod effective_terminal_state_tests {
             chain_deadline_at: None,
             memo: None,
             search_attrs: None,
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
             assigned_build_id: None,
             parent_close_policy: None,
             owner: None,
@@ -2383,7 +2494,7 @@ mod effective_terminal_state_tests {
     #[test]
     fn a_reconciled_seal_reads_the_live_copy_s_recorded_outcome() {
         let mut row = stub("MIGRATED");
-        row.migrated_run_terminal_at = Some(chrono::Utc::now());
+        row.migrated_run_terminal_at = Some(jiff::Timestamp::now());
         row.rebalance.migrated_run_terminal_state = Some("FAILED".to_string());
         assert_eq!(
             row.effective_terminal_state(),
@@ -2395,7 +2506,7 @@ mod effective_terminal_state_tests {
     #[test]
     fn a_reconciled_seal_with_a_successful_outcome_still_reads_as_that_outcome() {
         let mut row = stub("MIGRATED");
-        row.migrated_run_terminal_at = Some(chrono::Utc::now());
+        row.migrated_run_terminal_at = Some(jiff::Timestamp::now());
         row.rebalance.migrated_run_terminal_state = Some("COMPLETED".to_string());
         assert_eq!(row.effective_terminal_state(), "COMPLETED");
     }
@@ -2434,7 +2545,7 @@ mod effective_terminal_state_tests {
         // (or by a reconciler build that predates it): the fallback must
         // not panic or fabricate an outcome.
         let mut row = stub("MIGRATED");
-        row.migrated_run_terminal_at = Some(chrono::Utc::now());
+        row.migrated_run_terminal_at = Some(jiff::Timestamp::now());
         assert_eq!(row.effective_terminal_state(), "MIGRATED");
     }
 }

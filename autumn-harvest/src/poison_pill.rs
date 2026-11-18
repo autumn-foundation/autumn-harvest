@@ -32,6 +32,7 @@
 //! pass. A quarantine also locks the owning execution and its open tasks.
 //! Those locks still wait, up to the session `lock_timeout`. A timeout or a
 //! deadlock on one row skips that row, not the pass.
+use jiff_diesel::ToDiesel;
 
 /// What to do with an orphaned `RUNNING` task whose claiming worker has died.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,7 +108,7 @@ pub struct OrphanClaim {
     /// The attempt of the claim.
     pub attempt: i32,
     /// The start time of the claim.
-    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub started_at: Option<jiff::Timestamp>,
 }
 
 /// The orphan claims that one reclaimer saw, and when it first saw each one
@@ -205,7 +206,7 @@ pub const fn quarantine_confirm_secs(worker_stale_secs: i64) -> i64 {
 /// Upper bound (one year, in seconds) applied to the worker-stale threshold.
 ///
 /// The reclaim path multiplies this value into a Postgres `INTERVAL` and a
-/// [`chrono::Duration`]. The clamp keeps both inside their valid range, so an
+/// [`jiff::SignedDuration`]. The clamp keeps both inside their valid range, so an
 /// absurd `worker_heartbeat_interval` cannot overflow or panic. A one-year
 /// staleness window is already far beyond any sane fleet config.
 pub const MAX_WORKER_STALE_SECS: i64 = 31_536_000;
@@ -341,7 +342,7 @@ pub const fn requeue_orphan_stmt() -> &'static str {
 
 #[cfg(feature = "db")]
 mod scanner {
-    use chrono::Utc;
+    use jiff::Timestamp;
     use diesel::BoolExpressionMethods;
     use diesel::ExpressionMethods;
     use diesel::OptionalExtension;
@@ -484,15 +485,15 @@ mod scanner {
             // statement's. A lock wait before this point would make `NOW()`
             // stale. `SKIP LOCKED` removes that wait, but this read does not
             // depend on it. It matches the pre-fix code, which computed
-            // `Utc::now()` at this same point -- after the row lock.
-            let now = Utc::now();
+            // `Timestamp::now()` at this same point -- after the row lock.
+            let now = Timestamp::now();
             let updated: Option<IdRow> = diesel::sql_query(super::requeue_orphan_stmt())
                 .bind::<diesel::sql_types::Uuid, _>(task_id)
                 .bind::<diesel::sql_types::Text, _>(&worker_id)
                 .bind::<diesel::sql_types::Integer, _>(prior_strikes)
                 .bind::<diesel::sql_types::Integer, _>(new_strikes)
                 .bind::<diesel::sql_types::BigInt, _>(worker_stale_secs)
-                .bind::<diesel::sql_types::Timestamptz, _>(now)
+                .bind::<diesel::sql_types::Timestamptz, _>(now.to_diesel())
                 .get_result(conn)
                 .await
                 .optional()
@@ -552,7 +553,7 @@ mod scanner {
             Option<String>,
             i32,
             String,
-            Option<chrono::DateTime<Utc>>,
+            Option<jiff::Timestamp>,
         );
 
         let task_id = task.id;
@@ -584,7 +585,7 @@ mod scanner {
                 .await
                 .optional()
                 .map_err(crate::error::database_error)?;
-            let cutoff = Utc::now() - chrono::Duration::seconds(stuck_running_secs);
+            let cutoff = Timestamp::now() - jiff::SignedDuration::from_secs(stuck_running_secs);
             match current {
                 Some((state, Some(wid), strikes, task_type, Some(started_at)))
                     if state == "RUNNING"
@@ -599,10 +600,10 @@ mod scanner {
                 .set((
                     dsl::state.eq("PENDING"),
                     dsl::worker_id.eq(None::<String>),
-                    dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
+                    dsl::started_at.eq(None::<jiff::Timestamp>),
                     dsl::sticky_worker_id.eq(None::<String>),
-                    dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
-                    dsl::last_heartbeat_at.eq(None::<chrono::DateTime<Utc>>),
+                    dsl::sticky_until.eq(None::<jiff::Timestamp>),
+                    dsl::last_heartbeat_at.eq(None::<jiff::Timestamp>),
                     // Mirrors `requeue_orphan_stmt`: a stale `error` from an
                     // earlier attempt must not survive into the fresh one it
                     // no longer describes.
@@ -715,9 +716,9 @@ mod scanner {
             exec_dsl::state.eq("FAILED"),
             exec_dsl::output.eq(None::<serde_json::Value>),
             exec_dsl::error.eq(Some(error.to_string())),
-            exec_dsl::completed_at.eq(Some(Utc::now())),
+            exec_dsl::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             // Clear active-pause metadata when a paused owner is failed (#383).
-            exec_dsl::paused_at.eq(None::<chrono::DateTime<Utc>>),
+            exec_dsl::paused_at.eq(None::<jiff::Timestamp>),
             exec_dsl::pause_reason.eq(None::<String>),
             exec_dsl::pause_actor.eq(None::<String>),
         ))
@@ -744,7 +745,7 @@ mod scanner {
             .set((
                 task_dsl::state.eq("FAILED"),
                 task_dsl::error.eq(Some(error.to_string())),
-                task_dsl::completed_at.eq(Some(Utc::now())),
+                task_dsl::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             ))
             .execute(conn)
             .await
@@ -813,7 +814,7 @@ mod scanner {
         Option<String>,
         i32,
         i32,
-        Option<chrono::DateTime<Utc>>,
+        Option<jiff::Timestamp>,
     );
 
     /// Quarantine an orphaned poison-pill task.
@@ -970,7 +971,7 @@ mod scanner {
                             dsl::worker_id.eq(None::<String>),
                             dsl::crash_strikes.eq(new_strikes),
                             dsl::error.eq(Some(error.clone())),
-                            dsl::completed_at.eq(Some(Utc::now())),
+                            dsl::completed_at.eq(Some(Timestamp::now()).to_diesel()),
                         ))
                         .execute(conn)
                         .await

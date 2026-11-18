@@ -6,6 +6,7 @@
 //! exercises `autumn_harvest::audit` insert/list/filter behaviour.
 
 use autumn_harvest::audit::{
+use jiff_diesel::ToDiesel;
     self, AuditFilters, OP_WORKFLOW_CANCEL, OP_WORKFLOW_START, STATUS_FAILED, STATUS_SUCCEEDED,
     TARGET_SCHEDULE, TARGET_WORKFLOW,
 };
@@ -414,15 +415,12 @@ async fn audit_list_filter_by_target_id() {
 async fn audit_list_date_range_since() {
     let (mut conn, _c) = make_conn().await;
 
-    let before = chrono::DateTime::parse_from_rfc3339("2026-05-06T12:00:00Z")
-        .expect("fixed before timestamp")
-        .with_timezone(&chrono::Utc);
-    let midpoint = chrono::DateTime::parse_from_rfc3339("2026-05-06T12:30:00Z")
-        .expect("fixed midpoint timestamp")
-        .with_timezone(&chrono::Utc);
-    let after = chrono::DateTime::parse_from_rfc3339("2026-05-06T13:00:00Z")
-        .expect("fixed after timestamp")
-        .with_timezone(&chrono::Utc);
+    let before = ("2026-05-06T12:00:00Z").parse::<Timestamp>()
+        .expect("fixed before timestamp");
+    let midpoint = ("2026-05-06T12:30:00Z").parse::<Timestamp>()
+        .expect("fixed midpoint timestamp");
+    let after = ("2026-05-06T13:00:00Z").parse::<Timestamp>()
+        .expect("fixed after timestamp");
 
     let before_id = audit::insert_audit(
         &mut conn,
@@ -439,12 +437,12 @@ async fn audit_list_date_range_since() {
     .expect("insert after");
 
     diesel::update(harvest_audit_log::table.filter(harvest_audit_log::id.eq(before_id)))
-        .set(harvest_audit_log::occurred_at.eq(before))
+        .set(harvest_audit_log::occurred_at.eq(before.to_diesel()))
         .execute(&mut conn)
         .await
         .expect("pin before timestamp");
     diesel::update(harvest_audit_log::table.filter(harvest_audit_log::id.eq(after_id)))
-        .set(harvest_audit_log::occurred_at.eq(after))
+        .set(harvest_audit_log::occurred_at.eq(after.to_diesel()))
         .execute(&mut conn)
         .await
         .expect("pin after timestamp");

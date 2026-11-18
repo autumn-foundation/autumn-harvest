@@ -75,7 +75,7 @@ use autumn_harvest::dispatch::{
 };
 use autumn_harvest::error::{HarvestError, HarvestResult};
 use autumn_harvest::types::ShardId;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::streams::{
     StreamClaimReply, StreamPendingCountReply, StreamReadOptions, StreamReadReply,
@@ -221,7 +221,7 @@ impl RedisDispatchConfig {
 struct DispatchRef {
     task_id: Uuid,
     queue_name: String,
-    scheduled_at: DateTime<Utc>,
+    scheduled_at: Timestamp,
     #[serde(default)]
     priority: i32,
     #[serde(default)]
@@ -258,7 +258,7 @@ impl DispatchRef {
         Self {
             task_id: lease.task_id,
             queue_name: lease.queue_name.clone(),
-            scheduled_at: Utc::now(),
+            scheduled_at: Timestamp::now(),
             priority: 0,
             redeliveries: lease.redeliveries,
             shard: lease.shard.map(ShardId::as_i32),
@@ -279,7 +279,7 @@ impl DispatchRef {
 
     /// Marker value for this reference: the row's due time in milliseconds.
     const fn marker_value(&self) -> i64 {
-        self.scheduled_at.timestamp_millis()
+        self.scheduled_at.as_millisecond()
     }
 }
 
@@ -323,7 +323,7 @@ impl std::fmt::Debug for RedisDispatch {
 
 /// One queue's share of a [`RedisDispatch::requeue_batch`] call: each
 /// entry's handle, reference and due time, borrowed from the caller's slice.
-type QueueBatch<'a> = Vec<(&'a String, &'a DispatchRef, DateTime<Utc>)>;
+type QueueBatch<'a> = Vec<(&'a String, &'a DispatchRef, Timestamp)>;
 
 impl RedisDispatch {
     /// Build a channel from two open connection managers.
@@ -529,7 +529,7 @@ impl RedisDispatch {
         }
         // The groups must exist before the script adds entries.
         self.ensure_groups(queues, false).await?;
-        let now_ms = Utc::now().timestamp_millis();
+        let now_ms = Timestamp::now().as_millisecond();
         let mut conn = self.conn.clone();
         let counts: Vec<i64> = match self
             .promote_pipeline(queues, now_ms)
@@ -578,7 +578,7 @@ impl RedisDispatch {
         let interval_ms = i64::try_from(interval.as_millis()).unwrap_or(i64::MAX);
         if !claim_rate_limit_slot(
             &self.last_promote_ms,
-            Utc::now().timestamp_millis(),
+            Timestamp::now().as_millisecond(),
             interval_ms,
         ) {
             return Ok(0);
@@ -596,7 +596,7 @@ impl RedisDispatch {
             .max(1);
         claim_rate_limit_slot(
             &self.last_recover_ms,
-            Utc::now().timestamp_millis(),
+            Timestamp::now().as_millisecond(),
             interval_ms,
         )
     }
@@ -651,7 +651,7 @@ impl RedisDispatch {
         &self,
         handle: &str,
         reference: &DispatchRef,
-        due: DateTime<Utc>,
+        due: Timestamp,
     ) -> RedisAdapterResult<()> {
         let entries = [(handle.to_string(), reference.clone(), due)];
         self.requeue_batch(&entries).await
@@ -678,7 +678,7 @@ impl RedisDispatch {
     /// `XADD` generates.
     async fn requeue_batch(
         &self,
-        entries: &[(String, DispatchRef, DateTime<Utc>)],
+        entries: &[(String, DispatchRef, Timestamp)],
     ) -> RedisAdapterResult<()> {
         if entries.is_empty() {
             return Ok(());
@@ -690,7 +690,7 @@ impl RedisDispatch {
                 .or_default()
                 .push((handle, reference, *due));
         }
-        let now_ms = Utc::now().timestamp_millis();
+        let now_ms = Timestamp::now().as_millisecond();
         let ttl = self.dedupe_ttl_secs();
         // One queue's script invocation failing must not abort the rest of
         // this batch (issue #1429 review). A caller
@@ -722,7 +722,7 @@ impl RedisDispatch {
                 invocation
                     .arg(handle_entry_id(handle))
                     .arg(reference.task_id.to_string())
-                    .arg(due.timestamp_millis())
+                    .arg(due.as_millisecond())
                     .arg(reference.marker_value())
                     .arg(serde_json::to_string(reference)?);
             }
@@ -747,7 +747,7 @@ impl RedisDispatch {
                 .push(hint);
         }
 
-        let now_ms = Utc::now().timestamp_millis();
+        let now_ms = Timestamp::now().as_millisecond();
         let ttl = self.dedupe_ttl_secs();
         for (queue, batch) in by_queue {
             // The group must exist before the first entry lands on the stream.
@@ -765,7 +765,7 @@ impl RedisDispatch {
                 let payload = serde_json::to_string(&DispatchRef::from_hint(hint))?;
                 invocation
                     .arg(hint.task_id.to_string())
-                    .arg(hint.scheduled_at.timestamp_millis())
+                    .arg(hint.scheduled_at.as_millisecond())
                     .arg(payload);
             }
             let mut conn = self.conn.clone();
@@ -1048,9 +1048,9 @@ impl RedisDispatch {
         // costs one redelivery per entry, which the visibility timeout already
         // covers, so the leases already collected are returned either way.
         if !surplus.is_empty() {
-            let now = Utc::now();
+            let now = Timestamp::now();
             let surplus_len = surplus.len();
-            let surplus_entries: Vec<(String, DispatchRef, DateTime<Utc>)> = surplus
+            let surplus_entries: Vec<(String, DispatchRef, Timestamp)> = surplus
                 .into_iter()
                 .map(|(handle, reference)| (handle, reference, now))
                 .collect();
@@ -1164,12 +1164,12 @@ impl RedisDispatch {
             .and_then(|payload| serde_json::from_str::<DispatchRef>(payload).ok())
             .unwrap_or_else(|| DispatchRef::from_lease(lease));
         reference.redeliveries = lease.redeliveries.saturating_add(1);
-        let chrono_delay = chrono::Duration::from_std(delay).map_err(|err| {
+        let chrono_delay = jiff::SignedDuration::try_from(delay).map_err(|err| {
             RedisAdapterError::DurationOutOfRange(format!("release delay: {err}"))
         })?;
         // `scheduled_at` stays the row's due time. Only the delivery time
         // moves, so a reconcile republish does not disturb the backoff (C1).
-        self.requeue(&lease.handle, &reference, Utc::now() + chrono_delay)
+        self.requeue(&lease.handle, &reference, Timestamp::now() + chrono_delay)
             .await
     }
 
@@ -1260,7 +1260,7 @@ impl RedisDispatch {
     /// batch (issue #1429 follow-up). An oversized
     /// `poll_interval`/`release_backoff_cap` on a direct embedder's
     /// `DispatchSettings` can make one lease's `std::time::Duration` land
-    /// outside what `chrono::Duration` can represent. The `?` this used to
+    /// outside what `jiff::SignedDuration` can represent. The `?` this used to
     /// return on would abort before [`Self::requeue_batch`] ever ran. Every
     /// other, unrelated lease in the batch then stayed pending until
     /// visibility recovery, the exact blast radius this PR's own
@@ -1274,7 +1274,7 @@ impl RedisDispatch {
         if leases.is_empty() {
             return Ok(());
         }
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mut entries = Vec::with_capacity(leases.len());
         let mut first_error = None;
         for (lease, delay) in leases {
@@ -1284,7 +1284,7 @@ impl RedisDispatch {
                 .and_then(|payload| serde_json::from_str::<DispatchRef>(payload).ok())
                 .unwrap_or_else(|| DispatchRef::from_lease(lease));
             reference.redeliveries = lease.redeliveries.saturating_add(1);
-            match chrono::Duration::from_std(*delay) {
+            match jiff::SignedDuration::try_from(*delay) {
                 Ok(chrono_delay) => {
                     entries.push((lease.handle.clone(), reference, now + chrono_delay));
                 }
@@ -1388,8 +1388,8 @@ impl RedisDispatch {
         // here. See [`RedisDispatch::discard_entries`].
         self.discard_entries(&malformed).await?;
         let count = recovered.len();
-        let now = Utc::now();
-        let recovered_entries: Vec<(String, DispatchRef, DateTime<Utc>)> = recovered
+        let now = Timestamp::now();
+        let recovered_entries: Vec<(String, DispatchRef, Timestamp)> = recovered
             .into_iter()
             .map(|(handle, reference)| (handle, reference, now))
             .collect();
@@ -1924,7 +1924,7 @@ mod tests {
         let hint = DispatchHint {
             task_id: Uuid::new_v4(),
             queue_name: "email".to_string(),
-            scheduled_at: Utc::now(),
+            scheduled_at: Timestamp::now(),
             priority: 7,
             shard: Some(ShardId::new(2)),
             kind: None,
@@ -1945,7 +1945,7 @@ mod tests {
         let hint = DispatchHint {
             task_id: Uuid::new_v4(),
             queue_name: "email".to_string(),
-            scheduled_at: Utc::now(),
+            scheduled_at: Timestamp::now(),
             priority: 0,
             shard: None,
             kind: Some(DispatchKind::Activity),
@@ -1976,9 +1976,8 @@ mod tests {
         let hint = DispatchHint {
             task_id: Uuid::nil(),
             queue_name: "q".to_string(),
-            scheduled_at: DateTime::parse_from_rfc3339("2026-09-07T12:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
+            scheduled_at: ("2026-09-07T12:00:00Z").parse::<Timestamp>()
+                .unwrap(),
             priority: 0,
             shard: None,
             kind: None,
@@ -1995,9 +1994,8 @@ mod tests {
         let hint = DispatchHint {
             task_id: Uuid::nil(),
             queue_name: "q".to_string(),
-            scheduled_at: DateTime::parse_from_rfc3339("2026-09-07T12:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
+            scheduled_at: ("2026-09-07T12:00:00Z").parse::<Timestamp>()
+                .unwrap(),
             priority: 0,
             shard: None,
             kind: None,
@@ -2006,7 +2004,7 @@ mod tests {
         // `scheduled_at` that a hint carries, so the two must agree.
         assert_eq!(
             DispatchRef::from_hint(&hint).marker_value(),
-            hint.scheduled_at.timestamp_millis()
+            hint.scheduled_at.as_millisecond()
         );
     }
 
@@ -2015,7 +2013,7 @@ mod tests {
         let hint = DispatchHint {
             task_id: Uuid::nil(),
             queue_name: "q".to_string(),
-            scheduled_at: Utc::now(),
+            scheduled_at: Timestamp::now(),
             priority: 0,
             shard: Some(ShardId::new(5)),
             kind: None,
@@ -2039,7 +2037,7 @@ mod tests {
         let hint = DispatchHint {
             task_id: Uuid::new_v4(),
             queue_name: "email".to_string(),
-            scheduled_at: Utc::now(),
+            scheduled_at: Timestamp::now(),
             priority: 9,
             shard: None,
             kind: None,

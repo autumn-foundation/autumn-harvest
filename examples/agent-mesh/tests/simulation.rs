@@ -244,7 +244,7 @@ async fn run_seed(seed: u64) -> Seen {
         awaiting_approval: false,
     };
     let mut reached = Seen::default();
-    let mut clock: DateTime<Utc> = "2026-10-23T08:00:00Z".parse().unwrap();
+    let mut clock: Timestamp = "2026-10-23T08:00:00Z".parse().unwrap();
     let mut asked: BTreeSet<String> = BTreeSet::new();
     let mut approved = 0_usize;
     world.in_exchange = mesh::start(world.rt(), clock).await.unwrap().in_exchange;
@@ -401,7 +401,7 @@ async fn run_seed(seed: u64) -> Seen {
     // Invariant 3: the check runs before each turn, so a day passes the cap
     // by one turn at most. Each row carries the drive clock of its turn.
     // Every run of the file is an agent of the desk mesh.
-    let mut day: DateTime<Utc> = "2026-10-23T00:00:00Z".parse().unwrap();
+    let mut day: Timestamp = "2026-10-23T00:00:00Z".parse().unwrap();
     while day <= clock {
         let tokens: u64 = rt
             .llm_ledger_between(day, day + Duration::days(1))

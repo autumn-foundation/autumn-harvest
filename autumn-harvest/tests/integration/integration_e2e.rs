@@ -12,6 +12,7 @@
 //! stack against a real database.
 
 use autumn_harvest::dlq::{self, NewDeadLetterEntry};
+use jiff_diesel::ToDiesel;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::failure::{IntoWorkflowErrorString, WorkflowFailure};
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
@@ -31,7 +32,7 @@ use autumn_harvest::{
     tick_once, timeout,
 };
 
-use chrono::Utc;
+use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
@@ -333,9 +334,8 @@ async fn drop_dag_runs_migration_copies_legacy_rows_to_workflow_executions() {
     let (mut conn, _container) = setup_test_db_with_legacy_dag_runs().await;
     let legacy_run_id = Uuid::new_v4();
     let dag_name = "legacy_migrated_dag";
-    let logical_date = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00Z")
-        .expect("fixed timestamp should parse")
-        .with_timezone(&Utc);
+    let logical_date = ("2026-05-14T02:00:00Z").parse::<Timestamp>()
+        .expect("fixed timestamp should parse");
     let dag_conf = serde_json::json!({ "customer": "acme" });
 
     diesel::sql_query(
@@ -348,7 +348,7 @@ async fn drop_dag_runs_migration_copies_legacy_rows_to_workflow_executions() {
     )
     .bind::<diesel::sql_types::Uuid, _>(legacy_run_id)
     .bind::<diesel::sql_types::Text, _>(dag_name)
-    .bind::<diesel::sql_types::Timestamptz, _>(logical_date)
+    .bind::<diesel::sql_types::Timestamptz, _>(logical_date.to_diesel())
     .bind::<diesel::sql_types::Jsonb, _>(dag_conf.clone())
     .execute(&mut conn)
     .await
@@ -361,7 +361,7 @@ async fn drop_dag_runs_migration_copies_legacy_rows_to_workflow_executions() {
     .expect("drop migration should migrate legacy DAG runs before dropping the table");
 
     // The migration generates IDs in the legacy format (no schedule UUID embedded).
-    let workflow_id = format!("sched:{}:{}", dag_name, logical_date.timestamp());
+    let workflow_id = format!("sched:{}:{}", dag_name, logical_date.as_second());
     let migrated = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(dag_name))
         .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
@@ -387,9 +387,8 @@ async fn drop_dag_runs_migration_does_not_turn_queued_runs_into_running_workflow
     let (mut conn, _container) = setup_test_db_with_legacy_dag_runs().await;
     let legacy_run_id = Uuid::new_v4();
     let dag_name = "legacy_queued_dag";
-    let logical_date = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00Z")
-        .expect("fixed timestamp should parse")
-        .with_timezone(&Utc);
+    let logical_date = ("2026-05-14T02:00:00Z").parse::<Timestamp>()
+        .expect("fixed timestamp should parse");
 
     diesel::sql_query(
         r"
@@ -401,7 +400,7 @@ async fn drop_dag_runs_migration_does_not_turn_queued_runs_into_running_workflow
     )
     .bind::<diesel::sql_types::Uuid, _>(legacy_run_id)
     .bind::<diesel::sql_types::Text, _>(dag_name)
-    .bind::<diesel::sql_types::Timestamptz, _>(logical_date)
+    .bind::<diesel::sql_types::Timestamptz, _>(logical_date.to_diesel())
     .execute(&mut conn)
     .await
     .expect("failed to seed queued legacy DAG run");
@@ -444,12 +443,10 @@ async fn drop_dag_runs_migration_preserves_subsecond_legacy_run_identities() {
     let dag_name = "legacy_subsecond_dag";
     let first_run_id = Uuid::new_v4();
     let second_run_id = Uuid::new_v4();
-    let first_logical_date = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00.100000Z")
-        .expect("fixed timestamp should parse")
-        .with_timezone(&Utc);
-    let second_logical_date = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00.900000Z")
-        .expect("fixed timestamp should parse")
-        .with_timezone(&Utc);
+    let first_logical_date = ("2026-05-14T02:00:00.100000Z").parse::<Timestamp>()
+        .expect("fixed timestamp should parse");
+    let second_logical_date = ("2026-05-14T02:00:00.900000Z").parse::<Timestamp>()
+        .expect("fixed timestamp should parse");
 
     diesel::sql_query(
         r"
@@ -463,9 +460,9 @@ async fn drop_dag_runs_migration_preserves_subsecond_legacy_run_identities() {
     )
     .bind::<diesel::sql_types::Uuid, _>(first_run_id)
     .bind::<diesel::sql_types::Text, _>(dag_name)
-    .bind::<diesel::sql_types::Timestamptz, _>(first_logical_date)
+    .bind::<diesel::sql_types::Timestamptz, _>(first_logical_date.to_diesel())
     .bind::<diesel::sql_types::Uuid, _>(second_run_id)
-    .bind::<diesel::sql_types::Timestamptz, _>(second_logical_date)
+    .bind::<diesel::sql_types::Timestamptz, _>(second_logical_date.to_diesel())
     .execute(&mut conn)
     .await
     .expect("failed to seed subsecond legacy DAG runs");
@@ -596,7 +593,7 @@ pub(crate) async fn seed_pending_timer_row(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     timer_id: &str,
-    fires_at: chrono::DateTime<Utc>,
+    fires_at: jiff::Timestamp,
 ) {
     diesel::insert_into(harvest_timers::table)
         .values(autumn_harvest::models::NewHarvestTimer {
@@ -967,7 +964,7 @@ pub(crate) async fn enqueue_started_workflow_task(
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -979,7 +976,7 @@ pub(crate) async fn enqueue_started_workflow_task(
 
     let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input);
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
 
     queue::enqueue(conn, &params)
         .await
@@ -1909,7 +1906,7 @@ async fn full_workflow_lifecycle() {
     // 1. Append WorkflowStarted event
     let started_events = vec![WorkflowEvent::WorkflowStarted {
         input: serde_json::json!({"user": "alice"}),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -1931,7 +1928,7 @@ async fn full_workflow_lifecycle() {
     assert_eq!(history.next_event_id, 1);
 
     // 3. Enqueue an activity task. Set scheduled_at slightly in the past to
-    //    absorb clock skew. Utc::now() runs on the host, and Postgres NOW()
+    //    absorb clock skew. Timestamp::now() runs on the host, and Postgres NOW()
     //    runs in the Docker container.
     let mut params = EnqueueParams::new(
         "default",
@@ -1940,7 +1937,7 @@ async fn full_workflow_lifecycle() {
     );
     params.workflow_exec_id = Some(exec_id.as_uuid());
     params.activity_name = Some("send_email".into());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
 
     let task_id = queue::enqueue(&mut conn, &params)
         .await
@@ -2052,7 +2049,7 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
         .await
         .expect("failed to connect to Postgres container");
 
-    let timeout = chrono::Duration::minutes(30);
+    let timeout = jiff::SignedDuration::from_mins(30);
     let exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     let request = StartWorkflowParams {
         workflow_name: "deadline_echo",
@@ -2246,7 +2243,7 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
     // Cross-check the row's deadline_at is the same instant (within the µs
     // truncation Postgres applies to TIMESTAMPTZ).
     assert!(
-        (expected_deadline - deadline_at).num_milliseconds().abs() <= 1,
+        autumn_harvest::time::num_milliseconds((expected_deadline - deadline_at)).abs() <= 1,
         "ctx.deadline() ({expected_deadline}) must match the row's deadline_at ({deadline_at})"
     );
 }
@@ -2279,7 +2276,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
         .await
         .expect("failed to connect to Postgres container");
 
-    let timeout = chrono::Duration::minutes(30);
+    let timeout = jiff::SignedDuration::from_mins(30);
     let exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     let request = StartWorkflowParams {
         workflow_name: "deadline_echo",
@@ -2340,13 +2337,13 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
     // Simulate a resume/redrive shift: push `deadline_at` forward by 2h, exactly
     // as `resume_workflow_execution` shifts it by the pause span. The new value
     // is now well past `started_at + execution_timeout`.
-    let shift = chrono::Duration::hours(2);
+    let shift = jiff::SignedDuration::from_hours(2);
     let shifted_deadline = original_deadline + shift;
     let updated = diesel::update(
         harvest_workflow_executions::table
             .filter(harvest_workflow_executions::id.eq(exec_id.as_uuid())),
     )
-    .set(harvest_workflow_executions::deadline_at.eq(Some(shifted_deadline)))
+    .set(harvest_workflow_executions::deadline_at.eq(Some(shifted_deadline).to_diesel()))
     .execute(&mut conn)
     .await
     .expect("shift deadline_at should succeed");
@@ -2456,7 +2453,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
         .expect("deadline_at must still be set after completion");
     // The shift persisted (the worker never re-derives / overwrites deadline_at).
     assert!(
-        (post_deadline - shifted_deadline).num_milliseconds().abs() <= 1,
+        autumn_harvest::time::num_milliseconds((post_deadline - shifted_deadline)).abs() <= 1,
         "the row's deadline_at should remain the shifted value ({shifted_deadline}), got \
          {post_deadline}"
     );
@@ -2470,7 +2467,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
         serde_json::Value::Null,
         "ctx.deadline() must not be null — that means the deadline was NOT threaded"
     );
-    let ctx_deadline: chrono::DateTime<Utc> =
+    let ctx_deadline: jiff::Timestamp =
         serde_json::from_value(output).expect("ctx.deadline() output must be an RFC3339 timestamp");
 
     // The public ctx.deadline() must equal the NOMINAL `WorkflowStarted.timestamp
@@ -2484,7 +2481,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
     };
     let nominal_deadline = started_ts + timeout;
     assert!(
-        (ctx_deadline - nominal_deadline).num_milliseconds().abs() <= 1,
+        autumn_harvest::time::num_milliseconds((ctx_deadline - nominal_deadline)).abs() <= 1,
         "public ctx.deadline() ({ctx_deadline}) must equal the nominal start+timeout \
          ({nominal_deadline}), not the mutable deadline_at"
     );
@@ -2492,7 +2489,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
     // And it must be far from the SHIFTED row `deadline_at` (2h apart) — proving
     // the public accessor never surfaces the pause/resume-shifted value.
     assert!(
-        (ctx_deadline - shifted_deadline).num_seconds().abs() > 3600,
+        (ctx_deadline - shifted_deadline).as_secs().abs() > 3600,
         "public ctx.deadline() ({ctx_deadline}) must NOT be the shifted row deadline_at \
          ({shifted_deadline}) — that value is internal to the CAN budget check only"
     );
@@ -2511,7 +2508,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
 
     let started_events = vec![WorkflowEvent::WorkflowStarted {
         input: workflow_input.clone(),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -2522,7 +2519,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
 
     let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
 
     let task_id = queue::enqueue(&mut conn, &params)
         .await
@@ -2658,7 +2655,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
 
     let started_events = vec![WorkflowEvent::WorkflowStarted {
         input: workflow_input.clone(),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -2669,7 +2666,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
 
     let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input);
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
 
     let task_id = queue::enqueue(&mut conn, &params)
         .await
@@ -2818,7 +2815,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
 
     let started_events = vec![WorkflowEvent::WorkflowStarted {
         input: workflow_input.clone(),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -2829,7 +2826,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
 
     let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
 
     let workflow_task_id = queue::enqueue(&mut conn, &params)
         .await
@@ -2998,7 +2995,7 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -3010,7 +3007,7 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
 
     let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     queue::enqueue(&mut conn, &params)
         .await
         .expect("enqueue workflow task failed");
@@ -3118,7 +3115,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
 
     let started_events = vec![WorkflowEvent::WorkflowStarted {
         input: serde_json::json!({"workflow": "activity-only"}),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -3130,7 +3127,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
     let mut params = EnqueueParams::new("default", TaskType::Activity, activity_input);
     params.workflow_exec_id = Some(exec_id.as_uuid());
     params.activity_name = Some("send_email".to_string());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
 
     let task_id = queue::enqueue(&mut conn, &params)
         .await
@@ -3274,7 +3271,7 @@ async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
         &[
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!({"timeout": "schedule_to_start"}),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -3297,7 +3294,7 @@ async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
         serde_json::json!({"workflow": true}),
     );
     workflow_params.workflow_exec_id = Some(exec_id.as_uuid());
-    workflow_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    workflow_params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
     let workflow_task_id = queue::enqueue(&mut conn, &workflow_params)
         .await
         .expect("enqueue parked workflow task failed");
@@ -3328,8 +3325,8 @@ async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
     );
     activity_params.workflow_exec_id = Some(exec_id.as_uuid());
     activity_params.activity_name = Some("send_email".to_string());
-    activity_params.schedule_to_start = Some(chrono::Duration::milliseconds(50));
-    activity_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    activity_params.schedule_to_start = Some(jiff::SignedDuration::from_millis(50));
+    activity_params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
     let activity_task_id = queue::enqueue(&mut conn, &activity_params)
         .await
         .expect("enqueue timed-out activity task failed");
@@ -3391,7 +3388,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -3403,7 +3400,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
 
     let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input);
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
 
     queue::enqueue(&mut conn, &params)
         .await
@@ -3594,7 +3591,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -3606,7 +3603,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
 
     let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input);
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
 
     queue::enqueue(&mut conn, &params)
         .await
@@ -5108,7 +5105,7 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -5120,7 +5117,7 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
 
     let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
 
     queue::enqueue(&mut conn, &params)
         .await
@@ -5307,7 +5304,7 @@ async fn wake_workflow_task_emits_notification() {
         serde_json::json!({"wake": true}),
     );
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
 
     let task_id = queue::enqueue(&mut conn, &params)
         .await
@@ -5354,7 +5351,7 @@ async fn wake_workflow_task_does_not_requeue_active_running_task() {
         serde_json::json!({"wake": false}),
     );
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(10);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(10);
 
     let task_id = queue::enqueue(&mut conn, &params)
         .await
@@ -5394,7 +5391,7 @@ async fn reschedule_task_clears_stale_heartbeat_timestamp() {
     );
     params.workflow_exec_id = Some(exec_id.as_uuid());
     params.activity_name = Some("flaky_step".to_string());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
 
     let task_id = queue::enqueue(&mut conn, &params)
         .await
@@ -5426,7 +5423,7 @@ async fn reschedule_task_clears_stale_heartbeat_timestamp() {
     queue::reschedule_task(
         &mut conn,
         task_id,
-        Utc::now() + chrono::Duration::seconds(30),
+        Timestamp::now() + jiff::SignedDuration::from_secs(30),
     )
     .await
     .expect("reschedule_task should succeed");
@@ -5532,7 +5529,7 @@ async fn event_store_round_trip() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({"batch": "round_trip"}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -5633,7 +5630,7 @@ async fn worker_completes_workflow_after_signal_delivery() {
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -5645,7 +5642,7 @@ async fn worker_completes_workflow_after_signal_delivery() {
 
     let mut params = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({}));
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
 
     queue::enqueue(&mut conn, &params)
         .await
@@ -5752,7 +5749,7 @@ async fn worker_handles_early_ingested_signal_before_activity() {
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -5779,7 +5776,7 @@ async fn worker_handles_early_ingested_signal_before_activity() {
 
     let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
 
     queue::enqueue(&mut conn, &params)
         .await
@@ -5867,7 +5864,7 @@ async fn duplicate_event_id_is_rejected() {
 
     let events = vec![WorkflowEvent::WorkflowStarted {
         input: serde_json::json!({}),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -5917,7 +5914,7 @@ async fn enqueue_with_sticky_pin_stores_worker_and_expiry() {
     assert!(row.sticky_until.is_some(), "sticky_until should be set");
     let stored_timeout = row.sticky_timeout.expect("sticky_timeout should be set");
     assert_eq!(
-        stored_timeout.num_seconds(),
+        stored_timeout.as_secs(),
         3,
         "sticky_timeout interval should round-trip as 3 seconds (got {stored_timeout})",
     );
@@ -6164,7 +6161,7 @@ async fn park_workflow_task_with_sticky_hint_pins_to_worker() {
     assert!(row.sticky_until.is_some());
     let stored_timeout = row.sticky_timeout.expect("sticky_timeout should be set");
     assert_eq!(
-        stored_timeout.num_seconds(),
+        stored_timeout.as_secs(),
         10,
         "sticky_timeout should round-trip as 10 seconds (got {stored_timeout})",
     );
@@ -7839,7 +7836,7 @@ async fn concurrency_cap_limits_concurrent_claims_cluster_wide() {
         let mut params =
             EnqueueParams::new("default", TaskType::Activity, serde_json::json!({ "i": i }));
         params.activity_name = Some("capped_activity".into());
-        params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+        params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
         params.concurrency_key = Some("capped_activity".to_string());
         params.max_concurrent = Some(2);
         queue::enqueue(&mut conn, &params)
@@ -7897,7 +7894,7 @@ async fn concurrency_cap_shared_key_budget_is_not_doubled() {
             serde_json::json!({ "act": "charge", "i": i }),
         );
         params.activity_name = Some("charge_stripe".into());
-        params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+        params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
         params.concurrency_key = Some("stripe".to_string());
         params.max_concurrent = Some(3);
         queue::enqueue(&mut conn, &params)
@@ -7913,7 +7910,7 @@ async fn concurrency_cap_shared_key_budget_is_not_doubled() {
             serde_json::json!({ "act": "refund", "i": i }),
         );
         params.activity_name = Some("refund_stripe".into());
-        params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+        params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
         params.concurrency_key = Some("stripe".to_string());
         params.max_concurrent = Some(3);
         queue::enqueue(&mut conn, &params)
@@ -7950,7 +7947,7 @@ async fn concurrency_cap_failure_frees_slot_and_does_not_wedge_queue() {
         let mut params =
             EnqueueParams::new("default", TaskType::Activity, serde_json::json!({ "i": i }));
         params.activity_name = Some("fragile_activity".into());
-        params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+        params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
         params.concurrency_key = Some("fragile".to_string());
         params.max_concurrent = Some(2);
         queue::enqueue(&mut conn, &params)
@@ -8013,7 +8010,7 @@ async fn concurrency_cap_null_key_tasks_are_unaffected_by_saturated_key() {
         let mut params =
             EnqueueParams::new("default", TaskType::Activity, serde_json::json!({ "i": i }));
         params.activity_name = Some("capped_activity".into());
-        params.scheduled_at = Utc::now() - chrono::Duration::seconds(120);
+        params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(120);
         params.concurrency_key = Some("saturated_key".to_string());
         params.max_concurrent = Some(2);
         queue::enqueue(&mut conn, &params)
@@ -8039,7 +8036,7 @@ async fn concurrency_cap_null_key_tasks_are_unaffected_by_saturated_key() {
         let mut params =
             EnqueueParams::new("default", TaskType::Activity, serde_json::json!({ "i": i }));
         params.activity_name = Some("uncapped_activity".into());
-        params.scheduled_at = Utc::now() - chrono::Duration::seconds(60);
+        params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(60);
         // concurrency_key left as None (default) — backward-compat path.
         queue::enqueue(&mut conn, &params)
             .await
@@ -8479,8 +8476,8 @@ async fn workflow_schedule_pause_and_resume() {
         diesel::update(sched_dsl::harvest_schedules.filter(sched_dsl::workflow_name.eq(wf_name)))
             .set((
                 sched_dsl::is_paused.eq(false),
-                sched_dsl::next_run_at.eq(Utc::now() - chrono::Duration::seconds(1)),
-                sched_dsl::updated_at.eq(Utc::now()),
+                sched_dsl::next_run_at.eq((Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()),
+                sched_dsl::updated_at.eq(Timestamp::now().to_diesel()),
             ))
             .execute(&mut conn)
             .await
@@ -9061,7 +9058,7 @@ async fn drain_accepted_sets_status_to_draining() {
     // Supply an explicit deadline; the default is computed by the HTTP handler
     // layer, not request_drain itself. The integration test verifies the DB
     // round-trip for a caller-supplied deadline.
-    let deadline = Utc::now() + chrono::Duration::minutes(1);
+    let deadline = Timestamp::now() + jiff::SignedDuration::from_mins(1);
     let resp = request_drain(
         &mut conn,
         "w-drain-1",
@@ -9109,7 +9106,7 @@ async fn drain_already_draining_on_second_call() {
     .await
     .unwrap();
 
-    let first_deadline = Utc::now() + chrono::Duration::minutes(1);
+    let first_deadline = Timestamp::now() + jiff::SignedDuration::from_mins(1);
     request_drain(
         &mut conn,
         "w-drain-2",
@@ -9122,7 +9119,7 @@ async fn drain_already_draining_on_second_call() {
 
     // Re-drain with a new deadline — should return AlreadyDraining and
     // persist the updated deadline (operators extending a drain window).
-    let new_deadline = Utc::now() + chrono::Duration::minutes(5);
+    let new_deadline = Timestamp::now() + jiff::SignedDuration::from_mins(5);
     let resp2 = request_drain(
         &mut conn,
         "w-drain-2",
@@ -9140,7 +9137,7 @@ async fn drain_already_draining_on_second_call() {
     );
     // Deadline must reflect the refreshed value, not the original.
     let stored = resp2.drain_deadline_at.expect("deadline must be echoed");
-    let diff = (stored - new_deadline).num_seconds().abs();
+    let diff = (stored - new_deadline).as_secs().abs();
     assert!(diff <= 2, "refreshed deadline differs by {diff}s");
 }
 
@@ -9226,7 +9223,7 @@ async fn drain_with_explicit_deadline_is_stored() {
     .await
     .unwrap();
 
-    let explicit_deadline = Utc::now() + chrono::Duration::minutes(5);
+    let explicit_deadline = Timestamp::now() + jiff::SignedDuration::from_mins(5);
     let resp = request_drain(
         &mut conn,
         "w-drain-deadline",
@@ -9239,7 +9236,7 @@ async fn drain_with_explicit_deadline_is_stored() {
 
     assert_eq!(resp.outcome, DrainOutcome::Accepted);
     let stored = resp.drain_deadline_at.expect("deadline must be set");
-    let diff = (stored - explicit_deadline).num_seconds().abs();
+    let diff = (stored - explicit_deadline).as_secs().abs();
     assert!(diff <= 2, "stored deadline differs by {diff}s");
 }
 
@@ -9349,7 +9346,7 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
 
     let started_events = vec![WorkflowEvent::WorkflowStarted {
         input: workflow_input.clone(),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -9360,7 +9357,7 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
 
     let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     queue::enqueue(&mut conn, &params)
         .await
         .expect("enqueue workflow task failed");
@@ -9512,7 +9509,7 @@ async fn circuit_breaker_short_circuits_after_tripping() {
 
     let started_events = vec![WorkflowEvent::WorkflowStarted {
         input: workflow_input.clone(),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -9523,7 +9520,7 @@ async fn circuit_breaker_short_circuits_after_tripping() {
 
     let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     queue::enqueue(&mut conn, &params)
         .await
         .expect("enqueue workflow task failed");
@@ -9658,7 +9655,7 @@ async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
 
     let started_events = vec![WorkflowEvent::WorkflowStarted {
         input: workflow_input.clone(),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -9669,7 +9666,7 @@ async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
 
     let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     queue::enqueue(&mut conn, &params)
         .await
         .expect("enqueue workflow task failed");
@@ -10315,7 +10312,7 @@ async fn insert_cross_type_scheduled_execution(
         sla: None,
         sla_deadline_at: None,
         schedule_id: Some(schedule_id),
-        scheduled_for: Some(Utc::now()),
+        scheduled_for: Some(Timestamp::now()),
         workflow_attempt: 1,
         workflow_retry_policy: None,
         retry_of_exec_id: None,
@@ -11001,8 +10998,8 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
 
     // Start the workflow with a short execution deadline.
     let exec_id = ExecutionId::new();
-    let execution_timeout = chrono::Duration::milliseconds(200);
-    let started_at = Utc::now();
+    let execution_timeout = jiff::SignedDuration::from_millis(200);
+    let started_at = Timestamp::now();
     let deadline_at = started_at + execution_timeout;
     let row = NewWorkflowExecution {
         quota_key: None,
@@ -11057,7 +11054,7 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -11070,7 +11067,7 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
     // Enqueue a RUNNING workflow task (simulating the worker parked the task).
     let mut params = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({}));
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(10);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(10);
     let task_id = queue::enqueue(&mut conn, &params)
         .await
         .expect("enqueue workflow task failed");
@@ -11155,8 +11152,8 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
 
     // Verify the deadline fields are surfaced correctly.
     assert_eq!(
-        execution.deadline_at.map(|d| d.timestamp_millis()),
-        Some(deadline_at.timestamp_millis()),
+        execution.deadline_at.map(|d| d.as_millisecond()),
+        Some(deadline_at.as_millisecond()),
         "deadline_at should match what was set at start time"
     );
     assert_eq!(
@@ -11191,7 +11188,7 @@ async fn per_key_concurrency_cap_enforced_across_fleet() {
             EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({ "i": i }));
         params.concurrency_key = Some(KEY.to_string());
         params.max_concurrent = Some(LIMIT);
-        params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+        params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
         queue::enqueue(&mut conn, &params)
             .await
             .expect("enqueue failed");
@@ -11308,7 +11305,7 @@ async fn per_key_concurrency_does_not_block_other_keys() {
             EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({ "i": i }));
         params.concurrency_key = Some(LOUD_KEY.to_string());
         params.max_concurrent = Some(LOUD_CAP);
-        params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+        params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
         queue::enqueue(&mut conn, &params)
             .await
             .expect("enqueue loud task failed");
@@ -11320,7 +11317,7 @@ async fn per_key_concurrency_does_not_block_other_keys() {
             EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({ "i": i }));
         params.concurrency_key = Some(QUIET_KEY.to_string());
         params.max_concurrent = Some(10u32);
-        params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+        params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
         queue::enqueue(&mut conn, &params)
             .await
             .expect("enqueue quiet task failed");
@@ -11462,7 +11459,7 @@ async fn activity_context_exposes_attempt_and_previous_failure_on_retry() {
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -11474,7 +11471,7 @@ async fn activity_context_exposes_attempt_and_previous_failure_on_retry() {
 
     let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
     queue::enqueue(&mut conn, &params)
         .await
         .expect("enqueue workflow task failed");

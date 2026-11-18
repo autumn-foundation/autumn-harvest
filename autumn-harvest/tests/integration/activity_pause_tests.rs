@@ -172,7 +172,7 @@ async fn enqueue_activity(
     conn: &mut AsyncPgConnection,
     queue: &str,
     activity: &str,
-    schedule_to_start: Option<chrono::Duration>,
+    schedule_to_start: Option<jiff::SignedDuration>,
 ) -> Uuid {
     let exec_id = insert_execution(conn).await;
     let mut params = EnqueueParams::new(queue, TaskType::Activity, serde_json::json!({}));
@@ -463,9 +463,9 @@ async fn resume_credits_the_held_time_only_not_the_whole_wait() {
     // the hold. So each accrued only ~5s of wait outside the hold. They differ
     // only in whether that 5s fits their budget.
     let within_budget =
-        enqueue_activity(&mut conn, &q, &act, Some(chrono::Duration::seconds(60))).await;
+        enqueue_activity(&mut conn, &q, &act, Some(jiff::SignedDuration::from_secs(60))).await;
     let already_blown =
-        enqueue_activity(&mut conn, &q, &act, Some(chrono::Duration::seconds(2))).await;
+        enqueue_activity(&mut conn, &q, &act, Some(jiff::SignedDuration::from_secs(2))).await;
 
     pause(&mut conn, &act).await;
     backdate_scheduled_at(&mut conn, within_budget, 600).await;
@@ -893,7 +893,8 @@ async fn resume_credits_a_task_that_arrives_between_the_two_passes() {
     #[derive(diesel::QueryableByName)]
     struct PausedAtRow {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        paused_at: chrono::DateTime<chrono::Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        paused_at: jiff::Timestamp,
     }
     let paused_at = {
         use diesel_async::RunQueryDsl;
@@ -945,7 +946,7 @@ async fn resume_credits_a_task_that_arrives_between_the_two_passes() {
     );
     // Prove the primary pass genuinely missed it, so the pass-2 assertion below
     // cannot be vacuous.
-    let before_pass2 = (chrono::Utc::now() - scheduled_at_of(&mut conn, late).await).num_seconds();
+    let before_pass2 = (jiff::Timestamp::now() - scheduled_at_of(&mut conn, late).await).as_secs();
     assert!(
         (99..=101).contains(&before_pass2),
         "the primary shift cannot see a row enqueued after its snapshot; if this \
@@ -981,7 +982,7 @@ async fn resume_credits_a_task_that_arrives_between_the_two_passes() {
 
     // Both are credited: neither carries its held wait past the thaw.
     for (id, label) in [(early, "pre-existing"), (late, "late-arriving")] {
-        let wait = (chrono::Utc::now() - scheduled_at_of(&mut conn, id).await).num_seconds();
+        let wait = (jiff::Timestamp::now() - scheduled_at_of(&mut conn, id).await).as_secs();
         assert!(
             wait <= 2,
             "the {label} task must be credited for the held time, else the \
@@ -1050,7 +1051,7 @@ async fn overlapping_queue_and_activity_holds_over_credit_but_never_starve() {
     // of it held. That leaves 5s of genuine wait against a 2s budget, so
     // union-correct behaviour is to time out.
     let doubly_held =
-        enqueue_activity(&mut conn, &q, &act, Some(chrono::Duration::seconds(2))).await;
+        enqueue_activity(&mut conn, &q, &act, Some(jiff::SignedDuration::from_secs(2))).await;
 
     queue_pause::pause_queue(&mut conn, &q, "downstream outage", "oncall", None)
         .await
@@ -1073,7 +1074,7 @@ async fn overlapping_queue_and_activity_holds_over_credit_but_never_starve() {
         .expect("resume activity");
     let after_both = scheduled_at_of(&mut conn, doubly_held).await;
 
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
 
     // ── 1. the safety invariant ───────────────────────────────────────────────
     assert!(
@@ -1120,12 +1121,13 @@ async fn overlapping_queue_and_activity_holds_over_credit_but_never_starve() {
 }
 
 /// `scheduled_at` of one task — how long the claim gate believes it has waited.
-async fn scheduled_at_of(conn: &mut AsyncPgConnection, id: Uuid) -> chrono::DateTime<chrono::Utc> {
+async fn scheduled_at_of(conn: &mut AsyncPgConnection, id: Uuid) -> jiff::Timestamp {
     use diesel_async::RunQueryDsl;
     #[derive(diesel::QueryableByName)]
     struct Row {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        scheduled_at: chrono::DateTime<chrono::Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        scheduled_at: jiff::Timestamp,
     }
     let rows: Vec<Row> =
         diesel::sql_query("SELECT scheduled_at FROM harvest_task_queue WHERE id = $1")
@@ -1182,7 +1184,8 @@ async fn resume_credits_a_task_that_arrives_during_the_notification_pass() {
     #[derive(diesel::QueryableByName)]
     struct PausedAtRow {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        paused_at: chrono::DateTime<chrono::Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        paused_at: jiff::Timestamp,
     }
     let paused_at = {
         use diesel_async::RunQueryDsl;
@@ -1260,7 +1263,7 @@ async fn resume_credits_a_task_that_arrives_during_the_notification_pass() {
         "the hold is still in force: the resume's DELETE has not committed, so a \
          task enqueued during the notification pass is genuinely held"
     );
-    let before_credit = (chrono::Utc::now() - scheduled_at_of(&mut conn, late).await).num_seconds();
+    let before_credit = (jiff::Timestamp::now() - scheduled_at_of(&mut conn, late).await).as_secs();
     assert!(
         (99..=101).contains(&before_credit),
         "neither the primary shift nor the doorbell credits this row, so the \
@@ -1290,7 +1293,7 @@ async fn resume_credits_a_task_that_arrives_during_the_notification_pass() {
          pass's row -- with the notification pass running last it would have \
          been missed entirely"
     );
-    let wait = (chrono::Utc::now() - scheduled_at_of(&mut conn, late).await).num_seconds();
+    let wait = (jiff::Timestamp::now() - scheduled_at_of(&mut conn, late).await).as_secs();
     assert!(
         wait <= 2,
         "the task that arrived during the notification pass must be credited, \
@@ -1526,7 +1529,7 @@ async fn resume_credits_a_late_arrival_under_a_repeatable_read_session_default()
     // Both must be credited: a task that carries its held wait past the thaw is
     // exactly what the schedule_to_start scanner terminally fails.
     for (id, label) in [(early, "pre-existing"), (late, "late-arriving")] {
-        let wait = (chrono::Utc::now() - scheduled_at_of(&mut conn, id).await).num_seconds();
+        let wait = (jiff::Timestamp::now() - scheduled_at_of(&mut conn, id).await).as_secs();
         assert!(
             wait <= 2,
             "the {label} task must be credited for the held time even when the \
@@ -1623,7 +1626,7 @@ async fn a_pause_committed_while_enforcement_waits_on_the_row_lock_suppresses_th
     params.workflow_exec_id = Some(exec_id);
     params.activity_name = Some(activity.clone());
     params.activity_id = Some(activity_id);
-    params.schedule_to_start = Some(chrono::Duration::seconds(1));
+    params.schedule_to_start = Some(jiff::SignedDuration::from_secs(1));
     let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
     // Blow the schedule_to_start deadline so the scan selects it.
     backdate_scheduled_at(&mut conn, task_id, 600).await;

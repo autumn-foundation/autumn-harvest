@@ -7,7 +7,7 @@
 //! panic release sticky affinity, quota retry keeps it.
 
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
-use chrono::Duration;
+use jiff::SignedDuration;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
@@ -57,7 +57,7 @@ impl Path {
         !matches!(self, Self::QuotaRetry)
     }
 
-    async fn run(self, conn: &mut AsyncPgConnection, task: Uuid, delay: Duration, reason: &str) {
+    async fn run(self, conn: &mut AsyncPgConnection, task: Uuid, delay: SignedDuration, reason: &str) {
         match self {
             Self::NdBlocked => queue::requeue_workflow_task_nd_blocked(conn, task, delay, reason)
                 .await
@@ -168,7 +168,7 @@ async fn every_backoff_requeue_repends_and_clears_the_shared_markers() {
     for path in ALL_PATHS {
         let task = claimed_task_with_stale_markers(&mut conn).await;
 
-        path.run(&mut conn, task, Duration::seconds(60), "why")
+        path.run(&mut conn, task, SignedDuration::from_secs(60), "why")
             .await;
 
         let row = read_row(&mut conn, task).await;
@@ -191,7 +191,7 @@ async fn only_quota_retry_keeps_sticky_affinity() {
     for path in ALL_PATHS {
         let task = claimed_task_with_stale_markers(&mut conn).await;
 
-        path.run(&mut conn, task, Duration::seconds(60), "why")
+        path.run(&mut conn, task, SignedDuration::from_secs(60), "why")
             .await;
 
         let row = read_row(&mut conn, task).await;
@@ -218,7 +218,7 @@ async fn every_backoff_requeue_reports_not_found_for_an_unclaimed_task() {
                 queue::requeue_workflow_task_nd_blocked(
                     &mut conn,
                     Uuid::new_v4(),
-                    Duration::seconds(1),
+                    SignedDuration::from_secs(1),
                     "x",
                 )
                 .await
@@ -227,7 +227,7 @@ async fn every_backoff_requeue_reports_not_found_for_an_unclaimed_task() {
                 queue::requeue_workflow_task_after_panic(
                     &mut conn,
                     Uuid::new_v4(),
-                    Duration::seconds(1),
+                    SignedDuration::from_secs(1),
                     "x",
                 )
                 .await
@@ -236,7 +236,7 @@ async fn every_backoff_requeue_reports_not_found_for_an_unclaimed_task() {
                 queue::requeue_workflow_task_for_quota_retry(
                     &mut conn,
                     Uuid::new_v4(),
-                    Duration::seconds(1),
+                    SignedDuration::from_secs(1),
                     "x",
                 )
                 .await
@@ -266,14 +266,14 @@ async fn every_backoff_requeue_rejects_a_pending_task() {
 
         let result = match path {
             Path::NdBlocked => {
-                queue::requeue_workflow_task_nd_blocked(&mut conn, task, Duration::seconds(60), "x")
+                queue::requeue_workflow_task_nd_blocked(&mut conn, task, SignedDuration::from_secs(60), "x")
                     .await
             }
             Path::AfterPanic => {
                 queue::requeue_workflow_task_after_panic(
                     &mut conn,
                     task,
-                    Duration::seconds(60),
+                    SignedDuration::from_secs(60),
                     "x",
                 )
                 .await
@@ -282,7 +282,7 @@ async fn every_backoff_requeue_rejects_a_pending_task() {
                 queue::requeue_workflow_task_for_quota_retry(
                     &mut conn,
                     task,
-                    Duration::seconds(60),
+                    SignedDuration::from_secs(60),
                     "x",
                 )
                 .await
@@ -326,7 +326,7 @@ async fn the_fenced_panic_requeue_leaves_a_peer_claim_alone() {
     let applied = queue::requeue_claimed_workflow_task_after_panic(
         &mut conn,
         &stale,
-        Duration::seconds(60),
+        SignedDuration::from_secs(60),
         "stale",
     )
     .await
@@ -344,7 +344,7 @@ async fn the_fenced_panic_requeue_leaves_a_peer_claim_alone() {
     let applied = queue::requeue_claimed_workflow_task_after_panic(
         &mut conn,
         &current,
-        Duration::seconds(60),
+        SignedDuration::from_secs(60),
         "why",
     )
     .await

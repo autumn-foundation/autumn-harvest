@@ -8,7 +8,7 @@
 //! **Append-only invariant:** Never remove or reorder variants. Stored JSON
 //! must deserialize into the same variants after deployment.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -99,7 +99,7 @@ pub enum WorkflowEvent {
         #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         input: serde_json::Value,
         /// Time when the workflow was initiated.
-        timestamp: DateTime<Utc>,
+        timestamp: Timestamp,
         /// Output of the most recent prior COMPLETED run of the same schedule (issue #488).
         /// `None` for the first run, for manual (non-scheduled) starts, and when no prior
         /// run succeeded. Frozen at workflow start time; replay always returns this value.
@@ -117,7 +117,7 @@ pub enum WorkflowEvent {
         /// the pre-jitter logical slot (`scheduled_for`), NOT `effective_fire_time` and
         /// NOT the execution start wall-clock (`timestamp`). Frozen at start; replay-stable.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        scheduled_time: Option<DateTime<Utc>>,
+        scheduled_time: Option<Timestamp>,
     },
     /// The workflow ran to completion without an error.
     WorkflowCompleted {
@@ -529,7 +529,7 @@ pub enum WorkflowEvent {
         #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         input: serde_json::Value,
         /// Time when the update was admitted.
-        timestamp: DateTime<Utc>,
+        timestamp: Timestamp,
     },
     /// The update handler ran to completion and returned a value.
     UpdateCompleted {
@@ -696,9 +696,9 @@ pub enum WorkflowEvent {
     /// the timeout decision is derivable from the stored `deadline` alone.
     WorkflowExecutionTimedOut {
         /// The absolute deadline that was exceeded (`started_at + execution_timeout`).
-        deadline: DateTime<Utc>,
+        deadline: Timestamp,
         /// The actual wall-clock time when the scanner detected and enforced the timeout.
-        timed_out_at: DateTime<Utc>,
+        timed_out_at: Timestamp,
     },
 
     // ── Deterministic side-effect primitives (issue #384) ─────────────────────
@@ -744,7 +744,7 @@ pub enum WorkflowEvent {
     /// reconstructed from history.
     WorkflowExecutionPaused {
         /// Wall-clock time the pause was applied.
-        paused_at: DateTime<Utc>,
+        paused_at: Timestamp,
         /// Optional operator-supplied reason (max 500 chars, enforced at the API
         /// boundary). `None` when no reason was given.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -760,7 +760,7 @@ pub enum WorkflowEvent {
     /// are delivered in order.
     WorkflowExecutionResumed {
         /// Wall-clock time the resume was applied.
-        resumed_at: DateTime<Utc>,
+        resumed_at: Timestamp,
         /// Identity that requested the resume. `"auto-resume(timeout)"` when the
         /// bounded-pause scanner resumed an over-long pause.
         actor: String,
@@ -831,7 +831,7 @@ pub enum WorkflowEvent {
     /// still advances past them instead of diverging.
     WorkflowRedriven {
         /// Wall-clock time the redrive reactivation was applied.
-        redriven_at: DateTime<Utc>,
+        redriven_at: Timestamp,
         /// The `harvest_dead_letters` row that triggered this reactivation.
         dead_letter_id: Uuid,
         /// Optional operator-supplied reason. `None` when no reason was given.
@@ -856,8 +856,8 @@ pub enum WorkflowEvent {
         /// Attempt number of the NEW run (= `failed_run.workflow_attempt` + 1).
         attempt: u32,
         /// Wall-clock instant when the retry becomes claimable by a worker.
-        /// `Utc::now()` for immediate retries, or `now + backoff` for delayed ones.
-        fire_at: DateTime<Utc>,
+        /// `Timestamp::now()` for immediate retries, or `now + backoff` for delayed ones.
+        fire_at: Timestamp,
     },
 
     // ── Cancellable / renewable durable timers (issue #768) ───────────────────────
@@ -959,7 +959,7 @@ pub enum WorkflowEvent {
         /// Monotonic fencing token minted for this grant.
         lock_seq: i64,
         /// Wall-clock instant the lock was granted.
-        acquired_at: DateTime<Utc>,
+        acquired_at: Timestamp,
     },
 
     // ── Decision boundary (issue #1833) ───────────────────────────────────────
@@ -1065,7 +1065,7 @@ impl WorkflowEvent {
     #[must_use]
     pub const fn workflow_started(
         input: serde_json::Value,
-        timestamp: chrono::DateTime<chrono::Utc>,
+        timestamp: jiff::Timestamp,
     ) -> Self {
         Self::WorkflowStarted {
             input,
@@ -1366,13 +1366,13 @@ impl PayloadSlot<'_> {
 mod tests {
     use super::*;
     use crate::types::ActivityExecId;
-    use chrono::Utc;
+    use jiff::Timestamp;
 
     /// Issue #2253: a state change evicts the owner's cache entry. A plain
     /// result does not.
     #[test]
     fn a_state_change_evicts_the_owner_cache() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let evicting = [
             WorkflowEvent::WorkflowExecutionPaused {
                 paused_at: now,
@@ -1572,7 +1572,7 @@ mod tests {
     fn workflow_started_round_trips_serde() -> Result<(), serde_json::Error> {
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({"user_id": 42}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1605,11 +1605,11 @@ mod tests {
     /// `scheduled_time: Some(t)` round-trips correctly through serde.
     #[test]
     fn workflow_started_scheduled_time_round_trips() {
-        use chrono::TimeZone as _;
-        let slot = Utc.with_ymd_and_hms(2026, 3, 15, 0, 0, 0).unwrap();
+        use jiff::Timestamp;
+        let slot = crate::time::utc_ymd_hms(2026, 3, 15, 0, 0, 0).unwrap();
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!(null),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: Some(slot),
@@ -1629,7 +1629,7 @@ mod tests {
     fn workflow_started_scheduled_time_none_omitted_from_json() {
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!(null),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1662,7 +1662,7 @@ mod tests {
         let event = WorkflowEvent::MutexGranted {
             key: "ledger:acct-42".into(),
             lock_seq: 7,
-            acquired_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            acquired_at: Timestamp::from_second(1_700_000_000).ok().unwrap(),
         };
         let value = serde_json::to_value(&event)?;
         assert_eq!(value["type"], "MutexGranted");
@@ -1681,7 +1681,7 @@ mod tests {
         assert_eq!(lock_seq, 7);
         assert_eq!(
             acquired_at,
-            DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+            Timestamp::from_second(1_700_000_000).ok().unwrap()
         );
         Ok(())
     }
@@ -1816,7 +1816,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -1935,7 +1935,7 @@ mod tests {
                 update_id: crate::types::UpdateId::new(),
                 name: "approve".into(),
                 input: serde_json::Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
             },
             WorkflowEvent::UpdateCompleted {
                 update_id: crate::types::UpdateId::new(),
@@ -1971,8 +1971,8 @@ mod tests {
                 reason_code: "target_terminal".into(),
             },
             WorkflowEvent::WorkflowExecutionTimedOut {
-                deadline: Utc::now(),
-                timed_out_at: Utc::now(),
+                deadline: Timestamp::now(),
+                timed_out_at: Timestamp::now(),
             },
             WorkflowEvent::SideEffectRecorded {
                 kind: crate::event::SideEffectKind::Now,
@@ -1980,12 +1980,12 @@ mod tests {
                 value: serde_json::Value::Null,
             },
             WorkflowEvent::WorkflowExecutionPaused {
-                paused_at: Utc::now(),
+                paused_at: Timestamp::now(),
                 reason: Some("incident".into()),
                 actor: "oncall".into(),
             },
             WorkflowEvent::WorkflowExecutionResumed {
-                resumed_at: Utc::now(),
+                resumed_at: Timestamp::now(),
                 actor: "oncall".into(),
             },
             WorkflowEvent::ChildWorkflowSpawnedDetached {
@@ -2011,14 +2011,14 @@ mod tests {
                 reason_code: "target_unknown".into(),
             },
             WorkflowEvent::WorkflowRedriven {
-                redriven_at: Utc::now(),
+                redriven_at: Timestamp::now(),
                 dead_letter_id: Uuid::new_v4(),
                 reason: None,
             },
             WorkflowEvent::WorkflowRetryScheduled {
                 retry_exec_id: ExecutionId::new(),
                 attempt: 2,
-                fire_at: Utc::now(),
+                fire_at: Timestamp::now(),
             },
             WorkflowEvent::TimerCancelled {
                 timer_id: TimerId::new("t"),
@@ -2354,8 +2354,8 @@ mod tests {
 
     #[test]
     fn workflow_execution_timed_out_round_trips() -> Result<(), serde_json::Error> {
-        let deadline = Utc::now();
-        let timed_out_at = Utc::now();
+        let deadline = Timestamp::now();
+        let timed_out_at = Timestamp::now();
         let event = WorkflowEvent::WorkflowExecutionTimedOut {
             deadline,
             timed_out_at,
@@ -2389,8 +2389,8 @@ mod tests {
     #[test]
     fn workflow_execution_timed_out_type_name_is_stable() {
         let e = WorkflowEvent::WorkflowExecutionTimedOut {
-            deadline: Utc::now(),
-            timed_out_at: Utc::now(),
+            deadline: Timestamp::now(),
+            timed_out_at: Timestamp::now(),
         };
         assert_eq!(e.type_name(), "WorkflowExecutionTimedOut");
     }
@@ -2419,8 +2419,8 @@ mod tests {
                 operator_id: "op".into(),
             },
             WorkflowEvent::WorkflowExecutionTimedOut {
-                deadline: Utc::now(),
-                timed_out_at: Utc::now(),
+                deadline: Timestamp::now(),
+                timed_out_at: Timestamp::now(),
             },
             // Trailing bookkeeping events appended after the terminal seal.
             WorkflowEvent::ChildWorkflowCascadeApplied {
@@ -2431,7 +2431,7 @@ mod tests {
             WorkflowEvent::WorkflowRetryScheduled {
                 retry_exec_id: exec,
                 attempt: 2,
-                fire_at: Utc::now(),
+                fire_at: Timestamp::now(),
             },
         ];
         for event in &terminal {
@@ -2467,14 +2467,14 @@ mod tests {
             },
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
             },
             // Redrive reopens a previously-failed run — must NOT count as a seal.
             WorkflowEvent::WorkflowRedriven {
-                redriven_at: Utc::now(),
+                redriven_at: Timestamp::now(),
                 dead_letter_id: Uuid::new_v4(),
                 reason: None,
             },
@@ -2492,7 +2492,7 @@ mod tests {
 
     #[test]
     fn workflow_execution_paused_round_trips() -> Result<(), serde_json::Error> {
-        let paused_at = Utc::now();
+        let paused_at = Timestamp::now();
         let event = WorkflowEvent::WorkflowExecutionPaused {
             paused_at,
             reason: Some("investigating runaway dispatch".into()),
@@ -2523,7 +2523,7 @@ mod tests {
     #[test]
     fn workflow_execution_paused_round_trips_without_reason() -> Result<(), serde_json::Error> {
         let event = WorkflowEvent::WorkflowExecutionPaused {
-            paused_at: Utc::now(),
+            paused_at: Timestamp::now(),
             reason: None,
             actor: "auto".into(),
         };
@@ -2538,7 +2538,7 @@ mod tests {
 
     #[test]
     fn workflow_execution_resumed_round_trips() -> Result<(), serde_json::Error> {
-        let resumed_at = Utc::now();
+        let resumed_at = Timestamp::now();
         let event = WorkflowEvent::WorkflowExecutionResumed {
             resumed_at,
             actor: "auto-resume(timeout)".into(),
@@ -2568,7 +2568,7 @@ mod tests {
     #[test]
     fn workflow_redriven_type_name_and_not_terminal() {
         let event = WorkflowEvent::WorkflowRedriven {
-            redriven_at: Utc::now(),
+            redriven_at: Timestamp::now(),
             dead_letter_id: Uuid::new_v4(),
             reason: Some("downstream fixed".into()),
         };
@@ -2583,7 +2583,7 @@ mod tests {
     fn workflow_redriven_round_trips_adjacently_tagged() -> Result<(), serde_json::Error> {
         let dead_letter_id = Uuid::new_v4();
         let event = WorkflowEvent::WorkflowRedriven {
-            redriven_at: Utc::now(),
+            redriven_at: Timestamp::now(),
             dead_letter_id,
             reason: Some("credential rotated".into()),
         };
@@ -2610,7 +2610,7 @@ mod tests {
     #[test]
     fn workflow_redriven_omits_reason_when_none() -> Result<(), serde_json::Error> {
         let event = WorkflowEvent::WorkflowRedriven {
-            redriven_at: Utc::now(),
+            redriven_at: Timestamp::now(),
             dead_letter_id: Uuid::new_v4(),
             reason: None,
         };
@@ -2630,7 +2630,7 @@ mod tests {
     #[test]
     fn workflow_started_constructor_defaults_additive_fields_to_none()
     -> Result<(), serde_json::Error> {
-        let ts = Utc::now();
+        let ts = Timestamp::now();
         let event = WorkflowEvent::workflow_started(serde_json::json!({"k": 1}), ts);
         match &event {
             WorkflowEvent::WorkflowStarted {

@@ -338,7 +338,7 @@ async fn a_failed_start_backs_off_and_keeps_its_error() {
             .await
             .unwrap();
     }
-    let before = chrono::Utc::now().timestamp_millis();
+    let before = jiff::Timestamp::now().as_millisecond();
     assert_eq!(flush_workflow_start_outbox(state).await.unwrap(), 0);
     let row = outbox_row(state, "o-unknown").await.unwrap();
     assert!(row.delivery_attempts >= 1, "{row:?}");

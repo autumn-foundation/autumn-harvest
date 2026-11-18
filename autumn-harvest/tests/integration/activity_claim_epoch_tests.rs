@@ -11,6 +11,7 @@
 //! A's requeue, and the helper accepts that outcome.
 
 use std::time::Duration;
+use jiff_diesel::ToDiesel;
 
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::models::{NewWorkflowExecution, TaskQueueItem};
@@ -26,7 +27,7 @@ use autumn_harvest::worker::{
     observe_task_cancellation, preload_failure_history,
     requeue_workflow_task_after_event_id_conflict,
 };
-use chrono::Utc;
+use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
@@ -173,7 +174,7 @@ async fn seed_activity(conn: &mut AsyncPgConnection) -> Fixture {
         &[
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!({}),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -195,7 +196,7 @@ async fn seed_activity(conn: &mut AsyncPgConnection) -> Fixture {
     params.activity_name = Some(ACTIVITY.to_string());
     params.activity_id = Some(activity_id.as_uuid());
     params.max_attempts = 5;
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
     let task_id = queue::enqueue(conn, &params).await.expect("enqueue");
     Fixture {
         queue,
@@ -247,7 +248,7 @@ async fn requeue_orphan(conn: &mut AsyncPgConnection, task: &TaskQueueItem) {
                 .bind::<diesel::sql_types::Integer, _>(strikes)
                 .bind::<diesel::sql_types::Integer, _>(strikes + 1)
                 .bind::<diesel::sql_types::BigInt, _>(10_i64)
-                .bind::<diesel::sql_types::Timestamptz, _>(Utc::now())
+                .bind::<diesel::sql_types::Timestamptz, _>(Timestamp::now().to_diesel())
                 .execute(conn)
                 .await
         })
@@ -295,7 +296,8 @@ struct RowState {
     #[diesel(sql_type = diesel::sql_types::Integer)]
     attempt: i32,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    last_heartbeat_at: Option<chrono::DateTime<Utc>>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+    last_heartbeat_at: Option<jiff::Timestamp>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
     heartbeat_details: Option<serde_json::Value>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
@@ -547,10 +549,10 @@ async fn stale_claim_cannot_fail_requeue_or_defer_the_row() {
         .await
         .expect("query runs");
     let requeued =
-        queue::requeue_claimed_task_for_retry(&mut conn, &claim_a, chrono::Duration::zero(), "A")
+        queue::requeue_claimed_task_for_retry(&mut conn, &claim_a, jiff::SignedDuration::ZERO, "A")
             .await
             .expect("query runs");
-    let deferred = queue::defer_claimed_rate_limited_task(&mut conn, &claim_a, Utc::now())
+    let deferred = queue::defer_claimed_rate_limited_task(&mut conn, &claim_a, Timestamp::now())
         .await
         .expect("query runs");
 
@@ -573,7 +575,7 @@ async fn current_claim_writes_still_apply() {
     let claim_b = TaskClaim::of(&b).expect("B holds a claim");
 
     let requeued =
-        queue::requeue_claimed_task_for_retry(&mut conn, &claim_b, chrono::Duration::zero(), "B")
+        queue::requeue_claimed_task_for_retry(&mut conn, &claim_b, jiff::SignedDuration::ZERO, "B")
             .await
             .expect("query runs");
 
@@ -1013,7 +1015,7 @@ async fn seed_e2e_workflow(conn: &mut AsyncPgConnection, queue: &str) -> Executi
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1031,7 +1033,7 @@ async fn seed_e2e_workflow(conn: &mut AsyncPgConnection, queue: &str) -> Executi
     .expect("name the workflow");
     let mut params = EnqueueParams::new(queue, TaskType::Workflow, input);
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
     queue::enqueue(conn, &params)
         .await
         .expect("enqueue workflow task");

@@ -52,6 +52,11 @@ thiserror = "2"
 uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
+# Date and time (ADR 0018). `tzdb-bundle-always` embeds the IANA database, so
+# a host without `/usr/share/zoneinfo` still resolves a zone name.
+jiff = { version = "1.0.1", features = ["serde", "tzdb-bundle-always"] }
+# Diesel wrapper types for jiff. Diesel has no native jiff feature.
+jiff-diesel = { version = "1.0.0", features = ["postgres"] }
 tracing = "0.1"
 futures = "0.3"
 rand = "0.10"

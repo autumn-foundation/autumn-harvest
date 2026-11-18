@@ -14,6 +14,7 @@
 //! `retry_of_exec_id` successors from `FAILED` rows.
 
 use std::any::TypeId;
+use jiff_diesel::ToDiesel;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -402,7 +403,7 @@ async fn delayed_pending_workflow_tasks(conn: &mut AsyncPgConnection, exec_id: E
         .filter(harvest_task_queue::workflow_exec_id.eq(exec_id.as_uuid()))
         .filter(harvest_task_queue::task_type.eq("workflow"))
         .filter(harvest_task_queue::state.eq("PENDING"))
-        .filter(harvest_task_queue::scheduled_at.gt(chrono::Utc::now()))
+        .filter(harvest_task_queue::scheduled_at.gt(jiff::Timestamp::now().to_diesel()))
         .count()
         .get_result(conn)
         .await

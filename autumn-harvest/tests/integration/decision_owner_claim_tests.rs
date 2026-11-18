@@ -708,7 +708,7 @@ async fn an_unowned_claim_stamps_and_repends_its_row() {
         &mut conn,
         &claim_token,
         partition(62),
-        chrono::Duration::seconds(30),
+        jiff::SignedDuration::from_secs(30),
     )
     .await
     .expect("re-pend");

@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use autumn_harvest::prelude::*;
 use autumn_harvest_sqlite::{ExecutionOutcome, SqliteError, SqliteRuntime};
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::json;
 
 /// The stable token that names a rejected worker-session acquire.
@@ -240,7 +240,7 @@ async fn poll_once_as_of_drives_the_rest_of_the_fleet_past_an_unsupported_comman
     let healthy_after = start_healthy_after(&mut rt, broken);
 
     let err = rt
-        .poll_once_as_of(Utc::now())
+        .poll_once_as_of(Timestamp::now())
         .await
         .expect_err("the broken execution's command must still be rejected loudly");
     assert!(

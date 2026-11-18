@@ -1300,7 +1300,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let max_workflow_chain_timeout_ceiling = #stub_max_workflow_chain_timeout_ceiling_tokens;
 
                     let max_workflow_start_delay = {
-                        let ceiling_chrono = ::autumn_harvest::chrono::Duration::from_std(client.max_workflow_start_delay())
+                        let ceiling_chrono = ::autumn_harvest::jiff::SignedDuration::try_from(client.max_workflow_start_delay())
                             .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
                                 "max_workflow_start_delay ceiling exceeds chrono duration range".to_string()
                             ))?;
@@ -1334,7 +1334,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         sla: opts.sla
                             .or(client.apply_run_defaults(info.name, info.execution_timeout, info.sla).1)
                             .and_then(|d|
-                            ::autumn_harvest::chrono::Duration::from_std(d).ok()
+                            ::autumn_harvest::jiff::SignedDuration::try_from(d).ok()
                         ),
                         workflow_retry_policy: info.retry_policy.clone(),
                         max_workflow_attempts_ceiling: client.max_workflow_attempts(),
@@ -1434,7 +1434,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         sla: opts.sla
                             .or(client.apply_run_defaults(info.name, info.execution_timeout, info.sla).1)
                             .and_then(|d|
-                            ::autumn_harvest::chrono::Duration::from_std(d).ok()
+                            ::autumn_harvest::jiff::SignedDuration::try_from(d).ok()
                         ),
                         // Typed stubs already reject debounced workflows up front.
                         reject_fresh_if_debounced: false,

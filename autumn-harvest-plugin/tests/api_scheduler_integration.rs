@@ -1,4 +1,6 @@
 use autumn_harvest::schema::harvest_task_queue_ext;
+use jiff_diesel::ToDiesel;
+use autumn_harvest::time::sql::ToPgInterval;
 use autumn_harvest::table_split::SetExt;
 use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
@@ -520,7 +522,7 @@ async fn insert_workflow_on_url(
 async fn mark_workflow_completed_on_url(
     database_url: &str,
     exec_id: ExecutionId,
-    completed_at: chrono::DateTime<chrono::Utc>,
+    completed_at: jiff::Timestamp,
 ) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
@@ -528,7 +530,7 @@ async fn mark_workflow_completed_on_url(
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
-            harvest_workflow_executions::completed_at.eq(Some(completed_at)),
+            harvest_workflow_executions::completed_at.eq(Some(completed_at).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -615,11 +617,11 @@ async fn insert_child_workflow_on_url(fixture: ChildWorkflowFixture<'_>) -> Exec
     .await
     .expect("child workflow insert should succeed");
 
-    let started_at = chrono::Utc::now() - chrono::Duration::seconds(started_offset_secs);
+    let started_at = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(started_offset_secs);
     let completed_at = if state == "RUNNING" {
         None
     } else {
-        Some(started_at + chrono::Duration::seconds(5))
+        Some(started_at + jiff::SignedDuration::from_secs(5))
     };
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
@@ -1146,7 +1148,7 @@ async fn seed_scheduled_activity_task_from_url(
         &[
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -3577,9 +3579,9 @@ async fn timeout_sweeper_does_not_append_timeout_after_activity_completion() {
                 // event, as the path under test.
                 harvest_task_queue::max_attempts.eq(1),
                 harvest_task_queue::started_at
-                    .eq(Some(chrono::Utc::now() - chrono::Duration::seconds(60))),
+                    .eq(Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(60)).to_diesel()),
                 SetExt(
-                    harvest_task_queue_ext::start_to_close.eq(Some(chrono::Duration::seconds(1))),
+                    harvest_task_queue_ext::start_to_close.eq(Some(jiff::SignedDuration::from_secs(1)).to_pg_interval()),
                 ),
             ))
             .execute(&mut setup_conn)
@@ -5027,7 +5029,7 @@ async fn harvest_api_rejects_non_dry_run_backfill_for_paused_dag_schedule() {
         ShardRouter::single(),
     ));
     let app = harvest_api_router(api_state);
-    let backfill_at = chrono::Utc::now() - chrono::Duration::hours(1);
+    let backfill_at = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1);
 
     let (status, body) = post_json(
         &app,
@@ -5122,7 +5124,7 @@ async fn harvest_api_backfills_legacy_dag_schedule_null_queue_on_dag_default_que
         ShardRouter::single(),
     ));
     let app = harvest_api_router(api_state);
-    let backfill_at = chrono::Utc::now() - chrono::Duration::hours(2);
+    let backfill_at = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(2);
 
     let (status, body) = post_json(
         &app,
@@ -5213,13 +5215,12 @@ async fn harvest_api_backfill_matches_fractional_legacy_dag_workflow_id() {
     }
     let schedule = load_schedule_from_url(&database_url, dag_name).await;
 
-    let backfill_at = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00.123456Z")
-        .expect("fixed timestamp should parse")
-        .with_timezone(&chrono::Utc);
+    let backfill_at = ("2026-05-14T02:00:00.123456Z").parse::<Timestamp>()
+        .expect("fixed timestamp should parse");
     let migrated_workflow_id = format!(
         "sched:{dag_name}:{}.{:06}",
-        backfill_at.timestamp(),
-        backfill_at.timestamp_subsec_micros()
+        backfill_at.as_second(),
+        backfill_at.subsec_microsecond()
     );
     let seeded_exec = insert_workflow_on_url(
         &database_url,
@@ -5325,7 +5326,7 @@ async fn harvest_api_rejects_backfill_for_unregistered_dag_schedule_row() {
         ShardRouter::single(),
     ));
     let app = harvest_api_router(api_state);
-    let backfill_at = chrono::Utc::now() - chrono::Duration::hours(2);
+    let backfill_at = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(2);
 
     let (status, body) = post_json(
         &app,
@@ -5513,12 +5514,10 @@ async fn backfill_atomic_reservation_two_concurrent_requests_dispatch_exactly_on
 
     // A 3-hour hourly window → 4 candidate slots, more than the single remaining
     // slot, so two concurrent requests both have work to dispatch.
-    let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
-    let to = chrono::DateTime::parse_from_rfc3339("2026-04-01T13:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let from = ("2026-04-01T10:00:00Z").parse::<Timestamp>()
+        .unwrap();
+    let to = ("2026-04-01T13:00:00Z").parse::<Timestamp>()
+        .unwrap();
     let uri = format!("/admin/schedules/{}/backfill", schedule.id);
     let body = json!({ "from": from, "to": to });
 
@@ -5588,12 +5587,10 @@ async fn backfill_single_shard_pool_size_one_does_not_deadlock() {
     // reserve + transition budget path on the single shared connection.
     let (app, schedule) = setup_workflow_backfill_app(&database_url, pool, name, None).await;
 
-    let from = chrono::DateTime::parse_from_rfc3339("2026-05-01T10:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
-    let to = chrono::DateTime::parse_from_rfc3339("2026-05-01T12:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let from = ("2026-05-01T10:00:00Z").parse::<Timestamp>()
+        .unwrap();
+    let to = ("2026-05-01T12:00:00Z").parse::<Timestamp>()
+        .unwrap();
     let uri = format!("/admin/schedules/{}/backfill", schedule.id);
     let body = json!({ "from": from, "to": to });
 
@@ -5644,12 +5641,10 @@ async fn backfill_records_backfill_source_referencing_schedule_id() {
     let (app, schedule) = setup_workflow_backfill_app(&database_url, pool, name, None).await;
 
     // A 1-hour hourly window → 2 candidate slots (10:00, 11:00), both dispatch.
-    let from = chrono::DateTime::parse_from_rfc3339("2026-06-01T10:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
-    let to = chrono::DateTime::parse_from_rfc3339("2026-06-01T11:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let from = ("2026-06-01T10:00:00Z").parse::<Timestamp>()
+        .unwrap();
+    let to = ("2026-06-01T11:00:00Z").parse::<Timestamp>()
+        .unwrap();
     let (status, body) = post_json(
         &app,
         format!("/admin/schedules/{}/backfill", schedule.id),
@@ -5712,12 +5707,10 @@ async fn backfill_release_on_oversized_input_leaves_budget_intact() {
         setup_throttled_workflow_backfill_app(&database_url, pool, name, Some(5), input).await;
 
     // A 1-hour hourly window → 2 candidate slots (10:00, 11:00).
-    let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
-    let to = chrono::DateTime::parse_from_rfc3339("2026-04-01T11:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let from = ("2026-04-01T10:00:00Z").parse::<Timestamp>()
+        .unwrap();
+    let to = ("2026-04-01T11:00:00Z").parse::<Timestamp>()
+        .unwrap();
     let (status, body) = post_json(
         &app,
         format!("/admin/schedules/{}/backfill", schedule.id),
@@ -5766,12 +5759,10 @@ async fn backfill_over_window_dispatches_only_remaining_budget() {
     // Two slots of budget, a four-slot window.
     let (app, schedule) = setup_workflow_backfill_app(&database_url, pool, name, Some(2)).await;
 
-    let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
-    let to = chrono::DateTime::parse_from_rfc3339("2026-04-01T13:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let from = ("2026-04-01T10:00:00Z").parse::<Timestamp>()
+        .unwrap();
+    let to = ("2026-04-01T13:00:00Z").parse::<Timestamp>()
+        .unwrap();
     let (status, body) = post_json(
         &app,
         format!("/admin/schedules/{}/backfill", schedule.id),
@@ -5808,12 +5799,10 @@ async fn backfill_unlimited_schedule_increments_runs_started() {
     // still increments for observability, exhausted_at stays NULL.
     let (app, schedule) = setup_workflow_backfill_app(&database_url, pool, name, None).await;
 
-    let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
-    let to = chrono::DateTime::parse_from_rfc3339("2026-04-01T12:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let from = ("2026-04-01T10:00:00Z").parse::<Timestamp>()
+        .unwrap();
+    let to = ("2026-04-01T12:00:00Z").parse::<Timestamp>()
+        .unwrap();
     let (status, body) = post_json(
         &app,
         format!("/admin/schedules/{}/backfill", schedule.id),
@@ -5877,12 +5866,10 @@ async fn backfill_max_runs_zero_is_treated_as_unlimited() {
             .expect("forcing max_runs = 0 must succeed");
     }
 
-    let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
-    let to = chrono::DateTime::parse_from_rfc3339("2026-04-01T12:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let from = ("2026-04-01T10:00:00Z").parse::<Timestamp>()
+        .unwrap();
+    let to = ("2026-04-01T12:00:00Z").parse::<Timestamp>()
+        .unwrap();
     let (status, body) = post_json(
         &app,
         format!("/admin/schedules/{}/backfill", schedule.id),
@@ -5998,12 +5985,10 @@ async fn backfill_budget_reserve_and_release_touch_only_their_schedule() {
         setup_throttled_workflow_backfill_app(&database_url, pool, name, Some(5), input).await;
     let bystander = insert_exhausted_bystander_schedule(&database_url, schedule.id).await;
 
-    let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
-    let to = chrono::DateTime::parse_from_rfc3339("2026-04-01T11:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let from = ("2026-04-01T10:00:00Z").parse::<Timestamp>()
+        .unwrap();
+    let to = ("2026-04-01T11:00:00Z").parse::<Timestamp>()
+        .unwrap();
     let (status, body) = post_json(
         &app,
         format!("/admin/schedules/{}/backfill", schedule.id),
@@ -6099,12 +6084,10 @@ async fn backfill_dag_over_window_dispatches_only_remaining_budget() {
     ));
     let app = harvest_api_router(api_state);
 
-    let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
-    let to = chrono::DateTime::parse_from_rfc3339("2026-04-01T13:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let from = ("2026-04-01T10:00:00Z").parse::<Timestamp>()
+        .unwrap();
+    let to = ("2026-04-01T13:00:00Z").parse::<Timestamp>()
+        .unwrap();
     let (status, body) = post_json(
         &app,
         format!("/admin/schedules/{}/backfill", schedule.id),
@@ -6227,15 +6210,13 @@ async fn backfill_dag_threads_declared_execution_timeout_sla_and_fleet_ceiling()
     ));
     let app = harvest_api_router(api_state);
 
-    let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let from = ("2026-04-01T10:00:00Z").parse::<Timestamp>()
+        .unwrap();
     // Window boundaries are inclusive on both ends, so keep `to` just past
     // `from` to land only the 10:00 slot. A wider window would also dispatch
     // an irrelevant 11:00 slot.
-    let to = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:01Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let to = ("2026-04-01T10:00:01Z").parse::<Timestamp>()
+        .unwrap();
     let (status, body) = post_json(
         &app,
         format!("/admin/schedules/{}/backfill", schedule.id),
@@ -6253,11 +6234,11 @@ async fn backfill_dag_threads_declared_execution_timeout_sla_and_fleet_ceiling()
     // Ceiling wins over the 10h declared value.
     assert_eq!(
         execution.execution_timeout,
-        Some(chrono::Duration::seconds(3600)),
+        Some(jiff::SignedDuration::from_secs(3600)),
         "execution_timeout must be clamped to the 1h fleet-wide ceiling, not the declared 10h",
     );
     // The server computes `deadline_at`/`sla_deadline_at` from
-    // `target_start_time`. That is a separate `Utc::now()` capture from the
+    // `target_start_time`. That is a separate `Timestamp::now()` capture from the
     // row's `started_at` column. An exact comparison with
     // `execution.started_at + 3600s` is flaky by a few hundred microseconds.
     // So assert the deadline lands within a generous tolerance of one hour
@@ -6265,24 +6246,24 @@ async fn backfill_dag_threads_declared_execution_timeout_sla_and_fleet_ceiling()
     let deadline_at = execution
         .deadline_at
         .expect("deadline_at must be set from the ceiling-clamped execution_timeout");
-    let deadline_delta = (deadline_at - execution.started_at) - chrono::Duration::seconds(3600);
+    let deadline_delta = (deadline_at - execution.started_at) - jiff::SignedDuration::from_secs(3600);
     assert!(
-        deadline_delta.num_milliseconds().abs() < 2000,
+        autumn_harvest::time::num_milliseconds(deadline_delta).abs() < 2000,
         "deadline_at must be ~1h after started_at (ceiling-clamped); delta={deadline_delta}",
     );
     // sla (5h) also clamps down to the 1h effective (ceiling-clamped) timeout.
     assert_eq!(
         execution.sla,
-        Some(chrono::Duration::seconds(3600)),
+        Some(jiff::SignedDuration::from_secs(3600)),
         "sla must clamp to the ceiling-clamped effective execution_timeout, not the raw 10h ceiling-unaware ceiling",
     );
     let sla_deadline_at = execution
         .sla_deadline_at
         .expect("sla_deadline_at must be set from the clamped sla");
     let sla_deadline_delta =
-        (sla_deadline_at - execution.started_at) - chrono::Duration::seconds(3600);
+        (sla_deadline_at - execution.started_at) - jiff::SignedDuration::from_secs(3600);
     assert!(
-        sla_deadline_delta.num_milliseconds().abs() < 2000,
+        autumn_harvest::time::num_milliseconds(sla_deadline_delta).abs() < 2000,
         "sla_deadline_at must be ~1h after started_at (clamped); delta={sla_deadline_delta}",
     );
 }
@@ -6363,12 +6344,10 @@ async fn backfill_workflow_threads_declared_execution_timeout_sla_and_fleet_ceil
     ));
     let app = harvest_api_router(api_state);
 
-    let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
-    let to = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:01Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let from = ("2026-04-01T10:00:00Z").parse::<Timestamp>()
+        .unwrap();
+    let to = ("2026-04-01T10:00:01Z").parse::<Timestamp>()
+        .unwrap();
     let (status, body) = post_json(
         &app,
         format!("/admin/schedules/{}/backfill", schedule.id),
@@ -6385,20 +6364,20 @@ async fn backfill_workflow_threads_declared_execution_timeout_sla_and_fleet_ceil
 
     assert_eq!(
         execution.execution_timeout,
-        Some(chrono::Duration::seconds(3600)),
+        Some(jiff::SignedDuration::from_secs(3600)),
         "execution_timeout must be clamped to the 1h fleet-wide ceiling, not the declared 10h",
     );
     let deadline_at = execution
         .deadline_at
         .expect("deadline_at must be set from the ceiling-clamped execution_timeout");
-    let deadline_delta = (deadline_at - execution.started_at) - chrono::Duration::seconds(3600);
+    let deadline_delta = (deadline_at - execution.started_at) - jiff::SignedDuration::from_secs(3600);
     assert!(
-        deadline_delta.num_milliseconds().abs() < 2000,
+        autumn_harvest::time::num_milliseconds(deadline_delta).abs() < 2000,
         "deadline_at must be ~1h after started_at (ceiling-clamped); delta={deadline_delta}",
     );
     assert_eq!(
         execution.sla,
-        Some(chrono::Duration::seconds(3600)),
+        Some(jiff::SignedDuration::from_secs(3600)),
         "sla must clamp to the ceiling-clamped effective execution_timeout",
     );
 }
@@ -6497,7 +6476,7 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
         diesel::update(harvest_schedules::table.find(schedule.id))
             .set(
                 harvest_schedules::next_run_at
-                    .eq(Some(chrono::Utc::now() - chrono::Duration::seconds(1))),
+                    .eq(Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()),
             )
             .execute(&mut conn)
             .await
@@ -6592,7 +6571,7 @@ async fn concurrent_scheduler_ticks_activate_due_dag_run_once() {
         diesel::update(harvest_schedules::table.find(schedule.id))
             .set(
                 harvest_schedules::next_run_at
-                    .eq(Some(chrono::Utc::now() - chrono::Duration::seconds(1))),
+                    .eq(Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()),
             )
             .execute(&mut conn)
             .await
@@ -6666,7 +6645,7 @@ async fn concurrent_scheduler_ticks_dispatch_due_workflow_schedule_once() {
         )
         .set(
             harvest_schedules::next_run_at
-                .eq(Some(chrono::Utc::now() - chrono::Duration::seconds(1))),
+                .eq(Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()),
         )
         .execute(&mut conn)
         .await
@@ -6928,9 +6907,8 @@ async fn ensure_dag_schedule_reuses_paused_legacy_workflow_only_dag_row() {
         retry_policy: None,
         all_writable_shards: false,
     };
-    let paused_at = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00.123456Z")
-        .expect("fixed pause timestamp should parse")
-        .with_timezone(&chrono::Utc);
+    let paused_at = ("2026-05-14T02:00:00.123456Z").parse::<Timestamp>()
+        .expect("fixed pause timestamp should parse");
     let dag_catalog = Arc::new(
         compile_dag_catalog(vec![DagInfo {
             name: dag_name,
@@ -6968,7 +6946,7 @@ async fn ensure_dag_schedule_reuses_paused_legacy_workflow_only_dag_row() {
             .expect("legacy workflow-only row should exist");
         diesel::update(harvest_schedules::table.find(legacy.id))
             .set((
-                harvest_schedules::paused_at.eq(Some(paused_at)),
+                harvest_schedules::paused_at.eq(Some(paused_at).to_diesel()),
                 harvest_schedules::paused_by.eq(Some("ops-team")),
                 harvest_schedules::pause_reason.eq(Some("incident-response")),
             ))
@@ -7201,9 +7179,8 @@ async fn register_workflow_schedules_merges_split_legacy_dag_rows_before_upgrade
 async fn register_workflow_schedules_preserves_pause_metadata_when_merging_split_legacy_rows() {
     let (database_url, _container) = setup_test_database_url().await;
     let dag_name = "split_paused_legacy_dag";
-    let paused_at = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00.654321Z")
-        .expect("fixed pause timestamp should parse")
-        .with_timezone(&chrono::Utc);
+    let paused_at = ("2026-05-14T02:00:00.654321Z").parse::<Timestamp>()
+        .expect("fixed pause timestamp should parse");
     let classic_dag = compile_dag_catalog(vec![DagInfo {
         name: dag_name,
         module: "tests",
@@ -7291,7 +7268,7 @@ async fn register_workflow_schedules_preserves_pause_metadata_when_merging_split
         .expect("workflow-only legacy row should exist");
     diesel::update(harvest_schedules::table.find(workflow_only.id))
         .set((
-            harvest_schedules::paused_at.eq(Some(paused_at)),
+            harvest_schedules::paused_at.eq(Some(paused_at).to_diesel()),
             harvest_schedules::paused_by.eq(Some("ops-team")),
             harvest_schedules::pause_reason.eq(Some("incident-response")),
         ))
@@ -7400,7 +7377,7 @@ async fn scheduler_tick_dispatches_scheduled_unified_dag_on_dag_shard() {
         diesel::update(harvest_schedules::table.find(schedule.id))
             .set(
                 harvest_schedules::next_run_at
-                    .eq(Some(chrono::Utc::now() - chrono::Duration::seconds(1))),
+                    .eq(Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()),
             )
             .execute(&mut conn)
             .await
@@ -7508,7 +7485,7 @@ async fn scheduler_tick_removes_stale_unified_dag_schedule_from_old_shard() {
         diesel::update(harvest_schedules::table.find(stale.id))
             .set(
                 harvest_schedules::next_run_at
-                    .eq(Some(chrono::Utc::now() - chrono::Duration::seconds(1))),
+                    .eq(Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()),
             )
             .execute(&mut conn)
             .await
@@ -7642,7 +7619,7 @@ async fn scheduler_tick_removes_legacy_workflow_only_dag_schedule_from_old_shard
         diesel::update(harvest_schedules::table.find(stale.id))
             .set(
                 harvest_schedules::next_run_at
-                    .eq(Some(chrono::Utc::now() - chrono::Duration::seconds(1))),
+                    .eq(Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()),
             )
             .execute(&mut conn)
             .await
@@ -7773,7 +7750,7 @@ async fn scheduler_tick_removes_stale_classic_dag_schedule_from_old_shard() {
         diesel::update(harvest_schedules::table.find(stale.id))
             .set(
                 harvest_schedules::next_run_at
-                    .eq(Some(chrono::Utc::now() - chrono::Duration::seconds(1))),
+                    .eq(Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()),
             )
             .execute(&mut conn)
             .await
@@ -7847,7 +7824,7 @@ async fn scheduler_tick_does_not_dispatch_removed_dag_schedule_rows() {
         diesel::update(harvest_schedules::table.find(schedule.id))
             .set(
                 harvest_schedules::next_run_at
-                    .eq(Some(chrono::Utc::now() - chrono::Duration::seconds(1))),
+                    .eq(Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()),
             )
             .execute(&mut conn)
             .await
@@ -8246,8 +8223,8 @@ async fn get_schedule_decisions_api_endpoints() {
         .await
         .expect("connect");
 
-    let occurred_at = chrono::Utc::now();
-    let next_fire_at = occurred_at + chrono::Duration::hours(1);
+    let occurred_at = jiff::Timestamp::now();
+    let next_fire_at = occurred_at + jiff::SignedDuration::from_hours(1);
 
     autumn_harvest::schedule_decision::record_decision_graceful(
         &mut conn,
@@ -8345,7 +8322,7 @@ async fn scheduler_tick_preserves_dag_metadata() {
         diesel::update(harvest_schedules::table.find(schedule.id))
             .set(
                 harvest_schedules::next_run_at
-                    .eq(Some(chrono::Utc::now() - chrono::Duration::seconds(1))),
+                    .eq(Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()),
             )
             .execute(&mut conn)
             .await
@@ -8468,7 +8445,7 @@ async fn overdue_read_database_url() -> (String, Option<ContainerAsync<Postgres>
 async fn insert_overdue_test_schedule(
     database_url: &str,
     wf_name: &str,
-    next_run_at: chrono::DateTime<chrono::Utc>,
+    next_run_at: jiff::Timestamp,
     is_paused: bool,
 ) -> uuid::Uuid {
     use autumn_harvest::schema::harvest_schedules::dsl;
@@ -8513,12 +8490,12 @@ async fn schedule_read_reports_overdue_fields() {
     api_state.install_storage_pool(HarvestDbPool::from(pool));
     let app = harvest_api_router(api_state);
 
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     // interval:60 => grace = 61s. 300s past its slot => overdue.
     let wedged_id = insert_overdue_test_schedule(
         &database_url,
         "overdue_read_wedged",
-        now - chrono::Duration::seconds(300),
+        now - jiff::SignedDuration::from_secs(300),
         false,
     )
     .await;
@@ -8526,7 +8503,7 @@ async fn schedule_read_reports_overdue_fields() {
     insert_overdue_test_schedule(
         &database_url,
         "overdue_read_healthy",
-        now - chrono::Duration::seconds(10),
+        now - jiff::SignedDuration::from_secs(10),
         false,
     )
     .await;
@@ -8681,7 +8658,7 @@ async fn schedule_create_response_at_capacity_is_not_overdue() {
         diesel::update(harvest_schedules::table.filter(harvest_schedules::workflow_name.eq(name)))
             .set(
                 harvest_schedules::next_run_at
-                    .eq(chrono::Utc::now() - chrono::Duration::seconds(300)),
+                    .eq((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(300)).to_diesel()),
             )
             .execute(&mut conn)
             .await
@@ -8745,7 +8722,7 @@ async fn schedule_create_response_at_capacity_is_not_overdue() {
 /// calendar exclusion block `[today-3 .. today+2]`. A `run_next_business_day`
 /// policy rebases the effective fire to `today+3` (future). Returns
 /// `(deferred_id, control_id)`; the control has no calendar (same past slot). Dates are relative
-/// to the real `Utc::now()`, because the read path uses the real clock. So the
+/// to the real `Timestamp::now()`, because the read path uses the real clock. So the
 /// deferral is future on any weekday CI runs.
 async fn seed_calendar_deferred_read_schedules(database_url: &str) -> (uuid::Uuid, uuid::Uuid) {
     use autumn_harvest::schema::harvest_schedules::dsl;
@@ -8784,12 +8761,12 @@ async fn seed_calendar_deferred_read_schedules(database_url: &str) -> (uuid::Uui
     .await
     .expect("insert calendar");
 
-    let today = chrono::Utc::now().date_naive();
-    let slot_date = today - chrono::Duration::days(3);
+    let today = autumn_harvest::time::utc_date(jiff::Timestamp::now());
+    let slot_date = today - autumn_harvest::time::days(3);
     // Exclude [today-3 .. today+2] (6 days) so the forward scan from the slot lands
     // on today+3 — comfortably in the future relative to the mid-run `now`.
     for offset in -3..=2 {
-        let d = today + chrono::Duration::days(offset);
+        let d = today + autumn_harvest::time::days(offset);
         diesel::sql_query(format!(
             "INSERT INTO harvest_calendar_exclusions (id, calendar_name, excluded_date) \
              VALUES (gen_random_uuid(), '{cal}', DATE '{d}')"

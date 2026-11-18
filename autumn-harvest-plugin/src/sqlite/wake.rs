@@ -491,7 +491,7 @@ impl WakeReport {
 
 /// The wall clock in epoch milliseconds.
 fn now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
+    jiff::Timestamp::now().as_millisecond()
 }
 
 /// The sweep that wakes closed tenants.
@@ -958,7 +958,7 @@ mod tests {
     /// A runtime at a fixed clock with two timers: 5 s and 90 s out.
     async fn two_timers(dir: &std::path::Path, t0: i64) -> SqliteRuntime {
         let mut runtime = SqliteRuntime::open(&dir.join("t.harvest.db")).expect("open");
-        runtime.set_clock(move || chrono::DateTime::from_timestamp_millis(t0).expect("time"));
+        runtime.set_clock(move || jiff::Timestamp::from_millisecond(t0).ok().expect("time"));
         runtime.register_workflow(&dozing_info());
         runtime
             .start_workflow("dozing", serde_json::json!(5))

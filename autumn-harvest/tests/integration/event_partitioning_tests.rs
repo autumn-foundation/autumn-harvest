@@ -25,6 +25,7 @@
 //! fresh testcontainers Postgres boots with the full migration bundle.
 
 use std::sync::{Arc, Mutex};
+use jiff_diesel::ToDiesel;
 use std::time::Duration;
 
 use autumn_harvest::WorkflowEvent;
@@ -37,7 +38,7 @@ use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::DbPool;
-use chrono::{DateTime, TimeZone, Utc};
+use jiff::Timestamp;
 use diesel::sql_types::{BigInt, Bool, Text, Timestamptz};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
@@ -156,8 +157,8 @@ async fn insert_execution(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
     workflow_id: &str,
-    created_at: DateTime<Utc>,
-    completed_at: Option<DateTime<Utc>>,
+    created_at: Timestamp,
+    completed_at: Option<Timestamp>,
 ) -> uuid::Uuid {
     let state = if completed_at.is_some() {
         "COMPLETED"
@@ -192,7 +193,7 @@ async fn insert_execution(
 ///
 /// Layout-agnostic: `ensure_cohort` is a no-op on the unpartitioned layout and
 /// the column exists there too, so the same helper serves both.
-async fn backdate_events(conn: &mut AsyncPgConnection, exec: uuid::Uuid, at: DateTime<Utc>) {
+async fn backdate_events(conn: &mut AsyncPgConnection, exec: uuid::Uuid, at: Timestamp) {
     partition::ensure_cohort(conn, at)
         .await
         .expect("materialize the destination cohort");
@@ -203,7 +204,7 @@ async fn backdate_events(conn: &mut AsyncPgConnection, exec: uuid::Uuid, at: Dat
                 SET cohort = harvest_event_cohort($1), timestamp = $1
               WHERE workflow_exec_id = $2",
         )
-        .bind::<Timestamptz, _>(at)
+        .bind::<Timestamptz, _>(at.to_diesel())
         .bind::<diesel::sql_types::Uuid, _>(exec)
         .execute(c)
         .await
@@ -218,7 +219,7 @@ async fn seed_expired(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
     workflow_id: &str,
-    at: DateTime<Utc>,
+    at: Timestamp,
 ) -> uuid::Uuid {
     let exec = insert_execution(conn, workflow_name, workflow_id, at, Some(at)).await;
     autumn_harvest::store::append_events(conn, ExecutionId::from_uuid(exec), &sample_events(), 0)
@@ -257,8 +258,8 @@ fn as_json(events: &[WorkflowEvent]) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn day(y: i32, m: u32, d: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(y, m, d, 12, 0, 0).unwrap()
+fn day(y: i32, m: u32, d: u32) -> Timestamp {
+    autumn_harvest::time::utc_ymd_hms(y, m, d, 12, 0, 0).unwrap()
 }
 
 #[derive(Default)]
@@ -316,7 +317,7 @@ async fn run_one_tick(
     // flaky. Wait for a maintenance stamp newer than this call instead. That
     // also makes a SECOND `run_one_tick` in the same test observe its own pass
     // rather than the previous one's.
-    let started = Utc::now();
+    let started = Timestamp::now();
     let pools = ShardedDbPool::single(pool);
     let runtime = RetentionRuntime::spawn(pools, config, Arc::new(NoopMetrics), archiver, None)
         .expect("retention runtime should spawn when enabled");
@@ -577,7 +578,7 @@ async fn the_large_table_plans_phase_1_also_refuses_a_unique_index_without_cohor
         .expect("seed a unique index that does not include cohort");
 
     let mut refusal: Option<String> = None;
-    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now())
         .into_iter()
         .filter(|s| s.phase == 1)
     {
@@ -621,7 +622,7 @@ async fn the_large_table_plans_phase_1_also_refuses_an_include_only_cohort_colum
     .expect("seed a unique index with cohort only as an INCLUDE column");
 
     let mut refusal: Option<String> = None;
-    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now())
         .into_iter()
         .filter(|s| s.phase == 1)
     {
@@ -717,7 +718,7 @@ async fn the_large_table_plans_phase_1_also_refuses_a_constraint_backed_unique_i
     .expect("seed an operator's own constraint-backed unique index missing cohort");
 
     let mut refusal: Option<String> = None;
-    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now())
         .into_iter()
         .filter(|s| s.phase == 1)
     {
@@ -1009,7 +1010,7 @@ async fn the_large_table_plans_phase_1_also_refuses_a_compatible_constraint_back
     .expect("seed an operator's own constraint-backed unique index that includes cohort");
 
     let mut refusal: Option<String> = None;
-    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now())
         .into_iter()
         .filter(|s| s.phase == 1)
     {
@@ -1434,7 +1435,7 @@ async fn the_large_table_plans_phase_1_also_refuses_a_dependent_view() {
     .expect("seed a dependent view");
 
     let mut refusal: Option<String> = None;
-    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now())
         .into_iter()
         .filter(|s| s.phase == 1)
     {
@@ -1587,7 +1588,7 @@ async fn enable_sql_rechecks_a_dependent_view_created_after_the_preflight() {
     // this recheck is what caught it. The populated path never runs
     // that `DROP`, so this is the only guard standing between it and a
     // silently stranded view.
-    let exec = insert_execution(&mut conn, "race_view_wf", "race-view-1", Utc::now(), None).await;
+    let exec = insert_execution(&mut conn, "race_view_wf", "race-view-1", Timestamp::now(), None).await;
     autumn_harvest::store::append_events(
         &mut conn,
         ExecutionId::from_uuid(exec),
@@ -1647,7 +1648,7 @@ async fn enable_sql_rechecks_an_operator_trigger_installed_after_the_preflight()
     // the legacy table as a partition rather than dropping it. See the
     // dependent-view test's sibling comment for why the empty path
     // cannot isolate this recheck from Postgres's own protection.
-    let exec = insert_execution(&mut conn, "race_trg_wf", "race-trg-1", Utc::now(), None).await;
+    let exec = insert_execution(&mut conn, "race_trg_wf", "race-trg-1", Timestamp::now(), None).await;
     autumn_harvest::store::append_events(
         &mut conn,
         ExecutionId::from_uuid(exec),
@@ -1727,7 +1728,7 @@ async fn enable_sql_rechecks_a_unique_index_added_after_the_preflight() {
     // A populated table takes the AttachLegacy path. See the dependent-view
     // test's sibling comment for why the empty path cannot isolate this
     // recheck from Postgres's own protection.
-    let exec = insert_execution(&mut conn, "race_idx_wf", "race-idx-1", Utc::now(), None).await;
+    let exec = insert_execution(&mut conn, "race_idx_wf", "race-idx-1", Timestamp::now(), None).await;
     autumn_harvest::store::append_events(
         &mut conn,
         ExecutionId::from_uuid(exec),
@@ -1786,7 +1787,7 @@ async fn enable_sql_rechecks_an_unreplayable_constraint_installed_after_the_pref
     // A populated table takes the AttachLegacy path. See the dependent-view
     // test's sibling comment for why the empty path cannot isolate this
     // recheck from Postgres's own protection.
-    let exec = insert_execution(&mut conn, "race_con_wf", "race-con-1", Utc::now(), None).await;
+    let exec = insert_execution(&mut conn, "race_con_wf", "race-con-1", Timestamp::now(), None).await;
     autumn_harvest::store::append_events(
         &mut conn,
         ExecutionId::from_uuid(exec),
@@ -1854,7 +1855,7 @@ async fn a_plain_compatible_unique_index_survives_the_direct_enable_path() {
     let mut conn = connect(&url).await;
     reset_to_unpartitioned(&mut conn).await;
 
-    let exec = insert_execution(&mut conn, "plain_idx_wf", "plain-idx-1", Utc::now(), None).await;
+    let exec = insert_execution(&mut conn, "plain_idx_wf", "plain-idx-1", Timestamp::now(), None).await;
     autumn_harvest::store::append_events(
         &mut conn,
         ExecutionId::from_uuid(exec),
@@ -1908,7 +1909,7 @@ async fn a_plain_compatible_index_present_before_conversion_does_not_block_the_r
         &mut conn,
         "plain_idx_revert_wf",
         "plain-idx-revert-1",
-        Utc::now(),
+        Timestamp::now(),
         None,
     )
     .await;
@@ -1982,7 +1983,7 @@ async fn a_disambiguated_residual_index_name_still_does_not_block_the_revert() {
         &mut conn,
         "disambig_residual_wf",
         "disambig-residual-1",
-        Utc::now(),
+        Timestamp::now(),
         None,
     )
     .await;
@@ -2093,7 +2094,7 @@ async fn quoted_residual_index_name_with_whitespace_is_recognized_by_shape() {
         &mut conn,
         "quoted_shape_wf",
         "quoted-shape-1",
-        Utc::now(),
+        Timestamp::now(),
         None,
     )
     .await;
@@ -2167,7 +2168,7 @@ async fn an_operator_index_squatting_a_reserved_legacy_name_still_refuses_the_re
         &mut conn,
         "squat_pk_idx_wf",
         "squat-pk-idx-1",
-        Utc::now(),
+        Timestamp::now(),
         None,
     )
     .await;
@@ -2307,7 +2308,7 @@ async fn a_leaf_constraint_coincidentally_matching_a_parent_index_still_refuses_
         &mut conn,
         "leaf_constraint_coincidence_wf",
         "leaf-constraint-coincidence-1",
-        Utc::now(),
+        Timestamp::now(),
         None,
     )
     .await;
@@ -2441,7 +2442,7 @@ async fn the_large_table_plans_phase_1_also_refuses_a_dependent_materialized_vie
     .expect("seed a dependent materialized view");
 
     let mut refusal: Option<String> = None;
-    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now())
         .into_iter()
         .filter(|s| s.phase == 1)
     {
@@ -2650,7 +2651,7 @@ async fn the_large_table_plans_phase_1_also_refuses_an_operator_trigger() {
     .expect("seed an operator trigger");
 
     let mut refusal: Option<String> = None;
-    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now())
         .into_iter()
         .filter(|s| s.phase == 1)
     {
@@ -3289,7 +3290,7 @@ async fn the_large_table_plans_phase_1_also_refuses_an_unreplayable_constraint()
     .expect("seed an operator CHECK constraint");
 
     let mut refusal: Option<String> = None;
-    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now())
         .into_iter()
         .filter(|s| s.phase == 1)
     {
@@ -3335,7 +3336,7 @@ async fn the_large_table_plans_phase_1_refuses_a_cohort_check_bound_to_the_wrong
     .expect("seed an impostor at harvest's reserved name and shape, bound to an unrelated date");
 
     let mut refusal: Option<String> = None;
-    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now())
         .into_iter()
         .filter(|s| s.phase == 1)
     {
@@ -3808,7 +3809,7 @@ async fn a_user_index_at_the_identifier_length_limit_survives_conversion() {
     // A row, so the table takes the ATTACH-LEGACY path rather than the
     // fresh-table path. Only the former exercises the legacy rename loop
     // this item's fix is in.
-    let exec = insert_execution(&mut conn, "longidx_wf", "li-1", Utc::now(), None).await;
+    let exec = insert_execution(&mut conn, "longidx_wf", "li-1", Timestamp::now(), None).await;
     autumn_harvest::store::append_events(
         &mut conn,
         ExecutionId::from_uuid(exec),
@@ -3937,7 +3938,7 @@ async fn a_multibyte_user_index_name_near_the_limit_survives_conversion() {
     let mut conn = connect(&url).await;
     reset_to_unpartitioned(&mut conn).await;
 
-    let exec = insert_execution(&mut conn, "mbidx_wf", "mb-1", Utc::now(), None).await;
+    let exec = insert_execution(&mut conn, "mbidx_wf", "mb-1", Timestamp::now(), None).await;
     autumn_harvest::store::append_events(
         &mut conn,
         ExecutionId::from_uuid(exec),
@@ -4029,7 +4030,7 @@ async fn an_operators_own_function_of_the_same_name_does_not_block_conversion() 
     .await
     .expect("seed an operator's own function sharing the helper's name and signature");
 
-    let exec = insert_execution(&mut conn, "fn_collide_wf", "fn-collide-1", Utc::now(), None).await;
+    let exec = insert_execution(&mut conn, "fn_collide_wf", "fn-collide-1", Timestamp::now(), None).await;
     autumn_harvest::store::append_events(
         &mut conn,
         ExecutionId::from_uuid(exec),
@@ -4211,7 +4212,7 @@ async fn a_closed_partition_cannot_be_raced_by_a_later_append() {
     // row is its APPEND instant, so nothing can route into it. That makes the
     // sweeper's "this partition holds no live execution's rows" proof safe
     // against a concurrent append between the check and the drop.
-    let yesterday = Utc::now() - chrono::Duration::days(1);
+    let yesterday = Timestamp::now() - autumn_harvest::time::days(1);
     partition::ensure_cohort(&mut conn, yesterday)
         .await
         .expect("materialize yesterday");
@@ -4245,7 +4246,7 @@ async fn a_closed_partition_cannot_be_raced_by_a_later_append() {
          execution's history"
     );
     let today = partition::partition_name(partition::cohort_start(
-        Utc::now(),
+        Timestamp::now(),
         partition::DEFAULT_COHORT_WIDTH_SECS,
     ));
     assert_eq!(
@@ -4275,12 +4276,12 @@ async fn an_execution_whose_events_span_cohorts_loads_its_full_history_in_order(
     // append instant genuinely splits its history across partitions. This
     // design makes that trade. So AC2's ordering and delta guarantees must hold
     // ACROSS that split, not merely within one partition.
-    let exec = insert_execution(&mut conn, "span_wf", "span-1", Utc::now(), None).await;
+    let exec = insert_execution(&mut conn, "span_wf", "span-1", Timestamp::now(), None).await;
     let exec_id = ExecutionId::from_uuid(exec);
     autumn_harvest::store::append_events(&mut conn, exec_id, &sample_events(), 0)
         .await
         .expect("first append");
-    backdate_events(&mut conn, exec, Utc::now() - chrono::Duration::days(2)).await;
+    backdate_events(&mut conn, exec, Timestamp::now() - autumn_harvest::time::days(2)).await;
     autumn_harvest::store::append_events(&mut conn, exec_id, &sample_events(), 3)
         .await
         .expect("second append");
@@ -4357,7 +4358,7 @@ async fn a_retention_pass_reclaims_an_expired_cohort_by_dropping_its_partition()
         .await
         .expect("enable");
 
-    let old = Utc::now() - chrono::Duration::days(30);
+    let old = Timestamp::now() - autumn_harvest::time::days(30);
     for i in 0..5 {
         seed_expired(&mut conn, "drop_wf", &format!("d-{i}"), old).await;
     }
@@ -4408,7 +4409,7 @@ async fn reclamation_leaves_no_dead_tuples_behind() {
         .await
         .expect("enable");
 
-    let old = Utc::now() - chrono::Duration::days(30);
+    let old = Timestamp::now() - autumn_harvest::time::days(30);
     for i in 0..20 {
         seed_expired(&mut conn, "bloat_wf", &format!("b-{i}"), old).await;
     }
@@ -4469,7 +4470,7 @@ async fn a_cohort_with_a_surviving_execution_is_never_dropped() {
         .await
         .expect("enable");
 
-    let old = Utc::now() - chrono::Duration::days(30);
+    let old = Timestamp::now() - autumn_harvest::time::days(30);
     // One expired execution and one still RUNNING, both with rows in the same
     // cohort.
     seed_expired(&mut conn, "mix_wf", "m-old", old).await;
@@ -4526,7 +4527,7 @@ async fn the_archiver_receives_full_history_before_the_partition_is_dropped() {
         .await
         .expect("enable");
 
-    let old = Utc::now() - chrono::Duration::days(30);
+    let old = Timestamp::now() - autumn_harvest::time::days(30);
     for i in 0..3 {
         seed_expired(&mut conn, "arc_wf", &format!("a-{i}"), old).await;
     }
@@ -4567,7 +4568,7 @@ async fn a_failing_archiver_blocks_both_the_delete_and_the_partition_drop() {
         .await
         .expect("enable");
 
-    let old = Utc::now() - chrono::Duration::days(30);
+    let old = Timestamp::now() - autumn_harvest::time::days(30);
     seed_expired(&mut conn, "fail_wf", "f-1", old).await;
     let cohort_partition = partition::partition_name(partition::cohort_start(
         old,
@@ -4614,7 +4615,7 @@ async fn a_legal_hold_deterministically_blocks_the_partition_drop() {
         .await
         .expect("enable");
 
-    let old = Utc::now() - chrono::Duration::days(30);
+    let old = Timestamp::now() - autumn_harvest::time::days(30);
     let held = seed_expired(&mut conn, "hold_wf", "h-held", old).await;
     let _free = seed_expired(&mut conn, "hold_wf", "h-free", old).await;
     diesel::sql_query(
@@ -4691,7 +4692,7 @@ async fn a_longer_per_type_override_blocks_the_partition_drop() {
         .await
         .expect("enable");
 
-    let old = Utc::now() - chrono::Duration::days(30);
+    let old = Timestamp::now() - autumn_harvest::time::days(30);
     let _short = seed_expired(&mut conn, "short_wf", "s-1", old).await;
     let long = seed_expired(&mut conn, "long_wf", "l-1", old).await;
 
@@ -4750,7 +4751,7 @@ async fn pii_erasure_tombstones_partitioned_rows_identically() {
     let mut conn = connect(&url).await;
 
     reset_to_unpartitioned(&mut conn).await;
-    let past = Utc::now() - chrono::Duration::days(3);
+    let past = Timestamp::now() - autumn_harvest::time::days(3);
     let a = insert_execution(&mut conn, "pii_wf", "p-1", past, Some(past)).await;
     autumn_harvest::store::append_events(&mut conn, ExecutionId::from_uuid(a), &sample_events(), 0)
         .await
@@ -4788,7 +4789,7 @@ async fn heartbeat_checkpoints_are_unaffected_by_partitioning() {
         .await
         .expect("enable");
 
-    let past = Utc::now();
+    let past = Timestamp::now();
     let exec = insert_execution(&mut conn, "hb_wf", "hb-1", past, None).await;
     let task: uuid::Uuid = diesel::sql_query(
         "INSERT INTO harvest_task_queue
@@ -4864,7 +4865,7 @@ async fn the_retention_tick_pre_creates_future_partitions_with_no_operator_cron(
         after.len()
     );
     let horizon =
-        Utc::now() + chrono::Duration::days(i64::from(partition::DEFAULT_LOOKAHEAD_COHORTS));
+        Timestamp::now() + autumn_harvest::time::days(i64::from(partition::DEFAULT_LOOKAHEAD_COHORTS));
     assert!(
         after
             .iter()
@@ -4902,7 +4903,7 @@ async fn partition_maintenance_runs_at_startup_not_after_a_full_tick_interval() 
         "precondition: partition maintenance must be on by default"
     );
 
-    let started = Utc::now();
+    let started = Timestamp::now();
     let runtime = RetentionRuntime::spawn(pools, config, Arc::new(NoopMetrics), None, None)
         .expect("retention runtime should spawn when enabled");
     // Deliberately NOT calling `runtime.run_now()` — that is the crutch
@@ -4954,7 +4955,7 @@ async fn the_startup_pass_runs_partition_maintenance_only_not_the_whole_tick() {
         .await
         .expect("enable");
 
-    let old = Utc::now() - chrono::Duration::days(30);
+    let old = Timestamp::now() - autumn_harvest::time::days(30);
     seed_expired(&mut conn, "startup_wf", "startup-1", old).await;
 
     let pool = build_pool(&url);
@@ -4967,7 +4968,7 @@ async fn the_startup_pass_runs_partition_maintenance_only_not_the_whole_tick() {
         ..RetentionConfig::with_max_age(Duration::from_hours(24))
     };
 
-    let started = Utc::now();
+    let started = Timestamp::now();
     let runtime = RetentionRuntime::spawn(pools, config, Arc::new(NoopMetrics), None, None)
         .expect("retention runtime should spawn when enabled");
 
@@ -5106,7 +5107,7 @@ async fn maintenance_outcome_reports_whether_the_shard_was_partitioned() {
 
     let outcome = partition::maintain(
         &mut conn,
-        Utc::now(),
+        Timestamp::now(),
         0,
         &SweepOptions::default(),
         None,
@@ -5126,7 +5127,7 @@ async fn maintenance_outcome_reports_whether_the_shard_was_partitioned() {
 
     let outcome = partition::maintain(
         &mut conn,
-        Utc::now(),
+        Timestamp::now(),
         0,
         &SweepOptions::default(),
         None,
@@ -5301,7 +5302,7 @@ async fn an_append_for_an_uncovered_cohort_survives_via_the_default_partition() 
     // partition of relation found" and stall a live workflow. That is an
     // availability bug, not a storage one.
     let today = partition::partition_name(partition::cohort_start(
-        Utc::now(),
+        Timestamp::now(),
         partition::DEFAULT_COHORT_WIDTH_SECS,
     ));
     diesel::sql_query(format!("DROP TABLE {today}"))
@@ -5309,7 +5310,7 @@ async fn an_append_for_an_uncovered_cohort_survives_via_the_default_partition() 
         .await
         .expect("simulate a maintenance gap");
 
-    let exec = insert_execution(&mut conn, "skew_wf", "sk-1", Utc::now(), None).await;
+    let exec = insert_execution(&mut conn, "skew_wf", "sk-1", Timestamp::now(), None).await;
     let exec_id = ExecutionId::from_uuid(exec);
     autumn_harvest::store::append_events(&mut conn, exec_id, &sample_events(), 0)
         .await
@@ -5370,12 +5371,12 @@ async fn the_sweep_is_bounded_and_reports_what_it_dropped_and_blocked() {
 
     // Three fully-reclaimable cohorts (no execution rows at all) and one held.
     for days in [10_i64, 11, 12] {
-        let ts = Utc::now() - chrono::Duration::days(days);
+        let ts = Timestamp::now() - autumn_harvest::time::days(days);
         partition::ensure_cohort(&mut conn, ts)
             .await
             .expect("materialize cohort");
     }
-    let live_ts = Utc::now() - chrono::Duration::days(13);
+    let live_ts = Timestamp::now() - autumn_harvest::time::days(13);
     let live = insert_execution(&mut conn, "live_wf", "lv-1", live_ts, None).await;
     autumn_harvest::store::append_events(
         &mut conn,
@@ -5389,7 +5390,7 @@ async fn the_sweep_is_bounded_and_reports_what_it_dropped_and_blocked() {
 
     let outcome = partition::sweep(
         &mut conn,
-        Utc::now(),
+        Timestamp::now(),
         &SweepOptions {
             max_drops: 2,
             ..SweepOptions::default()
@@ -5441,7 +5442,7 @@ async fn a_truncated_pass_resumes_past_a_permanently_blocked_oldest_run() {
         .expect("enable");
 
     for days in [20_i64, 21] {
-        let ts = Utc::now() - chrono::Duration::days(days);
+        let ts = Timestamp::now() - autumn_harvest::time::days(days);
         let exec =
             insert_execution(&mut conn, "pinned_wf", &format!("resume-{days}"), ts, None).await;
         autumn_harvest::store::append_events(
@@ -5454,7 +5455,7 @@ async fn a_truncated_pass_resumes_past_a_permanently_blocked_oldest_run() {
         .expect("seed");
         backdate_events(&mut conn, exec, ts).await;
     }
-    let droppable_ts = Utc::now() - chrono::Duration::days(19);
+    let droppable_ts = Timestamp::now() - autumn_harvest::time::days(19);
     partition::ensure_cohort(&mut conn, droppable_ts)
         .await
         .expect("materialize the droppable cohort");
@@ -5465,7 +5466,7 @@ async fn a_truncated_pass_resumes_past_a_permanently_blocked_oldest_run() {
         ..SweepOptions::default()
     };
 
-    let first = partition::sweep(&mut conn, Utc::now(), &opts, None)
+    let first = partition::sweep(&mut conn, Timestamp::now(), &opts, None)
         .await
         .expect("first sweep");
     assert!(
@@ -5478,7 +5479,7 @@ async fn a_truncated_pass_resumes_past_a_permanently_blocked_oldest_run() {
         .next_resume
         .expect("a truncated pass must report where to resume");
 
-    let second = partition::sweep(&mut conn, Utc::now(), &opts, Some(resume_after))
+    let second = partition::sweep(&mut conn, Timestamp::now(), &opts, Some(resume_after))
         .await
         .expect("second sweep");
     assert_eq!(
@@ -5506,7 +5507,7 @@ async fn a_sweep_bounds_blocked_evaluations_too_not_only_drops() {
     // Five closed cohorts, each pinned by its own still-existing execution —
     // every one of them is blocked, none droppable.
     for days in [20_i64, 21, 22, 23, 24] {
-        let ts = Utc::now() - chrono::Duration::days(days);
+        let ts = Timestamp::now() - autumn_harvest::time::days(days);
         let exec = insert_execution(&mut conn, "pinned_wf", &format!("p-{days}"), ts, None).await;
         autumn_harvest::store::append_events(
             &mut conn,
@@ -5521,7 +5522,7 @@ async fn a_sweep_bounds_blocked_evaluations_too_not_only_drops() {
 
     let outcome = partition::sweep(
         &mut conn,
-        Utc::now(),
+        Timestamp::now(),
         &SweepOptions {
             max_drops: 10,
             max_attempts: 2,
@@ -5570,13 +5571,13 @@ async fn exhausting_the_budget_on_the_last_eligible_partition_is_not_truncated()
     // skips them for free. `max_attempts: 1` exactly exhausts the budget
     // on the one real candidate.
     let (past_partition, _) =
-        partition::ensure_cohort(&mut conn, Utc::now() - chrono::Duration::days(5))
+        partition::ensure_cohort(&mut conn, Timestamp::now() - autumn_harvest::time::days(5))
             .await
             .expect("materialize a past, empty cohort partition");
 
     let outcome = partition::sweep(
         &mut conn,
-        Utc::now(),
+        Timestamp::now(),
         &SweepOptions {
             max_drops: 10,
             max_attempts: 1,
@@ -5618,7 +5619,7 @@ async fn the_straggler_delete_bounds_its_own_statement_timeout() {
     // A cohort pinned by a still-existing execution, so the gate reports
     // OWNED_REASON (not droppable). With straggler_grace configured, the
     // sweep attempts the targeted orphan DELETE rather than skipping it.
-    let old = Utc::now() - chrono::Duration::days(10);
+    let old = Timestamp::now() - autumn_harvest::time::days(10);
     let pinning = insert_execution(&mut conn, "pin_wf", "pin-1", old, None).await;
     autumn_harvest::store::append_events(
         &mut conn,
@@ -5652,7 +5653,7 @@ async fn the_straggler_delete_bounds_its_own_statement_timeout() {
 
     let outcome = partition::sweep(
         &mut conn,
-        Utc::now(),
+        Timestamp::now(),
         &SweepOptions {
             straggler_grace: Some(Duration::from_secs(0)),
             exact_scan_timeout: Duration::from_millis(200),
@@ -5706,7 +5707,7 @@ async fn the_straggler_delete_restores_statement_timeout_inside_a_caller_transac
     // a real orphan alongside it. The targeted DELETE then has something
     // to remove and actually succeeds, rather than timing out on a lock
     // wait like the sibling test above.
-    let old = Utc::now() - chrono::Duration::days(10);
+    let old = Timestamp::now() - autumn_harvest::time::days(10);
     let pinning = insert_execution(&mut conn, "pin2_wf", "pin2-1", old, None).await;
     autumn_harvest::store::append_events(
         &mut conn,
@@ -5741,7 +5742,7 @@ async fn the_straggler_delete_restores_statement_timeout_inside_a_caller_transac
 
         let outcome = partition::sweep(
             conn,
-            Utc::now(),
+            Timestamp::now(),
             &SweepOptions {
                 straggler_grace: Some(Duration::from_secs(0)),
                 ..SweepOptions::default()
@@ -5775,15 +5776,15 @@ async fn the_straggler_delete_restores_statement_timeout_inside_a_caller_transac
 
 #[test]
 fn cohort_start_floors_to_the_configured_width() {
-    let ts = Utc.with_ymd_and_hms(2026, 8, 31, 17, 42, 9).unwrap();
+    let ts = autumn_harvest::time::utc_ymd_hms(2026, 8, 31, 17, 42, 9).unwrap();
     assert_eq!(
         partition::cohort_start(ts, 86_400),
-        Utc.with_ymd_and_hms(2026, 8, 31, 0, 0, 0).unwrap(),
+        autumn_harvest::time::utc_ymd_hms(2026, 8, 31, 0, 0, 0).unwrap(),
         "a daily cohort floors to UTC midnight"
     );
     assert_eq!(
         partition::cohort_start(ts, 3_600),
-        Utc.with_ymd_and_hms(2026, 8, 31, 17, 0, 0).unwrap(),
+        autumn_harvest::time::utc_ymd_hms(2026, 8, 31, 17, 0, 0).unwrap(),
         "an hourly cohort floors to the hour"
     );
 }
@@ -5793,18 +5794,18 @@ fn cohort_start_floors_pre_epoch_timestamps_downward() {
     // Rust's integer division truncates toward zero. That would round a
     // pre-1970 timestamp UP into the next cohort and route an execution's
     // events to the wrong partition.
-    let ts = Utc.with_ymd_and_hms(1969, 12, 31, 23, 0, 0).unwrap();
+    let ts = autumn_harvest::time::utc_ymd_hms(1969, 12, 31, 23, 0, 0).unwrap();
     assert_eq!(
         partition::cohort_start(ts, 86_400),
-        Utc.with_ymd_and_hms(1969, 12, 31, 0, 0, 0).unwrap(),
+        autumn_harvest::time::utc_ymd_hms(1969, 12, 31, 0, 0, 0).unwrap(),
         "flooring must go DOWN on both sides of the epoch"
     );
 }
 
 #[test]
 fn partition_names_are_legible_and_collision_free() {
-    let a = partition::partition_name(Utc.with_ymd_and_hms(2026, 8, 31, 0, 0, 0).unwrap());
-    let b = partition::partition_name(Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap());
+    let a = partition::partition_name(autumn_harvest::time::utc_ymd_hms(2026, 8, 31, 0, 0, 0).unwrap());
+    let b = partition::partition_name(autumn_harvest::time::utc_ymd_hms(2026, 9, 1, 0, 0, 0).unwrap());
     assert_ne!(a, b);
     assert!(a.starts_with("harvest_events_p_"), "got {a}");
     assert!(
@@ -6038,7 +6039,7 @@ async fn the_legacy_partition_is_never_dropped_while_it_holds_live_history() {
     // ZERO of its rows and conclude "no live owner". It would then drop the
     // entire pre-conversion history on the first tick after conversion,
     // running executions and legal holds included.
-    let outcome = partition::sweep(&mut conn, Utc::now(), &SweepOptions::default(), None)
+    let outcome = partition::sweep(&mut conn, Timestamp::now(), &SweepOptions::default(), None)
         .await
         .expect("sweep must not error on a converted shard");
 
@@ -6078,7 +6079,7 @@ async fn a_duplicate_event_id_is_rejected_even_across_cohorts() {
         .await
         .expect("enable");
 
-    let exec = insert_execution(&mut conn, "dup_wf", "dup-x", Utc::now(), None).await;
+    let exec = insert_execution(&mut conn, "dup_wf", "dup-x", Timestamp::now(), None).await;
     let exec_id = ExecutionId::from_uuid(exec);
     autumn_harvest::store::append_events(&mut conn, exec_id, &sample_events(), 0)
         .await
@@ -6095,7 +6096,7 @@ async fn a_duplicate_event_id_is_rejected_even_across_cohorts() {
     // cohort: a stale worker whose task was reclaimed, or a retried workflow
     // task. Without a cross-partition check, the engine's split-brain detector
     // silently stops firing for every execution that existed at conversion.
-    backdate_events(&mut conn, exec, Utc::now() - chrono::Duration::days(3)).await;
+    backdate_events(&mut conn, exec, Timestamp::now() - autumn_harvest::time::days(3)).await;
 
     let clash = autumn_harvest::store::append_events(&mut conn, exec_id, &sample_events(), 0).await;
     assert!(
@@ -6129,7 +6130,7 @@ async fn reverting_succeeds_on_a_shard_that_has_orphans_and_rebuilds_the_flat_co
     // Otherwise it is unavailable on exactly the shards that have run long
     // enough to need it. The flat layout's foreign key forbids what the
     // partitioned layout deliberately allows.
-    let exec = insert_execution(&mut conn, "rev_wf", "rev-1", Utc::now(), None).await;
+    let exec = insert_execution(&mut conn, "rev_wf", "rev-1", Timestamp::now(), None).await;
     autumn_harvest::store::append_events(
         &mut conn,
         ExecutionId::from_uuid(exec),
@@ -6168,7 +6169,7 @@ async fn reverting_succeeds_on_a_shard_that_has_orphans_and_rebuilds_the_flat_co
         "and the layout is back to an ordinary table"
     );
     // The flat layout's constraints must be real again, not silently skipped.
-    let live = insert_execution(&mut conn, "rev_wf", "rev-2", Utc::now(), None).await;
+    let live = insert_execution(&mut conn, "rev_wf", "rev-2", Timestamp::now(), None).await;
     autumn_harvest::store::append_events(
         &mut conn,
         ExecutionId::from_uuid(live),
@@ -6208,7 +6209,7 @@ async fn enabling_does_not_lose_events_committed_while_the_probe_ran() {
     // This test cannot open the real window from one connection. It pins the
     // invariant the fix establishes instead. Whatever rows exist when the
     // exclusive lock is taken must survive the conversion.
-    let exec = insert_execution(&mut conn, "toctou_wf", "tc-1", Utc::now(), None).await;
+    let exec = insert_execution(&mut conn, "toctou_wf", "tc-1", Timestamp::now(), None).await;
     let exec_id = ExecutionId::from_uuid(exec);
     autumn_harvest::store::append_events(&mut conn, exec_id, &sample_events(), 0)
         .await
@@ -6249,7 +6250,7 @@ async fn reverting_and_re_enabling_round_trips() {
     partition::enable_partitioning(&mut conn, &EnableOptions::default())
         .await
         .expect("first enable");
-    let exec = insert_execution(&mut conn, "rt_wf", "rt-1", Utc::now(), None).await;
+    let exec = insert_execution(&mut conn, "rt_wf", "rt-1", Timestamp::now(), None).await;
     autumn_harvest::store::append_events(
         &mut conn,
         ExecutionId::from_uuid(exec),
@@ -6267,7 +6268,7 @@ async fn reverting_and_re_enabling_round_trips() {
 
     // Append again on the flat layout — this is what poisons the column if the
     // partitioned default was carried over.
-    let flat = insert_execution(&mut conn, "rt_wf", "rt-2", Utc::now(), None).await;
+    let flat = insert_execution(&mut conn, "rt_wf", "rt-2", Timestamp::now(), None).await;
     autumn_harvest::store::append_events(
         &mut conn,
         ExecutionId::from_uuid(flat),
@@ -6319,7 +6320,7 @@ async fn the_large_table_migration_plan_actually_runs() {
         .await
         .expect("seed a populated table");
 
-    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now()) {
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now()) {
         // `CREATE INDEX CONCURRENTLY` cannot run inside a transaction block, so
         // each is sent on its own — exactly as the script instructs.
         diesel::sql_query(&step.sql)
@@ -6364,7 +6365,7 @@ async fn the_large_table_migration_plan_actually_runs() {
 
     // The layout must be functionally the real thing, not merely partitioned:
     // the trigger and the cohort default are what the sweeper depends on.
-    let fresh = insert_execution(&mut conn, "plan_wf", "plan-2", Utc::now(), None).await;
+    let fresh = insert_execution(&mut conn, "plan_wf", "plan-2", Timestamp::now(), None).await;
     autumn_harvest::store::append_events(
         &mut conn,
         ExecutionId::from_uuid(fresh),
@@ -6420,7 +6421,7 @@ async fn the_large_table_plans_rename_loop_survives_an_index_at_the_identifier_l
     .await
     .expect("seed a user index at the identifier limit");
 
-    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now()) {
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now()) {
         diesel::sql_query(&step.sql)
             .execute(&mut conn)
             .await
@@ -6459,7 +6460,7 @@ async fn an_append_racing_the_execution_delete_cannot_commit_an_orphan() {
         .await
         .expect("enable");
 
-    let exec = insert_execution(&mut conn, "race_wf", "race-1", Utc::now(), None).await;
+    let exec = insert_execution(&mut conn, "race_wf", "race-1", Timestamp::now(), None).await;
 
     // The integrity trigger's probe takes `FOR KEY SHARE` — the same lock mode
     // the foreign key it replaces took. Without it, the probe is an observation,
@@ -6545,7 +6546,7 @@ async fn a_cohort_proved_droppable_by_the_exact_scan_is_actually_dropped() {
     // dead on precisely the high-volume and legal-hold-heavy shards this
     // feature exists for, while the sweep kept cheerfully reporting them as
     // "blocked".
-    let old = Utc::now() - chrono::Duration::days(30);
+    let old = Timestamp::now() - autumn_harvest::time::days(30);
     for i in 0..4 {
         seed_expired(&mut conn, "exact_wf", &format!("x-{i}"), old).await;
     }
@@ -6565,7 +6566,7 @@ async fn a_cohort_proved_droppable_by_the_exact_scan_is_actually_dropped() {
             &mut conn,
             "survivor_wf",
             &format!("s-{i}"),
-            Utc::now() - chrono::Duration::days(40),
+            Timestamp::now() - autumn_harvest::time::days(40),
             None,
         )
         .await;
@@ -6645,7 +6646,7 @@ async fn the_layout_works_when_harvest_is_installed_outside_public() {
         .await
         .expect("enable in a non-public schema");
 
-    let exec = insert_execution(&mut alt, "alt_wf", "alt-1", Utc::now(), None).await;
+    let exec = insert_execution(&mut alt, "alt_wf", "alt-1", Timestamp::now(), None).await;
     let exec_id = ExecutionId::from_uuid(exec);
     autumn_harvest::store::append_events(&mut alt, exec_id, &sample_events(), 0)
         .await
@@ -6730,7 +6731,7 @@ async fn a_drop_attempt_never_blocks_appends_while_it_waits_for_its_partition() 
         let mut c = connect(&sweep_url).await;
         partition::sweep(
             &mut c,
-            Utc::now(),
+            Timestamp::now(),
             &SweepOptions {
                 lock_timeout: Duration::from_secs(8),
                 ..SweepOptions::default()
@@ -6744,7 +6745,7 @@ async fn a_drop_attempt_never_blocks_appends_while_it_waits_for_its_partition() 
     // different partition entirely, which the blocker does not touch.
     tokio::time::sleep(Duration::from_millis(750)).await;
     let mut writer = connect(&url).await;
-    let live = insert_execution(&mut writer, "lock_wf", "lock-live", Utc::now(), None).await;
+    let live = insert_execution(&mut writer, "lock_wf", "lock-live", Timestamp::now(), None).await;
     let appended = tokio::time::timeout(
         Duration::from_secs(3),
         autumn_harvest::store::append_events(
@@ -6807,7 +6808,7 @@ async fn the_online_migration_phases_bound_their_lock_wait() {
         ..EnableOptions::default()
     };
     let mut saw_lock_timeout = false;
-    for step in partition::migration_plan_steps(&opts, Utc::now())
+    for step in partition::migration_plan_steps(&opts, Timestamp::now())
         .into_iter()
         .filter(|s| s.phase == 3)
     {
@@ -6945,7 +6946,7 @@ async fn index_is_valid(conn: &mut AsyncPgConnection, name: &str) -> bool {
 }
 
 async fn run_plan_phases(conn: &mut AsyncPgConnection, phases: std::ops::RangeInclusive<u8>) {
-    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now())
         .into_iter()
         .filter(|s| phases.contains(&s.phase))
     {
@@ -6986,7 +6987,7 @@ async fn the_plan_refuses_over_an_exclusion_constraint_at_the_rename_target_name
     .expect("seed an exclusion constraint at the reserved rename-target name");
 
     let mut refusal: Option<String> = None;
-    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now())
         .into_iter()
         .filter(|s| s.phase == 1)
     {
@@ -7076,7 +7077,7 @@ async fn phase_2_refuses_when_a_reserved_index_name_is_squatted_elsewhere() {
     run_plan_phases(&mut conn, 1..=1).await;
 
     let mut refusal: Option<String> = None;
-    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now())
         .into_iter()
         .filter(|s| s.phase == 2)
     {
@@ -7142,7 +7143,7 @@ async fn phase_2_refuses_a_same_table_same_columns_index_with_different_semantic
     run_plan_phases(&mut conn, 1..=1).await;
 
     let mut refusal: Option<String> = None;
-    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now())
         .into_iter()
         .filter(|s| s.phase == 2)
     {
@@ -7208,7 +7209,7 @@ async fn phase_2_refuses_an_invalid_nulls_not_distinct_impostor_of_the_pk_index(
     run_plan_phases(&mut conn, 1..=1).await;
 
     let mut refusal: Option<String> = None;
-    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now())
         .into_iter()
         .filter(|s| s.phase == 2)
     {
@@ -7275,7 +7276,7 @@ async fn phase_2_refuses_an_invalid_impostor_using_a_different_access_method() {
     run_plan_phases(&mut conn, 1..=1).await;
 
     let mut refusal: Option<String> = None;
-    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now())
         .into_iter()
         .filter(|s| s.phase == 2)
     {
@@ -7331,7 +7332,7 @@ async fn the_lock_window_refuses_to_open_over_an_invalid_index() {
     // runbook back up at the lock window. Phase 4 must refuse rather than take
     // ACCESS EXCLUSIVE and then discover it has an index to build.
     let mut failed = false;
-    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now())
         .into_iter()
         .filter(|s| s.phase == 4)
     {
@@ -7405,7 +7406,7 @@ async fn phase_4_refuses_a_valid_index_with_the_right_name_and_the_wrong_shape()
     run_plan_phases(&mut conn, 1..=3).await;
 
     let mut failure: Option<String> = None;
-    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now())
         .into_iter()
         .filter(|s| s.phase == 4)
     {
@@ -7513,7 +7514,7 @@ async fn phase_4_refuses_a_nulls_not_distinct_impostor_of_the_pk_index() {
     run_plan_phases(&mut conn, 1..=3).await;
 
     let mut failure: Option<String> = None;
-    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now())
         .into_iter()
         .filter(|s| s.phase == 4)
     {
@@ -7602,7 +7603,7 @@ async fn phase_4_refuses_a_differently_ordered_impostor_of_the_pk_index() {
     run_plan_phases(&mut conn, 1..=3).await;
 
     let mut failure: Option<String> = None;
-    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now())
         .into_iter()
         .filter(|s| s.phase == 4)
     {
@@ -7672,7 +7673,7 @@ async fn phase_4_rechecks_dependent_views_created_after_phase_1() {
     .expect("seed a view created after phase 1's check already passed");
 
     let mut refusal: Option<String> = None;
-    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now())
         .into_iter()
         .filter(|s| s.phase == 4)
     {
@@ -7830,7 +7831,7 @@ async fn enable_sql_rechecks_row_security_enabled_after_the_preflight() {
     let mut conn = connect(&url).await;
     reset_to_unpartitioned(&mut conn).await;
 
-    let exec = insert_execution(&mut conn, "race_rls_wf", "race-rls-1", Utc::now(), None).await;
+    let exec = insert_execution(&mut conn, "race_rls_wf", "race-rls-1", Timestamp::now(), None).await;
     autumn_harvest::store::append_events(
         &mut conn,
         ExecutionId::from_uuid(exec),
@@ -7896,7 +7897,7 @@ async fn enable_sql_rechecks_a_publication_added_after_the_preflight() {
     let mut conn = connect(&url).await;
     reset_to_unpartitioned(&mut conn).await;
 
-    let exec = insert_execution(&mut conn, "race_pub_wf", "race-pub-1", Utc::now(), None).await;
+    let exec = insert_execution(&mut conn, "race_pub_wf", "race-pub-1", Timestamp::now(), None).await;
     autumn_harvest::store::append_events(
         &mut conn,
         ExecutionId::from_uuid(exec),
@@ -7969,7 +7970,7 @@ async fn phase_4_rechecks_row_security_enabled_after_phase_1() {
         .expect("seed a policy created after phase 1's check already passed");
 
     let mut refusal: Option<String> = None;
-    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now())
         .into_iter()
         .filter(|s| s.phase == 4)
     {
@@ -8044,7 +8045,7 @@ async fn phase_4_rechecks_a_publication_added_after_phase_1() {
         .expect("seed a publication created after phase 1's check already passed");
 
     let mut refusal: Option<String> = None;
-    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now())
         .into_iter()
         .filter(|s| s.phase == 4)
     {
@@ -8108,7 +8109,7 @@ async fn phase_4_holds_access_exclusive_before_the_dependent_view_recheck() {
     reset_to_unpartitioned(&mut conn).await;
     run_plan_phases(&mut conn, 1..=3).await;
 
-    let steps: Vec<_> = partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+    let steps: Vec<_> = partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now())
         .into_iter()
         .filter(|s| s.phase == 4)
         .collect();
@@ -8219,7 +8220,7 @@ async fn phase_4_rechecks_an_operator_trigger_installed_after_phase_1() {
     .expect("seed a trigger installed after phase 1's check already passed");
 
     let mut refusal: Option<String> = None;
-    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now())
         .into_iter()
         .filter(|s| s.phase == 4)
     {
@@ -8306,7 +8307,7 @@ async fn phase_4_rechecks_a_constraint_backed_unique_index_installed_after_phase
     .expect("seed a constraint-backed unique index added after phase 1's check already passed");
 
     let mut refusal: Option<String> = None;
-    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now())
         .into_iter()
         .filter(|s| s.phase == 4)
     {
@@ -8829,7 +8830,7 @@ async fn maintenance_says_what_is_wrong_when_the_runtime_role_cannot_own_partiti
 
     let err = partition::maintain(
         &mut runtime,
-        Utc::now(),
+        Timestamp::now(),
         partition::DEFAULT_LOOKAHEAD_COHORTS,
         &SweepOptions::default(),
         None,
@@ -8866,7 +8867,7 @@ async fn maintenance_says_what_is_wrong_when_the_runtime_role_cannot_own_partiti
     let mut runtime = connect(&runtime_url).await;
     let outcome = partition::maintain(
         &mut runtime,
-        Utc::now(),
+        Timestamp::now(),
         partition::DEFAULT_LOOKAHEAD_COHORTS,
         &SweepOptions::default(),
         None,
@@ -8930,7 +8931,7 @@ async fn a_drop_blocked_by_a_reader_does_not_queue_appends_behind_its_upgrade() 
         let mut c = connect(&sweep_url).await;
         partition::sweep(
             &mut c,
-            Utc::now(),
+            Timestamp::now(),
             &SweepOptions {
                 lock_timeout: Duration::from_secs(8),
                 ..SweepOptions::default()
@@ -8942,7 +8943,7 @@ async fn a_drop_blocked_by_a_reader_does_not_queue_appends_behind_its_upgrade() 
 
     tokio::time::sleep(Duration::from_millis(750)).await;
     let mut writer = connect(&url).await;
-    let live = insert_execution(&mut writer, "up_wf", "up-live", Utc::now(), None).await;
+    let live = insert_execution(&mut writer, "up_wf", "up-live", Timestamp::now(), None).await;
     let appended = tokio::time::timeout(
         Duration::from_secs(3),
         autumn_harvest::store::append_events(
@@ -9125,7 +9126,7 @@ async fn re_running_the_plan_over_a_converted_table_cannot_break_appends() {
     // Their cohort is at or after the cutover by construction. So every
     // append on a working shard failed from that moment.
     let mut refused = false;
-    for step in partition::migration_plan_steps(&EnableOptions::default(), Utc::now())
+    for step in partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now())
         .into_iter()
         .filter(|s| s.phase == 1 || s.phase == 3)
     {
@@ -9143,7 +9144,7 @@ async fn re_running_the_plan_over_a_converted_table_cannot_break_appends() {
     );
 
     // The assertion that actually matters: the shard still works.
-    let live = insert_execution(&mut conn, "rerun_wf", "rerun-2", Utc::now(), None).await;
+    let live = insert_execution(&mut conn, "rerun_wf", "rerun-2", Timestamp::now(), None).await;
     autumn_harvest::store::append_events(
         &mut conn,
         ExecutionId::from_uuid(live),
@@ -9190,7 +9191,7 @@ async fn extending_the_write_window_never_queues_appends_indefinitely() {
 
     // A cohort far enough ahead that it certainly does not exist yet, so the
     // creation really is attempted.
-    let far = Utc::now() + chrono::Duration::days(400);
+    let far = Timestamp::now() + autumn_harvest::time::days(400);
     let ensure_url = url.clone();
     let ensurer = tokio::spawn(async move {
         let mut c = connect(&ensure_url).await;
@@ -9204,7 +9205,7 @@ async fn extending_the_write_window_never_queues_appends_indefinitely() {
     // anything.
     tokio::time::sleep(Duration::from_millis(750)).await;
     let mut writer = connect(&url).await;
-    let live = insert_execution(&mut writer, "win_wf", "win-live", Utc::now(), None).await;
+    let live = insert_execution(&mut writer, "win_wf", "win-live", Timestamp::now(), None).await;
     let appended = tokio::time::timeout(
         Duration::from_secs(6),
         autumn_harvest::store::append_events(
@@ -9255,7 +9256,7 @@ async fn ensure_partitions_treats_already_attached_cohorts_as_coverage() {
     // 0..=3 (today through +3 days). Force step 4 of a wider 0..=4
     // window to collide. This call's only new work is then one blocked
     // cohort, with everything else already attached.
-    let collide_at = Utc::now() + chrono::Duration::days(4);
+    let collide_at = Timestamp::now() + autumn_harvest::time::days(4);
     let collide_cohort = partition::cohort_start(collide_at, partition::DEFAULT_COHORT_WIDTH_SECS);
     let collide_name = partition::partition_name(collide_cohort);
     diesel::sql_query(format!("DROP TABLE IF EXISTS {collide_name}"))
@@ -9268,7 +9269,7 @@ async fn ensure_partitions_treats_already_attached_cohorts_as_coverage() {
         .expect("seed a colliding relation");
 
     let (created, blocked) =
-        partition::ensure_partitions(&mut conn, Utc::now(), 4, Duration::from_secs(2))
+        partition::ensure_partitions(&mut conn, Timestamp::now(), 4, Duration::from_secs(2))
             .await
             .expect(
                 "a window that is already almost fully covered, with one \
@@ -9282,7 +9283,7 @@ async fn ensure_partitions_treats_already_attached_cohorts_as_coverage() {
     );
     assert_eq!(
         blocked,
-        vec![collide_cohort.to_rfc3339()],
+        vec![autumn_harvest::time::rfc3339(collide_cohort)],
         "the one genuinely blocked cohort must still be reported; got {blocked:?}"
     );
 
@@ -9314,7 +9315,7 @@ async fn a_partly_blocked_lookahead_catch_up_is_not_reported_as_a_healthy_pass()
     // already-existing relation. That is one of the two ways
     // `ensure_cohort_with_width` reports a cohort blocked (the other is a
     // lock timeout, exercised above).
-    let collide_at = Utc::now() + chrono::Duration::days(5);
+    let collide_at = Timestamp::now() + autumn_harvest::time::days(5);
     let collide_cohort = partition::cohort_start(collide_at, partition::DEFAULT_COHORT_WIDTH_SECS);
     let collide_name = partition::partition_name(collide_cohort);
     // `IF EXISTS` first. This suite may re-run against a persistent
@@ -9332,7 +9333,7 @@ async fn a_partly_blocked_lookahead_catch_up_is_not_reported_as_a_healthy_pass()
 
     let outcome = partition::maintain(
         &mut conn,
-        Utc::now(),
+        Timestamp::now(),
         6,
         &SweepOptions::default(),
         None,
@@ -9347,7 +9348,7 @@ async fn a_partly_blocked_lookahead_catch_up_is_not_reported_as_a_healthy_pass()
     );
     assert_eq!(
         outcome.lookahead_blocked,
-        vec![collide_cohort.to_rfc3339()],
+        vec![autumn_harvest::time::rfc3339(collide_cohort)],
         "the blocked cohort must be named individually, not folded into a \
          count; got {outcome:?}"
     );
@@ -9397,7 +9398,7 @@ async fn maintain_with_progress_ticks_once_per_partition_the_sweep_attempts() {
         .expect("enable");
 
     for days in [20_i64, 21, 22, 23] {
-        let ts = Utc::now() - chrono::Duration::days(days);
+        let ts = Timestamp::now() - autumn_harvest::time::days(days);
         let exec = insert_execution(&mut conn, "pinned_wf", &format!("pr-{days}"), ts, None).await;
         autumn_harvest::store::append_events(
             &mut conn,
@@ -9413,7 +9414,7 @@ async fn maintain_with_progress_ticks_once_per_partition_the_sweep_attempts() {
     let mut ticks = 0usize;
     let outcome = partition::maintain_with_progress(
         &mut conn,
-        Utc::now(),
+        Timestamp::now(),
         0,
         &SweepOptions::default(),
         None,
@@ -9500,7 +9501,7 @@ async fn maintain_with_progress_ticks_during_the_default_partition_drain_too() {
     let mut ticks = 0usize;
     let outcome = partition::maintain_with_progress(
         &mut conn,
-        Utc::now(),
+        Timestamp::now(),
         0,
         &SweepOptions::default(),
         None,
@@ -9549,7 +9550,7 @@ async fn maintain_with_progress_ticks_while_extending_the_lookahead_window() {
     let mut ticks = 0usize;
     let outcome = partition::maintain_with_progress(
         &mut conn,
-        Utc::now(),
+        Timestamp::now(),
         lookahead_cohorts,
         &SweepOptions::default(),
         None,
@@ -9587,7 +9588,7 @@ async fn seed_pinning_execution(
     workflow_id: &str,
     days_ago: i64,
 ) -> uuid::Uuid {
-    let ts = Utc::now() - chrono::Duration::days(days_ago);
+    let ts = Timestamp::now() - autumn_harvest::time::days(days_ago);
     let exec = insert_execution(conn, "catchup_wf", workflow_id, ts, None).await;
     autumn_harvest::store::append_events(conn, ExecutionId::from_uuid(exec), &sample_events(), 0)
         .await
@@ -9614,8 +9615,8 @@ async fn collect_pinning_executions(conn: &mut AsyncPgConnection, execs: &[uuid:
 async fn drain_catch_up_cycle(
     conn: &mut AsyncPgConnection,
     opts: &SweepOptions,
-    mut resume_after: Option<DateTime<Utc>>,
-    mut catch_up_target: Option<DateTime<Utc>>,
+    mut resume_after: Option<Timestamp>,
+    mut catch_up_target: Option<Timestamp>,
     target_total: usize,
     max_passes: usize,
 ) -> usize {
@@ -9624,7 +9625,7 @@ async fn drain_catch_up_cycle(
         if dropped_total == target_total {
             break;
         }
-        let now = Utc::now();
+        let now = Timestamp::now();
         let outcome = partition::maintain(conn, now, 0, opts, resume_after, catch_up_target)
             .await
             .expect("catch-up pass");
@@ -9673,7 +9674,7 @@ async fn catch_up_target_bounds_the_resume_cycle_when_the_backlog_outgrows_the_b
     // truncates on budget with two more already-eligible partitions
     // (day -3, day -2) still unvisited. This is the first pass of a
     // catch-up cycle: it must snapshot a target and return it.
-    let now_1 = Utc::now();
+    let now_1 = Timestamp::now();
     let outcome_1 = partition::maintain(&mut conn, now_1, 0, &opts, None, None)
         .await
         .expect("pass 1");
@@ -9695,7 +9696,7 @@ async fn catch_up_target_bounds_the_resume_cycle_when_the_backlog_outgrows_the_b
     // Pass 2: a later `now`, with the freshly grown backlog. Old code
     // would recompute this pass's own target as ITS OWN `now`, every
     // time. The fix must keep the ORIGINAL target from pass 1 instead.
-    let now_2 = Utc::now();
+    let now_2 = Timestamp::now();
     assert!(now_2 > now_1, "precondition: real time advanced");
     let outcome_2 = partition::maintain(
         &mut conn,
@@ -9842,7 +9843,7 @@ async fn a_large_default_backlog_drains_in_bounded_passes() {
         "every parked row must end up in a real cohort partition"
     );
     // And the layout is still sound: DEFAULT re-attached, appends still route.
-    let live = insert_execution(&mut conn, "drain_wf", "drain-live", Utc::now(), None).await;
+    let live = insert_execution(&mut conn, "drain_wf", "drain-live", Timestamp::now(), None).await;
     autumn_harvest::store::append_events(
         &mut conn,
         ExecutionId::from_uuid(live),
@@ -9982,7 +9983,7 @@ async fn a_drain_pass_bounds_the_ddl_it_runs_under_the_parent_lock() {
         0,
         "every parked row must end up in a real cohort partition"
     );
-    let live = insert_execution(&mut conn, "drain_wf", "drain-ddl-live", Utc::now(), None).await;
+    let live = insert_execution(&mut conn, "drain_wf", "drain-ddl-live", Timestamp::now(), None).await;
     autumn_harvest::store::append_events(
         &mut conn,
         ExecutionId::from_uuid(live),
@@ -10056,7 +10057,7 @@ async fn converting_refuses_to_drop_the_row_security_it_cannot_carry() {
     assert_eq!(policies, vec!["harvest_events_tenant".to_string()]);
 
     // The scripted large-table path refuses in phase 1, before any index build.
-    let plan = partition::migration_plan_steps(&EnableOptions::default(), Utc::now());
+    let plan = partition::migration_plan_steps(&EnableOptions::default(), Timestamp::now());
     let guard = plan
         .iter()
         .find(|s| s.sql.contains("harvest_rls_958"))
@@ -10172,7 +10173,7 @@ async fn assert_guarded(conn: &mut AsyncPgConnection, exec: uuid::Uuid, layout: 
 }
 
 async fn seed_with_history(conn: &mut AsyncPgConnection, id: &str) -> uuid::Uuid {
-    let exec = insert_execution(conn, "guard_wf", id, Utc::now(), None).await;
+    let exec = insert_execution(conn, "guard_wf", id, Timestamp::now(), None).await;
     autumn_harvest::store::append_events(conn, ExecutionId::from_uuid(exec), &sample_events(), 0)
         .await
         .expect("seed history");
@@ -10302,7 +10303,7 @@ async fn the_append_only_guard_survives_a_default_partition_drain() {
     // Park rows in DEFAULT, then drain them. The drain detaches and
     // re-attaches DEFAULT, which drops and re-clones its triggers.
     let today = partition::partition_name(partition::cohort_start(
-        Utc::now(),
+        Timestamp::now(),
         partition::DEFAULT_COHORT_WIDTH_SECS,
     ));
     diesel::sql_query(format!("DROP TABLE {today}"))

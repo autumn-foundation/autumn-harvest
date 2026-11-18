@@ -47,7 +47,7 @@ use autumn_harvest::execution::{
     WorkflowCountDimension, WorkflowCountQuery, WorkflowCountRow, count_workflow_executions_grouped,
 };
 use autumn_harvest::worker::DbPool;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use futures::future::join_all;
 use serde::Serialize;
 
@@ -96,7 +96,7 @@ pub struct WorkflowCountResponse {
     pub status: WorkflowCountReportStatus,
     /// When the snapshot was assembled. Eventually-consistent point-in-time —
     /// no replay or ordering guarantee under concurrent writes.
-    pub as_of: DateTime<Utc>,
+    pub as_of: Timestamp,
     /// Returned groups, ordered by descending count.
     pub groups: Vec<WorkflowCountGroupEntry>,
     /// Total executions matching the filters, summed across inspected shards
@@ -119,9 +119,9 @@ pub struct WorkflowCountParams {
     /// Filter: restrict to these states (empty = all states).
     pub states: Vec<String>,
     /// Filter: inclusive lower bound on `started_at`.
-    pub started_after: Option<DateTime<Utc>>,
+    pub started_after: Option<Timestamp>,
     /// Filter: inclusive upper bound on `started_at`.
-    pub started_before: Option<DateTime<Utc>>,
+    pub started_before: Option<Timestamp>,
     /// Cap on returned groups; long tail rolls into `other`.
     pub limit_groups: u32,
 }
@@ -205,25 +205,23 @@ impl WorkflowCountParams {
                     }
                 }
                 "started_after" => {
-                    let dt = DateTime::parse_from_rfc3339(value.trim())
+                    let dt = value.trim().parse::<Timestamp>()
                         .map_err(|_| {
                             format!(
                                 "invalid started_after '{value}'; expected RFC 3339 \
                                  (e.g. 2026-01-01T00:00:00Z)"
                             )
-                        })?
-                        .with_timezone(&Utc);
+                        })?;
                     params.started_after = Some(dt);
                 }
                 "started_before" => {
-                    let dt = DateTime::parse_from_rfc3339(value.trim())
+                    let dt = value.trim().parse::<Timestamp>()
                         .map_err(|_| {
                             format!(
                                 "invalid started_before '{value}'; expected RFC 3339 \
                                  (e.g. 2026-01-01T00:00:00Z)"
                             )
-                        })?
-                        .with_timezone(&Utc);
+                        })?;
                     params.started_before = Some(dt);
                 }
                 "limit_groups" => {
@@ -267,7 +265,7 @@ type CountKey = (Option<String>, Option<String>);
 #[must_use]
 #[allow(clippy::needless_pass_by_value)]
 pub fn build_count_response(
-    as_of: DateTime<Utc>,
+    as_of: Timestamp,
     limit_groups: usize,
     observations: Vec<ShardObservation<WorkflowCountRow>>,
 ) -> WorkflowCountResponse {
@@ -349,7 +347,7 @@ pub async fn build_workflow_count_report(
     api_state: &HarvestApiState,
     params: WorkflowCountParams,
 ) -> WorkflowCountResponse {
-    let as_of = Utc::now();
+    let as_of = Timestamp::now();
     let pools = shard_fanout::pools_by_shard(api_state);
     let expected = shard_fanout::expected_shards(api_state, &pools);
     let limit_groups = params.limit_groups as usize;
@@ -377,10 +375,10 @@ pub async fn build_workflow_count_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone as _;
+    use jiff::Timestamp;
 
-    fn at(seconds: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(seconds, 0).unwrap()
+    fn at(seconds: i64) -> Timestamp {
+        Timestamp::new(seconds, 0).unwrap()
     }
 
     fn row(state: Option<&str>, workflow_name: Option<&str>, count: i64) -> WorkflowCountRow {

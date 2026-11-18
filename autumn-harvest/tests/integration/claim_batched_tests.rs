@@ -623,7 +623,7 @@ async fn batched_claim_attempt_rejects_a_deadline_that_passed_mid_transaction() 
     params.activity_id = Some(Uuid::new_v4());
     // Due already, with a deadline 300ms out -- comfortably true at
     // enqueue time, and at the transaction's own BEGIN moments later.
-    let deadline = chrono::Utc::now() + chrono::Duration::milliseconds(300);
+    let deadline = jiff::Timestamp::now() + jiff::SignedDuration::from_millis(300);
     params.schedule_to_close_at = Some(deadline);
     let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
 
@@ -708,7 +708,7 @@ async fn batched_claim_attempt_never_debits_rate_limit_for_a_candidate_past_its_
     params.activity_name = Some("noop".to_string());
     params.activity_id = Some(Uuid::new_v4());
     params.rate_limit_key = Some(bucket_key.clone());
-    let deadline = chrono::Utc::now() + chrono::Duration::milliseconds(300);
+    let deadline = jiff::Timestamp::now() + jiff::SignedDuration::from_millis(300);
     params.schedule_to_close_at = Some(deadline);
     let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
 
@@ -845,7 +845,7 @@ async fn batched_claim_attempt_never_debits_rate_limit_for_a_build_incompatible_
                             &Vec::<String>::new(),
                         )
                         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-                            None::<chrono::DateTime<chrono::Utc>>,
+                            None::<jiff::Timestamp>,
                         )
                         .bind::<diesel::sql_types::Text, _>(&worker_build)
                         .load(conn)
@@ -950,7 +950,7 @@ async fn batched_claim_attempt_never_debits_rate_limit_for_a_capability_mismatch
                             &Vec::<String>::new(),
                         )
                         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-                            None::<chrono::DateTime<chrono::Utc>>,
+                            None::<jiff::Timestamp>,
                         )
                         .bind::<diesel::sql_types::Text, _>("")
                         .load(conn)
@@ -1060,7 +1060,7 @@ async fn batched_claim_attempt_rechecks_capability_labels_not_just_the_batch_sca
                             &Vec::<String>::new(),
                         )
                         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-                            None::<chrono::DateTime<chrono::Utc>>,
+                            None::<jiff::Timestamp>,
                         )
                         .bind::<diesel::sql_types::Text, _>("")
                         .load(conn)
@@ -1190,14 +1190,15 @@ async fn batched_claim_attempt_stamps_started_at_with_real_time_not_frozen_now()
     params.activity_id = Some(Uuid::new_v4());
     let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
 
-    let before_sleep = chrono::Utc::now();
+    let before_sleep = jiff::Timestamp::now();
 
     #[derive(diesel::QueryableByName)]
     struct ClaimedRow {
         #[diesel(sql_type = diesel::sql_types::Uuid)]
         id: Uuid,
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-        started_at: Option<chrono::DateTime<chrono::Utc>>,
+        #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+        started_at: Option<jiff::Timestamp>,
     }
 
     let mut tx = conn.build_transaction().read_committed();
@@ -1231,7 +1232,7 @@ async fn batched_claim_attempt_stamps_started_at_with_real_time_not_frozen_now()
                             &Vec::<String>::new(),
                         )
                         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-                            None::<chrono::DateTime<chrono::Utc>>,
+                            None::<jiff::Timestamp>,
                         )
                         .bind::<diesel::sql_types::Text, _>("")
                         .load(conn)
@@ -1245,7 +1246,7 @@ async fn batched_claim_attempt_stamps_started_at_with_real_time_not_frozen_now()
     assert_eq!(claimed.id, task_id);
     let started_at = claimed.started_at.expect("started_at must be set on claim");
     assert!(
-        started_at > before_sleep + chrono::Duration::milliseconds(400),
+        started_at > before_sleep + jiff::SignedDuration::from_millis(400),
         "started_at must reflect the real time of the claim, after the \
          600ms in-transaction sleep -- a frozen NOW() would stamp it near \
          before_sleep instead; before_sleep={before_sleep}, \
@@ -1284,7 +1285,7 @@ async fn batched_claim_attempt_rejects_a_deadline_that_passes_while_waiting_on_t
     params.activity_id = Some(Uuid::new_v4());
     params.rate_limit_key = Some(bucket_key.clone());
     // Expires well before the locker below releases the bucket row.
-    let deadline = chrono::Utc::now() + chrono::Duration::milliseconds(500);
+    let deadline = jiff::Timestamp::now() + jiff::SignedDuration::from_millis(500);
     params.schedule_to_close_at = Some(deadline);
     let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
 
@@ -1478,7 +1479,7 @@ async fn batched_claim_attempt_skips_the_bucket_lock_for_a_circuit_breaker_activ
                             "breaker-bypassed".to_string(),
                         ])
                         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-                            None::<chrono::DateTime<chrono::Utc>>,
+                            None::<jiff::Timestamp>,
                         )
                         .bind::<diesel::sql_types::Text, _>("")
                         .load(conn)
@@ -1555,7 +1556,7 @@ async fn batched_claim_skips_the_bucket_lock_for_a_candidate_already_past_its_de
     params_b.activity_id = Some(Uuid::new_v4());
     params_b.priority = 1;
     params_b.rate_limit_key = Some(bucket_b.clone());
-    params_b.schedule_to_close_at = Some(chrono::Utc::now() + chrono::Duration::milliseconds(300));
+    params_b.schedule_to_close_at = Some(jiff::Timestamp::now() + jiff::SignedDuration::from_millis(300));
     let task_b = queue::enqueue(&mut conn, &params_b)
         .await
         .expect("enqueue b");
@@ -1738,7 +1739,7 @@ async fn batched_claim_attempt_skips_the_bucket_lock_for_a_build_incompatible_ca
                             &Vec::<String>::new(),
                         )
                         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-                            None::<chrono::DateTime<chrono::Utc>>,
+                            None::<jiff::Timestamp>,
                         )
                         .bind::<diesel::sql_types::Text, _>(&worker_build)
                         .load(conn)
@@ -1790,7 +1791,7 @@ async fn batched_claim_attempt_stamps_last_refilled_at_with_real_time_not_frozen
     params.rate_limit_key = Some(bucket_key.clone());
     let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
 
-    let before_sleep = chrono::Utc::now();
+    let before_sleep = jiff::Timestamp::now();
 
     #[derive(diesel::QueryableByName)]
     struct ClaimedId {
@@ -1829,7 +1830,7 @@ async fn batched_claim_attempt_stamps_last_refilled_at_with_real_time_not_frozen
                             &Vec::<String>::new(),
                         )
                         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-                            None::<chrono::DateTime<chrono::Utc>>,
+                            None::<jiff::Timestamp>,
                         )
                         .bind::<diesel::sql_types::Text, _>("")
                         .load(conn)
@@ -1845,7 +1846,8 @@ async fn batched_claim_attempt_stamps_last_refilled_at_with_real_time_not_frozen
     #[derive(diesel::QueryableByName)]
     struct RefilledAt {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        last_refilled_at: chrono::DateTime<chrono::Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        last_refilled_at: jiff::Timestamp,
     }
     let final_refilled_at =
         diesel::sql_query("SELECT last_refilled_at FROM harvest_rate_limit_buckets WHERE key = $1")
@@ -1856,7 +1858,7 @@ async fn batched_claim_attempt_stamps_last_refilled_at_with_real_time_not_frozen
             .last_refilled_at;
 
     assert!(
-        final_refilled_at > before_sleep + chrono::Duration::milliseconds(400),
+        final_refilled_at > before_sleep + jiff::SignedDuration::from_millis(400),
         "last_refilled_at must reflect the real time of the debit, \
          after the 600ms in-transaction sleep -- a frozen NOW() would \
          stamp it near before_sleep instead; before_sleep={before_sleep}, \
@@ -1928,7 +1930,7 @@ async fn batched_claim_attempt_rechecks_build_routing_not_just_the_batch_scan() 
                             &Vec::<String>::new(),
                         )
                         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-                            None::<chrono::DateTime<chrono::Utc>>,
+                            None::<jiff::Timestamp>,
                         )
                         .bind::<diesel::sql_types::Text, _>(worker_build_id)
                         .load(conn)

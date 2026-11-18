@@ -62,7 +62,7 @@ use std::time::Duration;
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
@@ -1771,7 +1771,7 @@ pub fn build_history(n: usize) -> (ExecutionId, Vec<WorkflowEvent>) {
 
     events.push(WorkflowEvent::WorkflowStarted {
         input: Value::from(n as u64),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -3009,7 +3009,7 @@ pub mod db {
     use std::sync::{Arc, Mutex, OnceLock, PoisonError};
     use std::time::Instant;
 
-    use chrono::{DateTime, Utc};
+    use jiff::Timestamp;
     use diesel::QueryableByName;
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
     use testcontainers::ContainerAsync;
@@ -3649,7 +3649,7 @@ pub mod db {
     pub struct BenchObservations {
         /// `(harvest_task_queue.id, handler-entry host clock)` for every
         /// dispatched activity.
-        activity_starts: Mutex<Vec<(Uuid, DateTime<Utc>)>>,
+        activity_starts: Mutex<Vec<(Uuid, Timestamp)>>,
         /// Execution id -> the first instant the workflow's own code ran past
         /// `wait_for_signal`. First-wins, so a later replay of the same code
         /// cannot move an already-recorded observation.
@@ -3664,7 +3664,7 @@ pub mod db {
 
     impl BenchObservations {
         #[must_use]
-        pub fn activity_starts(&self) -> Vec<(Uuid, DateTime<Utc>)> {
+        pub fn activity_starts(&self) -> Vec<(Uuid, Timestamp)> {
             self.activity_starts.lock().expect("poisoned").clone()
         }
 
@@ -3695,7 +3695,7 @@ pub mod db {
             self.activity_starts
                 .lock()
                 .expect("poisoned")
-                .push((task_id, Utc::now()));
+                .push((task_id, Timestamp::now()));
         }
 
         fn record_parked(&self, exec_id: Uuid) {
@@ -4468,7 +4468,8 @@ pub mod db {
     #[derive(QueryableByName)]
     struct CompletionRow {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        completed_at: DateTime<Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        completed_at: Timestamp,
     }
 
     #[derive(QueryableByName)]
@@ -4476,13 +4477,15 @@ pub mod db {
         #[diesel(sql_type = diesel::sql_types::Uuid)]
         id: Uuid,
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-        created_at: Option<DateTime<Utc>>,
+        #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+        created_at: Option<Timestamp>,
     }
 
     #[derive(QueryableByName)]
     struct NowRow {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        now: DateTime<Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        now: Timestamp,
     }
 
     async fn completed_count(conn: &mut AsyncPgConnection, cohort: &str) -> i64 {
@@ -4497,7 +4500,7 @@ pub mod db {
         .n
     }
 
-    async fn completion_times(conn: &mut AsyncPgConnection, cohort: &str) -> Vec<DateTime<Utc>> {
+    async fn completion_times(conn: &mut AsyncPgConnection, cohort: &str) -> Vec<Timestamp> {
         diesel::sql_query(
             "SELECT completed_at FROM harvest_workflow_executions \
              WHERE state = 'COMPLETED' AND completed_at IS NOT NULL AND workflow_id LIKE $1 \
@@ -4520,18 +4523,18 @@ pub mod db {
     pub async fn clock_offset_ms(conn: &mut AsyncPgConnection) -> f64 {
         let mut samples = Vec::new();
         for _ in 0..7 {
-            let before = Utc::now();
+            let before = Timestamp::now();
             let row = diesel::sql_query("SELECT now() AS now")
                 .get_result::<NowRow>(conn)
                 .await
                 .expect("probe database clock");
-            let after = Utc::now();
+            let after = Timestamp::now();
             let midpoint = before + (after - before) / 2;
             #[allow(
                 clippy::cast_precision_loss,
                 reason = "microsecond offsets on one host are far below 2^53"
             )]
-            let offset = (row.now - midpoint).num_microseconds().unwrap_or(0) as f64 / 1000.0;
+            let offset = autumn_harvest::time::num_microseconds((row.now - midpoint)).unwrap_or(0) as f64 / 1000.0;
             samples.push(offset);
         }
         samples.sort_by(f64::total_cmp);
@@ -4955,7 +4958,7 @@ pub mod db {
 
         // Completion instants come from the database clock (`completed_at`), so
         // the throughput headline carries no host-to-database skew term at all.
-        let mut completions: Vec<DateTime<Utc>> = Vec::new();
+        let mut completions: Vec<Timestamp> = Vec::new();
         let mut per_shard = Vec::new();
         for shard in &shards {
             let mut conn = cluster.connect(*shard).await;
@@ -4982,7 +4985,7 @@ pub mod db {
                         reason = "a run lasts seconds; microsecond counts stay far below 2^53"
                     )]
                     {
-                        (*t - start).num_microseconds().unwrap_or(0) as f64 / 1e6
+                        autumn_harvest::time::num_microseconds((*t - start)).unwrap_or(0) as f64 / 1e6
                     }
                 })
                 .collect()
@@ -5360,7 +5363,7 @@ pub mod db {
         // a capability release) would then sample the whole re-delivery delay.
         // That silently inflates the tail. Duplicates are counted instead, and
         // reported.
-        let mut starts: BTreeMap<Uuid, DateTime<Utc>> = BTreeMap::new();
+        let mut starts: BTreeMap<Uuid, Timestamp> = BTreeMap::new();
         let mut redispatched = 0_usize;
         for (task_id, started) in observations.activity_starts() {
             if starts.insert(task_id, started).is_some() {
@@ -5373,7 +5376,7 @@ pub mod db {
             }
         }
 
-        let mut samples: Vec<(DateTime<Utc>, f64)> = Vec::new();
+        let mut samples: Vec<(Timestamp, f64)> = Vec::new();
         let mut negative = 0_usize;
         let mut missing_created_at = 0_usize;
         let mut offsets = Vec::new();
@@ -5399,7 +5402,7 @@ pub mod db {
                         reason = "dispatch latencies are milliseconds, far below 2^53 microseconds"
                     )]
                     let ms =
-                        (*started - created_at).num_microseconds().unwrap_or(0) as f64 / 1000.0;
+                        autumn_harvest::time::num_microseconds((*started - created_at)).unwrap_or(0) as f64 / 1000.0;
                     if ms < 0.0 {
                         negative += 1;
                     }

@@ -635,7 +635,7 @@ async fn postgres_refuses_an_auto_move_over_a_stale_policy() {
         expected: None,
         actor: "00000000-0000-0000-0000-000000000001",
         cap: None,
-        at: Utc::now(),
+        at: Timestamp::now(),
         policy_revision,
     };
     for stale in [None, Some(2)] {

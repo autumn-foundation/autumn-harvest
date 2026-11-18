@@ -188,7 +188,7 @@ async fn timed_workflow(ctx: &WorkflowContext) -> Result<Value, String> {
 
 #[update(workflow = "timed_workflow")]
 async fn clock(ctx: &WorkflowContext) -> Result<String, String> {
-    Ok(ctx.now().to_rfc3339())
+    Ok(autumn_harvest::time::rfc3339(ctx.now()))
 }
 
 fn string_schema() -> Value {
@@ -248,7 +248,7 @@ async fn signal_sent_after_block_unblocks_the_workflow() {
         outcome.result,
         Ok(json!({ "approve": { "by": "alice" }, "confirm": "yes" }))
     );
-    assert_eq!(outcome.elapsed().num_seconds(), 3600);
+    assert_eq!(outcome.elapsed().as_secs(), 3600);
     let report = outcome.replay_check(approval_workflow).await;
     assert!(
         matches!(report.status, ReplayStatus::ReplaySucceeded),
@@ -402,13 +402,13 @@ async fn update_timestamp_follows_the_virtual_clock() {
     run.signal("approve", json!(1)).expect("signal");
     assert_eq!(run.run_until_blocked().await, TestRunStatus::Blocked);
 
-    assert_eq!(run.now(), env.now() + chrono::Duration::hours(1));
+    assert_eq!(run.now(), env.now() + jiff::SignedDuration::from_hours(1));
     run.update("set_limit", json!(2)).await.expect("update");
     let stamp = run.events().iter().find_map(|e| match e {
         WorkflowEvent::UpdateAdmitted { timestamp, .. } => Some(*timestamp),
         _ => None,
     });
-    assert_eq!(stamp, Some(env.now() + chrono::Duration::hours(1)));
+    assert_eq!(stamp, Some(env.now() + jiff::SignedDuration::from_hours(1)));
 }
 
 /// Declarative `#[query]` and `#[update]` handlers work when the env
@@ -567,8 +567,8 @@ async fn declarative_update_handler_sees_the_virtual_clock() {
     assert_eq!(run.run_until_blocked().await, TestRunStatus::Blocked);
 
     let seen = run.update("clock", json!(null)).await.expect("update");
-    assert_eq!(seen, json!(run.now().to_rfc3339()));
-    assert_eq!(run.now(), env.now() + chrono::Duration::hours(1));
+    assert_eq!(seen, json!(autumn_harvest::time::rfc3339(run.now())));
+    assert_eq!(run.now(), env.now() + jiff::SignedDuration::from_hours(1));
 }
 
 // ─────────────────────────────── queries ─────────────────────────────────────

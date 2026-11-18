@@ -951,7 +951,7 @@ pub async fn agent_consolidate_turn(
 ) -> Result<ConsolidateFacts, String> {
     let harness = harness(ctx)?;
     let check = Box::new(|| Box::pin(ctx.check_llm_budget()) as BoxFuture<'_, _>);
-    let (facts, calls) = run_turn(harness, turn, check, autumn_harvest::chrono::Utc::now()).await;
+    let (facts, calls) = run_turn(harness, turn, check, autumn_harvest::jiff::Timestamp::now()).await;
     for call in calls {
         if let Err(err) = ctx.record_llm_call(call) {
             tracing::warn!(error = %err, "the agent cost ledger refused a pass turn");
@@ -1287,7 +1287,7 @@ mod tests {
             let mut capped = turn();
             capped.max_output_tokens = cap;
             let (facts, _) =
-                run_turn(&harness, capped, pass, autumn_harvest::chrono::Utc::now()).await;
+                run_turn(&harness, capped, pass, autumn_harvest::jiff::Timestamp::now()).await;
             assert!(facts.is_ok());
             assert_eq!(*spy.0.lock().unwrap(), vec![cap]);
         }
@@ -1308,7 +1308,7 @@ mod tests {
             })
         });
         let (facts, calls) =
-            run_turn(&harness, turn(), zero, autumn_harvest::chrono::Utc::now()).await;
+            run_turn(&harness, turn(), zero, autumn_harvest::jiff::Timestamp::now()).await;
         let payload = facts.unwrap_err();
         let failure = autumn_harvest::failure::parse_typed_payload(&payload).unwrap();
         assert_eq!(
@@ -1325,7 +1325,7 @@ mod tests {
         let harness = AgentHarness::new(model.clone());
         let pass: crate::score::BudgetCheck<'_> = Box::new(|| Box::pin(async { Ok(()) }));
         let (facts, calls) =
-            run_turn(&harness, turn(), pass, autumn_harvest::chrono::Utc::now()).await;
+            run_turn(&harness, turn(), pass, autumn_harvest::jiff::Timestamp::now()).await;
         let facts = facts.unwrap();
         assert_eq!(facts.facts, Some(Vec::new()));
         assert_eq!(facts.usage, TokenUsage::new(5, 2));
@@ -1354,7 +1354,7 @@ mod tests {
     async fn turn_of(text: &'static str, stop: StopReason) -> ConsolidateFacts {
         let harness = AgentHarness::new(Arc::new(Fixed(text, stop)));
         let pass: crate::score::BudgetCheck<'_> = Box::new(|| Box::pin(async { Ok(()) }));
-        let (facts, _) = run_turn(&harness, turn(), pass, autumn_harvest::chrono::Utc::now()).await;
+        let (facts, _) = run_turn(&harness, turn(), pass, autumn_harvest::jiff::Timestamp::now()).await;
         facts.unwrap()
     }
 
@@ -1419,7 +1419,7 @@ mod tests {
         let mut unknown = turn();
         unknown.model = Some("nope".to_owned());
         let (facts, calls) =
-            run_turn(&harness, unknown, never, autumn_harvest::chrono::Utc::now()).await;
+            run_turn(&harness, unknown, never, autumn_harvest::jiff::Timestamp::now()).await;
         assert!(facts.unwrap_err().contains("UnknownModel"));
         assert_eq!(calls.len(), 0);
     }

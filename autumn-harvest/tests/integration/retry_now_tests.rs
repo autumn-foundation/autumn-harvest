@@ -7,7 +7,7 @@
 
 use autumn_harvest::queue::{self, EnqueueParams, TaskType, force_retry_activity_now};
 use autumn_harvest::schema::harvest_task_queue;
-use chrono::{Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use diesel::ExpressionMethods;
 use diesel::QueryDsl;
 use diesel_async::AsyncPgConnection;
@@ -78,7 +78,7 @@ async fn enqueue_backing_off_activity(
     params.workflow_exec_id = Some(workflow_exec_id);
     params.activity_name = Some("test_activity".to_string());
     // Future scheduled_at simulates a backing-off retry.
-    params.scheduled_at = Utc::now() + Duration::seconds(backoff_delay_secs);
+    params.scheduled_at = Timestamp::now() + SignedDuration::from_secs(backoff_delay_secs);
     params.max_attempts = 5;
 
     queue::enqueue(conn, &params)
@@ -113,16 +113,16 @@ async fn backing_off_task_is_advanced_to_now() {
 
     let task_id = enqueue_backing_off_activity(&mut conn, workflow_exec_id, 300).await;
 
-    let before = Utc::now();
+    let before = Timestamp::now();
     let outcome = force_retry_activity_now(&mut conn, workflow_exec_id, task_id)
         .await
         .expect("force_retry_activity_now should succeed for a backing-off task");
-    let after = Utc::now();
+    let after = Timestamp::now();
 
     assert!(outcome.advanced, "backing-off task should be advanced");
     assert!(
-        outcome.scheduled_at >= before - Duration::seconds(15)
-            && outcome.scheduled_at <= after + Duration::seconds(5),
+        outcome.scheduled_at >= before - SignedDuration::from_secs(15)
+            && outcome.scheduled_at <= after + SignedDuration::from_secs(5),
         "scheduled_at should be near now, got {:?}",
         outcome.scheduled_at
     );

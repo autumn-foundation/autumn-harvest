@@ -16,7 +16,7 @@ use autumn_harvest_redis::{
     RedisDispatch, RedisDispatchConfig, dispatch_delayed_key, dispatch_marker_key,
     dispatch_stream_key,
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use redis::AsyncCommands;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::redis::{REDIS_PORT, Redis};
@@ -120,7 +120,7 @@ async fn try_start(visibility_timeout: Duration) -> Option<Fixture> {
     })
 }
 
-fn hint(queue: &str, task_id: Uuid, scheduled_at: DateTime<Utc>) -> DispatchHint {
+fn hint(queue: &str, task_id: Uuid, scheduled_at: Timestamp) -> DispatchHint {
     DispatchHint {
         task_id,
         queue_name: queue.to_string(),
@@ -150,7 +150,7 @@ async fn publish_then_next_round_trips_a_hint() {
 
     fixture
         .dispatch
-        .publish(&[hint("default", task_id, Utc::now())])
+        .publish(&[hint("default", task_id, Timestamp::now())])
         .await
         .expect("publish");
 
@@ -172,7 +172,7 @@ async fn duplicate_publish_is_a_no_op() {
     };
     let queues = vec!["default".to_string()];
     let task_id = Uuid::new_v4();
-    let hint = hint("default", task_id, Utc::now());
+    let hint = hint("default", task_id, Timestamp::now());
 
     let batch = std::slice::from_ref(&hint);
     fixture.dispatch.publish(batch).await.expect("one");
@@ -201,7 +201,7 @@ async fn a_future_hint_is_invisible_until_due() {
         .publish(&[hint(
             "delayed",
             task_id,
-            Utc::now() + chrono::Duration::milliseconds(400),
+            Timestamp::now() + jiff::SignedDuration::from_millis(400),
         )])
         .await
         .expect("publish");
@@ -230,7 +230,7 @@ async fn a_due_hint_is_promoted_after_the_server_forgets_the_script() {
         .publish(&[hint(
             "flushed",
             task_id,
-            Utc::now() + chrono::Duration::milliseconds(200),
+            Timestamp::now() + jiff::SignedDuration::from_millis(200),
         )])
         .await
         .expect("publish");
@@ -267,7 +267,7 @@ async fn an_earlier_due_time_moves_a_delayed_entry_forward() {
         .publish(&[hint(
             "timers",
             task_id,
-            Utc::now() + chrono::Duration::seconds(3600),
+            Timestamp::now() + jiff::SignedDuration::from_secs(3600),
         )])
         .await
         .expect("park");
@@ -280,7 +280,7 @@ async fn an_earlier_due_time_moves_a_delayed_entry_forward() {
     // entry moves out of the delayed set and onto the stream.
     fixture
         .dispatch
-        .publish(&[hint("timers", task_id, Utc::now())])
+        .publish(&[hint("timers", task_id, Timestamp::now())])
         .await
         .expect("move forward");
 
@@ -306,7 +306,7 @@ async fn a_retry_moves_a_held_entry_later() {
         .publish(&[hint(
             "timers",
             task_id,
-            Utc::now() + chrono::Duration::milliseconds(300),
+            Timestamp::now() + jiff::SignedDuration::from_millis(300),
         )])
         .await
         .expect("park");
@@ -317,7 +317,7 @@ async fn a_retry_moves_a_held_entry_later() {
         .publish(&[hint(
             "timers",
             task_id,
-            Utc::now() + chrono::Duration::seconds(3600),
+            Timestamp::now() + jiff::SignedDuration::from_secs(3600),
         )])
         .await
         .expect("later");
@@ -337,7 +337,7 @@ async fn a_reconcile_republish_leaves_a_backed_off_entry_alone() {
     let queues = vec!["gated".to_string()];
     let task_id = Uuid::new_v4();
     // The row's due time. Every republish of this row carries it again.
-    let scheduled_at = Utc::now();
+    let scheduled_at = Timestamp::now();
 
     fixture
         .dispatch
@@ -380,7 +380,7 @@ async fn a_wake_moves_a_backed_off_entry_forward() {
     };
     let queues = vec!["waking".to_string()];
     let task_id = Uuid::new_v4();
-    let scheduled_at = Utc::now();
+    let scheduled_at = Timestamp::now();
 
     fixture
         .dispatch
@@ -402,7 +402,7 @@ async fn a_wake_moves_a_backed_off_entry_forward() {
     // A signal moves the row's `scheduled_at`, so the reference moves too.
     fixture
         .dispatch
-        .publish(&[hint("waking", task_id, Utc::now())])
+        .publish(&[hint("waking", task_id, Timestamp::now())])
         .await
         .expect("wake");
 
@@ -427,8 +427,8 @@ async fn one_read_spans_two_queues() {
     fixture
         .dispatch
         .publish(&[
-            hint("alpha", alpha, Utc::now()),
-            hint("beta", beta, Utc::now()),
+            hint("alpha", alpha, Timestamp::now()),
+            hint("beta", beta, Timestamp::now()),
         ])
         .await
         .expect("publish");
@@ -450,7 +450,7 @@ async fn release_with_delay_hides_the_entry_and_counts_a_redelivery() {
 
     fixture
         .dispatch
-        .publish(&[hint("gated", task_id, Utc::now())])
+        .publish(&[hint("gated", task_id, Timestamp::now())])
         .await
         .expect("publish");
     let leases = read(&fixture, &queues, 10).await;
@@ -478,7 +478,7 @@ async fn release_with_delay_hides_the_entry_and_counts_a_redelivery() {
     assert_eq!(again[0].redeliveries, 1, "release counts one redelivery");
 }
 
-/// One lease's delay overflowing `chrono::Duration` must not skip its
+/// One lease's delay overflowing `jiff::SignedDuration` must not skip its
 /// siblings' release in the same batch (issue #1429 follow-up).
 ///
 /// `release_many_inner` used to build every entry's due time with a `?` on
@@ -486,7 +486,7 @@ async fn release_with_delay_hides_the_entry_and_counts_a_redelivery() {
 /// then aborted the whole call before `requeue_batch` ever ran, and every
 /// other, unrelated lease in the batch stayed pending until visibility
 /// recovery. This drives a batch with one ordinary lease and one whose delay
-/// `chrono::Duration` cannot represent, and asserts the ordinary lease
+/// `jiff::SignedDuration` cannot represent, and asserts the ordinary lease
 /// still gets released.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_leases_invalid_release_delay_does_not_block_its_siblings() {
@@ -499,12 +499,12 @@ async fn a_leases_invalid_release_delay_does_not_block_its_siblings() {
 
     fixture
         .dispatch
-        .publish(&[hint("healthy", healthy_task, Utc::now())])
+        .publish(&[hint("healthy", healthy_task, Timestamp::now())])
         .await
         .expect("publish healthy");
     fixture
         .dispatch
-        .publish(&[hint("overflow", overflow_task, Utc::now())])
+        .publish(&[hint("overflow", overflow_task, Timestamp::now())])
         .await
         .expect("publish overflow");
     let leases = read(&fixture, &queues, 10).await;
@@ -552,7 +552,7 @@ async fn ack_deletes_the_marker_so_a_republish_is_delivered() {
 
     fixture
         .dispatch
-        .publish(&[hint("acked", task_id, Utc::now())])
+        .publish(&[hint("acked", task_id, Timestamp::now())])
         .await
         .expect("publish");
     let leases = read(&fixture, &queues, 10).await;
@@ -576,7 +576,7 @@ async fn ack_deletes_the_marker_so_a_republish_is_delivered() {
 
     fixture
         .dispatch
-        .publish(&[hint("acked", task_id, Utc::now())])
+        .publish(&[hint("acked", task_id, Timestamp::now())])
         .await
         .expect("republish");
     let again = read(&fixture, &queues, 10).await;
@@ -600,7 +600,7 @@ async fn acking_a_stale_lease_leaves_a_fresher_entrys_marker_intact() {
     };
     let queues = vec!["acked".to_string()];
     let task_id = Uuid::new_v4();
-    let stale_due = Utc::now();
+    let stale_due = Timestamp::now();
 
     fixture
         .dispatch
@@ -614,7 +614,7 @@ async fn acking_a_stale_lease_leaves_a_fresher_entrys_marker_intact() {
     // stale lease above is acked, at a due time distinct from the first
     // publish. The old marker then reads as not intact, so this writes a
     // fresh entry and overwrites the marker to name it.
-    let fresh_due = stale_due + chrono::Duration::milliseconds(1);
+    let fresh_due = stale_due + jiff::SignedDuration::from_millis(1);
     fixture
         .dispatch
         .publish(&[hint("acked", task_id, fresh_due)])
@@ -671,7 +671,7 @@ async fn recovering_a_stale_lease_leaves_a_fresher_entrys_marker_intact() {
     };
     let queues = vec!["recovered-stale".to_string()];
     let task_id = Uuid::new_v4();
-    let stale_due = Utc::now();
+    let stale_due = Timestamp::now();
 
     fixture
         .dispatch
@@ -688,7 +688,7 @@ async fn recovering_a_stale_lease_leaves_a_fresher_entrys_marker_intact() {
     // here, so it never enters the pending entries list itself -- only the
     // stale lease read above does. Recovery's `XPENDING` scan must see
     // just that one idle entry.
-    let fresh_due = stale_due + chrono::Duration::milliseconds(1);
+    let fresh_due = stale_due + jiff::SignedDuration::from_millis(1);
     fixture
         .dispatch
         .publish(&[hint("recovered-stale", task_id, fresh_due)])
@@ -742,7 +742,7 @@ async fn maintain_recovers_an_unacked_lease_after_the_visibility_timeout() {
 
     fixture
         .dispatch
-        .publish(&[hint("crashed", task_id, Utc::now())])
+        .publish(&[hint("crashed", task_id, Timestamp::now())])
         .await
         .expect("publish");
     let leases = read(&fixture, &queues, 10).await;
@@ -775,12 +775,12 @@ async fn maintain_recovers_unacked_leases_across_several_queues_in_one_pass() {
 
     fixture
         .dispatch
-        .publish(&[hint("crashed-a", task_a, Utc::now())])
+        .publish(&[hint("crashed-a", task_a, Timestamp::now())])
         .await
         .expect("publish a");
     fixture
         .dispatch
-        .publish(&[hint("crashed-b", task_b, Utc::now())])
+        .publish(&[hint("crashed-b", task_b, Timestamp::now())])
         .await
         .expect("publish b");
     let leases = read(&fixture, &queues, 10).await;
@@ -823,12 +823,12 @@ async fn one_queues_broken_pending_scan_does_not_block_its_siblings_recovery() {
 
     fixture
         .dispatch
-        .publish(&[hint("healthy", healthy_task, Utc::now())])
+        .publish(&[hint("healthy", healthy_task, Timestamp::now())])
         .await
         .expect("publish healthy");
     fixture
         .dispatch
-        .publish(&[hint("broken", broken_task, Utc::now())])
+        .publish(&[hint("broken", broken_task, Timestamp::now())])
         .await
         .expect("publish broken");
     let leases = read(&fixture, &queues, 10).await;
@@ -888,7 +888,7 @@ async fn a_blocking_read_returns_early_when_an_entry_arrives() {
     let handle = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(200)).await;
         publisher
-            .publish(&[hint("blocking", task_id, Utc::now())])
+            .publish(&[hint("blocking", task_id, Timestamp::now())])
             .await
             .expect("publish");
     });
@@ -933,7 +933,7 @@ async fn a_multi_queue_blocking_read_still_delivers_an_arrival_on_either_queue()
     let handle = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(100)).await;
         publisher
-            .publish(&[hint("multi-b", task_id, Utc::now())])
+            .publish(&[hint("multi-b", task_id, Timestamp::now())])
             .await
             .expect("publish");
     });
@@ -972,7 +972,7 @@ async fn a_deleted_consumer_group_self_heals() {
 
     fixture
         .dispatch
-        .publish(&[hint("healing", task_id, Utc::now())])
+        .publish(&[hint("healing", task_id, Timestamp::now())])
         .await
         .expect("publish");
     fixture.destroy_group("healing").await;
@@ -999,7 +999,7 @@ async fn a_read_across_two_queues_returns_at_most_the_requested_count() {
             published.push(task_id);
             fixture
                 .dispatch
-                .publish(&[hint(queue, task_id, Utc::now())])
+                .publish(&[hint(queue, task_id, Timestamp::now())])
                 .await
                 .expect("publish");
         }
@@ -1061,7 +1061,7 @@ async fn a_busy_queue_gets_the_full_budget_among_idle_peers() {
         published.push(task_id);
         fixture
             .dispatch
-            .publish(&[hint("busy", task_id, Utc::now())])
+            .publish(&[hint("busy", task_id, Timestamp::now())])
             .await
             .expect("publish");
     }
@@ -1101,7 +1101,7 @@ async fn a_persistently_broken_queue_is_not_masked_by_a_healthy_sibling() {
 
     fixture
         .dispatch
-        .publish(&[hint("healthy", Uuid::new_v4(), Utc::now())])
+        .publish(&[hint("healthy", Uuid::new_v4(), Timestamp::now())])
         .await
         .expect("publish");
 
@@ -1178,7 +1178,7 @@ async fn every_queue_is_served_when_the_read_cap_is_one() {
     for queue in &queues {
         fixture
             .dispatch
-            .publish(&[hint(queue, Uuid::new_v4(), Utc::now())])
+            .publish(&[hint(queue, Uuid::new_v4(), Timestamp::now())])
             .await
             .expect("publish");
     }
@@ -1237,7 +1237,7 @@ async fn a_non_leader_queue_is_not_starved_behind_the_leaders_full_wait() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     fixture
         .dispatch
-        .publish(&[hint("second", Uuid::new_v4(), Utc::now())])
+        .publish(&[hint("second", Uuid::new_v4(), Timestamp::now())])
         .await
         .expect("publish");
 
@@ -1295,7 +1295,7 @@ async fn a_queue_near_the_tail_of_a_long_rotation_still_gets_a_blocking_look() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     fixture
         .dispatch
-        .publish(&[hint(&tail_queue, Uuid::new_v4(), Utc::now())])
+        .publish(&[hint(&tail_queue, Uuid::new_v4(), Timestamp::now())])
         .await
         .expect("publish");
 
@@ -1353,7 +1353,7 @@ async fn a_malformed_entry_leaves_the_pending_list() {
     // A real publish creates the consumer group the hand-written entries need.
     fixture
         .dispatch
-        .publish(&[hint("malformed", task_id, Utc::now())])
+        .publish(&[hint("malformed", task_id, Timestamp::now())])
         .await
         .expect("publish");
 
@@ -1427,12 +1427,12 @@ async fn malformed_entries_across_two_queues_are_both_discarded() {
     // hand-written entries need.
     fixture
         .dispatch
-        .publish(&[hint("malformed-a", task_a, Utc::now())])
+        .publish(&[hint("malformed-a", task_a, Timestamp::now())])
         .await
         .expect("publish a");
     fixture
         .dispatch
-        .publish(&[hint("malformed-b", task_b, Utc::now())])
+        .publish(&[hint("malformed-b", task_b, Timestamp::now())])
         .await
         .expect("publish b");
 
@@ -1478,7 +1478,7 @@ async fn the_recovery_pass_discards_a_malformed_entry() {
 
     fixture
         .dispatch
-        .publish(&[hint("recover_malformed", task_id, Utc::now())])
+        .publish(&[hint("recover_malformed", task_id, Timestamp::now())])
         .await
         .expect("publish");
     let leases = read(&fixture, &queues, 10).await;
@@ -1534,7 +1534,7 @@ async fn a_lease_carries_the_kind_of_its_hint() {
     let queues = vec!["typed".to_string()];
     let task_id = Uuid::new_v4();
 
-    let mut typed = hint("typed", task_id, Utc::now());
+    let mut typed = hint("typed", task_id, Timestamp::now());
     typed.kind = Some(autumn_harvest::dispatch::DispatchKind::Activity);
     fixture.dispatch.publish(&[typed]).await.expect("publish");
 
@@ -1560,7 +1560,7 @@ async fn a_republish_restores_a_stream_entry_that_vanished() {
     };
     let queues = vec!["vanished".to_string()];
     let task_id = Uuid::new_v4();
-    let due = Utc::now();
+    let due = Timestamp::now();
 
     fixture
         .dispatch
@@ -1617,7 +1617,7 @@ async fn a_republish_restores_a_parked_reference_that_vanished() {
     };
     let queues = vec!["parked".to_string()];
     let task_id = Uuid::new_v4();
-    let due = Utc::now() + chrono::Duration::milliseconds(400);
+    let due = Timestamp::now() + jiff::SignedDuration::from_millis(400);
 
     fixture
         .dispatch

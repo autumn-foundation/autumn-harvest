@@ -314,7 +314,7 @@ impl HarvestFleet {
     pub async fn restore(
         &self,
         key: &FleetDbKey,
-        target: Option<chrono::DateTime<chrono::Utc>>,
+        target: Option<jiff::Timestamp>,
     ) -> Result<autumn_web::replication::RestoreOutcome, HarvestSqliteError> {
         let Some(replicas) = &self.shared.replicas else {
             let restored = self.shared.fleet.restore(key, target).await?;
@@ -457,7 +457,7 @@ impl Shared {
     /// Ask the next sweep to open `key`.
     fn wake_now(&self, key: &FleetDbKey) {
         if let Some(wakes) = &self.wakes {
-            wakes.record(key, Some(chrono::Utc::now().timestamp_millis()));
+            wakes.record(key, Some(jiff::Timestamp::now().as_millisecond()));
         }
     }
 

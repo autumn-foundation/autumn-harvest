@@ -15,7 +15,7 @@ use autumn_harvest_sqlite::{
     ExecutionFilter, ExecutionOutcome, ListCursor, MAX_FILTER_TERMS, MAX_LIST_LIMIT, RunState,
     SqliteError, SqliteReader, SqliteRuntime, StartOptions, Stored,
 };
-use chrono::Utc;
+use jiff::Timestamp;
 use rusqlite::Connection;
 use serde_json::{Map, Value, json};
 
@@ -150,7 +150,7 @@ fn ids(rt: &SqliteRuntime, filter: &ExecutionFilter) -> Vec<ExecutionId> {
 #[tokio::test]
 async fn describe_returns_every_field_the_daemon_reads() {
     let mut rt = runtime();
-    let before = Utc::now();
+    let before = Timestamp::now();
     let started = rt
         .start_workflow_with_options(
             "echo",
@@ -183,9 +183,9 @@ async fn describe_returns_every_field_the_daemon_reads() {
     );
     let started_at = *summary.started_at.value().expect("a start time");
     let closed_at = *summary.closed_at.value().expect("a close time");
-    assert!(started_at >= before - chrono::TimeDelta::milliseconds(1));
+    assert!(started_at >= before - jiff::SignedDuration::from_millis(1));
     assert!(closed_at >= started_at, "{closed_at} < {started_at}");
-    assert!(closed_at <= Utc::now());
+    assert!(closed_at <= Timestamp::now());
 
     // The listed row is the same row, without the payloads.
     let page = rt
@@ -210,7 +210,7 @@ async fn the_start_time_is_the_started_event_time() {
             .started_at
             .value()
             .map(chrono::DateTime::timestamp_millis),
-        Some(timestamp.timestamp_millis())
+        Some(timestamp.as_millisecond())
     );
     assert_eq!(row.summary.closed_at, Stored::Null, "a running run is open");
     assert_eq!(row.summary.search_attributes, Stored::Null);
@@ -411,7 +411,7 @@ fn list_filters_by_start_time() {
     let mut rt = runtime();
     let early = rt.start_workflow("echo", json!(1)).unwrap();
     std::thread::sleep(Duration::from_millis(5));
-    let middle = Utc::now();
+    let middle = Timestamp::now();
     std::thread::sleep(Duration::from_millis(5));
     let late = rt.start_workflow("echo", json!(2)).unwrap();
 
@@ -445,7 +445,7 @@ fn list_filters_by_start_time() {
     );
 }
 
-fn early_at(rt: &SqliteRuntime, exec: ExecutionId) -> chrono::DateTime<Utc> {
+fn early_at(rt: &SqliteRuntime, exec: ExecutionId) -> jiff::Timestamp {
     *rt.describe(exec)
         .unwrap()
         .summary
@@ -923,7 +923,7 @@ fn a_reader_reads_a_file_without_the_new_columns() {
     assert_eq!(row.output_json, Stored::Value("2".to_string()));
     // A filter on a missing column matches nothing, and does not fail.
     let page = reader
-        .list_executions(&ExecutionFilter::new().started_after(Utc::now()))
+        .list_executions(&ExecutionFilter::new().started_after(Timestamp::now()))
         .unwrap();
     assert_eq!(page.executions, Vec::new());
 }
@@ -991,7 +991,7 @@ fn the_start_time_filter_is_exact_to_the_microsecond() {
     };
     let row = rt.describe(exec).unwrap();
     assert_eq!(row.summary.started_at, Stored::Value(timestamp));
-    let tick = chrono::TimeDelta::microseconds(1);
+    let tick = jiff::SignedDuration::from_micros(1);
     assert_eq!(
         ids(
             &rt,

@@ -25,6 +25,7 @@
 //! exact.
 
 use std::sync::Arc;
+use jiff_diesel::ToDiesel;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -416,7 +417,7 @@ async fn insert_due_schedule(conn: &mut AsyncPgConnection, wf_name: &str) -> Uui
             dsl::catchup.eq(false),
             dsl::max_active_runs.eq(10),
             dsl::is_paused.eq(false),
-            dsl::next_run_at.eq(chrono::Utc::now() - chrono::Duration::seconds(5)),
+            dsl::next_run_at.eq((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(5)).to_diesel()),
             dsl::jitter_secs.eq(0_i64),
             dsl::overlap_policy.eq("skip"),
             dsl::buffered_runs.eq(serde_json::json!([])),

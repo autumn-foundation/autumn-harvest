@@ -786,7 +786,7 @@ impl AgentHarness {
             if budget.is_spent(&spend) {
                 let details = MeshBudgetExceeded {
                     mesh: mesh.to_owned(),
-                    until_ms: until.timestamp_millis(),
+                    until_ms: until.as_millisecond(),
                 };
                 return Err(ActivityFailure::non_retryable(
                     MESH_BUDGET_EXCEEDED,
@@ -1059,7 +1059,7 @@ impl AgentHarness {
             tenant,
             prepare,
             None,
-            autumn_harvest::chrono::Utc::now(),
+            autumn_harvest::jiff::Timestamp::now(),
         )
         .await
         .map(|(turn, _latency)| turn)
@@ -1884,7 +1884,7 @@ impl AgentHarness {
     /// Returns the delivery error. A retryable kind retries, and so does a
     /// send over its time budget.
     pub async fn notify_approval(&self, call: ParkedCall) -> Result<(), String> {
-        let notice = call.notice(autumn_harvest::chrono::Utc::now());
+        let notice = call.notice(autumn_harvest::jiff::Timestamp::now());
         tokio::time::timeout(self.hook_timeout, self.delivery.notify_approval(&notice))
             .await
             .map_err(|_| self.hook_timed_out("ApprovalNoticeTimeout", "the approval notice"))?

@@ -18,7 +18,7 @@ use autumn_harvest::schema::{
 };
 use autumn_harvest::table_split::SetExt;
 
-use chrono::{Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde_json::json;
@@ -56,7 +56,7 @@ async fn connect() -> (AsyncPgConnection, Option<ContainerAsync<Postgres>>) {
 /// An execution with every extension field set to a value that is not the
 /// column default.
 fn execution(id: Uuid, workflow_id: &str, parent: Uuid) -> NewWorkflowExecution<'_> {
-    let now = Utc::now();
+    let now = Timestamp::now();
     NewWorkflowExecution {
         id,
         workflow_name: "split_flow",
@@ -66,10 +66,10 @@ fn execution(id: Uuid, workflow_id: &str, parent: Uuid) -> NewWorkflowExecution<
         input: json!({"n": 1}).into(),
         parent_id: None,
         queue_name: "default",
-        execution_timeout: Some(Duration::seconds(30)),
-        deadline_at: Some(now + Duration::seconds(30)),
-        chain_execution_timeout: Some(Duration::seconds(90)),
-        chain_deadline_at: Some(now + Duration::seconds(90)),
+        execution_timeout: Some(SignedDuration::from_secs(30)),
+        deadline_at: Some(now + SignedDuration::from_secs(30)),
+        chain_execution_timeout: Some(SignedDuration::from_secs(90)),
+        chain_deadline_at: Some(now + SignedDuration::from_secs(90)),
         memo: Some(json!({"memo": true})),
         search_attrs: Some(json!({"k": "v"})),
         assigned_build_id: Some("build-7".to_string()),
@@ -78,8 +78,8 @@ fn execution(id: Uuid, workflow_id: &str, parent: Uuid) -> NewWorkflowExecution<
         runbook_url: Some("https://runbook.example/split"),
         severity: Some("high"),
         context_headers: Some(json!({"x-tenant": "t1"})),
-        sla: Some(Duration::seconds(60)),
-        sla_deadline_at: Some(now + Duration::seconds(60)),
+        sla: Some(SignedDuration::from_secs(60)),
+        sla_deadline_at: Some(now + SignedDuration::from_secs(60)),
         schedule_id: None,
         scheduled_for: Some(now),
         workflow_attempt: 3,
@@ -122,7 +122,7 @@ async fn an_execution_round_trips_every_extension_field() {
     let read = load_execution(&mut conn, id).await;
     assert_eq!(read.run_id, parent);
     assert_eq!(read.workflow_attempt, 3);
-    assert_eq!(read.chain_execution_timeout, Some(Duration::seconds(90)));
+    assert_eq!(read.chain_execution_timeout, Some(SignedDuration::from_secs(90)));
     assert_eq!(read.memo, Some(json!({"memo": true})));
     assert_eq!(read.assigned_build_id.as_deref(), Some("build-7"));
     assert_eq!(
@@ -216,10 +216,10 @@ fn task(id: Uuid, queue: &str) -> NewTaskQueueItem<'_> {
         input: json!({"amount": 5}).into(),
         priority: 2,
         max_attempts: 4,
-        scheduled_at: Utc::now(),
-        heartbeat_timeout: Some(Duration::seconds(5)),
-        start_to_close: Some(Duration::seconds(20)),
-        schedule_to_start: Some(Duration::seconds(10)),
+        scheduled_at: Timestamp::now(),
+        heartbeat_timeout: Some(SignedDuration::from_secs(5)),
+        start_to_close: Some(SignedDuration::from_secs(20)),
+        schedule_to_start: Some(SignedDuration::from_secs(10)),
         retry_policy: Some(json!({"backoff": 2})),
         heartbeat_details: None,
         sticky_worker_id: None,
@@ -262,9 +262,9 @@ async fn a_task_batch_round_trips_every_extension_field() {
     for item in &read {
         assert_eq!(item.retry_policy, Some(json!({"backoff": 2})));
         assert_eq!(item.trace_context, Some(json!({"traceparent": "00-1"})));
-        assert_eq!(item.heartbeat_timeout, Some(Duration::seconds(5)));
-        assert_eq!(item.start_to_close, Some(Duration::seconds(20)));
-        assert_eq!(item.schedule_to_start, Some(Duration::seconds(10)));
+        assert_eq!(item.heartbeat_timeout, Some(SignedDuration::from_secs(5)));
+        assert_eq!(item.start_to_close, Some(SignedDuration::from_secs(20)));
+        assert_eq!(item.schedule_to_start, Some(SignedDuration::from_secs(10)));
         assert_eq!(item.concurrency_cap, Some(3));
         assert_eq!(item.required_build_id.as_deref(), Some("build-9"));
         assert_eq!(item.rate_limit_key.as_deref(), Some("rate-a"));

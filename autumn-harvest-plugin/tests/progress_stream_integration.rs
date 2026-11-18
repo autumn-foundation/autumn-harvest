@@ -18,6 +18,7 @@
 #![allow(clippy::too_many_lines)]
 
 use std::pin::Pin;
+use jiff_diesel::ToDiesel;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -528,7 +529,7 @@ async fn progress_stream_on_already_terminal_execution_closes_immediately() {
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
-            harvest_workflow_executions::completed_at.eq(chrono::Utc::now()),
+            harvest_workflow_executions::completed_at.eq(jiff::Timestamp::now().to_diesel()),
         ))
         .execute(&mut conn)
         .await

@@ -5,7 +5,7 @@
 //! that runs ahead hides stuck work. These columns must take their value from
 //! the database clock, as in `queue::record_heartbeat`.
 //!
-//! The scan is textual. It finds `.eq(..Utc::now()..)` and `column: ..Utc::now()`
+//! The scan is textual. It finds `.eq(..Timestamp::now()..)` and `column: ..Timestamp::now()`
 //! in non-test code. It does not follow a value through a local variable.
 //!
 //! A deliberate host-clock write carries `host-clock-ok: <reason>` on the same

@@ -107,7 +107,7 @@ fn history(len: usize) -> (Vec<WorkflowEvent>, Vec<usize>) {
     let mut events = Vec::with_capacity(len);
     events.push(WorkflowEvent::WorkflowStarted {
         input: payload(0),
-        timestamp: chrono::DateTime::from_timestamp(START_SECS, 0).expect("fixed start time"),
+        timestamp: jiff::Timestamp::from_second(START_SECS).ok().expect("fixed start time"),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,

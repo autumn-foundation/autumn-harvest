@@ -14,6 +14,7 @@
 //! fresh suffix, so a shared cluster needs no scrub.
 
 use std::pin::Pin;
+use jiff_diesel::ToDiesel;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -41,7 +42,7 @@ use autumn_harvest::{
     ExecutionId, StartWorkflowParams, WorkflowContext, cancel_workflow_execution,
     start_or_load_workflow_execution,
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde_json::Value;
@@ -300,7 +301,7 @@ async fn runs(conn: &mut AsyncPgConnection, name: &str) -> Vec<Row> {
 }
 
 /// The fire time of the workflow task of one run.
-async fn fire_time(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> DateTime<Utc> {
+async fn fire_time(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Timestamp {
     use harvest_task_queue::dsl;
     dsl::harvest_task_queue
         .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
@@ -713,14 +714,14 @@ async fn ac1_an_override_slows_the_next_retry() {
     .await;
     let mut conn = db.conn().await;
     let first = start(&mut conn, name, Some(code), RetryPolicySource::Type).await;
-    let before = Utc::now();
+    let before = Timestamp::now();
     let running = Running::spawn(&db, &registry);
     let rows = wait_runs(&db, name, "a delayed retry", |rows| rows.len() == 2).await;
-    let after = Utc::now();
+    let after = Timestamp::now();
     running.stop().await;
     let fire_at = fire_time(&mut conn, rows[1].exec_id()).await;
-    let hour = chrono::Duration::hours(1);
-    let slack = chrono::Duration::minutes(1);
+    let hour = jiff::SignedDuration::from_hours(1);
+    let slack = jiff::SignedDuration::from_mins(1);
     assert!(
         fire_at >= before + hour - slack && fire_at <= after + hour + slack,
         "the first delay is the override, 1 hour: {fire_at}"
@@ -965,7 +966,7 @@ async fn insert_due_schedule(
             dsl::catchup.eq(false),
             dsl::max_active_runs.eq(10),
             dsl::is_paused.eq(false),
-            dsl::next_run_at.eq(Utc::now() - chrono::Duration::seconds(5)),
+            dsl::next_run_at.eq((Timestamp::now() - jiff::SignedDuration::from_secs(5)).to_diesel()),
             dsl::jitter_secs.eq(0_i64),
             dsl::overlap_policy.eq("skip"),
             dsl::buffered_runs.eq(serde_json::json!([])),

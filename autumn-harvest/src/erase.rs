@@ -397,7 +397,7 @@ mod db {
     use std::future::Future;
     use std::pin::Pin;
 
-    use chrono::{DateTime, Utc};
+    use jiff::Timestamp;
     use diesel::ExpressionMethods;
     use diesel::OptionalExtension;
     use diesel::QueryDsl;
@@ -524,7 +524,7 @@ mod db {
         pool: Option<&ShardedDbPool>,
     ) -> HarvestResult<EraseOutcome> {
         visited.insert(exec_id.as_uuid());
-        let now = Utc::now();
+        let now = Timestamp::now();
         match load_erase_gate_row(conn, exec_id).await {
             Ok((state, set_at, until, reason)) => {
                 if !is_terminal_state(&state) {
@@ -693,7 +693,7 @@ mod db {
     fn erase_child_execution_node<'a>(
         conn: &'a mut AsyncPgConnection,
         exec_id: ExecutionId,
-        now: DateTime<Utc>,
+        now: Timestamp,
         visited: &'a mut HashSet<Uuid>,
         pool: Option<&'a ShardedDbPool>,
     ) -> EraseFuture<'a> {
@@ -715,7 +715,7 @@ mod db {
     fn erase_summary_only_node<'a>(
         conn: &'a mut AsyncPgConnection,
         exec_id: ExecutionId,
-        now: DateTime<Utc>,
+        now: Timestamp,
         visited: &'a mut HashSet<Uuid>,
         pool: Option<&'a ShardedDbPool>,
     ) -> OptEraseFuture<'a> {
@@ -972,7 +972,7 @@ mod db {
     async fn erase_one_child(
         conn: &mut AsyncPgConnection,
         child_exec_id: ExecutionId,
-        now: DateTime<Utc>,
+        now: Timestamp,
         visited: &mut HashSet<Uuid>,
         pool: Option<&ShardedDbPool>,
     ) -> (
@@ -1080,7 +1080,7 @@ mod db {
     async fn cascade_children(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
-        now: DateTime<Utc>,
+        now: Timestamp,
         visited: &mut HashSet<Uuid>,
         pool: Option<&ShardedDbPool>,
     ) -> HarvestResult<(Vec<EraseOutcome>, Vec<SkippedChild>, Vec<EraseFailure>)> {
@@ -1281,8 +1281,8 @@ mod db {
     /// The state + legal-hold columns read under the erase gate.
     type EraseGateRow = (
         String,
-        Option<chrono::DateTime<chrono::Utc>>,
-        Option<chrono::DateTime<chrono::Utc>>,
+        Option<jiff::Timestamp>,
+        Option<jiff::Timestamp>,
         Option<String>,
     );
 
@@ -1372,7 +1372,7 @@ mod db {
     async fn scrub_execution_node(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
-        now: DateTime<Utc>,
+        now: Timestamp,
         visited: &mut HashSet<Uuid>,
         pool: Option<&ShardedDbPool>,
     ) -> HarvestResult<EraseOutcome> {

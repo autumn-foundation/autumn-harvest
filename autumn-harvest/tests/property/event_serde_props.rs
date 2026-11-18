@@ -18,7 +18,7 @@ use autumn_harvest::event::SideEffectKind;
 use autumn_harvest::types::{
     ActivityExecId, ExecutionId, ExternalSignalId, ExternalTarget, TimerId,
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use proptest::prelude::*;
 use serde_json::Value;
 use uuid::Uuid;
@@ -78,7 +78,7 @@ fn json_value_non_null() -> impl Strategy<Value = Value> {
     ]
 }
 
-fn timestamp() -> impl Strategy<Value = DateTime<Utc>> {
+fn timestamp() -> impl Strategy<Value = Timestamp> {
     (0i64..4_000_000_000, 0u32..1_000_000_000)
         .prop_map(|(s, n)| DateTime::from_timestamp(s, n).expect("valid timestamp"))
 }

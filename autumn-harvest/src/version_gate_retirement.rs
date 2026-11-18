@@ -5,7 +5,7 @@
 //! the caller-supplied `min_safe_version`. It joins back to
 //! `harvest_workflow_executions` for execution state and start timestamp.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use diesel::sql_types::{BigInt, Integer, Nullable, Text, Timestamptz};
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
@@ -57,8 +57,8 @@ pub struct RetirementCheckShardRow {
     pub recorded_version: u32,
     pub active_executions: i64,
     pub terminal_executions: i64,
-    pub oldest_blocker_started_at: DateTime<Utc>,
-    pub newest_blocker_started_at: DateTime<Utc>,
+    pub oldest_blocker_started_at: Timestamp,
+    pub newest_blocker_started_at: Timestamp,
     /// Up to 10 active (non-terminal) execution IDs for manual investigation.
     pub sample_active_execution_ids: Vec<Uuid>,
     pub shard_id: i32,
@@ -77,9 +77,11 @@ struct RetirementCheckSqlRow {
     #[diesel(sql_type = BigInt)]
     terminal_executions: i64,
     #[diesel(sql_type = Timestamptz)]
-    oldest_blocker_started_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    oldest_blocker_started_at: Timestamp,
     #[diesel(sql_type = Timestamptz)]
-    newest_blocker_started_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    newest_blocker_started_at: Timestamp,
     /// JSON array of UUID strings, e.g. `["uuid1","uuid2"]`.
     #[diesel(sql_type = Text)]
     sample_active_execution_ids: String,

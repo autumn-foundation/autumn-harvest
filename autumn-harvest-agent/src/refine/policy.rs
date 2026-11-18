@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 use std::time::Duration;
 
-use autumn_harvest::chrono::{DateTime, TimeDelta, Utc};
+use autumn_harvest::chrono::{DateTime, SignedDuration, Utc};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -253,7 +253,7 @@ pub enum GateState {
     /// The gate waits until `until`.
     Waiting {
         /// The time at which the gate times out.
-        until: DateTime<Utc>,
+        until: Timestamp,
     },
     /// The gate waited for its whole timeout.
     TimedOut,
@@ -264,19 +264,19 @@ pub enum GateState {
 /// A time before 1970 counts as 1970.
 #[must_use]
 pub fn gate_state(
-    requested_at: DateTime<Utc>,
-    now: DateTime<Utc>,
+    requested_at: Timestamp,
+    now: Timestamp,
     timeout: ApprovalTimeout,
 ) -> GateState {
-    let millis = |at: DateTime<Utc>| u64::try_from(at.timestamp_millis()).unwrap_or(0);
+    let millis = |at: Timestamp| u64::try_from(at.as_millisecond()).unwrap_or(0);
     let timeout_ms = u64::try_from(timeout.get().as_millis()).unwrap_or(u64::MAX);
     if gate_timed_out(millis(requested_at), millis(now), timeout_ms) {
         return GateState::TimedOut;
     }
-    let wait = TimeDelta::from_std(timeout.get()).unwrap_or(TimeDelta::MAX);
+    let wait = SignedDuration::try_from(timeout.get()).unwrap_or(SignedDuration::MAX);
     let until = requested_at
-        .checked_add_signed(wait)
-        .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        .checked_add(wait).ok()
+        .unwrap_or(Timestamp::MAX);
     GateState::Waiting { until }
 }
 
@@ -744,7 +744,7 @@ impl RefinePolicy {
 
     /// The state at `now` of a gate that opened at `requested_at`.
     #[must_use]
-    pub fn gate_state(&self, requested_at: DateTime<Utc>, now: DateTime<Utc>) -> GateState {
+    pub fn gate_state(&self, requested_at: Timestamp, now: Timestamp) -> GateState {
         gate_state(requested_at, now, self.approval_timeout)
     }
 }
@@ -930,10 +930,9 @@ mod tests {
     #[test]
     fn a_one_hour_gate_times_out_after_one_hour() {
         let policy = decode(json!({"approval_timeout": "1h"})).expect("decode");
-        let opened = DateTime::parse_from_rfc3339("2026-11-03T10:00:00Z")
-            .expect("time")
-            .with_timezone(&Utc);
-        let at = |minutes| opened + TimeDelta::minutes(minutes);
+        let opened = ("2026-11-03T10:00:00Z").parse::<Timestamp>()
+            .expect("time");
+        let at = |minutes| opened + SignedDuration::from_mins(minutes);
         assert_eq!(
             policy.gate_state(opened, at(59)),
             GateState::Waiting { until: at(60) }
@@ -951,8 +950,8 @@ mod tests {
     #[test]
     fn a_clock_before_the_gate_still_waits() {
         let timeout = ApprovalTimeout::new(Duration::from_hours(1)).expect("1h");
-        let opened = DateTime::from_timestamp(10_000, 0).expect("time");
-        let earlier = DateTime::from_timestamp(5_000, 0).expect("time");
+        let opened = Timestamp::from_second(10_000).ok().expect("time");
+        let earlier = Timestamp::from_second(5_000).ok().expect("time");
         assert!(matches!(
             gate_state(opened, earlier, timeout),
             GateState::Waiting { .. }

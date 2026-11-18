@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 #[cfg(feature = "db")]
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::Value;
 use tokio::sync::oneshot;
 
@@ -2517,16 +2517,16 @@ fn duration_to_millis_saturating(d: std::time::Duration) -> u64 {
 ///   whole-second granularity, so the wait never resolves *before* the
 ///   deadline.
 /// - A defensive fallback saturates to `u64::MAX` for a delta whose whole
-///   seconds overflow `i64`→`u64`. No chrono-valid `DateTime<Utc>` pair can
+///   seconds overflow `i64`→`u64`. No chrono-valid `Timestamp` pair can
 ///   reach it, because the chrono range caps the delta far below that. If it
 ///   is hit, the worker's `chrono_duration_from_secs` gives a `Config` error
 ///   at persist, like an overflowing `ctx.timer` duration.
-pub(crate) fn remaining_secs_until(deadline: DateTime<Utc>, now: DateTime<Utc>) -> u64 {
-    let delta = deadline.signed_duration_since(now);
-    if delta <= chrono::Duration::zero() {
+pub(crate) fn remaining_secs_until(deadline: Timestamp, now: Timestamp) -> u64 {
+    let delta = deadline.duration_since(now);
+    if delta <= jiff::SignedDuration::ZERO {
         return 0;
     }
-    let secs = delta.num_seconds();
+    let secs = delta.as_secs();
     let round_up = i64::from(delta.subsec_nanos() > 0);
     u64::try_from(secs.saturating_add(round_up)).unwrap_or(u64::MAX)
 }
@@ -2561,23 +2561,23 @@ pub(crate) struct FrozenBusinessDay {
 pub(crate) enum FrozenBusinessDayOutcome {
     /// The resolution succeeded.
     Resolved {
-        anchor: DateTime<Utc>,
-        deadline: DateTime<Utc>,
+        anchor: Timestamp,
+        deadline: Timestamp,
         calendar: String,
         /// Non-business dates stepped over — the audit trail that answers
         /// "why did this land on Tuesday?" from history alone.
-        skipped: Vec<chrono::NaiveDate>,
+        skipped: Vec<jiff::civil::Date>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        coverage_end: Option<chrono::NaiveDate>,
+        coverage_end: Option<jiff::civil::Date>,
     },
     /// The named calendar is not in the registered snapshot.
     UnknownCalendar {
-        anchor: DateTime<Utc>,
+        anchor: Timestamp,
         calendar: String,
     },
     /// The calendar could not cover the requested span.
     Rejected {
-        anchor: DateTime<Utc>,
+        anchor: Timestamp,
         calendar: String,
         rejection: crate::calendar::BusinessDayRejection,
     },
@@ -2585,10 +2585,10 @@ pub(crate) enum FrozenBusinessDayOutcome {
 
 impl FrozenBusinessDay {
     fn resolved(
-        anchor: DateTime<Utc>,
+        anchor: Timestamp,
         calendar: String,
         res: &crate::calendar::BusinessDayResolution,
-        coverage_end: Option<chrono::NaiveDate>,
+        coverage_end: Option<jiff::civil::Date>,
     ) -> Self {
         Self {
             v: 1,
@@ -2602,7 +2602,7 @@ impl FrozenBusinessDay {
         }
     }
 
-    const fn unknown_calendar(anchor: DateTime<Utc>, calendar: String) -> Self {
+    const fn unknown_calendar(anchor: Timestamp, calendar: String) -> Self {
         Self {
             v: 1,
             outcome: FrozenBusinessDayOutcome::UnknownCalendar { anchor, calendar },
@@ -2610,7 +2610,7 @@ impl FrozenBusinessDay {
     }
 
     const fn rejected(
-        anchor: DateTime<Utc>,
+        anchor: Timestamp,
         calendar: String,
         rejection: crate::calendar::BusinessDayRejection,
     ) -> Self {
@@ -2625,7 +2625,7 @@ impl FrozenBusinessDay {
     }
 
     /// The anchor captured at resolution time, whichever arm was frozen.
-    const fn anchor(&self) -> DateTime<Utc> {
+    const fn anchor(&self) -> Timestamp {
         match &self.outcome {
             FrozenBusinessDayOutcome::Resolved { anchor, .. }
             | FrozenBusinessDayOutcome::UnknownCalendar { anchor, .. }
@@ -2666,9 +2666,9 @@ impl FrozenBusinessDay {
 /// A successfully frozen business-day resolution.
 pub(crate) struct ResolvedBusinessDay {
     /// The instant the resolution was anchored on.
-    pub(crate) anchor: DateTime<Utc>,
+    pub(crate) anchor: Timestamp,
     /// The resolved fire instant.
-    pub(crate) deadline: DateTime<Utc>,
+    pub(crate) deadline: Timestamp,
 }
 
 /// Options for [`WorkflowContext::create_session`] (issue #606).
@@ -2999,7 +2999,7 @@ pub struct WorkflowContext {
     /// forever.
     promise_keys: Mutex<std::collections::HashSet<String>>,
     /// Deterministic "now" -- the timestamp from the `WorkflowStarted` event.
-    start_time: DateTime<Utc>,
+    start_time: Timestamp,
     /// History-size thresholds visible to author code.
     history_policy: WorkflowHistoryPolicy,
     /// The effective execution-timeout budget for this run (issue #243/#772), or
@@ -3008,7 +3008,7 @@ pub struct WorkflowContext {
     /// execution_timeout`), and as the total budget for the deadline-fraction
     /// continue-as-new check. Records no event. Threaded from the execution row
     /// by the worker.
-    execution_timeout: Option<chrono::Duration>,
+    execution_timeout: Option<jiff::SignedDuration>,
     /// The authoritative absolute wall-clock deadline for this run (issue #772),
     /// read live from the execution row's `deadline_at` column at context
     /// construction. This is the *effective* deadline the timeout scanner
@@ -3019,7 +3019,7 @@ pub struct WorkflowContext {
     /// public [`deadline`](Self::deadline) accessor (which stays replay-stable
     /// nominal). Falls back to `start_time + execution_timeout` when no absolute
     /// deadline was threaded (the replayer / test-env paths). `None` = fall back.
-    deadline_at: Option<DateTime<Utc>>,
+    deadline_at: Option<Timestamp>,
     /// Monotonically increasing counter for generating activity sequence IDs.
     activity_seq: Mutex<u32>,
     /// Monotonically increasing counter for naming fan-out count markers.
@@ -3356,7 +3356,7 @@ pub struct WorkflowContext {
     /// Nominal scheduled fire-time (logical slot) frozen in `WorkflowStarted` (issue #508).
     /// `Some` for scheduled / backfilled / caught-up runs; `None` for manual/ad-hoc starts
     /// and pre-#508 histories (which deserialize the absent field to `None`).
-    scheduled_time: Option<DateTime<Utc>>,
+    scheduled_time: Option<Timestamp>,
     /// Total virtual seconds elapsed from durable timers (issue #526).
     /// `None` = production behavior (`ctx.now()` always returns `start_time`).
     /// `Some` = test harness advancing-clock mode; incremented each time a
@@ -3471,7 +3471,7 @@ pub struct WorkflowExecutionInfo {
     /// under the test harness; this does not).
     ///
     /// [`now`]: WorkflowContext::now
-    pub start_time: DateTime<Utc>,
+    pub start_time: Timestamp,
     /// The number of history events consumed up to the current point (the
     /// matcher's cursor position).
     ///
@@ -3804,7 +3804,7 @@ impl WorkflowContext {
     #[allow(clippy::too_many_lines)]
     fn fresh(
         exec_id: ExecutionId,
-        start_time: DateTime<Utc>,
+        start_time: Timestamp,
         matcher: HistoryMatcher,
         state: SharedState,
     ) -> Self {
@@ -3949,7 +3949,7 @@ impl WorkflowContext {
                 )),
                 _ => None,
             })
-            .unwrap_or_else(|| (Utc::now(), None, None, None));
+            .unwrap_or_else(|| (Timestamp::now(), None, None, None));
 
         // Capture any terminal cancellation event so workflow code can detect
         // it via `is_cancelled()` / `check_cancellation()` during replay.
@@ -4086,7 +4086,7 @@ impl WorkflowContext {
     #[must_use]
     pub fn new_for_handler(
         exec_id: ExecutionId,
-        start_time: chrono::DateTime<chrono::Utc>,
+        start_time: jiff::Timestamp,
         cancellation_reason: Option<String>,
         state: SharedState,
     ) -> std::sync::Arc<Self> {
@@ -4103,7 +4103,7 @@ impl WorkflowContext {
     pub fn new_test() -> Self {
         Self::fresh(
             ExecutionId::new(),
-            Utc::now(),
+            Timestamp::now(),
             HistoryMatcher::new(Vec::new()),
             empty_shared_state(),
         )
@@ -4131,9 +4131,9 @@ impl WorkflowContext {
     /// returns `now`, the virtual time of the cycle. Production leaves it unset.
     #[cfg(any(test, feature = "testing"))]
     #[must_use]
-    pub(crate) fn with_seeded_side_effects(mut self, seed: u64, now: DateTime<Utc>) -> Self {
+    pub(crate) fn with_seeded_side_effects(mut self, seed: u64, now: Timestamp) -> Self {
         let rng = Mutex::new(crate::dst::SplitMix64::new(seed));
-        self.side_effect_rng = Some(Arc::new((rng, now.timestamp_millis())));
+        self.side_effect_rng = Some(Arc::new((rng, now.as_millisecond())));
         self
     }
 
@@ -4161,7 +4161,7 @@ impl WorkflowContext {
         self.seeded_draw().map_or_else(
             || {
                 self.drive_clock_ms
-                    .unwrap_or_else(|| Utc::now().timestamp_millis())
+                    .unwrap_or_else(|| Timestamp::now().as_millisecond())
             },
             |(_, now)| now,
         )
@@ -4174,8 +4174,8 @@ impl WorkflowContext {
     /// wall clock. The SQLite runtime sets it on each cycle.
     #[doc(hidden)]
     #[must_use]
-    pub fn with_drive_clock(mut self, now: Option<DateTime<Utc>>) -> Self {
-        self.drive_clock_ms = now.map(|now| now.timestamp_millis());
+    pub fn with_drive_clock(mut self, now: Option<Timestamp>) -> Self {
+        self.drive_clock_ms = now.map(|now| now.as_millisecond());
         self
     }
 
@@ -4490,7 +4490,7 @@ impl WorkflowContext {
     #[must_use]
     pub const fn with_execution_timeout(
         mut self,
-        execution_timeout: Option<chrono::Duration>,
+        execution_timeout: Option<jiff::SignedDuration>,
     ) -> Self {
         self.execution_timeout = execution_timeout;
         self
@@ -4516,7 +4516,7 @@ impl WorkflowContext {
     /// `start_time + execution_timeout`. The replayer and test-env paths, which
     /// carry only the timeout, use that fallback.
     #[must_use]
-    pub const fn with_deadline(mut self, deadline_at: Option<DateTime<Utc>>) -> Self {
+    pub const fn with_deadline(mut self, deadline_at: Option<Timestamp>) -> Self {
         self.deadline_at = deadline_at;
         self
     }
@@ -4628,11 +4628,11 @@ impl WorkflowContext {
     /// durable timer that fires from history advances this by its duration. So
     /// time-aware logic can be unit-tested without a real database.
     #[must_use]
-    pub fn now(&self) -> DateTime<Utc> {
+    pub fn now(&self) -> Timestamp {
         #[cfg(any(test, feature = "testing"))]
         if let Some(ref atomic) = self.timer_clock_elapsed_secs {
             let elapsed = atomic.load(std::sync::atomic::Ordering::Relaxed);
-            let delta = chrono::Duration::seconds(
+            let delta = jiff::SignedDuration::from_secs(
                 i64::try_from(elapsed)
                     .unwrap_or(i64::MAX / 1000)
                     .min(i64::MAX / 1000),
@@ -4669,9 +4669,9 @@ impl WorkflowContext {
     /// `None` is returned when there is no `execution_timeout`, or when the
     /// computation would overflow the representable range.
     #[must_use]
-    pub fn deadline(&self) -> Option<DateTime<Utc>> {
+    pub fn deadline(&self) -> Option<Timestamp> {
         self.execution_timeout
-            .and_then(|budget| self.start_time.checked_add_signed(budget))
+            .and_then(|budget| self.start_time.checked_add(budget).ok())
     }
 
     /// The **live effective** absolute wall-clock deadline the timeout scanner
@@ -4693,12 +4693,12 @@ impl WorkflowContext {
     /// `continue_as_new`, so no divergent replay follows. A later replay
     /// computes a live `false` against an equal-or-larger deadline. That is a
     /// smaller consumed fraction, so it stays `false`.
-    fn effective_deadline_live(&self) -> Option<DateTime<Utc>> {
+    fn effective_deadline_live(&self) -> Option<Timestamp> {
         if let Some(deadline_at) = self.deadline_at {
             return Some(deadline_at);
         }
         self.execution_timeout
-            .and_then(|budget| self.start_time.checked_add_signed(budget))
+            .and_then(|budget| self.start_time.checked_add(budget).ok())
     }
 
     /// Time remaining until the **nominal** execution
@@ -4709,7 +4709,7 @@ impl WorkflowContext {
     /// **not** reflect pause/resume extensions (see [`deadline`](Self::deadline)).
     /// The clock is the replay-safe recorded wall clock
     /// ([`system_now`](Self::system_now), issue #384), **never**
-    /// `chrono::Utc::now()`. So it is deterministic across replays. A negative
+    /// `jiff::Timestamp::now()`. So it is deterministic across replays. A negative
     /// duration means the nominal deadline has already passed.
     ///
     /// A workflow with no deadline records **no** side-effect. The pure
@@ -4728,7 +4728,7 @@ impl WorkflowContext {
     /// Panics if the internal matcher or commands mutex is poisoned (via
     /// [`system_now`](Self::system_now)).
     #[must_use]
-    pub fn time_until_deadline(&self) -> Option<chrono::Duration> {
+    pub fn time_until_deadline(&self) -> Option<jiff::SignedDuration> {
         // Check the pure deadline first so a no-deadline workflow never records
         // a `system_now` side-effect (AC4).
         let deadline = self.deadline()?;
@@ -4757,7 +4757,7 @@ impl WorkflowContext {
     /// }
     /// ```
     #[must_use]
-    pub const fn scheduled_time(&self) -> Option<DateTime<Utc>> {
+    pub const fn scheduled_time(&self) -> Option<Timestamp> {
         self.scheduled_time
     }
 
@@ -4797,7 +4797,7 @@ impl WorkflowContext {
     /// virtual clock of the test harness (issue #526) does **not** move it. So
     /// it is safe to compare across replay cycles and workers.
     #[must_use]
-    pub const fn start_time(&self) -> DateTime<Utc> {
+    pub const fn start_time(&self) -> Timestamp {
         self.start_time
     }
 
@@ -5284,7 +5284,7 @@ impl WorkflowContext {
         let Some(total) = self.execution_timeout else {
             return false;
         };
-        let total_ms = total.num_milliseconds();
+        let total_ms = crate::time::num_milliseconds(total);
         if total_ms <= 0 {
             return false;
         }
@@ -5308,7 +5308,7 @@ impl WorkflowContext {
         // Trip once at least `fraction` of the budget is consumed, i.e. the
         // remaining time is at most `(1 - fraction)` of the total. Negative
         // remaining (past the deadline) trips.
-        (remaining.num_milliseconds() as f64) <= (1.0 - fraction) * (total_ms as f64)
+        (crate::time::num_milliseconds(remaining) as f64) <= (1.0 - fraction) * (total_ms as f64)
     }
 
     /// The frontier wall-clock instant (millis) the deadline probe records.
@@ -5319,20 +5319,20 @@ impl WorkflowContext {
     /// [`now`](Self::now)). So a live test run that uses up its deadline budget
     /// through durable timers can exercise the deadline-aware continue-as-new
     /// branch (issue #772). Production builds compile out the virtual-clock arm,
-    /// and this is `Utc::now()`. The #384 host-wall-clock behavior of the
+    /// and this is `Timestamp::now()`. The #384 host-wall-clock behavior of the
     /// deadline probe does not change.
     fn deadline_frontier_now_millis(&self) -> i64 {
         #[cfg(any(test, feature = "testing"))]
         if let Some(ref atomic) = self.timer_clock_elapsed_secs {
             let elapsed = atomic.load(std::sync::atomic::Ordering::Relaxed);
-            let delta = chrono::Duration::seconds(
+            let delta = jiff::SignedDuration::from_secs(
                 i64::try_from(elapsed)
                     .unwrap_or(i64::MAX / 1000)
                     .min(i64::MAX / 1000),
             );
-            return (self.start_time + delta).timestamp_millis();
+            return (self.start_time + delta).as_millisecond();
         }
-        Utc::now().timestamp_millis()
+        Timestamp::now().as_millisecond()
     }
 
     /// Tolerant deadline-branch wall-clock read (issue #772).
@@ -5380,10 +5380,10 @@ impl WorkflowContext {
     /// checkpoint *suggestion*, not an nd-block. It is fail-safe: it never
     /// produces a wrong command. Any real control-flow divergence still
     /// nd-errors at the next real command mismatch.
-    fn deadline_clock_read(&self) -> Option<DateTime<Utc>> {
+    fn deadline_clock_read(&self) -> Option<Timestamp> {
         match self.match_history(HistoryMatcher::match_side_effect_now_tolerant) {
             crate::replay::SideEffectNowMatch::Matched { millis } => {
-                Some(DateTime::from_timestamp_millis(millis).unwrap_or(self.start_time))
+                Some(Timestamp::from_millisecond(millis).ok().unwrap_or(self.start_time))
             }
             crate::replay::SideEffectNowMatch::NotRecorded => None,
             crate::replay::SideEffectNowMatch::Frontier => {
@@ -5393,7 +5393,7 @@ impl WorkflowContext {
                 // workflow that sleeps past its deadline fraction through
                 // durable timers trips the deadline continue-as-new branch under
                 // test. In production, with no virtual clock, this is
-                // `Utc::now()` as before. The #384 host-wall-clock contract of
+                // `Timestamp::now()` as before. The #384 host-wall-clock contract of
                 // `system_now` does not change. This internal probe is the only
                 // reader of the virtual clock.
                 let millis = self
@@ -5429,7 +5429,7 @@ impl WorkflowContext {
                     name: Some(crate::replay::DEADLINE_PROBE_SIDE_EFFECT_NAME.to_string()),
                     value,
                 });
-                Some(DateTime::from_timestamp_millis(millis).unwrap_or(self.start_time))
+                Some(Timestamp::from_millisecond(millis).ok().unwrap_or(self.start_time))
             }
         }
     }
@@ -6091,16 +6091,16 @@ impl WorkflowContext {
     /// inside a long-running workflow.
     ///
     /// This is the safe, replay-deterministic alternative to calling
-    /// `chrono::Utc::now()` directly (guardrail HVG001).
+    /// `jiff::Timestamp::now()` directly (guardrail HVG001).
     ///
     /// # Panics
     ///
     /// Panics if the internal matcher or commands mutex is poisoned.
     #[must_use]
-    pub fn system_now(&self) -> DateTime<Utc> {
+    pub fn system_now(&self) -> Timestamp {
         let millis =
             self.capture_builtin(crate::event::SideEffectKind::Now, || self.live_now_millis());
-        DateTime::from_timestamp_millis(millis).unwrap_or(self.start_time)
+        Timestamp::from_millisecond(millis).ok().unwrap_or(self.start_time)
     }
 
     /// Deterministic wall-clock read as a [`std::time::SystemTime`].
@@ -7410,7 +7410,7 @@ impl WorkflowContext {
     ///
     /// This is the absolute-deadline companion to [`WorkflowContext::timer`] (a
     /// relative, whole-second wait). It is the blessed, replay-safe form of the
-    /// hand-rolled `ctx.timer(id, (deadline - ctx.system_now()).num_seconds() as u64)`
+    /// hand-rolled `ctx.timer(id, (deadline - ctx.system_now()).as_secs() as u64)`
     /// pattern, with both foot-guns closed inside the engine:
     ///
     /// - **Replay-determinism:** the current wall clock is captured once via the
@@ -7419,7 +7419,7 @@ impl WorkflowContext {
     ///   variant, no migration. Every replay recomputes the identical remaining
     ///   duration from that frozen instant. So the wait resolves at the same
     ///   instant on every worker, whatever the replaying worker's wall clock.
-    ///   `chrono::Utc::now()` here would silently break replay (guardrail
+    ///   `jiff::Timestamp::now()` here would silently break replay (guardrail
     ///   HVG001). `sleep_until` removes that path entirely.
     /// - **Past deadline:** a `deadline` at or before the captured "now" clamps
     ///   the remaining duration to zero. It fires on the next poll, never as a
@@ -7439,7 +7439,7 @@ impl WorkflowContext {
     /// slightly early in DB-clock terms. The skew is normally well below the
     /// whole-second timer granularity. The round-up eliminates truncation-induced
     /// early fires, not clock skew — matching the hand-rolled `ctx.timer(id,
-    /// (deadline - system_now()).num_seconds())` pattern this method replaces.
+    /// (deadline - system_now()).as_secs())` pattern this method replaces.
     ///
     /// The timer lowers onto the existing `TimerStarted`/`TimerFired` events and
     /// the existing suspension/`match_timer` path. A `sleep_until` timer is
@@ -7451,7 +7451,7 @@ impl WorkflowContext {
     ///
     /// - **Derive `deadline` from deterministic state**: a workflow input, a
     ///   prior activity output, or `ctx.system_now()`. Never derive it from
-    ///   `chrono::Utc::now()` directly. That is the non-deterministic path this
+    ///   `jiff::Timestamp::now()` directly. That is the non-deterministic path this
     ///   method replaces.
     /// - **Prefer [`WorkflowContext::timer`] for a purely *relative* wait** (e.g. "wait
     ///   30s"). `sleep_until` captures `system_now()` to convert an absolute instant
@@ -7479,9 +7479,9 @@ impl WorkflowContext {
     /// # Examples
     /// ```ignore
     /// // Send a renewal reminder 24h before an absolute expiry instant:
-    /// ctx.sleep_until("renewal-reminder", expiry - chrono::Duration::hours(24)).await?;
+    /// ctx.sleep_until("renewal-reminder", expiry - jiff::SignedDuration::from_hours(24)).await?;
     /// ```
-    pub async fn sleep_until(&self, timer_id: &str, deadline: DateTime<Utc>) -> HarvestResult<()> {
+    pub async fn sleep_until(&self, timer_id: &str, deadline: Timestamp) -> HarvestResult<()> {
         let now = self.system_now();
         let remaining_secs = remaining_secs_until(deadline, now);
         self.timer(timer_id, remaining_secs).await
@@ -7499,12 +7499,12 @@ impl WorkflowContext {
     /// Mirrors [`Self::deadline_frontier_now_millis`]'s precedent (issue #772).
     /// The value is captured **inside** the freeze closure and never escapes as
     /// its own event, so a failed resolution leaves no orphaned anchor behind.
-    fn business_day_anchor(&self) -> DateTime<Utc> {
+    fn business_day_anchor(&self) -> Timestamp {
         #[cfg(any(test, feature = "testing"))]
         if self.timer_clock_elapsed_secs.is_some() {
             return self.now();
         }
-        Utc::now()
+        Timestamp::now()
     }
 
     /// Resolve and **freeze** a business-day deadline, without arming a timer.
@@ -7559,7 +7559,7 @@ impl WorkflowContext {
         id: &str,
         n: u32,
         calendar: &str,
-    ) -> HarvestResult<DateTime<Utc>> {
+    ) -> HarvestResult<Timestamp> {
         Ok(self.freeze_business_day(id, n, calendar, false)?.deadline)
     }
 
@@ -7599,7 +7599,7 @@ impl WorkflowContext {
     /// # Determinism
     ///
     /// The resolution runs **once**, on the first live execution, from an anchor
-    /// captured inside the freeze — never a fresh `Utc::now()` on replay. The
+    /// captured inside the freeze — never a fresh `Timestamp::now()` on replay. The
     /// existing `SideEffectRecorded` event (issue #384) records it. The
     /// existing `TimerStarted` event carries the wait. So there is **no new
     /// `WorkflowEvent` variant and no migration**.
@@ -7635,7 +7635,7 @@ impl WorkflowContext {
         timer_id: &str,
         n: u32,
         calendar: &str,
-    ) -> HarvestResult<DateTime<Utc>> {
+    ) -> HarvestResult<Timestamp> {
         let frozen = self.freeze_business_day(timer_id, n, calendar, true)?;
         let remaining_secs = remaining_secs_until(frozen.deadline, frozen.anchor);
         self.timer(timer_id, remaining_secs).await?;
@@ -16811,7 +16811,7 @@ pub struct ActivityContext {
     /// `now + per_attempt_timeout`, recomputed on each retry (never `None` —
     /// an unset local `start_to_close` resolves to
     /// `WorkerConfig::max_local_activity_start_to_close`).
-    deadline: Option<DateTime<Utc>>,
+    deadline: Option<Timestamp>,
     /// Shared last-heartbeat payload cell for the auto-heartbeat ticker
     /// (issue #682).
     ///
@@ -17437,7 +17437,7 @@ impl ActivityContext {
     /// [`ActivityContext`] by hand use it to exercise a deadline-aware
     /// branch without a real timeout.
     #[must_use]
-    pub const fn with_deadline(mut self, deadline: Option<DateTime<Utc>>) -> Self {
+    pub const fn with_deadline(mut self, deadline: Option<Timestamp>) -> Self {
         self.deadline = deadline;
         self
     }
@@ -17845,7 +17845,7 @@ impl ActivityContext {
     /// therefore ignoring pause extensions. This one reports the **live
     /// enforced** attempt deadline. They are not interchangeable.
     #[must_use]
-    pub const fn deadline(&self) -> Option<DateTime<Utc>> {
+    pub const fn deadline(&self) -> Option<Timestamp> {
         self.deadline
     }
 
@@ -17867,15 +17867,15 @@ impl ActivityContext {
     /// # Differs from the workflow-side sibling
     ///
     /// [`WorkflowContext::time_until_deadline`] returns a
-    /// [`chrono::Duration`] that goes **negative** past the deadline. This
+    /// [`jiff::SignedDuration`] that goes **negative** past the deadline. This
     /// returns a [`std::time::Duration`], which cannot be negative. So it
     /// saturates, which suits a reserve comparison. But `Some(Duration::ZERO)`
     /// cannot tell "exactly at the deadline" from "ten minutes over". To
     /// measure overrun, subtract directly:
-    /// `ctx.deadline().map(|d| Utc::now() - d)`.
+    /// `ctx.deadline().map(|d| Timestamp::now() - d)`.
     #[must_use]
     pub fn time_remaining(&self) -> Option<std::time::Duration> {
-        time_remaining_from(self.deadline, Utc::now())
+        time_remaining_from(self.deadline, Timestamp::now())
     }
 
     /// `true` when less than `reserve` remains before the attempt deadline.
@@ -18937,7 +18937,7 @@ mod tests {
     use crate::error::TimeoutType;
     use crate::shard::ShardRouter;
     use crate::types::{ActivityExecId, ShardId};
-    use chrono::Utc;
+    use jiff::{SignedDuration, Timestamp};
     use std::time::Duration;
 
     // ── Embedded-backend context (issue #2024) ──────────────────────────────
@@ -19008,7 +19008,7 @@ mod tests {
     fn started_event() -> WorkflowEvent {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -19775,7 +19775,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -19806,7 +19806,7 @@ mod tests {
     fn ctx_with_extra_events(extra: usize, threshold: u64) -> WorkflowContext {
         let mut events = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -19863,7 +19863,7 @@ mod tests {
     fn should_continue_as_new_reads_a_legacy_checkpoint_after_the_deadline_probe() {
         // A history from before #2080 with an execution timeout holds the
         // deadline clock read, then the checkpoint.
-        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
         let ctx = deadline_ctx(
             t0,
             vec![
@@ -19874,7 +19874,7 @@ mod tests {
                     new_workflow_type: None,
                 },
             ],
-            Some(chrono::Duration::seconds(30)),
+            Some(jiff::SignedDuration::from_secs(30)),
         );
         assert!(ctx.should_continue_as_new());
         assert!(ctx.drain_commands().is_empty());
@@ -19882,7 +19882,7 @@ mod tests {
 
     #[test]
     fn should_continue_as_new_replays_the_decision_before_the_deadline_probe() {
-        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
         let ctx = deadline_ctx(
             t0,
             vec![
@@ -19890,7 +19890,7 @@ mod tests {
                 recorded_now(t0),
                 next_side_effect(),
             ],
-            Some(chrono::Duration::seconds(30)),
+            Some(jiff::SignedDuration::from_secs(30)),
         );
         assert!(ctx.should_continue_as_new());
         assert!(ctx.drain_commands().is_empty());
@@ -19905,7 +19905,7 @@ mod tests {
             let events = vec![
                 WorkflowEvent::WorkflowStarted {
                     input: Value::Null,
-                    timestamp: Utc::now(),
+                    timestamp: Timestamp::now(),
                     last_completion_result: None,
                     last_error: None,
                     scheduled_time: None,
@@ -19946,7 +19946,7 @@ mod tests {
             payload: serde_json::json!(n),
         };
         let ctx = deadline_ctx_with_policy(
-            Utc::now(),
+            Timestamp::now(),
             vec![
                 continue_decision(false),
                 signal(1),
@@ -19985,7 +19985,7 @@ mod tests {
     #[test]
     fn should_continue_as_new_reads_a_recorded_false_as_false() {
         let ctx = deadline_ctx_with_policy(
-            Utc::now(),
+            Timestamp::now(),
             vec![continue_decision(false), next_side_effect()],
             None,
             WorkflowHistoryPolicy::default(),
@@ -20007,7 +20007,7 @@ mod tests {
     #[test]
     fn should_continue_as_new_replays_a_recorded_true_decision() {
         let ctx = deadline_ctx_with_policy(
-            Utc::now(),
+            Timestamp::now(),
             vec![continue_decision(true), next_side_effect()],
             None,
             WorkflowHistoryPolicy::default(),
@@ -20022,7 +20022,7 @@ mod tests {
     fn should_continue_as_new_reads_a_legacy_checkpoint_as_true() {
         // A history that predates the decision event ends in the checkpoint.
         let ctx = deadline_ctx_with_policy(
-            Utc::now(),
+            Timestamp::now(),
             vec![WorkflowEvent::WorkflowContinuedAsNew {
                 new_exec_id: ExecutionId::new(),
                 input: Value::Null,
@@ -20040,7 +20040,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -20069,9 +20069,9 @@ mod tests {
     /// `WorkflowStarted` timestamp, plus any extra events (e.g. a recorded
     /// `SideEffectRecorded{Now}` for `system_now`).
     fn deadline_ctx(
-        t0: DateTime<Utc>,
+        t0: Timestamp,
         extra: Vec<WorkflowEvent>,
-        execution_timeout: Option<chrono::Duration>,
+        execution_timeout: Option<jiff::SignedDuration>,
     ) -> WorkflowContext {
         let mut events = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
@@ -20088,9 +20088,9 @@ mod tests {
     /// Like [`deadline_ctx`] but with a caller-supplied history policy so tests
     /// can vary the deadline fraction (issue #772 Finding 3/4).
     fn deadline_ctx_with_policy(
-        t0: DateTime<Utc>,
+        t0: Timestamp,
         extra: Vec<WorkflowEvent>,
-        execution_timeout: Option<chrono::Duration>,
+        execution_timeout: Option<jiff::SignedDuration>,
         policy: WorkflowHistoryPolicy,
     ) -> WorkflowContext {
         let mut events = vec![WorkflowEvent::WorkflowStarted {
@@ -20113,11 +20113,11 @@ mod tests {
     /// A recorded deadline-probe clock read at the given wall-clock instant —
     /// recorded under the reserved probe name so the tolerant matcher consumes
     /// it (issue #772).
-    fn recorded_now(instant: DateTime<Utc>) -> WorkflowEvent {
+    fn recorded_now(instant: Timestamp) -> WorkflowEvent {
         WorkflowEvent::SideEffectRecorded {
             kind: crate::event::SideEffectKind::Now,
             name: Some(crate::replay::DEADLINE_PROBE_SIDE_EFFECT_NAME.to_string()),
-            value: serde_json::json!(instant.timestamp_millis()),
+            value: serde_json::json!(instant.as_millisecond()),
         }
     }
 
@@ -20126,24 +20126,24 @@ mod tests {
     /// [`time_until_deadline`](WorkflowContext::time_until_deadline) accessors
     /// match this shape strictly. The tolerant deadline probe (issue #772)
     /// does not.
-    fn recorded_user_now(instant: DateTime<Utc>) -> WorkflowEvent {
+    fn recorded_user_now(instant: Timestamp) -> WorkflowEvent {
         WorkflowEvent::SideEffectRecorded {
             kind: crate::event::SideEffectKind::Now,
             name: None,
-            value: serde_json::json!(instant.timestamp_millis()),
+            value: serde_json::json!(instant.as_millisecond()),
         }
     }
 
     #[test]
     fn deadline_returns_start_plus_timeout() {
-        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
-        let ctx = deadline_ctx(t0, vec![], Some(chrono::Duration::seconds(30)));
-        assert_eq!(ctx.deadline(), Some(t0 + chrono::Duration::seconds(30)));
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let ctx = deadline_ctx(t0, vec![], Some(jiff::SignedDuration::from_secs(30)));
+        assert_eq!(ctx.deadline(), Some(t0 + jiff::SignedDuration::from_secs(30)));
     }
 
     #[test]
     fn deadline_is_none_without_timeout() {
-        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
         let ctx = deadline_ctx(t0, vec![], None);
         assert_eq!(ctx.deadline(), None);
     }
@@ -20158,10 +20158,10 @@ mod tests {
     /// `should_continue_as_new_uses_live_effective_deadline_not_nominal`).
     #[test]
     fn deadline_public_accessor_is_nominal_not_shifted_deadline_at() {
-        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
-        let timeout = chrono::Duration::seconds(30);
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let timeout = jiff::SignedDuration::from_secs(30);
         // A resume shift of +120s pushes the row's `deadline_at` past start+timeout.
-        let shift = chrono::Duration::seconds(120);
+        let shift = jiff::SignedDuration::from_secs(120);
         let shifted = t0 + timeout + shift;
         let ctx = deadline_ctx(t0, vec![], Some(timeout)).with_deadline(Some(shifted));
         assert_eq!(
@@ -20181,8 +20181,8 @@ mod tests {
     /// `ctx.deadline()` falls back to `start + execution_timeout`, as before.
     #[test]
     fn deadline_falls_back_to_start_plus_timeout_without_absolute() {
-        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
-        let timeout = chrono::Duration::seconds(30);
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let timeout = jiff::SignedDuration::from_secs(30);
         // Explicit None threaded — must behave identically to not threading.
         let ctx = deadline_ctx(t0, vec![], Some(timeout)).with_deadline(None);
         assert_eq!(ctx.deadline(), Some(t0 + timeout));
@@ -20196,10 +20196,10 @@ mod tests {
     /// The run is then nowhere near its fraction of the effective deadline.
     #[test]
     fn should_continue_as_new_reads_shifted_deadline_not_stale_start_plus_timeout() {
-        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
-        let timeout = chrono::Duration::seconds(30);
-        let clock = t0 + chrono::Duration::seconds(25);
-        let shifted = t0 + timeout + chrono::Duration::hours(1);
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let timeout = jiff::SignedDuration::from_secs(30);
+        let clock = t0 + jiff::SignedDuration::from_secs(25);
+        let shifted = t0 + timeout + jiff::SignedDuration::from_hours(1);
         let ctx =
             deadline_ctx(t0, vec![recorded_now(clock)], Some(timeout)).with_deadline(Some(shifted));
         // The public accessor stays nominal ...
@@ -20221,13 +20221,13 @@ mod tests {
     /// immediately on resume.
     #[test]
     fn should_continue_as_new_uses_live_effective_deadline_not_nominal() {
-        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
-        let timeout = chrono::Duration::seconds(30);
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let timeout = jiff::SignedDuration::from_secs(30);
         // Recorded clock is PAST the nominal deadline (t0+30s): nominal fraction
         // is > 1.0, so a nominal-based check would trip.
-        let clock = t0 + chrono::Duration::seconds(40);
+        let clock = t0 + jiff::SignedDuration::from_secs(40);
         // But the effective deadline was shifted an hour into the future.
-        let shifted = t0 + timeout + chrono::Duration::hours(1);
+        let shifted = t0 + timeout + jiff::SignedDuration::from_hours(1);
 
         // Control: WITHOUT a threaded deadline_at, the effective deadline IS
         // the (past) nominal, so the check DOES trip. So the live read is the
@@ -20284,10 +20284,10 @@ mod tests {
             response_schema: None,
         };
 
-        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
-        let parent = deadline_ctx(t0, vec![], Some(chrono::Duration::seconds(30)));
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let parent = deadline_ctx(t0, vec![], Some(jiff::SignedDuration::from_secs(30)));
         // Sanity: the parent workflow context itself sees the deadline.
-        assert_eq!(parent.deadline(), Some(t0 + chrono::Duration::seconds(30)));
+        assert_eq!(parent.deadline(), Some(t0 + jiff::SignedDuration::from_secs(30)));
 
         parent.register_declarative_update_handler(&info);
         let fut = parent
@@ -20315,7 +20315,7 @@ mod tests {
         {
             // The public accessor is the nominal deadline; return its millis so
             // the test can assert the handler inherited execution_timeout.
-            let nominal = ctx.deadline().map(|d| d.timestamp_millis());
+            let nominal = ctx.deadline().map(|d| d.as_millisecond());
             Box::pin(async move { Ok(serde_json::json!(nominal)) })
         }
 
@@ -20334,9 +20334,9 @@ mod tests {
             response_schema: None,
         };
 
-        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
-        let timeout = chrono::Duration::seconds(30);
-        let shifted = t0 + timeout + chrono::Duration::hours(1);
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let timeout = jiff::SignedDuration::from_secs(30);
+        let shifted = t0 + timeout + jiff::SignedDuration::from_hours(1);
         let parent = deadline_ctx(t0, vec![], Some(timeout)).with_deadline(Some(shifted));
 
         parent.register_declarative_update_handler(&info);
@@ -20346,7 +20346,7 @@ mod tests {
         let result = fut.await;
         assert_eq!(
             result,
-            Ok(serde_json::json!((t0 + timeout).timestamp_millis())),
+            Ok(serde_json::json!((t0 + timeout).as_millisecond())),
             "the update handler must inherit execution_timeout (nominal deadline present)"
         );
     }
@@ -20446,8 +20446,8 @@ mod tests {
 
     #[test]
     fn time_until_deadline_uses_recorded_clock() {
-        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
-        let clock = t0 + chrono::Duration::seconds(10);
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let clock = t0 + jiff::SignedDuration::from_secs(10);
         // execution_timeout = 30s, recorded clock = t0+10s ⇒ 20s remaining.
         // `time_until_deadline()` reads the PUBLIC (strict) `system_now()`, so
         // the recorded clock must be a bare user `Now` (`name: None`), not the
@@ -20455,17 +20455,17 @@ mod tests {
         let ctx = deadline_ctx(
             t0,
             vec![recorded_user_now(clock)],
-            Some(chrono::Duration::seconds(30)),
+            Some(jiff::SignedDuration::from_secs(30)),
         );
         assert_eq!(
             ctx.time_until_deadline(),
-            Some(chrono::Duration::seconds(20))
+            Some(jiff::SignedDuration::from_secs(20))
         );
     }
 
     #[test]
     fn time_until_deadline_is_none_without_deadline() {
-        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
         // No execution_timeout: time_until_deadline must be None AND must not
         // consult (or record) the wall clock.
         let ctx = deadline_ctx(t0, vec![], None);
@@ -20478,14 +20478,14 @@ mod tests {
 
     #[test]
     fn should_continue_as_new_trips_on_deadline_fraction() {
-        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
         // 25s of a 30s budget consumed (0.83 ≥ 0.8) ⇒ trips, even though the
         // event count is far under the soft threshold.
-        let clock = t0 + chrono::Duration::seconds(25);
+        let clock = t0 + jiff::SignedDuration::from_secs(25);
         let ctx = deadline_ctx(
             t0,
             vec![recorded_now(clock)],
-            Some(chrono::Duration::seconds(30)),
+            Some(jiff::SignedDuration::from_secs(30)),
         );
         assert!(ctx.history_event_count() < 10_000);
         assert!(ctx.should_continue_as_new());
@@ -20493,13 +20493,13 @@ mod tests {
 
     #[test]
     fn should_continue_as_new_not_yet_before_fraction() {
-        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
         // Only 10s of a 30s budget consumed (0.33 < 0.8) ⇒ does not trip.
-        let clock = t0 + chrono::Duration::seconds(10);
+        let clock = t0 + jiff::SignedDuration::from_secs(10);
         let ctx = deadline_ctx(
             t0,
             vec![recorded_now(clock)],
-            Some(chrono::Duration::seconds(30)),
+            Some(jiff::SignedDuration::from_secs(30)),
         );
         assert!(!ctx.should_continue_as_new());
     }
@@ -20677,7 +20677,7 @@ mod tests {
     /// event at the cursor is a `TimerStarted`.
     #[test]
     fn deadline_read_tolerates_non_now_cursor_event_no_divergence_no_command() {
-        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
         // execution_timeout is Some, so the deadline branch IS evaluated. But
         // the cursor holds a TimerStarted, because a pre-#772 history recorded
         // no Now here. So the tolerant read degrades to history-count-only.
@@ -20687,7 +20687,7 @@ mod tests {
                 timer_id: crate::types::TimerId::new("renewal"),
                 duration_secs: 3600,
             }],
-            Some(chrono::Duration::seconds(30)),
+            Some(jiff::SignedDuration::from_secs(30)),
         );
 
         // Deadline branch is off (returns None → false); event count is far
@@ -20716,10 +20716,10 @@ mod tests {
     #[test]
     fn deadline_read_records_live_at_frontier() {
         // t0 far in the past + a 30s budget ⇒ the frozen live clock
-        // (Utc::now()) is well past the deadline, so the branch trips. The key
+        // (Timestamp::now()) is well past the deadline, so the branch trips. The key
         // assertion is that exactly one Now side-effect command is recorded.
-        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
-        let ctx = deadline_ctx(t0, vec![], Some(chrono::Duration::seconds(30)));
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let ctx = deadline_ctx(t0, vec![], Some(jiff::SignedDuration::from_secs(30)));
 
         assert!(
             ctx.should_continue_as_new(),
@@ -20765,13 +20765,13 @@ mod tests {
     /// this to a trip, so this test pins the default boundary's *effect*.
     #[test]
     fn default_fraction_does_not_trip_at_0_6_consumed() {
-        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
         // 18s of a 30s budget consumed (0.6). Remaining 12s > (1-0.8)*30 = 6s.
-        let clock = t0 + chrono::Duration::seconds(18);
+        let clock = t0 + jiff::SignedDuration::from_secs(18);
         let ctx = deadline_ctx(
             t0,
             vec![recorded_now(clock)],
-            Some(chrono::Duration::seconds(30)),
+            Some(jiff::SignedDuration::from_secs(30)),
         );
         assert!(
             !ctx.should_continue_as_new(),
@@ -20783,13 +20783,13 @@ mod tests {
     /// history that does not trip at 0.8 DOES trip at 0.5.
     #[test]
     fn configured_fraction_shifts_the_boundary() {
-        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
-        let clock = t0 + chrono::Duration::seconds(18); // 0.6 consumed of 30s
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let clock = t0 + jiff::SignedDuration::from_secs(18); // 0.6 consumed of 30s
         let policy = WorkflowHistoryPolicy::default().with_continue_as_new_deadline_fraction(0.5);
         let ctx = deadline_ctx_with_policy(
             t0,
             vec![recorded_now(clock)],
-            Some(chrono::Duration::seconds(30)),
+            Some(jiff::SignedDuration::from_secs(30)),
             policy,
         );
         // Remaining 12s ≤ (1-0.5)*30 = 15s ⇒ trips.
@@ -20805,13 +20805,13 @@ mod tests {
     /// remaining) still trips at the default fraction.
     #[test]
     fn deadline_in_the_past_still_trips() {
-        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
         // 40s consumed of a 30s budget ⇒ deadline already 10s in the past.
-        let clock = t0 + chrono::Duration::seconds(40);
+        let clock = t0 + jiff::SignedDuration::from_secs(40);
         let ctx = deadline_ctx(
             t0,
             vec![recorded_now(clock)],
-            Some(chrono::Duration::seconds(30)),
+            Some(jiff::SignedDuration::from_secs(30)),
         );
         assert!(
             ctx.should_continue_as_new(),
@@ -20823,14 +20823,14 @@ mod tests {
     /// only trips once the deadline is reached (remaining ≤ 0).
     #[test]
     fn fraction_clamp_endpoints_behave() {
-        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
 
         // fraction 0.0: trips even at 1s consumed of a 30s budget.
-        let clock = t0 + chrono::Duration::seconds(1);
+        let clock = t0 + jiff::SignedDuration::from_secs(1);
         let ctx0 = deadline_ctx_with_policy(
             t0,
             vec![recorded_now(clock)],
-            Some(chrono::Duration::seconds(30)),
+            Some(jiff::SignedDuration::from_secs(30)),
             WorkflowHistoryPolicy::default().with_continue_as_new_deadline_fraction(0.0),
         );
         assert!(
@@ -20839,11 +20839,11 @@ mod tests {
         );
 
         // fraction 1.0, 29s consumed of 30s (still 1s remaining): must NOT trip.
-        let clock_before = t0 + chrono::Duration::seconds(29);
+        let clock_before = t0 + jiff::SignedDuration::from_secs(29);
         let ctx1_before = deadline_ctx_with_policy(
             t0,
             vec![recorded_now(clock_before)],
-            Some(chrono::Duration::seconds(30)),
+            Some(jiff::SignedDuration::from_secs(30)),
             WorkflowHistoryPolicy::default().with_continue_as_new_deadline_fraction(1.0),
         );
         assert!(
@@ -20852,11 +20852,11 @@ mod tests {
         );
 
         // fraction 1.0, exactly at the deadline (remaining 0): trips.
-        let clock_at = t0 + chrono::Duration::seconds(30);
+        let clock_at = t0 + jiff::SignedDuration::from_secs(30);
         let ctx1_at = deadline_ctx_with_policy(
             t0,
             vec![recorded_now(clock_at)],
-            Some(chrono::Duration::seconds(30)),
+            Some(jiff::SignedDuration::from_secs(30)),
             WorkflowHistoryPolicy::default().with_continue_as_new_deadline_fraction(1.0),
         );
         assert!(
@@ -20870,10 +20870,10 @@ mod tests {
     /// degrades to false, with no panic and no immediate trip.
     #[test]
     fn deadline_overflow_returns_none_and_does_not_trip() {
-        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
         // ~547k years — well past chrono's representable date range when added
         // to a 2023 start, so checked_add_signed returns None.
-        let huge = chrono::Duration::days(200_000_000);
+        let huge = crate::time::days(200_000_000);
         let ctx = deadline_ctx(t0, vec![recorded_now(t0)], Some(huge));
         assert_eq!(ctx.deadline(), None, "an overflowing deadline must be None");
         assert!(
@@ -20890,9 +20890,9 @@ mod tests {
     /// start time, not the predecessor's.
     #[test]
     fn deadline_reanchors_for_continue_as_new_successor() {
-        let predecessor_t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
-        let successor_t0 = predecessor_t0 + chrono::Duration::seconds(100);
-        let budget = chrono::Duration::seconds(30);
+        let predecessor_t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let successor_t0 = predecessor_t0 + jiff::SignedDuration::from_secs(100);
+        let budget = jiff::SignedDuration::from_secs(30);
 
         let predecessor = deadline_ctx(predecessor_t0, vec![], Some(budget));
         // A successor-shaped history: its first event is the successor's own
@@ -21057,7 +21057,7 @@ mod tests {
         let history = vec![
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -21097,7 +21097,7 @@ mod tests {
         let history = vec![
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -21182,7 +21182,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -21217,7 +21217,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -21245,7 +21245,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -21873,9 +21873,8 @@ mod tests {
 
     #[test]
     fn context_now_returns_deterministic_time() {
-        let fixed_time = DateTime::parse_from_rfc3339("2026-01-15T10:30:00Z")
-            .expect("valid timestamp")
-            .with_timezone(&Utc);
+        let fixed_time = ("2026-01-15T10:30:00Z").parse::<Timestamp>()
+            .expect("valid timestamp");
 
         let events = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
@@ -21901,7 +21900,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -21950,7 +21949,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -21998,7 +21997,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -22040,7 +22039,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -22077,7 +22076,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -22101,7 +22100,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -22171,7 +22170,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -22195,7 +22194,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -22230,7 +22229,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -22269,7 +22268,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -22311,7 +22310,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -22348,7 +22347,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -22442,7 +22441,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -22474,7 +22473,7 @@ mod tests {
     fn wf_started_event() -> WorkflowEvent {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -23062,7 +23061,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -23106,7 +23105,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -23149,7 +23148,7 @@ mod tests {
         let ctx = WorkflowContext::new_test();
         let t = ctx.system_now();
         // The captured instant is a real wall-clock value (>= the year 2020).
-        assert!(t.timestamp() > 1_577_836_800);
+        assert!(t.as_second() > 1_577_836_800);
 
         let cmds = ctx.drain_commands();
         assert_eq!(cmds.len(), 1);
@@ -23168,7 +23167,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -23181,7 +23180,7 @@ mod tests {
         ];
         let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
         let t = ctx.system_now();
-        assert_eq!(t.timestamp_millis(), frozen_millis);
+        assert_eq!(t.as_millisecond(), frozen_millis);
         // No command emitted on replay.
         assert!(ctx.drain_commands().is_empty());
         assert!(ctx.take_deferred_nd_error().is_none());
@@ -23192,8 +23191,8 @@ mod tests {
     #[test]
     fn remaining_secs_until_truth_table() {
         let base = 1_700_000_000_000_i64;
-        let now = DateTime::from_timestamp_millis(base).unwrap();
-        let at = |delta_ms: i64| DateTime::from_timestamp_millis(base + delta_ms).unwrap();
+        let now = Timestamp::from_millisecond(base).ok().unwrap();
+        let at = |delta_ms: i64| Timestamp::from_millisecond(base + delta_ms).ok().unwrap();
 
         // Future: exactly one hour out.
         assert_eq!(remaining_secs_until(at(3_600_000), now), 3600);
@@ -23209,17 +23208,17 @@ mod tests {
         // millisecond-granular `at()` helper cannot express these, so build the
         // deadlines with micro/nanosecond offsets directly.
         assert_eq!(
-            remaining_secs_until(now + chrono::Duration::microseconds(500), now),
+            remaining_secs_until(now + jiff::SignedDuration::from_micros(500), now),
             1
         );
         assert_eq!(
-            remaining_secs_until(now + chrono::Duration::nanoseconds(1), now),
+            remaining_secs_until(now + jiff::SignedDuration::from_nanos(1), now),
             1
         );
         // A whole second plus a single nanosecond still rounds up to 2.
         assert_eq!(
             remaining_secs_until(
-                now + chrono::Duration::seconds(1) + chrono::Duration::nanoseconds(1),
+                now + jiff::SignedDuration::from_secs(1) + jiff::SignedDuration::from_nanos(1),
                 now
             ),
             2
@@ -23240,10 +23239,10 @@ mod tests {
     /// `PROPTEST_CASES` overrides the (low) default case count; on-disk failure
     /// persistence is disabled to keep CI runners artifact-free.
     mod remaining_secs_until_props {
-        use chrono::{DateTime, Duration, Utc};
+        use jiff::{SignedDuration, Timestamp};
         use proptest::prelude::*;
 
-        fn dt(secs: i64, nanos: u32) -> DateTime<Utc> {
+        fn dt(secs: i64, nanos: u32) -> Timestamp {
             DateTime::from_timestamp(secs, nanos).expect("in-range timestamp")
         }
 
@@ -23310,7 +23309,7 @@ mod tests {
         let ctx = WorkflowContext::new_test();
         // Base the deadline on a fresh wall-clock read so it is ~1h ahead of
         // the internal `system_now()` capture regardless of `ctx.now()`.
-        let deadline = Utc::now() + chrono::Duration::hours(1);
+        let deadline = Timestamp::now() + jiff::SignedDuration::from_hours(1);
 
         let fut = ctx.sleep_until("wake", deadline);
         let mut fut = Box::pin(fut);
@@ -23348,7 +23347,7 @@ mod tests {
         };
         assert_eq!(timer_id.as_str(), "wake");
         // ~3600s, but the exact whole-second value depends on sub-second timing.
-        // `deadline` is a full-precision `Utc::now() + 1h`. The internal
+        // `deadline` is a full-precision `Timestamp::now() + 1h`. The internal
         // `system_now()` capture truncates to whole milliseconds. In the same
         // wall-clock millisecond, the remaining delta is `1h + frac_ms`, and
         // the nanosecond-precise round-up yields 3601. A millisecond or two
@@ -23363,7 +23362,7 @@ mod tests {
     #[tokio::test]
     async fn sleep_until_past_deadline_starts_zero_duration_timer() {
         let ctx = WorkflowContext::new_test();
-        let deadline = Utc::now() - chrono::Duration::days(365);
+        let deadline = Timestamp::now() - crate::time::days(365);
 
         let fut = ctx.sleep_until("wake", deadline);
         let mut fut = Box::pin(fut);
@@ -23388,15 +23387,15 @@ mod tests {
         let frozen_millis = 1_700_000_000_000_i64;
         let deadline_millis = frozen_millis + 3_600_000;
         let d = remaining_secs_until(
-            DateTime::from_timestamp_millis(deadline_millis).unwrap(),
-            DateTime::from_timestamp_millis(frozen_millis).unwrap(),
+            Timestamp::from_millisecond(deadline_millis).ok().unwrap(),
+            Timestamp::from_millisecond(frozen_millis).ok().unwrap(),
         );
         assert_eq!(d, 3600, "fixture math must be internally consistent");
 
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -23415,7 +23414,7 @@ mod tests {
             },
         ];
         let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
-        let deadline = DateTime::from_timestamp_millis(deadline_millis).unwrap();
+        let deadline = Timestamp::from_millisecond(deadline_millis).ok().unwrap();
         let result = ctx.sleep_until("wake", deadline).await;
         assert!(
             result.is_ok(),
@@ -23437,13 +23436,13 @@ mod tests {
     /// virtual clock, not the real wall clock. So every business-day test is
     /// hermetic across all seven weekdays (issue #806 R6).
     #[cfg(test)]
-    fn bd_ctx(anchor: DateTime<Utc>, cals: crate::calendar::BusinessCalendars) -> WorkflowContext {
+    fn bd_ctx(anchor: Timestamp, cals: crate::calendar::BusinessCalendars) -> WorkflowContext {
         bd_ctx_with_events(anchor, cals, vec![])
     }
 
     #[cfg(test)]
     fn bd_ctx_with_events(
-        anchor: DateTime<Utc>,
+        anchor: Timestamp,
         cals: crate::calendar::BusinessCalendars,
         mut tail: Vec<WorkflowEvent>,
     ) -> WorkflowContext {
@@ -23465,8 +23464,8 @@ mod tests {
     }
 
     #[cfg(test)]
-    fn bd_utc(s: &str) -> DateTime<Utc> {
-        s.parse::<DateTime<Utc>>().expect("valid RFC 3339 instant")
+    fn bd_utc(s: &str) -> Timestamp {
+        s.parse::<Timestamp>().expect("valid RFC 3339 instant")
     }
 
     #[cfg(test)]
@@ -23623,7 +23622,7 @@ mod tests {
     async fn timer_business_days_skips_a_holiday() {
         let cals = crate::calendar::BusinessCalendars::new().with_calendar(
             "biz",
-            [chrono::NaiveDate::from_ymd_opt(2026, 7, 6).expect("valid")],
+            [crate::time::date_ymd(2026, 7, 6).expect("valid")],
         );
         let ctx = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
 
@@ -23807,7 +23806,7 @@ mod tests {
         let cals = crate::calendar::BusinessCalendars::new().with_calendar_covering(
             "biz",
             [],
-            chrono::NaiveDate::from_ymd_opt(2026, 7, 3).expect("valid"),
+            crate::time::date_ymd(2026, 7, 3).expect("valid"),
         );
         for (label, id, n, cal) in [
             ("missing calendar name", "a", 2_u32, "typo"),
@@ -23929,14 +23928,14 @@ mod tests {
 
     #[tokio::test]
     async fn business_day_coverage_exhausted_is_frozen_rejection() {
-        let horizon = chrono::NaiveDate::from_ymd_opt(2026, 7, 3).expect("valid");
+        let horizon = crate::time::date_ymd(2026, 7, 3).expect("valid");
         let (first, second) = bd_frozen_rejection_round_trip(
             crate::calendar::BusinessCalendars::new().with_calendar_covering("biz", [], horizon),
             // The corrected snapshot extends coverage well past the deadline.
             crate::calendar::BusinessCalendars::new().with_calendar_covering(
                 "biz",
                 [],
-                chrono::NaiveDate::from_ymd_opt(2027, 12, 31).expect("valid"),
+                crate::time::date_ymd(2027, 12, 31).expect("valid"),
             ),
             5,
             "biz",
@@ -24004,7 +24003,7 @@ mod tests {
         );
 
         // Frozen: coverage exhausted -> Config, and it IS recorded.
-        let horizon = chrono::NaiveDate::from_ymd_opt(2026, 7, 3).expect("valid");
+        let horizon = crate::time::date_ymd(2026, 7, 3).expect("valid");
         let cals =
             crate::calendar::BusinessCalendars::new().with_calendar_covering("biz", [], horizon);
         let ctx = bd_ctx(bd_utc("2026-07-02T09:00:00Z"), cals);
@@ -24071,17 +24070,17 @@ mod tests {
             let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", []);
             let ctx = bd_ctx(bd_utc(anchor), cals);
             let deadline = ctx.business_days_from_now("d", 1, "biz").expect("resolves");
-            deadline.date_naive()
+            crate::time::utc_date(deadline)
         };
         // Friday 23:59:59Z -> +1 business day = Monday.
         assert_eq!(
             mk("2026-07-03T23:59:59Z"),
-            chrono::NaiveDate::from_ymd_opt(2026, 7, 6).expect("valid"),
+            crate::time::date_ymd(2026, 7, 6).expect("valid"),
         );
         // Two seconds later it is Saturday in UTC -> +1 business day = Tuesday.
         assert_eq!(
             mk("2026-07-04T00:00:01Z"),
-            chrono::NaiveDate::from_ymd_opt(2026, 7, 7).expect("valid"),
+            crate::time::date_ymd(2026, 7, 7).expect("valid"),
         );
 
         // The SHARPER form of the same limitation. For a deployment east of
@@ -24129,7 +24128,7 @@ mod tests {
         let anchor = bd_utc("2026-07-02T09:00:00Z");
         let res = crate::calendar::BusinessDayResolution {
             deadline: bd_utc("2026-07-06T09:00:00Z"),
-            skipped: vec![chrono::NaiveDate::from_ymd_opt(2026, 7, 4).expect("valid")],
+            skipped: vec![crate::time::date_ymd(2026, 7, 4).expect("valid")],
         };
         for original in [
             FrozenBusinessDay::resolved(anchor, "biz".into(), &res, None),
@@ -24152,10 +24151,10 @@ mod tests {
         // R10: a decision cycle must stay cheap. The scan is bounded and uses
         // BTreeSet lookups, so even MAX_BUSINESS_DAYS is cheap.
         // Every tenth day stays open, so no run is longer than 30 days (issue #1968).
-        let holidays: Vec<chrono::NaiveDate> = (0..400)
+        let holidays: Vec<jiff::civil::Date> = (0..400)
             .filter(|i| i % 10 != 0)
             .filter_map(|i| {
-                chrono::NaiveDate::from_ymd_opt(2026, 1, 1)?.checked_add_days(chrono::Days::new(i))
+                crate::time::date_ymd(2026, 1, 1)?.checked_add_days(chrono::Days::new(i))
             })
             .collect();
         let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", holidays);
@@ -24233,7 +24232,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -24253,7 +24252,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -24283,7 +24282,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -24312,7 +24311,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -24335,7 +24334,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -24363,7 +24362,7 @@ mod tests {
         // Build a history with 1,000 distinct recorded Now values.
         let mut events = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -24380,7 +24379,7 @@ mod tests {
         let run = || {
             let ctx = WorkflowContext::for_replay(ExecutionId::new(), events.clone());
             let seq: Vec<i64> = (0..1000)
-                .map(|_| ctx.system_now().timestamp_millis())
+                .map(|_| ctx.system_now().as_millisecond())
                 .collect();
             assert!(ctx.take_deferred_nd_error().is_none());
             seq
@@ -24399,7 +24398,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -24430,7 +24429,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -24460,7 +24459,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -24551,7 +24550,7 @@ mod tests {
             vec![
                 WorkflowEvent::WorkflowStarted {
                     input: Value::Null,
-                    timestamp: Utc::now(),
+                    timestamp: Timestamp::now(),
                     last_completion_result: None,
                     last_error: None,
                     scheduled_time: None,
@@ -24595,7 +24594,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -24637,7 +24636,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -24707,7 +24706,7 @@ mod tests {
         let exec_id = ExecutionId::new();
         let events = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -24729,7 +24728,7 @@ mod tests {
 
         let events = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -24747,7 +24746,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -24773,7 +24772,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -25030,7 +25029,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -25072,7 +25071,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -25112,7 +25111,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -25166,7 +25165,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -25244,7 +25243,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -25299,7 +25298,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -25332,7 +25331,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -25367,7 +25366,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -25414,7 +25413,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -25480,7 +25479,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -25520,7 +25519,7 @@ mod tests {
         let history = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -25668,7 +25667,7 @@ mod tests {
         let history = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -25732,7 +25731,7 @@ mod tests {
         let history = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -25785,7 +25784,7 @@ mod tests {
         let history = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -25814,7 +25813,7 @@ mod tests {
         let history = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -25850,7 +25849,7 @@ mod tests {
         let history = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -25887,7 +25886,7 @@ mod tests {
         let history = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -25916,7 +25915,7 @@ mod tests {
         let history = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -25943,7 +25942,7 @@ mod tests {
         let history = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -25978,7 +25977,7 @@ mod tests {
         let history = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -26049,7 +26048,7 @@ mod tests {
         let history = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -26076,7 +26075,7 @@ mod tests {
     fn context_is_not_cancelled_without_terminal_event() {
         let events = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -26093,7 +26092,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -26183,7 +26182,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -26216,7 +26215,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -26258,7 +26257,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -26352,7 +26351,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -26443,7 +26442,7 @@ mod tests {
     fn child_timeout_started_event() -> WorkflowEvent {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -27151,7 +27150,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -27448,7 +27447,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -27506,7 +27505,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -27542,7 +27541,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -27583,7 +27582,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -27623,7 +27622,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -27662,7 +27661,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -27701,7 +27700,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -27784,7 +27783,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -27811,7 +27810,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -27848,7 +27847,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -27879,7 +27878,7 @@ mod tests {
             own_id,
             vec![WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -27909,7 +27908,7 @@ mod tests {
             own_id,
             vec![WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -27955,7 +27954,7 @@ mod tests {
             successor_exec_id,
             vec![WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -28024,7 +28023,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -28063,7 +28062,7 @@ mod tests {
             own_id,
             vec![WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -28106,7 +28105,7 @@ mod tests {
             successor_exec_id,
             vec![WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -28173,7 +28172,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -28227,7 +28226,7 @@ mod tests {
             own_id,
             vec![WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -28261,7 +28260,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -28285,7 +28284,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -28322,7 +28321,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -28355,7 +28354,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -28388,7 +28387,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -28440,7 +28439,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -28570,7 +28569,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -28601,7 +28600,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -28646,7 +28645,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -28679,7 +28678,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -28713,7 +28712,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -28798,7 +28797,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -28873,7 +28872,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -29031,7 +29030,7 @@ mod tests {
 
     #[test]
     fn durable_progress_is_suppressed_during_replay_but_claims_an_offset() {
-        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Timestamp::now());
         let side_effect = WorkflowEvent::SideEffectRecorded {
             kind: crate::event::SideEffectKind::Uuid,
             name: None,
@@ -29057,7 +29056,7 @@ mod tests {
         // Regression (issue #1974 review). A signal that arrives before the
         // first cycle sits at the cursor. The raw cursor check then reports
         // replay, and the chunks before `wait_for_signal` were never stored.
-        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Timestamp::now());
         let signal = WorkflowEvent::SignalReceived {
             signal_name: "go".to_string(),
             payload: serde_json::json!({}),
@@ -29077,7 +29076,7 @@ mod tests {
         // Regression (issue #1974 review). The durable gate must only read
         // the matcher. A gate that moves the cursor makes later code see
         // `is_replaying() == false` early, so a guarded side effect runs twice.
-        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Timestamp::now());
         let signal = WorkflowEvent::SignalReceived {
             signal_name: "go".to_string(),
             payload: serde_json::json!({}),
@@ -29102,7 +29101,7 @@ mod tests {
     fn durable_progress_offset_is_stable_when_the_cycle_appends_an_event() {
         // The ephemeral epoch seq fails this case. The same chunk gets a new
         // value in cycle 2, so the store holds it twice.
-        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Timestamp::now());
         let cycle1 = WorkflowContext::for_replay(ExecutionId::new(), vec![started.clone()]);
         cycle1
             .publish_durable_progress(serde_json::json!("A"))
@@ -29134,12 +29133,12 @@ mod tests {
 
     #[test]
     fn durable_progress_offset_is_stable_across_a_pause_resume() {
-        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Timestamp::now());
         let before = WorkflowContext::for_replay(ExecutionId::new(), vec![started.clone()]);
         before
             .publish_durable_progress(serde_json::json!("waiting"))
             .expect("before");
-        let now = Utc::now();
+        let now = Timestamp::now();
         let after = WorkflowContext::for_replay(
             ExecutionId::new(),
             vec![
@@ -29329,7 +29328,7 @@ mod tests {
         // durable write INHERITS that. So a workflow replayed N times yields
         // one copy of each line.
         let events = vec![
-            WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now()),
+            WorkflowEvent::workflow_started(serde_json::json!(null), Timestamp::now()),
             WorkflowEvent::MarkerRecorded {
                 name: "m".to_string(),
                 details: serde_json::json!(null),
@@ -29371,7 +29370,7 @@ mod tests {
         // dedups on it.
         let history = vec![WorkflowEvent::workflow_started(
             serde_json::json!(null),
-            Utc::now(),
+            Timestamp::now(),
         )];
         let seqs_for = |events: Vec<WorkflowEvent>| {
             let ctx = WorkflowContext::for_replay(ExecutionId::new(), events)
@@ -29410,7 +29409,7 @@ mod tests {
         //
         // "B" is the SAME logical line in both cycles and must carry the same
         // seq so the store's UNIQUE(exec, seq) collapses the re-emission.
-        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Timestamp::now());
 
         let cycle1 = WorkflowContext::for_replay(ExecutionId::new(), vec![started.clone()])
             .with_log_policy(Some(WorkflowLogPolicy::default()));
@@ -29459,14 +29458,14 @@ mod tests {
         // history-length model re-minted a different seq and duplicated the
         // line. Events the workflow never consumes do not move the call
         // ordinal.
-        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Timestamp::now());
         let before = WorkflowContext::for_replay(ExecutionId::new(), vec![started.clone()])
             .with_log_policy(Some(WorkflowLogPolicy::default()));
         before.log_info("awaiting approval");
         let before_logs = recorded_logs(&before.drain_commands());
         assert_eq!(before_logs.len(), 1, "the line must be emitted live");
 
-        let now = Utc::now();
+        let now = Timestamp::now();
         let after = WorkflowContext::for_replay(
             ExecutionId::new(),
             vec![
@@ -29504,7 +29503,7 @@ mod tests {
         // distinguish a genuinely new line. Cycle 2 replays (and suppresses)
         // the first line, then emits a second -- which must NOT collide with
         // the first line's stored row.
-        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Utc::now());
+        let started = WorkflowEvent::workflow_started(serde_json::json!(null), Timestamp::now());
         let cycle1 = WorkflowContext::for_replay(ExecutionId::new(), vec![started.clone()])
             .with_log_policy(Some(WorkflowLogPolicy::default()));
         cycle1.log_info("first");
@@ -29854,7 +29853,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -29863,13 +29862,13 @@ mod tests {
                 update_id: update_id1,
                 name: "update_1".into(),
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
             },
             WorkflowEvent::UpdateAdmitted {
                 update_id: update_id2,
                 name: "update_2".into(),
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
             },
             WorkflowEvent::UpdateCompleted {
                 update_id: update_id1,
@@ -29896,7 +29895,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -29905,7 +29904,7 @@ mod tests {
                 update_id,
                 name: "update_1".into(),
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
             },
             WorkflowEvent::UpdateCompleted {
                 update_id,
@@ -29928,7 +29927,7 @@ mod tests {
     fn race_started_event() -> WorkflowEvent {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -31508,7 +31507,7 @@ mod tests {
             .await?;
         assert_eq!(winner.index, 0, "the lowest-index resolved branch wins");
 
-        let elapsed = (ctx.now() - start).num_seconds();
+        let elapsed = (ctx.now() - start).as_secs();
         assert_eq!(
             elapsed, 60,
             "two concurrently-armed race deadlines share an anchor, so the clock \
@@ -31781,7 +31780,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -31811,7 +31810,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -31832,7 +31831,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -31936,7 +31935,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -31973,7 +31972,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -32044,7 +32043,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -32094,7 +32093,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -32137,7 +32136,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -32194,7 +32193,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -32252,7 +32251,7 @@ mod tests {
         vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -32461,7 +32460,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -32505,7 +32504,7 @@ mod tests {
     fn started_history() -> Vec<WorkflowEvent> {
         vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -32782,7 +32781,7 @@ mod tests {
         vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -32837,7 +32836,7 @@ mod tests {
     #[test]
     fn info_is_graceful_for_new_for_handler_context() {
         let exec_id = ExecutionId::new();
-        let ctx = WorkflowContext::new_for_handler(exec_id, Utc::now(), None, empty_shared_state());
+        let ctx = WorkflowContext::new_for_handler(exec_id, Timestamp::now(), None, empty_shared_state());
         let info = ctx.info();
         assert_eq!(info.execution_id, exec_id);
         assert_eq!(info.workflow_id, "");
@@ -32849,7 +32848,7 @@ mod tests {
     /// RAW frozen `WorkflowStarted` timestamp, not the advancing virtual clock.
     #[test]
     fn start_time_returns_raw_frozen_start_not_virtual_clock() {
-        let frozen = "2026-06-15T07:07:04Z".parse::<DateTime<Utc>>().unwrap();
+        let frozen = "2026-06-15T07:07:04Z".parse::<Timestamp>().unwrap();
         let events = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: frozen,
@@ -32875,7 +32874,7 @@ mod tests {
     #[cfg(any(test, feature = "testing"))]
     #[tokio::test]
     async fn info_start_time_is_immune_to_advancing_virtual_clock() {
-        let frozen = "2026-06-15T07:07:04Z".parse::<DateTime<Utc>>().unwrap();
+        let frozen = "2026-06-15T07:07:04Z".parse::<Timestamp>().unwrap();
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
@@ -33032,7 +33031,7 @@ mod tests {
     fn info_is_replay_deterministic_across_1000_rebuilds() {
         let exec_id = ExecutionId::new();
         let parent = ExecutionId::new();
-        let frozen = "2026-06-15T07:07:04Z".parse::<DateTime<Utc>>().unwrap();
+        let frozen = "2026-06-15T07:07:04Z".parse::<Timestamp>().unwrap();
         let fixture = vec![
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!({"cart": "cart-42"}),
@@ -33105,7 +33104,7 @@ mod tests {
         let activity_id = ActivityExecId::new();
         let started = WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -33241,13 +33240,13 @@ mod tests {
 /// [`ActivityContext::new_local_activity`]).
 #[cfg_attr(not(feature = "db"), allow(dead_code))]
 pub(crate) fn attempt_deadline(
-    started_at: Option<DateTime<Utc>>,
-    start_to_close: Option<chrono::Duration>,
-    schedule_to_close_at: Option<DateTime<Utc>>,
-) -> Option<DateTime<Utc>> {
+    started_at: Option<Timestamp>,
+    start_to_close: Option<jiff::SignedDuration>,
+    schedule_to_close_at: Option<Timestamp>,
+) -> Option<Timestamp> {
     let per_attempt = started_at
         .zip(start_to_close)
-        .and_then(|(started, budget)| started.checked_add_signed(budget));
+        .and_then(|(started, budget)| started.checked_add(budget).ok());
     match (per_attempt, schedule_to_close_at) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (Some(only), None) | (None, Some(only)) => Some(only),
@@ -33263,13 +33262,12 @@ pub(crate) fn attempt_deadline(
 /// `unwrap_or(ZERO)` saturates an elapsed deadline, as AC2 requires. It never
 /// mis-reports a far-future deadline as zero.
 pub(crate) fn time_remaining_from(
-    deadline: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
+    deadline: Option<Timestamp>,
+    now: Timestamp,
 ) -> Option<std::time::Duration> {
     let deadline = deadline?;
     Some(
-        (deadline - now)
-            .to_std()
+        std::time::Duration::try_from((deadline - now))
             .unwrap_or(std::time::Duration::ZERO),
     )
 }
@@ -33292,19 +33290,18 @@ pub(crate) fn should_checkpoint(
 #[cfg(test)]
 mod activity_deadline_helper_tests {
     use super::{attempt_deadline, should_checkpoint, time_remaining_from};
-    use chrono::{Duration as ChronoDuration, TimeZone as _, Utc};
+    use jiff::{SignedDuration, Timestamp};
     use std::time::Duration;
 
-    fn at(secs: i64) -> chrono::DateTime<Utc> {
-        Utc.timestamp_opt(1_700_000_000 + secs, 0)
-            .single()
+    fn at(secs: i64) -> jiff::Timestamp {
+        Timestamp::new(1_700_000_000 + secs, 0).ok()
             .expect("valid timestamp")
     }
 
     #[test]
     fn attempt_deadline_is_started_at_plus_start_to_close() {
         assert_eq!(
-            attempt_deadline(Some(at(0)), Some(ChronoDuration::seconds(30)), None),
+            attempt_deadline(Some(at(0)), Some(SignedDuration::from_secs(30)), None),
             Some(at(30))
         );
     }
@@ -33315,7 +33312,7 @@ mod activity_deadline_helper_tests {
     #[test]
     fn attempt_deadline_is_none_without_started_at() {
         assert_eq!(
-            attempt_deadline(None, Some(ChronoDuration::seconds(30)), None),
+            attempt_deadline(None, Some(SignedDuration::from_secs(30)), None),
             None
         );
     }
@@ -33340,7 +33337,7 @@ mod activity_deadline_helper_tests {
         assert_eq!(
             attempt_deadline(
                 Some(at(0)),
-                Some(ChronoDuration::seconds(300)),
+                Some(SignedDuration::from_secs(300)),
                 Some(at(60))
             ),
             Some(at(60))
@@ -33349,7 +33346,7 @@ mod activity_deadline_helper_tests {
         assert_eq!(
             attempt_deadline(
                 Some(at(0)),
-                Some(ChronoDuration::seconds(30)),
+                Some(SignedDuration::from_secs(30)),
                 Some(at(600))
             ),
             Some(at(30))
@@ -33371,8 +33368,8 @@ mod activity_deadline_helper_tests {
     fn attempt_deadline_overflow_saturates_to_none() {
         assert_eq!(
             attempt_deadline(
-                Some(chrono::DateTime::<Utc>::MAX_UTC),
-                Some(ChronoDuration::seconds(1)),
+                Some(jiff::Timestamp::MAX),
+                Some(SignedDuration::from_secs(1)),
                 None
             ),
             None
@@ -33445,7 +33442,7 @@ mod activity_deadline_helper_tests {
 mod activity_info_tests {
     use super::{ActivityContext, ActivityExecutionInfo, ActivityIdentity};
     use crate::types::{ActivityExecId, ExecutionId};
-    use chrono::{Duration as ChronoDuration, Utc};
+    use jiff::{SignedDuration, Timestamp};
     use std::time::Duration;
 
     fn configured() -> ActivityContext {
@@ -33719,7 +33716,7 @@ mod activity_info_tests {
 
     #[test]
     fn deadline_round_trips_and_time_remaining_is_positive_for_a_future_deadline() {
-        let deadline = Utc::now() + ChronoDuration::seconds(60);
+        let deadline = Timestamp::now() + SignedDuration::from_secs(60);
         let ctx = ActivityContext::new_test().with_deadline(Some(deadline));
         assert_eq!(ctx.deadline(), Some(deadline));
         let left = ctx
@@ -33737,7 +33734,7 @@ mod activity_info_tests {
     #[test]
     fn time_remaining_saturates_at_zero_for_an_elapsed_deadline() {
         let ctx = ActivityContext::new_test()
-            .with_deadline(Some(Utc::now() - ChronoDuration::minutes(10)));
+            .with_deadline(Some(Timestamp::now() - SignedDuration::from_mins(10)));
         assert_eq!(ctx.time_remaining(), Some(Duration::ZERO));
         assert!(ctx.is_expiring_within(Duration::from_secs(1)));
     }
@@ -34239,7 +34236,7 @@ mod activity_override_tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -34366,7 +34363,7 @@ mod activity_override_tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -34605,7 +34602,7 @@ mod constructor_tests {
     ///
     /// The marker sits before the cancel, so the cancel scan must read past
     /// the event after `WorkflowStarted`.
-    fn rich_history(started: DateTime<Utc>, slot: DateTime<Utc>) -> Vec<WorkflowEvent> {
+    fn rich_history(started: Timestamp, slot: Timestamp) -> Vec<WorkflowEvent> {
         vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
@@ -34677,8 +34674,8 @@ mod constructor_tests {
                 true,
             ),
         ];
-        let started = Utc::now() - chrono::Duration::hours(1);
-        let slot = started - chrono::Duration::minutes(5);
+        let started = Timestamp::now() - jiff::SignedDuration::from_hours(1);
+        let slot = started - jiff::SignedDuration::from_mins(5);
 
         for (name, build, takes_state, strict, canary) in cases {
             let exec_id = ExecutionId::new();
@@ -34742,9 +34739,9 @@ mod constructor_tests {
 
     #[test]
     fn for_replay_with_no_start_event_reads_the_clock() {
-        let before = Utc::now();
+        let before = Timestamp::now();
         let ctx = WorkflowContext::for_replay(ExecutionId::new(), Vec::new());
-        let after = Utc::now();
+        let after = Timestamp::now();
 
         assert_fresh(&ctx);
         assert!((before..=after).contains(&ctx.start_time));
@@ -34758,7 +34755,7 @@ mod constructor_tests {
     #[test]
     fn new_for_handler_inherits_only_its_arguments() {
         let exec_id = ExecutionId::new();
-        let started = Utc::now() - chrono::Duration::hours(2);
+        let started = Timestamp::now() - jiff::SignedDuration::from_hours(2);
         let state = empty_shared_state();
 
         let ctx = WorkflowContext::new_for_handler(
@@ -34800,9 +34797,9 @@ mod constructor_tests {
 
     #[test]
     fn new_test_is_a_live_context_with_a_new_id() {
-        let before = Utc::now();
+        let before = Timestamp::now();
         let ctx = WorkflowContext::new_test();
-        let after = Utc::now();
+        let after = Timestamp::now();
 
         assert_fresh(&ctx);
         assert_ne!(ctx.exec_id, WorkflowContext::new_test().exec_id);

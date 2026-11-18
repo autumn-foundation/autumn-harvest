@@ -1630,7 +1630,7 @@ async fn deny_rows_reach_the_siem_export() {
         0,
         100,
         std::time::Duration::from_secs(60),
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await
     .expect("claim")

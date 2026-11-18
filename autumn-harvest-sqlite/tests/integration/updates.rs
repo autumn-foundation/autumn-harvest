@@ -592,12 +592,11 @@ async fn rebuild_panic_is_contained() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&panic_after_timer_wf_info());
     let exec = rt.start_workflow("panic_after_timer_wf", json!(0)).unwrap();
-    let t0 = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let t0 = ("2026-01-01T00:00:00Z").parse::<Timestamp>()
+        .unwrap();
     rt.run_until_blocked_as_of(exec, t0).await.unwrap();
     let drive = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(61))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(61))
         .await
         .unwrap_err();
     assert!(
@@ -966,9 +965,8 @@ async fn update_before_the_first_drive() {
 /// run completes.
 #[tokio::test]
 async fn update_while_a_timer_is_pending() {
-    let t0 = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let t0 = ("2026-01-01T00:00:00Z").parse::<Timestamp>()
+        .unwrap();
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&timer_wf_info());
     let exec = rt.start_workflow("timer_wf", json!(0)).unwrap();
@@ -980,7 +978,7 @@ async fn update_while_a_timer_is_pending() {
         json!(3)
     );
     let state = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(61))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(61))
         .await
         .unwrap();
     assert!(

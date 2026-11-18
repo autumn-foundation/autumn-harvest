@@ -24,7 +24,7 @@ use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker};
 use autumn_harvest::{ExecutionId, ShardId};
 
-use chrono::Utc;
+use jiff::Timestamp;
 use diesel::sql_types::{BigInt, Text, Uuid as SqlUuid};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use uuid::Uuid;
@@ -424,14 +424,14 @@ async fn seed(
     store::append_events(
         conn,
         exec_id,
-        &[WorkflowEvent::workflow_started(input.clone(), Utc::now())],
+        &[WorkflowEvent::workflow_started(input.clone(), Timestamp::now())],
         0,
     )
     .await
     .expect("append WorkflowStarted");
     let mut params = EnqueueParams::new(queue, TaskType::Workflow, input);
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     queue::enqueue(conn, &params)
         .await
         .expect("enqueue workflow task");

@@ -9,7 +9,7 @@
 //! runtime first, and the runtime migrates it.
 
 use autumn_harvest::{ExecutionId, WorkflowEvent};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use rusqlite::{Connection, params};
 use serde_json::Value;
 
@@ -23,9 +23,9 @@ pub struct CountFilter {
     /// Only runs in one of these states. An empty list matches every state.
     pub states: Vec<String>,
     /// Only runs that started at or after this time.
-    pub started_after: Option<DateTime<Utc>>,
+    pub started_after: Option<Timestamp>,
     /// Only runs that started at or before this time.
-    pub started_before: Option<DateTime<Utc>>,
+    pub started_before: Option<Timestamp>,
 }
 
 /// The number of runs of one `(state, workflow_name)` group.
@@ -53,9 +53,9 @@ pub struct ChildRun {
     /// The child's state.
     pub state: String,
     /// When the child started. A row from before issue #2027 has none.
-    pub started_at: Option<DateTime<Utc>>,
+    pub started_at: Option<Timestamp>,
     /// When the child closed. An open child has none.
-    pub closed_at: Option<DateTime<Utc>>,
+    pub closed_at: Option<Timestamp>,
     /// The failure, cancel or terminate reason.
     pub error: Option<String>,
     /// `true` for a detached child.
@@ -69,7 +69,7 @@ pub struct ChildRun {
 pub struct TimedEvent {
     /// When the event was appended. An event from before issue #2489 has
     /// none.
-    pub recorded_at: Option<DateTime<Utc>>,
+    pub recorded_at: Option<Timestamp>,
     /// The event.
     pub event: WorkflowEvent,
 }
@@ -90,13 +90,13 @@ pub struct PendingTask {
     /// The attempt cap. `None` until the first claim resolves it.
     pub max_attempts: Option<i64>,
     /// The earliest time that the next attempt may run.
-    pub run_at: DateTime<Utc>,
+    pub run_at: Timestamp,
     /// When the workflow scheduled the activity.
-    pub scheduled_at: DateTime<Utc>,
+    pub scheduled_at: Timestamp,
     /// The start-to-close budget of one attempt.
-    pub start_to_close: Option<chrono::Duration>,
+    pub start_to_close: Option<jiff::SignedDuration>,
     /// The deadline over all attempts.
-    pub schedule_to_close_at: Option<DateTime<Utc>>,
+    pub schedule_to_close_at: Option<Timestamp>,
     /// The latest heartbeat payload.
     pub heartbeat_details: Option<Value>,
     /// The error of the previous attempt.
@@ -109,7 +109,7 @@ pub struct PendingTimer {
     /// The timer id.
     pub timer_id: String,
     /// When the timer fires.
-    pub fire_at: DateTime<Utc>,
+    pub fire_at: Timestamp,
 }
 
 /// The undelivered signals of one name.
@@ -120,7 +120,7 @@ pub struct BufferedSignal {
     /// The number of undelivered signals.
     pub count: i64,
     /// When the oldest one arrived.
-    pub oldest_received_at: DateTime<Utc>,
+    pub oldest_received_at: Timestamp,
 }
 
 /// The work that a run waits on.
@@ -135,15 +135,15 @@ pub struct PendingWork {
 }
 
 /// A time column in epoch microseconds.
-fn micros(value: Option<i64>, field: &str) -> SqliteResult<Option<DateTime<Utc>>> {
+fn micros(value: Option<i64>, field: &str) -> SqliteResult<Option<Timestamp>> {
     value
-        .map(|us| DateTime::from_timestamp_micros(us).ok_or_else(|| SqliteError::corrupt(field)))
+        .map(|us| Timestamp::from_microsecond(us).ok().ok_or_else(|| SqliteError::corrupt(field)))
         .transpose()
 }
 
 /// A time column in epoch milliseconds.
-fn millis(value: i64, field: &str) -> SqliteResult<DateTime<Utc>> {
-    DateTime::from_timestamp_millis(value).ok_or_else(|| SqliteError::corrupt(field))
+fn millis(value: i64, field: &str) -> SqliteResult<Timestamp> {
+    Timestamp::from_millisecond(value).ok().ok_or_else(|| SqliteError::corrupt(field))
 }
 
 /// See [`SqliteReader::count_executions`](crate::SqliteReader::count_executions).
@@ -164,8 +164,8 @@ pub fn count(conn: &Connection, filter: &CountFilter) -> SqliteResult<Vec<Execut
         params![
             filter.workflow_name,
             serde_json::to_string(&filter.states)?,
-            filter.started_after.map(|at| at.timestamp_micros()),
-            filter.started_before.map(|at| at.timestamp_micros()),
+            filter.started_after.map(|at| at.as_microsecond()),
+            filter.started_before.map(|at| at.as_microsecond()),
         ],
         |row| {
             Ok(ExecutionCount {

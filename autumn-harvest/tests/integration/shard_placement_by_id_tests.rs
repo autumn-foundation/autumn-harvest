@@ -29,6 +29,7 @@
 //! duplicate them.
 
 use autumn_harvest::error::HarvestError;
+use jiff_diesel::ToDiesel;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::external_target_location::{TargetLocation, resolve_location_by_workflow_id};
 use autumn_harvest::info::WorkflowInfo;
@@ -599,7 +600,7 @@ async fn seed_signal_caller_with_key(
         conn,
         caller,
         &[
-            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::workflow_started(serde_json::json!({}), jiff::Timestamp::now()),
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
                 target: ExternalTarget::WorkflowId {
@@ -640,7 +641,7 @@ async fn outbox_signal_by_id_reaches_a_target_pinned_off_its_hash_shard() {
         target,
         &[WorkflowEvent::workflow_started(
             serde_json::json!({}),
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         )],
         1,
     )
@@ -709,7 +710,7 @@ async fn outbox_cancel_by_id_reaches_a_target_pinned_off_its_hash_shard() {
         target,
         &[WorkflowEvent::workflow_started(
             serde_json::json!({}),
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         )],
         1,
     )
@@ -724,7 +725,7 @@ async fn outbox_cancel_by_id_reaches_a_target_pinned_off_its_hash_shard() {
         &mut caller_conn,
         caller,
         &[
-            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::workflow_started(serde_json::json!({}), jiff::Timestamp::now()),
             WorkflowEvent::ExternalCancelRequested {
                 cancel_id,
                 target: ExternalTarget::WorkflowId {
@@ -1057,7 +1058,7 @@ async fn outbox_cancel_by_id_is_a_no_op_success_against_a_terminal_run_on_anothe
         &mut caller_conn,
         caller,
         &[
-            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::workflow_started(serde_json::json!({}), jiff::Timestamp::now()),
             WorkflowEvent::ExternalCancelRequested {
                 cancel_id,
                 target: ExternalTarget::WorkflowId {
@@ -1116,7 +1117,7 @@ async fn outbox_cancel_by_id_never_reports_target_unknown_while_a_shard_cannot_b
         &mut caller_conn,
         caller,
         &[
-            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::workflow_started(serde_json::json!({}), jiff::Timestamp::now()),
             WorkflowEvent::ExternalCancelRequested {
                 cancel_id,
                 target: ExternalTarget::WorkflowId {
@@ -1852,7 +1853,7 @@ async fn outbox_cancel_by_id_withholds_its_terminal_while_a_shard_is_uninspected
         &mut caller_conn,
         caller,
         &[
-            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::workflow_started(serde_json::json!({}), jiff::Timestamp::now()),
             WorkflowEvent::ExternalCancelRequested {
                 cancel_id,
                 target: ExternalTarget::WorkflowId {
@@ -1924,7 +1925,7 @@ async fn outbox_cancel_by_id_reports_once_every_shard_can_be_inspected() {
         &mut caller_conn,
         caller,
         &[
-            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::workflow_started(serde_json::json!({}), jiff::Timestamp::now()),
             WorkflowEvent::ExternalCancelRequested {
                 cancel_id,
                 target: ExternalTarget::WorkflowId {
@@ -2024,7 +2025,7 @@ async fn outbox_cancel_by_id_cancels_every_live_copy_before_reporting() {
     let mut conn1 = shards.conn(ShardId::new(1)).await;
     insert_running_row(&mut conn1, "twin_live_wf", &workflow_id, newer).await;
     diesel::update(harvest_workflow_executions::table.find(newer.as_uuid()))
-        .set(harvest_workflow_executions::started_at.eq(chrono::Utc::now()))
+        .set(harvest_workflow_executions::started_at.eq(jiff::Timestamp::now().to_diesel()))
         .execute(&mut conn1)
         .await
         .expect("make the shard-1 run the most recently started");
@@ -2036,7 +2037,7 @@ async fn outbox_cancel_by_id_cancels_every_live_copy_before_reporting() {
         &mut conn0,
         caller,
         &[
-            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::workflow_started(serde_json::json!({}), jiff::Timestamp::now()),
             WorkflowEvent::ExternalCancelRequested {
                 cancel_id,
                 target: ExternalTarget::WorkflowId {
@@ -2165,7 +2166,7 @@ async fn outbox_by_id_resolves_when_two_logical_shards_share_one_physical_pool()
         &mut seed,
         caller,
         &[
-            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::workflow_started(serde_json::json!({}), jiff::Timestamp::now()),
             WorkflowEvent::ExternalCancelRequested {
                 cancel_id,
                 target: ExternalTarget::WorkflowId {
@@ -2267,7 +2268,7 @@ async fn outbox_by_id_resolves_when_the_caller_holds_the_higher_aliased_shard() 
         &mut seed,
         caller,
         &[
-            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::workflow_started(serde_json::json!({}), jiff::Timestamp::now()),
             WorkflowEvent::ExternalCancelRequested {
                 cancel_id,
                 target: ExternalTarget::WorkflowId {
@@ -2482,7 +2483,7 @@ async fn awaits_outbox_does_not_wait_on_a_peer_shard_whose_only_connection_is_bu
             target,
             &[WorkflowEvent::workflow_started(
                 serde_json::json!({}),
-                chrono::Utc::now(),
+                jiff::Timestamp::now(),
             )],
             1,
         )
@@ -2502,7 +2503,7 @@ async fn awaits_outbox_does_not_wait_on_a_peer_shard_whose_only_connection_is_bu
             &mut seed,
             awaiter,
             &[
-                WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+                WorkflowEvent::workflow_started(serde_json::json!({}), jiff::Timestamp::now()),
                 WorkflowEvent::ExternalAwaitRequested { await_id, target },
             ],
             1,
@@ -2612,7 +2613,7 @@ async fn cancel_outbox_deferred_check_does_not_wait_on_a_peer_shard_whose_only_c
             target,
             &[WorkflowEvent::workflow_started(
                 serde_json::json!({}),
-                chrono::Utc::now(),
+                jiff::Timestamp::now(),
             )],
             1,
         )
@@ -2633,7 +2634,7 @@ async fn cancel_outbox_deferred_check_does_not_wait_on_a_peer_shard_whose_only_c
             child,
             &[WorkflowEvent::workflow_started(
                 serde_json::json!({}),
-                chrono::Utc::now(),
+                jiff::Timestamp::now(),
             )],
             1,
         )
@@ -2653,7 +2654,7 @@ async fn cancel_outbox_deferred_check_does_not_wait_on_a_peer_shard_whose_only_c
             &mut seed,
             caller,
             &[
-                WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+                WorkflowEvent::workflow_started(serde_json::json!({}), jiff::Timestamp::now()),
                 WorkflowEvent::ExternalCancelRequested {
                     cancel_id,
                     target: ExternalTarget::ExecutionId(target),
@@ -2788,7 +2789,7 @@ async fn seed_cancel_caller(
         conn,
         caller,
         &[
-            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::workflow_started(serde_json::json!({}), jiff::Timestamp::now()),
             WorkflowEvent::ExternalCancelRequested {
                 cancel_id,
                 target: ExternalTarget::WorkflowId {

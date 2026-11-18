@@ -22,7 +22,7 @@ use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest_sqlite::{
     ActivitySpec, ExecutionId, ExecutionOutcome, RunState, SqliteError, SqliteRuntime,
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -348,7 +348,7 @@ fn temp_db() -> (tempfile::TempDir, std::path::PathBuf) {
     (dir, path)
 }
 
-fn fixed_now() -> DateTime<Utc> {
+fn fixed_now() -> Timestamp {
     "2026-07-15T00:00:00Z".parse().unwrap()
 }
 
@@ -638,7 +638,7 @@ async fn cancel_waits_for_a_pending_activity_retry() {
     );
 
     let state = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(61))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(61))
         .await
         .unwrap();
     assert!(
@@ -1164,7 +1164,7 @@ async fn terminate_drops_a_pending_activity_task() {
 
     assert_eq!(leftover_rows(&path, exec), (0, 0, 0));
     let state = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(61))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(61))
         .await
         .unwrap();
     assert!(matches!(&state, RunState::Terminated(reason) if reason == "kill"));

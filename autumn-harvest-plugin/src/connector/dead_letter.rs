@@ -16,8 +16,9 @@
 //! `WorkflowEvent` variant, no core migration.**
 
 use async_trait::async_trait;
+use jiff_diesel::ToDiesel;
 use autumn_harvest::telemetry::PoisonReason;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use diesel_async::AsyncPgConnection;
 use uuid::Uuid;
 
@@ -47,7 +48,7 @@ pub struct ConnectorDeadLetter {
     /// The raw message body, so the message can be replayed after a fix.
     pub payload: Vec<u8>,
     /// When the message was dead-lettered.
-    pub failed_at: DateTime<Utc>,
+    pub failed_at: Timestamp,
 }
 
 /// Whether a [`DeadLetterSink::write`] created the record or found it already
@@ -246,7 +247,7 @@ pub async fn insert_dead_letter(
     .bind::<Text, _>(&entry.detail)
     .bind::<Int4, _>(entry.attempts)
     .bind::<Binary, _>(&entry.payload)
-    .bind::<Timestamptz, _>(entry.failed_at)
+    .bind::<Timestamptz, _>(entry.failed_at.to_diesel())
     .execute(conn)
     .await
     .map_err(|e| ConnectorError::Broker(format!("dead-letter insert: {e}")))?;
@@ -413,7 +414,7 @@ mod tests {
             detail: "bad json".to_string(),
             attempts: 1,
             payload: b"{".to_vec(),
-            failed_at: Utc::now(),
+            failed_at: Timestamp::now(),
         };
         assert!(sink.write(&entry).await.is_ok());
     }
@@ -430,7 +431,7 @@ mod tests {
             detail: "bad json".to_string(),
             attempts: 1,
             payload: b"{".to_vec(),
-            failed_at: Utc::now(),
+            failed_at: Timestamp::now(),
         };
 
         let err = UnconfiguredDeadLetterSink
@@ -462,7 +463,7 @@ mod tests {
             detail: "bad json".to_string(),
             attempts: 1,
             payload: b"{".to_vec(),
-            failed_at: Utc::now(),
+            failed_at: Timestamp::now(),
         }
     }
 

@@ -406,7 +406,7 @@ async fn ledger_spend_sums_the_tokens_of_one_mesh() {
         .agent(AgentProfile::new(&other_kind).mesh(unique("elsewhere")));
     let pg = PostgresAgents::single(pool(&url)).with_queue(&queue);
     let _worker = run_worker(&url, &queue, harness, &[ShardId::new(0)]);
-    let since = Utc::now();
+    let since = Timestamp::now();
     let ids = [
         AgentId::new(&kind, "a").unwrap(),
         AgentId::new(&kind, "b").unwrap(),
@@ -428,7 +428,7 @@ async fn ledger_spend_sums_the_tokens_of_one_mesh() {
     let total = spend.spent(&mesh, since).await.unwrap();
     assert_eq!(total.tokens, 14, "two runs of the mesh, 7 tokens each");
     assert_eq!(total.cost_usd_micros, 0, "the model sets no price");
-    let later = spend.spent(&mesh, DateTime::<Utc>::MAX_UTC).await.unwrap();
+    let later = spend.spent(&mesh, Timestamp::MAX).await.unwrap();
     assert_eq!(later.tokens, 0, "no row is recorded after the bound");
     let none = spend.spent(&unique("empty"), since).await.unwrap();
     assert_eq!(none.tokens, 0);
@@ -688,7 +688,7 @@ async fn a_rebalanced_agent_is_reached_on_its_new_shard_and_counted_once() {
     let mesh = unique("moving");
     let pg = PostgresAgents::sharded(&pools, router).with_queue(&queue);
     let id = AgentId::new(&kind, "a").unwrap();
-    let since = Utc::now();
+    let since = Timestamp::now();
     {
         let harness = AgentHarness::new(echo_model(9)).agent(AgentProfile::new(&kind).mesh(&mesh));
         let _worker = run_worker(&url, &queue, harness, &[source]);

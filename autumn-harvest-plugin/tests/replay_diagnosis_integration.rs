@@ -60,7 +60,7 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::Utc;
+use jiff::Timestamp;
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use serde_json::{Value, json};
@@ -437,7 +437,7 @@ fn progress_history(items: &[&str], should_fail: bool) -> (Value, Vec<WorkflowEv
     let input = json!({ "items": items, "should_fail": should_fail });
     let mut events = vec![WorkflowEvent::WorkflowStarted {
         input: input.clone(),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -467,7 +467,7 @@ fn diverging_history() -> (Value, Vec<WorkflowEvent>) {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -497,7 +497,7 @@ fn diverging_history_with_clean_prefix() -> (Value, Vec<WorkflowEvent>) {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -762,7 +762,7 @@ async fn terminal_run_with_truncated_history_returns_410() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -876,7 +876,7 @@ async fn running_healthy_run_parked_mid_activity_is_clean() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -920,7 +920,7 @@ async fn timed_out_run_sealed_mid_activity() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -932,8 +932,8 @@ async fn timed_out_run_sealed_mid_activity() {
             queue: "default".into(),
         },
         WorkflowEvent::WorkflowExecutionTimedOut {
-            deadline: Utc::now(),
-            timed_out_at: Utc::now(),
+            deadline: Timestamp::now(),
+            timed_out_at: Timestamp::now(),
         },
     ];
     let exec = seed_execution(&pool, "progress_wf", "TIMED_OUT", input, events, false).await;
@@ -966,7 +966,7 @@ async fn timed_out_run_sealed_awaiting_second_activity_is_clean() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -982,8 +982,8 @@ async fn timed_out_run_sealed_awaiting_second_activity_is_clean() {
             output: Value::Null,
         },
         WorkflowEvent::WorkflowExecutionTimedOut {
-            deadline: Utc::now(),
-            timed_out_at: Utc::now(),
+            deadline: Timestamp::now(),
+            timed_out_at: Timestamp::now(),
         },
     ];
     let exec = seed_execution(&pool, "progress_wf", "TIMED_OUT", input, events, false).await;
@@ -1016,7 +1016,7 @@ async fn state_registering_workflow_diagnoses_clean_with_registry_shared_state()
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1062,7 +1062,7 @@ async fn policy_branching_workflow_diagnoses_clean_with_registry_history_policy(
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,

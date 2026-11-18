@@ -722,7 +722,7 @@ impl Gate<'_> {
         let GateState::Waiting { until } = self.policy.gate_state(opened, now) else {
             return Ok(GateEvent::Deadline);
         };
-        let left = (until - now).to_std().unwrap_or(Duration::ZERO);
+        let left = std::time::Duration::try_from((until - now)).unwrap_or(Duration::ZERO);
         let decision = await_decision::<RefineDecision>(self.ctx, name, left)
             .await
             .map_err(|err| {

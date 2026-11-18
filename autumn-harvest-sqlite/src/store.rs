@@ -132,8 +132,8 @@ impl RunConfig {
     pub fn context_deadline(
         &self,
     ) -> (
-        Option<chrono::Duration>,
-        Option<chrono::DateTime<chrono::Utc>>,
+        Option<jiff::SignedDuration>,
+        Option<jiff::Timestamp>,
     ) {
         (
             self.execution_timeout_ms
@@ -578,7 +578,7 @@ fn release_run(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<()> {
 /// The wall clock in epoch microseconds. A terminal write stores it as
 /// `closed_at` (issue #2027).
 fn now_micros() -> i64 {
-    chrono::Utc::now().timestamp_micros()
+    jiff::Timestamp::now().as_microsecond()
 }
 
 /// Store the start time, the memo and the search attributes of a new run

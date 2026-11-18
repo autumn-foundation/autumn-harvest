@@ -28,6 +28,7 @@
 //! - Issue #1832 — a bulk redrive spreads `scheduled_at` across a window.
 
 use std::sync::Mutex;
+use jiff_diesel::ToDiesel;
 
 use autumn_harvest::dlq::{
     BulkDlqFilter, NewDeadLetterEntry, RedriveFilter, RedriveOutcome, bulk_replay_dead_letters,
@@ -591,7 +592,7 @@ struct SpreadStats {
 async fn spread_stats(
     conn: &mut AsyncPgConnection,
     queue: &str,
-    t0: chrono::DateTime<chrono::Utc>,
+    t0: jiff::Timestamp,
     window_secs: f64,
 ) -> SpreadStats {
     diesel::sql_query(
@@ -610,18 +611,19 @@ async fn spread_stats(
                 (SELECT min(n) FROM b) AS min_bucket",
     )
     .bind::<diesel::sql_types::Text, _>(queue)
-    .bind::<diesel::sql_types::Timestamptz, _>(t0)
+    .bind::<diesel::sql_types::Timestamptz, _>(t0.to_diesel())
     .bind::<diesel::sql_types::Double, _>(window_secs)
     .get_result(conn)
     .await
     .expect("spread stats")
 }
 
-async fn db_clock(conn: &mut AsyncPgConnection) -> chrono::DateTime<chrono::Utc> {
+async fn db_clock(conn: &mut AsyncPgConnection) -> jiff::Timestamp {
     #[derive(diesel::QueryableByName)]
     struct Now {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        now: chrono::DateTime<chrono::Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        now: jiff::Timestamp,
     }
     diesel::sql_query("SELECT clock_timestamp() AS now")
         .get_result::<Now>(conn)
@@ -780,7 +782,7 @@ async fn redrive_deadline_starts_at_the_spread_slot() {
     .await
     .expect("set timeouts");
 
-    let not_before = db_clock(&mut conn).await + chrono::Duration::seconds(120);
+    let not_before = db_clock(&mut conn).await + jiff::SignedDuration::from_secs(120);
     let outcome = redrive_dead_letter_at(&mut conn, dlq_id, None, None, Some(not_before))
         .await
         .expect("redrive");
@@ -789,9 +791,11 @@ async fn redrive_deadline_starts_at_the_spread_slot() {
     #[derive(diesel::QueryableByName)]
     struct Deadlines {
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-        deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+        #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+        deadline_at: Option<jiff::Timestamp>,
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-        sla_deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+        #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+        sla_deadline_at: Option<jiff::Timestamp>,
     }
     let row: Deadlines = diesel::sql_query(
         "SELECT deadline_at, sla_deadline_at FROM harvest_workflow_executions WHERE id = $1",
@@ -800,15 +804,15 @@ async fn redrive_deadline_starts_at_the_spread_slot() {
     .get_result(&mut conn)
     .await
     .expect("deadlines");
-    let slack = chrono::Duration::milliseconds(1);
+    let slack = jiff::SignedDuration::from_millis(1);
     assert!(
-        row.deadline_at.expect("deadline") >= not_before + chrono::Duration::seconds(10) - slack,
+        row.deadline_at.expect("deadline") >= not_before + jiff::SignedDuration::from_secs(10) - slack,
         "the timeout must start at the slot {not_before}, got {:?}",
         row.deadline_at
     );
     assert!(
         row.sla_deadline_at.expect("sla deadline")
-            >= not_before + chrono::Duration::seconds(20) - slack,
+            >= not_before + jiff::SignedDuration::from_secs(20) - slack,
         "the SLA must start at the slot {not_before}, got {:?}",
         row.sla_deadline_at
     );

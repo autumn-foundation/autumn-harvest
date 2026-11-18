@@ -13,8 +13,8 @@
 //! - [`plan_backfill_with_calendar`] — like `plan_backfill_timestamps` but calendar-aware
 
 #[cfg(feature = "db")]
-use chrono::TimeZone;
-use chrono::{Datelike, NaiveDate};
+use jiff::Timestamp;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::policy::SkipPolicy;
@@ -36,40 +36,40 @@ pub struct Calendar {
 /// `excluded_dates` and use binary search; the function handles both sorted
 /// and unsorted slices correctly.
 #[must_use]
-pub fn is_excluded_date(date: NaiveDate, excluded_dates: &[NaiveDate]) -> bool {
+pub fn is_excluded_date(date: jiff::civil::Date, excluded_dates: &[jiff::civil::Date]) -> bool {
     excluded_dates.contains(&date)
 }
 
 /// Internal helper: returns `true` if `date` should be treated as excluded,
 /// checking both the explicit exclusion list and the weekend flag.
-fn is_excluded_impl(date: NaiveDate, excluded_dates: &[NaiveDate], exclude_weekends: bool) -> bool {
+fn is_excluded_impl(date: jiff::civil::Date, excluded_dates: &[jiff::civil::Date], exclude_weekends: bool) -> bool {
     (exclude_weekends && is_weekend(date)) || excluded_dates.contains(&date)
 }
 
-fn is_weekend(date: NaiveDate) -> bool {
+fn is_weekend(date: jiff::civil::Date) -> bool {
     matches!(date.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun)
 }
 
 /// Shared skip-search: advances `date` per `skip_policy` using `is_excluded`
 /// as the exclusion check. Factored out so the two `excluded_dates`
 /// representations below share one 365-day scan implementation rather than
-/// two copies that could drift. Those representations are `&[NaiveDate]`
-/// for a single lookup, and `&BTreeSet<NaiveDate>` for a caller repeating
+/// two copies that could drift. Those representations are `&[jiff::civil::Date]`
+/// for a single lookup, and `&BTreeSet<jiff::civil::Date>` for a caller repeating
 /// this check across many dates.
 ///
 /// A shift target must be a weekday and not excluded (issue #1772). The
 /// weekday rule applies to the scan only. The check on `date` itself uses
 /// `is_excluded`, so a weekend slot that is not excluded keeps its date.
 fn apply_skip_policy_with(
-    date: NaiveDate,
+    date: jiff::civil::Date,
     skip_policy: SkipPolicy,
-    is_excluded: impl Fn(NaiveDate) -> bool,
-) -> Option<NaiveDate> {
+    is_excluded: impl Fn(jiff::civil::Date) -> bool,
+) -> Option<jiff::civil::Date> {
     if !is_excluded(date) {
         return Some(date);
     }
-    // Each step is checked. A scan past the `NaiveDate` range returns `None` (issue #1968).
-    let step: fn(NaiveDate) -> Option<NaiveDate> = match skip_policy {
+    // Each step is checked. A scan past the `jiff::civil::Date` range returns `None` (issue #1968).
+    let step: fn(jiff::civil::Date) -> Option<jiff::civil::Date> = match skip_policy {
         SkipPolicy::Skip => return None,
         SkipPolicy::RunNextBusinessDay => |d| d.checked_add_days(chrono::Days::new(1)),
         SkipPolicy::RunPrevBusinessDay => |d| d.checked_sub_days(chrono::Days::new(1)),
@@ -101,7 +101,7 @@ fn apply_skip_policy_with(
 ///
 /// Scans up to 365 calendar days in either direction. Returns `None` if no
 /// non-excluded weekday exists within that window, or if the scan gets to the
-/// limit of the `NaiveDate` range.
+/// limit of the `jiff::civil::Date` range.
 ///
 /// Checks `excluded_dates` with an O(n) linear scan per date. A caller that
 /// invokes this once per date in a loop over the *same* `excluded_dates`
@@ -110,11 +110,11 @@ fn apply_skip_policy_with(
 /// Backfill planning and firing previews are two such loop callers.
 #[must_use]
 pub fn apply_skip_policy(
-    date: NaiveDate,
+    date: jiff::civil::Date,
     skip_policy: SkipPolicy,
-    excluded_dates: &[NaiveDate],
+    excluded_dates: &[jiff::civil::Date],
     exclude_weekends: bool,
-) -> Option<NaiveDate> {
+) -> Option<jiff::civil::Date> {
     apply_skip_policy_with(date, skip_policy, |d| {
         is_excluded_impl(d, excluded_dates, exclude_weekends)
     })
@@ -140,11 +140,11 @@ pub fn apply_skip_policy(
 /// dead code.
 #[cfg(feature = "db")]
 fn apply_skip_policy_indexed(
-    date: NaiveDate,
+    date: jiff::civil::Date,
     skip_policy: SkipPolicy,
-    excluded: &std::collections::BTreeSet<NaiveDate>,
+    excluded: &std::collections::BTreeSet<jiff::civil::Date>,
     exclude_weekends: bool,
-) -> Option<NaiveDate> {
+) -> Option<jiff::civil::Date> {
     apply_skip_policy_with(date, skip_policy, |d| {
         (exclude_weekends && is_weekend(d)) || excluded.contains(&d)
     })
@@ -157,15 +157,15 @@ fn apply_skip_policy_indexed(
 /// the rebase helpers do.
 #[must_use]
 pub fn schedule_local_date(
-    ts: chrono::DateTime<chrono::Utc>,
+    ts: jiff::Timestamp,
     schedule: Option<&crate::policy::Schedule>,
-) -> NaiveDate {
+) -> jiff::civil::Date {
     if let Some(crate::policy::Schedule::CronInTimezone { tz, .. }) = schedule
         && let Ok(tz) = tz.parse::<chrono_tz::Tz>()
     {
-        return ts.with_timezone(&tz).date_naive();
+        return crate::time::utc_date(ts.with_timezone(&tz));
     }
-    ts.date_naive()
+    crate::time::utc_date(ts)
 }
 
 /// Returns `true` when the calendar name implies Saturday/Sunday are always excluded.
@@ -205,7 +205,7 @@ pub const MAX_BUSINESS_DAYS: u32 = 3650;
 /// `holidays` is a [`BTreeSet`](std::collections::BTreeSet), so a lookup in
 /// the scan loop is O(log n), not the O(n) slice scan of [`is_excluded_date`].
 #[must_use]
-pub fn is_business_day(date: NaiveDate, holidays: &std::collections::BTreeSet<NaiveDate>) -> bool {
+pub fn is_business_day(date: jiff::civil::Date, holidays: &std::collections::BTreeSet<jiff::civil::Date>) -> bool {
     !is_weekend(date) && !holidays.contains(&date)
 }
 
@@ -213,12 +213,12 @@ pub fn is_business_day(date: NaiveDate, holidays: &std::collections::BTreeSet<Na
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BusinessDayResolution {
     /// The resolved fire instant. Preserves the anchor's UTC time-of-day.
-    pub deadline: chrono::DateTime<chrono::Utc>,
+    pub deadline: jiff::Timestamp,
     /// Non-business dates the scan stepped over, in scan order.
     ///
     /// Recorded for the audit trail so a workflow's history answers
     /// "why did this land on Tuesday?" without re-reading the calendar.
-    pub skipped: Vec<NaiveDate>,
+    pub skipped: Vec<jiff::civil::Date>,
 }
 
 /// Why a business-day resolution could not be computed.
@@ -245,9 +245,9 @@ pub enum BusinessDayRejection {
     /// confidently. Extend the calendar instead.
     CoverageExhausted {
         /// The last date the calendar has an exclusion for.
-        coverage_end: NaiveDate,
+        coverage_end: jiff::civil::Date,
     },
-    /// Advancing the cursor would overflow [`NaiveDate`]'s representable range.
+    /// Advancing the cursor would overflow [`jiff::civil::Date`]'s representable range.
     DateOverflow,
     /// `n` exceeds [`MAX_BUSINESS_DAYS`].
     ///
@@ -305,8 +305,8 @@ pub struct BusinessCalendars {
 /// One registered calendar: its holiday set plus an optional declared horizon.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct RegisteredCalendar {
-    holidays: std::collections::BTreeSet<NaiveDate>,
-    coverage_end: Option<NaiveDate>,
+    holidays: std::collections::BTreeSet<jiff::civil::Date>,
+    coverage_end: Option<jiff::civil::Date>,
 }
 
 impl BusinessCalendars {
@@ -316,7 +316,7 @@ impl BusinessCalendars {
     /// resolution that needs a **2027** date is rejected with
     /// [`BusinessDayRejection::CoverageExhausted`], not silently answered
     /// weekends-only. Bump this (and the arrays) when adding a year.
-    pub const BUILTIN_COVERAGE_END: NaiveDate = match NaiveDate::from_ymd_opt(2026, 12, 31) {
+    pub const BUILTIN_COVERAGE_END: jiff::civil::Date = match crate::time::date_ymd(2026, 12, 31) {
         Some(d) => d,
         None => panic!("2026-12-31 is a valid date"),
     };
@@ -377,7 +377,7 @@ impl BusinessCalendars {
     pub fn with_calendar(
         mut self,
         name: impl Into<String>,
-        holidays: impl IntoIterator<Item = NaiveDate>,
+        holidays: impl IntoIterator<Item = jiff::civil::Date>,
     ) -> Self {
         self.calendars.insert(
             name.into(),
@@ -400,8 +400,8 @@ impl BusinessCalendars {
     pub fn with_calendar_covering(
         mut self,
         name: impl Into<String>,
-        holidays: impl IntoIterator<Item = NaiveDate>,
-        coverage_end: NaiveDate,
+        holidays: impl IntoIterator<Item = jiff::civil::Date>,
+        coverage_end: jiff::civil::Date,
     ) -> Self {
         self.calendars.insert(
             name.into(),
@@ -419,7 +419,7 @@ impl BusinessCalendars {
     /// distinct from an unknown name, so a typo is a loud error rather than a
     /// silent weekends-only answer.
     #[must_use]
-    pub fn get(&self, name: &str) -> Option<&std::collections::BTreeSet<NaiveDate>> {
+    pub fn get(&self, name: &str) -> Option<&std::collections::BTreeSet<jiff::civil::Date>> {
         self.calendars.get(name).map(|c| &c.holidays)
     }
 
@@ -431,7 +431,7 @@ impl BusinessCalendars {
     /// calendar's last holiday says nothing about how far its data extends.
     /// Inferring a horizon there would reject every resolution after it.
     #[must_use]
-    pub fn coverage_end(&self, name: &str) -> Option<NaiveDate> {
+    pub fn coverage_end(&self, name: &str) -> Option<jiff::civil::Date> {
         self.calendars.get(name)?.coverage_end
     }
 
@@ -441,8 +441,8 @@ impl BusinessCalendars {
     }
 }
 
-impl FromIterator<(String, Vec<NaiveDate>)> for BusinessCalendars {
-    fn from_iter<T: IntoIterator<Item = (String, Vec<NaiveDate>)>>(iter: T) -> Self {
+impl FromIterator<(String, Vec<jiff::civil::Date>)> for BusinessCalendars {
+    fn from_iter<T: IntoIterator<Item = (String, Vec<jiff::civil::Date>)>>(iter: T) -> Self {
         Self {
             calendars: iter
                 .into_iter()
@@ -461,11 +461,11 @@ impl FromIterator<(String, Vec<NaiveDate>)> for BusinessCalendars {
 }
 
 /// Parse a shipped `YYYY-MM-DD` constant array. Malformed entries are dropped.
-fn parse_builtin_dates(raw: &[&str]) -> Vec<NaiveDate> {
-    let out: Vec<NaiveDate> = raw
+fn parse_builtin_dates(raw: &[&str]) -> Vec<jiff::civil::Date> {
+    let out: Vec<jiff::civil::Date> = raw
         .iter()
         .filter_map(|s| {
-            let parsed = NaiveDate::parse_from_str(s, "%Y-%m-%d");
+            let parsed = jiff::civil::Date::parse_from_str(s, "%Y-%m-%d");
             debug_assert!(parsed.is_ok(), "built-in calendar date '{s}' must parse");
             parsed.ok()
         })
@@ -515,7 +515,7 @@ const MAX_NON_BUSINESS_RUN_DAYS: u32 = 30;
 ///   consecutive non-business days before it resolves. The bound applies to
 ///   each run, so a smaller `n` never rejects where a larger `n` resolves.
 /// - [`BusinessDayRejection::DateOverflow`] when advancing the cursor would
-///   leave [`NaiveDate`]'s representable range.
+///   leave [`jiff::civil::Date`]'s representable range.
 ///
 /// Both are pure functions of the inputs, so a caller may freeze the rejection
 /// into workflow history and replay it verbatim.
@@ -524,9 +524,9 @@ const MAX_NON_BUSINESS_RUN_DAYS: u32 = 30;
 /// [`add_business_days_bounded`], which rejects a resolution that would need a
 /// date the calendar does not cover.
 pub fn add_business_days(
-    anchor: chrono::DateTime<chrono::Utc>,
+    anchor: jiff::Timestamp,
     n: u32,
-    holidays: &std::collections::BTreeSet<NaiveDate>,
+    holidays: &std::collections::BTreeSet<jiff::civil::Date>,
 ) -> Result<BusinessDayResolution, BusinessDayRejection> {
     add_business_days_bounded(anchor, n, holidays, None)
 }
@@ -547,10 +547,10 @@ pub fn add_business_days(
 ///
 /// As [`add_business_days`], plus [`BusinessDayRejection::CoverageExhausted`].
 pub fn add_business_days_bounded(
-    anchor: chrono::DateTime<chrono::Utc>,
+    anchor: jiff::Timestamp,
     n: u32,
-    holidays: &std::collections::BTreeSet<NaiveDate>,
-    coverage_end: Option<NaiveDate>,
+    holidays: &std::collections::BTreeSet<jiff::civil::Date>,
+    coverage_end: Option<jiff::civil::Date>,
 ) -> Result<BusinessDayResolution, BusinessDayRejection> {
     // Enforced here, not only in the callers, because both entry points are
     // `pub` and re-exported. An unbounded `n` drives a multi-million iteration
@@ -563,7 +563,7 @@ pub fn add_business_days_bounded(
     }
 
     let time_of_day = anchor.time();
-    let mut cursor = anchor.date_naive();
+    let mut cursor = crate::time::utc_date(anchor);
     let mut skipped = Vec::new();
     let mut remaining = n;
     let mut run = 0_u32;
@@ -612,13 +612,13 @@ pub fn add_business_days_bounded(
 ///
 /// Same as [`add_business_days`].
 pub fn next_business_day_at_or_after(
-    anchor: chrono::DateTime<chrono::Utc>,
-    holidays: &std::collections::BTreeSet<NaiveDate>,
+    anchor: jiff::Timestamp,
+    holidays: &std::collections::BTreeSet<jiff::civil::Date>,
 ) -> Result<BusinessDayResolution, BusinessDayRejection> {
     add_business_days(anchor, 0, holidays)
 }
 
-/// Rebase a `DateTime<Utc>` to a different date, preserving the time-of-day.
+/// Rebase a `Timestamp` to a different date, preserving the time-of-day.
 ///
 /// For `CronInTimezone` schedules `date` is a date in the schedule's timezone.
 /// The wall-clock time in that timezone is preserved across DST boundaries
@@ -630,20 +630,20 @@ pub fn next_business_day_at_or_after(
 #[cfg(feature = "db")]
 #[must_use]
 pub(crate) fn rebase_to_date(
-    ts: chrono::DateTime<chrono::Utc>,
-    date: NaiveDate,
+    ts: jiff::Timestamp,
+    date: jiff::civil::Date,
     schedule: Option<&crate::policy::Schedule>,
-) -> chrono::DateTime<chrono::Utc> {
+) -> jiff::Timestamp {
     if let Some(crate::policy::Schedule::CronInTimezone { tz, .. }) = schedule
         && let Ok(tz) = tz.parse::<chrono_tz::Tz>()
     {
         let wanted = date.and_time(ts.with_timezone(&tz).time());
         for hours in 0..=2 {
-            if let Some(local_dt) = (wanted + chrono::Duration::hours(hours))
+            if let Some(local_dt) = (wanted + jiff::SignedDuration::from_hours(hours))
                 .and_local_timezone(tz)
                 .earliest()
             {
-                return local_dt.with_timezone(&chrono::Utc);
+                return local_dt;
             }
         }
     }
@@ -655,11 +655,11 @@ pub(crate) fn rebase_to_date(
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScheduleFirePreview {
     /// The original (unadjusted) scheduled fire timestamp.
-    pub scheduled_at: chrono::DateTime<chrono::Utc>,
+    pub scheduled_at: jiff::Timestamp,
     /// The effective fire timestamp after calendar + skip policy.
     ///
     /// `None` means the firing is suppressed (`SkipPolicy::Skip` on an excluded date).
-    pub effective_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub effective_at: Option<jiff::Timestamp>,
     /// Human-readable reason.
     ///
     /// - `"Fired"` — fires as scheduled.
@@ -680,10 +680,10 @@ pub struct ScheduleFirePreview {
 #[must_use]
 pub fn preview_schedule_firings(
     schedule: &crate::policy::Schedule,
-    from: chrono::DateTime<chrono::Utc>,
+    from: jiff::Timestamp,
     count: usize,
     calendar_name: Option<&str>,
-    excluded_dates: &[NaiveDate],
+    excluded_dates: &[jiff::civil::Date],
     skip_policy: SkipPolicy,
 ) -> Vec<ScheduleFirePreview> {
     use crate::scheduler::next_run_after_pub;
@@ -697,7 +697,7 @@ pub fn preview_schedule_firings(
     // at all. A caller disabling calendar filtering while still holding a
     // large `excluded_dates` snapshot must not pay to index a list it
     // asked not to be checked.
-    let excluded: std::collections::BTreeSet<NaiveDate> = if calendar_name.is_some() {
+    let excluded: std::collections::BTreeSet<jiff::civil::Date> = if calendar_name.is_some() {
         excluded_dates.iter().copied().collect()
     } else {
         std::collections::BTreeSet::new()
@@ -742,7 +742,7 @@ pub fn preview_schedule_firings(
 /// `original_slot` is the raw cron-generated timestamp used for deterministic
 /// workflow-ID generation. `fire_time` is the calendar-adjusted dispatch time
 /// (may equal `original_slot` when the slot is not excluded).
-pub type BackfillSlot = (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>);
+pub type BackfillSlot = (jiff::Timestamp, jiff::Timestamp);
 
 /// Like [`crate::scheduler::plan_backfill_timestamps`] but respects a calendar.
 ///
@@ -761,10 +761,10 @@ pub type BackfillSlot = (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono:
 #[cfg(feature = "db")]
 pub fn plan_backfill_with_calendar(
     schedule: Option<&crate::policy::Schedule>,
-    from: chrono::DateTime<chrono::Utc>,
-    to: chrono::DateTime<chrono::Utc>,
+    from: jiff::Timestamp,
+    to: jiff::Timestamp,
     max_count: usize,
-    excluded_dates: &[NaiveDate],
+    excluded_dates: &[jiff::civil::Date],
     skip_policy: SkipPolicy,
     exclude_weekends: bool,
 ) -> Result<Vec<BackfillSlot>, crate::scheduler::BackfillPlanError> {
@@ -780,7 +780,7 @@ pub fn plan_backfill_with_calendar(
     }
     // Indexed once for the whole backfill: `apply_skip_policy_indexed` below
     // is called once per raw slot (up to `max_count`) against this same list.
-    let excluded: std::collections::BTreeSet<NaiveDate> = excluded_dates.iter().copied().collect();
+    let excluded: std::collections::BTreeSet<jiff::civil::Date> = excluded_dates.iter().copied().collect();
     let pairs = raw
         .into_iter()
         .filter_map(|ts| {
@@ -814,12 +814,12 @@ pub fn plan_backfill_with_calendar(
 pub async fn load_exclusions_for_calendar(
     conn: &mut diesel_async::AsyncPgConnection,
     calendar_name: &str,
-) -> crate::error::HarvestResult<Vec<NaiveDate>> {
+) -> crate::error::HarvestResult<Vec<jiff::civil::Date>> {
     use crate::schema::harvest_calendar_exclusions;
     use diesel::{ExpressionMethods, QueryDsl};
     use diesel_async::RunQueryDsl;
 
-    let rows: Vec<chrono::NaiveDate> = harvest_calendar_exclusions::table
+    let rows: Vec<jiff::civil::Date> = harvest_calendar_exclusions::table
         .filter(harvest_calendar_exclusions::calendar_name.eq(calendar_name))
         .select(harvest_calendar_exclusions::excluded_date)
         .load(conn)
@@ -848,7 +848,7 @@ pub async fn load_exclusions_for_calendar(
 pub async fn load_exclusions_for_calendars(
     conn: &mut diesel_async::AsyncPgConnection,
     calendar_names: &[&str],
-) -> crate::error::HarvestResult<std::collections::HashMap<String, Vec<NaiveDate>>> {
+) -> crate::error::HarvestResult<std::collections::HashMap<String, Vec<jiff::civil::Date>>> {
     use crate::schema::harvest_calendar_exclusions;
     use diesel::{ExpressionMethods, QueryDsl};
     use diesel_async::RunQueryDsl;
@@ -857,7 +857,7 @@ pub async fn load_exclusions_for_calendars(
         return Ok(std::collections::HashMap::new());
     }
 
-    let rows: Vec<(String, chrono::NaiveDate)> = harvest_calendar_exclusions::table
+    let rows: Vec<(String, jiff::civil::Date)> = harvest_calendar_exclusions::table
         .filter(harvest_calendar_exclusions::calendar_name.eq_any(calendar_names))
         .select((
             harvest_calendar_exclusions::calendar_name,
@@ -867,7 +867,7 @@ pub async fn load_exclusions_for_calendars(
         .await
         .map_err(crate::error::database_error)?;
 
-    let mut map: std::collections::HashMap<String, Vec<NaiveDate>> =
+    let mut map: std::collections::HashMap<String, Vec<jiff::civil::Date>> =
         std::collections::HashMap::new();
     for (name, date) in rows {
         map.entry(name).or_default().push(date);
@@ -979,7 +979,7 @@ pub async fn create_calendar(
 pub async fn replace_calendar_exclusions(
     conn: &mut diesel_async::AsyncPgConnection,
     calendar_name: &str,
-    dates: &[NaiveDate],
+    dates: &[jiff::civil::Date],
 ) -> crate::error::HarvestResult<()> {
     use crate::models::NewHarvestCalendarExclusion;
     use crate::schema::harvest_calendar_exclusions;
@@ -1128,13 +1128,13 @@ struct CalendarsDocSnippets;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveDate;
+    use jiff::Timestamp;
 
-    fn date(s: &str) -> NaiveDate {
-        NaiveDate::parse_from_str(s, "%Y-%m-%d").expect("valid date")
+    fn date(s: &str) -> jiff::civil::Date {
+        jiff::civil::Date::parse_from_str(s, "%Y-%m-%d").expect("valid date")
     }
 
-    fn excluded(dates: &[&str]) -> Vec<NaiveDate> {
+    fn excluded(dates: &[&str]) -> Vec<jiff::civil::Date> {
         dates.iter().map(|s| date(s)).collect()
     }
 
@@ -1161,12 +1161,12 @@ mod tests {
 
     // ── business-day arithmetic (issue #806) ──────────────────────────────────
 
-    fn holidays(dates: &[&str]) -> std::collections::BTreeSet<NaiveDate> {
+    fn holidays(dates: &[&str]) -> std::collections::BTreeSet<jiff::civil::Date> {
         dates.iter().map(|s| date(s)).collect()
     }
 
-    fn utc(s: &str) -> chrono::DateTime<chrono::Utc> {
-        s.parse::<chrono::DateTime<chrono::Utc>>()
+    fn utc(s: &str) -> jiff::Timestamp {
+        s.parse::<jiff::Timestamp>()
             .expect("valid RFC 3339 instant")
     }
 
@@ -1205,7 +1205,7 @@ mod tests {
         // 2026-07-02 is a Thursday; +2 business days steps over Sat 07-04 / Sun 07-05.
         let res = add_business_days(utc("2026-07-02T09:00:00Z"), 2, &holidays(&[]))
             .expect("resolves within the scan bound");
-        assert_eq!(res.deadline.date_naive(), date("2026-07-06"), "Monday");
+        assert_eq!(crate::time::utc_date(res.deadline), date("2026-07-06"), "Monday");
     }
 
     #[test]
@@ -1213,7 +1213,7 @@ mod tests {
         // Same anchor, but Monday 2026-07-06 is a holiday -> lands Tuesday.
         let res = add_business_days(utc("2026-07-02T09:00:00Z"), 2, &holidays(&["2026-07-06"]))
             .expect("resolves within the scan bound");
-        assert_eq!(res.deadline.date_naive(), date("2026-07-07"), "Tuesday");
+        assert_eq!(crate::time::utc_date(res.deadline), date("2026-07-07"), "Tuesday");
     }
 
     #[test]
@@ -1265,7 +1265,7 @@ mod tests {
         //
         // This matters because context.rs freezes the rejection into history:
         // recovery would need a workflow reset.
-        let shutdown: std::collections::BTreeSet<NaiveDate> = [
+        let shutdown: std::collections::BTreeSet<jiff::civil::Date> = [
             "2025-12-22",
             "2025-12-23",
             "2025-12-24",
@@ -1306,7 +1306,7 @@ mod tests {
         // "weekends-only guess" the horizon exists to prevent. The outcome also
         // depended on the anchor's weekday. A Monday past the horizon resolved,
         // while a Saturday past the horizon rejected.
-        let holidays: std::collections::BTreeSet<NaiveDate> =
+        let holidays: std::collections::BTreeSet<jiff::civil::Date> =
             std::iter::once(date("2026-07-03")).collect();
         let horizon = date("2026-12-31");
 
@@ -1376,7 +1376,7 @@ mod tests {
     }
 
     /// Returns `days` consecutive holiday dates from `start`.
-    fn closure(start: &str, days: u64) -> std::collections::BTreeSet<NaiveDate> {
+    fn closure(start: &str, days: u64) -> std::collections::BTreeSet<jiff::civil::Date> {
         let start = date(start);
         (0..days)
             .map(|i| {
@@ -1447,9 +1447,9 @@ mod tests {
 
     #[test]
     fn add_business_days_near_naivedate_max_rejects_without_panic() {
-        // `NaiveDate + Duration` panics on overflow; `checked_add_days` must be used.
+        // `jiff::civil::Date + Duration` panics on overflow; `checked_add_days` must be used.
         assert_eq!(
-            add_business_days(chrono::DateTime::<chrono::Utc>::MAX_UTC, 1, &holidays(&[])),
+            add_business_days(jiff::Timestamp::MAX, 1, &holidays(&[])),
             Err(BusinessDayRejection::DateOverflow),
         );
     }
@@ -1628,7 +1628,7 @@ mod tests {
             Some(date("2026-12-31")),
         )
         .expect("Mon -> Wed is inside coverage");
-        assert_eq!(res.deadline.date_naive(), date("2026-12-30"), "Wednesday");
+        assert_eq!(crate::time::utc_date(res.deadline), date("2026-12-30"), "Wednesday");
     }
 
     #[test]
@@ -1642,7 +1642,7 @@ mod tests {
             Some(date("2026-12-31")),
         )
         .expect("Wed -> Thu lands exactly on the horizon");
-        assert_eq!(res.deadline.date_naive(), date("2026-12-31"));
+        assert_eq!(crate::time::utc_date(res.deadline), date("2026-12-31"));
     }
 
     #[test]
@@ -1650,7 +1650,7 @@ mod tests {
         // A calendar with no exclusions at all imposes no horizon.
         let res = add_business_days_bounded(utc("2030-03-04T09:00:00Z"), 2, &holidays(&[]), None)
             .expect("no horizon -> weekends-only resolution is intended");
-        assert_eq!(res.deadline.date_naive(), date("2030-03-06"));
+        assert_eq!(crate::time::utc_date(res.deadline), date("2030-03-06"));
     }
 
     #[test]
@@ -1746,7 +1746,7 @@ mod tests {
         let mut exc = Vec::new();
         // Exclude start_date and the next 365 days
         for i in 0..=365 {
-            exc.push(start_date + chrono::Duration::days(i));
+            exc.push(start_date + crate::time::days(i));
         }
 
         assert_eq!(
@@ -1761,7 +1761,7 @@ mod tests {
         let mut exc = Vec::new();
         // Exclude start_date and the previous 365 days
         for i in 0..=365 {
-            exc.push(start_date - chrono::Duration::days(i));
+            exc.push(start_date - crate::time::days(i));
         }
 
         assert_eq!(
@@ -1845,11 +1845,11 @@ mod tests {
         }
     }
 
-    // ── NaiveDate range limits (issue #1968) ──────────────────────────────────
+    // ── jiff::civil::Date range limits (issue #1968) ──────────────────────────────────
 
     #[test]
     fn apply_skip_policy_next_at_naivedate_max_returns_none() {
-        let max = NaiveDate::MAX;
+        let max = jiff::civil::Date::MAX;
         assert_eq!(
             apply_skip_policy(max, SkipPolicy::RunNextBusinessDay, &[max], false),
             None
@@ -1863,7 +1863,7 @@ mod tests {
 
     #[test]
     fn apply_skip_policy_prev_at_naivedate_min_returns_none() {
-        let min = NaiveDate::MIN;
+        let min = jiff::civil::Date::MIN;
         assert_eq!(
             apply_skip_policy(min, SkipPolicy::RunPrevBusinessDay, &[min], false),
             None
@@ -1873,7 +1873,7 @@ mod tests {
     #[test]
     fn apply_skip_policy_scan_stops_at_naivedate_range_limits() {
         // The first step is in range. The second step is not.
-        let max = NaiveDate::MAX;
+        let max = jiff::civil::Date::MAX;
         let before_max = max.pred_opt().expect("in range");
         assert_eq!(
             apply_skip_policy(
@@ -1884,7 +1884,7 @@ mod tests {
             ),
             None
         );
-        let min = NaiveDate::MIN;
+        let min = jiff::civil::Date::MIN;
         let after_min = min.succ_opt().expect("in range");
         assert_eq!(
             apply_skip_policy(
@@ -1907,7 +1907,7 @@ mod tests {
             tz: name.into(),
         };
         let ts = "2026-01-04T23:00:00Z"
-            .parse::<chrono::DateTime<chrono::Utc>>()
+            .parse::<jiff::Timestamp>()
             .unwrap();
         assert_eq!(
             schedule_local_date(ts, Some(&tz("Asia/Tokyo"))),
@@ -1923,7 +1923,7 @@ mod tests {
     fn schedule_local_date_falls_back_to_utc() {
         use crate::policy::Schedule;
         let ts = "2026-01-04T23:00:00Z"
-            .parse::<chrono::DateTime<chrono::Utc>>()
+            .parse::<jiff::Timestamp>()
             .unwrap();
         let bad_tz = Schedule::CronInTimezone {
             expr: "0 8 * * 1-5".into(),
@@ -1945,9 +1945,9 @@ mod tests {
     mod db_tests {
         use super::*;
         use crate::policy::Schedule;
-        use chrono::Utc;
+        use jiff::Timestamp;
 
-        fn utc(s: &str) -> chrono::DateTime<Utc> {
+        fn utc(s: &str) -> jiff::Timestamp {
             s.parse().unwrap()
         }
 
@@ -1966,7 +1966,7 @@ mod tests {
             let slot = utc("2026-10-02T16:30:00Z"); // Sat 3 Oct 02:30 AEST
             let shifted = rebase_to_date(slot, date("2026-10-04"), Some(&s));
             let local = shifted.with_timezone(&chrono_tz::Australia::Sydney);
-            assert_eq!(local.date_naive(), date("2026-10-04"));
+            assert_eq!(crate::time::utc_date(local), date("2026-10-04"));
             assert_eq!(local.format("%H:%M").to_string(), "03:30");
         }
 
@@ -2060,7 +2060,7 @@ mod tests {
         #[test]
         fn preview_firings_no_calendar_all_fired() {
             let from = "2026-07-01T00:00:00Z"
-                .parse::<chrono::DateTime<Utc>>()
+                .parse::<jiff::Timestamp>()
                 .unwrap();
             let schedule = Schedule::Cron("0 9 * * *".to_string());
             let previews =
@@ -2075,7 +2075,7 @@ mod tests {
         #[test]
         fn preview_firings_skip_excluded() {
             let from = "2026-07-03T10:00:00Z"
-                .parse::<chrono::DateTime<Utc>>()
+                .parse::<jiff::Timestamp>()
                 .unwrap();
             let schedule = Schedule::Cron("0 9 * * *".to_string());
             let exc = excluded(&["2026-07-04"]);
@@ -2089,7 +2089,7 @@ mod tests {
             );
             let skipped = previews
                 .iter()
-                .find(|p| p.scheduled_at.date_naive() == date("2026-07-04"));
+                .find(|p| crate::time::utc_date(p.scheduled_at) == date("2026-07-04"));
             assert!(skipped.is_some(), "Jul 4 should appear in preview");
             let skipped = skipped.unwrap();
             assert_eq!(skipped.effective_at, None);
@@ -2103,7 +2103,7 @@ mod tests {
         #[test]
         fn preview_firings_deferred_next() {
             let from = "2026-07-03T10:00:00Z"
-                .parse::<chrono::DateTime<Utc>>()
+                .parse::<jiff::Timestamp>()
                 .unwrap();
             let schedule = Schedule::Cron("0 9 * * *".to_string());
             let exc = excluded(&["2026-07-04"]);
@@ -2117,12 +2117,12 @@ mod tests {
             );
             let deferred = previews
                 .iter()
-                .find(|p| p.scheduled_at.date_naive() == date("2026-07-04"));
+                .find(|p| crate::time::utc_date(p.scheduled_at) == date("2026-07-04"));
             assert!(deferred.is_some());
             let deferred = deferred.unwrap();
             assert!(deferred.effective_at.is_some());
             assert_eq!(
-                deferred.effective_at.unwrap().date_naive(),
+                crate::time::utc_date(deferred.effective_at.unwrap()),
                 date("2026-07-06")
             );
             assert!(
@@ -2137,10 +2137,10 @@ mod tests {
         #[test]
         fn backfill_skip_drops_excluded_dates() {
             let from = "2026-07-01T09:00:00Z"
-                .parse::<chrono::DateTime<Utc>>()
+                .parse::<jiff::Timestamp>()
                 .unwrap();
             let to = "2026-07-05T09:00:00Z"
-                .parse::<chrono::DateTime<Utc>>()
+                .parse::<jiff::Timestamp>()
                 .unwrap();
             let schedule = Schedule::Cron("0 9 * * *".to_string());
             let exc = excluded(&["2026-07-04"]);
@@ -2154,7 +2154,7 @@ mod tests {
                 false,
             )
             .unwrap();
-            let dates: Vec<_> = result.iter().map(|(_, ft)| ft.date_naive()).collect();
+            let dates: Vec<_> = result.iter().map(|(_, ft)| crate::time::utc_date(ft)).collect();
             assert!(
                 !dates.contains(&date("2026-07-04")),
                 "Jul 4 should be excluded"
@@ -2168,10 +2168,10 @@ mod tests {
         #[test]
         fn backfill_next_business_day_adjusts_excluded_date() {
             let from = "2026-07-01T09:00:00Z"
-                .parse::<chrono::DateTime<Utc>>()
+                .parse::<jiff::Timestamp>()
                 .unwrap();
             let to = "2026-07-05T09:00:00Z"
-                .parse::<chrono::DateTime<Utc>>()
+                .parse::<jiff::Timestamp>()
                 .unwrap();
             let schedule = Schedule::Cron("0 9 * * *".to_string());
             let exc = excluded(&["2026-07-04"]);
@@ -2185,7 +2185,7 @@ mod tests {
                 false,
             )
             .unwrap();
-            let dates: Vec<_> = result.iter().map(|(_, ft)| ft.date_naive()).collect();
+            let dates: Vec<_> = result.iter().map(|(_, ft)| crate::time::utc_date(ft)).collect();
             assert!(
                 dates.iter().filter(|&&d| d == date("2026-07-05")).count() >= 1,
                 "Jul 5 should appear (as adjusted Jul 4 and/or natural Jul 5)"
@@ -2199,10 +2199,10 @@ mod tests {
         #[test]
         fn backfill_no_exclusions_passes_through() {
             let from = "2026-07-01T09:00:00Z"
-                .parse::<chrono::DateTime<Utc>>()
+                .parse::<jiff::Timestamp>()
                 .unwrap();
             let to = "2026-07-03T09:00:00Z"
-                .parse::<chrono::DateTime<Utc>>()
+                .parse::<jiff::Timestamp>()
                 .unwrap();
             let schedule = Schedule::Cron("0 9 * * *".to_string());
             let plain =

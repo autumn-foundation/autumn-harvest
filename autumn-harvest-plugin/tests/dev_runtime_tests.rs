@@ -855,7 +855,7 @@ fn record(owner_pid: u32, postmaster_pid: Option<u32>) -> SessionRecord {
         postmaster_start_token: Some("87231".to_owned()),
         bin_dir: Some(PathBuf::from("/usr/lib/postgresql/16/bin")),
         data_dir: PathBuf::from("/tmp/harvest-dev-0/session-1-aa/data"),
-        created_at: chrono::Utc::now(),
+        created_at: jiff::Timestamp::now(),
     }
 }
 
@@ -866,7 +866,7 @@ fn reap_leaves_a_live_session_alone() {
         true,
         PostmasterIdentity::Confirmed,
         99,
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     );
     assert!(
         matches!(decision, ReapDecision::Skip { .. }),
@@ -883,7 +883,7 @@ fn reap_never_touches_our_own_session() {
         true,
         PostmasterIdentity::Confirmed,
         4242,
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     );
     assert!(
         matches!(decision, ReapDecision::Skip { .. }),
@@ -900,7 +900,7 @@ fn reap_stops_an_orphaned_postmaster_then_removes_the_directory() {
         false,
         PostmasterIdentity::Confirmed,
         99,
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     );
     assert!(
         matches!(
@@ -923,7 +923,7 @@ fn reap_removes_the_directory_when_the_postmaster_is_already_gone() {
         false,
         PostmasterIdentity::NotRunning,
         99,
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     );
     assert!(matches!(decision, ReapDecision::Remove), "{decision:?}");
 }
@@ -934,13 +934,13 @@ fn reap_removes_a_session_that_died_before_recording_a_postmaster() {
     // record with no known postmaster this stale is confirmed dead, not
     // merely still starting.
     let mut aged = record(4242, None);
-    aged.created_at = chrono::Utc::now() - chrono::Duration::minutes(5);
+    aged.created_at = jiff::Timestamp::now() - jiff::SignedDuration::from_mins(5);
     let decision = decide_reap(
         &aged,
         false,
         PostmasterIdentity::NotRunning,
         99,
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     );
     assert!(matches!(decision, ReapDecision::Remove), "{decision:?}");
 }
@@ -957,7 +957,7 @@ fn reap_skips_a_freshly_created_session_with_no_pid_file_yet() {
         false,
         PostmasterIdentity::NotRunning,
         99,
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     );
     assert_eq!(
         decision,
@@ -973,7 +973,7 @@ fn the_grace_period_boundary_is_15_seconds_not_some_other_unit() {
     // would not fail either. This pins the boundary itself, on one record so
     // only the elapsed time differs between the two assertions.
     let mut aging = record(4242, None);
-    let created_at = chrono::Utc::now() - chrono::Duration::seconds(14);
+    let created_at = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(14);
     aging.created_at = created_at;
 
     let still_within_grace = decide_reap(
@@ -981,7 +981,7 @@ fn the_grace_period_boundary_is_15_seconds_not_some_other_unit() {
         false,
         PostmasterIdentity::NotRunning,
         99,
-        created_at + chrono::Duration::seconds(14),
+        created_at + jiff::SignedDuration::from_secs(14),
     );
     assert_eq!(
         still_within_grace,
@@ -994,7 +994,7 @@ fn the_grace_period_boundary_is_15_seconds_not_some_other_unit() {
         false,
         PostmasterIdentity::NotRunning,
         99,
-        created_at + chrono::Duration::seconds(16),
+        created_at + jiff::SignedDuration::from_secs(16),
     );
     assert!(
         matches!(past_grace, ReapDecision::Remove),
@@ -1014,7 +1014,7 @@ fn a_skipped_session_is_reaped_once_it_ages_past_the_grace_period() {
         false,
         PostmasterIdentity::NotRunning,
         99,
-        record.created_at + chrono::Duration::seconds(5),
+        record.created_at + jiff::SignedDuration::from_secs(5),
     );
     assert_eq!(
         first_poll,
@@ -1027,7 +1027,7 @@ fn a_skipped_session_is_reaped_once_it_ages_past_the_grace_period() {
         false,
         PostmasterIdentity::NotRunning,
         99,
-        record.created_at + chrono::Duration::seconds(16),
+        record.created_at + jiff::SignedDuration::from_secs(16),
     );
     assert!(
         matches!(second_poll, ReapDecision::Remove),
@@ -1047,7 +1047,7 @@ fn a_tokenless_but_live_postmaster_is_skipped_not_stopped() {
         false,
         PostmasterIdentity::Unknown,
         99,
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     );
     assert_eq!(
         decision,
@@ -2257,7 +2257,7 @@ fn a_reused_owner_pid_does_not_strand_a_session_forever() {
         postmaster_start_token: Some("222".to_owned()),
         bin_dir: None,
         data_dir: PathBuf::from("/tmp/harvest-dev-1/session-4242-0000000a/data"),
-        created_at: chrono::Utc::now(),
+        created_at: jiff::Timestamp::now(),
     };
 
     // Same pid as ours, but the owner is *not* the recorded one: reap it.
@@ -2267,7 +2267,7 @@ fn a_reused_owner_pid_does_not_strand_a_session_forever() {
             false,
             PostmasterIdentity::Confirmed,
             4242,
-            chrono::Utc::now()
+            jiff::Timestamp::now()
         ),
         ReapDecision::StopThenRemove {
             postmaster_pid: 4243
@@ -2282,7 +2282,7 @@ fn a_reused_owner_pid_does_not_strand_a_session_forever() {
             true,
             PostmasterIdentity::Confirmed,
             4242,
-            chrono::Utc::now()
+            jiff::Timestamp::now()
         ),
         ReapDecision::Skip(SkipReason::OwnedByThisProcess)
     );
@@ -2294,7 +2294,7 @@ fn a_reused_owner_pid_does_not_strand_a_session_forever() {
             true,
             PostmasterIdentity::Confirmed,
             99,
-            chrono::Utc::now()
+            jiff::Timestamp::now()
         ),
         ReapDecision::Skip(SkipReason::OwnerAlive)
     );
@@ -2374,7 +2374,7 @@ fn an_unreadable_postmaster_pid_file_leaves_the_session_alone() {
     // Old enough that the startup grace period (issue #1299) has passed. So
     // this test still exercises confirmed absence, not the "might still be
     // starting" skip a freshly created record now gets.
-    stale.created_at = chrono::Utc::now() - chrono::Duration::minutes(5);
+    stale.created_at = jiff::Timestamp::now() - jiff::SignedDuration::from_mins(5);
     std::fs::write(
         session_dir.join("session.json"),
         stale.to_json().expect("json"),
@@ -2440,13 +2440,13 @@ fn reap_skips_an_old_session_when_a_process_names_its_data_dir() {
     // record past the grace period while the postmaster gets no CPU. A live
     // process that names the data directory is positive evidence.
     let mut aged = record(4242, None);
-    aged.created_at = chrono::Utc::now() - chrono::Duration::minutes(5);
+    aged.created_at = jiff::Timestamp::now() - jiff::SignedDuration::from_mins(5);
     let decision = decide_reap(
         &aged,
         false,
         PostmasterIdentity::ProcessFound,
         99,
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     );
     assert_eq!(
         decision,
@@ -2483,7 +2483,7 @@ fn an_old_session_with_a_live_process_on_its_data_dir_survives_the_full_reap_pip
     let mut aged = record(u32::MAX - 1, None);
     aged.owner_start_token = None;
     aged.data_dir = data_dir.clone();
-    aged.created_at = chrono::Utc::now() - chrono::Duration::minutes(5);
+    aged.created_at = jiff::Timestamp::now() - jiff::SignedDuration::from_mins(5);
     std::fs::write(
         session_dir.join("session.json"),
         aged.to_json().expect("json"),

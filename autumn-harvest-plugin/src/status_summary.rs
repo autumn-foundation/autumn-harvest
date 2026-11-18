@@ -27,7 +27,7 @@ use autumn_harvest::workers::{
     LiveWorkerTaskStats, WorkerFilters, WorkerHealth, WorkerRow, WorkerStatus, list_workers,
     load_live_worker_task_stats_per_cohort,
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use diesel::sql_types::{BigInt, Nullable};
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
@@ -185,7 +185,7 @@ pub struct HealthSummaryReport {
     /// Worst-of the five subsystem verdicts.
     pub status: SubsystemStatus,
     /// When this snapshot was assembled.
-    pub as_of: DateTime<Utc>,
+    pub as_of: Timestamp,
     /// The five subsystem blocks, in a stable order.
     pub subsystems: Vec<SubsystemHealth>,
     /// Shards that could not be inspected (from either the shard-health pass or
@@ -615,7 +615,7 @@ fn collect_unavailable_shards(
 /// deduped by `shard_id`. Top-level `status` is the worst of all five.
 #[must_use]
 pub fn build_status_response(
-    as_of: DateTime<Utc>,
+    as_of: Timestamp,
     shard_report: &ShardHealthReport,
     bundle: &StatusBundleMerge,
     thresholds: &StatusThresholds,
@@ -729,7 +729,7 @@ pub async fn build_status_report(
     api_state: &HarvestApiState,
     thresholds: &StatusThresholds,
 ) -> HealthSummaryReport {
-    let as_of = Utc::now();
+    let as_of = Timestamp::now();
     // Activity names with a circuit-breaker policy skip the rate-limit gate at
     // claim. So the per-shard claimable-backlog scan exempts them from its
     // rate-limit filter, to match `claim_task`. The shard-health coverage gate
@@ -1001,7 +1001,7 @@ mod tests {
         ShardSchedulerCoverage, ShardSchemaHealth,
     };
     use autumn_harvest::worker_outlier::OutlierDimension;
-    use chrono::{TimeZone as _, Utc};
+    use jiff::Timestamp;
     use std::collections::BTreeMap;
 
     fn thresholds() -> StatusThresholds {
@@ -1059,7 +1059,7 @@ mod tests {
     fn shard_report(overall: ShardReadiness, rows: Vec<ShardHealthRow>) -> ShardHealthReport {
         ShardHealthReport {
             overall_readiness: overall,
-            observed_at: Utc.timestamp_opt(1000, 0).unwrap(),
+            observed_at: Timestamp::new(1000, 0).unwrap(),
             freshness_window_secs: 10,
             candidate_shard: None,
             shards: rows,
@@ -1214,7 +1214,7 @@ mod tests {
             peer_median_p99_latency_ms: Some(25),
         }];
         let resp = build_status_response(
-            Utc.timestamp_opt(2000, 0).unwrap(),
+            Timestamp::new(2000, 0).unwrap(),
             &report,
             &bundle,
             &thresholds(),
@@ -1242,7 +1242,7 @@ mod tests {
             vec![shard_row(0, ShardReadiness::Ready, true, &[])],
         );
         let resp = build_status_response(
-            Utc.timestamp_opt(2000, 0).unwrap(),
+            Timestamp::new(2000, 0).unwrap(),
             &report,
             &healthy_bundle(),
             &thresholds(),
@@ -1585,7 +1585,7 @@ mod tests {
             vec![shard_row(0, ShardReadiness::Ready, true, &[])],
         );
         let resp = build_status_response(
-            Utc.timestamp_opt(2000, 0).unwrap(),
+            Timestamp::new(2000, 0).unwrap(),
             &report,
             &healthy_bundle(),
             &thresholds(),
@@ -1606,7 +1606,7 @@ mod tests {
         let mut bundle = healthy_bundle();
         bundle.dlq_total = 5; // degraded dead_letters
         let resp = build_status_response(
-            Utc.timestamp_opt(2000, 0).unwrap(),
+            Timestamp::new(2000, 0).unwrap(),
             &report,
             &bundle,
             &thresholds(),
@@ -1641,7 +1641,7 @@ mod tests {
             reason: "connection refused".to_string(),
         }];
         let resp = build_status_response(
-            Utc.timestamp_opt(2000, 0).unwrap(),
+            Timestamp::new(2000, 0).unwrap(),
             &report,
             &bundle,
             &thresholds(),
@@ -1693,7 +1693,7 @@ mod tests {
             },
         ];
         let resp = build_status_response(
-            Utc.timestamp_opt(2000, 0).unwrap(),
+            Timestamp::new(2000, 0).unwrap(),
             &report,
             &bundle,
             &thresholds(),
@@ -1731,7 +1731,7 @@ mod tests {
         bundle.stalled_count = 5; // degraded
         let mut t = thresholds();
         t.stalled_no_progress_minutes = 42;
-        let resp = build_status_response(Utc.timestamp_opt(2000, 0).unwrap(), &report, &bundle, &t);
+        let resp = build_status_response(Timestamp::new(2000, 0).unwrap(), &report, &bundle, &t);
         let stalled = resp
             .subsystems
             .iter()

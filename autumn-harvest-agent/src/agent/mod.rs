@@ -1485,7 +1485,7 @@ pub async fn agent(ctx: &WorkflowContext, input: serde_json::Value) -> Result<Ag
             |state: &AgentState| {
                 let (at, op) = state.next_wake(profile)?;
                 Some(Wake::new(
-                    autumn_harvest::chrono::DateTime::from_timestamp_millis(at)?,
+                    autumn_harvest::jiff::Timestamp::from_millisecond(at).ok()?,
                     op,
                 ))
             },
@@ -1526,7 +1526,7 @@ impl AgentRun<'_> {
             state.incarnation = self.ctx.new_uuid().to_string();
         }
         // One recorded clock read per op. Replay reads the same time.
-        let now = self.ctx.system_now().timestamp_millis();
+        let now = self.ctx.system_now().as_millisecond();
         self.publish(&state, self.profile.as_ref().ok(), "running", now);
         let mut ticked = false;
         let mut reload = None;
@@ -1554,7 +1554,7 @@ impl AgentRun<'_> {
         // longer than the interval then never makes the next one due at
         // once, so waiting ops run first.
         let booked_at = if ticked {
-            self.ctx.system_now().timestamp_millis()
+            self.ctx.system_now().as_millisecond()
         } else {
             now
         };
@@ -1952,7 +1952,7 @@ impl AgentRun<'_> {
             );
             return;
         }
-        let at_ms = self.ctx.system_now().timestamp_millis();
+        let at_ms = self.ctx.system_now().as_millisecond();
         let max_text = usize::try_from(settings.max_text_bytes).unwrap_or(usize::MAX);
         let append = EpisodeAppend {
             scope: episode_scope(id),
@@ -2057,7 +2057,7 @@ impl AgentRun<'_> {
         scope: &str,
     ) -> Result<u64, String> {
         self.workspace_floor(state, scope).await?;
-        let now = self.ctx.system_now().timestamp_millis();
+        let now = self.ctx.system_now().as_millisecond();
         state.workspace_generation = next_generation(state.workspace_generation, now);
         Ok(state.workspace_generation)
     }
@@ -2465,7 +2465,7 @@ impl AgentRun<'_> {
                 {
                     let delay =
                         i64::try_from(planned.delay_secs.saturating_mul(1_000)).unwrap_or(i64::MAX);
-                    let ended = self.ctx.system_now().timestamp_millis();
+                    let ended = self.ctx.system_now().as_millisecond();
                     state.followup_due_ms = Some(ended.saturating_add(delay));
                 }
                 if task.deliver {

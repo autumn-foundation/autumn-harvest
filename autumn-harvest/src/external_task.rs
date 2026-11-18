@@ -6,7 +6,8 @@
 //! in O(log n) through the `idx_harvest_ext_token` index. It then appends the
 //! terminal event and wakes the workflow.
 
-use chrono::Utc;
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 
@@ -30,8 +31,8 @@ pub struct ExternalHandoffFilters {
     pub activity_name: Option<String>,
     pub token: Option<ExternalActivityToken>,
     pub shard_id: Option<i32>,
-    pub due_before: Option<chrono::DateTime<Utc>>,
-    pub updated_before: Option<chrono::DateTime<Utc>>,
+    pub due_before: Option<jiff::Timestamp>,
+    pub updated_before: Option<jiff::Timestamp>,
     pub limit: i64,
 }
 
@@ -69,9 +70,9 @@ pub struct ExternalHandoffRow {
     pub activity_id: ActivityExecId,
     pub activity_name: String,
     pub state: String,
-    pub created_at: chrono::DateTime<Utc>,
-    pub updated_at: chrono::DateTime<Utc>,
-    pub deadline_at: chrono::DateTime<Utc>,
+    pub created_at: jiff::Timestamp,
+    pub updated_at: jiff::Timestamp,
+    pub deadline_at: jiff::Timestamp,
     pub shard_id: i32,
 }
 
@@ -83,9 +84,9 @@ type ExternalHandoffProjection = (
     uuid::Uuid,
     String,
     String,
-    chrono::DateTime<Utc>,
-    chrono::DateTime<Utc>,
-    chrono::DateTime<Utc>,
+    jiff::Timestamp,
+    jiff::Timestamp,
+    jiff::Timestamp,
     i32,
 );
 
@@ -143,7 +144,7 @@ pub async fn record_external_task(
     )?;
 
     // host-clock-ok: the external-task timeout scan also compares with the host clock.
-    let schedule_to_close_at = Utc::now().checked_add_signed(dur).ok_or_else(|| {
+    let schedule_to_close_at = Timestamp::now().checked_add(dur).ok().ok_or_else(|| {
         crate::error::HarvestError::Database("Datetime addition overflow".to_string())
     })?;
 
@@ -236,10 +237,10 @@ pub async fn list_external_handoffs(
         query = query.filter(harvest_workflow_executions::shard_id.eq(shard_id));
     }
     if let Some(due_before) = filters.due_before {
-        query = query.filter(harvest_external_tasks::schedule_to_close_at.le(due_before));
+        query = query.filter(harvest_external_tasks::schedule_to_close_at.le(due_before.to_diesel()));
     }
     if let Some(updated_before) = filters.updated_before {
-        query = query.filter(harvest_external_tasks::updated_at.le(updated_before));
+        query = query.filter(harvest_external_tasks::updated_at.le(updated_before.to_diesel()));
     }
 
     query
@@ -369,7 +370,7 @@ pub async fn complete_externally_with_codecs(
             diesel::update(harvest_external_tasks::table.find(task.id))
                 .set((
                     harvest_external_tasks::state.eq("COMPLETED"),
-                    harvest_external_tasks::updated_at.eq(Utc::now()),
+                    harvest_external_tasks::updated_at.eq(Timestamp::now().to_diesel()),
                 ))
                 .execute(conn)
                 .await
@@ -423,7 +424,7 @@ pub async fn fail_externally(
             diesel::update(harvest_external_tasks::table.find(task.id))
                 .set((
                     harvest_external_tasks::state.eq("FAILED"),
-                    harvest_external_tasks::updated_at.eq(Utc::now()),
+                    harvest_external_tasks::updated_at.eq(Timestamp::now().to_diesel()),
                 ))
                 .execute(conn)
                 .await
@@ -474,14 +475,14 @@ pub async fn extend_deadline(
         let dur =
             crate::worker::chrono_duration_from_secs(extend_by_secs, "external task extend by")?;
 
-        let new_deadline = Utc::now().checked_add_signed(dur).ok_or_else(|| {
+        let new_deadline = Timestamp::now().checked_add(dur).ok().ok_or_else(|| {
             crate::error::HarvestError::Database("Datetime addition overflow".to_string())
         })?;
 
         diesel::update(harvest_external_tasks::table.find(task.id))
             .set((
-                harvest_external_tasks::schedule_to_close_at.eq(new_deadline),
-                harvest_external_tasks::updated_at.eq(Utc::now()),
+                harvest_external_tasks::schedule_to_close_at.eq(new_deadline.to_diesel()),
+                harvest_external_tasks::updated_at.eq(Timestamp::now().to_diesel()),
             ))
             .execute(conn)
             .await

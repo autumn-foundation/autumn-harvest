@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use autumn_harvest::ExecutionId;
 use autumn_harvest::llm_ledger::{LlmCall, MAX_LATENCY_MS, MAX_LLM_CALLS_PER_ATTEMPT};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension as _, Row, params};
 
 use crate::error::{SqliteError, SqliteResult};
@@ -53,7 +53,7 @@ pub struct LlmLedgerRow {
     /// The latency of the call in whole milliseconds.
     pub latency_ms: u64,
     /// The time of the completion, from the drive clock.
-    pub recorded_at: DateTime<Utc>,
+    pub recorded_at: Timestamp,
 }
 
 /// Fill each unset latency as `ActivityContext::record_llm_call` would.
@@ -171,8 +171,8 @@ pub fn rows_of(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<Vec<LlmL
 /// The errors of [`rows_of`].
 pub fn rows_between(
     conn: &Connection,
-    from: DateTime<Utc>,
-    until: DateTime<Utc>,
+    from: Timestamp,
+    until: Timestamp,
 ) -> SqliteResult<Vec<LlmLedgerRow>> {
     if !table_exists(conn)? {
         return Ok(Vec::new());
@@ -183,7 +183,7 @@ pub fn rows_between(
          ORDER BY recorded_at, exec_id, event_seq, call_index"
     ))?;
     let rows = stmt.query_map(
-        params![from.timestamp_millis(), until.timestamp_millis()],
+        params![from.as_millisecond(), until.as_millisecond()],
         raw_row,
     )?;
     rows.map(|raw| parse(raw?)).collect()
@@ -248,7 +248,7 @@ fn parse(raw: RawRow) -> SqliteResult<LlmLedgerRow> {
             .map(|cost| count(cost, "cost_usd_micros"))
             .transpose()?,
         latency_ms: count(raw.latency_ms, "latency_ms")?,
-        recorded_at: DateTime::from_timestamp_millis(raw.recorded_at)
+        recorded_at: Timestamp::from_millisecond(raw.recorded_at).ok()
             .ok_or_else(|| corrupt("recorded_at"))?,
         activity_name: raw.activity_name,
         model: raw.model,
@@ -298,7 +298,7 @@ mod tests {
         assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (10, 2));
         assert_eq!(rows[0].cost_usd_micros, Some(7));
         assert_eq!(rows[0].latency_ms, 1_500);
-        assert_eq!(rows[0].recorded_at.timestamp_millis(), 1_700_000_000_123);
+        assert_eq!(rows[0].recorded_at.as_millisecond(), 1_700_000_000_123);
         assert_eq!(rows[1].call_index, 1);
         assert_eq!(rows[1].cost_usd_micros, None, "an unpriced call");
         assert_eq!(rows[1].latency_ms, 0, "a latency rounds down to whole ms");

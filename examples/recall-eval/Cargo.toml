@@ -16,6 +16,7 @@ autumn-harvest-sqlite = { version = "0.10.0", path = "../../autumn-harvest-sqlit
 # OpenAI-compatible server through `--base-url`.
 autumn-harvest-agent = { version = "0.10.0", path = "../../autumn-harvest-agent", features = ["sqlite", "anthropic", "openai"] }
 chrono = { workspace = true }
+jiff = { workspace = true }
 clap = { version = "4.6", features = ["derive", "env"] }
 tempfile = "3"
 tokio = { workspace = true }

@@ -14,6 +14,7 @@
 #![allow(clippy::too_many_lines)]
 
 use std::sync::Arc;
+use jiff_diesel::ToDiesel;
 
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
 use autumn_harvest::schema::harvest_execution_summaries;
@@ -26,7 +27,7 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{DateTime, Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
@@ -151,7 +152,7 @@ async fn seed_summary(
     workflow_name: &str,
     workflow_id: &str,
     state: &str,
-    completed_at: DateTime<Utc>,
+    completed_at: Timestamp,
     search_attrs: Option<Value>,
     result: Option<Value>,
 ) -> String {
@@ -164,7 +165,7 @@ async fn seed_summary(
             harvest_execution_summaries::workflow_name.eq(workflow_name),
             harvest_execution_summaries::workflow_id.eq(workflow_id),
             harvest_execution_summaries::state.eq(state),
-            harvest_execution_summaries::started_at.eq(completed_at - Duration::seconds(5)),
+            harvest_execution_summaries::started_at.eq((completed_at - SignedDuration::from_secs(5)).to_diesel()),
             harvest_execution_summaries::completed_at.eq(completed_at),
             harvest_execution_summaries::duration_ms.eq(Some(5_000i64)),
             harvest_execution_summaries::shard_id.eq(0i32),
@@ -190,13 +191,13 @@ async fn list_returns_summaries_with_flags() {
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
     scrub(&mut conn).await;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     seed_summary(
         &mut conn,
         "sum_wf",
         "sum-1",
         "COMPLETED",
-        now - Duration::minutes(2),
+        now - SignedDuration::from_mins(2),
         Some(json!({"tenant": "acme"})),
         Some(json!({"ok": true})),
     )
@@ -206,7 +207,7 @@ async fn list_returns_summaries_with_flags() {
         "sum_wf",
         "sum-2",
         "FAILED",
-        now - Duration::minutes(1),
+        now - SignedDuration::from_mins(1),
         Some(json!({"tenant": "globex"})),
         None,
     )
@@ -237,13 +238,13 @@ async fn list_applies_filters() {
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
     scrub(&mut conn).await;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     seed_summary(
         &mut conn,
         "billing",
         "b-1",
         "COMPLETED",
-        now - Duration::hours(3),
+        now - SignedDuration::from_hours(3),
         Some(json!({"tenant": "acme"})),
         None,
     )
@@ -253,7 +254,7 @@ async fn list_applies_filters() {
         "billing",
         "b-2",
         "FAILED",
-        now - Duration::minutes(30),
+        now - SignedDuration::from_mins(30),
         Some(json!({"tenant": "acme"})),
         None,
     )
@@ -263,7 +264,7 @@ async fn list_applies_filters() {
         "onboarding",
         "o-1",
         "COMPLETED",
-        now - Duration::minutes(10),
+        now - SignedDuration::from_mins(10),
         Some(json!({"tenant": "globex"})),
         None,
     )
@@ -286,7 +287,7 @@ async fn list_applies_filters() {
     // Filter by completed_after (only the two most recent). Use the Z-suffixed
     // RFC 3339 form so the timezone offset carries no `+` (axum's query parser
     // decodes a raw `+` as a space).
-    let cutoff = (now - Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let cutoff = autumn_harvest::time::rfc3339_opts((now - SignedDuration::from_hours(1)), autumn_harvest::time::SecondsFormat::Secs, true);
     let (status, body) = get_json(
         &app,
         &format!("/workflows/summaries?completed_after={cutoff}"),
@@ -307,7 +308,7 @@ async fn list_paginates_with_keyset_cursor() {
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
     scrub(&mut conn).await;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     let mut expected_ids = Vec::new();
     for i in 0..5 {
         let id = seed_summary(
@@ -315,7 +316,7 @@ async fn list_paginates_with_keyset_cursor() {
             "page_wf",
             &format!("p-{i}"),
             "COMPLETED",
-            now - Duration::minutes(i64::from(i)),
+            now - SignedDuration::from_mins(i64::from(i)),
             None,
             None,
         )
@@ -388,7 +389,7 @@ async fn list_paginates_across_identical_completed_at() {
     scrub(&mut conn).await;
 
     // Four summaries all sharing the EXACT same completed_at.
-    let ts = Utc::now() - Duration::minutes(5);
+    let ts = Timestamp::now() - SignedDuration::from_mins(5);
     let mut expected = Vec::new();
     for i in 0..4 {
         expected.push(
@@ -442,14 +443,14 @@ async fn list_order_asc_and_desc() {
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
     scrub(&mut conn).await;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     for i in 0..5 {
         seed_summary(
             &mut conn,
             "ord_wf",
             &format!("o-{i}"),
             "COMPLETED",
-            now - Duration::minutes(i64::from(i)),
+            now - SignedDuration::from_mins(i64::from(i)),
             None,
             None,
         )
@@ -529,14 +530,14 @@ async fn erase_scrubs_summary_only_execution() {
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
     scrub(&mut conn).await;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     // No harvest_workflow_executions row — only the summary remains.
     let exec_id = seed_summary(
         &mut conn,
         "erase_wf",
         "e-1",
         "COMPLETED",
-        now - Duration::minutes(5),
+        now - SignedDuration::from_mins(5),
         Some(json!({"pii": "secret-attr"})),
         Some(json!({"pii": "secret-result"})),
     )

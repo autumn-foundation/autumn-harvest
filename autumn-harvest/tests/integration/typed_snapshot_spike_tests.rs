@@ -589,7 +589,7 @@ type HandlerFuture<'a> =
 const fn started(input: Value) -> WorkflowEvent {
     WorkflowEvent::WorkflowStarted {
         input,
-        timestamp: chrono::DateTime::from_timestamp(1_791_676_800, 0).expect("valid timestamp"),
+        timestamp: jiff::Timestamp::from_second(1_791_676_800).ok().expect("valid timestamp"),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -747,7 +747,7 @@ fn update_events(name: &str) -> [WorkflowEvent; 2] {
             update_id,
             name: name.into(),
             input: Value::Null,
-            timestamp: chrono::DateTime::from_timestamp(1_791_676_800, 0).expect("valid timestamp"),
+            timestamp: jiff::Timestamp::from_second(1_791_676_800).ok().expect("valid timestamp"),
         },
         WorkflowEvent::UpdateCompleted {
             update_id,
@@ -853,7 +853,7 @@ fn a_checkpoint_with_an_open_effect_is_refused() {
                 update_id: update,
                 name: "bump".into(),
                 input: Value::Null,
-                timestamp: chrono::DateTime::from_timestamp(1_791_676_800, 0)
+                timestamp: jiff::Timestamp::from_second(1_791_676_800).ok()
                     .expect("valid timestamp"),
             }],
             OpenEffect::Update("bump".into()),

@@ -27,7 +27,7 @@ use autoresearch::workflows::{
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest_agent::{AgentTask, MemoryScope, sqlite};
 use autumn_harvest_sqlite::{ExecutionFilter, ExecutionOutcome, SqliteError};
-use chrono::{TimeZone, Utc};
+use jiff::Timestamp;
 use common::{Fixture, activities_of, input_of, run_to_approval, run_to_end, runs_of, signals_of};
 use serde_json::{Value, json};
 
@@ -324,7 +324,7 @@ async fn an_approved_rewind_moves_the_base_to_an_older_kept_commit() {
 async fn a_late_approval_never_releases_the_call() {
     let fx = Fixture::new();
     let mut rt = fx.open(&model());
-    let clock = Arc::new(std::sync::Mutex::new(Utc::now()));
+    let clock = Arc::new(std::sync::Mutex::new(Timestamp::now()));
     let read = Arc::clone(&clock);
     rt.set_clock(move || *read.lock().unwrap());
     let exec = runtime::start(&mut rt, &fx.config("late", 1)).unwrap();
@@ -332,7 +332,7 @@ async fn a_late_approval_never_releases_the_call() {
     let before = fx.lab().read("train.py").unwrap();
     let pending = run_to_approval(&mut rt, exec).await;
     // The deadline passes: 120 seconds in this fixture.
-    *clock.lock().unwrap() += chrono::Duration::seconds(121);
+    *clock.lock().unwrap() += jiff::SignedDuration::from_secs(121);
     run_to_end(&mut rt, exec).await;
 
     // The call did not run, and the agent read that no approval came.
@@ -594,7 +594,7 @@ async fn the_nightly_schedule_starts_a_session_and_the_heartbeat_speaks_up() {
     let model = model();
     let mut rt = fx.open(&model);
     let clock = Arc::new(std::sync::Mutex::new(
-        Utc.with_ymd_and_hms(2026, 10, 17, 22, 0, 0).unwrap(),
+        autumn_harvest::time::utc_ymd_hms(2026, 10, 17, 22, 0, 0).unwrap(),
     ));
     let read = Arc::clone(&clock);
     rt.set_clock(move || *read.lock().unwrap());
@@ -604,7 +604,7 @@ async fn the_nightly_schedule_starts_a_session_and_the_heartbeat_speaks_up() {
         .unwrap();
     rt.upsert_schedule(&runtime::heartbeat(fx.lab().root()).unwrap())
         .unwrap();
-    let at = |d, h, m| Utc.with_ymd_and_hms(2026, 10, d, h, m, 30).unwrap();
+    let at = |d, h, m| autumn_harvest::time::utc_ymd_hms(2026, 10, d, h, m, 30).unwrap();
 
     // AC14: 23:00 starts the night under a tag from the slot time.
     *clock.lock().unwrap() = at(17, 23, 0);
@@ -875,7 +875,7 @@ async fn purge_removes_old_finished_runs() {
     run_to_end(&mut rt, exec).await;
     // AC25: nothing is old enough yet.
     assert_eq!(rt.purge_terminal(Duration::from_hours(30 * 24)).unwrap(), 0);
-    let later = Utc::now() + chrono::Duration::days(31);
+    let later = Timestamp::now() + autumn_harvest::time::days(31);
     let removed = rt
         .purge_terminal_as_of(later, Duration::from_hours(30 * 24))
         .unwrap();
@@ -980,7 +980,7 @@ async fn a_nightly_session_that_waits_for_its_lab_takes_commands_by_its_tag() {
     let fx = Fixture::new();
     let mut rt = fx.open(&model());
     let clock = Arc::new(std::sync::Mutex::new(
-        Utc.with_ymd_and_hms(2026, 10, 17, 22, 59, 50).unwrap(),
+        autumn_harvest::time::utc_ymd_hms(2026, 10, 17, 22, 59, 50).unwrap(),
     ));
     let read = Arc::clone(&clock);
     rt.set_clock(move || *read.lock().unwrap());
@@ -990,7 +990,7 @@ async fn a_nightly_session_that_waits_for_its_lab_takes_commands_by_its_tag() {
     hint(&mut rt, "a", "paper:warmdown", "h1");
     run_to_approval(&mut rt, exec_a).await;
     // Forty seconds on: the edit of A still waits, and A holds the lab.
-    let slot = Utc.with_ymd_and_hms(2026, 10, 17, 23, 0, 30).unwrap();
+    let slot = autumn_harvest::time::utc_ymd_hms(2026, 10, 17, 23, 0, 30).unwrap();
     *clock.lock().unwrap() = slot;
     rt.poll_once_as_of(slot).await.unwrap();
     rt.run_until_idle().await.unwrap();
@@ -1080,14 +1080,14 @@ async fn a_nightly_session_takes_commands_by_its_tag() {
     let fx = Fixture::new();
     let mut rt = fx.open(&model());
     let clock = Arc::new(std::sync::Mutex::new(
-        Utc.with_ymd_and_hms(2026, 10, 17, 22, 0, 0).unwrap(),
+        autumn_harvest::time::utc_ymd_hms(2026, 10, 17, 22, 0, 0).unwrap(),
     ));
     let read = Arc::clone(&clock);
     rt.set_clock(move || *read.lock().unwrap());
     // Zero experiments: the night runs until a stop.
     rt.upsert_schedule(&runtime::nightly(&fx.config("", 0)).unwrap())
         .unwrap();
-    let slot = Utc.with_ymd_and_hms(2026, 10, 17, 23, 0, 30).unwrap();
+    let slot = autumn_harvest::time::utc_ymd_hms(2026, 10, 17, 23, 0, 30).unwrap();
     *clock.lock().unwrap() = slot;
     rt.poll_once_as_of(slot).await.unwrap();
     let first = runs_of(&rt, SESSION)[0];
@@ -1163,7 +1163,7 @@ async fn a_failed_report_run_is_an_error() {
 async fn a_command_waits_for_a_session_that_has_no_tag_yet() {
     let fx = Fixture::new();
     let mut rt = fx.open(&model());
-    let slot = Utc.with_ymd_and_hms(2026, 10, 17, 23, 0, 30).unwrap();
+    let slot = autumn_harvest::time::utc_ymd_hms(2026, 10, 17, 23, 0, 30).unwrap();
     rt.set_clock(move || slot);
     let input = serde_json::to_value(autoresearch::workflows::SessionInput {
         config: fx.config("", 0),

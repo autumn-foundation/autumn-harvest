@@ -447,7 +447,7 @@ fn judged_run(judge_model: &str) -> (AgentHarness, SampleInput) {
 
 fn ledger_rows(rt: &SqliteRuntime) -> Vec<autumn_harvest_sqlite::LlmLedgerRow> {
     use autumn_harvest::chrono::{DateTime, Utc};
-    rt.llm_ledger_between(DateTime::<Utc>::MIN_UTC, DateTime::<Utc>::MAX_UTC)
+    rt.llm_ledger_between(Timestamp::MIN, Timestamp::MAX)
         .unwrap()
 }
 

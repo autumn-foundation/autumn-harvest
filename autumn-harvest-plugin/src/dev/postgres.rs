@@ -755,7 +755,7 @@ fn write_session_record(
             // that proof.
             postmaster_start_token: postmaster_pid.and_then(process_start_token),
             data_dir: data_dir.to_path_buf(),
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
         }
         .to_json()
         .map_err(DevError::SessionRecord)?,

@@ -17,7 +17,7 @@ use std::time::Duration;
 use autumn_harvest::failure::ERROR_TYPE_HANDLER_PANIC;
 use autumn_harvest::prelude::*;
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 
@@ -82,7 +82,7 @@ async fn report_info(ctx: &ActivityContext, _n: i64) -> Result<Value, String> {
         "is_local": info.is_local,
         "queue_name": info.queue_name,
         "task_id": info.task_id.map(|id| id.to_string()),
-        "deadline": ctx.deadline().map(|d| d.to_rfc3339()),
+        "deadline": ctx.deadline().map(|d| autumn_harvest::time::rfc3339(d)),
         "idempotency_key": ctx.idempotency_key().map_err(|e| e.to_string())?.as_str(),
         "cancelled": ctx.is_cancelled(),
     }))
@@ -106,9 +106,9 @@ async fn info_reports_the_dispatch_values() {
         .start_workflow_with_id("info_flow", "order-7", json!(1))
         .unwrap();
 
-    let before = Utc::now();
+    let before = Timestamp::now();
     let report = completed(&mut rt, exec).await;
-    let after = Utc::now();
+    let after = Timestamp::now();
     let activity_id = scheduled_activity_id(&rt.load_history(exec).unwrap());
     drop(rt);
 
@@ -134,14 +134,14 @@ async fn info_reports_the_dispatch_values() {
     assert_eq!(report["cancelled"], json!(false));
 
     // The deadline is the claim instant plus the one-hour budget.
-    let deadline: DateTime<Utc> = report["deadline"].as_str().unwrap().parse().unwrap();
-    let budget = chrono::Duration::hours(1);
-    assert!(deadline >= before + budget - chrono::Duration::seconds(1));
+    let deadline: Timestamp = report["deadline"].as_str().unwrap().parse().unwrap();
+    let budget = jiff::SignedDuration::from_hours(1);
+    assert!(deadline >= before + budget - jiff::SignedDuration::from_secs(1));
     assert!(deadline <= after + budget);
 }
 
 /// Under a simulated clock, `deadline()` still uses the real clock, because
-/// `time_remaining()` compares it with `Utc::now()`.
+/// `time_remaining()` compares it with `Timestamp::now()`.
 #[tokio::test]
 async fn the_deadline_is_on_the_real_clock_under_a_simulated_drive() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
@@ -149,17 +149,17 @@ async fn the_deadline_is_on_the_real_clock_under_a_simulated_drive() {
     rt.register_activity(&report_info_info());
     let exec = rt.start_workflow("info_flow", json!(1)).unwrap();
 
-    let before = Utc::now();
-    let epoch = DateTime::from_timestamp(0, 0).unwrap();
+    let before = Timestamp::now();
+    let epoch = Timestamp::from_second(0).ok().unwrap();
     let report = match rt.run_until_blocked_as_of(exec, epoch).await.unwrap() {
         RunState::Completed(v) => v,
         other => panic!("the run must complete, got {other:?}"),
     };
-    let after = Utc::now();
+    let after = Timestamp::now();
 
-    let deadline: DateTime<Utc> = report["deadline"].as_str().unwrap().parse().unwrap();
-    let budget = chrono::Duration::hours(1);
-    assert!(deadline >= before + budget - chrono::Duration::seconds(1));
+    let deadline: Timestamp = report["deadline"].as_str().unwrap().parse().unwrap();
+    let budget = jiff::SignedDuration::from_hours(1);
+    assert!(deadline >= before + budget - jiff::SignedDuration::from_secs(1));
     assert!(deadline <= after + budget);
 }
 

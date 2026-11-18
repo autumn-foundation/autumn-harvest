@@ -9,6 +9,7 @@
 //! Otherwise a testcontainers Postgres starts with the full migration bundle.
 
 use std::collections::HashMap;
+use jiff_diesel::ToDiesel;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,7 +23,7 @@ use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::DbPool;
-use chrono::{DateTime, TimeZone, Utc};
+use jiff::Timestamp;
 use diesel::sql_types::{BigInt, Bool, Text, Timestamptz};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
@@ -142,7 +143,7 @@ async fn rows_as_json(conn: &mut AsyncPgConnection, table: &str) -> Vec<serde_js
 async fn insert_execution(
     conn: &mut AsyncPgConnection,
     workflow_id: &str,
-    at: DateTime<Utc>,
+    at: Timestamp,
 ) -> uuid::Uuid {
     diesel::sql_query(
         "INSERT INTO harvest_workflow_executions
@@ -151,7 +152,7 @@ async fn insert_execution(
          RETURNING id",
     )
     .bind::<Text, _>(workflow_id)
-    .bind::<Timestamptz, _>(at)
+    .bind::<Timestamptz, _>(at.to_diesel())
     .get_result::<IdRow>(conn)
     .await
     .expect("insert execution")
@@ -159,7 +160,7 @@ async fn insert_execution(
 }
 
 /// Move a run's rows into the cohort of `at`, as if appended then.
-async fn backdate_events(conn: &mut AsyncPgConnection, exec: uuid::Uuid, at: DateTime<Utc>) {
+async fn backdate_events(conn: &mut AsyncPgConnection, exec: uuid::Uuid, at: Timestamp) {
     partition::ensure_cohort(conn, at)
         .await
         .expect("materialize the destination cohort");
@@ -169,7 +170,7 @@ async fn backdate_events(conn: &mut AsyncPgConnection, exec: uuid::Uuid, at: Dat
                 SET cohort = harvest_event_cohort($1), timestamp = $1
               WHERE workflow_exec_id = $2",
         )
-        .bind::<Timestamptz, _>(at)
+        .bind::<Timestamptz, _>(at.to_diesel())
         .bind::<diesel::sql_types::Uuid, _>(exec)
         .execute(c)
         .await
@@ -182,7 +183,7 @@ fn sample_events() -> Vec<WorkflowEvent> {
     vec![
         WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({"customer": "acme", "amount": 42}),
-            timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap(),
+            timestamp: autumn_harvest::time::utc_ymd_hms(2026, 1, 1, 12, 0, 0).unwrap(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -205,7 +206,7 @@ fn as_json(events: &[WorkflowEvent]) -> Vec<serde_json::Value> {
 }
 
 /// Seed `n` terminal runs whose history sits in the cohort of `at`.
-async fn seed_runs(conn: &mut AsyncPgConnection, at: DateTime<Utc>, n: usize) -> Vec<uuid::Uuid> {
+async fn seed_runs(conn: &mut AsyncPgConnection, at: Timestamp, n: usize) -> Vec<uuid::Uuid> {
     let ids = seed_runs_in_place(conn, at, n).await;
     for exec in &ids {
         backdate_events(conn, *exec, at).await;
@@ -216,7 +217,7 @@ async fn seed_runs(conn: &mut AsyncPgConnection, at: DateTime<Utc>, n: usize) ->
 /// Seed `n` terminal runs created at `at`. Their rows keep the default cohort.
 async fn seed_runs_in_place(
     conn: &mut AsyncPgConnection,
-    at: DateTime<Utc>,
+    at: Timestamp,
     n: usize,
 ) -> Vec<uuid::Uuid> {
     let mut ids = Vec::new();
@@ -247,8 +248,8 @@ async fn delete_runs(conn: &mut AsyncPgConnection, ids: &[uuid::Uuid]) {
 /// The partition, its bounds, and the orphan runs it holds.
 struct Aged {
     name: String,
-    lower: DateTime<Utc>,
-    upper: DateTime<Utc>,
+    lower: Timestamp,
+    upper: Timestamp,
     runs: Vec<uuid::Uuid>,
 }
 
@@ -257,11 +258,11 @@ async fn seed_aged_partition(conn: &mut AsyncPgConnection, n: usize) -> Aged {
 }
 
 async fn seed_aged_partition_at(conn: &mut AsyncPgConnection, n: usize, days: i64) -> Aged {
-    let at = Utc::now() - chrono::Duration::days(days);
+    let at = Timestamp::now() - autumn_harvest::time::days(days);
     let runs = seed_runs(conn, at, n).await;
     delete_runs(conn, &runs).await;
     let lower = partition::cohort_start(at, partition::DEFAULT_COHORT_WIDTH_SECS);
-    let upper = lower + chrono::Duration::seconds(partition::DEFAULT_COHORT_WIDTH_SECS);
+    let upper = lower + jiff::SignedDuration::from_secs(partition::DEFAULT_COHORT_WIDTH_SECS);
     Aged {
         name: partition::partition_name(lower),
         lower,
@@ -362,7 +363,7 @@ async fn sweep_with(
 ) -> partition::SweepOutcome {
     partition::sweep_exporting(
         conn,
-        Utc::now(),
+        Timestamp::now(),
         &SweepOptions::default(),
         None,
         &export_to(archiver),
@@ -383,7 +384,7 @@ fn typed(rows: Vec<serde_json::Value>) -> Vec<partition_archive::ArchivedEventRo
 async fn dropped_manifest(
     conn: &mut AsyncPgConnection,
     name: &str,
-    upper: DateTime<Utc>,
+    upper: Timestamp,
 ) -> String {
     partition_archive::dropped_manifest_key(conn, name, upper)
         .await
@@ -468,7 +469,7 @@ async fn the_legacy_partition_exports_under_a_min_lower_bound() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
     reset(&mut conn).await;
-    let runs = seed_runs_in_place(&mut conn, Utc::now() - chrono::Duration::days(3), 2).await;
+    let runs = seed_runs_in_place(&mut conn, Timestamp::now() - autumn_harvest::time::days(3), 2).await;
     partition::enable_partitioning(&mut conn, &EnableOptions::default())
         .await
         .expect("enable on a populated table");
@@ -615,7 +616,7 @@ async fn a_partition_a_live_run_owns_is_not_exported() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
     reset_partitioned(&mut conn).await;
-    let at = Utc::now() - chrono::Duration::days(30);
+    let at = Timestamp::now() - autumn_harvest::time::days(30);
     seed_runs(&mut conn, at, 1).await;
     let backend = Arc::new(TestArchiver::default());
     let outcome = sweep_with(&mut conn, backend.clone()).await;
@@ -648,7 +649,7 @@ async fn a_slow_backend_times_out_and_keeps_the_partition() {
     let export = PartitionExport::new(backend, 0).with_io_timeout(Duration::from_millis(100));
     let outcome = partition::sweep_exporting(
         &mut conn,
-        Utc::now(),
+        Timestamp::now(),
         &SweepOptions::default(),
         None,
         &export,
@@ -691,7 +692,7 @@ async fn an_exporting_sweep_never_deletes_stragglers() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
     reset_partitioned(&mut conn).await;
-    let at = Utc::now() - chrono::Duration::days(30);
+    let at = Timestamp::now() - autumn_harvest::time::days(30);
     let runs = seed_runs(&mut conn, at, 2).await;
     delete_runs(&mut conn, &runs[..1]).await;
     let lower = partition::cohort_start(at, partition::DEFAULT_COHORT_WIDTH_SECS);
@@ -702,7 +703,7 @@ async fn an_exporting_sweep_never_deletes_stragglers() {
     };
     let outcome = partition::sweep_exporting(
         &mut conn,
-        Utc::now(),
+        Timestamp::now(),
         &opts,
         None,
         &export_to(Arc::new(TestArchiver::default())),
@@ -725,7 +726,7 @@ async fn a_sweep_without_an_archiver_drops_nothing_once_a_shard_exported() {
     // `harvest partition maintain` and `RetentionRuntime::spawn` take these
     // paths. Neither has an archiver.
     let second = seed_aged_partition_at(&mut conn, 1, 20).await;
-    let plain = partition::sweep(&mut conn, Utc::now(), &SweepOptions::default(), None)
+    let plain = partition::sweep(&mut conn, Timestamp::now(), &SweepOptions::default(), None)
         .await
         .expect("sweep");
     assert!(plain.dropped.is_empty(), "{plain:?}");
@@ -738,7 +739,7 @@ async fn a_sweep_without_an_archiver_drops_nothing_once_a_shard_exported() {
     );
     // The status report predicts the same: it reports the partition as
     // waiting for an export, not as droppable.
-    let status = partition::evaluate(&mut conn, Utc::now(), &SweepOptions::default(), None)
+    let status = partition::evaluate(&mut conn, Timestamp::now(), &SweepOptions::default(), None)
         .await
         .expect("evaluate");
     assert!(status.dropped.is_empty(), "{status:?}");
@@ -751,7 +752,7 @@ async fn a_sweep_without_an_archiver_drops_nothing_once_a_shard_exported() {
     );
     let maintained = partition::maintain(
         &mut conn,
-        Utc::now(),
+        Timestamp::now(),
         partition::DEFAULT_LOOKAHEAD_COHORTS,
         &SweepOptions::default(),
         None,
@@ -767,7 +768,7 @@ async fn a_sweep_without_an_archiver_drops_nothing_once_a_shard_exported() {
         .execute(&mut conn)
         .await
         .expect("clear the marker");
-    let plain = partition::sweep(&mut conn, Utc::now(), &SweepOptions::default(), None)
+    let plain = partition::sweep(&mut conn, Timestamp::now(), &SweepOptions::default(), None)
         .await
         .expect("sweep");
     assert_eq!(plain.dropped, vec![second.name], "{plain:?}");
@@ -818,7 +819,7 @@ async fn a_sweep_without_an_archiver_drops_nothing_while_an_exporter_holds_the_l
         .await
         .expect("hold the export lock exclusive");
 
-    let plain = partition::sweep(&mut conn, Utc::now(), &SweepOptions::default(), None)
+    let plain = partition::sweep(&mut conn, Timestamp::now(), &SweepOptions::default(), None)
         .await
         .expect("sweep");
     assert_kept(&mut conn, &aged, &plain, partition::EXPORT_BUSY_REASON).await;
@@ -827,7 +828,7 @@ async fn a_sweep_without_an_archiver_drops_nothing_while_an_exporter_holds_the_l
         .batch_execute(&format!("SELECT pg_advisory_unlock({key})"))
         .await
         .expect("release");
-    let plain = partition::sweep(&mut conn, Utc::now(), &SweepOptions::default(), None)
+    let plain = partition::sweep(&mut conn, Timestamp::now(), &SweepOptions::default(), None)
         .await
         .expect("sweep");
     assert_eq!(plain.dropped, vec![aged.name], "{plain:?}");
@@ -911,14 +912,14 @@ async fn the_export_budget_spreads_a_backlog_over_passes() {
     let newer = seed_aged_partition_at(&mut conn, 1, 20).await;
     let export = export_to(Arc::new(TestArchiver::default())).with_max_exports_per_pass(1);
     let opts = SweepOptions::default();
-    let first = partition::sweep_exporting(&mut conn, Utc::now(), &opts, None, &export)
+    let first = partition::sweep_exporting(&mut conn, Timestamp::now(), &opts, None, &export)
         .await
         .expect("sweep");
     assert_eq!(first.dropped, vec![older.name], "{first:?}");
     assert!(first.truncated, "{first:?}");
     assert!(exists(&mut conn, &newer.name).await);
     let second =
-        partition::sweep_exporting(&mut conn, Utc::now(), &opts, first.next_resume, &export)
+        partition::sweep_exporting(&mut conn, Timestamp::now(), &opts, first.next_resume, &export)
             .await
             .expect("sweep");
     assert_eq!(second.dropped, vec![newer.name], "{second:?}");
@@ -935,15 +936,15 @@ async fn the_retention_runtime_exports_before_it_drops() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
     reset_partitioned(&mut conn).await;
-    let at = Utc::now() - chrono::Duration::days(30);
+    let at = Timestamp::now() - autumn_harvest::time::days(30);
     let runs = seed_runs(&mut conn, at, 2).await;
     let lower = partition::cohort_start(at, partition::DEFAULT_COHORT_WIDTH_SECS);
-    let upper = lower + chrono::Duration::seconds(partition::DEFAULT_COHORT_WIDTH_SECS);
+    let upper = lower + jiff::SignedDuration::from_secs(partition::DEFAULT_COHORT_WIDTH_SECS);
     let name = partition::partition_name(lower);
 
     let dir = tempfile::tempdir().unwrap();
     let disk: Arc<dyn PartitionArchiver> = Arc::new(DirectoryPartitionArchiver::new(dir.path()));
-    let started = Utc::now();
+    let started = Timestamp::now();
     let runtime = RetentionRuntime::spawn_with_hooks(
         ShardedDbPool::single(build_pool(&url)),
         RetentionConfig::with_max_age(Duration::from_hours(24)),
@@ -1048,7 +1049,7 @@ async fn a_sweep_without_an_archiver_waits_for_an_uncommitted_marker() {
     let outcome = sweep_with(&mut exporter, failing).await;
     assert!(outcome.dropped.is_empty(), "{outcome:?}");
 
-    let plain = partition::sweep(&mut conn, Utc::now(), &SweepOptions::default(), None)
+    let plain = partition::sweep(&mut conn, Timestamp::now(), &SweepOptions::default(), None)
         .await
         .expect("sweep");
     assert_kept(&mut conn, &aged, &plain, partition::EXPORT_BUSY_REASON).await;
@@ -1056,7 +1057,7 @@ async fn a_sweep_without_an_archiver_waits_for_an_uncommitted_marker() {
     AnsiTransactionManager::commit_transaction(&mut exporter)
         .await
         .expect("commit the caller transaction");
-    let plain = partition::sweep(&mut conn, Utc::now(), &SweepOptions::default(), None)
+    let plain = partition::sweep(&mut conn, Timestamp::now(), &SweepOptions::default(), None)
         .await
         .expect("sweep");
     assert_kept(&mut conn, &aged, &plain, partition::EXPORT_REQUIRED_REASON).await;
@@ -1076,7 +1077,7 @@ async fn an_exporter_waits_for_a_plain_sweep_in_a_caller_transaction() {
     AnsiTransactionManager::begin_transaction(&mut conn)
         .await
         .expect("begin the caller transaction");
-    let plain = partition::sweep(&mut conn, Utc::now(), &SweepOptions::default(), None)
+    let plain = partition::sweep(&mut conn, Timestamp::now(), &SweepOptions::default(), None)
         .await
         .expect("sweep");
     assert!(plain.dropped.is_empty(), "{plain:?}");
@@ -1116,7 +1117,7 @@ async fn a_dry_run_writes_no_marker() {
     let (url, _c) = setup_db().await;
     let mut conn = connect(&url).await;
     reset_partitioned(&mut conn).await;
-    let at = Utc::now() - chrono::Duration::days(30);
+    let at = Timestamp::now() - autumn_harvest::time::days(30);
     seed_runs(&mut conn, at, 2).await;
     let name = partition::partition_name(partition::cohort_start(
         at,
@@ -1126,7 +1127,7 @@ async fn a_dry_run_writes_no_marker() {
     let backend = Arc::new(TestArchiver::default());
     let mut config = RetentionConfig::with_max_age(Duration::from_hours(24));
     config.dry_run = true;
-    let started = Utc::now();
+    let started = Timestamp::now();
     let runtime = RetentionRuntime::spawn_with_hooks(
         ShardedDbPool::single(build_pool(&url)),
         config,
@@ -1182,7 +1183,7 @@ async fn a_failed_marker_write_in_a_caller_transaction_releases_the_lock() {
         .expect("hide the marker table in the caller transaction");
     let failed = partition::sweep_exporting(
         &mut conn,
-        Utc::now(),
+        Timestamp::now(),
         &SweepOptions::default(),
         None,
         &export_to(Arc::new(TestArchiver::default())),
@@ -1226,7 +1227,7 @@ async fn a_cancelled_sweep_in_a_caller_transaction_leaves_no_lock() {
         Duration::from_millis(500),
         partition::sweep_exporting(
             &mut conn,
-            Utc::now(),
+            Timestamp::now(),
             &SweepOptions::default(),
             None,
             &export,
@@ -1268,7 +1269,7 @@ async fn an_exporting_sweep_refuses_a_repeatable_read_caller_transaction() {
         .expect("set the isolation level");
     let refused = partition::sweep_exporting(
         &mut conn,
-        Utc::now(),
+        Timestamp::now(),
         &SweepOptions::default(),
         None,
         &export_to(Arc::new(TestArchiver::default())),

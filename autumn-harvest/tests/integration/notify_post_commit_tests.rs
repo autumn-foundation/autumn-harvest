@@ -134,7 +134,7 @@ async fn pending_count(url: &str, task_id: Uuid) -> i64 {
 fn started() -> WorkflowEvent {
     WorkflowEvent::WorkflowStarted {
         input: serde_json::json!({}),
-        timestamp: chrono::Utc::now(),
+        timestamp: jiff::Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -204,7 +204,7 @@ async fn park_task(url: &str) -> (ExecutionId, Uuid) {
     let mut conn = AsyncPgConnection::establish(url).await.expect("connect");
     let exec_id = insert_execution(&mut conn).await;
     let mut params = enqueue_params("default", exec_id);
-    params.scheduled_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+    params.scheduled_at = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1);
     let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
     let queues = vec!["default".to_string()];
     let claimed = queue::claim_task(&mut conn, &queues, "notify-test", "", None, &[], &[])

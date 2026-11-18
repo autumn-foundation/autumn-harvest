@@ -1,6 +1,6 @@
 #![cfg(feature = "webhooks")]
 
-use chrono::Utc;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -100,7 +100,7 @@ pub async fn deliver_webhook(
                 "SubscriptionNotFound: active subscription {} not found",
                 input.subscription_id
             )),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
         };
         manager.store().log_delivery(log).await.ok();
 
@@ -127,7 +127,7 @@ pub async fn deliver_webhook(
             max_attempts: 5,
             is_dlq: false,
             last_error: Some("SubscriptionDisabled: Webhook subscription is disabled".to_owned()),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
         };
         manager.store().log_delivery(log).await.ok();
 
@@ -135,7 +135,7 @@ pub async fn deliver_webhook(
     }
 
     // Stripe-style payload signing: t=<timestamp>,v1=<signature>
-    let timestamp = Utc::now().timestamp();
+    let timestamp = Timestamp::now().as_second();
     let signing_payload = format!("{}.{}", timestamp, input.payload);
     let signature =
         autumn_web::security::hmac_sha256_hex(sub.secret.as_bytes(), signing_payload.as_bytes());
@@ -161,7 +161,7 @@ pub async fn deliver_webhook(
         max_attempts,
         is_dlq: false,
         last_error: None,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
     };
 
     let start = std::time::Instant::now();
@@ -178,7 +178,7 @@ pub async fn deliver_webhook(
     let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     log.elapsed_ms = elapsed;
-    log.timestamp = Utc::now();
+    log.timestamp = Timestamp::now();
 
     match response {
         Ok(res) => {

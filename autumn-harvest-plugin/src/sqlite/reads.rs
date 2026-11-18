@@ -30,7 +30,7 @@ use autumn_web::reexports::axum;
 use axum::Json;
 use axum::extract::{Path, RawQuery, State};
 use axum::response::{IntoResponse, Response};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Deserialize;
 
 use super::HarvestSqlite;
@@ -46,8 +46,8 @@ const SHARD: i32 = 0;
 ///
 /// A row from before issue #2027 has no start time. Postgres always has one,
 /// so the field cannot be `null`.
-fn or_epoch(at: Option<DateTime<Utc>>) -> DateTime<Utc> {
-    at.unwrap_or(DateTime::UNIX_EPOCH)
+fn or_epoch(at: Option<Timestamp>) -> Timestamp {
+    at.unwrap_or(Timestamp::UNIX_EPOCH)
 }
 
 /// The stored fields of a run that a read route reports.
@@ -56,8 +56,8 @@ struct Run {
     workflow_name: String,
     workflow_id: String,
     state: String,
-    started_at: Option<DateTime<Utc>>,
-    closed_at: Option<DateTime<Utc>>,
+    started_at: Option<Timestamp>,
+    closed_at: Option<Timestamp>,
 }
 
 impl Run {
@@ -149,7 +149,7 @@ pub(super) async fn count(
         error: None,
     };
     Ok(Json(crate::workflow_count::build_count_response(
-        Utc::now(),
+        Timestamp::now(),
         usize::try_from(params.limit_groups).unwrap_or(usize::MAX),
         vec![observation],
     )))
@@ -555,8 +555,8 @@ pub(super) async fn run_chain_route(
 fn timed_rows(
     reader: &SqliteReader,
     exec: ExecutionId,
-    started_at: DateTime<Utc>,
-) -> autumn_harvest_sqlite::SqliteResult<Vec<(DateTime<Utc>, autumn_harvest::WorkflowEvent)>> {
+    started_at: Timestamp,
+) -> autumn_harvest_sqlite::SqliteResult<Vec<(Timestamp, autumn_harvest::WorkflowEvent)>> {
     let mut last = started_at;
     Ok(reader
         .timed_history(exec)?
@@ -590,7 +590,7 @@ pub(super) async fn timeline(
     Ok(Json(autumn_harvest::derive_timeline(
         &rows,
         or_epoch(run.started_at),
-        Utc::now(),
+        Timestamp::now(),
         run.closed_at,
         exec.to_string(),
         run.workflow_id,
@@ -660,9 +660,9 @@ pub(super) async fn logs(
 /// What an awaitables report reads from the file in one call.
 struct AwaitablesRows {
     run: Run,
-    rows: Vec<(DateTime<Utc>, autumn_harvest::WorkflowEvent)>,
+    rows: Vec<(Timestamp, autumn_harvest::WorkflowEvent)>,
     timers: HashSet<String>,
-    deadlines: HashMap<String, DateTime<Utc>>,
+    deadlines: HashMap<String, Timestamp>,
     replay: autumn_harvest_sqlite::ReplayInput,
 }
 
@@ -755,7 +755,7 @@ async fn wait_set(
     catalog: &super::handle::Catalog,
     workflow_name: &str,
     replay: autumn_harvest_sqlite::ReplayInput,
-    rows: &[(DateTime<Utc>, autumn_harvest::WorkflowEvent)],
+    rows: &[(Timestamp, autumn_harvest::WorkflowEvent)],
     timers: &HashSet<String>,
 ) -> (
     &'static str,
@@ -816,13 +816,13 @@ async fn wait_set(
 struct StackRows {
     run: Run,
     work: autumn_harvest_sqlite::PendingWork,
-    history: Vec<(DateTime<Utc>, autumn_harvest::WorkflowEvent)>,
+    history: Vec<(Timestamp, autumn_harvest::WorkflowEvent)>,
     children: Vec<ChildRun>,
 }
 
 fn pending_activity(
     task: autumn_harvest_sqlite::PendingTask,
-    now: DateTime<Utc>,
+    now: Timestamp,
     catalog: &super::handle::Catalog,
 ) -> api::PendingActivity {
     let (heartbeat_details, heartbeat_details_truncated, heartbeat_details_bytes) =
@@ -914,7 +914,7 @@ async fn stack_body(
     if is_terminal {
         return Ok(Json(body));
     }
-    let now = Utc::now();
+    let now = Timestamp::now();
     body.pending_activities = read
         .work
         .tasks
@@ -925,7 +925,7 @@ async fn stack_body(
         &mut body.pending_activities,
         autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
     );
-    let numbered: Vec<(i64, autumn_harvest::WorkflowEvent, DateTime<Utc>)> = read
+    let numbered: Vec<(i64, autumn_harvest::WorkflowEvent, Timestamp)> = read
         .history
         .iter()
         .enumerate()
@@ -1028,7 +1028,7 @@ pub(super) async fn history_export(
         state: run.state,
         parent_execution_id: replay.parent(),
         events: replay.into_history(),
-        exported_at: Utc::now(),
+        exported_at: Timestamp::now(),
         payload_policy: query.payload_policy,
         max_bytes: Some(query.max_bytes),
         context_headers: None,

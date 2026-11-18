@@ -357,7 +357,7 @@ mod tests {
             "wf".to_string(),
             ExecutionId::new(),
             &[
-                WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+                WorkflowEvent::workflow_started(serde_json::json!({}), jiff::Timestamp::now()),
                 WorkflowEvent::ActivityScheduled {
                     activity_id,
                     name: "charge".to_string(),

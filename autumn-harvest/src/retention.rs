@@ -2,6 +2,7 @@
 
 #[cfg(feature = "db")]
 use crate::schema::harvest_workflow_executions_ext;
+use jiff_diesel::ToDiesel;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -9,7 +10,7 @@ use std::time::Duration;
 #[cfg(feature = "db")]
 use std::{collections::HashMap, time::Instant};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 #[cfg(feature = "db")]
 use diesel::prelude::*;
 #[cfg(feature = "db")]
@@ -1133,7 +1134,7 @@ pub struct RetentionTickResult {
     /// The ID of the shard this retention tick operated on.
     pub shard: u16,
     /// The timestamp when this retention tick started.
-    pub ran_at: Option<DateTime<Utc>>,
+    pub ran_at: Option<Timestamp>,
     /// The number of expired candidate records identified during the tick.
     pub candidate_count: usize,
     /// The actual number of records successfully deleted during the tick.
@@ -1475,8 +1476,8 @@ impl RetentionMonitor {
 #[cfg(feature = "db")]
 #[derive(Debug, Clone, Copy, Default)]
 struct PartitionSweepCursor {
-    resume_after: Option<DateTime<Utc>>,
-    catch_up_target: Option<DateTime<Utc>>,
+    resume_after: Option<Timestamp>,
+    catch_up_target: Option<Timestamp>,
 }
 
 /// One terminal-task janitor pass over every database (issue #1811).
@@ -1503,9 +1504,9 @@ async fn run_terminal_task_pass(
     // of range skips the pass, and each shard reports why.
     let cutoff = (MIN_TERMINAL_TASK_RETENTION..=MAX_MAX_AGE)
         .contains(&age)
-        .then(|| chrono::Duration::from_std(age).ok())
+        .then(|| jiff::SignedDuration::try_from(age).ok())
         .flatten()
-        .and_then(|age| Utc::now().checked_sub_signed(age));
+        .and_then(|age| Timestamp::now().checked_sub(age).ok());
     let Some(cutoff) = cutoff else {
         let error = format!(
             "terminal_task_retention of {}s is out of range ({}s to {}s); the pass is skipped",
@@ -1869,7 +1870,7 @@ async fn run_partition_maintenance_pass(
         // is already behind. Its true current cohort then stays uncovered
         // until the next tick. Read the clock fresh, right before this
         // shard's own call.
-        let now = Utc::now();
+        let now = Timestamp::now();
         // A lost fence session stops the pass. See
         // `crate::replication::run_fenced_pass`.
         let maintained = crate::replication::run_fenced_pass(&fence, async {
@@ -2251,7 +2252,7 @@ impl RetentionRuntime {
                     // Resolve the loosest cutoff age up front. `None` here means
                     // no retention age is configured, the common case. As a
                     // fail-safe, it also means the loosest age is unrepresentable
-                    // as a `chrono::Duration`. That is unreachable for validated
+                    // as a `jiff::SignedDuration`. That is unreachable for validated
                     // ages: MAX_MAX_AGE ≪ the ~292M-year range of chrono. In the
                     // fail-safe case the workflow-history phase is skipped this
                     // tick and everything is retained. A zero cutoff would make
@@ -2259,20 +2260,20 @@ impl RetentionRuntime {
                     // row. The audit/schedule purges below still run.
                     if config
                         .loosest_cutoff_age()
-                        .and_then(|age| chrono::Duration::from_std(age).ok())
+                        .and_then(|age| jiff::SignedDuration::try_from(age).ok())
                         .is_some()
                     {
                         // Phase-active gate (issue #737). The `and_then(from_std)`
                         // above is the fail-safe guard from commit 34ddb62. If the
                         // loosest configured age is unrepresentable as a
-                        // `chrono::Duration` (unreachable for validated ages), the
+                        // `jiff::SignedDuration` (unreachable for validated ages), the
                         // whole workflow-history phase is skipped this tick. It does
                         // not over-select. Compute `now` once, so the SQL predicate
                         // of every shard and each per-candidate resolution share one
                         // clock. `run_shard_tick` pushes the exact per-type cutoffs
                         // into the SELECT (PR #990). There is no single "loose
                         // cutoff" SQL bind any more.
-                        let now = Utc::now();
+                        let now = Timestamp::now();
                         // A single pool names its shard through the default pin,
                         // as `begin_fenced_tick` does (issue #1823).
                         let single_pool = pools.len() == 1;
@@ -2309,7 +2310,7 @@ impl RetentionRuntime {
                         for (shard, started, tick) in join_all(tick_futures).await {
                             let mut result = RetentionTickResult {
                                 shard: u16::try_from(shard.as_i32()).unwrap_or(0),
-                                ran_at: Some(Utc::now()),
+                                ran_at: Some(Timestamp::now()),
                                 duration_ms: started.elapsed().as_millis(),
                                 ..RetentionTickResult::default()
                             };
@@ -2420,7 +2421,7 @@ impl RetentionRuntime {
                         && !config.dry_run
                         && let Some(summary_age) = config.summary_age()
                     {
-                        let now = Utc::now();
+                        let now = Timestamp::now();
                         for (shard, pool) in pools.iter_shards() {
                             if let Ok(mut conn) = crate::replication::fenced_checkout(pool).await {
                                 match purge_expired_summaries(
@@ -2491,9 +2492,9 @@ impl RetentionRuntime {
                     // operator wants to preview first.
                     if config.rate_limit_bucket_gc_active()
                         && let Some(window) = config.rate_limit_bucket_retention()
-                        && let Ok(window) = chrono::Duration::from_std(window)
+                        && let Ok(window) = jiff::SignedDuration::try_from(window)
                     {
-                        let cutoff = Utc::now() - window;
+                        let cutoff = Timestamp::now() - window;
                         for (shard, pool) in pools.iter_shards() {
                             let mut conn = match crate::replication::fenced_checkout(pool).await {
                                 Ok(conn) => conn,
@@ -2537,7 +2538,7 @@ impl RetentionRuntime {
                                             shard = %shard,
                                             deleted = total,
                                             dry_run = config.dry_run,
-                                            window_secs = window.num_seconds(),
+                                            window_secs = window.as_secs(),
                                             "harvest idle rate-limit buckets collected"
                                         );
                                     }
@@ -2711,23 +2712,28 @@ struct CandidateExecution {
     /// Non-null: the scan filters `completed_at IS NOT NULL`. A NULL fails the
     /// load with an error, not a panic (issue #1821).
     #[diesel(sql_type = Timestamptz)]
-    completed_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    completed_at: Timestamp,
     /// Legal-hold columns (issue #747), read only for the per-candidate skip
     /// gate. The SELECT's WHERE clause is intentionally NOT changed — the gate
     /// is evaluated in Rust so the two-variant bind numbering stays stable.
     #[diesel(sql_type = Nullable<Timestamptz>) ]
-    legal_hold_set_at: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    legal_hold_set_at: Option<Timestamp>,
     #[diesel(sql_type = Nullable<Timestamptz>) ]
-    legal_hold_until: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    legal_hold_until: Option<Timestamp>,
     /// Deadline-aware replay budget (issue #772), carried into the pre-deletion
     /// archive document. A completed/continued run can record a
     /// `SideEffectRecorded{Now}` deadline probe. This budget lets that run
     /// replay cleanly from cold storage. The archive is the last surviving
     /// copy; the row is deleted moments after.
     #[diesel(sql_type = Nullable<Interval>) ]
-    execution_timeout: Option<chrono::Duration>,
+    #[diesel(deserialize_as = crate::time::sql::NullablePgDuration)]
+    execution_timeout: Option<jiff::SignedDuration>,
     #[diesel(sql_type = Nullable<Timestamptz>) ]
-    deadline_at: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    deadline_at: Option<Timestamp>,
     /// Spawning-parent id (issue #698), carried into the pre-deletion archive
     /// document like `execution_timeout`/`deadline_at`. The archived history of
     /// a parent-aware child then round-trips its `parent_execution_id`. It
@@ -2757,7 +2763,7 @@ struct CandidateExecution {
 #[cfg(feature = "db")]
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct RetentionScanCursor {
-    completed_at: DateTime<Utc>,
+    completed_at: Timestamp,
     id: uuid::Uuid,
 }
 
@@ -2944,7 +2950,7 @@ async fn run_shard_tick(
     pool: crate::worker::DbPool,
     shard: ShardId,
     fence_key: ShardId,
-    now: DateTime<Utc>,
+    now: Timestamp,
     config: &RetentionConfig,
     archiver: Option<Arc<dyn HistoryArchiver>>,
     start_cursor: Option<RetentionScanCursor>,
@@ -2975,14 +2981,14 @@ async fn run_shard_tick(
     // to `global_fallback`, the global `max_age` cutoff. With no global age, it
     // falls to `'-infinity'`, so it is never selected.
     let mut override_cut_names: Vec<String> = Vec::new();
-    let mut override_cuts: Vec<DateTime<Utc>> = Vec::new();
+    let mut override_cuts: Vec<Timestamp> = Vec::new();
     for (name, secs) in config.workflow_overrides() {
         // Fail safe: omit an unrepresentable override age. That is unreachable
         // for validated ages: MAX_MAX_AGE ≪ the ~292M-year range of chrono. Its
         // rows are then never selected under a too-aggressive cutoff. With a global
         // `max_age` set they then fall back to it; without one they fall back to
         // `'-infinity'` (never selected). Retaining is the correct failure mode.
-        if let Ok(delta) = chrono::Duration::from_std(Duration::from_secs(*secs)) {
+        if let Ok(delta) = jiff::SignedDuration::try_from(Duration::from_secs(*secs)) {
             override_cut_names.push(name.clone());
             override_cuts.push(now - delta);
         }
@@ -2990,9 +2996,9 @@ async fn run_shard_tick(
     // Per-tenant cutoffs (issue #1977), built the same way. The SQL tries the
     // tenant arm before the type arm, so a tenant override wins.
     let mut tenant_cut_names: Vec<String> = Vec::new();
-    let mut tenant_cuts: Vec<DateTime<Utc>> = Vec::new();
+    let mut tenant_cuts: Vec<Timestamp> = Vec::new();
     for (tenant, secs) in config.tenant_overrides() {
-        if let Ok(delta) = chrono::Duration::from_std(Duration::from_secs(*secs)) {
+        if let Ok(delta) = jiff::SignedDuration::try_from(Duration::from_secs(*secs)) {
             tenant_cut_names.push(tenant.clone());
             tenant_cuts.push(now - delta);
         }
@@ -3000,9 +3006,9 @@ async fn run_shard_tick(
     // The global fallback cutoff for un-overridden types. `None` means "no global
     // age" (or an unrepresentable one — same fail-safe): the SQL uses an
     // `'-infinity'` literal so those types are never selected.
-    let global_fallback: Option<DateTime<Utc>> = config
+    let global_fallback: Option<Timestamp> = config
         .max_age()
-        .and_then(|age| chrono::Duration::from_std(age).ok())
+        .and_then(|age| jiff::SignedDuration::try_from(age).ok())
         .map(|delta| now - delta);
 
     // The candidate SQL excludes rows whose `sticky_worker_id` starts with
@@ -3092,8 +3098,8 @@ async fn run_shard_tick(
                     .bind::<Array<Timestamptz>, _>(cuts_inner);
                 let rows = if let Some(fallback) = global_fallback {
                     query
-                        .bind::<Timestamptz, _>(fallback)
-                        .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
+                        .bind::<Timestamptz, _>(fallback.to_diesel())
+                        .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at).to_diesel())
                         .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
                         .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
                         .bind::<Array<Text>, _>(tenant_names_inner)
@@ -3102,7 +3108,7 @@ async fn run_shard_tick(
                         .await
                 } else {
                     query
-                        .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
+                        .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at).to_diesel())
                         .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
                         .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
                         .bind::<Array<Text>, _>(tenant_names_inner)
@@ -3216,7 +3222,7 @@ async fn run_shard_tick(
                 .await?;
                 continue;
             };
-            let Ok(chrono_age) = chrono::Duration::from_std(age) else {
+            let Ok(chrono_age) = jiff::SignedDuration::try_from(age) else {
                 // Unrepresentable duration (unreachable for validated ages, which
                 // are bounded by MAX_MAX_AGE ≪ chrono's ~292M-year range); fail
                 // safe toward RETAINING the row rather than deleting it. A zero
@@ -3241,8 +3247,8 @@ async fn run_shard_tick(
                 // record its age for tuning observability (as the existing
                 // should_skip branch does for not-yet-collectable candidates).
                 let skipped_age = now
-                    .signed_duration_since(completed_at)
-                    .num_seconds()
+                    .duration_since(completed_at)
+                    .as_secs()
                     .max(0)
                     .cast_unsigned();
                 outcome.oldest_age_secs_skipped = Some(
@@ -3267,8 +3273,8 @@ async fn run_shard_tick(
             // `completed_at >= $cutoff`. It is correct only with the cutoff of this type.
             if should_skip_candidate(&mut conn, &candidate, resolved_cutoff).await? {
                 let skipped_age = now
-                    .signed_duration_since(completed_at)
-                    .num_seconds()
+                    .duration_since(completed_at)
+                    .as_secs()
                     .max(0)
                     .cast_unsigned();
                 outcome.oldest_age_secs_skipped = Some(
@@ -3358,7 +3364,7 @@ async fn run_shard_tick(
                             shard_id: shard.as_i32(),
                             state: candidate.state.clone(),
                             events: history.events,
-                            exported_at: chrono::Utc::now(),
+                            exported_at: jiff::Timestamp::now(),
                             payload_policy: crate::history_export::HistoryPayloadPolicy::Full,
                             max_bytes: Some(usize::MAX),
                             // The archive never decodes (issue #1983), so an
@@ -3775,7 +3781,7 @@ fn chain_link_count_sql() -> &'static str {
 
 /// The two legal-hold timestamp columns `(legal_hold_set_at, legal_hold_until)`.
 #[cfg(feature = "db")]
-type HoldTimestamps = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+type HoldTimestamps = (Option<Timestamp>, Option<Timestamp>);
 
 /// Best-effort, non-locking read of a candidate's legal-hold columns, used for
 /// the pre-archival re-read gate (issue #747 BLOCKER 1). A concurrently-deleted
@@ -3804,7 +3810,7 @@ async fn read_candidate_hold(
 async fn delete_candidate_execution(
     conn: &mut diesel_async::AsyncPgConnection,
     candidate_id: uuid::Uuid,
-    now: DateTime<Utc>,
+    now: Timestamp,
     summary: Option<&SummaryPolicy>,
     fence_key: ShardId,
 ) -> HarvestResult<CandidateDeleteOutcome> {
@@ -3967,7 +3973,7 @@ async fn delete_candidate_execution(
                 let completed = completed_at.unwrap_or(started_at);
                 // Clamp at 0: a `completed_at` before `started_at` (clock
                 // skew across nodes) must never produce a negative duration.
-                let duration_ms = Some((completed - started_at).num_milliseconds().max(0));
+                let duration_ms = Some(crate::time::num_milliseconds((completed - started_at)).max(0));
                 // Payload capture is opt-in (AC3), and only ever happens
                 // under an explicit policy that asked for it. The
                 // migration-target tombstone case has no policy, so it
@@ -4145,13 +4151,13 @@ async fn delete_candidate_execution(
 /// #752): the two legal-hold columns plus the demotion source columns.
 #[cfg(feature = "db")]
 type SummarySourceRow = (
-    Option<DateTime<Utc>>,     // legal_hold_set_at
-    Option<DateTime<Utc>>,     // legal_hold_until
+    Option<Timestamp>,     // legal_hold_set_at
+    Option<Timestamp>,     // legal_hold_until
     String,                    // workflow_name
     String,                    // workflow_id
     String,                    // state
-    DateTime<Utc>,             // started_at
-    Option<DateTime<Utc>>,     // completed_at
+    Timestamp,             // started_at
+    Option<Timestamp>,     // completed_at
     i32,                       // shard_id
     Option<serde_json::Value>, // output
     Option<String>,            // error
@@ -4176,7 +4182,7 @@ pub(crate) async fn purge_expired_summaries(
     summary_age: Duration,
     batch_size: usize,
     dry_run: bool,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> HarvestResult<BTreeMap<String, u64>> {
     #[derive(QueryableByName)]
     struct NameRow {
@@ -4201,7 +4207,7 @@ pub(crate) async fn purge_expired_summaries(
         "(migrated_from_shards IS NULL OR jsonb_array_length(migrated_from_shards) = 0)";
 
     let mut counts: BTreeMap<String, u64> = BTreeMap::new();
-    let Ok(chrono_age) = chrono::Duration::from_std(summary_age) else {
+    let Ok(chrono_age) = jiff::SignedDuration::try_from(summary_age) else {
         // Unrepresentable age (unreachable for validated horizons, bounded by
         // MAX_MAX_AGE ≪ the chrono range). Fail safe toward RETAINING: GC
         // nothing this tick. A zero cutoff would delete everything.
@@ -4215,7 +4221,7 @@ pub(crate) async fn purge_expired_summaries(
             "SELECT workflow_name FROM harvest_execution_summaries \
               WHERE completed_at < $1 AND {NOT_A_MIGRATION_TARGET}"
         ))
-        .bind::<Timestamptz, _>(cutoff)
+        .bind::<Timestamptz, _>(cutoff.to_diesel())
         .load::<NameRow>(conn)
         .await
         .map_err(database_error)?;
@@ -4236,7 +4242,7 @@ pub(crate) async fn purge_expired_summaries(
              )
              RETURNING workflow_name"
         ))
-        .bind::<Timestamptz, _>(cutoff)
+        .bind::<Timestamptz, _>(cutoff.to_diesel())
         .bind::<BigInt, _>(batch)
         .load::<NameRow>(conn)
         .await
@@ -4282,7 +4288,7 @@ pub(crate) async fn purge_expired_summaries(
                  LIMIT $2
              )",
         )
-        .bind::<Timestamptz, _>(cutoff)
+        .bind::<Timestamptz, _>(cutoff.to_diesel())
         .bind::<BigInt, _>(batch)
         .execute(conn)
         .await
@@ -4318,10 +4324,10 @@ pub(crate) async fn purge_expired_trigger_fires(
     conn: &mut diesel_async::AsyncPgConnection,
     summary_age: Duration,
     batch_size: usize,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> HarvestResult<u64> {
     // An unrepresentable age deletes nothing, like `purge_expired_summaries`.
-    let Ok(chrono_age) = chrono::Duration::from_std(summary_age) else {
+    let Ok(chrono_age) = jiff::SignedDuration::try_from(summary_age) else {
         return Ok(0);
     };
     let cutoff = now - chrono_age;
@@ -4346,7 +4352,7 @@ pub(crate) async fn purge_expired_trigger_fires(
                  LIMIT $2
              )",
         )
-        .bind::<Timestamptz, _>(cutoff)
+        .bind::<Timestamptz, _>(cutoff.to_diesel())
         .bind::<BigInt, _>(batch)
         .execute(conn)
         .await
@@ -4376,16 +4382,16 @@ pub struct SummaryQuery {
     /// Terminal-state filter (`ANY` of the listed states).
     pub states: Vec<String>,
     /// Only summaries whose `completed_at` is at/after this instant.
-    pub completed_after: Option<DateTime<Utc>>,
+    pub completed_after: Option<Timestamp>,
     /// Only summaries whose `completed_at` is at/before this instant.
-    pub completed_before: Option<DateTime<Utc>>,
+    pub completed_before: Option<Timestamp>,
     /// JSONB containment (`@>`) predicates over `search_attrs`; combined with
     /// `AND`.
     pub search_attrs: Vec<serde_json::Value>,
     /// Keyset cursor `(completed_at, execution_id)` — under the default
     /// descending order, return only rows strictly *older* than this pair; under
     /// ascending order (`ascending = true`), only rows strictly *newer*.
-    pub cursor: Option<(DateTime<Utc>, uuid::Uuid)>,
+    pub cursor: Option<(Timestamp, uuid::Uuid)>,
     /// Sort direction (issue #752, AC4 parity with `GET /workflows`). `false`
     /// (the default) is `(completed_at DESC, execution_id DESC)`; `true` is the
     /// ascending order. Threaded through both the `ORDER BY` and the keyset
@@ -4433,7 +4439,7 @@ pub async fn list_execution_summaries(
                     "(harvest_execution_summaries.completed_at, \
                      harvest_execution_summaries.execution_id) > (",
                 )
-                .bind::<Timestamptz, _>(ts)
+                .bind::<Timestamptz, _>(ts.to_diesel())
                 .sql(", ")
                 .bind::<SqlUuid, _>(id)
                 .sql(")"),
@@ -4444,7 +4450,7 @@ pub async fn list_execution_summaries(
                     "(harvest_execution_summaries.completed_at, \
                      harvest_execution_summaries.execution_id) < (",
                 )
-                .bind::<Timestamptz, _>(ts)
+                .bind::<Timestamptz, _>(ts.to_diesel())
                 .sql(", ")
                 .bind::<SqlUuid, _>(id)
                 .sql(")"),
@@ -4461,10 +4467,10 @@ pub async fn list_execution_summaries(
         q = q.filter(harvest_execution_summaries::workflow_id.eq(wid.clone()));
     }
     if let Some(after) = query.completed_after {
-        q = q.filter(harvest_execution_summaries::completed_at.ge(after));
+        q = q.filter(harvest_execution_summaries::completed_at.ge(after.to_diesel()));
     }
     if let Some(before) = query.completed_before {
-        q = q.filter(harvest_execution_summaries::completed_at.le(before));
+        q = q.filter(harvest_execution_summaries::completed_at.le(before.to_diesel()));
     }
     for attr in &query.search_attrs {
         q = q.filter(sql::<Bool>("search_attrs @> ").bind::<Jsonb, _>(attr.clone()));
@@ -4527,7 +4533,7 @@ fn release_active_id(active_ids: &Mutex<Vec<uuid::Uuid>>, id: uuid::Uuid) {
 async fn should_skip_candidate(
     conn: &mut diesel_async::AsyncPgConnection,
     candidate: &CandidateExecution,
-    cutoff: DateTime<Utc>,
+    cutoff: Timestamp,
 ) -> HarvestResult<bool> {
     // The candidate loop runs these probes once per candidate. Each text is
     // constant, so each stays prepared and keeps one plan.
@@ -4586,7 +4592,7 @@ async fn should_skip_candidate(
         .bind::<Text, _>(&candidate.workflow_name)
         .bind::<Text, _>(&candidate.workflow_id)
         .bind::<SqlUuid, _>(candidate.id)
-        .bind::<Timestamptz, _>(cutoff)
+        .bind::<Timestamptz, _>(cutoff.to_diesel())
         .cache_prepared()
         .get_result::<CountRow>(conn)
         .await
@@ -4618,9 +4624,9 @@ struct CountRow {
 /// release.
 #[must_use]
 pub fn legal_hold_active(
-    set_at: Option<DateTime<Utc>>,
-    until: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
+    set_at: Option<Timestamp>,
+    until: Option<Timestamp>,
+    now: Timestamp,
 ) -> bool {
     set_at.is_some() && until.is_none_or(|deadline| deadline > now)
 }
@@ -4644,10 +4650,10 @@ pub struct LegalHoldOutcome {
     pub legal_hold_actor: Option<String>,
     /// When the active hold was placed, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub legal_hold_set_at: Option<DateTime<Utc>>,
+    pub legal_hold_set_at: Option<Timestamp>,
     /// The active hold's auto-expiry, if any (`None` = indefinite).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub legal_hold_until: Option<DateTime<Utc>>,
+    pub legal_hold_until: Option<Timestamp>,
     /// `true` when this `set` call actually placed a fresh hold; `false` when a
     /// hold was already active (idempotent no-op, provenance preserved).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -4662,7 +4668,7 @@ pub struct LegalHoldOutcome {
 mod legal_hold_db {
     use crate::schema::harvest_workflow_executions_ext;
     use crate::table_split::SetExt;
-    use chrono::{DateTime, Utc};
+    use jiff::Timestamp;
     use diesel::prelude::*;
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 
@@ -4675,8 +4681,8 @@ mod legal_hold_db {
     /// The four legal-hold columns, plus the forwarding pointer, loaded from a
     /// locked execution row.
     type HoldColumns = (
-        Option<DateTime<Utc>>,
-        Option<DateTime<Utc>>,
+        Option<Timestamp>,
+        Option<Timestamp>,
         Option<String>,
         Option<String>,
         Option<i32>,
@@ -4758,9 +4764,9 @@ mod legal_hold_db {
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
         reason: &str,
-        hold_until: Option<DateTime<Utc>>,
+        hold_until: Option<Timestamp>,
         actor: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> HarvestResult<LegalHoldOutcome> {
         // Empty reason normalizes to NULL (issue #747). A blank hold stores
         // `NULL`, not `Some("")`, so the erase-rejection message and describe
@@ -4795,8 +4801,8 @@ mod legal_hold_db {
 
                 diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
                     .set((
-                        SetExt(harvest_workflow_executions_ext::legal_hold_set_at.eq(Some(now))),
-                        harvest_workflow_executions::legal_hold_until.eq(hold_until),
+                        SetExt(harvest_workflow_executions_ext::legal_hold_set_at.eq(Some(now).to_diesel())),
+                        harvest_workflow_executions::legal_hold_until.eq(hold_until.to_diesel()),
                         SetExt(
                             harvest_workflow_executions_ext::legal_hold_reason.eq(stored_reason),
                         ),
@@ -4846,7 +4852,7 @@ mod legal_hold_db {
     pub async fn release_legal_hold(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
-        _now: DateTime<Utc>,
+        _now: Timestamp,
     ) -> HarvestResult<LegalHoldOutcome> {
         // Read + update in one transaction (issue #747 MINOR 1) so the
         // `FOR UPDATE` lock holds across the clear, serializing against a
@@ -4863,13 +4869,13 @@ mod legal_hold_db {
                         .set((
                             SetExt(
                                 harvest_workflow_executions_ext::legal_hold_set_at.eq::<Option<
-                                    DateTime<Utc>,
+                                    Timestamp,
                                 >>(
                                     None
                                 ),
                             ),
                             harvest_workflow_executions::legal_hold_until
-                                .eq::<Option<DateTime<Utc>>>(None),
+                                .eq::<Option<Timestamp>>(None),
                             SetExt(
                                 harvest_workflow_executions_ext::legal_hold_reason
                                     .eq::<Option<String>>(None),
@@ -5844,7 +5850,7 @@ mod tests {
         fn list(
             &self,
             _prefix: &str,
-            _created_before: DateTime<Utc>,
+            _created_before: Timestamp,
             _cursor: Option<&str>,
         ) -> Option<crate::payload_store::PayloadStoreFuture<'_, crate::payload_store::BlobPage>>
         {
@@ -6088,7 +6094,7 @@ mod tests {
             workflow_name: "test".to_string(),
             workflow_id: "ok".to_string(),
             state: "COMPLETED".to_string(),
-            completed_at: Utc::now() - chrono::Duration::days(10),
+            completed_at: Timestamp::now() - crate::time::days(10),
             context_headers: None,
             legal_hold_set_at: None,
             legal_hold_until: None,
@@ -6105,7 +6111,7 @@ mod tests {
             workflow_name: "test".to_string(),
             workflow_id: "skip".to_string(),
             state: "COMPLETED".to_string(),
-            completed_at: Utc::now() - chrono::Duration::days(9),
+            completed_at: Timestamp::now() - crate::time::days(9),
             context_headers: None,
             legal_hold_set_at: None,
             legal_hold_until: None,
@@ -6150,21 +6156,21 @@ mod tests {
 
     #[test]
     fn legal_hold_inactive_when_never_set() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         assert!(!legal_hold_active(None, None, now));
         // A stray `until` with no `set_at` is still not a hold.
         assert!(!legal_hold_active(
             None,
-            Some(now + chrono::Duration::days(1)),
+            Some(now + crate::time::days(1)),
             now
         ));
     }
 
     #[test]
     fn legal_hold_active_when_set_and_indefinite() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         assert!(legal_hold_active(
-            Some(now - chrono::Duration::hours(1)),
+            Some(now - jiff::SignedDuration::from_hours(1)),
             None,
             now
         ));
@@ -6172,27 +6178,27 @@ mod tests {
 
     #[test]
     fn legal_hold_active_when_until_in_future() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         assert!(legal_hold_active(
-            Some(now - chrono::Duration::hours(1)),
-            Some(now + chrono::Duration::hours(1)),
+            Some(now - jiff::SignedDuration::from_hours(1)),
+            Some(now + jiff::SignedDuration::from_hours(1)),
             now
         ));
     }
 
     #[test]
     fn legal_hold_inactive_when_expired() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         // until == now is expired (strict `>`): a hold whose deadline has been
         // reached is no longer active.
         assert!(!legal_hold_active(
-            Some(now - chrono::Duration::hours(2)),
+            Some(now - jiff::SignedDuration::from_hours(2)),
             Some(now),
             now
         ));
         assert!(!legal_hold_active(
-            Some(now - chrono::Duration::hours(2)),
-            Some(now - chrono::Duration::hours(1)),
+            Some(now - jiff::SignedDuration::from_hours(2)),
+            Some(now - jiff::SignedDuration::from_hours(1)),
             now
         ));
     }
@@ -6221,7 +6227,7 @@ mod tests {
             held: true,
             legal_hold_reason: Some("subpoena".into()),
             legal_hold_actor: Some("legal@corp".into()),
-            legal_hold_set_at: Some(Utc::now()),
+            legal_hold_set_at: Some(Timestamp::now()),
             legal_hold_until: None,
             newly_held: true,
             released: false,

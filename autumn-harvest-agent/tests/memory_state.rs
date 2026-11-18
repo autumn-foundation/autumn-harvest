@@ -215,11 +215,11 @@ async fn a_tick_without_memory_writes_cannot_edit_the_state_memory() {
             .memory(AgentMemory::State)
             .heartbeat(beat);
         let mut rt = runtime(&db, AgentHarness::new(model.clone()).agent(profile));
-        let start = Utc::now();
+        let start = Timestamp::now();
         sqlite::send(&mut rt, &agent(), &AgentOp::Control(Control::Resume), None).unwrap();
         let exec = sqlite::current_run(&rt, &agent()).unwrap().unwrap();
         rt.run_until_blocked_as_of(exec, start).await.unwrap();
-        let later = start + chrono::Duration::seconds(90);
+        let later = start + jiff::SignedDuration::from_secs(90);
         rt.run_until_blocked_as_of(exec, later).await.unwrap();
 
         let state = state_of(&rt, &agent()).await;

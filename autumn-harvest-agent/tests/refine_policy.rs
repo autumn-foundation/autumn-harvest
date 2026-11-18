@@ -54,10 +54,9 @@ fn policy(value: serde_json::Value) -> RefinePolicy {
     serde_json::from_value(value).expect("a valid policy")
 }
 
-fn noon() -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339("2026-11-03T12:00:00Z")
+fn noon() -> Timestamp {
+    ("2026-11-03T12:00:00Z").parse::<Timestamp>()
         .expect("time")
-        .with_timezone(&Utc)
 }
 
 fn system(text: &str) -> ProfileOverlay {

@@ -160,8 +160,8 @@ pub const fn broken_session_reason(
 /// Pure lease-expiry check: has `now` reached or passed `expires_at`?
 #[must_use]
 pub fn lease_expired(
-    now: chrono::DateTime<chrono::Utc>,
-    expires_at: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
+    expires_at: jiff::Timestamp,
 ) -> bool {
     now >= expires_at
 }
@@ -508,7 +508,7 @@ pub async fn record_session_acquired(
     workflow_exec_id: crate::types::ExecutionId,
     host_worker_id: &str,
     queue_name: &str,
-    expires_at: chrono::DateTime<chrono::Utc>,
+    expires_at: jiff::Timestamp,
 ) -> crate::error::HarvestResult<SessionAcquireRecordOutcome> {
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
@@ -575,7 +575,7 @@ pub async fn record_session_completed(
     )
     .set(crate::models::SessionCompletedUpdate {
         state: "COMPLETED".to_string(),
-        completed_at: chrono::Utc::now(),
+        completed_at: jiff::Timestamp::now(),
     })
     .execute(conn)
     .await
@@ -607,9 +607,9 @@ pub async fn refresh_session_lease(
 
     use crate::schema::harvest_sessions::dsl;
 
-    let expires_at = chrono::Utc::now()
-        + chrono::Duration::from_std(SESSION_MEMBER_STICKY_TIMEOUT)
-            .unwrap_or_else(|_| chrono::Duration::hours(24));
+    let expires_at = jiff::Timestamp::now()
+        + jiff::SignedDuration::try_from(SESSION_MEMBER_STICKY_TIMEOUT)
+            .unwrap_or_else(|_| jiff::SignedDuration::from_hours(24));
     diesel::update(
         dsl::harvest_sessions
             .find(session_id.as_uuid())
@@ -679,7 +679,7 @@ async fn resolve_broken_reason(
     use crate::schema::harvest_workers::dsl as w;
     use crate::schema::harvest_workflow_executions::dsl as e;
 
-    let worker: Option<(chrono::DateTime<chrono::Utc>, String)> = w::harvest_workers
+    let worker: Option<(jiff::Timestamp, String)> = w::harvest_workers
         .filter(w::worker_id.eq(&session.host_worker_id))
         .select((w::last_heartbeat_at, w::status))
         .first(conn)
@@ -692,7 +692,7 @@ async fn resolve_broken_reason(
         // can be de-registered/GC'd without ever transitioning to Stopped).
         None => (true, false),
         Some((last_heartbeat_at, status)) => {
-            let cutoff = chrono::Utc::now() - chrono::Duration::seconds(worker_stale_secs);
+            let cutoff = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(worker_stale_secs);
             (
                 last_heartbeat_at <= cutoff,
                 status == "Draining" || status == "Stopped",
@@ -717,7 +717,7 @@ async fn resolve_broken_reason(
         .as_deref()
         .is_some_and(crate::erase::is_terminal_state);
 
-    let lease_expired_naive = lease_expired(chrono::Utc::now(), session.expires_at);
+    let lease_expired_naive = lease_expired(jiff::Timestamp::now(), session.expires_at);
 
     // A lease-expiry check alone would call a healthy pipeline broken when a
     // member activity runs longer than `SESSION_MEMBER_STICKY_TIMEOUT` (24h).
@@ -805,7 +805,7 @@ async fn break_session_and_fail_members(
             diesel::update(s::harvest_sessions.find(session_id.as_uuid()))
                 .set(crate::models::SessionBrokenUpdate {
                     state: "BROKEN".to_string(),
-                    broken_at: chrono::Utc::now(),
+                    broken_at: jiff::Timestamp::now(),
                     broken_reason: reason.to_string(),
                 })
                 .execute(conn)
@@ -1060,21 +1060,21 @@ mod tests {
 
     #[test]
     fn lease_expired_true_when_now_past_expiry() {
-        let expires_at = chrono::Utc::now();
-        let now = expires_at + chrono::Duration::seconds(1);
+        let expires_at = jiff::Timestamp::now();
+        let now = expires_at + jiff::SignedDuration::from_secs(1);
         assert!(lease_expired(now, expires_at));
     }
 
     #[test]
     fn lease_expired_true_at_exact_boundary() {
-        let t = chrono::Utc::now();
+        let t = jiff::Timestamp::now();
         assert!(lease_expired(t, t));
     }
 
     #[test]
     fn lease_expired_false_when_still_within_lease() {
-        let expires_at = chrono::Utc::now() + chrono::Duration::seconds(60);
-        assert!(!lease_expired(chrono::Utc::now(), expires_at));
+        let expires_at = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(60);
+        assert!(!lease_expired(jiff::Timestamp::now(), expires_at));
     }
 
     #[test]

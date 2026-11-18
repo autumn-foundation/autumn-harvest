@@ -79,7 +79,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use crate::types::ExecutionId;
 
@@ -138,7 +138,7 @@ pub fn effective_mutex_lease_ttl() -> Duration {
 /// Whether a lease has elapsed relative to `now` (pure; the scanner's reclaim
 /// predicate). A lease is expired the instant `now` reaches `lease_expires_at`.
 #[must_use]
-pub fn lease_expired(lease_expires_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+pub fn lease_expired(lease_expires_at: Timestamp, now: Timestamp) -> bool {
     now >= lease_expires_at
 }
 
@@ -463,7 +463,7 @@ mod db_ops {
     use crate::cached_stmt::CachePreparedDsl as _;
     use crate::error::{HarvestResult, database_error};
     use crate::types::ExecutionId;
-    use chrono::{DateTime, Utc};
+    use jiff::Timestamp;
     use diesel::OptionalExtension;
     use diesel_async::{AsyncPgConnection, RunQueryDsl};
     use std::time::Duration;
@@ -514,7 +514,8 @@ mod db_ops {
     #[derive(diesel::QueryableByName)]
     struct AcquiredAtRow {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        acquired_at: DateTime<Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        acquired_at: Timestamp,
     }
 
     #[derive(diesel::QueryableByName)]
@@ -526,7 +527,8 @@ mod db_ops {
     #[derive(diesel::QueryableByName)]
     struct WaitMetricsRow {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        requested_at: DateTime<Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        requested_at: Timestamp,
         #[diesel(sql_type = diesel::sql_types::BigInt)]
         depth: i64,
     }
@@ -634,7 +636,7 @@ mod db_ops {
         conn: &mut AsyncPgConnection,
         key: &str,
         exec_id: ExecutionId,
-    ) -> HarvestResult<Option<(DateTime<Utc>, i64)>> {
+    ) -> HarvestResult<Option<(Timestamp, i64)>> {
         let row: Option<WaitMetricsRow> = diesel::sql_query(super::waiter_wait_metrics_stmt())
             .bind::<diesel::sql_types::Text, _>(key)
             .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
@@ -679,7 +681,7 @@ mod db_ops {
         key: &str,
         holder: ExecutionId,
         lock_seq: i64,
-    ) -> HarvestResult<Option<DateTime<Utc>>> {
+    ) -> HarvestResult<Option<Timestamp>> {
         advisory_lock(conn, key).await?;
 
         let released: Option<AcquiredAtRow> = diesel::sql_query(release_lock_stmt())
@@ -1018,11 +1020,10 @@ mod pure_tests {
 
     #[test]
     fn lease_expired_truth_table() {
-        let base = DateTime::parse_from_rfc3339("2026-07-20T12:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let before = base - chrono::Duration::seconds(1);
-        let after = base + chrono::Duration::seconds(1);
+        let base = ("2026-07-20T12:00:00Z").parse::<Timestamp>()
+            .unwrap();
+        let before = base - jiff::SignedDuration::from_secs(1);
+        let after = base + jiff::SignedDuration::from_secs(1);
         assert!(!lease_expired(base, before));
         // Expired exactly at the deadline (>=).
         assert!(lease_expired(base, base));
@@ -1160,7 +1161,7 @@ mod pure_tests {
         let grant = WorkflowEvent::MutexGranted {
             key: "account-1".to_string(),
             lock_seq: 7,
-            acquired_at: chrono::Utc::now(),
+            acquired_at: jiff::Timestamp::now(),
         };
         let other = || WorkflowEvent::TimerFired {
             timer_id: crate::types::TimerId::new("t-1"),

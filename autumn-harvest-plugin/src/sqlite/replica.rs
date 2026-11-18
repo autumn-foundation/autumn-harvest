@@ -51,7 +51,7 @@ use autumn_web::replication::{
     ReplicaDestination, ReplicationSettings, ReplicationStatus, Replicator, segment,
 };
 use autumn_web::time::ClockSource;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 /// The engine name of the Harvest file under the prefix of its tenant.
 pub const REPLICA_ENGINE: &str = "harvest";
@@ -418,7 +418,7 @@ impl Replicas {
     }
 
     /// What the replica of `key` holds at `target`, or at its latest state.
-    fn plan(&self, key: &FleetDbKey, target: Option<DateTime<Utc>>) -> Result<Planned, String> {
+    fn plan(&self, key: &FleetDbKey, target: Option<Timestamp>) -> Result<Planned, String> {
         let root = self.replica.root_for(key);
         match restore::plan(self.destination(), &root, target) {
             Ok(plan) => Ok(Planned::Plan(Box::new(plan))),
@@ -436,7 +436,7 @@ impl Replicas {
         &self,
         key: &FleetDbKey,
         path: &Path,
-        target: Option<DateTime<Utc>>,
+        target: Option<Timestamp>,
     ) -> Result<(), String> {
         match self.plan(key, target)? {
             Planned::Plan(plan) => self.publish_plan(key, path, &plan, true),
@@ -806,7 +806,7 @@ impl Replicas {
     }
 
     /// `HarvestFleet::restore` starts a restore of `key` to `target`.
-    pub fn request_restore(&self, key: &FleetDbKey, target: Option<DateTime<Utc>>) {
+    pub fn request_restore(&self, key: &FleetDbKey, target: Option<Timestamp>) {
         self.requested_map().insert(
             key.clone(),
             Requested {
@@ -1029,18 +1029,18 @@ enum Target {
     /// The latest state of the replica.
     Latest,
     /// The state at this time.
-    At(DateTime<Utc>),
+    At(Timestamp),
 }
 
 impl Target {
-    const fn of(time: Option<DateTime<Utc>>) -> Self {
+    const fn of(time: Option<Timestamp>) -> Self {
         match time {
             Some(at) => Self::At(at),
             None => Self::Latest,
         }
     }
 
-    const fn time(self) -> Option<DateTime<Utc>> {
+    const fn time(self) -> Option<Timestamp> {
         match self {
             Self::Latest => None,
             Self::At(at) => Some(at),
@@ -1050,7 +1050,7 @@ impl Target {
     fn render(self) -> String {
         match self {
             Self::Latest => LATEST.to_owned(),
-            Self::At(at) => at.to_rfc3339(),
+            Self::At(at) => autumn_harvest::time::rfc3339(at),
         }
     }
 
@@ -1058,9 +1058,9 @@ impl Target {
         if text == LATEST {
             return Some(Self::Latest);
         }
-        DateTime::parse_from_rfc3339(text)
+        text.parse::<Timestamp>()
             .ok()
-            .map(|at| Self::At(at.with_timezone(&Utc)))
+            .map(|at| Self::At(at))
     }
 }
 
@@ -1531,8 +1531,8 @@ mod tests {
     }
 
     /// A target that no replica reaches. An open that applies it fails.
-    fn unreachable() -> Option<DateTime<Utc>> {
-        Some(DateTime::UNIX_EPOCH)
+    fn unreachable() -> Option<Timestamp> {
+        Some(Timestamp::UNIX_EPOCH)
     }
 
     /// The key and the paths of the tenant `acme`. It writes a database
@@ -1565,7 +1565,7 @@ mod tests {
         replicas: &Replicas,
         key: &FleetDbKey,
         db: &Path,
-        target: Option<DateTime<Utc>>,
+        target: Option<Timestamp>,
     ) {
         replicas.request_restore(key, target);
         replicas.release(key);
@@ -1584,7 +1584,7 @@ mod tests {
         replicas.release(&key);
         assert_eq!(entry(&path), None, "a plain release");
 
-        let at = Utc::now();
+        let at = Timestamp::now();
         replicas.request_restore(&key, Some(at));
         replicas.release(&key);
         assert_eq!(
@@ -1606,7 +1606,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let replicas = replicas(dir.path());
         let (key, path, db) = acme(&replicas);
-        let first = Utc::now();
+        let first = Timestamp::now();
         harvest_restore(&replicas, &key, &db, Some(first));
         let committed = Some(Entry::Committed {
             target: Target::At(first),
@@ -1996,9 +1996,8 @@ mod tests {
     fn a_target_entry_reads_back() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("acme.harvest.db");
-        let at = DateTime::parse_from_rfc3339("2026-11-12T05:00:00.250Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let at = ("2026-11-12T05:00:00.250Z").parse::<Timestamp>()
+            .unwrap();
         for written in [
             Entry::Committed {
                 target: Target::At(at),

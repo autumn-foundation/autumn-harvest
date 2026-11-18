@@ -28,7 +28,7 @@
 //! only the inspected shards.
 
 use autumn_harvest::{ScheduleRunRow, ScheduleRunStateCount};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -60,11 +60,11 @@ pub struct ScheduleRunEntry {
     /// Execution id of the run.
     pub execution_id: Uuid,
     /// Logical schedule slot the run fired for (`null` for a `manual_trigger`).
-    pub nominal_fire_time: Option<DateTime<Utc>>,
+    pub nominal_fire_time: Option<Timestamp>,
     /// When the run started.
-    pub started_at: DateTime<Utc>,
+    pub started_at: Timestamp,
     /// When the run reached a terminal state, or `null` while active.
-    pub completed_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<Timestamp>,
     /// Current execution state.
     pub state: String,
     /// At-a-glance collapse of `state` into an outcome bucket (issue #762):
@@ -198,7 +198,7 @@ pub struct ScheduleRunsResponse {
     /// The schedule's next expected fire time (issue #762), echoed so a caller gets
     /// "last N actual + next expected" without a second call. `null` when the
     /// schedule has no upcoming fire (paused, exhausted, or manual-only).
-    pub next_run_at: Option<DateTime<Utc>>,
+    pub next_run_at: Option<Timestamp>,
     /// The schedule's runs, newest-slot-first, capped at `limit`.
     pub runs: Vec<ScheduleRunEntry>,
     /// Per-state cadence summary over the window (scheduled-origin only).
@@ -238,12 +238,12 @@ pub struct ScheduleRunsParams {
     /// Origin filter (empty = all origins).
     pub origins: Vec<String>,
     /// Inclusive lower bound on `started_at`.
-    pub since: Option<DateTime<Utc>>,
+    pub since: Option<Timestamp>,
     /// Exclusive upper bound on `started_at`.
-    pub until: Option<DateTime<Utc>>,
+    pub until: Option<Timestamp>,
     /// Keyset cursor `(sort_key, execution_id)`, where `sort_key` is the logical-slot
     /// ordering key (`COALESCE(scheduled_for, started_at)`, issue #762).
-    pub cursor: Option<(DateTime<Utc>, Uuid)>,
+    pub cursor: Option<(Timestamp, Uuid)>,
     /// Applied row cap.
     pub limit: i64,
 }
@@ -266,7 +266,7 @@ impl ScheduleRunsParams {
     /// `since`, `until`, or `cursor` — the handler maps this to `400`, never `500`.
     pub fn from_query_pairs(
         pairs: &[(String, String)],
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<Self, String> {
         let mut out = Self {
             limit: DEFAULT_LIMIT,
@@ -304,7 +304,7 @@ impl ScheduleRunsParams {
 /// (`COALESCE(scheduled_for, started_at)`, issue #762) so pagination stays
 /// consistent with the newest-slot-first ordering.
 #[must_use]
-pub fn encode_cursor(sort_key: DateTime<Utc>, execution_id: Uuid) -> String {
+pub fn encode_cursor(sort_key: Timestamp, execution_id: Uuid) -> String {
     crate::api::encode_workflow_list_cursor_raw(&sort_key, &execution_id)
 }
 
@@ -313,13 +313,12 @@ pub fn encode_cursor(sort_key: DateTime<Utc>, execution_id: Uuid) -> String {
 /// # Errors
 ///
 /// Returns `Err` with a human-readable reason when the token is malformed.
-pub fn parse_cursor(raw: &str) -> Result<(DateTime<Utc>, Uuid), String> {
+pub fn parse_cursor(raw: &str) -> Result<(Timestamp, Uuid), String> {
     let (ts_part, id_part) = raw
         .split_once('|')
         .ok_or_else(|| "invalid cursor; expected '<started_at>|<execution_id>'".to_string())?;
-    let started_at = DateTime::parse_from_rfc3339(ts_part)
-        .map_err(|_| "invalid cursor: bad timestamp".to_string())?
-        .with_timezone(&Utc);
+    let started_at = ts_part.parse::<Timestamp>()
+        .map_err(|_| "invalid cursor: bad timestamp".to_string())?;
     let execution_id = id_part
         .parse::<Uuid>()
         .map_err(|_| "invalid cursor: bad execution id".to_string())?;
@@ -340,7 +339,7 @@ pub fn parse_cursor(raw: &str) -> Result<(DateTime<Utc>, Uuid), String> {
 #[allow(clippy::needless_pass_by_value)]
 pub fn build_runs_response(
     schedule_id: Uuid,
-    next_run_at: Option<DateTime<Utc>>,
+    next_run_at: Option<Timestamp>,
     limit: i64,
     observations: Vec<ShardRunsObservation>,
 ) -> ScheduleRunsResponse {
@@ -416,10 +415,10 @@ pub fn build_runs_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone as _;
+    use jiff::Timestamp;
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(secs, 0).unwrap()
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::new(secs, 0).unwrap()
     }
 
     fn uid(n: u128) -> Uuid {
@@ -507,7 +506,7 @@ mod tests {
             ],
         );
 
-        let order: Vec<i64> = resp.runs.iter().map(|r| r.started_at.timestamp()).collect();
+        let order: Vec<i64> = resp.runs.iter().map(|r| r.started_at.as_second()).collect();
         assert_eq!(order, vec![300, 200, 100], "newest-first across shards");
         assert_eq!(resp.status, RunsReportStatus::Complete);
         assert!(resp.next_cursor.is_none());
@@ -690,7 +689,7 @@ mod tests {
     fn params_relative_since_duration() {
         let now = at(1_000_000);
         let p = ScheduleRunsParams::from_query_pairs(&pairs(&[("since", "1h")]), now).unwrap();
-        assert_eq!(p.since, Some(now - chrono::Duration::hours(1)));
+        assert_eq!(p.since, Some(now - jiff::SignedDuration::from_hours(1)));
     }
 
     #[test]
@@ -829,7 +828,7 @@ mod tests {
                 ),
             ],
         );
-        let slots: Vec<i64> = resp.runs.iter().map(|r| r.started_at.timestamp()).collect();
+        let slots: Vec<i64> = resp.runs.iter().map(|r| r.started_at.as_second()).collect();
         // 400 (s0) > 300 (s1) > 200 (s0) > 100 (s1 manual).
         assert_eq!(slots, vec![400, 300, 200, 100]);
     }

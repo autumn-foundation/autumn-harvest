@@ -58,9 +58,10 @@
 
 #[cfg(feature = "db")]
 use crate::error::HarvestError;
+use jiff_diesel::ToDiesel;
 use crate::error::HarvestResult;
 #[cfg(feature = "db")]
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 #[cfg(feature = "db")]
 use diesel_async::AsyncPgConnection;
 
@@ -653,7 +654,7 @@ pub struct PausedActivity {
     /// Operator identity that applied the pause.
     pub paused_by: String,
     /// When the pause was applied.
-    pub paused_at: chrono::DateTime<chrono::Utc>,
+    pub paused_at: jiff::Timestamp,
     /// `None` = fleet-wide (the default); otherwise the shard the operator
     /// scoped the pause to.
     pub scope_shard_id: Option<i32>,
@@ -677,7 +678,7 @@ pub struct ActivityPauseOutcome {
     /// The effective operator identity (the original one on a re-pause).
     pub paused_by: String,
     /// The effective pause instant (the original one on a re-pause).
-    pub paused_at: chrono::DateTime<chrono::Utc>,
+    pub paused_at: jiff::Timestamp,
     /// `None` = fleet-wide (the default); otherwise the shard the operator
     /// scoped the pause to. The effective value (the original on a re-pause).
     pub scope_shard_id: Option<i32>,
@@ -725,7 +726,8 @@ struct PausedActivityRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     paused_by: String,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    paused_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    paused_at: Timestamp,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
     scope_shard_id: Option<i32>,
     #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -744,7 +746,8 @@ struct UpsertedPauseRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     paused_by: String,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    paused_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    paused_at: Timestamp,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
     scope_shard_id: Option<i32>,
     /// `xmax = 0` on a freshly inserted tuple; non-zero when `DO UPDATE` fired
@@ -933,7 +936,8 @@ struct DeletedPauseRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     paused_by: String,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    paused_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    paused_at: Timestamp,
 }
 
 /// One id returned by [`resume_shift_scheduled_at_query`], so the second pass
@@ -1024,7 +1028,7 @@ pub async fn resume_activity(
             let shifted: Vec<ShiftedTaskIdRow> =
                 diesel::sql_query(resume_shift_scheduled_at_query())
                     .bind::<diesel::sql_types::Text, _>(&name)
-                    .bind::<diesel::sql_types::Timestamptz, _>(pause.paused_at)
+                    .bind::<diesel::sql_types::Timestamptz, _>(pause.paused_at.to_diesel())
                     .load(conn)
                     .await
                     .map_err(crate::error::database_error)?;
@@ -1076,13 +1080,13 @@ pub async fn resume_activity(
             // this narrows but cannot close.
             let late: usize = diesel::sql_query(resume_shift_late_arrivals_query())
                 .bind::<diesel::sql_types::Text, _>(&name)
-                .bind::<diesel::sql_types::Timestamptz, _>(pause.paused_at)
+                .bind::<diesel::sql_types::Timestamptz, _>(pause.paused_at.to_diesel())
                 .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
                 .execute(conn)
                 .await
                 .map_err(crate::error::database_error)?;
 
-            let paused_duration_secs = (Utc::now() - pause.paused_at).num_seconds().max(0);
+            let paused_duration_secs = (Timestamp::now() - pause.paused_at).as_secs().max(0);
             Ok(ActivityResumeOutcome {
                 activity_name: name,
                 newly_resumed: true,

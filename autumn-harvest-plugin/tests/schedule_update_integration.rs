@@ -7,6 +7,7 @@
 //! immediate list visibility.
 
 use std::sync::Arc;
+use jiff_diesel::ToDiesel;
 use std::time::Duration;
 
 use autumn_harvest::builder::WorkerConfig;
@@ -26,7 +27,7 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::Utc;
+use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
@@ -256,7 +257,7 @@ async fn arm_slot(url: &str, id: Uuid, secs_ago: i64) {
     use harvest_schedules::dsl;
     let mut conn = connect(url).await;
     diesel::update(harvest_schedules::table.find(id))
-        .set(dsl::next_run_at.eq(Utc::now() - chrono::Duration::seconds(secs_ago)))
+        .set(dsl::next_run_at.eq((Timestamp::now() - jiff::SignedDuration::from_secs(secs_ago)).to_diesel()))
         .execute(&mut conn)
         .await
         .expect("arm slot");
@@ -391,7 +392,7 @@ async fn patch_preserves_identity_and_carryover_across_the_edit() {
     );
 
     // ── Run 2 under the post-edit spec ───────────────────────────────────────
-    let t_before_tick2 = Utc::now();
+    let t_before_tick2 = Timestamp::now();
     arm_slot(&url, id, 200).await;
     tick(&pool, &registry).await;
     let completed_ids = wait_for_completed(&url, wf_name, 2).await;
@@ -434,12 +435,12 @@ async fn patch_preserves_identity_and_carryover_across_the_edit() {
         .next_run_at
         .expect("next_run_at must be advanced after the fire");
     assert!(
-        advanced >= t_before_tick2 + chrono::Duration::seconds(120),
+        advanced >= t_before_tick2 + jiff::SignedDuration::from_secs(120),
         "the advanced next_run_at must be driven by the NEW 120s interval \
          (got {advanced}, tick started {t_before_tick2})"
     );
     assert!(
-        advanced <= Utc::now() + chrono::Duration::seconds(121),
+        advanced <= Timestamp::now() + jiff::SignedDuration::from_secs(121),
         "the advanced next_run_at must be ~tick_now + 120s, got {advanced}"
     );
 
@@ -633,7 +634,7 @@ async fn live_fire_claim_returns_409_until_expired() {
     diesel::update(harvest_schedules::table.find(id))
         .set((
             dsl::fire_claim_token.eq(Some(Uuid::new_v4())),
-            dsl::fire_claimed_until.eq(Some(Utc::now() + chrono::Duration::seconds(25))),
+            dsl::fire_claimed_until.eq(Some(Timestamp::now() + jiff::SignedDuration::from_secs(25)).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -653,7 +654,7 @@ async fn live_fire_claim_returns_409_until_expired() {
 
     // Expire the claim — the edit proceeds.
     diesel::update(harvest_schedules::table.find(id))
-        .set(dsl::fire_claimed_until.eq(Some(Utc::now() - chrono::Duration::seconds(5))))
+        .set(dsl::fire_claimed_until.eq(Some(Timestamp::now() - jiff::SignedDuration::from_secs(5)).to_diesel()))
         .execute(&mut conn)
         .await
         .expect("expire claim");

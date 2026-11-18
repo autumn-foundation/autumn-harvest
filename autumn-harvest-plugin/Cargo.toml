@@ -114,9 +114,11 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+jiff = { workspace = true }
 chrono-tz = { workspace = true }
 tracing = { workspace = true }
 diesel = { workspace = true }
+jiff-diesel = { workspace = true }
 diesel-async = { workspace = true }
 diesel_migrations = { workspace = true }
 deadpool = { workspace = true }

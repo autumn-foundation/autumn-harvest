@@ -371,7 +371,7 @@ async fn run(f: &mut Fixture, k: u32, mode: RefineMode) -> RefineReport {
         if !matches!(state, RunState::WaitingTimer) {
             break;
         }
-        let at = autumn_harvest::chrono::Utc::now() + autumn_harvest::chrono::Duration::hours(hour);
+        let at = autumn_harvest::jiff::Timestamp::now() + autumn_harvest::jiff::SignedDuration::from_hours(hour);
         state = f.rt.run_until_blocked_as_of(refine, at).await.unwrap();
     }
     match state {

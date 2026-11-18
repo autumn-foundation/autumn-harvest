@@ -16,6 +16,7 @@
 //! - child fails before the deadline → parent gets a typed `Err` (R13).
 
 use std::pin::Pin;
+use jiff_diesel::ToDiesel;
 use std::sync::Arc;
 
 use autumn_harvest::WorkflowContext;
@@ -533,7 +534,7 @@ async fn seed_overdue_child_race(
     child_exec_id: ExecutionId,
 ) {
     let started_prefix = vec![
-        WorkflowEvent::workflow_started(serde_json::json!({"id": 1}), chrono::Utc::now()),
+        WorkflowEvent::workflow_started(serde_json::json!({"id": 1}), jiff::Timestamp::now()),
         WorkflowEvent::ChildWorkflowStarted {
             child_id: child_exec_id,
             workflow_name: "timeout_child".into(),
@@ -551,7 +552,7 @@ async fn seed_overdue_child_race(
     let overdue = autumn_harvest::models::NewHarvestTimer {
         workflow_exec_id: parent_exec_id.as_uuid(),
         timer_id: RACE_TIMER_ID,
-        fires_at: chrono::Utc::now() - chrono::Duration::seconds(2),
+        fires_at: jiff::Timestamp::now() - jiff::SignedDuration::from_secs(2),
     };
     diesel::insert_into(autumn_harvest::schema::harvest_timers::table)
         .values(&overdue)
@@ -580,7 +581,7 @@ async fn setup_parent_racing_overdue_child(
 /// deadline (in the past), so the timeout scanner picks it up.
 async fn setup_parent_racing_overdue_real_child(
     conn: &mut AsyncPgConnection,
-    child_deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    child_deadline_at: Option<jiff::Timestamp>,
 ) -> (ExecutionId, ExecutionId) {
     use autumn_harvest::schema::harvest_workflow_executions::dsl;
     use diesel::{ExpressionMethods, QueryDsl};
@@ -597,7 +598,7 @@ async fn setup_parent_racing_overdue_real_child(
     diesel::update(dsl::harvest_workflow_executions.find(child_exec_id.as_uuid()))
         .set((
             dsl::parent_id.eq(Some(parent_exec_id.as_uuid())),
-            dsl::deadline_at.eq(child_deadline_at),
+            dsl::deadline_at.eq(child_deadline_at.to_diesel()),
         ))
         .execute(conn)
         .await
@@ -847,7 +848,7 @@ async fn over_deadline_child_execution_timeout_orders_deadline_first_and_resolve
         .expect("connect");
 
     // Child's own execution deadline is 5s in the past so the scanner selects it.
-    let child_deadline = chrono::Utc::now() - chrono::Duration::seconds(5);
+    let child_deadline = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(5);
     let (parent_exec_id, _child_exec_id) =
         setup_parent_racing_overdue_real_child(&mut conn, Some(child_deadline)).await;
 
@@ -892,7 +893,7 @@ async fn materialize_due_child_timeout_deadlines_fires_only_due_child_timeout_ti
         parent_exec_id,
         &[WorkflowEvent::workflow_started(
             serde_json::json!({}),
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         )],
         0,
     )
@@ -906,17 +907,17 @@ async fn materialize_due_child_timeout_deadlines_fires_only_due_child_timeout_ti
         autumn_harvest::models::NewHarvestTimer {
             workflow_exec_id: parent_exec_id.as_uuid(),
             timer_id: due_child,
-            fires_at: chrono::Utc::now() - chrono::Duration::seconds(2),
+            fires_at: jiff::Timestamp::now() - jiff::SignedDuration::from_secs(2),
         },
         autumn_harvest::models::NewHarvestTimer {
             workflow_exec_id: parent_exec_id.as_uuid(),
             timer_id: future_child,
-            fires_at: chrono::Utc::now() + chrono::Duration::seconds(300),
+            fires_at: jiff::Timestamp::now() + jiff::SignedDuration::from_secs(300),
         },
         autumn_harvest::models::NewHarvestTimer {
             workflow_exec_id: parent_exec_id.as_uuid(),
             timer_id: due_plain,
-            fires_at: chrono::Utc::now() - chrono::Duration::seconds(2),
+            fires_at: jiff::Timestamp::now() - jiff::SignedDuration::from_secs(2),
         },
     ];
     diesel::insert_into(dsl::harvest_timers)
@@ -1005,7 +1006,7 @@ async fn materialize_due_child_timeout_deadlines_is_idempotent_no_duplicate_time
         parent_exec_id,
         &[WorkflowEvent::workflow_started(
             serde_json::json!({}),
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         )],
         0,
     )
@@ -1017,7 +1018,7 @@ async fn materialize_due_child_timeout_deadlines_is_idempotent_no_duplicate_time
         .values(&autumn_harvest::models::NewHarvestTimer {
             workflow_exec_id: parent_exec_id.as_uuid(),
             timer_id: due_child,
-            fires_at: chrono::Utc::now() - chrono::Duration::seconds(2),
+            fires_at: jiff::Timestamp::now() - jiff::SignedDuration::from_secs(2),
         })
         .execute(&mut conn)
         .await
@@ -1232,7 +1233,7 @@ async fn child_timeout_suspension_append_uses_single_event_discipline_not_stale_
         parent_exec_id,
         &[WorkflowEvent::workflow_started(
             serde_json::json!({}),
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         )],
         0,
     )
@@ -1372,7 +1373,7 @@ async fn transient_event_id_conflict_requeues_parent_instead_of_failing() {
         exec_id,
         &[WorkflowEvent::workflow_started(
             serde_json::json!({}),
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         )],
         0,
     )
@@ -1385,7 +1386,7 @@ async fn transient_event_id_conflict_requeues_parent_instead_of_failing() {
         .values(&autumn_harvest::models::NewHarvestTimer {
             workflow_exec_id: exec_id.as_uuid(),
             timer_id: due_timer,
-            fires_at: chrono::Utc::now() - chrono::Duration::seconds(2),
+            fires_at: jiff::Timestamp::now() - jiff::SignedDuration::from_secs(2),
         })
         .execute(&mut conn)
         .await
@@ -1396,7 +1397,7 @@ async fn transient_event_id_conflict_requeues_parent_instead_of_failing() {
     let mut params =
         queue::EnqueueParams::new("default", queue::TaskType::Workflow, serde_json::json!({}));
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+    params.scheduled_at = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1);
     queue::enqueue(&mut conn, &params).await.expect("enqueue");
     let task = queue::claim_task(
         &mut conn,
@@ -1494,7 +1495,7 @@ async fn transient_event_id_conflict_requeues_parent_instead_of_failing() {
     let (task_state, task_worker, task_scheduled): (
         String,
         Option<String>,
-        chrono::DateTime<chrono::Utc>,
+        jiff::Timestamp,
     ) = task_dsl::harvest_task_queue
         .find(task.id)
         .select((task_dsl::state, task_dsl::worker_id, task_dsl::scheduled_at))
@@ -1507,7 +1508,7 @@ async fn transient_event_id_conflict_requeues_parent_instead_of_failing() {
     );
     assert!(task_worker.is_none(), "the claim was released on re-drive");
     assert!(
-        task_scheduled <= chrono::Utc::now(),
+        task_scheduled <= jiff::Timestamp::now(),
         "the re-pended task is immediately claimable (scheduled_at in the past)"
     );
 
@@ -1640,7 +1641,7 @@ async fn materializer_locks_execution_row_before_timers_no_abba() {
         parent_exec_id,
         &[WorkflowEvent::workflow_started(
             serde_json::json!({}),
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         )],
         0,
     )
@@ -1651,7 +1652,7 @@ async fn materializer_locks_execution_row_before_timers_no_abba() {
         .values(&autumn_harvest::models::NewHarvestTimer {
             workflow_exec_id: parent_exec_id.as_uuid(),
             timer_id: timer_id_str,
-            fires_at: chrono::Utc::now() - chrono::Duration::seconds(2),
+            fires_at: jiff::Timestamp::now() - jiff::SignedDuration::from_secs(2),
         })
         .execute(&mut conn)
         .await

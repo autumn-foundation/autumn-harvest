@@ -53,7 +53,7 @@
 use autumn_harvest::store::{AwaitMode, LineageChildRow};
 use autumn_harvest::types::{ExecutionId, ParentClosePolicy};
 use autumn_harvest_plugin::lineage::{LineageLimits, LineageWalk, lineage_root_node};
-use chrono::{DateTime, TimeZone, Utc};
+use jiff::Timestamp;
 
 /// Reads `key` as a `usize`. Only an *absent* variable gives `default`. A
 /// malformed value panics.
@@ -69,8 +69,8 @@ fn env_usize(key: &str, default: usize) -> usize {
     }
 }
 
-fn at(offset_secs: i64) -> DateTime<Utc> {
-    Utc.timestamp_opt(1_800_000_000 + offset_secs, 0).unwrap()
+fn at(offset_secs: i64) -> Timestamp {
+    Timestamp::new(1_800_000_000 + offset_secs, 0).unwrap()
 }
 
 const WORKFLOW_NAMES: [&str; 4] = [
@@ -110,7 +110,7 @@ fn child_row(i: usize, parent: uuid::Uuid, shard_id: i32) -> LineageChildRow {
         state: if closed { "COMPLETED" } else { "RUNNING" }.to_string(),
         started_at: at(i64::try_from(i).unwrap_or(i64::MAX)),
         completed_at: if closed {
-            Some(at(i64::try_from(i).unwrap_or(i64::MAX)) + chrono::Duration::minutes(5))
+            Some(at(i64::try_from(i).unwrap_or(i64::MAX)) + jiff::SignedDuration::from_mins(5))
         } else {
             None
         },

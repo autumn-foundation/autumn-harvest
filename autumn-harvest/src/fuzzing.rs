@@ -740,7 +740,7 @@ async fn run_once(case: &ReplayCase, history: &[WorkflowEvent]) -> (Verdict, Str
     let mut replayer = WorkflowReplayer::new();
     // A deadline probe reads the clock only when the run has a deadline.
     if read.iter().any(is_deadline_probe) {
-        replayer = replayer.with_execution_timeout(chrono::Duration::hours(1));
+        replayer = replayer.with_execution_timeout(jiff::SignedDuration::from_hours(1));
     }
     let report = replayer
         .register_fn(WORKFLOW, program_workflow)

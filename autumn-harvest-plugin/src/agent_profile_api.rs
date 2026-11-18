@@ -61,7 +61,7 @@ pub struct OverlayVersionSummary {
     /// Who or what wrote the version.
     pub provenance: Provenance,
     /// The time of the put.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 /// The body of `GET /agents/{kind}/profile/versions`.
@@ -87,7 +87,7 @@ pub struct OverlayVersionView {
     /// Who or what wrote the version.
     pub provenance: Provenance,
     /// The time of the put.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// The `sha256:<hex>` digest of the overlay.
     pub digest: String,
     /// The overlay.
@@ -612,7 +612,7 @@ pub struct PolicyChangeView {
     /// The operator id.
     pub actor: String,
     /// The time of the change.
-    pub changed_at: DateTime<Utc>,
+    pub changed_at: Timestamp,
     /// The policy before the change, or `null` for every default.
     pub old: Option<RefinePolicy>,
     /// The policy after the change, or `null` for every default.

@@ -229,7 +229,7 @@ mod replay_tests {
     use autumn_harvest::context::WorkflowContext;
     use autumn_harvest::testing::{HistorySnapshot, ReplayStatus, WorkflowReplayer};
     use autumn_harvest::types::ExecutionId;
-    use chrono::Utc;
+    use jiff::Timestamp;
     use serde_json::Value;
 
     fn failing_workflow<'a>(
@@ -257,7 +257,7 @@ mod replay_tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,

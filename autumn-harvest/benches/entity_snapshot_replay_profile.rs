@@ -315,7 +315,7 @@ fn runtime() -> tokio::runtime::Runtime {
 
 /// Record `n` ops of `shape` in `layout` with `WorkflowTestEnv`.
 fn record(rt: &tokio::runtime::Runtime, shape: Shape, layout: Layout, n: usize) -> Recording {
-    let anchor = chrono::DateTime::from_timestamp(1_790_000_000, 0).expect("a fixed time");
+    let anchor = jiff::Timestamp::from_second(1_790_000_000).ok().expect("a fixed time");
     let env = WorkflowTestEnv::new().with_frozen_anchor(anchor);
     let env = match layout {
         Layout::Interleaved => env,

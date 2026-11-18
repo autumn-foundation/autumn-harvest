@@ -55,7 +55,7 @@ use std::time::{Duration, Instant};
 // model-check the breaker's concurrent state machine. See `crate::loom_sync`.
 use crate::loom_sync::{Mutex, MutexGuard};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -121,7 +121,7 @@ pub struct ClaimKey {
     pub attempt: i32,
     /// The claim's `started_at` epoch. A deferral lowers `attempt`, so the
     /// epoch keeps two claims of one row apart.
-    pub started_at: Option<DateTime<Utc>>,
+    pub started_at: Option<Timestamp>,
 }
 
 /// A claim that this process dispatched and that has not reported yet, or
@@ -179,7 +179,7 @@ pub enum DispatchDecision {
     /// Short-circuit the attempt: the breaker is open.
     ShortCircuit {
         /// Wall-clock instant at which the breaker last tripped, if known.
-        opened_at: Option<DateTime<Utc>>,
+        opened_at: Option<Timestamp>,
         /// How long until a half-open probe will be admitted. `None` when the
         /// breaker is **operator-forced open**. No timer then admits a probe,
         /// so no retry-after is meaningful. Recovery requires an explicit
@@ -227,7 +227,7 @@ pub struct CircuitSnapshot {
     /// Whether an operator has pinned the breaker open via the management API.
     pub forced_open: bool,
     /// Wall-clock timestamp of the most recent trip, if the breaker has tripped.
-    pub last_trip: Option<DateTime<Utc>>,
+    pub last_trip: Option<Timestamp>,
     /// Failures currently counted inside the rolling window (closed-phase signal).
     pub rolling_failure_count: u32,
     /// Seconds until a half-open probe is admitted (only set while open and not
@@ -252,7 +252,7 @@ struct BreakerState {
     /// Monotonic instant of the last trip (drives cooldown math).
     opened_at: Option<Instant>,
     /// Wall-clock instant of the last trip (for the observable snapshot).
-    opened_at_wall: Option<DateTime<Utc>>,
+    opened_at_wall: Option<Timestamp>,
     /// `true` while a half-open probe is in flight so concurrent dispatches
     /// short-circuit and only one probe runs.
     probe_in_flight: bool,
@@ -306,7 +306,7 @@ impl BreakerState {
     fn trip(&mut self, now: Instant) {
         self.phase = CircuitPhase::Open;
         self.opened_at = Some(now);
-        self.opened_at_wall = Some(Utc::now());
+        self.opened_at_wall = Some(Timestamp::now());
         self.failures.clear();
         self.probe_in_flight = false;
         self.bump_generation();
@@ -867,7 +867,7 @@ impl CircuitBreakerRegistry {
         st.forced_open = true;
         st.phase = CircuitPhase::Open;
         st.opened_at = Some(now);
-        st.opened_at_wall = Some(Utc::now());
+        st.opened_at_wall = Some(Timestamp::now());
         st.probe_in_flight = false;
         // Fence any attempt dispatched before this manual pin.
         st.bump_generation();

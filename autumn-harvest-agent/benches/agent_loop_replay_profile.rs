@@ -213,7 +213,7 @@ fn runtime() -> tokio::runtime::Runtime {
 /// Record one run of `n` tool rounds with `WorkflowTestEnv`.
 fn record(rt: &tokio::runtime::Runtime, shape: Shape, n: usize, result_bytes: usize) -> Recording {
     let rounds = u32::try_from(n).expect("the round count fits in u32");
-    let anchor = chrono::DateTime::from_timestamp(1_790_000_000, 0).expect("a fixed time");
+    let anchor = jiff::Timestamp::from_second(1_790_000_000).ok().expect("a fixed time");
     let env = WorkflowTestEnv::new()
         .with_frozen_anchor(anchor)
         .with_workflow_id(WORKFLOW_ID)
@@ -319,7 +319,7 @@ fn span_meta() -> WorkflowExecuteSpanMeta {
         workflow_id: WORKFLOW_ID.to_owned(),
         shard_id: 0,
         queue_name: String::new(),
-        drive_clock: chrono::DateTime::from_timestamp(1_790_000_000, 0),
+        drive_clock: jiff::Timestamp::from_second(1_790_000_000).ok(),
         is_replay: false,
         link_traceparent: None,
         build_id: None,

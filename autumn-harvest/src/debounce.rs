@@ -52,10 +52,11 @@
 //! [`WorkerConfig::default_debounce_max_wait`]: crate::builder::WorkerConfig::default_debounce_max_wait
 
 use std::time::Duration;
+use jiff_diesel::ToDiesel;
 
 #[cfg(feature = "db")]
 use crate::cached_stmt::CachePreparedDsl as _;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 /// Declarative debounce configuration attached to a [`crate::info::WorkflowInfo`].
 ///
@@ -102,21 +103,21 @@ pub fn resolve_debounce_key(expr: &str, input: &serde_json::Value) -> Option<Str
 /// This function is pure and unit-testable without a database.
 #[must_use]
 pub fn compute_fire_deadline(
-    now: DateTime<Utc>,
+    now: Timestamp,
     window: Duration,
-    first_seen: DateTime<Utc>,
+    first_seen: Timestamp,
     max_wait: Duration,
-) -> DateTime<Utc> {
+) -> Timestamp {
     // Clamp absurd/overflowing durations to a large-but-finite value and use
     // checked addition so an extreme `window`/`max_wait` can never panic.
     let window_chrono =
-        chrono::Duration::from_std(window).unwrap_or_else(|_| chrono::Duration::days(365 * 100));
+        jiff::SignedDuration::try_from(window).unwrap_or_else(|_| crate::time::days(365 * 100));
     let max_wait_chrono =
-        chrono::Duration::from_std(max_wait).unwrap_or_else(|_| chrono::Duration::days(365 * 100));
+        jiff::SignedDuration::try_from(max_wait).unwrap_or_else(|_| crate::time::days(365 * 100));
 
-    let trailing_edge = now.checked_add_signed(window_chrono).unwrap_or(now);
+    let trailing_edge = now.checked_add(window_chrono).ok().unwrap_or(now);
     let cap = first_seen
-        .checked_add_signed(max_wait_chrono)
+        .checked_add(max_wait_chrono).ok()
         .unwrap_or(first_seen);
 
     trailing_edge.min(cap)
@@ -219,7 +220,7 @@ pub struct DebounceStartOptions {
     pub schedule_id: Option<uuid::Uuid>,
     /// Logical schedule slot this deferred start fires for (issue #488).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scheduled_for: Option<DateTime<Utc>>,
+    pub scheduled_for: Option<Timestamp>,
     /// Dispatch origin (issue #534): `scheduled`/`backfill`/`manual_trigger`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
@@ -269,7 +270,7 @@ pub struct DebounceAdmitOutcome {
     /// exception (issue #1430).
     pub workflow_id: String,
     /// Current fire deadline after this admission.
-    pub fire_at: DateTime<Utc>,
+    pub fire_at: Timestamp,
     /// Total qualifying requests seen for this key since the record was created.
     pub pending_count: i32,
     /// `true` when this admission created a brand-new pending record.
@@ -284,12 +285,12 @@ pub struct PendingDebounceRecord {
     pub debounce_key: String,
     pub workflow_id: String,
     pub queue_name: String,
-    pub effective_fire_at: DateTime<Utc>,
-    pub max_fire_at: DateTime<Utc>,
+    pub effective_fire_at: Timestamp,
+    pub max_fire_at: Timestamp,
     pub pending_count: i32,
     pub shard_id: i32,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 /// [`admit_debounced_start_with_codecs`], with the identity registry.
@@ -380,7 +381,8 @@ pub async fn admit_debounced_start_with_codecs(
         #[diesel(sql_type = diesel::sql_types::Text)]
         workflow_id: String,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        effective_fire_at: DateTime<Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        effective_fire_at: Timestamp,
         #[diesel(sql_type = diesel::sql_types::Integer)]
         pending_count: i32,
         #[diesel(sql_type = diesel::sql_types::Bool)]
@@ -404,17 +406,17 @@ pub async fn admit_debounced_start_with_codecs(
         return Err(crate::error::HarvestError::EmptyWorkflowId);
     }
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     // Clamp absurd/overflowing durations to a large-but-finite value and use
     // checked addition so an extreme `window`/`max_wait` can never panic.
-    let window_chrono = chrono::Duration::from_std(params.window)
-        .unwrap_or_else(|_| chrono::Duration::days(365 * 100));
-    let max_wait_chrono = chrono::Duration::from_std(params.max_wait)
-        .unwrap_or_else(|_| chrono::Duration::days(365 * 100));
+    let window_chrono = jiff::SignedDuration::try_from(params.window)
+        .unwrap_or_else(|_| crate::time::days(365 * 100));
+    let max_wait_chrono = jiff::SignedDuration::try_from(params.max_wait)
+        .unwrap_or_else(|_| crate::time::days(365 * 100));
 
-    let max_fire_at = now.checked_add_signed(max_wait_chrono).unwrap_or(now);
+    let max_fire_at = now.checked_add(max_wait_chrono).ok().unwrap_or(now);
     let initial_fire_at = now
-        .checked_add_signed(window_chrono)
+        .checked_add(window_chrono).ok()
         .unwrap_or(now)
         .min(max_fire_at);
 
@@ -509,8 +511,8 @@ pub async fn admit_debounced_start_with_codecs(
                 .bind::<diesel::sql_types::Text, _>(queue_name)
                 .bind::<diesel::sql_types::Jsonb, _>(last_input)
                 .bind::<diesel::sql_types::Jsonb, _>(start_options_json)
-                .bind::<diesel::sql_types::Timestamptz, _>(initial_fire_at)
-                .bind::<diesel::sql_types::Timestamptz, _>(max_fire_at)
+                .bind::<diesel::sql_types::Timestamptz, _>(initial_fire_at.to_diesel())
+                .bind::<diesel::sql_types::Timestamptz, _>(max_fire_at.to_diesel())
                 .bind::<diesel::sql_types::Integer, _>(shard_id)
                 .get_result(conn)
                 .await?;
@@ -577,7 +579,8 @@ struct FireDueRow {
     /// a quota (issue #1227, Finding 3). It is fetched here, under the same
     /// `FOR UPDATE` claim, rather than in a second round trip.
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    max_fire_at: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    max_fire_at: Timestamp,
 }
 
 #[cfg(feature = "db")]
@@ -613,7 +616,7 @@ async fn decode_due_rows(
     conn: &mut diesel_async::AsyncPgConnection,
     rows: Vec<FireDueRow>,
     codecs: &crate::payload_codec::PayloadCodecs,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> crate::error::HarvestResult<Vec<FireDueRow>> {
     let mut decodable = Vec::with_capacity(rows.len());
     for mut row in rows {
@@ -791,7 +794,7 @@ async fn fire_due_on_conn(
             Box::pin(
                 conn.transaction::<Vec<FiredDebounce>, crate::error::HarvestError, _>(
                     async |conn| {
-                        let now = Utc::now();
+                        let now = Timestamp::now();
                         let due_sql = "
                 SELECT id, workflow_name, debounce_key, workflow_id, queue_name,
                        last_input, start_options, shard_id, max_fire_at
@@ -803,7 +806,7 @@ async fn fire_due_on_conn(
             ";
 
                         let due_rows: Vec<FireDueRow> = diesel::sql_query(due_sql)
-                            .bind::<diesel::sql_types::Timestamptz, _>(now)
+                            .bind::<diesel::sql_types::Timestamptz, _>(now.to_diesel())
                             .bind::<diesel::sql_types::BigInt, _>(DEBOUNCE_FIRE_BATCH_SIZE)
                             .cache_prepared()
                             .load(conn)
@@ -1027,10 +1030,10 @@ const QUOTA_REDEFER_BACKOFF: Duration = Duration::from_secs(5);
 /// throughout this crate for exactly that shape.
 #[cfg_attr(not(feature = "db"), allow(dead_code))]
 fn redefer_target(
-    now: DateTime<Utc>,
-    max_fire_at: DateTime<Utc>,
-    proposed: DateTime<Utc>,
-) -> DateTime<Utc> {
+    now: Timestamp,
+    max_fire_at: Timestamp,
+    proposed: Timestamp,
+) -> Timestamp {
     if max_fire_at < now {
         proposed
     } else {
@@ -1047,12 +1050,12 @@ fn redefer_target(
 async fn redefer_debounce_row(
     conn: &mut diesel_async::AsyncPgConnection,
     row_id: uuid::Uuid,
-    new_effective_fire_at: DateTime<Utc>,
+    new_effective_fire_at: Timestamp,
 ) -> crate::error::HarvestResult<()> {
     use diesel_async::RunQueryDsl;
     diesel::sql_query("UPDATE harvest_debounce SET effective_fire_at = $2 WHERE id = $1")
         .bind::<diesel::sql_types::Uuid, _>(row_id)
-        .bind::<diesel::sql_types::Timestamptz, _>(new_effective_fire_at)
+        .bind::<diesel::sql_types::Timestamptz, _>(new_effective_fire_at.to_diesel())
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -1236,7 +1239,7 @@ async fn fire_claimed_debounce_row(
             limit,
             current,
         }) => {
-            let now = Utc::now();
+            let now = Timestamp::now();
             let new_effective_fire_at =
                 redefer_target(now, max_fire_at, now + QUOTA_REDEFER_BACKOFF);
             redefer_debounce_row(conn, row_id, new_effective_fire_at).await?;
@@ -1287,14 +1290,14 @@ pub(crate) fn parse_reuse_policy(s: &str) -> Option<crate::types::WorkflowIdReus
 #[cfg(feature = "db")]
 pub(crate) struct DeferredAdmissionFields {
     pub reuse_policy: crate::types::WorkflowIdReusePolicy,
-    pub execution_timeout: Option<chrono::Duration>,
-    pub sla: Option<chrono::Duration>,
-    pub max_execution_timeout_ceiling: Option<chrono::Duration>,
+    pub execution_timeout: Option<jiff::SignedDuration>,
+    pub sla: Option<jiff::SignedDuration>,
+    pub max_execution_timeout_ceiling: Option<jiff::SignedDuration>,
     /// Chain-scoped lifetime cap captured at admission (issue #617), so a
     /// deferred start of a `#[workflow(chain_execution_timeout = ...)]`
     /// workflow does not silently drop the declared cap.
-    pub chain_execution_timeout: Option<chrono::Duration>,
-    pub max_workflow_chain_timeout_ceiling: Option<chrono::Duration>,
+    pub chain_execution_timeout: Option<jiff::SignedDuration>,
+    pub max_workflow_chain_timeout_ceiling: Option<jiff::SignedDuration>,
     pub priority: crate::types::Priority,
 }
 
@@ -1355,17 +1358,21 @@ pub async fn list_pending_debounce(
         #[diesel(sql_type = diesel::sql_types::Text)]
         queue_name: String,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        effective_fire_at: DateTime<Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        effective_fire_at: Timestamp,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        max_fire_at: DateTime<Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        max_fire_at: Timestamp,
         #[diesel(sql_type = diesel::sql_types::Integer)]
         pending_count: i32,
         #[diesel(sql_type = diesel::sql_types::Integer)]
         shard_id: i32,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        created_at: DateTime<Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        created_at: Timestamp,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        updated_at: DateTime<Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        updated_at: Timestamp,
     }
 
     let rows: Vec<ListRow> = diesel::sql_query(
@@ -1404,7 +1411,7 @@ pub async fn list_pending_debounce(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone as _;
+    use jiff::Timestamp;
 
     #[cfg(feature = "db")]
     #[test]
@@ -1419,14 +1426,14 @@ mod tests {
             last_input: serde_json::json!({ "tenant_id": "t1" }),
             start_options: serde_json::json!({ "tenant_id": "wrong" }),
             shard_id: 0,
-            max_fire_at: Utc::now(),
+            max_fire_at: Timestamp::now(),
         };
         assert_eq!(row.workflow_name(), "wf_a");
         assert_eq!(row.quota_input()["tenant_id"], "t1");
     }
 
-    fn ts(year: i32, month: u32, day: u32, h: u32, m: u32, s: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(year, month, day, h, m, s).unwrap()
+    fn ts(year: i32, month: u32, day: u32, h: u32, m: u32, s: u32) -> Timestamp {
+        crate::time::utc_ymd_hms(year, month, day, h, m, s).unwrap()
     }
 
     // ── DebouncePolicy construction ──────────────────────────────────────────
@@ -1521,12 +1528,12 @@ mod tests {
 
         // First request: deadline = t0 + 30s
         let d1 = compute_fire_deadline(t0, window, first_seen, max_wait);
-        assert_eq!(d1, t0 + chrono::Duration::seconds(30));
+        assert_eq!(d1, t0 + jiff::SignedDuration::from_secs(30));
 
         // Second request arrives 10s later: deadline = (t0+10) + 30s = t0+40s
-        let t1 = t0 + chrono::Duration::seconds(10);
+        let t1 = t0 + jiff::SignedDuration::from_secs(10);
         let d2 = compute_fire_deadline(t1, window, first_seen, max_wait);
-        assert_eq!(d2, t0 + chrono::Duration::seconds(40));
+        assert_eq!(d2, t0 + jiff::SignedDuration::from_secs(40));
 
         // Deadline moved out (trailing edge).
         assert!(d2 > d1);
@@ -1540,9 +1547,9 @@ mod tests {
 
         // Request arrives 40s after first_seen: trailing edge = now+30s = t0+70s,
         // but cap = t0+60s → deadline is clamped to t0+60s.
-        let t1 = t0 + chrono::Duration::seconds(40);
+        let t1 = t0 + jiff::SignedDuration::from_secs(40);
         let deadline = compute_fire_deadline(t1, window, t0, max_wait);
-        let cap = t0 + chrono::Duration::seconds(60);
+        let cap = t0 + jiff::SignedDuration::from_secs(60);
         assert_eq!(deadline, cap, "deadline should be clamped to max_fire_at");
     }
 
@@ -1551,10 +1558,10 @@ mod tests {
         let t0 = ts(2026, 6, 18, 10, 0, 0);
         let window = Duration::from_secs(30);
         let max_wait = Duration::from_secs(60);
-        let cap = t0 + chrono::Duration::seconds(60);
+        let cap = t0 + jiff::SignedDuration::from_secs(60);
 
         for i in 0..20i64 {
-            let now = t0 + chrono::Duration::seconds(i * 5);
+            let now = t0 + jiff::SignedDuration::from_secs(i * 5);
             let deadline = compute_fire_deadline(now, window, t0, max_wait);
             assert!(
                 deadline <= cap,
@@ -1573,12 +1580,12 @@ mod tests {
         let deadline_a = compute_fire_deadline(t0, window, t0, max_wait);
 
         // Key B: last request at t0 + 15s
-        let t1 = t0 + chrono::Duration::seconds(15);
+        let t1 = t0 + jiff::SignedDuration::from_secs(15);
         let deadline_b = compute_fire_deadline(t1, window, t1, max_wait);
 
         assert_ne!(deadline_a, deadline_b);
-        assert_eq!(deadline_a, t0 + chrono::Duration::seconds(30));
-        assert_eq!(deadline_b, t0 + chrono::Duration::seconds(45));
+        assert_eq!(deadline_a, t0 + jiff::SignedDuration::from_secs(30));
+        assert_eq!(deadline_b, t0 + jiff::SignedDuration::from_secs(45));
     }
 
     #[test]
@@ -1594,7 +1601,7 @@ mod tests {
     #[test]
     fn redefer_target_clamps_to_max_fire_at_when_deadline_still_ahead() {
         let now = ts(2026, 6, 18, 10, 0, 0);
-        let max_fire_at = now + chrono::Duration::seconds(3); // deadline in 3s
+        let max_fire_at = now + jiff::SignedDuration::from_secs(3); // deadline in 3s
         let proposed = now + QUOTA_REDEFER_BACKOFF_FOR_TEST; // backoff of 5s overshoots it
         let target = redefer_target(now, max_fire_at, proposed);
         assert_eq!(
@@ -1607,7 +1614,7 @@ mod tests {
     #[test]
     fn redefer_target_does_not_clamp_when_max_fire_at_already_passed() {
         let now = ts(2026, 6, 18, 10, 0, 0);
-        let max_fire_at = now - chrono::Duration::seconds(30); // deadline already blown
+        let max_fire_at = now - jiff::SignedDuration::from_secs(30); // deadline already blown
         let proposed = now + QUOTA_REDEFER_BACKOFF_FOR_TEST;
         let target = redefer_target(now, max_fire_at, proposed);
         assert_eq!(
@@ -1634,7 +1641,7 @@ mod tests {
         assert_eq!(target, now);
     }
 
-    const QUOTA_REDEFER_BACKOFF_FOR_TEST: chrono::Duration = chrono::Duration::seconds(5);
+    const QUOTA_REDEFER_BACKOFF_FOR_TEST: jiff::SignedDuration = jiff::SignedDuration::from_secs(5);
 
     // ── decode_deferred_admission_fields ─────────────────────────────────────
     //
@@ -1679,20 +1686,20 @@ mod tests {
         );
         assert_eq!(
             decoded.execution_timeout,
-            Some(chrono::Duration::seconds(30))
+            Some(jiff::SignedDuration::from_secs(30))
         );
-        assert_eq!(decoded.sla, Some(chrono::Duration::seconds(60)));
+        assert_eq!(decoded.sla, Some(jiff::SignedDuration::from_secs(60)));
         assert_eq!(
             decoded.max_execution_timeout_ceiling,
-            Some(chrono::Duration::seconds(3600))
+            Some(jiff::SignedDuration::from_secs(3600))
         );
         assert_eq!(
             decoded.chain_execution_timeout,
-            Some(chrono::Duration::seconds(7200))
+            Some(jiff::SignedDuration::from_secs(7200))
         );
         assert_eq!(
             decoded.max_workflow_chain_timeout_ceiling,
-            Some(chrono::Duration::seconds(86400))
+            Some(jiff::SignedDuration::from_secs(86400))
         );
         assert_eq!(decoded.priority, crate::types::Priority::High);
     }

@@ -14,7 +14,7 @@ use std::sync::{Mutex, PoisonError};
 use autumn_harvest::agent_policy_log::{
     ACTION_RESET, ACTION_SET, PolicyAuditRow, PolicyChangeRow, PolicyRow, next_policy_revision,
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 
 use crate::error::{SqliteError, SqliteResult};
@@ -185,7 +185,7 @@ fn write_in(
         return Ok(None);
     };
     let old = stored.and_then(|row| row.body);
-    let now = Utc::now().timestamp_millis();
+    let now = Timestamp::now().as_millisecond();
     tx.execute(
         "INSERT INTO harvest_agent_policies
              (kind, policy, body, revision, updated_by, updated_at_ms)
@@ -255,7 +255,7 @@ fn to_revision(stored: i64) -> SqliteResult<u64> {
         .map_err(|_| SqliteError::Unsupported(format!("policy revision {stored} is negative")))
 }
 
-fn from_millis(ms: i64) -> SqliteResult<DateTime<Utc>> {
-    DateTime::from_timestamp_millis(ms)
+fn from_millis(ms: i64) -> SqliteResult<Timestamp> {
+    Timestamp::from_millisecond(ms).ok()
         .ok_or_else(|| SqliteError::Unsupported(format!("policy time {ms} is out of range")))
 }

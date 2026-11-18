@@ -11,7 +11,7 @@ use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest::{WorkflowHandlerFn, WorkflowInfo};
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
-use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::json;
 
 /// Arms a timer and waits for it to fire.
@@ -77,8 +77,8 @@ async fn reuses_cancelled_id(ctx: &WorkflowContext, _n: i64) -> Result<String, S
     Ok("classic fired".to_string())
 }
 
-fn t(secs: i64) -> DateTime<Utc> {
-    Utc.timestamp_opt(1_000_000 + secs, 0).unwrap()
+fn t(secs: i64) -> Timestamp {
+    Timestamp::new(1_000_000 + secs, 0).unwrap()
 }
 
 fn runtime(info: &WorkflowInfo) -> SqliteRuntime {
@@ -226,7 +226,7 @@ async fn an_armed_timer_survives_a_reopen() {
     let mut rt = SqliteRuntime::open(&path).unwrap();
     rt.register_workflow(&info);
     let state = rt
-        .run_until_blocked_as_of(exec, t(0) + ChronoDuration::seconds(10))
+        .run_until_blocked_as_of(exec, t(0) + SignedDuration::from_secs(10))
         .await
         .unwrap();
     assert!(matches!(state, RunState::Completed(_)), "got {state:?}");

@@ -12,7 +12,7 @@ use autumn_harvest::HarvestResult;
 use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::DbPool;
 use autumn_harvest::workers::WorkerRow;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 
 use crate::api::{HarvestApiRuntime, HarvestApiState, PoolConn, acquire_conn};
@@ -159,10 +159,10 @@ pub fn expected_shards_for(
 
 /// Seconds elapsed from `started_at` to `observed_at`, clamped to zero.
 #[must_use]
-pub fn age_secs(observed_at: DateTime<Utc>, started_at: DateTime<Utc>) -> i64 {
+pub fn age_secs(observed_at: Timestamp, started_at: Timestamp) -> i64 {
     observed_at
-        .signed_duration_since(started_at)
-        .num_seconds()
+        .duration_since(started_at)
+        .as_secs()
         .max(0)
 }
 

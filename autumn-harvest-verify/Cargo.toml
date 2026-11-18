@@ -29,6 +29,7 @@ autumn-harvest = { version = "0.10.0", path = "../autumn-harvest", default-featu
 tempfile = "3"
 # The end-to-end structure test runs the core upgrade check (issue #1995).
 chrono = { workspace = true }
+jiff = { workspace = true }
 tokio = { workspace = true }
 
 [[bin]]

@@ -17,7 +17,7 @@ use std::time::Duration;
 use autumn_harvest::policy::{RetryPolicy, Schedule, WorkflowSchedule};
 use autumn_harvest::prelude::*;
 use autumn_harvest_sqlite::SqliteRuntime;
-use chrono::DateTime;
+use jiff::Timestamp;
 use serde_json::json;
 
 /// 2026-01-01T00:00:00Z in epoch milliseconds.
@@ -76,7 +76,7 @@ async fn bounded(ctx: &WorkflowContext, _n: i64) -> Result<(), String> {
 fn runtime_at(path: &std::path::Path, clock: &Arc<AtomicI64>) -> SqliteRuntime {
     let mut rt = SqliteRuntime::open(path).unwrap();
     let clock = clock.clone();
-    rt.set_clock(move || DateTime::from_timestamp_millis(clock.load(Ordering::SeqCst)).unwrap());
+    rt.set_clock(move || Timestamp::from_millisecond(clock.load(Ordering::SeqCst)).ok().unwrap());
     rt.register_workflow(&napper_info());
     rt.register_workflow(&waiter_info());
     rt.register_workflow(&retrier_info());
@@ -151,7 +151,7 @@ async fn a_schedule_gives_its_next_slot() {
     let slot = rt.list_schedules().unwrap()[0]
         .next_run_at
         .expect("a slot")
-        .timestamp_millis();
+        .as_millisecond();
     assert!(slot > T0 && slot <= T0 + MINUTE, "{slot}");
     assert_eq!(rt.next_wake_at().unwrap(), Some(slot));
 }

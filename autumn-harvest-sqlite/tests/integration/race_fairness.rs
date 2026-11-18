@@ -42,11 +42,11 @@ use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest_sqlite::{ActivitySpec, RunState, SqliteRuntime};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::json;
 
-const fn t0() -> DateTime<Utc> {
-    match DateTime::from_timestamp(4_000_000, 0) {
+const fn t0() -> Timestamp {
+    match Timestamp::from_second(4_000_000).ok() {
         Some(t) => t,
         None => unreachable!(),
     }

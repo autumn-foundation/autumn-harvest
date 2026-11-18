@@ -33,6 +33,8 @@
 //! against it, otherwise a testcontainers instance is booted.
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
+use jiff_diesel::ToDiesel;
+use autumn_harvest::time::sql::ToPgInterval;
 use autumn_harvest::table_split::SetExt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -50,7 +52,7 @@ use autumn_harvest::types::{
 };
 use autumn_harvest::worker::{HandlerRegistry, NO_CAPABLE_WORKER_PREFIX};
 use autumn_harvest::{ActivityContext, WorkflowContext, WorkflowInfo};
-use chrono::{Duration as ChronoDuration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use uuid::Uuid;
@@ -515,19 +517,19 @@ async fn successor_resolves_lifecycle_defaults_from_the_new_type() {
 
     // Give the PREDECESSOR row lifecycle values that differ from the target
     // type's declared defaults, plus a chain cap to pin the #617 interaction.
-    let frozen_chain_deadline = Utc::now() + ChronoDuration::hours(6);
+    let frozen_chain_deadline = Timestamp::now() + SignedDuration::from_hours(6);
     diesel::update(harvest_workflow_executions::table.find(predecessor.as_uuid()))
         .set((
-            harvest_workflow_executions::execution_timeout.eq(Some(ChronoDuration::seconds(600))),
-            harvest_workflow_executions::sla.eq(Some(ChronoDuration::seconds(300))),
+            harvest_workflow_executions::execution_timeout.eq(Some(SignedDuration::from_secs(600)).to_pg_interval()),
+            harvest_workflow_executions::sla.eq(Some(SignedDuration::from_secs(300)).to_pg_interval()),
             harvest_workflow_executions::owner.eq(Some("growth-team")),
             harvest_workflow_executions::severity.eq(Some("SEV3")),
             SetExt(
                 harvest_workflow_executions_ext::chain_execution_timeout
-                    .eq(Some(ChronoDuration::days(7))),
+                    .eq(Some(autumn_harvest::time::days(7)).to_pg_interval()),
             ),
             SetExt(
-                harvest_workflow_executions_ext::chain_deadline_at.eq(Some(frozen_chain_deadline)),
+                harvest_workflow_executions_ext::chain_deadline_at.eq(Some(frozen_chain_deadline).to_diesel()),
             ),
         ))
         .execute(&mut conn)
@@ -547,12 +549,12 @@ async fn successor_resolves_lifecycle_defaults_from_the_new_type() {
 
     assert_eq!(
         after.execution_timeout,
-        Some(ChronoDuration::seconds(7_200)),
+        Some(SignedDuration::from_secs(7_200)),
         "execution_timeout must come from the NEW type (#243), not the predecessor's 600s"
     );
     assert_eq!(
         after.sla,
-        Some(ChronoDuration::seconds(1_800)),
+        Some(SignedDuration::from_secs(1_800)),
         "sla must come from the NEW type (#487), not the predecessor's 300s"
     );
     assert_eq!(
@@ -565,7 +567,7 @@ async fn successor_resolves_lifecycle_defaults_from_the_new_type() {
     // Per-run deadline re-anchored from the NEW type's budget.
     let deadline = after.deadline_at.expect("successor deadline_at");
     assert!(
-        deadline > Utc::now() + ChronoDuration::seconds(7_000),
+        deadline > Timestamp::now() + SignedDuration::from_secs(7_000),
         "deadline must re-anchor to now + the new type's 7200s budget, got {deadline}"
     );
 
@@ -573,15 +575,14 @@ async fn successor_resolves_lifecycle_defaults_from_the_new_type() {
     // hatch from the #617 runaway-loop budget.
     assert_eq!(
         after.chain_execution_timeout,
-        Some(ChronoDuration::days(7)),
+        Some(autumn_harvest::time::days(7)),
         "chain cap duration carried verbatim across a type change"
     );
     let chain_deadline = after
         .chain_deadline_at
         .expect("successor chain_deadline_at");
     assert!(
-        (chain_deadline - frozen_chain_deadline)
-            .num_milliseconds()
+        autumn_harvest::time::num_milliseconds((chain_deadline - frozen_chain_deadline))
             .abs()
             < 1_000,
         "chain_deadline_at must be the predecessor's ABSOLUTE value ({frozen_chain_deadline}), \
@@ -610,7 +611,7 @@ async fn successor_without_declared_defaults_does_not_inherit_the_predecessors()
     .await;
     diesel::update(harvest_workflow_executions::table.find(predecessor.as_uuid()))
         .set((
-            harvest_workflow_executions::execution_timeout.eq(Some(ChronoDuration::seconds(600))),
+            harvest_workflow_executions::execution_timeout.eq(Some(SignedDuration::from_secs(600)).to_pg_interval()),
             harvest_workflow_executions::owner.eq(Some("growth-team")),
         ))
         .execute(&mut conn)
@@ -878,7 +879,7 @@ async fn a_cap_rejected_transition_increments_the_schedules_failure_counter() {
             harvest_schedules::dsl::catchup.eq(false),
             harvest_schedules::dsl::max_active_runs.eq(10),
             harvest_schedules::dsl::is_paused.eq(false),
-            harvest_schedules::dsl::next_run_at.eq(Utc::now() - ChronoDuration::seconds(5)),
+            harvest_schedules::dsl::next_run_at.eq((Timestamp::now() - SignedDuration::from_secs(5)).to_diesel()),
             harvest_schedules::dsl::jitter_secs.eq(0_i64),
             harvest_schedules::dsl::overlap_policy.eq("skip"),
             harvest_schedules::dsl::buffered_runs.eq(serde_json::json!([])),
@@ -1182,7 +1183,7 @@ async fn naming_the_current_type_continues_normally_instead_of_self_blocking() {
     )
     .await;
     diesel::update(harvest_workflow_executions::table.find(predecessor.as_uuid()))
-        .set(harvest_workflow_executions::execution_timeout.eq(Some(ChronoDuration::seconds(600))))
+        .set(harvest_workflow_executions::execution_timeout.eq(Some(SignedDuration::from_secs(600)).to_pg_interval()))
         .execute(&mut conn)
         .await
         .expect("stamp a per-start override the type never declared");
@@ -1445,8 +1446,8 @@ async fn scheduled_carryover_and_lineage_survive_a_type_change() {
         "schedule lineage must survive a type change"
     );
     assert_eq!(
-        after.scheduled_for.map(|s| s.timestamp_millis()),
-        Some(slot.timestamp_millis()),
+        after.scheduled_for.map(|s| s.as_millisecond()),
+        Some(slot.as_millisecond()),
         "the logical slot must survive a type change"
     );
 
@@ -1920,7 +1921,7 @@ async fn same_type_continue_as_new_is_unchanged() {
     // verbatim, which is exactly what distinguishes the same-type path.
     diesel::update(harvest_workflow_executions::table.find(predecessor.as_uuid()))
         .set((
-            harvest_workflow_executions::execution_timeout.eq(Some(ChronoDuration::seconds(900))),
+            harvest_workflow_executions::execution_timeout.eq(Some(SignedDuration::from_secs(900)).to_pg_interval()),
             harvest_workflow_executions::owner.eq(Some("growth-team")),
         ))
         .execute(&mut conn)
@@ -1939,7 +1940,7 @@ async fn same_type_continue_as_new_is_unchanged() {
     assert_eq!(after.workflow_name, name);
     assert_eq!(
         after.execution_timeout,
-        Some(ChronoDuration::seconds(900)),
+        Some(SignedDuration::from_secs(900)),
         "the per-start override must still be carried verbatim"
     );
     assert_eq!(after.owner.as_deref(), Some("growth-team"));
@@ -1969,7 +1970,7 @@ fn same_type_loop<'a>(
 /// exact values written.
 struct CarriedColumns {
     schedule_id: Uuid,
-    slot: chrono::DateTime<Utc>,
+    slot: jiff::Timestamp,
     memo: serde_json::Value,
     search_attrs: serde_json::Value,
     headers: serde_json::Value,
@@ -1989,7 +1990,7 @@ async fn stamp_type_agnostic_carryover(
 ) -> CarriedColumns {
     let carried = CarriedColumns {
         schedule_id: Uuid::new_v4(),
-        slot: Utc::now() - ChronoDuration::minutes(5),
+        slot: Timestamp::now() - SignedDuration::from_mins(5),
         memo: serde_json::json!({"tier": "trial"}),
         search_attrs: serde_json::json!({"customer": "acme", "region": "eu"}),
         headers: serde_json::json!({"traceparent": "00-abc-def-01"}),
@@ -2010,7 +2011,7 @@ async fn stamp_type_agnostic_carryover(
     diesel::update(harvest_workflow_executions::table.find(predecessor.as_uuid()))
         .set((
             harvest_workflow_executions::schedule_id.eq(Some(carried.schedule_id)),
-            SetExt(harvest_workflow_executions_ext::scheduled_for.eq(Some(carried.slot))),
+            SetExt(harvest_workflow_executions_ext::scheduled_for.eq(Some(carried.slot).to_diesel())),
             SetExt(harvest_workflow_executions_ext::memo.eq(Some(carried.memo.clone()))),
             harvest_workflow_executions::search_attrs.eq(Some(carried.search_attrs.clone())),
             SetExt(

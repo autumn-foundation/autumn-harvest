@@ -1,6 +1,7 @@
 //! Integration tests for the Vantage dashboard UI.
 
 use std::collections::{BTreeMap, HashMap};
+use jiff_diesel::ToDiesel;
 use std::sync::Arc;
 
 use autumn_harvest::builder::WorkerConfig;
@@ -5798,8 +5799,8 @@ async fn ui_schedules_displays_recent_decisions() {
         .await
         .expect("connect");
 
-    let occurred_at = chrono::Utc::now();
-    let next_fire_at = occurred_at + chrono::Duration::hours(1);
+    let occurred_at = jiff::Timestamp::now();
+    let next_fire_at = occurred_at + jiff::SignedDuration::from_hours(1);
 
     autumn_harvest::schedule_decision::record_decision_graceful(
         &mut conn,
@@ -6050,29 +6051,29 @@ async fn ui_trigger_now_threads_dag_execution_timeout_sla_and_fleet_ceiling() {
 
     assert_eq!(
         execution.execution_timeout,
-        Some(chrono::Duration::seconds(3600)),
+        Some(jiff::SignedDuration::from_secs(3600)),
         "execution_timeout must be clamped to the 1h fleet-wide ceiling, not the declared 10h"
     );
     let deadline_at = execution
         .deadline_at
         .expect("deadline_at must be set from the ceiling-clamped execution_timeout");
-    let deadline_delta = (deadline_at - execution.started_at) - chrono::Duration::seconds(3600);
+    let deadline_delta = (deadline_at - execution.started_at) - jiff::SignedDuration::from_secs(3600);
     assert!(
-        deadline_delta.num_milliseconds().abs() < 2000,
+        autumn_harvest::time::num_milliseconds(deadline_delta).abs() < 2000,
         "deadline_at must be ~1h after started_at (ceiling-clamped); delta={deadline_delta}"
     );
     assert_eq!(
         execution.sla,
-        Some(chrono::Duration::seconds(3600)),
+        Some(jiff::SignedDuration::from_secs(3600)),
         "sla must clamp to the ceiling-clamped effective execution_timeout, not the raw 5h"
     );
     let sla_deadline_at = execution
         .sla_deadline_at
         .expect("sla_deadline_at must be set from the clamped sla");
     let sla_deadline_delta =
-        (sla_deadline_at - execution.started_at) - chrono::Duration::seconds(3600);
+        (sla_deadline_at - execution.started_at) - jiff::SignedDuration::from_secs(3600);
     assert!(
-        sla_deadline_delta.num_milliseconds().abs() < 2000,
+        autumn_harvest::time::num_milliseconds(sla_deadline_delta).abs() < 2000,
         "sla_deadline_at must be ~1h after started_at (clamped); delta={sla_deadline_delta}"
     );
 }
@@ -6142,7 +6143,7 @@ async fn ui_trigger_now_takes_the_chain_cap_override_and_the_ceiling() {
     let first = trigger(app.clone()).await;
     assert_eq!(
         first.chain_execution_timeout,
-        Some(chrono::Duration::hours(2))
+        Some(jiff::SignedDuration::from_hours(2))
     );
 
     // An override below the ceiling applies.
@@ -6156,11 +6157,11 @@ async fn ui_trigger_now_takes_the_chain_cap_override_and_the_ceiling() {
     let second = trigger(app.clone()).await;
     assert_eq!(
         second.chain_execution_timeout,
-        Some(chrono::Duration::seconds(1800))
+        Some(jiff::SignedDuration::from_secs(1800))
     );
     let chain_deadline_at = second.chain_deadline_at.expect("a chain deadline");
-    let delta = (chain_deadline_at - second.started_at) - chrono::Duration::seconds(1800);
-    assert!(delta.num_milliseconds().abs() < 2000, "delta={delta}");
+    let delta = (chain_deadline_at - second.started_at) - jiff::SignedDuration::from_secs(1800);
+    assert!(autumn_harvest::time::num_milliseconds(delta).abs() < 2000, "delta={delta}");
 
     // The ceiling caps an override above it.
     registry.run_defaults().write_through(
@@ -6173,7 +6174,7 @@ async fn ui_trigger_now_takes_the_chain_cap_override_and_the_ceiling() {
     let third = trigger(app).await;
     assert_eq!(
         third.chain_execution_timeout,
-        Some(chrono::Duration::hours(2))
+        Some(jiff::SignedDuration::from_hours(2))
     );
 }
 
@@ -6572,7 +6573,7 @@ async fn workflow_detail_ui_renders_decoded_input() {
             harvest_task_queue::heartbeat_details.eq(Some(envelope_608(
                 &json!({"progress": "pii-detail-checkpoint"}),
             ))),
-            harvest_task_queue::last_heartbeat_at.eq(Some(chrono::Utc::now())),
+            harvest_task_queue::last_heartbeat_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -7877,14 +7878,14 @@ async fn tl960_set_event_ts(
     database_url: &str,
     exec_id: ExecutionId,
     event_id: i32,
-    ts: chrono::DateTime<chrono::Utc>,
+    ts: jiff::Timestamp,
 ) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
         .expect("connect for event-ts update");
     let sql = format!(
         "UPDATE harvest_events SET timestamp = '{}' WHERE workflow_exec_id = '{}' AND event_id = {}",
-        ts.to_rfc3339(),
+        autumn_harvest::time::rfc3339(ts),
         exec_id.as_uuid(),
         event_id,
     );
@@ -7902,14 +7903,14 @@ async fn tl960_seed_run(
     database_url: &str,
     workflow_id: &str,
     events: Vec<autumn_harvest::WorkflowEvent>,
-    base: chrono::DateTime<chrono::Utc>,
+    base: jiff::Timestamp,
     step_ms: i64,
     state: &str,
-    completed_at: Option<chrono::DateTime<chrono::Utc>>,
-    paused_at: Option<chrono::DateTime<chrono::Utc>>,
+    completed_at: Option<jiff::Timestamp>,
+    paused_at: Option<jiff::Timestamp>,
     pause_reason: Option<&str>,
     pause_actor: Option<&str>,
-    nd_blocked_at: Option<chrono::DateTime<chrono::Utc>>,
+    nd_blocked_at: Option<jiff::Timestamp>,
     nd_block_reason: Option<&str>,
     current_details: Option<&str>,
 ) -> ExecutionId {
@@ -7928,18 +7929,18 @@ async fn tl960_seed_run(
     // Anchor the WorkflowStarted (event 1) to `base` and spread the rest.
     tl960_set_event_ts(database_url, exec_id, 1, base).await;
     for offset in 0..count {
-        let ts = base + chrono::Duration::milliseconds((i64::from(offset) + 1) * step_ms);
+        let ts = base + jiff::SignedDuration::from_millis((i64::from(offset) + 1) * step_ms);
         tl960_set_event_ts(database_url, exec_id, start_event_id + offset, ts).await;
     }
 
     // Apply the row overrides (state, completion, pause/ND-block, current_details).
     let mut sets: Vec<String> = vec![format!("state = '{state}'")];
-    sets.push(format!("started_at = '{}'", base.to_rfc3339()));
+    sets.push(format!("started_at = '{}'", autumn_harvest::time::rfc3339(base)));
     if let Some(c) = completed_at {
-        sets.push(format!("completed_at = '{}'", c.to_rfc3339()));
+        sets.push(format!("completed_at = '{}'", autumn_harvest::time::rfc3339(c)));
     }
     if let Some(p) = paused_at {
-        sets.push(format!("paused_at = '{}'", p.to_rfc3339()));
+        sets.push(format!("paused_at = '{}'", autumn_harvest::time::rfc3339(p)));
     }
     if let Some(r) = pause_reason {
         sets.push(format!("pause_reason = '{r}'"));
@@ -7948,7 +7949,7 @@ async fn tl960_seed_run(
         sets.push(format!("pause_actor = '{a}'"));
     }
     if let Some(nd) = nd_blocked_at {
-        sets.push(format!("nd_blocked_at = '{}'", nd.to_rfc3339()));
+        sets.push(format!("nd_blocked_at = '{}'", autumn_harvest::time::rfc3339(nd)));
     }
     if let Some(r) = nd_block_reason {
         sets.push(format!("nd_block_reason = '{r}'"));
@@ -8033,9 +8034,8 @@ const fn tl960_child_completed(child: ExecutionId) -> autumn_harvest::WorkflowEv
 async fn ui_timeline_renders_activity_timer_pause_ndblock() {
     let (database_url, _container) = setup_test_database_url().await;
     let app = build_single_shard_ui_app(&database_url);
-    let base = chrono::DateTime::parse_from_rfc3339("2026-07-15T10:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let base = ("2026-07-15T10:00:00Z").parse::<Timestamp>()
+        .unwrap();
 
     // Activity retried twice (attempt 1 and 2 fail, then attempt 3 completes),
     // so `derive_timeline` counts the 3 starts (issue #1809) → a "×3" badge.
@@ -8061,10 +8061,10 @@ async fn ui_timeline_renders_activity_timer_pause_ndblock() {
         1000,
         "RUNNING",
         None,
-        Some(base + chrono::Duration::seconds(4)),
+        Some(base + jiff::SignedDuration::from_secs(4)),
         Some("incident-4821"),
         Some("oncall@corp"),
-        Some(base + chrono::Duration::seconds(6)),
+        Some(base + jiff::SignedDuration::from_secs(6)),
         Some("expected ActivityScheduled got TimerStarted"),
         None,
     )
@@ -8099,9 +8099,8 @@ async fn ui_timeline_renders_activity_timer_pause_ndblock() {
 async fn ui_timeline_split_only_when_present() {
     let (database_url, _container) = setup_test_database_url().await;
     let app = build_single_shard_ui_app(&database_url);
-    let base = chrono::DateTime::parse_from_rfc3339("2026-07-15T11:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let base = ("2026-07-15T11:00:00Z").parse::<Timestamp>()
+        .unwrap();
 
     // An activity WITH ActivityStarted → wait/exec split. A child workflow → no split.
     let a = autumn_harvest::ActivityExecId::new();
@@ -8120,7 +8119,7 @@ async fn ui_timeline_split_only_when_present() {
         base,
         1000,
         "COMPLETED",
-        Some(base + chrono::Duration::seconds(6)),
+        Some(base + jiff::SignedDuration::from_secs(6)),
         None,
         None,
         None,
@@ -8155,9 +8154,8 @@ async fn ui_timeline_split_only_when_present() {
 async fn ui_timeline_slowest_highlight_and_rollup() {
     let (database_url, _container) = setup_test_database_url().await;
     let app = build_single_shard_ui_app(&database_url);
-    let base = chrono::DateTime::parse_from_rfc3339("2026-07-15T12:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let base = ("2026-07-15T12:00:00Z").parse::<Timestamp>()
+        .unwrap();
 
     // A quick activity then a much slower one (the slowest step).
     let a1 = autumn_harvest::ActivityExecId::new();
@@ -8178,7 +8176,7 @@ async fn ui_timeline_slowest_highlight_and_rollup() {
         base,
         3000,
         "COMPLETED",
-        Some(base + chrono::Duration::seconds(20)),
+        Some(base + jiff::SignedDuration::from_secs(20)),
         None,
         None,
         None,
@@ -8192,7 +8190,7 @@ async fn ui_timeline_slowest_highlight_and_rollup() {
         &database_url,
         exec_id,
         5,
-        base + chrono::Duration::seconds(20),
+        base + jiff::SignedDuration::from_secs(20),
     )
     .await;
 
@@ -8217,9 +8215,8 @@ async fn ui_timeline_slowest_highlight_and_rollup() {
 async fn ui_timeline_inflight_open_span_and_current_details() {
     let (database_url, _container) = setup_test_database_url().await;
     let app = build_single_shard_ui_app(&database_url);
-    let base = chrono::DateTime::parse_from_rfc3339("2026-07-15T13:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let base = ("2026-07-15T13:00:00Z").parse::<Timestamp>()
+        .unwrap();
 
     // A running execution with a scheduled-but-not-completed activity.
     let a = autumn_harvest::ActivityExecId::new();
@@ -8273,9 +8270,8 @@ async fn ui_timeline_unknown_execution_404() {
 async fn ui_detail_page_has_timeline_link() {
     let (database_url, _container) = setup_test_database_url().await;
     let app = build_single_shard_ui_app(&database_url);
-    let base = chrono::DateTime::parse_from_rfc3339("2026-07-15T14:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let base = ("2026-07-15T14:00:00Z").parse::<Timestamp>()
+        .unwrap();
     let a = autumn_harvest::ActivityExecId::new();
     let exec_id = tl960_seed_run(
         &database_url,
@@ -8284,7 +8280,7 @@ async fn ui_detail_page_has_timeline_link() {
         base,
         1000,
         "COMPLETED",
-        Some(base + chrono::Duration::seconds(3)),
+        Some(base + jiff::SignedDuration::from_secs(3)),
         None,
         None,
         None,
@@ -8307,9 +8303,8 @@ async fn ui_detail_page_has_timeline_link() {
 async fn ui_timeline_200_steps_under_1s() {
     let (database_url, _container) = setup_test_database_url().await;
     let app = build_single_shard_ui_app(&database_url);
-    let base = chrono::DateTime::parse_from_rfc3339("2026-07-15T15:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let base = ("2026-07-15T15:00:00Z").parse::<Timestamp>()
+        .unwrap();
 
     // 200 activities (400 events: sched + complete each).
     let mut events = Vec::with_capacity(400);
@@ -8325,7 +8320,7 @@ async fn ui_timeline_200_steps_under_1s() {
         base,
         100,
         "COMPLETED",
-        Some(base + chrono::Duration::seconds(60)),
+        Some(base + jiff::SignedDuration::from_secs(60)),
         None,
         None,
         None,

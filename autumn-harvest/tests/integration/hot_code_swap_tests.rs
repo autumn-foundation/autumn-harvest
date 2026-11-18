@@ -198,10 +198,9 @@ fn native_pipeline_v2(ctx: &WorkflowContext, _input: Value) -> BoxFut<'_> {
 /// Two independent runs of the same logic then produce the same
 /// `WorkflowStarted` timestamp. So the comparison checks the code, not the
 /// wall clock.
-fn anchor() -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::parse_from_rfc3339("2026-07-08T00:00:00Z")
+fn anchor() -> jiff::Timestamp {
+    ("2026-07-08T00:00:00Z").parse::<Timestamp>()
         .expect("valid anchor")
-        .with_timezone(&chrono::Utc)
 }
 
 fn env() -> WorkflowTestEnv {
@@ -2286,7 +2285,7 @@ mod one_worker_process {
         let mut params = EnqueueParams::new(queue, TaskType::Workflow, input);
         params.workflow_exec_id = Some(exec_id.as_uuid());
         params.required_build_id = Some(build_id.to_string());
-        params.scheduled_at = chrono::Utc::now() - chrono::Duration::seconds(5);
+        params.scheduled_at = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(5);
         queue::enqueue(conn, &params).await.expect("enqueue");
         exec_id
     }

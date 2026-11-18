@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use autumn_harvest::ExecutionId;
-use autumn_harvest::chrono::{DateTime, TimeDelta, Utc};
+use autumn_harvest::chrono::{DateTime, SignedDuration, Utc};
 use autumn_harvest_agent::agent::overlay::apply;
 use autumn_harvest_agent::agent::overlay_store::AutoAdoptOutcome;
 use autumn_harvest_agent::refine::policy::{OverlayPart, RefinePolicy};
@@ -29,16 +29,16 @@ pub type MakeClockedStore<'a> =
 
 /// A clock that a test moves by hand.
 #[derive(Clone)]
-pub struct HandClock(Arc<std::sync::Mutex<DateTime<Utc>>>);
+pub struct HandClock(Arc<std::sync::Mutex<Timestamp>>);
 
 impl HandClock {
     /// A clock at `at`.
-    pub fn at(at: DateTime<Utc>) -> Self {
+    pub fn at(at: Timestamp) -> Self {
         Self(Arc::new(std::sync::Mutex::new(at)))
     }
 
     /// Move the clock to `at`.
-    pub fn set(&self, at: DateTime<Utc>) {
+    pub fn set(&self, at: Timestamp) {
         *self.0.lock().expect("clock") = at;
     }
 
@@ -597,10 +597,9 @@ pub async fn an_activation_checks_its_actor(make: MakeStore<'_>) {
 }
 
 /// A fixed time in one UTC day, so a cap test never spans midnight.
-fn noon() -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339("2026-11-03T12:00:00Z")
+fn noon() -> Timestamp {
+    ("2026-11-03T12:00:00Z").parse::<Timestamp>()
         .expect("time")
-        .with_timezone(&Utc)
 }
 
 fn policy(json: serde_json::Value) -> RefinePolicy {
@@ -848,7 +847,7 @@ pub async fn the_daily_cap_holds_in_the_store(make: MakeClockedStore<'_>) {
     let AutoAdoptOutcome::Adopted(v1) = adopt("a", None, one.clone()).await else {
         panic!("the first adoption passes");
     };
-    clock.set(noon() + TimeDelta::hours(11));
+    clock.set(noon() + SignedDuration::from_hours(11));
     assert_eq!(
         adopt("b", Some(v1), one.clone()).await,
         AutoAdoptOutcome::CapReached { cap: 1, used: 1 }
@@ -874,7 +873,7 @@ pub async fn the_daily_cap_holds_in_the_store(make: MakeClockedStore<'_>) {
         AutoAdoptOutcome::CapReached { cap: 1, used: 2 },
         "the stricter cap of the store counts"
     );
-    clock.set(noon() + TimeDelta::days(1));
+    clock.set(noon() + autumn_harvest::time::days(1));
     let AutoAdoptOutcome::Adopted(v3) = adopt("f", Some(v2), one).await else {
         panic!("a new UTC day has a new cap");
     };

@@ -45,7 +45,7 @@ pub enum Severity {
 /// The determinism category a rule belongs to.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RuleCategory {
-    /// Direct reads of wall-clock time (`SystemTime`, `Instant`, `chrono::Utc::now()`).
+    /// Direct reads of wall-clock time (`SystemTime`, `Instant`, `jiff::Timestamp::now()`).
     WallClock,
     /// Random number generation or ad-hoc UUID creation (`rand`, `Uuid::new_v4()`).
     Randomness,

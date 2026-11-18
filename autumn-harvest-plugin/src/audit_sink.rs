@@ -229,7 +229,7 @@ mod tests {
             seq: 1,
             id: uuid::Uuid::nil(),
             shard_id: Some(0),
-            occurred_at: chrono::Utc::now(),
+            occurred_at: jiff::Timestamp::now(),
             actor: "alice".to_string(),
             operation: "workflow.cancel".to_string(),
             target_type: "workflow".to_string(),
@@ -254,7 +254,7 @@ mod tests {
         let record = sample_record();
         let body = serialize_batch(std::slice::from_ref(&record)).expect("serializes");
         let secret = CallbackSecret::new(b"k".to_vec());
-        let headers = export_headers(&secret, &body, 0, 1, 1, chrono::Utc::now());
+        let headers = export_headers(&secret, &body, 0, 1, 1, jiff::Timestamp::now());
         let batch = AuditBatch {
             shard: 0,
             first_seq: 1,
@@ -307,7 +307,7 @@ mod tests {
             0,
             1,
             1,
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         );
         let batch = AuditBatch {
             shard: 0,
@@ -343,7 +343,7 @@ mod tests {
             0,
             1,
             1,
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         );
         let batch = AuditBatch {
             shard: 0,

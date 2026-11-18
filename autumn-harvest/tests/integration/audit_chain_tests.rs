@@ -111,7 +111,7 @@ async fn export_tick(conn: &mut AsyncPgConnection, chain: Option<&CallbackSecret
 /// Claim one batch with `chain` and acknowledge it.
 async fn export_tick_with(conn: &mut AsyncPgConnection, chain: Option<&AuditChainKey>) -> Vec<u8> {
     ensure_cursor_row(conn, SHARD).await.expect("cursor row");
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let claim = claim_shard_chained(conn, SHARD, 500, LEASE, now, chain)
         .await
         .expect("claim")
@@ -197,7 +197,7 @@ async fn without_a_chain_key_no_row_is_chained() {
     let (mut conn, _c) = fresh_db().await;
     insert_rows(&mut conn, 2).await;
     ensure_cursor_row(&mut conn, SHARD).await.expect("cursor");
-    let claim = claim_shard(&mut conn, SHARD, 500, LEASE, chrono::Utc::now())
+    let claim = claim_shard(&mut conn, SHARD, 500, LEASE, jiff::Timestamp::now())
         .await
         .expect("claim")
         .expect("batch");
@@ -285,7 +285,7 @@ async fn a_redrive_reexports_the_same_bytes() {
     insert_rows(&mut conn, 2).await;
     let first = export_tick(&mut conn, Some(&key())).await;
 
-    rewind_cursor(&mut conn, SHARD, RewindRequest::Seq(0), chrono::Utc::now())
+    rewind_cursor(&mut conn, SHARD, RewindRequest::Seq(0), jiff::Timestamp::now())
         .await
         .expect("rewind");
     let again = export_tick(&mut conn, Some(&key())).await;
@@ -482,7 +482,7 @@ async fn retention_gaps_verify_with_the_cutoff_and_fail_without_it() {
     let key = key();
     let options = ChainVerifyOptions {
         keys: std::slice::from_ref(&key),
-        retention_cutoff: Some(chrono::Utc::now() - chrono::TimeDelta::days(90)),
+        retention_cutoff: Some(jiff::Timestamp::now() - autumn_harvest::time::days(90)),
         known_head: None,
     };
     let report = verify_shard_chain_with(&mut conn, SHARD, &options)
@@ -773,7 +773,7 @@ async fn verify_with_retention(
     let key = key();
     let options = ChainVerifyOptions {
         keys: std::slice::from_ref(&key),
-        retention_cutoff: Some(chrono::Utc::now() - chrono::TimeDelta::days(90)),
+        retention_cutoff: Some(jiff::Timestamp::now() - autumn_harvest::time::days(90)),
         known_head: None,
     };
     verify_shard_chain_with(conn, SHARD, &options)
@@ -1010,7 +1010,7 @@ async fn reanchoring_never_changes_a_sequenced_row() {
     export_tick(&mut conn, Some(&key())).await;
     insert_rows(&mut conn, 1).await;
     export_tick(&mut conn, None).await;
-    rewind_cursor(&mut conn, SHARD, RewindRequest::Seq(0), chrono::Utc::now())
+    rewind_cursor(&mut conn, SHARD, RewindRequest::Seq(0), jiff::Timestamp::now())
         .await
         .expect("rewind");
     let before = export_tick(&mut conn, None).await;
@@ -1024,7 +1024,7 @@ async fn reanchoring_never_changes_a_sequenced_row() {
     assert_eq!(chain_columns(&mut conn).await, columns);
 
     // A redrive of the rows sequenced before the re-anchor is byte-identical.
-    rewind_cursor(&mut conn, SHARD, RewindRequest::Seq(0), chrono::Utc::now())
+    rewind_cursor(&mut conn, SHARD, RewindRequest::Seq(0), jiff::Timestamp::now())
         .await
         .expect("rewind");
     assert_eq!(export_tick(&mut conn, Some(&key())).await, before);
@@ -1090,7 +1090,7 @@ async fn another_shard_never_exports_links_this_shard_stamped() {
         SHARD + 1,
         500,
         LEASE,
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
         Some(&key),
     )
     .await
@@ -1103,7 +1103,7 @@ async fn another_shard_never_exports_links_this_shard_stamped() {
     }
 
     // The stamping shard's redrive stays byte-identical.
-    rewind_cursor(&mut conn, SHARD, RewindRequest::Seq(0), chrono::Utc::now())
+    rewind_cursor(&mut conn, SHARD, RewindRequest::Seq(0), jiff::Timestamp::now())
         .await
         .expect("rewind");
     assert_eq!(export_tick(&mut conn, None).await, first);

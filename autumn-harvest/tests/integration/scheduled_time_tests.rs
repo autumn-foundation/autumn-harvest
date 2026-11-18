@@ -13,6 +13,7 @@
 //! for direct/manual API starts. Also verifies replay-stability.
 
 use std::sync::Arc;
+use jiff_diesel::ToDiesel;
 use std::time::Duration;
 
 use autumn_harvest::info::WorkflowInfo;
@@ -26,7 +27,7 @@ use autumn_harvest::{
     DagCatalog, SchedulerMonitor, StartWorkflowParams, WorkflowContext, WorkflowIdReusePolicy,
     register_workflow_schedules, start_or_load_workflow_execution, tick_once,
 };
-use chrono::Utc;
+use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
@@ -48,7 +49,7 @@ fn scheduled_time_recorder<'a>(
     Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>,
 > {
     Box::pin(async move {
-        let slot: Option<String> = ctx.scheduled_time().map(|t| t.to_rfc3339());
+        let slot: Option<String> = ctx.scheduled_time().map(|t| autumn_harvest::time::rfc3339(t));
         Ok(json!({ "scheduled_time": slot }))
     })
 }
@@ -74,7 +75,7 @@ async fn arm_slot(conn: &mut AsyncPgConnection, wf_name: &str, secs_ago: i64) {
     use autumn_harvest::schema::harvest_schedules::dsl;
     diesel::update(dsl::harvest_schedules)
         .filter(dsl::workflow_name.eq(wf_name))
-        .set(dsl::next_run_at.eq(Utc::now() - chrono::Duration::seconds(secs_ago)))
+        .set(dsl::next_run_at.eq((Timestamp::now() - jiff::SignedDuration::from_secs(secs_ago)).to_diesel()))
         .execute(conn)
         .await
         .expect("arm next_run_at slot");
@@ -206,7 +207,7 @@ async fn scheduled_run_has_correct_scheduled_time() {
         .expect("register schedules");
 
     let slot_secs_ago: i64 = 300;
-    let before_arm = Utc::now();
+    let before_arm = Timestamp::now();
     arm_slot(&mut conn, wf_name, slot_secs_ago).await;
 
     tick_once(
@@ -246,8 +247,8 @@ async fn scheduled_run_has_correct_scheduled_time() {
 
     let slot = scheduled_time.unwrap();
     // The slot is within a few seconds of `before_arm - slot_secs_ago`.
-    let expected_approx = before_arm - chrono::Duration::seconds(slot_secs_ago);
-    let diff = (slot - expected_approx).num_seconds().abs();
+    let expected_approx = before_arm - jiff::SignedDuration::from_secs(slot_secs_ago);
+    let diff = (slot - expected_approx).as_secs().abs();
     assert!(
         diff < 10,
         "scheduled_time should be close to the armed slot (diff={diff}s). slot={slot}, expected≈{expected_approx}"
@@ -255,7 +256,7 @@ async fn scheduled_run_has_correct_scheduled_time() {
 
     // The slot is not near `now()`, the execution start wall clock. It differs
     // from now by at least `slot_secs_ago - 30` seconds.
-    let diff_from_now = (Utc::now() - slot).num_seconds();
+    let diff_from_now = (Timestamp::now() - slot).as_secs();
     assert!(
         diff_from_now > (slot_secs_ago - 30),
         "scheduled_time must not be now(), got diff_from_now={diff_from_now}s"
@@ -273,7 +274,7 @@ async fn scheduled_run_has_correct_scheduled_time() {
         .and_then(|v| v["scheduled_time"].as_str())
         .expect("output must have scheduled_time string");
     // Round-trip: the ISO string from the output should parse back to the same instant.
-    let parsed: chrono::DateTime<Utc> = scheduled_time_out.parse().expect("parse ISO string");
+    let parsed: jiff::Timestamp = scheduled_time_out.parse().expect("parse ISO string");
     assert_eq!(
         parsed, slot,
         "workflow output's scheduled_time must match the WorkflowStarted event field"
@@ -436,13 +437,13 @@ async fn n_slots_produce_n_distinct_scheduled_times() {
             scheduled_time.expect("scheduled run must have scheduled_time (no now() fallback)");
 
         // Must not be "now" — slot should be at least 240s in the past.
-        let diff_from_now = (Utc::now() - slot).num_seconds();
+        let diff_from_now = (Timestamp::now() - slot).as_secs();
         assert!(
             diff_from_now > 240,
             "scheduled_time must not be now(), got diff_from_now={diff_from_now}s for exec {exec_id}"
         );
 
-        seen_slots.insert(slot.timestamp());
+        seen_slots.insert(slot.as_second());
     }
 
     assert_eq!(

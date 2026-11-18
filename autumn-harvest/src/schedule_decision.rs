@@ -1,7 +1,8 @@
 use crate::models::NewScheduleDecision;
+use jiff_diesel::ToDiesel;
 use crate::schema::harvest_schedule_decisions;
 use crate::telemetry::MetricsRecorder;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde_json::Value;
 use uuid::Uuid;
@@ -20,8 +21,8 @@ pub async fn record_decision_graceful(
     decision: &str,
     reason_code: &str,
     detail: Option<Value>,
-    occurred_at: DateTime<Utc>,
-    next_fire_at: DateTime<Utc>,
+    occurred_at: Timestamp,
+    next_fire_at: Timestamp,
     shard_id: i16,
 ) {
     let new_dec = NewScheduleDecision {
@@ -62,11 +63,11 @@ pub async fn purge_old_schedule_decisions(
     use diesel::ExpressionMethods;
     use diesel::QueryDsl;
 
-    let cutoff = Utc::now() - chrono::Duration::days(retention_days.max(0));
+    let cutoff = Timestamp::now() - crate::time::days(retention_days.max(0));
 
     let deleted = diesel::delete(
         harvest_schedule_decisions::table
-            .filter(harvest_schedule_decisions::occurred_at.lt(cutoff)),
+            .filter(harvest_schedule_decisions::occurred_at.lt(cutoff.to_diesel())),
     )
     .execute(conn)
     .await

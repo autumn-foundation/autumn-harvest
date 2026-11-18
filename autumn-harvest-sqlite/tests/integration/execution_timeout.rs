@@ -17,7 +17,7 @@ use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest::{WorkflowHandlerFn, WorkflowInfo};
 use autumn_harvest_sqlite::{ExecutionOutcome, RunState, SqliteError, SqliteRuntime};
-use chrono::{TimeZone, Utc};
+use jiff::Timestamp;
 use serde_json::json;
 
 /// Reports whether the context carries a deadline.
@@ -47,7 +47,7 @@ async fn sleeps_past_deadline(ctx: &WorkflowContext, _n: i64) -> Result<i64, Str
 /// Returns its deadline in epoch milliseconds.
 #[workflow(execution_timeout = "30s")]
 async fn reports_deadline(ctx: &WorkflowContext, _n: i64) -> Result<Option<i64>, String> {
-    Ok(ctx.deadline().map(|d| d.timestamp_millis()))
+    Ok(ctx.deadline().map(|d| d.as_millisecond()))
 }
 
 /// Waits forever, with a retry policy that must not apply to a timeout.
@@ -79,7 +79,7 @@ fn runtime(info: &WorkflowInfo) -> (SqliteRuntime, Clock) {
     let clock = Clock(Arc::new(AtomicI64::new(0)));
     clock.set(0);
     let read = clock.clone();
-    rt.set_clock(move || Utc.timestamp_opt(read.0.load(Ordering::SeqCst), 0).unwrap());
+    rt.set_clock(move || Timestamp::new(read.0.load(Ordering::SeqCst), 0).unwrap());
     (rt, clock)
 }
 
@@ -134,7 +134,7 @@ async fn a_blocked_run_past_its_deadline_ends_timed_out() {
     let last = history.last().unwrap();
     assert!(
         matches!(last, WorkflowEvent::WorkflowExecutionTimedOut { deadline, .. }
-            if deadline.timestamp() == 1_000_030),
+            if deadline.as_second() == 1_000_030),
         "got {last:?}"
     );
     assert_replays(info.name, info.handler, history).await;
@@ -227,7 +227,7 @@ async fn the_timeout_seal_deletes_the_timer_row() {
         let clock = Clock(Arc::new(AtomicI64::new(0)));
         clock.set(0);
         let read = clock.clone();
-        rt.set_clock(move || Utc.timestamp_opt(read.0.load(Ordering::SeqCst), 0).unwrap());
+        rt.set_clock(move || Timestamp::new(read.0.load(Ordering::SeqCst), 0).unwrap());
         let exec = rt.start_workflow(info.name, json!(1)).unwrap();
         rt.run_until_blocked(exec).await.unwrap();
         clock.set(31);
@@ -282,7 +282,7 @@ async fn a_late_input_seal_deletes_a_running_task() {
         let clock = Clock(Arc::new(AtomicI64::new(0)));
         clock.set(0);
         let read = clock.clone();
-        rt.set_clock(move || Utc.timestamp_opt(read.0.load(Ordering::SeqCst), 0).unwrap());
+        rt.set_clock(move || Timestamp::new(read.0.load(Ordering::SeqCst), 0).unwrap());
         let exec = rt.start_workflow(info.name, json!(1)).unwrap();
         let started = hang_started();
         tokio::select! {
@@ -410,7 +410,7 @@ async fn an_as_of_signal_checks_the_deadline_at_its_own_time() {
     rt.run_until_blocked(exec).await.unwrap();
 
     // The runtime clock stays at the start. The signal is 31 seconds late.
-    let late = Utc.timestamp_opt(1_000_031, 0).unwrap();
+    let late = Timestamp::new(1_000_031, 0).unwrap();
     assert!(matches!(
         rt.send_signal_as_of(exec, "never", json!(1), late),
         Err(SqliteError::WorkflowNotRunning { ref state, .. }) if state == "TIMED_OUT"
@@ -436,8 +436,7 @@ async fn a_body_that_ends_past_the_deadline_times_out() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&info);
     rt.set_clock(|| {
-        Utc.timestamp_opt(LATE_CLOCK.load(Ordering::SeqCst), 0)
-            .unwrap()
+        Timestamp::new(LATE_CLOCK.load(Ordering::SeqCst), 0).unwrap()
     });
     let exec = rt.start_workflow(info.name, json!(1)).unwrap();
 
@@ -563,8 +562,7 @@ async fn an_update_that_ends_past_the_deadline_is_refused() {
     rt.register_workflow(&info);
     rt.register_update(&slow_update_info());
     rt.set_clock(|| {
-        Utc.timestamp_opt(UPDATE_CLOCK.load(Ordering::SeqCst), 0)
-            .unwrap()
+        Timestamp::new(UPDATE_CLOCK.load(Ordering::SeqCst), 0).unwrap()
     });
     let exec = rt.start_workflow(info.name, json!(1)).unwrap();
     rt.run_until_blocked(exec).await.unwrap();

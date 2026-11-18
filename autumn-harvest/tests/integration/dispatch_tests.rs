@@ -557,7 +557,7 @@ async fn hint_publishes_after_commit_not_before() {
     let hint = autumn_harvest::dispatch::DispatchHint {
         task_id: uuid::Uuid::new_v4(),
         queue_name: "default".to_string(),
-        scheduled_at: chrono::Utc::now(),
+        scheduled_at: jiff::Timestamp::now(),
         priority: 0,
         shard: None,
         kind: Some(autumn_harvest::dispatch::DispatchKind::Workflow),
@@ -619,7 +619,7 @@ async fn redelivery_of_a_terminal_row_is_acked() {
         .publish(&[autumn_harvest::dispatch::DispatchHint {
             task_id: task.id,
             queue_name: "default".to_string(),
-            scheduled_at: chrono::Utc::now(),
+            scheduled_at: jiff::Timestamp::now(),
             priority: 0,
             shard: None,
             kind: Some(autumn_harvest::dispatch::DispatchKind::Workflow),
@@ -1584,7 +1584,7 @@ async fn a_multi_shard_worker_never_consumes_references() {
         .publish(&[autumn_harvest::dispatch::DispatchHint {
             task_id,
             queue_name: queue.clone(),
-            scheduled_at: chrono::Utc::now(),
+            scheduled_at: jiff::Timestamp::now(),
             priority: 0,
             shard: None,
             kind: Some(autumn_harvest::dispatch::DispatchKind::Workflow),
@@ -1887,7 +1887,7 @@ async fn a_stale_reference_does_not_spend_a_sibling_lease_share() {
             autumn_harvest::dispatch::DispatchHint {
                 task_id: stale_task.id,
                 queue_name: queue.clone(),
-                scheduled_at: chrono::Utc::now(),
+                scheduled_at: jiff::Timestamp::now(),
                 priority: 0,
                 shard: None,
                 kind: Some(autumn_harvest::dispatch::DispatchKind::Workflow),
@@ -1895,7 +1895,7 @@ async fn a_stale_reference_does_not_spend_a_sibling_lease_share() {
             autumn_harvest::dispatch::DispatchHint {
                 task_id: claimable_task.id,
                 queue_name: queue.clone(),
-                scheduled_at: chrono::Utc::now(),
+                scheduled_at: jiff::Timestamp::now(),
                 priority: 0,
                 shard: None,
                 kind: Some(autumn_harvest::dispatch::DispatchKind::Workflow),

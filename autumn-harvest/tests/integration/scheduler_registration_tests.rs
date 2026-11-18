@@ -25,6 +25,7 @@
 //! `scrub()`s first for isolation.
 
 use std::sync::Arc;
+use jiff_diesel::ToDiesel;
 
 use autumn_harvest::policy::{Schedule, WorkflowSchedule};
 use autumn_harvest::scheduler::{
@@ -32,7 +33,7 @@ use autumn_harvest::scheduler::{
 };
 use autumn_harvest::schema::harvest_schedules;
 use autumn_harvest::worker::HandlerRegistry;
-use chrono::{DateTime, SubsecRound, Utc};
+use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
@@ -176,12 +177,12 @@ async fn schedule_expr_of(conn: &mut AsyncPgConnection, id: Uuid) -> Option<Stri
         .expect("schedule_expr")
 }
 
-async fn updated_at_of(conn: &mut AsyncPgConnection, id: Uuid) -> DateTime<Utc> {
+async fn updated_at_of(conn: &mut AsyncPgConnection, id: Uuid) -> Timestamp {
     use autumn_harvest::schema::harvest_schedules::dsl;
     dsl::harvest_schedules
         .find(id)
         .select(dsl::updated_at)
-        .first::<DateTime<Utc>>(conn)
+        .first::<Timestamp>(conn)
         .await
         .expect("updated_at")
 }
@@ -197,7 +198,7 @@ async fn due_rows(conn: &mut AsyncPgConnection) -> i64 {
         .filter(dsl::auto_paused_at.is_null())
         .filter(dsl::exhausted_at.is_null())
         .filter(dsl::next_run_at.is_not_null())
-        .filter(dsl::next_run_at.le(Utc::now()))
+        .filter(dsl::next_run_at.le(Timestamp::now().to_diesel()))
         .count()
         .get_result(conn)
         .await
@@ -699,13 +700,13 @@ async fn releasing_a_squatted_name_preserves_the_rows_other_state() {
     // Give the squatter operator state and counters worth losing. The
     // timestamp is truncated to microseconds so the round-trip compares
     // exactly -- Postgres stores `timestamptz` at microsecond precision.
-    let pinned_next_run = (Utc::now() + chrono::Duration::hours(5)).trunc_subsecs(6);
+    let pinned_next_run = (Timestamp::now() + jiff::SignedDuration::from_hours(5)).trunc_subsecs(6);
     diesel::update(dsl::harvest_schedules.find(squatter))
         .set((
             dsl::is_paused.eq(true),
             dsl::paused_by.eq(Some("operator")),
             dsl::runs_started.eq(7),
-            dsl::next_run_at.eq(Some(pinned_next_run)),
+            dsl::next_run_at.eq(Some(pinned_next_run).to_diesel()),
             dsl::buffered_runs.eq(serde_json::json!(["2026-01-01T00:00:00Z"])),
         ))
         .execute(&mut conn)
@@ -729,7 +730,7 @@ async fn releasing_a_squatted_name_preserves_the_rows_other_state() {
             bool,
             Option<String>,
             i32,
-            Option<DateTime<Utc>>,
+            Option<Timestamp>,
             serde_json::Value,
         )>(&mut conn)
         .await
@@ -853,7 +854,7 @@ async fn a_stale_row_is_collected_even_while_a_peer_holds_the_lock() {
     {
         use autumn_harvest::schema::harvest_schedules::dsl;
         diesel::update(dsl::harvest_schedules.find(stale))
-            .set(dsl::next_run_at.eq(Some(Utc::now() - chrono::Duration::minutes(5))))
+            .set(dsl::next_run_at.eq(Some(Timestamp::now() - jiff::SignedDuration::from_mins(5)).to_diesel()))
             .execute(&mut conn)
             .await
             .expect("make the stale row due");
@@ -1028,7 +1029,7 @@ async fn seed_due_stale_row(conn: &mut AsyncPgConnection, name: &str) -> Uuid {
     use autumn_harvest::schema::harvest_schedules::dsl;
     let id = insert_raw_row(conn, Some(name), Some(name), "cron:0 1 * * *").await;
     diesel::update(dsl::harvest_schedules.find(id))
-        .set(dsl::next_run_at.eq(Some(Utc::now() - chrono::Duration::minutes(5))))
+        .set(dsl::next_run_at.eq(Some(Timestamp::now() - jiff::SignedDuration::from_mins(5)).to_diesel()))
         .execute(conn)
         .await
         .expect("make the stale row due");

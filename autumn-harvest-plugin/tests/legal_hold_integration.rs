@@ -14,6 +14,7 @@
 #![allow(clippy::too_many_lines)]
 
 use std::sync::Arc;
+use jiff_diesel::ToDiesel;
 
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
 use autumn_harvest::schema::harvest_audit_log;
@@ -26,7 +27,7 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel::sql_types::{Text, Timestamptz};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -164,7 +165,7 @@ async fn seed_completed(
         #[diesel(sql_type = diesel::sql_types::Uuid)]
         id: uuid::Uuid,
     }
-    let now = Utc::now();
+    let now = Timestamp::now();
     let id: uuid::Uuid = diesel::sql_query(
         "INSERT INTO harvest_workflow_executions
             (workflow_name, workflow_id, shard_id, state, input, started_at, completed_at)
@@ -173,7 +174,7 @@ async fn seed_completed(
     )
     .bind::<Text, _>(workflow_name)
     .bind::<Text, _>(workflow_id)
-    .bind::<Timestamptz, _>(now)
+    .bind::<Timestamptz, _>(now.to_diesel())
     .get_result::<IdRow>(conn)
     .await
     .expect("insert execution")
@@ -295,11 +296,11 @@ async fn past_hold_until_returns_400() {
     scrub(&mut conn).await;
 
     let exec_id = seed_completed(&mut conn, "lh_wf", "lh-http-past").await;
-    let past: DateTime<Utc> = Utc::now() - chrono::Duration::hours(1);
+    let past: Timestamp = Timestamp::now() - jiff::SignedDuration::from_hours(1);
     let (status, body) = post_json_admin(
         &app,
         &format!("/workflows/{exec_id}/legal-hold"),
-        json!({ "reason": "x", "hold_until": past.to_rfc3339() }),
+        json!({ "reason": "x", "hold_until": autumn_harvest::time::rfc3339(past) }),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");

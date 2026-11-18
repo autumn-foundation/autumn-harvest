@@ -97,7 +97,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, RwLock};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use crate::telemetry::{MetricsRecorder, SCANNER_SHARD_LABEL_NONE};
 use crate::types::ShardId;
@@ -284,7 +284,7 @@ pub struct ScannerStatus {
     pub tick_count: u64,
     /// Wall-clock stamp of the most recent tick, for display. `None` until
     /// the first tick.
-    pub last_tick_at: Option<DateTime<Utc>>,
+    pub last_tick_at: Option<Timestamp>,
     /// Monotonic time since the most recent tick, or since registration when
     /// the scanner has not ticked yet (the boot-grace window).
     pub age: Duration,
@@ -376,7 +376,7 @@ struct OwnerState {
     poll_interval: Duration,
     registered_at: Instant,
     last_tick: Option<Instant>,
-    last_tick_at: Option<DateTime<Utc>>,
+    last_tick_at: Option<Timestamp>,
     tick_count: u64,
     /// The shard this instance polls, for the per-shard loops. Recorded here
     /// rather than derived, because the id is only knowable at the spawn site.
@@ -567,7 +567,7 @@ impl ScannerLiveness {
         // Resolve the wall clock BEFORE the write lock. This runs on every
         // iteration of every control loop, so the critical section holds the
         // map mutation alone.
-        let wall_now = Utc::now();
+        let wall_now = Timestamp::now();
         let mut entries = self.write();
         if let Some(state) = entries
             .get_mut(&owner.scanner)

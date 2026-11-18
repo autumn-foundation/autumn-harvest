@@ -9,13 +9,14 @@
 //! scheduler tick path end-to-end.
 
 use std::sync::{Arc, Mutex};
+use jiff_diesel::ToDiesel;
 
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::schema::harvest_schedules;
 use autumn_harvest::telemetry::{METRIC_SCHEDULE_AUTO_PAUSED, MetricsRecorder};
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::{DagCatalog, SchedulerMonitor, WorkflowContext, tick_once};
-use chrono::Utc;
+use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
@@ -125,7 +126,7 @@ async fn insert_schedule_with_failure_limit(
     failure_limit: i32,
 ) -> Uuid {
     use autumn_harvest::schema::harvest_schedules::dsl;
-    let now = Utc::now();
+    let now = Timestamp::now();
     let id = Uuid::new_v4();
     diesel::insert_into(harvest_schedules::table)
         .values((
@@ -136,7 +137,7 @@ async fn insert_schedule_with_failure_limit(
             dsl::catchup.eq(false),
             dsl::max_active_runs.eq(10),
             dsl::is_paused.eq(false),
-            dsl::next_run_at.eq(now - chrono::Duration::seconds(5)),
+            dsl::next_run_at.eq(now - jiff::SignedDuration::from_secs(5)),
             dsl::jitter_secs.eq(0_i64),
             dsl::overlap_policy.eq("skip"),
             dsl::buffered_runs.eq(serde_json::json!([])),
@@ -227,7 +228,7 @@ async fn schedule_auto_pauses_after_consecutive_failures() {
         .expect("check conn");
 
     // The schedule must be auto-paused.
-    let auto_paused_at: Option<chrono::DateTime<Utc>> = harvest_schedules::table
+    let auto_paused_at: Option<jiff::Timestamp> = harvest_schedules::table
         .find(sched_id)
         .select(harvest_schedules::dsl::auto_paused_at)
         .first(&mut check)
@@ -260,11 +261,11 @@ async fn auto_paused_schedule_remains_paused_on_subsequent_ticks() {
     let wf_name = "ap_remains_paused_wf";
     let sched_id = insert_schedule_with_failure_limit(&mut conn, wf_name, 2).await;
 
-    let pause_time = Utc::now() - chrono::Duration::seconds(30);
+    let pause_time = Timestamp::now() - jiff::SignedDuration::from_secs(30);
     diesel::update(harvest_schedules::table.find(sched_id))
         .set((
             harvest_schedules::dsl::consecutive_failure_count.eq(2),
-            harvest_schedules::dsl::auto_paused_at.eq(Some(pause_time)),
+            harvest_schedules::dsl::auto_paused_at.eq(Some(pause_time).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -293,7 +294,7 @@ async fn auto_paused_schedule_remains_paused_on_subsequent_ticks() {
         .await
         .expect("check conn");
 
-    let auto_paused_at: Option<chrono::DateTime<Utc>> = harvest_schedules::table
+    let auto_paused_at: Option<jiff::Timestamp> = harvest_schedules::table
         .find(sched_id)
         .select(harvest_schedules::dsl::auto_paused_at)
         .first(&mut check)
@@ -329,7 +330,7 @@ async fn schedule_resumes_and_resets_failure_count() {
     diesel::update(harvest_schedules::table.find(sched_id))
         .set((
             harvest_schedules::dsl::consecutive_failure_count.eq(3),
-            harvest_schedules::dsl::auto_paused_at.eq(Some(Utc::now())),
+            harvest_schedules::dsl::auto_paused_at.eq(Some(Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -339,7 +340,7 @@ async fn schedule_resumes_and_resets_failure_count() {
     // This mirrors what `POST /admin/schedules/{id}/resume` does.
     diesel::update(harvest_schedules::table.find(sched_id))
         .set((
-            harvest_schedules::dsl::auto_paused_at.eq(Option::<chrono::DateTime<Utc>>::None),
+            harvest_schedules::dsl::auto_paused_at.eq(Option::<jiff::Timestamp>::None),
             harvest_schedules::dsl::consecutive_failure_count.eq(0),
             harvest_schedules::dsl::is_paused.eq(false),
         ))
@@ -348,7 +349,7 @@ async fn schedule_resumes_and_resets_failure_count() {
         .expect("resume schedule");
 
     // Verify the schedule is no longer auto-paused and count is reset.
-    let (auto_paused_at, failure_count): (Option<chrono::DateTime<Utc>>, i32) =
+    let (auto_paused_at, failure_count): (Option<jiff::Timestamp>, i32) =
         harvest_schedules::table
             .find(sched_id)
             .select((
@@ -401,7 +402,7 @@ async fn schedule_resumes_and_resets_failure_count() {
     );
 
     // auto_paused_at must still be NULL after the successful tick.
-    let auto_paused_after_tick: Option<chrono::DateTime<Utc>> = harvest_schedules::table
+    let auto_paused_after_tick: Option<jiff::Timestamp> = harvest_schedules::table
         .find(sched_id)
         .select(harvest_schedules::dsl::auto_paused_at)
         .first(&mut check)
@@ -450,7 +451,7 @@ async fn schedule_fires_when_below_failure_limit() {
         .expect("check conn");
 
     // Schedule must NOT be auto-paused.
-    let auto_paused_at: Option<chrono::DateTime<Utc>> = harvest_schedules::table
+    let auto_paused_at: Option<jiff::Timestamp> = harvest_schedules::table
         .find(sched_id)
         .select(harvest_schedules::dsl::auto_paused_at)
         .first(&mut check)
@@ -482,7 +483,7 @@ async fn schedule_without_limit_never_auto_pauses() {
     // Insert without a failure limit.
     let sched_id = {
         use autumn_harvest::schema::harvest_schedules::dsl;
-        let now = Utc::now();
+        let now = Timestamp::now();
         let id = Uuid::new_v4();
         diesel::insert_into(harvest_schedules::table)
             .values((
@@ -493,7 +494,7 @@ async fn schedule_without_limit_never_auto_pauses() {
                 dsl::catchup.eq(false),
                 dsl::max_active_runs.eq(10),
                 dsl::is_paused.eq(false),
-                dsl::next_run_at.eq(now - chrono::Duration::seconds(5)),
+                dsl::next_run_at.eq(now - jiff::SignedDuration::from_secs(5)),
                 dsl::jitter_secs.eq(0_i64),
                 dsl::overlap_policy.eq("skip"),
                 dsl::buffered_runs.eq(serde_json::json!([])),
@@ -534,7 +535,7 @@ async fn schedule_without_limit_never_auto_pauses() {
         .await
         .expect("check conn");
 
-    let auto_paused_at: Option<chrono::DateTime<Utc>> = harvest_schedules::table
+    let auto_paused_at: Option<jiff::Timestamp> = harvest_schedules::table
         .find(sched_id)
         .select(harvest_schedules::dsl::auto_paused_at)
         .first(&mut check)

@@ -10,6 +10,7 @@
 //! it, a testcontainers Postgres starts.
 
 use std::sync::Mutex;
+use jiff_diesel::ToDiesel;
 
 use autumn_harvest::concurrency::ConcurrencyOnConflict;
 use autumn_harvest::error::{HarvestError, PayloadKind};
@@ -175,7 +176,7 @@ async fn set_state(conn: &mut AsyncPgConnection, id: ExecutionId, state: &str) {
     diesel::update(wf::table.find(id.as_uuid()))
         .set((
             wf::state.eq(state),
-            wf::completed_at.eq((state != "PAUSED").then(chrono::Utc::now)),
+            wf::completed_at.eq((state != "PAUSED").then(chrono::Utc::now).to_diesel()),
         ))
         .execute(conn)
         .await
@@ -489,7 +490,7 @@ async fn common_start_fields_reach_the_row_identically_on_both_routes() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (mut conn, _c) = setup().await;
-    let hour = chrono::Duration::hours(1);
+    let hour = jiff::SignedDuration::from_hours(1);
 
     let mut a = sws("fields-sws", ALLOW);
     a.queue_name = "q-fields";

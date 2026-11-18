@@ -37,7 +37,7 @@ use autumn_harvest::executor::{
     drive_query_replay_async, history_reached_terminal_seal,
 };
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
-use chrono::{Duration as ChronoDuration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 
 // ── Test workflow handler ─────────────────────────────────────────────────
@@ -198,7 +198,7 @@ fn workflow_input(items: &[&str], should_fail: bool) -> Value {
 fn started_event(input: Value) -> WorkflowEvent {
     WorkflowEvent::WorkflowStarted {
         input,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -483,8 +483,8 @@ fn timed_out_sealed_mid_activity_serves_partial_state() {
     // activity: history sealed by WorkflowExecutionTimedOut. Same shape/behaviour
     // as the cancelled case.
     let seal = WorkflowEvent::WorkflowExecutionTimedOut {
-        deadline: Utc::now(),
-        timed_out_at: Utc::now(),
+        deadline: Timestamp::now(),
+        timed_out_at: Timestamp::now(),
     };
     let (exec_id, input, events) = sealed_mid_activity_history(&["a"], "b", seal);
     let sealed = history_reached_terminal_seal(&events);
@@ -616,8 +616,8 @@ fn terminal_sealed_while_await_condition_parked_serves_partial_state() {
     // old any_pending_command guard produced by driving to the deadline.
     let (exec_id, input, mut events) = complete_history(&["a", "b"], false);
     events.push(WorkflowEvent::WorkflowExecutionTimedOut {
-        deadline: Utc::now() - ChronoDuration::seconds(1),
-        timed_out_at: Utc::now(),
+        deadline: Timestamp::now() - SignedDuration::from_secs(1),
+        timed_out_at: Timestamp::now(),
     });
     let sealed = history_reached_terminal_seal(&events);
     assert!(sealed, "a WorkflowExecutionTimedOut history is sealed");
@@ -937,8 +937,8 @@ fn deadline_probe_workflow<'a>(
 
 /// A start time far enough in the past that a 24h budget is nowhere near
 /// consumed, so `should_continue_as_new()`'s deadline branch never trips.
-const fn probe_t0() -> chrono::DateTime<Utc> {
-    let Some(t0) = chrono::DateTime::from_timestamp_millis(1_700_000_000_000) else {
+const fn probe_t0() -> jiff::Timestamp {
+    let Some(t0) = jiff::Timestamp::from_millisecond(1_700_000_000_000).ok() else {
         panic!("valid probe start instant")
     };
     t0
@@ -956,14 +956,14 @@ fn deadline_probe_history(
     ExecutionId,
     Value,
     Vec<WorkflowEvent>,
-    ChronoDuration,
-    chrono::DateTime<Utc>,
+    SignedDuration,
+    jiff::Timestamp,
 ) {
     let exec_id = ExecutionId::new();
     let t0 = probe_t0();
-    let budget = ChronoDuration::hours(24);
+    let budget = SignedDuration::from_hours(24);
     let deadline = t0 + budget;
-    let recorded_now = t0 + ChronoDuration::seconds(1);
+    let recorded_now = t0 + SignedDuration::from_secs(1);
     let input = json!({ "items": items });
     let mut events = vec![
         WorkflowEvent::WorkflowStarted {
@@ -976,7 +976,7 @@ fn deadline_probe_history(
         WorkflowEvent::SideEffectRecorded {
             kind: SideEffectKind::Now,
             name: Some(DEADLINE_PROBE_SIDE_EFFECT_NAME.to_string()),
-            value: json!(recorded_now.timestamp_millis()),
+            value: json!(recorded_now.as_millisecond()),
         },
     ];
     for item in items {
@@ -1004,8 +1004,8 @@ fn deadline_probe_history(
 fn build_ctx_with_deadline(
     exec_id: ExecutionId,
     events: Vec<WorkflowEvent>,
-    execution_timeout: Option<ChronoDuration>,
-    deadline_at: Option<chrono::DateTime<Utc>>,
+    execution_timeout: Option<SignedDuration>,
+    deadline_at: Option<jiff::Timestamp>,
 ) -> WorkflowContext {
     WorkflowContext::for_replay_with_state_and_history_policy(
         exec_id,

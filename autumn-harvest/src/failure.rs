@@ -342,12 +342,12 @@ impl ActivityFailure {
     #[must_use]
     pub fn circuit_open(
         activity_name: &str,
-        opened_at: Option<chrono::DateTime<chrono::Utc>>,
+        opened_at: Option<jiff::Timestamp>,
         retry_after: Option<std::time::Duration>,
     ) -> Self {
         let mut details = serde_json::json!({ "activity_name": activity_name });
         if let Some(opened) = opened_at {
-            details["opened_at"] = serde_json::json!(opened.to_rfc3339());
+            details["opened_at"] = serde_json::json!(crate::time::rfc3339(opened));
         }
         let message = if let Some(after) = retry_after {
             let secs = after.as_secs_f64();
@@ -1067,7 +1067,7 @@ mod tests {
     fn circuit_open_is_non_retryable_typed_failure() {
         let f = ActivityFailure::circuit_open(
             "send_email",
-            Some(chrono::Utc::now()),
+            Some(jiff::Timestamp::now()),
             Some(std::time::Duration::from_secs(42)),
         );
         assert_eq!(f.error_type, ERROR_TYPE_CIRCUIT_OPEN);

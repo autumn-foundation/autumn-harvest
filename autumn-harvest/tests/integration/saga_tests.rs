@@ -7,7 +7,7 @@ use autumn_harvest::telemetry::{
 use autumn_harvest::{
     ExecutionId, HarvestError, HarvestResult, Saga, WorkflowCommand, WorkflowContext, WorkflowEvent,
 };
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::Value;
 
 fn test_context() -> WorkflowContext {
@@ -15,7 +15,7 @@ fn test_context() -> WorkflowContext {
         ExecutionId::new(),
         vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -29,7 +29,7 @@ fn cancelled_context(reason: &str) -> WorkflowContext {
         vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -522,7 +522,7 @@ async fn run_compensated_saga_once(comp_log: Arc<Mutex<Vec<String>>>) {
         ExecutionId::new(),
         vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -763,7 +763,7 @@ impl MetricsRecorder for SagaRecordingMetrics {
 fn started_history() -> Vec<WorkflowEvent> {
     vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,

@@ -912,7 +912,7 @@ async fn keyed_replay_bypasses_a_raised_admission_gate() {
             reason: "incident".to_string(),
             message: None,
             created_by: "op".to_string(),
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
             expires_at: None,
         }]);
         set_global_admission_gate_cache(Some(api_state.gate_cache()));

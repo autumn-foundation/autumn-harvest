@@ -220,7 +220,7 @@ async fn seed_activity(
     params.activity_name = Some(ACTIVITY.to_string());
     params.activity_id = Some(activity_id.as_uuid());
     params.max_attempts = 5;
-    params.scheduled_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+    params.scheduled_at = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1);
     let task_id = queue::enqueue(conn, &params).await.expect("enqueue");
     (exec_id, activity_id, queue_name, task_id)
 }

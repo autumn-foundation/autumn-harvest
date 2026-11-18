@@ -117,8 +117,8 @@ impl Drop for Globals {
     }
 }
 
-fn chrono_of(d: Duration) -> Option<chrono::Duration> {
-    chrono::Duration::from_std(d).ok()
+fn chrono_of(d: Duration) -> Option<jiff::SignedDuration> {
+    jiff::SignedDuration::try_from(d).ok()
 }
 
 /// Start a source run that the trigger watches.
@@ -435,8 +435,8 @@ impl Site {
 ///
 /// The start reads its clock a few milliseconds before the row default
 /// `started_at`, so an exact comparison is off by that gap.
-fn whole_secs(started_at: chrono::DateTime<chrono::Utc>, at: chrono::DateTime<chrono::Utc>) -> u64 {
-    let millis = (at - started_at).num_milliseconds() + 500;
+fn whole_secs(started_at: jiff::Timestamp, at: jiff::Timestamp) -> u64 {
+    let millis = autumn_harvest::time::num_milliseconds((at - started_at)) + 500;
     u64::try_from(millis.div_euclid(1000)).expect("a deadline after the start")
 }
 
@@ -581,7 +581,7 @@ async fn update_with_start_takes_the_overrides() {
     assert_eq!(row.chain_execution_timeout, chrono_of(4 * HOUR));
     let sla = row.sla_deadline_at.expect("SLA deadline") - row.started_at;
     assert!(
-        sla <= chrono::Duration::minutes(10) + chrono::Duration::seconds(5),
+        sla <= jiff::SignedDuration::from_mins(10) + jiff::SignedDuration::from_secs(5),
         "the SLA override applies: {sla}"
     );
 }

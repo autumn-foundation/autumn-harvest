@@ -103,7 +103,7 @@ use autumn_harvest::dag::{DagDefinition, DagTask, GateTimeoutAction};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::policy::TaskStatus;
 use autumn_harvest::types::ActivityExecId;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 
 use crate::dag_retry::{NodeOutcome, node_outcome};
@@ -170,10 +170,10 @@ pub struct DagRunNode {
     /// `ActivityStarted` timestamp), falling back to the schedule timestamp for
     /// a scheduled-but-not-yet-claimed node. `None` for a never-scheduled node.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub started_at: Option<DateTime<Utc>>,
+    pub started_at: Option<Timestamp>,
     /// When the node's latest attempt reached a terminal event, if it did.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub finished_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<Timestamp>,
     /// Number of execution attempts of the node's latest attempt-chain.
     ///
     /// It counts the `ActivityStarted` events for its authoritative
@@ -198,10 +198,10 @@ pub struct DagRunGraphResponse {
     /// The run's execution state (e.g. `RUNNING`, `FAILED`, `COMPLETED`).
     pub state: String,
     /// When the run started.
-    pub started_at: DateTime<Utc>,
+    pub started_at: Timestamp,
     /// When the run finished, if it has (its `completed_at`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub finished_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<Timestamp>,
     /// The annotated node topology.
     pub nodes: Vec<DagRunNode>,
 }
@@ -440,7 +440,7 @@ fn has_skip_marker(
 #[must_use]
 pub fn build_run_graph(
     def: &DagDefinition,
-    timestamped_events: &[(DateTime<Utc>, WorkflowEvent)],
+    timestamped_events: &[(Timestamp, WorkflowEvent)],
     exec_state: &str,
 ) -> Vec<DagRunNode> {
     let events: Vec<WorkflowEvent> = timestamped_events
@@ -807,12 +807,12 @@ fn classify(
     upstreams: &[usize],
     events: &[WorkflowEvent],
     dispatched: &BTreeSet<&str>,
-    timestamped_events: &[(DateTime<Utc>, WorkflowEvent)],
+    timestamped_events: &[(Timestamp, WorkflowEvent)],
     exec_state: &str,
 ) -> (
     DagNodeStatus,
-    Option<DateTime<Utc>>,
-    Option<DateTime<Utc>>,
+    Option<Timestamp>,
+    Option<Timestamp>,
     Option<String>,
     Option<String>,
     u32,
@@ -881,7 +881,7 @@ mod tests {
     use super::*;
     use autumn_harvest::dag::{DagBuilder, DagDefinition};
     use autumn_harvest::types::{ActivityExecId, WorkerId};
-    use chrono::{TimeZone, Utc};
+    use jiff::Timestamp;
     use serde_json::Value;
 
     // Distinct activity functions → distinct node names.
@@ -928,8 +928,8 @@ mod tests {
         builder.build().expect("conditional dag builds")
     }
 
-    fn ts(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(1_700_000_000 + secs, 0).single().unwrap()
+    fn ts(secs: i64) -> Timestamp {
+        Timestamp::new(1_700_000_000 + secs, 0).ok().unwrap()
     }
 
     fn sched(name: &str, id: ActivityExecId) -> WorkflowEvent {

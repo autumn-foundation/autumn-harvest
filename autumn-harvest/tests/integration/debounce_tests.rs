@@ -36,7 +36,7 @@ use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::types::{ExecutionId, ShardId, WorkflowIdReusePolicy};
 use autumn_harvest::worker::DbPool;
 use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
-use chrono::Utc;
+use jiff::Timestamp;
 use diesel_async::AsyncPgConnection;
 use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -650,7 +650,8 @@ async fn max_wait_cap_prevents_endless_deferral() {
         #[derive(diesel::QueryableByName)]
         struct Row {
             #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-            max_fire_at: chrono::DateTime<Utc>,
+            #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+            max_fire_at: jiff::Timestamp,
         }
         diesel::sql_query(
             "SELECT max_fire_at FROM harvest_debounce WHERE workflow_name=$1 AND debounce_key=$2",
@@ -845,7 +846,7 @@ async fn list_pending_debounce_surfaces_pending_records() {
     assert_eq!(record.queue_name, "default");
     // effective_fire_at must be in the future
     assert!(
-        record.effective_fire_at > Utc::now(),
+        record.effective_fire_at > Timestamp::now(),
         "effective_fire_at must be in the future"
     );
     assert!(

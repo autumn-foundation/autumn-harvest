@@ -16,7 +16,7 @@ use autumn_harvest_redis::{
     EnqueueParams, RedisDispatch, RedisDispatchConfig, RedisTaskQueue, RedisTaskQueueConfig,
     RedisTlsOptions, TaskQueueAdapter, TaskType,
 };
-use chrono::Utc;
+use jiff::Timestamp;
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
 };
@@ -164,7 +164,7 @@ fn hint(task_id: Uuid) -> DispatchHint {
     DispatchHint {
         task_id,
         queue_name: "default".to_string(),
-        scheduled_at: Utc::now(),
+        scheduled_at: Timestamp::now(),
         priority: 0,
         shard: None,
         kind: Some(autumn_harvest::dispatch::DispatchKind::Workflow),

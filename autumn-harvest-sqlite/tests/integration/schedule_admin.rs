@@ -20,7 +20,7 @@ use autumn_harvest_sqlite::{
     ExecutionFilter, ExecutionSummary, ScheduleTrigger, SqliteError, SqliteReader, SqliteRuntime,
     Stored,
 };
-use chrono::DateTime;
+use jiff::Timestamp;
 use serde_json::json;
 
 #[workflow]
@@ -42,7 +42,7 @@ const MINUTE: i64 = 60_000;
 fn runtime_at(path: &std::path::Path, clock: &Arc<AtomicI64>) -> SqliteRuntime {
     let mut rt = SqliteRuntime::open(path).unwrap();
     let clock = clock.clone();
-    rt.set_clock(move || DateTime::from_timestamp_millis(clock.load(Ordering::SeqCst)).unwrap());
+    rt.set_clock(move || Timestamp::from_millisecond(clock.load(Ordering::SeqCst)).ok().unwrap());
     rt.register_workflow(&tick_info());
     rt.register_workflow(&hold_info());
     rt
@@ -73,7 +73,7 @@ fn next_run_at(rt: &SqliteRuntime, workflow: &str) -> Option<i64> {
         .find(|s| s.workflow_name == workflow)
         .expect("the schedule exists")
         .next_run_at
-        .map(|at| at.timestamp_millis())
+        .map(|at| at.as_millisecond())
 }
 
 /// `harvest.scheduler_enabled = false` stops every fire. The rows stay, and
@@ -235,7 +235,7 @@ async fn the_reader_lists_schedules_with_input_and_policy() {
     assert_eq!(listed[0].max_active_runs, 3);
     assert_eq!(listed[1].overlap_policy, OverlapPolicy::Skip);
     assert_eq!(
-        listed[1].next_run_at.map(|at| at.timestamp_millis()),
+        listed[1].next_run_at.map(|at| at.as_millisecond()),
         Some(T0 + MINUTE)
     );
     assert!(reader.schedule_override("tick").unwrap().is_none());

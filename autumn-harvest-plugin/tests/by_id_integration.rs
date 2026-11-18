@@ -19,6 +19,7 @@
 #![allow(clippy::too_many_lines)]
 
 use std::future::Future;
+use jiff_diesel::ToDiesel;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -41,7 +42,7 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{DateTime, Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
@@ -179,9 +180,9 @@ async fn seed(
     .await
     .expect("seed workflow");
 
-    let started_at: DateTime<Utc> = Utc::now() + Duration::minutes(started_min);
+    let started_at: Timestamp = Timestamp::now() + SignedDuration::from_mins(started_min);
     let completed_at = if autumn_harvest::erase::is_terminal_state(state) {
-        Some(started_at + Duration::minutes(1))
+        Some(started_at + SignedDuration::from_mins(1))
     } else {
         None
     };
@@ -282,7 +283,7 @@ async fn seed_query_run(
 
     let mut events = vec![WorkflowEvent::WorkflowStarted {
         input,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -320,8 +321,8 @@ async fn seed_terminal_raw(
     started_min: i64,
 ) -> ExecutionId {
     let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
-    let started_at: DateTime<Utc> = Utc::now() + Duration::minutes(started_min);
-    let completed_at = started_at + Duration::minutes(1);
+    let started_at: Timestamp = Timestamp::now() + SignedDuration::from_mins(started_min);
+    let completed_at = started_at + SignedDuration::from_mins(1);
     diesel::sql_query(
         "INSERT INTO harvest_workflow_executions \
          (id, workflow_name, workflow_id, shard_id, input, queue_name, state, started_at, completed_at) \
@@ -632,7 +633,7 @@ async fn resolves_to_running_successor_after_continue_as_new() {
     diesel::update(harvest_workflow_executions::table.find(predecessor.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"),
-            harvest_workflow_executions::started_at.eq(Utc::now() - Duration::minutes(10)),
+            harvest_workflow_executions::started_at.eq((Timestamp::now() - SignedDuration::from_mins(10)).to_diesel()),
         ))
         .execute(&mut conn)
         .await

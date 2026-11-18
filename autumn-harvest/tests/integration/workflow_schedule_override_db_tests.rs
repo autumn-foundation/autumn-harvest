@@ -23,7 +23,7 @@ use autumn_harvest::scheduler::{
     tick_once, update_code_declared_workflow_schedule,
 };
 use autumn_harvest::worker::HandlerRegistry;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
@@ -128,7 +128,7 @@ struct Row {
     id: uuid::Uuid,
     schedule_expr: Option<String>,
     max_active_runs: i32,
-    next_run_at: Option<DateTime<Utc>>,
+    next_run_at: Option<Timestamp>,
 }
 
 async fn workflow_row(conn: &mut AsyncPgConnection, workflow_name: &str) -> Row {
@@ -141,7 +141,7 @@ async fn workflow_row(conn: &mut AsyncPgConnection, workflow_name: &str) -> Row 
             dsl::max_active_runs,
             dsl::next_run_at,
         ))
-        .first::<(uuid::Uuid, Option<String>, i32, Option<DateTime<Utc>>)>(conn)
+        .first::<(uuid::Uuid, Option<String>, i32, Option<Timestamp>)>(conn)
         .await
         .expect("workflow row");
     Row {

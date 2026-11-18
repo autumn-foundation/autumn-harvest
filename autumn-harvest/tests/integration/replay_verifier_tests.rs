@@ -23,7 +23,7 @@ use autumn_harvest::testing::{
     ReplayVerifier, ReportFormat,
 };
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
@@ -74,7 +74,7 @@ fn canonical_snapshot_json(workflow_name: &str) -> String {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -122,7 +122,7 @@ fn unregistered_snapshot_json() -> String {
         execution_id: ExecutionId::new(),
         events: vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,

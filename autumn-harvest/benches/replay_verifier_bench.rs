@@ -14,7 +14,7 @@ use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::testing::{HistorySnapshot, ReplayVerifier};
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
-use chrono::Utc;
+use jiff::Timestamp;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use serde_json::Value;
 
@@ -40,7 +40,7 @@ fn build_fixture_json(activity_count: usize) -> String {
     let mut events = Vec::with_capacity(activity_count * 2 + 1);
     events.push(WorkflowEvent::WorkflowStarted {
         input: Value::from(activity_count as u64),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,

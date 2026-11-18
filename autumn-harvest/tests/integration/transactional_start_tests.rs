@@ -57,7 +57,7 @@ use autumn_harvest::types::{
 use autumn_harvest::worker::DbPool;
 use autumn_harvest::{TransactionalStartOptions, TransactionalStartOutcome};
 
-use chrono::Utc;
+use jiff::Timestamp;
 use diesel::sql_types::{BigInt, Text, Uuid as SqlUuid};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
@@ -418,14 +418,17 @@ async fn task_queue_row_queue_name(conn: &mut AsyncPgConnection, exec_id: Execut
 #[derive(diesel::QueryableByName)]
 struct ExecutionColumns {
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Interval>)]
-    execution_timeout: Option<chrono::Duration>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::NullablePgDuration)]
+    execution_timeout: Option<jiff::SignedDuration>,
     // `sla`/`sla_deadline_at` (issue #487): the second and third defaults that
     // AC3's issue text names alongside `execution_timeout`. See
     // `honors_workflow_info_execution_timeout_and_concurrency_key_defaults`.
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Interval>)]
-    sla: Option<chrono::Duration>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::NullablePgDuration)]
+    sla: Option<jiff::SignedDuration>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    sla_deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+    sla_deadline_at: Option<jiff::Timestamp>,
     #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
     start_source: Option<String>,
 }
@@ -2431,7 +2434,7 @@ async fn admission_gate_blocks_a_matching_workflow_name_and_spares_others() {
         reason: "t763-gate-test-incident".to_string(),
         message: None,
         created_by: "test".to_string(),
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         expires_at: None,
     }]);
     set_global_admission_gate_cache(Some(Arc::clone(&cache)));

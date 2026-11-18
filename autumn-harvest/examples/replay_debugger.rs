@@ -112,7 +112,7 @@ fn recorded_history() -> Vec<WorkflowEvent> {
     let reserve = ActivityExecId::new();
     let charge = ActivityExecId::new();
     vec![
-        WorkflowEvent::workflow_started(json!({}), chrono::Utc::now()),
+        WorkflowEvent::workflow_started(json!({}), jiff::Timestamp::now()),
         WorkflowEvent::ActivityScheduled {
             activity_id: reserve,
             name: "reserve_stock".to_string(),

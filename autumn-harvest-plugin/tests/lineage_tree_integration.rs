@@ -28,7 +28,7 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
@@ -262,11 +262,11 @@ async fn insert(conn: &mut AsyncPgConnection, spec: Spec<'_>) -> ExecutionId {
         .await
         .expect("insert execution");
 
-    let started_at = Utc::now() + Duration::seconds(spec.offset_secs);
+    let started_at = Timestamp::now() + SignedDuration::from_secs(spec.offset_secs);
     let completed_at = if spec.state == "RUNNING" {
         None
     } else {
-        Some(started_at + Duration::seconds(1))
+        Some(started_at + SignedDuration::from_secs(1))
     };
     diesel::update(wfx::table.find(exec_id.as_uuid()))
         .set((

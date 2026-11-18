@@ -16,6 +16,7 @@
 #![allow(clippy::too_many_lines)]
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
+use jiff_diesel::ToDiesel;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,7 +40,7 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::Utc;
+use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
@@ -248,7 +249,7 @@ async fn mark_completed(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
         ))
         .execute(conn)
         .await
@@ -402,7 +403,7 @@ async fn seed_completion_delivery_with_pii(
                 "workflow_id": "erase-pii-wf",
                 "state": "COMPLETED",
                 "result": { "email": pii },
-                "completed_at": Utc::now().to_rfc3339(),
+                "completed_at": autumn_harvest::time::rfc3339(Timestamp::now()),
             }),
             max_attempts: 10,
             retry_policy: json!({
@@ -413,7 +414,7 @@ async fn seed_completion_delivery_with_pii(
                 "non_retryable_errors": [],
                 "jitter": "None"
             }),
-            next_attempt_at: Utc::now(),
+            next_attempt_at: Timestamp::now(),
         })
         .execute(conn)
         .await
@@ -606,7 +607,7 @@ async fn erase_tombstones_pii_in_a_callback_dead_letter_row() {
                 "workflow_id": "erase-pii-wf-cb-dlq",
                 "state": "COMPLETED",
                 "result": { "email": pii },
-                "completed_at": Utc::now().to_rfc3339(),
+                "completed_at": autumn_harvest::time::rfc3339(Timestamp::now()),
             }),
             error: "delivery exhausted 10 attempts".to_string(),
             attempts: 10,

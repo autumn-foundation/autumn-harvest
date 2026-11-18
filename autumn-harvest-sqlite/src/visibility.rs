@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use autumn_harvest::ExecutionId;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, Row, ToSql};
 use serde_json::{Map, Value};
@@ -118,9 +118,9 @@ pub struct ExecutionFilter {
     /// Only runs in one of these states. An empty list matches every state.
     pub states: Vec<String>,
     /// Only runs that started at or after this time.
-    pub started_after: Option<DateTime<Utc>>,
+    pub started_after: Option<Timestamp>,
     /// Only runs that started before this time.
-    pub started_before: Option<DateTime<Utc>>,
+    pub started_before: Option<Timestamp>,
     /// Only runs whose search attribute equals each value.
     ///
     /// A value must be a JSON string, number, boolean or `null`. Numbers
@@ -176,14 +176,14 @@ impl ExecutionFilter {
 
     /// Only runs that started at or after `at`.
     #[must_use]
-    pub const fn started_after(mut self, at: DateTime<Utc>) -> Self {
+    pub const fn started_after(mut self, at: Timestamp) -> Self {
         self.started_after = Some(at);
         self
     }
 
     /// Only runs that started before `at`.
     #[must_use]
-    pub const fn started_before(mut self, at: DateTime<Utc>) -> Self {
+    pub const fn started_before(mut self, at: Timestamp) -> Self {
         self.started_before = Some(at);
         self
     }
@@ -225,9 +225,9 @@ pub struct ExecutionSummary {
     /// The state, such as `RUNNING` or `COMPLETED`.
     pub state: Stored<String>,
     /// The `WorkflowStarted` time. A row written before issue #2027 has none.
-    pub started_at: Stored<DateTime<Utc>>,
+    pub started_at: Stored<Timestamp>,
     /// The time of the terminal write. A running run has none.
-    pub closed_at: Stored<DateTime<Utc>>,
+    pub closed_at: Stored<Timestamp>,
     /// The search attributes, as a JSON object.
     pub search_attributes: Stored<Map<String, Value>>,
     /// The memo that the start set.
@@ -416,8 +416,8 @@ impl SqliteReader {
     /// [`SqliteError::Corrupt`] for a row that does not parse.
     pub fn llm_ledger_between(
         &self,
-        from: DateTime<Utc>,
-        until: DateTime<Utc>,
+        from: Timestamp,
+        until: Timestamp,
     ) -> SqliteResult<Vec<LlmLedgerRow>> {
         crate::llm_ledger::rows_between(&self.conn, from, until)
     }
@@ -765,13 +765,13 @@ fn build_query(
     }
     let started = column("started_at");
     if let Some(at) = filter.started_after {
-        let p = bind(&mut params, Param::Integer(at.timestamp_micros()));
+        let p = bind(&mut params, Param::Integer(at.as_microsecond()));
         terms.push(format!(
             "typeof({started}) = 'integer' AND {started} >= {p}"
         ));
     }
     if let Some(at) = filter.started_before {
-        let p = bind(&mut params, Param::Integer(at.timestamp_micros()));
+        let p = bind(&mut params, Param::Integer(at.as_microsecond()));
         terms.push(format!("typeof({started}) = 'integer' AND {started} < {p}"));
     }
     let attrs = column("search_attrs");
@@ -892,11 +892,11 @@ fn text(value: ValueRef<'_>) -> Stored<String> {
 }
 
 /// An epoch-microsecond field.
-fn time(value: ValueRef<'_>) -> Stored<DateTime<Utc>> {
+fn time(value: ValueRef<'_>) -> Stored<Timestamp> {
     match value {
         ValueRef::Null => Stored::Null,
         ValueRef::Integer(us) => {
-            DateTime::from_timestamp_micros(us).map_or(Stored::Unreadable, Stored::Value)
+            Timestamp::from_microsecond(us).ok().map_or(Stored::Unreadable, Stored::Value)
         }
         ValueRef::Real(_) | ValueRef::Text(_) | ValueRef::Blob(_) => Stored::Unreadable,
     }
@@ -930,7 +930,7 @@ mod tests {
             .workflow_name("wf")
             .state("RUNNING")
             .workflow_id_prefix("order-")
-            .started_after(chrono::Utc::now())
+            .started_after(jiff::Timestamp::now())
             .search_attribute("stage", serde_json::json!("done"));
         for payloads in [false, true] {
             let (sql, params) =

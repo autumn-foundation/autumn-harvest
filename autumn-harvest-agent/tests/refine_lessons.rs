@@ -255,7 +255,7 @@ fn fixture_of(memory: Option<Arc<dyn MemoryStore>>, selector: Arc<dyn OverlaySel
     let mut rt = SqliteRuntime::open(&db).unwrap();
     let read = Arc::clone(&clock);
     rt.set_clock(move || {
-        chrono::DateTime::from_timestamp_millis(read.load(Ordering::SeqCst)).unwrap()
+        jiff::Timestamp::from_millisecond(read.load(Ordering::SeqCst)).ok().unwrap()
     });
     sqlite::register(&mut rt, Arc::new(harness.clone()));
     Fixture {

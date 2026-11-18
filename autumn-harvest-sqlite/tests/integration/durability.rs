@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use autumn_harvest::prelude::*;
 use autumn_harvest_sqlite::{ActivitySpec, ExecutionOutcome, RunState, SqliteRuntime};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::json;
 
 // ── Test workflows (real `#[workflow]` fns — the reused determinism core) ─────
@@ -73,8 +73,8 @@ fn temp_db_path() -> (tempfile::TempDir, std::path::PathBuf) {
     (dir, path)
 }
 
-const fn fixed_now() -> DateTime<Utc> {
-    DateTime::<Utc>::from_timestamp(1_000_000, 0).unwrap()
+const fn fixed_now() -> Timestamp {
+    Timestamp::from_second(1_000_000).ok().unwrap()
 }
 
 // ── AC4(a): activity retry, then success ─────────────────────────────────────
@@ -234,7 +234,7 @@ async fn timer_fires_across_restart() {
     let mut rt2 = SqliteRuntime::open(&path).unwrap();
     rt2.register_workflow(&timer_then_done_info());
     let state = rt2
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(10))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(10))
         .await
         .unwrap();
     assert!(

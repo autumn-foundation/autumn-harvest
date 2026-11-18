@@ -63,6 +63,7 @@
 )]
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
+use jiff_diesel::ToDiesel;
 use autumn_harvest::table_split::SetExt;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -310,7 +311,8 @@ struct TaskQueueStateRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     state: String,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    scheduled_at: chrono::DateTime<chrono::Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    scheduled_at: jiff::Timestamp,
 }
 
 async fn task_queue_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> TaskQueueStateRow {
@@ -351,19 +353,19 @@ async fn task_queue_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId) ->
 /// Returns `(scheduled_at, observed_now)`. The function captures
 /// `observed_now` immediately after the qualifying read, in the same call.
 /// So nothing that happens between this function returning and the caller's
-/// own `Utc::now()` call stretches the caller's "is this in the future"
+/// own `Timestamp::now()` call stretches the caller's "is this in the future"
 /// comparison. That gap is immaterial given the backoff's 500ms floor, but
 /// closing it costs nothing.
 async fn task_scheduled_at_after_a_retry_cycle(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
-    since: chrono::DateTime<chrono::Utc>,
-) -> (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) {
+    since: jiff::Timestamp,
+) -> (jiff::Timestamp, jiff::Timestamp) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let row = task_queue_state(conn, exec_id).await;
         if row.state == "PENDING" && row.scheduled_at != since {
-            return (row.scheduled_at, chrono::Utc::now());
+            return (row.scheduled_at, jiff::Timestamp::now());
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -4010,11 +4012,12 @@ async fn insert_outbox_row(
 async fn outbox_next_attempt_at(
     conn: &mut AsyncPgConnection,
     id: Uuid,
-) -> Option<chrono::DateTime<chrono::Utc>> {
+) -> Option<jiff::Timestamp> {
     #[derive(diesel::QueryableByName)]
     struct Row {
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-        next_attempt_at: Option<chrono::DateTime<chrono::Utc>>,
+        #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+        next_attempt_at: Option<jiff::Timestamp>,
     }
     diesel::sql_query("SELECT next_attempt_at FROM harvest_completion_trigger_outbox WHERE id = $1")
         .bind::<diesel::sql_types::Uuid, _>(id)
@@ -4048,7 +4051,7 @@ async fn outbox_row_exists(conn: &mut AsyncPgConnection, id: Uuid) -> bool {
 async fn set_outbox_created_at(
     conn: &mut AsyncPgConnection,
     id: Uuid,
-    created_at: chrono::DateTime<chrono::Utc>,
+    created_at: jiff::Timestamp,
 ) {
     diesel::sql_query("UPDATE harvest_completion_trigger_outbox SET created_at = $2 WHERE id = $1")
         .bind::<diesel::sql_types::Uuid, _>(id)
@@ -4122,7 +4125,7 @@ async fn quota_blocked_outbox_row_gets_backoff_and_does_not_starve_a_sibling_row
     // last" assumption this test depends on. Stamp `created_at` explicitly,
     // strictly increasing by a whole second per row, so the intended order is
     // exact regardless of real wall-clock resolution.
-    let base_created_at = chrono::Utc::now() - chrono::Duration::hours(1);
+    let base_created_at = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1);
 
     let mut blocked_outbox_ids = Vec::with_capacity(BLOCKED_ROW_COUNT);
     for i in 0..BLOCKED_ROW_COUNT {
@@ -4135,7 +4138,7 @@ async fn quota_blocked_outbox_row_gets_backoff_and_does_not_starve_a_sibling_row
         set_outbox_created_at(
             &mut conn,
             id,
-            base_created_at + chrono::Duration::seconds(i64::try_from(i).expect("small index")),
+            base_created_at + jiff::SignedDuration::from_secs(i64::try_from(i).expect("small index")),
         )
         .await;
         blocked_outbox_ids.push(id);
@@ -4146,7 +4149,7 @@ async fn quota_blocked_outbox_row_gets_backoff_and_does_not_starve_a_sibling_row
         &mut conn,
         free_outbox_id,
         base_created_at
-            + chrono::Duration::seconds(i64::try_from(BLOCKED_ROW_COUNT).expect("small count")),
+            + jiff::SignedDuration::from_secs(i64::try_from(BLOCKED_ROW_COUNT).expect("small count")),
     )
     .await;
 
@@ -4174,7 +4177,7 @@ async fn quota_blocked_outbox_row_gets_backoff_and_does_not_starve_a_sibling_row
              not leave the row untouched (issue #1227 Finding 4)",
         );
     assert!(
-        first_backoff > chrono::Utc::now(),
+        first_backoff > jiff::Timestamp::now(),
         "next_attempt_at must be in the future immediately after a quota block"
     );
 
@@ -4212,7 +4215,7 @@ async fn quota_blocked_outbox_row_gets_backoff_and_does_not_starve_a_sibling_row
         "UPDATE harvest_completion_trigger_outbox SET next_attempt_at = $2 WHERE id = $1",
     )
     .bind::<diesel::sql_types::Uuid, _>(oldest_blocked_outbox_id)
-    .bind::<diesel::sql_types::Timestamptz, _>(chrono::Utc::now() - chrono::Duration::seconds(1))
+    .bind::<diesel::sql_types::Timestamptz, _>((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel())
     .execute(&mut conn)
     .await
     .expect("force backoff elapsed");
@@ -4235,7 +4238,7 @@ async fn quota_blocked_outbox_row_gets_backoff_and_does_not_starve_a_sibling_row
 /// A host-computed deadline can already be due by the time a peer replica
 /// checks it, when that replica's clock runs ahead. This test compares the
 /// written deadline against the database's own `NOW()`, never this test
-/// process's `chrono::Utc::now()`. It then catches a regression back to the
+/// process's `jiff::Timestamp::now()`. It then catches a regression back to the
 /// host clock, regardless of which replica's clock the regression favors.
 #[tokio::test]
 async fn quota_blocked_outbox_backoff_lands_on_the_database_clock() {
@@ -4295,7 +4298,7 @@ async fn quota_blocked_outbox_backoff_lands_on_the_database_clock() {
         deadline,
         before,
         after,
-        chrono::Duration::seconds(5),
+        jiff::SignedDuration::from_secs(5),
     );
 
     mark_terminal(&mut conn, blocker, "CANCELLED").await;
@@ -4314,13 +4317,13 @@ async fn quota_blocked_outbox_backoff_lands_on_the_database_clock() {
 /// long the bracketed operation itself takes. It does not race a slow or
 /// loaded test run the way a single post-hoc clock probe would.
 fn assert_next_attempt_at_matches_backoff_on_db_clock(
-    deadline: chrono::DateTime<chrono::Utc>,
-    before: chrono::DateTime<chrono::Utc>,
-    after: chrono::DateTime<chrono::Utc>,
-    expected_backoff: chrono::Duration,
+    deadline: jiff::Timestamp,
+    before: jiff::Timestamp,
+    after: jiff::Timestamp,
+    expected_backoff: jiff::SignedDuration,
 ) {
     const TOLERANCE_MS: i64 = 750;
-    let tolerance = chrono::Duration::milliseconds(TOLERANCE_MS);
+    let tolerance = jiff::SignedDuration::from_millis(TOLERANCE_MS);
     let lower = before + expected_backoff - tolerance;
     let upper = after + expected_backoff + tolerance;
     assert!(
@@ -4409,7 +4412,7 @@ async fn outbox_relay_missing_pool_backoff_lands_on_the_database_clock() {
         deadline,
         before,
         after,
-        chrono::Duration::seconds(5),
+        jiff::SignedDuration::from_secs(5),
     );
 }
 
@@ -4456,8 +4459,8 @@ async fn quota_blocked_outbox_never_attempted_rows_outrank_expired_quota_retries
     const CLAIM_BATCH_LIMIT: usize = 50;
     const EXPIRED_RETRY_ROW_COUNT: usize = CLAIM_BATCH_LIMIT + 10;
 
-    let base_created_at = chrono::Utc::now() - chrono::Duration::hours(1);
-    let expired_next_attempt_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+    let base_created_at = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1);
+    let expired_next_attempt_at = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1);
 
     let mut expired_retry_ids = Vec::with_capacity(EXPIRED_RETRY_ROW_COUNT);
     for i in 0..EXPIRED_RETRY_ROW_COUNT {
@@ -4470,14 +4473,14 @@ async fn quota_blocked_outbox_never_attempted_rows_outrank_expired_quota_retries
         set_outbox_created_at(
             &mut conn,
             id,
-            base_created_at + chrono::Duration::seconds(i64::try_from(i).expect("small index")),
+            base_created_at + jiff::SignedDuration::from_secs(i64::try_from(i).expect("small index")),
         )
         .await;
         diesel::sql_query(
             "UPDATE harvest_completion_trigger_outbox SET next_attempt_at = $2 WHERE id = $1",
         )
         .bind::<diesel::sql_types::Uuid, _>(id)
-        .bind::<diesel::sql_types::Timestamptz, _>(expired_next_attempt_at)
+        .bind::<diesel::sql_types::Timestamptz, _>(expired_next_attempt_at.to_diesel())
         .execute(&mut conn)
         .await
         .expect("stamp an already-expired backoff");
@@ -4492,7 +4495,7 @@ async fn quota_blocked_outbox_never_attempted_rows_outrank_expired_quota_retries
     set_outbox_created_at(
         &mut conn,
         fresh_outbox_id,
-        base_created_at - chrono::Duration::hours(1),
+        base_created_at - jiff::SignedDuration::from_hours(1),
     )
     .await;
 
@@ -4566,7 +4569,7 @@ async fn quota_blocked_outbox_retry_row_is_not_starved_by_a_flood_of_fresh_rows(
         "UPDATE harvest_completion_trigger_outbox SET next_attempt_at = $2 WHERE id = $1",
     )
     .bind::<diesel::sql_types::Uuid, _>(retry_outbox_id)
-    .bind::<diesel::sql_types::Timestamptz, _>(chrono::Utc::now() - chrono::Duration::seconds(1))
+    .bind::<diesel::sql_types::Timestamptz, _>((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel())
     .execute(&mut conn)
     .await
     .expect("stamp an already-expired, now-eligible backoff");
@@ -4665,7 +4668,7 @@ async fn quota_blocked_outbox_backs_off_rows_targeting_an_unconfigured_shard() {
     const UNREACHABLE_SHARD: i32 = 1;
     const UNREACHABLE_ROW_COUNT: usize = 55;
 
-    let base_created_at = chrono::Utc::now() - chrono::Duration::hours(1);
+    let base_created_at = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1);
     let mut unreachable_ids = Vec::with_capacity(UNREACHABLE_ROW_COUNT);
     for i in 0..UNREACHABLE_ROW_COUNT {
         let id = diesel::insert_into(harvest_completion_trigger_outbox::table)
@@ -4690,7 +4693,7 @@ async fn quota_blocked_outbox_backs_off_rows_targeting_an_unconfigured_shard() {
         set_outbox_created_at(
             &mut conn,
             id,
-            base_created_at + chrono::Duration::seconds(i64::try_from(i).expect("small index")),
+            base_created_at + jiff::SignedDuration::from_secs(i64::try_from(i).expect("small index")),
         )
         .await;
         unreachable_ids.push(id);
@@ -4701,7 +4704,7 @@ async fn quota_blocked_outbox_backs_off_rows_targeting_an_unconfigured_shard() {
         &mut conn,
         healthy_id,
         base_created_at
-            + chrono::Duration::seconds(i64::try_from(UNREACHABLE_ROW_COUNT).expect("small count")),
+            + jiff::SignedDuration::from_secs(i64::try_from(UNREACHABLE_ROW_COUNT).expect("small count")),
     )
     .await;
 
@@ -4723,7 +4726,7 @@ async fn quota_blocked_outbox_backs_off_rows_targeting_an_unconfigured_shard() {
     );
     let backed_off = outbox_next_attempt_at(&mut conn, unreachable_ids[0]).await;
     assert!(
-        backed_off.is_some_and(|t| t > chrono::Utc::now()),
+        backed_off.is_some_and(|t| t > jiff::Timestamp::now()),
         "a row that could not even be attempted (no pool for its target \
          shard) must still be stamped with a future next_attempt_at -- \
          otherwise it stays 'fresh' forever and keeps winning the \
@@ -4868,7 +4871,7 @@ async fn quota_blocked_outbox_relay_backoff_stamp_skips_a_concurrently_claimed_r
     assert!(
         outbox_next_attempt_at(&mut conn, id)
             .await
-            .is_some_and(|t| t > chrono::Utc::now()),
+            .is_some_and(|t| t > jiff::Timestamp::now()),
         "once the lock is released, the row must still receive its backoff \
          stamp normally"
     );

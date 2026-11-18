@@ -7,6 +7,7 @@
 #![cfg(feature = "db")]
 
 use autumn_harvest::error::HarvestError;
+use jiff_diesel::ToDiesel;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::execution::{
     SignalWithStartOutcome, SignalWithStartParams, signal_with_start_workflow_execution,
@@ -103,7 +104,7 @@ async fn force_state(
     diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
         .set((
             dsl::state.eq(state),
-            dsl::completed_at.eq(Some(chrono::Utc::now())),
+            dsl::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(conn)
         .await

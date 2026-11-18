@@ -341,7 +341,7 @@ async fn delete_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
 ///
 /// A pacing-override `expires_at` passes through two clocks in this suite.
 /// The SET/CLEAR HTTP response reports the Rust-side
-/// `chrono::Utc::now() + ttl` read (nanosecond precision). A later GET
+/// `jiff::Timestamp::now() + ttl` read (nanosecond precision). A later GET
 /// reflects what Postgres persisted in the `TIMESTAMPTZ` column (microsecond
 /// precision). Postgres truncates, it does not round. So the two values can
 /// differ by up to ~1 microsecond for the same override. A raw string
@@ -349,14 +349,13 @@ async fn delete_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
 /// tolerance prove the two reads agree on the expiry.
 fn assert_close_instant(a: Option<&str>, b: Option<&str>, msg: &str) {
     let parse = |s: &str| {
-        chrono::DateTime::parse_from_rfc3339(s)
+        s.parse::<Timestamp>()
             .unwrap_or_else(|e| panic!("{msg}: failed to parse {s:?}: {e}"))
-            .with_timezone(&chrono::Utc)
     };
     match (a, b) {
         (Some(a), Some(b)) => {
             let (ta, tb) = (parse(a), parse(b));
-            let delta_ms = (ta - tb).num_milliseconds().abs();
+            let delta_ms = autumn_harvest::time::num_milliseconds((ta - tb)).abs();
             assert!(
                 delta_ms < 1000,
                 "{msg}: {a} and {b} differ by {delta_ms}ms (expected sub-second precision drift only)"
@@ -1396,7 +1395,7 @@ async fn override_expires_at_reflects_ttl_and_reverts_to_null_on_delete() {
         vec![],
     );
 
-    let before = chrono::Utc::now();
+    let before = jiff::Timestamp::now();
     let (status, body) = post_json(
         &app,
         &format!("/admin/rate-limits/{name}/override"),
@@ -1404,12 +1403,11 @@ async fn override_expires_at_reflects_ttl_and_reverts_to_null_on_delete() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "set: {body}");
-    let expires_at: chrono::DateTime<chrono::Utc> = body["expires_at"]
+    let expires_at: jiff::Timestamp = body["expires_at"]
         .as_str()
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .and_then(|s| s.parse::<Timestamp>().ok())
         .expect("expires_at must be a present, parseable RFC3339 timestamp");
-    let delta = (expires_at - before).num_seconds();
+    let delta = (expires_at - before).as_secs();
     assert!(
         (95..=105).contains(&delta),
         "expires_at should land ~100s after the SET call (was {delta}s), body={body}"
@@ -1417,7 +1415,7 @@ async fn override_expires_at_reflects_ttl_and_reverts_to_null_on_delete() {
 
     // The read surface (GET /admin/rate-limits) reports the same expires_at
     // as the SET response, compared as parsed instants, not raw strings. The
-    // SET response reports the Rust-side `chrono::Utc::now()` read
+    // SET response reports the Rust-side `jiff::Timestamp::now()` read
     // (nanosecond precision). The list read reflects what Postgres persisted
     // (TIMESTAMPTZ, microsecond precision). So the strings differ in their
     // sub-microsecond digits for the same instant.
@@ -1902,7 +1900,7 @@ async fn get_start_throttle_pacing_override_returns_207_on_partial_shard_outage_
     // Seed an ACTIVE override directly on the live shard, without the SET
     // route. So this test isolates the partial-outage handling of the GET
     // route from the partial-write behaviour of SET, covered separately.
-    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(300);
+    let expires_at = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(300);
     {
         let mut conn = live_pool.get().await.expect("live conn");
         diesel::sql_query(
@@ -1984,7 +1982,7 @@ async fn get_start_throttle_pacing_override_reports_disagreement_across_live_sha
     // Shard 0: a live ACTIVE override, seeded with MORE tokens than shard 1.
     // So the pre-fix "fewest tokens wins" merge picks the WRONG (inactive)
     // shard as the representative.
-    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(300);
+    let expires_at = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(300);
     {
         let mut conn = pool_0.get().await.expect("shard 0 conn");
         diesel::sql_query(
@@ -2106,7 +2104,7 @@ async fn list_rate_limits_reports_disagreement_across_live_shards() {
     // Shard 0: a live ACTIVE override, seeded with MORE tokens than shard 1.
     // So the pre-fix "fewest tokens wins" merge picks the WRONG (inactive)
     // shard as the sole representative.
-    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(300);
+    let expires_at = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(300);
     {
         let mut conn = pool_0.get().await.expect("shard 0 conn");
         diesel::sql_query(
@@ -2204,7 +2202,7 @@ async fn list_rate_limits_reports_disagreement_when_a_shard_has_no_row() {
     let name = leaked_name("send_email");
 
     // Shard 0: a live ACTIVE override.
-    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(300);
+    let expires_at = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(300);
     {
         let mut conn = pool_0.get().await.expect("shard 0 conn");
         diesel::sql_query(
@@ -2288,7 +2286,7 @@ async fn get_start_throttle_pacing_override_detects_diverged_baseline_disagreeme
     // Shard 0: baseline burst = 20.0, as after a fully successful legacy SET.
     // override_refill_rate = 5.0, and override_burst = NULL falls back to the
     // shard baseline of 20.0.
-    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(300);
+    let expires_at = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(300);
     {
         let mut conn = pool_0.get().await.expect("shard 0 conn");
         diesel::sql_query(

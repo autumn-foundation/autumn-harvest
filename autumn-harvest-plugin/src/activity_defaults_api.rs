@@ -129,7 +129,7 @@ pub struct ActivityDefaultOverrideView {
     /// The actor that last changed the override.
     pub updated_by: String,
     /// When the override last changed.
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: jiff::Timestamp,
 }
 
 impl From<ActivityDefaultOverride> for ActivityDefaultOverrideView {
