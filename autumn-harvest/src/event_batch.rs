@@ -1132,7 +1132,7 @@ mod tests {
     #[test]
     fn a_far_max_wait_inside_the_chrono_range_saturates() {
         let now = Timestamp::constant(1_700_000_000, 0);
-        let ten_thousand_years = Duration::from_secs(315_576_000_000);
+        let ten_thousand_years = Duration::from_hours(87_660_000);
         assert_eq!(batch_fire_at(now, ten_thousand_years), Timestamp::MAX);
     }
 }

@@ -3324,6 +3324,7 @@ fn fence_against_sink_swap(
 /// transaction, no locks), apply (transaction 2). Returns the number of
 /// records delivered.
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
 async fn export_once_on_conn(
     conn: &mut diesel_async::AsyncPgConnection,
     config_arc: &std::sync::Arc<AuditExportRuntimeConfig>,

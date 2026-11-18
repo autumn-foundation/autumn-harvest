@@ -230,7 +230,7 @@ async fn paused_schedule_stays_paused_and_bookkeeping_preserved() {
     assert_eq!(row.runs_started, 5, "runs_started must be preserved");
     assert_eq!(row.consecutive_failure_count, 2);
     assert_eq!(
-        row.last_run_at.map(|t| t.as_second()),
+        row.last_run_at.map(jiff::Timestamp::as_second),
         Some(last_run.as_second()),
         "last_run_at must be preserved"
     );
@@ -601,7 +601,10 @@ async fn tristate_clear_and_absence_semantics() {
         .expect("update must succeed"),
     );
     assert_eq!(row.calendar_name.as_deref(), Some("us-holidays"));
-    assert_eq!(row.end_at.map(|t| t.as_second()), Some(end_at.as_second()));
+    assert_eq!(
+        row.end_at.map(jiff::Timestamp::as_second),
+        Some(end_at.as_second())
+    );
     assert_eq!(row.max_runs, Some(9));
 
     // Explicit Some(None) clears the stored values.
@@ -711,7 +714,7 @@ async fn autopaused_schedule_patch_preserves_then_clears_auto_paused_at() {
         .expect("update must succeed"),
     );
     assert_eq!(
-        row.auto_paused_at.map(|t| t.as_second()),
+        row.auto_paused_at.map(jiff::Timestamp::as_second),
         Some(auto_paused.as_second()),
         "an unrelated patch must not clear auto_paused_at"
     );
@@ -789,7 +792,7 @@ async fn tick_fires_fresh_row_not_pre_claim_snapshot() {
         .expect("concurrent edit must succeed"),
     );
     assert_eq!(
-        patched.next_run_at.map(|t| t.as_microsecond()),
+        patched.next_run_at.map(jiff::Timestamp::as_microsecond),
         Some(slot.as_microsecond()),
         "a non-cadence edit must leave the armed slot in place"
     );
@@ -904,7 +907,7 @@ async fn patch_blocks_on_row_lock_and_applies_against_post_commit_row() {
             .expect("patch must succeed after the lock is released"),
     );
     assert_eq!(
-        row.next_run_at.map(|t| t.as_microsecond()),
+        row.next_run_at.map(jiff::Timestamp::as_microsecond),
         Some(advanced_slot.as_microsecond()),
         "the PATCH must merge against the post-commit row: the concurrently \
          advanced next_run_at must survive the edit"
@@ -982,7 +985,7 @@ async fn patch_on_expired_claim_fences_straggler_finalize() {
     );
     let after = load_by_id(&mut conn, before.id).await;
     assert_ne!(
-        after.next_run_at.map(|t| t.as_microsecond()),
+        after.next_run_at.map(jiff::Timestamp::as_microsecond),
         Some(old_spec_next.as_microsecond()),
         "the straggler must not have clobbered next_run_at"
     );

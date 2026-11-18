@@ -19,7 +19,7 @@ use super::CHRONO_MAX_DURATION;
 const NANOS_PER_SECOND: i32 = 1_000_000_000;
 
 /// Splits `duration` into the floored seconds and the nanoseconds of `chrono`.
-fn parts(duration: SignedDuration) -> (i64, i32) {
+const fn parts(duration: SignedDuration) -> (i64, i32) {
     let (seconds, nanos) = (duration.as_secs(), duration.subsec_nanos());
     if nanos < 0 {
         (seconds - 1, nanos + NANOS_PER_SECOND)

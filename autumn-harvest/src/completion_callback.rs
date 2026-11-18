@@ -1553,7 +1553,7 @@ fn strip_rfc2822_comments(value: &str) -> &str {
     let Some(start) = value.find('(') else {
         return value;
     };
-    let mut rest = value[start..].as_bytes();
+    let mut rest = &value.as_bytes()[start..];
     while !rest.is_empty() {
         let Some(after) = rest.trim_ascii_start().strip_prefix(b"(") else {
             return value;

@@ -15,6 +15,9 @@ Accepted.
   has one type for an instant (`Timestamp`), one for an exact elapsed time
   (`SignedDuration`), and one for a zoned value (`ZonedDateTime`). It
   bundles the IANA database and resolves a zone name at run time.
+- RustSec marks `chrono` and `chrono-tz` unmaintained, with no safe
+  upgrade (RUSTSEC-2026-0543 and RUSTSEC-2026-0555). The advisories name
+  `jiff` as a replacement.
 - Diesel has no `jiff` feature. A foreign trait cannot be implemented for a
   foreign type, so Harvest cannot add the Diesel impls itself.
 - Some text that holds a timestamp is a contract. The audit chain hashes
@@ -84,7 +87,7 @@ Accepted.
   year 9999. A reader of a stored timestamp clamps such a value to
   `Timestamp::MAX`. A calendar exclusion date past 9999-12-31 can match no
   fire date, so a read skips it. A request that sends such a date gets a
-  400. `chrono` accepted that request.
+  422. `chrono` accepted that request.
 - A sum of an instant and a duration that passes the jiff range, but not
   the `chrono` range, saturates to `Timestamp::MAX` or `Timestamp::MIN`.
   `time::checked_add_chrono_range` does it. So a far deadline stays far.

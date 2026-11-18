@@ -11157,7 +11157,7 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
 
     // Verify the deadline fields are surfaced correctly.
     assert_eq!(
-        execution.deadline_at.map(|d| d.as_millisecond()),
+        execution.deadline_at.map(jiff::Timestamp::as_millisecond),
         Some(deadline_at.as_millisecond()),
         "deadline_at should match what was set at start time"
     );

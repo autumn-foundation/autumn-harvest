@@ -1972,8 +1972,7 @@ pub mod db {
         // monotonic clock and stamped on the host wall clock.
         let t0 = Instant::now() + STEP_LEAD;
         let t0_utc = Timestamp::now()
-            + jiff::SignedDuration::try_from(STEP_LEAD)
-                .unwrap_or_else(|_| jiff::SignedDuration::ZERO);
+            + jiff::SignedDuration::try_from(STEP_LEAD).unwrap_or(jiff::SignedDuration::ZERO);
 
         // A `JoinSet` aborts every arrival if one panics. Each arrival holds
         // a census guard, so a forced abort can wait for its connection.

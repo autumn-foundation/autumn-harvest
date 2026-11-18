@@ -1565,26 +1565,28 @@ pub(crate) async fn insert_fork_row(
 ) -> Result<WorkflowExecution, diesel::result::Error> {
     // Re-compute deadline_at from the source execution's timeout so the fork
     // gets a fresh deadline anchored to its own start time (issue #243).
-    // jiff stops at year 9999, far below the `chrono` limit. A stored timeout
-    // past that year yields no deadline rather than a panic.
+    // jiff stops at year 9999, far below the `chrono` limit. A sum that
+    // `chrono` held saturates to `Timestamp::MAX`, as on the start path. A sum
+    // past the `chrono` range yields no deadline rather than a panic.
+    let now = jiff::Timestamp::now();
     let deadline_at = source
         .execution_timeout
-        .and_then(|d| jiff::Timestamp::now().checked_add(d).ok());
+        .and_then(|d| crate::time::checked_add_chrono_range(now, d));
     // Re-anchor the soft SLA deadline per-fork (issue #487).
     let sla_deadline_at = source
         .sla
-        .and_then(|d| jiff::Timestamp::now().checked_add(d).ok());
+        .and_then(|d| crate::time::checked_add_chrono_range(now, d));
     // Reset deliberately starts a NEW chain origin (issue #617), like
     // `first_exec_id: None` / `schedule_id: None` below. An operator reset breaks
     // the continue-as-new lineage, as in the #488 lineage-break precedent. So the
     // chain deadline is RE-ANCHORED to the start of the fork, not carried
     // verbatim. A source with no chain cap yields `None` for both.
-    // `checked_add` (not `+`): an absurd operator ceiling can make the
+    // A checked sum (not `+`): an absurd operator ceiling can make the
     // `chain_execution_timeout` of the source reach `jiff::SignedDuration::MAX`.
-    // `Timestamp + SignedDuration` panics on overflow; yield `None` instead (issue #617).
+    // `Timestamp + SignedDuration` panics on overflow. Yield `None` instead (issue #617).
     let chain_deadline_at = source
         .chain_execution_timeout
-        .and_then(|d| jiff::Timestamp::now().checked_add(d).ok());
+        .and_then(|d| crate::time::checked_add_chrono_range(now, d));
     // Provenance ref for a reset fork is the source execution id (#740).
     let source_exec_id_str = source.id.to_string();
     // Strip the six replay-non-determinism diagnostic keys unconditionally

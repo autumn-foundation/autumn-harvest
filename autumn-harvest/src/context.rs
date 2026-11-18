@@ -20318,7 +20318,7 @@ mod tests {
         {
             // The public accessor is the nominal deadline; return its millis so
             // the test can assert the handler inherited execution_timeout.
-            let nominal = ctx.deadline().map(|d| d.as_millisecond());
+            let nominal = ctx.deadline().map(jiff::Timestamp::as_millisecond);
             Box::pin(async move { Ok(serde_json::json!(nominal)) })
         }
 

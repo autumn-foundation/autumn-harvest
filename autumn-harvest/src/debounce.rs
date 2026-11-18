@@ -1621,7 +1621,7 @@ mod tests {
     fn a_max_wait_past_the_chrono_range_keeps_the_window() {
         let t0 = ts(2026, 6, 18, 10, 0, 0);
         let window = Duration::from_secs(30);
-        let max_wait = Duration::from_secs(999_999_999_999 * 86_400);
+        let max_wait = Duration::from_hours(23_999_999_999_976);
         let deadline = compute_fire_deadline(t0, window, t0, max_wait);
         assert_eq!(deadline, t0 + jiff::SignedDuration::from_secs(30));
     }
@@ -1632,7 +1632,7 @@ mod tests {
     fn a_far_max_wait_inside_the_chrono_range_keeps_the_window() {
         let t0 = ts(2026, 6, 18, 10, 0, 0);
         let thirty = Duration::from_secs(30);
-        let ten_thousand_years = Duration::from_secs(315_576_000_000);
+        let ten_thousand_years = Duration::from_hours(87_660_000);
         let expected = t0 + jiff::SignedDuration::from_secs(30);
         assert_eq!(
             compute_fire_deadline(t0, thirty, t0, ten_thousand_years),
@@ -1649,7 +1649,7 @@ mod tests {
     fn a_far_window_inside_the_chrono_range_fires_on_the_cap() {
         let t0 = ts(2026, 6, 18, 10, 0, 0);
         let hour = Duration::from_secs(3_600);
-        let ten_thousand_years = Duration::from_secs(315_576_000_000);
+        let ten_thousand_years = Duration::from_hours(87_660_000);
         let expected = t0 + jiff::SignedDuration::from_hours(1);
         assert_eq!(
             compute_fire_deadline(t0, ten_thousand_years, t0, hour),

@@ -95,14 +95,20 @@ const CHRONO_MAX_UTC_SECOND: i64 = 8_210_266_876_799;
 /// A sum past the `chrono` range gives `None`, as `checked_add_signed` did.
 #[must_use]
 pub fn checked_add_chrono_range(at: Timestamp, duration: SignedDuration) -> Option<Timestamp> {
-    let sum = at.as_second().saturating_add(duration.as_secs());
+    // The sum is exact in nanoseconds. An `i128` holds it with no overflow.
+    let sum = at.as_nanosecond() + duration.as_nanos();
+    let first = i128::from(CHRONO_MIN_UTC_SECOND) * NANOS_PER_SECOND;
+    let last = i128::from(CHRONO_MAX_UTC_SECOND) * NANOS_PER_SECOND + (NANOS_PER_SECOND - 1);
     match at.checked_add(duration) {
         Ok(sum) => Some(sum),
-        Err(_) if duration.is_positive() && sum <= CHRONO_MAX_UTC_SECOND => Some(Timestamp::MAX),
-        Err(_) if duration.is_negative() && sum >= CHRONO_MIN_UTC_SECOND => Some(Timestamp::MIN),
+        Err(_) if duration.is_positive() && sum <= last => Some(Timestamp::MAX),
+        Err(_) if duration.is_negative() && sum >= first => Some(Timestamp::MIN),
         Err(_) => None,
     }
 }
+
+/// Nanoseconds in one second.
+const NANOS_PER_SECOND: i128 = 1_000_000_000;
 
 /// Seconds in one day of elapsed time.
 const SECONDS_PER_DAY: i64 = 86_400;
@@ -327,6 +333,32 @@ mod tests {
         assert_eq!(checked_add_chrono_range(now, -past_chrono), None);
         assert_eq!(checked_add_chrono_range(now, SignedDuration::MAX), None);
         assert_eq!(checked_add_chrono_range(now, SignedDuration::MIN), None);
+    }
+
+    #[test]
+    fn checked_add_chrono_range_keeps_the_nanoseconds_at_the_chrono_ends() {
+        let past_min = SignedDuration::new(-8_334_601_228_800, -1);
+        assert_eq!(
+            checked_add_chrono_range(Timestamp::UNIX_EPOCH, past_min),
+            None
+        );
+        let at_min = SignedDuration::from_secs(-8_334_601_228_800);
+        assert_eq!(
+            checked_add_chrono_range(Timestamp::UNIX_EPOCH, at_min),
+            Some(Timestamp::MIN)
+        );
+        let half = Timestamp::new(0, 500_000_000).expect("in range");
+        let past_max = SignedDuration::new(8_210_266_876_799, 600_000_000);
+        assert_eq!(checked_add_chrono_range(half, past_max), None);
+        let before_epoch = Timestamp::new(-1, -900_000_000).expect("in range");
+        let inside = SignedDuration::from_secs(8_210_266_876_801);
+        assert_eq!(
+            checked_add_chrono_range(before_epoch, inside),
+            Some(Timestamp::MAX)
+        );
+        let late = Timestamp::new(1_700_000_000, 600_000_000).expect("in range");
+        let over = SignedDuration::new(8_208_566_876_799, 700_000_000);
+        assert_eq!(checked_add_chrono_range(late, over), None);
     }
 
     #[test]

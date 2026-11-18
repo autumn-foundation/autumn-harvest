@@ -929,7 +929,7 @@ pub struct EnqueueParams {
     /// this worker preferentially for `sticky_timeout` after it becomes
     /// claimable. Once the window expires, any worker may claim it.
     pub sticky_worker_id: Option<String>,
-    /// SignedDuration of the sticky preference window. Stored on the row so that
+    /// The sticky preference window. Stored on the row so that
     /// [`wake_workflow_task()`] can refresh `sticky_until` to the same value
     /// on each transition back to PENDING without needing external config.
     pub sticky_timeout: Option<StdDuration>,

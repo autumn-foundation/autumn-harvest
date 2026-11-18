@@ -6089,10 +6089,10 @@ pub fn schedule_overdue(inputs: &OverdueInputs) -> OverdueVerdict {
     let Some(step) = cadence_step(inputs.schedule, next_run_at) else {
         return OverdueVerdict::NOT_OVERDUE;
     };
-    let jitter = jiff::SignedDuration::try_from(inputs.jitter)
-        .unwrap_or_else(|_| jiff::SignedDuration::ZERO);
-    let tick = jiff::SignedDuration::try_from(inputs.tick_interval)
-        .unwrap_or_else(|_| jiff::SignedDuration::ZERO);
+    // A value past `i64::MAX` milliseconds counts as zero, as `chrono` did.
+    let jitter = crate::time::from_std_bounded(inputs.jitter).unwrap_or(jiff::SignedDuration::ZERO);
+    let tick =
+        crate::time::from_std_bounded(inputs.tick_interval).unwrap_or(jiff::SignedDuration::ZERO);
     // `jiff::SignedDuration`'s `+` panics on overflow; a pathological (near-i64-seconds)
     // interval + jitter could overflow. Treat an unrepresentable grace as "no
     // cadence" (never overdue), consistent with how the module treats a
@@ -6769,10 +6769,9 @@ pub(crate) fn catchup_run_plan(
 /// `chrono::Duration::from_std` failed for it. A cutoff before the jiff range
 /// gives `Timestamp::MIN`, so every missed slot is in the window, as in chrono.
 fn catchup_window_cutoff(now: Timestamp, window: std::time::Duration) -> Timestamp {
-    match crate::time::from_std_bounded(window) {
-        Some(window) => now.checked_sub(window).unwrap_or(Timestamp::MIN),
-        None => now,
-    }
+    crate::time::from_std_bounded(window).map_or(now, |window| {
+        now.checked_sub(window).unwrap_or(Timestamp::MIN)
+    })
 }
 
 /// Summary of the eligible missed slots for a bounded catchup policy.
@@ -10484,7 +10483,7 @@ mod tests {
             // changeset-shaped comparison misses it entirely. A row left
             // auto-paused then stays silently disabled forever.
             ("auto_paused_at", |r| {
-                r.auto_paused_at = Some(Timestamp::now())
+                r.auto_paused_at = Some(Timestamp::now());
             }),
         ];
 

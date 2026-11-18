@@ -1453,7 +1453,7 @@ async fn scheduled_carryover_and_lineage_survive_a_type_change() {
         "schedule lineage must survive a type change"
     );
     assert_eq!(
-        after.scheduled_for.map(|s| s.as_millisecond()),
+        after.scheduled_for.map(jiff::Timestamp::as_millisecond),
         Some(slot.as_millisecond()),
         "the logical slot must survive a type change"
     );

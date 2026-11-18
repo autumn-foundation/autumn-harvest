@@ -401,6 +401,9 @@ macro_rules! split_insertable {
 
         impl<'r, $a> $view<'r, $a> {
             /// Borrow the columns of this declaration from `row`.
+            // A view with a converted column calls `From::from`, which is not
+            // `const`. A view without one could be `const`, so the lint fires.
+            #[allow(clippy::missing_const_for_fn)]
             fn view(row: &'r $ty<$a>) -> Self {
                 Self {
                     $($plain: &row.$plain,)*

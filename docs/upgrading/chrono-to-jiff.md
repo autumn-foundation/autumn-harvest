@@ -88,7 +88,7 @@ text. It clamps an instant past the jiff range to the nearest end.
   `chrono` did. A date with a time is refused.
 - **Input that jiff cannot hold.** Three inputs differ from `chrono`.
   `PUT /calendars/{name}` refuses an exclusion date past 9999-12-31 or
-  before -9999-01-01 with a 400. `chrono` accepted it, but it can match no
+  before -9999-01-01 with a 422. `chrono` accepted it, but it can match no
   fire date. `harvest token bootstrap --expires-at` refuses a U+2212 minus
   sign in the offset, because Postgres gets the raw text and cannot read
   it. A leap second `:60` reads as second 59 with its fraction, as jiff

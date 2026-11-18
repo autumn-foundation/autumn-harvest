@@ -3439,7 +3439,7 @@ mod tests {
         let wanted = with_bound_channel(None, async { hints_wanted() }).await;
         with_bound_channel(None, publish_now(vec![hint("q", Timestamp::now())])).await;
         with_bound_channel(None, async {
-            publish_in_background(hint("q", Timestamp::now()))
+            publish_in_background(hint("q", Timestamp::now()));
         })
         .await;
         // The publisher queue is FIFO. A leaked hint lands before this one.

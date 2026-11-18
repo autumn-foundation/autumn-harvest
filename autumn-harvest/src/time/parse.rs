@@ -489,6 +489,8 @@ mod tests {
     struct Body {
         #[serde(default, deserialize_with = "de::optional")]
         start_at: Option<Timestamp>,
+        // The outer `Option` is absent; the inner one is JSON `null`.
+        #[allow(clippy::option_option)]
         #[serde(default, deserialize_with = "de::tristate")]
         end_at: Option<Option<Timestamp>>,
         #[serde(default, deserialize_with = "de::dates")]
@@ -507,7 +509,7 @@ mod tests {
 
         let empty: Body = serde_json::from_str("{}").expect("an empty body");
         assert_eq!((empty.start_at, empty.end_at), (None, None));
-        assert!(empty.dates.is_empty());
+        assert_eq!(empty.dates, [] as [jiff::civil::Date; 0]);
 
         let display: Body = serde_json::from_str(r#"{"end_at":"2026-12-01 09:00:00 UTC"}"#)
             .expect("the chrono display form");

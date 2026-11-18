@@ -5930,10 +5930,12 @@ fn bounded_duration_from_std(
 /// time. jiff stops at year 9999. A sum past that year saturates, so a
 /// timer that never fires does not panic the worker.
 fn saturating_fire_at(at: jiff::Timestamp, delay: jiff::SignedDuration) -> jiff::Timestamp {
-    at.checked_add(delay).unwrap_or(if delay.is_negative() {
-        jiff::Timestamp::MIN
-    } else {
-        jiff::Timestamp::MAX
+    at.checked_add(delay).unwrap_or_else(|_| {
+        if delay.is_negative() {
+            jiff::Timestamp::MIN
+        } else {
+            jiff::Timestamp::MAX
+        }
     })
 }
 
@@ -16695,8 +16697,8 @@ async fn create_detached_child_executions(
         // detached child resolves no `execution_timeout`, so only the SLA applies.
         let (_, child_sla) = registry.apply_run_defaults(workflow_name, None, child_sla);
         let child_sla = child_sla.and_then(crate::time::from_std_bounded);
-        let child_sla_deadline_at =
-            child_sla.and_then(|d| jiff::Timestamp::now().checked_add(d).ok());
+        let child_sla_deadline_at = child_sla
+            .and_then(|d| crate::time::checked_add_chrono_range(jiff::Timestamp::now(), d));
         // A detached child accumulates its own history/DLQ/active-execution
         // footprint exactly like any other registry-aware start. So it is
         // resolved against and enforced under its OWN declared quota (issue
@@ -57577,7 +57579,7 @@ mod tests {
     #[test]
     fn can803_cross_type_far_timeout_inside_the_chrono_range_saturates() {
         let execution = can803_predecessor();
-        let ten_thousand_years = Duration::from_secs(315_576_000_000);
+        let ten_thousand_years = Duration::from_hours(87_660_000);
         let mut target = can803_wf_info("paid_subscription");
         target.execution_timeout = Some(ten_thousand_years);
         target.sla = Some(ten_thousand_years);

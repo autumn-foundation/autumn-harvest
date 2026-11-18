@@ -242,13 +242,13 @@ impl From<NullableTimestamp> for Option<Timestamp> {
 
 impl ToSql<Nullable<Timestamptz>, Pg> for NullableTimestamp {
     fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Pg>) -> serialize::Result {
-        match self.0 {
-            Some(at) => {
+        self.0.map_or_else(
+            || Ok(serialize::IsNull::Yes),
+            |at| {
                 let at = jiff_diesel::Timestamp::from(at);
                 <jiff_diesel::Timestamp as ToSql<Timestamptz, Pg>>::to_sql(&at, &mut out.reborrow())
-            }
-            None => Ok(serialize::IsNull::Yes),
-        }
+            },
+        )
     }
 }
 

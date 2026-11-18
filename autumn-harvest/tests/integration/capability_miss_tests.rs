@@ -2522,6 +2522,7 @@ async fn stale_miss_evidence_from_a_worker_that_never_restarted_still_escalates(
 /// reads as a completed fleet sweep. The execution lands in `FAILED` with a
 /// `no_capable_worker:` reason instead of the task returning to `PENDING`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn restart_onto_a_capable_build_clears_its_stale_miss_evidence() {
     // Budget 1, already spent by the seeded miss. The very next miss escalates
     // unless the evidence is invalidated. So the two outcomes are one claim

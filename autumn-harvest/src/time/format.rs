@@ -85,13 +85,12 @@ fn write_datetime(out: &mut String, at: Timestamp, separator: char, format: Seco
     let nanos = dt.subsec_nanosecond();
     let digits = match format {
         SecondsFormat::Secs => 0,
-        SecondsFormat::Millis => 3,
-        SecondsFormat::Micros => 6,
-        SecondsFormat::Nanos => 9,
         SecondsFormat::AutoSi if nanos == 0 => 0,
+        SecondsFormat::Millis => 3,
         SecondsFormat::AutoSi if nanos % 1_000_000 == 0 => 3,
+        SecondsFormat::Micros => 6,
         SecondsFormat::AutoSi if nanos % 1_000 == 0 => 6,
-        SecondsFormat::AutoSi => 9,
+        SecondsFormat::Nanos | SecondsFormat::AutoSi => 9,
     };
     match digits {
         3 => {
