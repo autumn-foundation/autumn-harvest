@@ -314,6 +314,7 @@ pub mod dag_retry_envelope;
 #[cfg(any(test, feature = "testing"))]
 pub mod dag_simulator;
 pub mod dag_slack;
+pub mod dag_slot_plan;
 /// Debounced workflow starts — collapse trigger bursts into one run (issue #499).
 pub mod debounce;
 /// Time-travel replay debugger for recorded workflow histories (issue #949).
@@ -758,6 +759,7 @@ pub use dag_profiler::{DagProfile, DagProfiler, ProfilerEvent, ProfilerEventKind
 #[cfg(any(test, feature = "testing"))]
 pub use dag_simulator::{DagSimulator, DagSimulatorResult};
 pub use dag_slack::{DagSlackAnalyzer, DagSlackReport, TaskSlack};
+pub use dag_slot_plan::{PlannedTask, SlotPlan, fewest_slots as dag_fewest_slots};
 pub use det_check::{
     DetCheckReport, DetFinding, DetLocation, DetSeverity, DetSuppression, check_dir, check_file,
     check_paths, check_source,
