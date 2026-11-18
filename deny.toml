@@ -358,6 +358,17 @@ ignore = [
     # links it. Revisit: Rhai moves to compact_str or smol_str, or the example
     # drops Rhai.
     { id = "RUSTSEC-2026-0249", reason = "unmaintained, not a vulnerability, no safe upgrade: smartstring arrives only through rhai in examples/rhai-scripts (publish = false). No published crate links it. Revisit: rhai drops smartstring, or the example drops rhai." },
+
+    # RUSTSEC-2026-0543 / RUSTSEC-2026-0555: `chrono` 0.4.45 and `chrono-tz`
+    # 0.10.4 are unmaintained. Neither is a vulnerability, and each advisory
+    # names no safe upgrade. Both are in the public API: timestamps, cron
+    # schedules, diesel column types and autumn-web use them. Replacing them
+    # with jiff or time is a breaking change, so it needs its own release
+    # (issue #2726). The advisories fail `cargo deny` on every push and PR
+    # until then (issue #2722). Revisit: issue #2726 lands, or an advisory
+    # turns into a vulnerability.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained, not a vulnerability, no safe upgrade: chrono is in the public API (timestamps, cron, diesel columns, autumn-web). Replacing it is a breaking change tracked in issue #2726. Revisit: issue #2726 lands." },
+    { id = "RUSTSEC-2026-0555", reason = "unmaintained, not a vulnerability, no safe upgrade: chrono-tz carries the schedule time zones in the public API. Replacing it is a breaking change tracked in issue #2726. Revisit: issue #2726 lands." },
 ]
 
 # ---------------------------------------------------------------------------
