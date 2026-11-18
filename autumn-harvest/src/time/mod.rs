@@ -23,7 +23,10 @@ pub mod format;
 pub mod parse;
 pub mod serde_clamped;
 pub mod serde_secs_nanos;
+// The Postgres wrappers live in a flat file. The SQLite feasibility
+// inventory scans `src` one level deep, so it records their coupling.
 #[cfg(feature = "db")]
+#[path = "../time_sql.rs"]
 pub mod sql;
 
 pub use format::{SecondsFormat, rfc3339, rfc3339_opts, utc_display};
