@@ -153,5 +153,11 @@ struct Row {
 }
 ```
 
+`jiff_diesel::Timestamp` refuses a stored value past the jiff range, such
+as `infinity`. `autumn_harvest::time::sql::SqlTimestamp` and
+`NullableTimestamp` clamp it to the nearest end, as Harvest does on its
+own reads. Use them for a column that an older process could have written
+with such a value.
+
 `autumn_harvest::time::sql::PgDuration` maps a `SignedDuration` to an
 `interval` with the old rules.
