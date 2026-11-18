@@ -225,9 +225,10 @@ pub struct Task {
 
 /// The latest deadline that a handoff stores, in epoch milliseconds.
 ///
-/// A longer deadline saturates to it. A later instant has no `DateTime`
-/// form, so the read of its row would fail.
-const fn latest_deadline() -> i64 {
+/// A longer deadline saturates to it. A later instant has no `Timestamp`
+/// form. A row that `chrono` wrote can hold the old, later sentinel of the
+/// year 262142. Its read clamps it to [`Timestamp::MAX`].
+fn latest_deadline() -> i64 {
     Timestamp::MAX.as_millisecond()
 }
 
@@ -522,9 +523,8 @@ struct RawHandoff {
 
 impl RawHandoff {
     fn decode(self) -> SqliteResult<ExternalHandoff> {
-        let time = |ms: i64, field: &str| {
-            Timestamp::from_millisecond(ms).ok().ok_or_else(|| SqliteError::corrupt(field))
-        };
+        // A stored value past the jiff range reads clamped, so it never fails.
+        let time = autumn_harvest::time::from_millisecond_clamped;
         Ok(ExternalHandoff {
             token: self
                 .token
@@ -544,9 +544,9 @@ impl RawHandoff {
             queue: self.queue,
             input: serde_json::from_str(&self.input_json)?,
             state: ExternalTaskState::parse(&self.state)?,
-            created_at: time(self.created_at, "harvest_external_tasks.created_at")?,
-            updated_at: time(self.updated_at, "harvest_external_tasks.updated_at")?,
-            deadline_at: time(self.deadline_at, "harvest_external_tasks.deadline_at")?,
+            created_at: time(self.created_at),
+            updated_at: time(self.updated_at),
+            deadline_at: time(self.deadline_at),
         })
     }
 }
@@ -575,7 +575,7 @@ mod tests {
     fn a_deadline_stays_in_the_datetime_range() {
         assert_eq!(bounded_deadline(i64::MAX), latest_deadline());
         assert_eq!(bounded_deadline(5), 5);
-        assert!(jiff::Timestamp::from_millisecond(latest_deadline()).ok().is_some());
+        assert_eq!(jiff::Timestamp::from_millisecond(latest_deadline()).ok(), Some(jiff::Timestamp::MAX));
     }
 
     #[test]

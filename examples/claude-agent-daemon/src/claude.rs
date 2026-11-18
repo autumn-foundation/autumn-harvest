@@ -16,7 +16,6 @@
 
 use std::time::Duration;
 
-use autumn_harvest::chrono::{DateTime, Utc};
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 use autumn_harvest::llm_ledger::LlmCall;
 use autumn_harvest_agent::anthropic::reqwest::StatusCode;

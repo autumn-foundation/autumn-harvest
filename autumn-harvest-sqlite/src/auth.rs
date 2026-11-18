@@ -31,7 +31,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
-use jiff::{SignedDuration, Timestamp};
+use jiff::Timestamp;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, Row, params, params_from_iter};
 use uuid::Uuid;
@@ -719,7 +719,7 @@ fn parse_id(raw: &str) -> SqliteResult<Uuid> {
 }
 
 fn from_micros(micros: i64) -> SqliteResult<Timestamp> {
-    Timestamp::from_microsecond(micros).ok()
+    Some(autumn_harvest::time::from_microsecond_clamped(micros))
         .ok_or_else(|| SqliteError::Corrupt(format!("a stored time {micros}")))
 }
 

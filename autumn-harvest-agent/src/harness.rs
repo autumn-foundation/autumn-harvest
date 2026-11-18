@@ -758,7 +758,7 @@ impl AgentHarness {
     pub(crate) async fn check_mesh_budget(
         &self,
         mesh: Option<&str>,
-        now: autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>,
+        now: jiff::Timestamp,
     ) -> Result<(), String> {
         let Some(mesh) = mesh else {
             return Ok(());
@@ -1083,7 +1083,7 @@ impl AgentHarness {
         tenant: CacheTenant,
         prepare: impl FnMut(&mut Vec<ContentPart>),
         publish: Option<&(dyn Fn(&LiveEvent) + Send + Sync)>,
-        now: autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>,
+        now: jiff::Timestamp,
     ) -> Result<(ModelTurn, Option<Duration>), String> {
         let span = tracing::info_span!(
             "agent_model_turn",
@@ -1131,7 +1131,7 @@ impl AgentHarness {
         tenant: CacheTenant,
         mut prepare: impl FnMut(&mut Vec<ContentPart>),
         publish: Option<&(dyn Fn(&LiveEvent) + Send + Sync)>,
-        now: autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>,
+        now: jiff::Timestamp,
     ) -> Result<(ModelTurn, Option<Duration>), String> {
         let live = Live {
             run_id: request.run_id.clone(),

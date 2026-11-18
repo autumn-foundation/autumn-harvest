@@ -368,8 +368,8 @@ fn mesh_ledger_rows(db: &Path, mesh: &str) -> usize {
         .iter()
         .filter_map(autumn_harvest_sqlite::ExecutionSummary::execution_id)
         .collect();
-    let since = autumn_harvest::chrono::DateTime::<autumn_harvest::chrono::Utc>::MIN_UTC;
-    let until = autumn_harvest::chrono::DateTime::<autumn_harvest::chrono::Utc>::MAX_UTC;
+    let since = jiff::Timestamp::MIN;
+    let until = jiff::Timestamp::MAX;
     reader
         .llm_ledger_between(since, until)
         .unwrap()

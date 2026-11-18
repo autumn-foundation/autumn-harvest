@@ -631,7 +631,7 @@ impl SqliteRuntime {
             log_policy: None,
             update_timeout: UPDATE_TIMEOUT,
             workflow_panic_strikes: HashMap::new(),
-            now_fn: std::sync::Arc::new(Utc::now),
+            now_fn: std::sync::Arc::new(Timestamp::now),
             writer_lock,
             history_policy: WorkflowHistoryPolicy::default(),
             drive_blocked: HashSet::new(),
@@ -3620,7 +3620,7 @@ impl SqliteRuntime {
             task_name: workflow_name,
         }
         .to_string();
-        let at = |ms: i64| Timestamp::from_millisecond(ms).ok().unwrap_or_default();
+        let at = autumn_harvest::time::from_millisecond_clamped;
         let tx = self.conn.transaction()?;
         let event = WorkflowEvent::WorkflowExecutionTimedOut {
             deadline: at(deadline),
@@ -5639,7 +5639,7 @@ fn insert_run(
         &input,
         fresh.config,
     )?;
-    let started_at = Timestamp::from_millisecond(fresh.started_at).ok().unwrap_or_else(Utc::now);
+    let started_at = autumn_harvest::time::from_millisecond_clamped(fresh.started_at);
     store::set_start_fields(
         conn,
         exec,
@@ -5779,7 +5779,7 @@ fn start_retry(
         &WorkflowEvent::WorkflowRetryScheduled {
             retry_exec_id: successor,
             attempt: plan.attempt,
-            fire_at: Timestamp::from_millisecond(plan.start_at).ok().unwrap_or_default(),
+            fire_at: autumn_harvest::time::from_millisecond_clamped(plan.start_at),
         },
     )
 }
@@ -5965,7 +5965,7 @@ fn apply_mutex_command(
             let Some(lock_seq) = mutex::acquire(conn, exec, key)? else {
                 return Ok(false);
             };
-            let acquired_at = Timestamp::from_millisecond(now).ok().unwrap_or_default();
+            let acquired_at = autumn_harvest::time::from_millisecond_clamped(now);
             store::append_event(
                 conn,
                 exec,
@@ -6629,7 +6629,7 @@ fn drive_span_meta(
         workflow_id: workflow_id.to_string(),
         shard_id: 0,
         queue_name: String::new(),
-        drive_clock: Timestamp::from_millisecond(now).ok(),
+        drive_clock: Some(autumn_harvest::time::from_millisecond_clamped(now)),
         is_replay: false,
         link_traceparent: None,
         build_id: None,

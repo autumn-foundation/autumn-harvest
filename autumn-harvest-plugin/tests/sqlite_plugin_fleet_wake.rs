@@ -242,7 +242,7 @@ async fn a_closed_tenant_wakes_for_its_timer() {
     .await;
     let closed = run().closed_at.into_value().expect("closed_at");
     assert!(closed >= due, "the timer fired early: {closed} < {due}");
-    let late = std::time::Duration::try_from((closed - due)).unwrap_or_default();
+    let late = std::time::Duration::try_from(closed - due).unwrap_or_default();
     assert!(late <= TICK + SLACK, "the timer fired {late:?} late");
 
     // The sweep lets the fleet close the tenant again.

@@ -256,6 +256,6 @@ fn to_revision(stored: i64) -> SqliteResult<u64> {
 }
 
 fn from_millis(ms: i64) -> SqliteResult<Timestamp> {
-    Timestamp::from_millisecond(ms).ok()
+    Some(autumn_harvest::time::from_millisecond_clamped(ms))
         .ok_or_else(|| SqliteError::Unsupported(format!("policy time {ms} is out of range")))
 }

@@ -19,7 +19,6 @@
 //! [`Delivery`]. [`LogDelivery`] is the default.
 
 use autumn_harvest::ExecutionId;
-use autumn_harvest::chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

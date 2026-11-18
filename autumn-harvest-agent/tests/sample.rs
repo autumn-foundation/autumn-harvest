@@ -14,6 +14,7 @@
 mod common;
 
 use std::collections::BTreeSet;
+use jiff::Timestamp;
 use std::sync::Arc;
 
 use autumn_harvest_agent::model::BoxFuture;
@@ -446,8 +447,7 @@ fn judged_run(judge_model: &str) -> (AgentHarness, SampleInput) {
 }
 
 fn ledger_rows(rt: &SqliteRuntime) -> Vec<autumn_harvest_sqlite::LlmLedgerRow> {
-    use autumn_harvest::chrono::{DateTime, Utc};
-    rt.llm_ledger_between(Timestamp::MIN, Timestamp::MAX)
+        rt.llm_ledger_between(Timestamp::MIN, Timestamp::MAX)
         .unwrap()
 }
 

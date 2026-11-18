@@ -28,10 +28,10 @@
 //! [`overlay::apply`]: super::overlay::apply
 
 use std::collections::{BTreeSet, HashMap};
+use jiff::Timestamp;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use autumn_harvest::ExecutionId;
-use autumn_harvest::chrono::{DateTime, Utc};
 use autumn_harvest::overlay_log::{
     AUTHOR_AUTO, AUTHOR_OPERATOR, AUTHOR_REFINE, ActivateDecision, ActivateOutcome, AutoAdoptRaw,
     AutoMoveDecision, MoveRequest, OverlayRow, PolicyExpect, ReadHead, decide_auto_move,

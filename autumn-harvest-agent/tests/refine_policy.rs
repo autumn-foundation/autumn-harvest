@@ -10,13 +10,13 @@
 #![allow(clippy::used_underscore_binding)]
 
 use std::collections::BTreeSet;
+use jiff::Timestamp;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use autumn_harvest::ExecutionId;
-use autumn_harvest::chrono::{DateTime, Utc};
 use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest_agent::model::BoxFuture;

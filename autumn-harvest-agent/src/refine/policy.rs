@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 use std::time::Duration;
 
-use autumn_harvest::chrono::{DateTime, SignedDuration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;

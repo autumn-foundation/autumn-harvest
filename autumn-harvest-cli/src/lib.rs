@@ -2097,7 +2097,7 @@ enum ShardCommand {
         /// permanently blocked (an active session, a parked child) makes
         /// every repeated call re-examine the same rows forever.
         #[arg(long, requires = "after_execution_id")]
-        after_created_at: Option<autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>>,
+        after_created_at: Option<jiff::Timestamp>,
         /// See `--after-created-at`; both must be supplied together.
         #[arg(long, requires = "after_created_at")]
         after_execution_id: Option<autumn_harvest::uuid::Uuid>,
@@ -2169,7 +2169,7 @@ enum ShardCommand {
         /// unreachable makes every repeated call re-examine the same rows
         /// forever. Copy both fields verbatim from a prior run's resume hint.
         #[arg(long, requires = "after_execution_id")]
-        after_migrated_at: Option<autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>>,
+        after_migrated_at: Option<jiff::Timestamp>,
         /// See `--after-migrated-at`; both must be supplied together.
         #[arg(long, requires = "after_migrated_at")]
         after_execution_id: Option<autumn_harvest::uuid::Uuid>,
@@ -13709,7 +13709,7 @@ pub fn build_bootstrap_token_for_tenant(
     // Validate the expiry up front so we never print an INSERT that Postgres
     // rejects at run time.
     if let Some(e) = expires_at {
-        autumn_harvest::e.parse::<Timestamp>().map_err(|source| {
+        e.parse::<autumn_harvest::jiff::Timestamp>().map_err(|source| {
             CliError::InvalidInput(format!(
                 "token bootstrap: --expires-at '{e}' is not a valid RFC 3339 timestamp: {source}"
             ))
@@ -17924,7 +17924,7 @@ async fn entry_wf(ctx: &WorkflowContext) -> Result<(), String> {
 }
 
 fn bad_helper() -> i64 {
-    autumn_harvest::chrono::Utc::now().timestamp()
+    chrono::Utc::now().timestamp()
 }
 ";
         let text = format_det_findings_text(&report(src));

@@ -144,7 +144,7 @@ pub fn history_page(
         events.push(PagedEvent {
             id: seq + 1,
             event_id: seq,
-            recorded_at: recorded_at.and_then(DateTime::from_timestamp_micros),
+            recorded_at: recorded_at.map(autumn_harvest::time::from_microsecond_clamped),
             event: serde_json::from_str(&json)?,
         });
     }

@@ -17,12 +17,12 @@
 //! `docs/design/DESIGN-2394.md`.
 
 use std::sync::Arc;
+use jiff::Timestamp;
 
 use autumn_harvest::audit::{
     self, OP_AGENT_PROFILE_ACTIVATE, OP_AGENT_PROFILE_POLICY_RESET, OP_AGENT_PROFILE_POLICY_SET,
     OP_AGENT_PROFILE_ROLLBACK, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_AGENT_PROFILE,
 };
-use autumn_harvest::chrono::{DateTime, Utc};
 use autumn_harvest::models::NewAuditRecord;
 use autumn_harvest_agent::agent::MAX_AGENT_NAME_BYTES;
 use autumn_harvest_agent::refine::policy::{PolicyChange, policy_changes};

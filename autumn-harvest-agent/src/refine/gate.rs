@@ -714,7 +714,7 @@ impl Gate<'_> {
     async fn next(
         &self,
         name: &str,
-        opened: autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>,
+        opened: jiff::Timestamp,
         seen: Option<u64>,
         record: &mut GateRecord,
     ) -> Result<GateEvent, String> {
@@ -722,7 +722,7 @@ impl Gate<'_> {
         let GateState::Waiting { until } = self.policy.gate_state(opened, now) else {
             return Ok(GateEvent::Deadline);
         };
-        let left = std::time::Duration::try_from((until - now)).unwrap_or(Duration::ZERO);
+        let left = std::time::Duration::try_from(until - now).unwrap_or(Duration::ZERO);
         let decision = await_decision::<RefineDecision>(self.ctx, name, left)
             .await
             .map_err(|err| {

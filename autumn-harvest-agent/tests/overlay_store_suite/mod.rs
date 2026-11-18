@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use autumn_harvest::ExecutionId;
-use autumn_harvest::chrono::{DateTime, SignedDuration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use autumn_harvest_agent::agent::overlay::apply;
 use autumn_harvest_agent::agent::overlay_store::AutoAdoptOutcome;
 use autumn_harvest_agent::refine::policy::{OverlayPart, RefinePolicy};

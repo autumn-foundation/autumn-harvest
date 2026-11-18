@@ -28,10 +28,10 @@
 mod common;
 
 use std::collections::BTreeMap;
+use jiff::Timestamp;
 use std::sync::Arc;
 use std::time::Duration;
 
-use autumn_harvest::chrono::{DateTime, Utc};
 use autumn_harvest::entity::ENTITY_STATE_QUERY;
 use autumn_harvest::entity_state::ProjectedSnapshot;
 use autumn_harvest::event::WorkflowEvent;

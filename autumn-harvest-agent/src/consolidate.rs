@@ -680,7 +680,7 @@ pub(crate) async fn run_turn<'a>(
     harness: &'a AgentHarness,
     turn: ConsolidateTurn,
     check: crate::score::BudgetCheck<'a>,
-    now: autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> (Result<ConsolidateFacts, String>, Vec<LlmCall>) {
     let client = match harness.model(turn.model.as_deref()) {
         Ok(client) => client,

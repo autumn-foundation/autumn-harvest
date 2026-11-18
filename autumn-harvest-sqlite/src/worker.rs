@@ -452,7 +452,7 @@ fn run_ledger_body(
     input: &Value,
     claim_ms: i64,
 ) -> (Result<Value, String>, Vec<LlmCall>) {
-    let at = Timestamp::from_millisecond(claim_ms).ok().unwrap_or_else(Utc::now);
+    let at = autumn_harvest::time::from_millisecond_clamped(claim_ms);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(input.clone(), at)))
         .unwrap_or_else(|payload| {
             Err(handler_panic_activity_envelope(

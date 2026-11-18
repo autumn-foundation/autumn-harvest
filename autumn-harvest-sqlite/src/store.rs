@@ -137,9 +137,9 @@ impl RunConfig {
     ) {
         (
             self.execution_timeout_ms
-                .and_then(chrono::Duration::try_milliseconds),
+                .map(jiff::SignedDuration::from_millis),
             self.deadline_at
-                .and_then(chrono::DateTime::from_timestamp_millis),
+                .map(autumn_harvest::time::from_millisecond_clamped),
         )
     }
 }

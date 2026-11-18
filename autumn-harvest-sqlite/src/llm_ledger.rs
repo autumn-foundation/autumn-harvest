@@ -248,8 +248,7 @@ fn parse(raw: RawRow) -> SqliteResult<LlmLedgerRow> {
             .map(|cost| count(cost, "cost_usd_micros"))
             .transpose()?,
         latency_ms: count(raw.latency_ms, "latency_ms")?,
-        recorded_at: Timestamp::from_millisecond(raw.recorded_at).ok()
-            .ok_or_else(|| corrupt("recorded_at"))?,
+        recorded_at: autumn_harvest::time::from_millisecond_clamped(raw.recorded_at),
         activity_name: raw.activity_name,
         model: raw.model,
     })

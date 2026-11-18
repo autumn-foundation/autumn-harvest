@@ -15711,7 +15711,7 @@ pub(crate) async fn build_diagnosis_report(
         .await
         .map_err(database_error)?;
     let last_event_age_seconds = last_event_at.map(|ts| {
-        std::time::Duration::try_from((report_started_at - ts))
+        std::time::Duration::try_from(report_started_at - ts)
             .map_or(0.0, |d| d.as_secs_f64())
     });
 
@@ -44896,7 +44896,7 @@ pub(crate) async fn load_stalled_workflows(
             let id = execution.id;
             let last_event_at = last_event_ats.get(&id).copied();
             let last_event_age_seconds =
-                last_event_at.map(|ts| std::time::Duration::try_from((now - ts)).map_or(0.0, |d| d.as_secs_f64()));
+                last_event_at.map(|ts| std::time::Duration::try_from(now - ts).map_or(0.0, |d| d.as_secs_f64()));
             let stall_reason = Some(if has_activity.contains(&id) {
                 StallReason::PendingActivity
             } else if has_child.contains(&id) {

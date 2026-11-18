@@ -2,9 +2,9 @@
 //! drive loop of the embedded SQLite runtime.
 
 use std::sync::{Arc, LazyLock};
+use jiff::Timestamp;
 use std::time::Duration;
 
-use autumn_harvest::chrono::{DateTime, Utc};
 use autumn_harvest::durable_promise::PROMISE_SIGNAL_PREFIX;
 use autumn_harvest_agent::delivery::{Delivery, Report};
 use autumn_harvest_agent::mesh_control::{BudgetPeriod, MeshBudget, MeshSpend, Spend};

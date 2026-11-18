@@ -15,8 +15,8 @@
 //!
 //! [`AgentProfile::mesh`]: crate::AgentProfile::mesh
 
-use autumn_harvest::chrono::{DateTime, Datelike, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
+use jiff::Timestamp;
 
 use crate::agent::AgentId;
 use crate::error::AgentError;

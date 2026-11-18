@@ -720,7 +720,7 @@ async fn the_spend_is_charged_to_the_refine_run_in_the_cost_ledger() {
     let spend = autumn_harvest_agent::mesh_control::MeshSpend::spent(
         &sqlite::LedgerSpend::open(&db),
         "refine",
-        autumn_harvest::chrono::DateTime::<autumn_harvest::chrono::Utc>::MIN_UTC,
+        jiff::Timestamp::MIN,
     )
     .await
     .unwrap();

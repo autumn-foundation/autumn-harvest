@@ -9,12 +9,12 @@
 mod common;
 
 use std::io::Write as _;
+use jiff::Timestamp;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use autumn_harvest::chrono::{DateTime, Utc};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};

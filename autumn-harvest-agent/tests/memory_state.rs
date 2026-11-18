@@ -13,11 +13,11 @@
 mod common;
 
 use std::path::{Path, PathBuf};
+use jiff::Timestamp;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use autumn_harvest::chrono::Utc;
 use autumn_harvest::event::{SideEffectKind, WorkflowEvent};
 use autumn_harvest_agent::memory::MEMORY_TOOL;
 use autumn_harvest_agent::{

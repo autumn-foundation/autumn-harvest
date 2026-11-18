@@ -9,12 +9,12 @@
 //! its statements on the polling thread.
 
 use std::collections::HashMap;
+use jiff::Timestamp;
 use std::sync::{Mutex, PoisonError};
 
 use autumn_harvest::agent_policy_log::{
     ACTION_RESET, ACTION_SET, PolicyAuditRow, PolicyChangeRow, PolicyRow, next_policy_revision,
 };
-use autumn_harvest::chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 

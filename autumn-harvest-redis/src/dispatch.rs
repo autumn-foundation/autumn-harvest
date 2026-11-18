@@ -278,7 +278,7 @@ impl DispatchRef {
     }
 
     /// Marker value for this reference: the row's due time in milliseconds.
-    const fn marker_value(&self) -> i64 {
+    fn marker_value(&self) -> i64 {
         self.scheduled_at.as_millisecond()
     }
 }

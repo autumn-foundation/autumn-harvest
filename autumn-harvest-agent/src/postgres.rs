@@ -57,7 +57,6 @@ use crate::mesh_control::{MESH_ATTR, MeshPause, MeshSpend, Spend};
 use crate::model::BoxFuture;
 use crate::types::AgentTask;
 use crate::workflow::WORKFLOW_NAME;
-use autumn_harvest::chrono::{DateTime, Utc};
 
 /// The queue of a new run when the caller names none.
 pub const DEFAULT_QUEUE: &str = "default";

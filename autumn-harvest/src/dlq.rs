@@ -3198,7 +3198,7 @@ mod tests {
         let mut distinct = std::collections::HashSet::new();
         for at in &schedule {
             let at = at.expect("a non-zero window schedules every row");
-            let offset = std::time::Duration::try_from((at - now)).expect("never before now");
+            let offset = std::time::Duration::try_from(at - now).expect("never before now");
             assert!(offset < window, "{offset:?} is past the window");
             buckets[usize::try_from(offset.as_secs() / 6).unwrap()] += 1;
             distinct.insert(at);

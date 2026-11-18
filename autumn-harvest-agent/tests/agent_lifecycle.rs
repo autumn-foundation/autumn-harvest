@@ -9,11 +9,11 @@
 mod common;
 
 use std::path::PathBuf;
+use jiff::Timestamp;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use autumn_harvest::chrono::{DateTime, Utc};
 use autumn_harvest_agent::{
     AgentError, AgentHarness, AgentHeartbeat, AgentId, AgentModel, AgentOp, AgentProfile,
     AgentState, BoxFuture, ChatRequest, ChatResponse, ChatRole, ContentPart, Control, StopReason,

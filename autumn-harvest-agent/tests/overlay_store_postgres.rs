@@ -10,6 +10,7 @@
 mod overlay_store_suite;
 
 use std::sync::Arc;
+use jiff::Timestamp;
 
 use autumn_harvest::migrate;
 use autumn_harvest::worker::DbPool;
@@ -612,8 +613,7 @@ async fn postgres_races_pass_the_cap_and_the_revision_once() {
 /// read, under the policy lock. A stale revision moves nothing.
 #[tokio::test]
 async fn postgres_refuses_an_auto_move_over_a_stale_policy() {
-    use autumn_harvest::chrono::Utc;
-    use autumn_harvest::overlay_log::{AutoAdoptRaw, AutoAdoptRequest, auto_adopt_overlay};
+        use autumn_harvest::overlay_log::{AutoAdoptRaw, AutoAdoptRequest, auto_adopt_overlay};
     use autumn_harvest_agent::RefinePolicy;
 
     let (url, _container) = database().await;

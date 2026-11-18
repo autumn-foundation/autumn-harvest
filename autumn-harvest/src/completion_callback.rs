@@ -1935,7 +1935,7 @@ mod classify_outcome_tests {
             else {
                 panic!("expected Backoff");
             };
-            let delay = std::time::Duration::try_from((next_attempt_at - now())).unwrap();
+            let delay = std::time::Duration::try_from(next_attempt_at - now()).unwrap();
             assert!(
                 delay >= prev_delay,
                 "delay must be monotonically non-decreasing across attempts"
@@ -2016,7 +2016,7 @@ mod classify_outcome_tests {
         else {
             panic!("expected Backoff, got {action:?}");
         };
-        std::time::Duration::try_from((*next_attempt_at - now())).unwrap()
+        std::time::Duration::try_from(*next_attempt_at - now()).unwrap()
     }
 
     #[test]

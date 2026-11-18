@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use agent_mesh::desk::Desk;
 use agent_mesh::mesh::{self, DeskDelivery, MeshConfig};
 use agent_mesh::scripted::{ScriptedDesk, TOKENS_PER_CALL};
-use autumn_harvest::chrono::{DateTime, Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest_agent::{AgentStatus, Approval, LiveEvent, LiveSink, PeerEnvelope, sqlite};
 use autumn_harvest_sqlite::SqliteRuntime;
@@ -88,7 +88,7 @@ async fn a_session_checks_the_inbox_answers_a_ticket_and_waits_for_approval() {
     // Start the mesh, then let the heartbeat of the triage agent fire.
     let mut rt = runtime(&desk, &config, &live);
     mesh::start(&mut rt, t0).await.unwrap();
-    let t1 = t0 + Duration::minutes(16);
+    let t1 = t0 + SignedDuration::from_mins(16);
     mesh::settle(&mut rt, t1).await.unwrap();
     let reports = desk.reports();
     assert!(
@@ -197,7 +197,7 @@ async fn a_spent_budget_parks_the_mesh_until_the_next_day() {
     mesh::start(&mut rt, t0).await.unwrap();
     let mut t1 = t0;
     for _ in 0..3 {
-        t1 += Duration::minutes(16);
+        t1 += SignedDuration::from_mins(16);
         mesh::settle(&mut rt, t1).await.unwrap();
     }
     assert_eq!(desk.reports().len(), 3, "{:?}", desk.reports());

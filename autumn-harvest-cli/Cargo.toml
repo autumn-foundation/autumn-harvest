@@ -18,6 +18,7 @@ categories = ["command-line-utilities", "asynchronous"]
 default-run = "harvest"
 
 [dependencies]
+jiff = { workspace = true }
 # `db` is enabled UNCONDITIONALLY (not behind a CLI Cargo feature) so every CI
 # lint/test leg covers `backup verify` (issue #943). Diesel's `postgres_backend`
 # and diesel-async/tokio-postgres are pure Rust, so the Windows/macOS CI legs
@@ -63,7 +64,6 @@ path = "src/bin/harvest_replay.rs"
 # Already in the graph via `autumn-harvest`; a dev-dep so the integration test
 # binaries can stamp a `RestoreVerifyReport::generated_at` directly.
 chrono = { workspace = true }
-jiff = { workspace = true }
 tempfile = "3"
 
 [[test]]

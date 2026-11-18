@@ -475,8 +475,8 @@ pub fn list(conn: &Connection) -> SqliteResult<Vec<ScheduleSummary>> {
             overlap_policy: OverlapPolicy::from_db(&overlap),
             paused,
             pause_reason: reason.filter(|_| paused),
-            next_run_at: next.and_then(DateTime::from_timestamp_millis),
-            last_run_at: last.and_then(DateTime::from_timestamp_millis),
+            next_run_at: next.map(autumn_harvest::time::from_millisecond_clamped),
+            last_run_at: last.map(autumn_harvest::time::from_millisecond_clamped),
         });
     }
     Ok(out)
@@ -709,7 +709,7 @@ fn parse_spec(spec: &str) -> SqliteResult<Schedule> {
 
 /// An epoch-millisecond time. A value out of range reads as the epoch.
 fn to_time(millis: i64) -> Timestamp {
-    Timestamp::from_millisecond(millis).ok().unwrap_or_default()
+    autumn_harvest::time::from_millisecond_clamped(millis)
 }
 
 #[cfg(test)]

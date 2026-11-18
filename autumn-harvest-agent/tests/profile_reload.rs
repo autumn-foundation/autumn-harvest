@@ -10,11 +10,11 @@
 mod common;
 
 use std::path::PathBuf;
+use jiff::Timestamp;
 use std::sync::Arc;
 use std::time::Duration;
 
 use autumn_harvest::ExecutionId;
-use autumn_harvest::chrono::Utc;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};

@@ -135,15 +135,15 @@ pub struct PendingWork {
 }
 
 /// A time column in epoch microseconds.
-fn micros(value: Option<i64>, field: &str) -> SqliteResult<Option<Timestamp>> {
-    value
-        .map(|us| Timestamp::from_microsecond(us).ok().ok_or_else(|| SqliteError::corrupt(field)))
-        .transpose()
+///
+/// A stored value past the jiff range reads clamped, so it never fails.
+fn micros(value: Option<i64>) -> Option<Timestamp> {
+    value.map(autumn_harvest::time::from_microsecond_clamped)
 }
 
-/// A time column in epoch milliseconds.
-fn millis(value: i64, field: &str) -> SqliteResult<Timestamp> {
-    Timestamp::from_millisecond(value).ok().ok_or_else(|| SqliteError::corrupt(field))
+/// A time column in epoch milliseconds. A value past the jiff range clamps.
+fn millis(value: i64) -> Timestamp {
+    autumn_harvest::time::from_millisecond_clamped(value)
 }
 
 /// See [`SqliteReader::count_executions`](crate::SqliteReader::count_executions).
@@ -225,8 +225,8 @@ pub fn children(
             workflow_name,
             workflow_id,
             state,
-            started_at: micros(started, "started_at")?,
-            closed_at: micros(closed, "closed_at")?,
+            started_at: micros(started),
+            closed_at: micros(closed),
             error,
             detached: policy.is_some(),
             parent_close_policy: policy,
@@ -267,7 +267,7 @@ pub fn timed_history(conn: &Connection, exec: ExecutionId) -> SqliteResult<Vec<T
         .map(|row| {
             let (json, at) = row?;
             Ok(TimedEvent {
-                recorded_at: micros(at, "recorded_at")?,
+                recorded_at: micros(at),
                 event: serde_json::from_str(&json)?,
             })
         })
@@ -335,12 +335,10 @@ fn pending_tasks(conn: &Connection, id: &str) -> SqliteResult<Vec<PendingTask>> 
                 state,
                 attempt,
                 max_attempts,
-                run_at: millis(run_at, "run_at")?,
-                scheduled_at: millis(scheduled_at, "scheduled_at")?,
-                start_to_close: start_to_close_ms.map(chrono::Duration::milliseconds),
-                schedule_to_close_at: schedule_to_close_at
-                    .map(|at| millis(at, "schedule_to_close_at"))
-                    .transpose()?,
+                run_at: millis(run_at),
+                scheduled_at: millis(scheduled_at),
+                start_to_close: start_to_close_ms.map(jiff::SignedDuration::from_millis),
+                schedule_to_close_at: schedule_to_close_at.map(millis),
                 heartbeat_details: heartbeat
                     .map(|text| serde_json::from_str(&text))
                     .transpose()?,
@@ -368,7 +366,7 @@ fn pending_timers(conn: &Connection, id: &str) -> SqliteResult<Vec<PendingTimer>
             let (timer_id, fire_at) = row?;
             Ok(PendingTimer {
                 timer_id,
-                fire_at: millis(fire_at, "fire_at")?,
+                fire_at: millis(fire_at),
             })
         })
         .collect()
@@ -393,7 +391,7 @@ fn buffered_signals(conn: &Connection, id: &str) -> SqliteResult<Vec<BufferedSig
             Ok(BufferedSignal {
                 name,
                 count,
-                oldest_received_at: millis(oldest, "received_at")?,
+                oldest_received_at: millis(oldest),
             })
         })
         .collect()

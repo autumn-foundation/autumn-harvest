@@ -6,7 +6,7 @@ use std::sync::Arc;
 use agent_mesh::desk::Desk;
 use agent_mesh::mesh::{self, DeskDelivery, MESH, MeshConfig, PrintSink};
 use agent_mesh::scripted::ScriptedDesk;
-use autumn_harvest::chrono::{DateTime, Duration, Utc};
+use jiff::SignedDuration;
 use autumn_harvest_agent::anthropic::{ClaudeModel, DEFAULT_MODEL};
 use autumn_harvest_agent::openai::{OPENAI_BASE_URL, OpenAiModel};
 use autumn_harvest_agent::{AgentModel, AgentOp, Approval, Control, sqlite};
@@ -100,7 +100,7 @@ fn now(desk: &Desk) -> Timestamp {
         .ok()
         .and_then(|text| text.trim().parse::<i64>().ok())
         .unwrap_or(0);
-    Timestamp::now() + Duration::minutes(offset)
+    Timestamp::now() + SignedDuration::from_mins(offset)
 }
 
 fn move_clock(desk: &Desk, minutes: i64) -> std::io::Result<()> {

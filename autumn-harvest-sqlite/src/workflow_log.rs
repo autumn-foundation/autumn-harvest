@@ -240,9 +240,7 @@ pub fn load(
     )?;
     rows.map(|row| {
         let (seq, level, message, at) = row?;
-        let occurred_at = Timestamp::from_microsecond(at).ok().ok_or_else(|| {
-            SqliteError::Corrupt(format!("log line {seq} of {exec} has the time {at}"))
-        })?;
+        let occurred_at = autumn_harvest::time::from_microsecond_clamped(at);
         Ok(LogLine {
             seq,
             level,

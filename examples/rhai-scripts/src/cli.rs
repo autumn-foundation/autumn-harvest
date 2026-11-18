@@ -264,7 +264,7 @@ async fn sleep_to_next_timer(db: &Path, exec: ExecutionId) -> Result<(), String>
     let Some(due) = pending.timers.iter().map(|t| t.fire_at).min() else {
         return Ok(());
     };
-    let left = std::time::Duration::try_from((due - Timestamp::now())).unwrap_or_default();
+    let left = std::time::Duration::try_from(due - Timestamp::now()).unwrap_or_default();
     eprintln!("run {exec} sleeps for {:.1}s", left.as_secs_f64());
     tokio::time::sleep(left).await;
     Ok(())
