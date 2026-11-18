@@ -18,24 +18,14 @@ use crate::schema::{harvest_external_tasks, harvest_workflow_executions};
 use crate::store;
 use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken};
 
-/// The last second that `chrono` could hold, `DateTime::<Utc>::MAX_UTC`.
-const CHRONO_MAX_UTC_SECOND: i64 = 8_210_266_876_799;
-
 /// Returns the external-task deadline `dur` after `now`.
 ///
 /// A deadline past the jiff range saturates to `Timestamp::MAX`, as the
 /// worker timer does. A deadline past the old `chrono` range still fails, as
 /// `checked_add_signed` failed for it.
 fn external_deadline(now: Timestamp, dur: jiff::SignedDuration) -> HarvestResult<Timestamp> {
-    match now.checked_add(dur) {
-        Ok(deadline) => Ok(deadline),
-        Err(_) if now.as_second().saturating_add(dur.as_secs()) <= CHRONO_MAX_UTC_SECOND => {
-            Ok(Timestamp::MAX)
-        }
-        Err(_) => Err(HarvestError::Database(
-            "Datetime addition overflow".to_string(),
-        )),
-    }
+    crate::time::checked_add_chrono_range(now, dur)
+        .ok_or_else(|| HarvestError::Database("Datetime addition overflow".to_string()))
 }
 
 #[cfg(test)]

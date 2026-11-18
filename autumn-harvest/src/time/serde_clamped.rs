@@ -1,10 +1,14 @@
 //! A `serde` reader that clamps a stored timestamp into the jiff range.
 //!
 //! `chrono` wrote a year outside 0 to 9999 with a sign and four or more
-//! digits, such as `+12026-01-01T00:00:00Z` or `-0001-01-01T00:00:00Z`.
-//! jiff reads a signed year only with six digits, in the range -9999 to
-//! 9999. This reader rewrites such a year to the jiff form. A year past the
-//! jiff range reads as [`Timestamp::MIN`] or [`Timestamp::MAX`], as the
+//! digits, such as `+12026-01-01T00:00:00Z` or `-0001-01-01T00:00:00Z`. It
+//! wrote a year inside that range with no sign, such as
+//! `9999-12-31T23:59:59Z`, which is past the end of the jiff range. jiff
+//! refuses each of these forms.
+//!
+//! This reader uses [`crate::time::parse::relaxed`], the grammar of the
+//! `chrono` `serde` read. An instant past the jiff range, but inside the
+//! `chrono` range, reads as [`Timestamp::MIN`] or [`Timestamp::MAX`], as the
 //! Diesel readers in `time::sql` do. A stored event then still loads.
 //!
 //! Use it with `#[serde(deserialize_with = "...")]`. The writer stays the
@@ -45,36 +49,13 @@ pub mod option {
     }
 }
 
-/// Parses `text` in the jiff form, or in the signed-year form of `chrono`.
+/// Parses `text` in the jiff form, or in the `chrono` `serde` form.
 ///
 /// # Errors
 ///
 /// Returns the jiff parse error when `text` is in neither form.
 pub fn parse(text: &str) -> Result<Timestamp, jiff::Error> {
-    let error = match text.parse::<Timestamp>() {
-        Ok(at) => return Ok(at),
-        Err(error) => error,
-    };
-    let Some(sign) = text.chars().next().filter(|c| matches!(c, '+' | '-')) else {
-        return Err(error);
-    };
-    let rest = &text[1..];
-    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-    if digits < 4 || rest.as_bytes().get(digits) != Some(&b'-') {
-        return Err(error);
-    }
-    let tail = &rest[digits..];
-    let year = rest[..digits].parse::<u64>().unwrap_or(u64::MAX);
-    if year <= 9999 {
-        return format!("{sign}{year:06}{tail}").parse::<Timestamp>();
-    }
-    // Year 2000 is a leap year, so a valid 29 February still checks here.
-    format!("2000{tail}").parse::<Timestamp>()?;
-    Ok(if sign == '-' {
-        Timestamp::MIN
-    } else {
-        Timestamp::MAX
-    })
+    crate::time::parse::relaxed(text)
 }
 
 #[cfg(test)]
@@ -112,6 +93,29 @@ mod tests {
         assert_eq!(far.at, Timestamp::MAX);
         assert_eq!(far.maybe, Some(Timestamp::MAX));
         assert_eq!(row(r#"{"at":"-12026-01-01T00:00:00Z"}"#).at, Timestamp::MIN);
+    }
+
+    /// `chrono` wrote a year inside 0 to 9999 with no sign. Such an instant
+    /// can still be past the jiff range.
+    #[test]
+    fn clamps_an_unsigned_chrono_year_past_the_jiff_range() {
+        assert_eq!(parse("9999-12-31T23:59:59Z").unwrap(), Timestamp::MAX);
+        assert_eq!(parse("9999-12-31T12:00:00Z").unwrap(), Timestamp::MAX);
+        assert_eq!(parse("-9999-01-01T00:00:00Z").unwrap(), Timestamp::MIN);
+        assert_eq!(
+            row(r#"{"at":"9999-12-31T23:59:59Z","maybe":"9999-12-31T23:59:59Z"}"#).maybe,
+            Some(Timestamp::MAX)
+        );
+    }
+
+    /// `chrono` checked the date in its real year, its year range and the
+    /// offset. Such a refusal stays a refusal.
+    #[test]
+    fn refuses_what_chrono_refused_past_the_jiff_range() {
+        assert!(parse("+12026-02-29T00:00:00Z").is_err());
+        assert!(parse("+999999-01-01T00:00:00Z").is_err());
+        assert!(parse("+12026-01-01T00:00:00+25:00").is_err());
+        assert_eq!(parse("+12024-02-29T00:00:00Z").unwrap(), Timestamp::MAX);
     }
 
     #[test]

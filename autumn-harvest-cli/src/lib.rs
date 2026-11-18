@@ -13692,6 +13692,10 @@ pub fn build_bootstrap_token(
 /// That shape is a full date, `T`, `t` or a space, a full time, an optional
 /// fraction, and `Z`, `z` or a `+HH:MM` offset. Like `chrono`, it refuses an offset hour
 /// past 23 and an offset minute past 59. jiff reads an offset hour up to 25.
+///
+/// One difference from `chrono` is deliberate. `chrono` also read a U+2212
+/// minus sign in the offset. This check refuses it, because Postgres gets
+/// the raw text and does not read that sign.
 fn has_rfc3339_shape(text: &str) -> bool {
     let bytes = text.as_bytes();
     let digits = |range: std::ops::Range<usize>| {
@@ -18387,6 +18391,7 @@ mod token_bootstrap_tests {
     }
 
     /// The expiry check accepts and refuses what `chrono` `parse_from_rfc3339` did.
+    /// It also refuses a U+2212 offset sign, which Postgres does not read.
     #[test]
     fn bootstrap_expiry_keeps_the_chrono_accepted_set() {
         for good in [
@@ -18401,6 +18406,7 @@ mod token_bootstrap_tests {
             "2027-01-01T00:00:00+24:30",
             "2027-01-01T00:00:00+25:00",
             "2027-01-01T00:00:00+01:60",
+            "2027-01-01T00:00:00\u{2212}05:00",
         ] {
             assert!(
                 build_bootstrap_token("n", "read", Some(bad), "op").is_err(),

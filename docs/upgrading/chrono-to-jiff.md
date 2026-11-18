@@ -56,6 +56,11 @@ calls. Use them where the old text or the old `i64` is a contract.
 `Duration::from_std(d)` refused a value past `i64::MAX` milliseconds. Use
 `autumn_harvest::time::from_std_bounded(d)` where that bound matters.
 
+`t.checked_add(d)` fails for a sum past the year 9999. `checked_add_signed`
+held a sum up to the year 262142. `autumn_harvest::time::checked_add_chrono_range(t, d)`
+saturates such a sum to `Timestamp::MAX` or `Timestamp::MIN`. It returns
+`None` only where `checked_add_signed` did.
+
 `s.parse::<Timestamp>()` refuses some text that `parse_from_rfc3339`
 read: more than 9 fraction digits, and a U+2212 minus sign in the offset.
 It also refuses an instant after `9999-12-30T22:00:00.999999999Z`, the
@@ -74,12 +79,21 @@ text. It clamps an instant past the jiff range to the nearest end.
 - **Fields that Harvest pins.** The audit chain, cursors and the API fields
   that `chrono` formatted with a fixed format keep their exact bytes.
 - **Input.** A timestamp in a request body, a query parameter or a CLI flag
-  reads every text that `chrono` read. That includes the `chrono` display
+  reads every text that `chrono` read, except the three inputs in the next
+  item. That includes the `chrono` display
   form, one-digit fields and a far-future sentinel such as
   `9999-12-31T23:59:59Z`. A sentinel past the jiff range clamps to
   `Timestamp::MAX`. The jiff forms, such as an RFC 9557 `[zone]`
   annotation, also parse. A calendar exclusion date reads `Y-M-D` only, as
   `chrono` did. A date with a time is refused.
+- **Input that jiff cannot hold.** Three inputs differ from `chrono`.
+  `PUT /calendars/{name}` refuses an exclusion date past 9999-12-31 or
+  before -9999-01-01 with a 400. `chrono` accepted it, but it can match no
+  fire date. `harvest token bootstrap --expires-at` refuses a U+2212 minus
+  sign in the offset, because Postgres gets the raw text and cannot read
+  it. A leap second `:60` reads as second 59 with its fraction, as jiff
+  reads it. So `2016-12-31T23:59:60.5Z` reads as `2016-12-31T23:59:59.5Z`.
+  `chrono` read the instant one second later, `2017-01-01T00:00:00.5Z`.
 - **Durations.** A duration in a Harvest model, such as
   `WorkflowExecution::execution_timeout`, keeps the `chrono` JSON form
   `[seconds, nanoseconds]`. jiff writes a `SignedDuration` as an ISO 8601

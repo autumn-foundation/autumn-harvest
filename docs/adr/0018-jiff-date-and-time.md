@@ -83,7 +83,15 @@ Accepted.
   `DateTime::<Utc>::MAX_UTC`, is past the jiff range, which ends in the
   year 9999. A reader of a stored timestamp clamps such a value to
   `Timestamp::MAX`. A calendar exclusion date past 9999-12-31 can match no
-  fire date, so a read skips it.
+  fire date, so a read skips it. A request that sends such a date gets a
+  400. `chrono` accepted that request.
+- A sum of an instant and a duration that passes the jiff range, but not
+  the `chrono` range, saturates to `Timestamp::MAX` or `Timestamp::MIN`.
+  `time::checked_add_chrono_range` does it. So a far deadline stays far.
+- A leap second `:60` reads as second 59 with its fraction, as jiff reads
+  it. `chrono` read the instant one second later.
+- `harvest token bootstrap --expires-at` refuses a U+2212 minus sign in the
+  offset. Postgres gets the raw text and cannot read that sign.
 - A JSON timestamp can have fewer fraction digits than before. A client
   that compares timestamp strings byte for byte, not as instants, sees the
   change.

@@ -13930,8 +13930,7 @@ fn parse_workflow_children_cursor(raw: &str) -> Result<WorkflowChildrenCursor, A
     let (started_at, exec_id) = raw.split_once('|').ok_or_else(|| {
         AutumnError::bad_request_msg("invalid cursor; expected '<started_at>|<exec_id>'")
     })?;
-    let started_at = started_at
-        .parse::<jiff::Timestamp>()
+    let started_at = autumn_harvest::time::parse::rfc3339(started_at)
         .map_err(|_| AutumnError::bad_request_msg("invalid cursor timestamp"))?;
     let exec_id = exec_id
         .parse::<uuid::Uuid>()
@@ -14018,8 +14017,7 @@ pub(crate) fn parse_workflow_cursor(raw: &str) -> Result<WorkflowListCursor, Aut
     let (ts_part, id_part) = raw.split_once('|').ok_or_else(|| {
         AutumnError::bad_request_msg("invalid cursor; expected '<created_at>|<exec_id>'")
     })?;
-    let created_at = ts_part
-        .parse::<jiff::Timestamp>()
+    let created_at = autumn_harvest::time::parse::rfc3339(ts_part)
         .map_err(|_| AutumnError::bad_request_msg("invalid cursor: bad timestamp"))?;
     let exec_id = id_part
         .parse::<uuid::Uuid>()
@@ -17712,10 +17710,10 @@ pub(crate) fn clamp_info_default_sla(
     info_execution_timeout: Option<std::time::Duration>,
 ) -> Option<jiff::SignedDuration> {
     info_sla
-        .and_then(|d| jiff::SignedDuration::try_from(d).ok())
+        .and_then(autumn_harvest::time::from_std_bounded)
         .map(|sla| {
             info_execution_timeout
-                .and_then(|d| jiff::SignedDuration::try_from(d).ok())
+                .and_then(autumn_harvest::time::from_std_bounded)
                 .map_or(sla, |hard| sla.min(hard))
         })
 }
@@ -19560,10 +19558,10 @@ pub(crate) async fn start_workflow(
                 .sla_secs
                 .filter(|&secs| secs >= 0)
                 .and_then(try_seconds)
-                .or_else(|| info_sla.and_then(|d| jiff::SignedDuration::try_from(d).ok()))
+                .or_else(|| info_sla.and_then(autumn_harvest::time::from_std_bounded))
                 .map(|sla| {
                     info_execution_timeout
-                        .and_then(|d| jiff::SignedDuration::try_from(d).ok())
+                        .and_then(autumn_harvest::time::from_std_bounded)
                         .map_or(sla, |hard| sla.min(hard))
                 })
                 .map(|d| d.as_secs());
@@ -19571,14 +19569,14 @@ pub(crate) async fn start_workflow(
             // Effective execution timeout: request override → WorkflowInfo default.
             let effective_execution_timeout_secs = request.execution_timeout_secs.or_else(|| {
                 info_execution_timeout
-                    .and_then(|d| jiff::SignedDuration::try_from(d).ok())
+                    .and_then(autumn_harvest::time::from_std_bounded)
                     .map(|d| d.as_secs())
             });
 
             // Effective server-side ceiling captured so the fire path cannot bypass it.
             let effective_ceiling_secs = api_state
                 .max_workflow_execution_timeout()
-                .and_then(|d| jiff::SignedDuration::try_from(d).ok())
+                .and_then(autumn_harvest::time::from_std_bounded)
                 .map(|d| d.as_secs());
             // Chain-scoped lifetime cap (issue #617): resolve the workflow-type
             // default + fleet-wide ceiling-as-default so a debounced start does not
@@ -19587,11 +19585,11 @@ pub(crate) async fn start_workflow(
             let effective_chain_execution_timeout_secs = runtime
                 .registry
                 .chain_execution_timeout(&workflow_name)
-                .and_then(|d| jiff::SignedDuration::try_from(d).ok())
+                .and_then(autumn_harvest::time::from_std_bounded)
                 .map(|d| d.as_secs());
             let effective_chain_ceiling_secs = api_state
                 .max_workflow_chain_timeout()
-                .and_then(|d| jiff::SignedDuration::try_from(d).ok())
+                .and_then(autumn_harvest::time::from_std_bounded)
                 .map(|d| d.as_secs());
 
             // Route to the shard that owns this debounce key (shard-local, consistent with #247).
@@ -19907,23 +19905,23 @@ pub(crate) async fn start_workflow(
             .sla_secs
             .filter(|&secs| secs >= 0)
             .and_then(try_seconds)
-            .or_else(|| info_sla.and_then(|d| jiff::SignedDuration::try_from(d).ok()))
+            .or_else(|| info_sla.and_then(autumn_harvest::time::from_std_bounded))
             .map(|sla| {
                 info_execution_timeout
-                    .and_then(|d| jiff::SignedDuration::try_from(d).ok())
+                    .and_then(autumn_harvest::time::from_std_bounded)
                     .map_or(sla, |hard| sla.min(hard))
             })
             .map(|d| d.as_secs());
 
         let effective_execution_timeout_secs = request.execution_timeout_secs.or_else(|| {
             info_execution_timeout
-                .and_then(|d| jiff::SignedDuration::try_from(d).ok())
+                .and_then(autumn_harvest::time::from_std_bounded)
                 .map(|d| d.as_secs())
         });
 
         let effective_ceiling_secs = api_state
             .max_workflow_execution_timeout()
-            .and_then(|d| jiff::SignedDuration::try_from(d).ok())
+            .and_then(autumn_harvest::time::from_std_bounded)
             .map(|d| d.as_secs());
         // Chain-scoped lifetime cap (issue #617): resolve the workflow-type
         // default + fleet-wide ceiling-as-default so a batched start does not
@@ -19932,11 +19930,11 @@ pub(crate) async fn start_workflow(
         let effective_chain_execution_timeout_secs = runtime
             .registry
             .chain_execution_timeout(&workflow_name)
-            .and_then(|d| jiff::SignedDuration::try_from(d).ok())
+            .and_then(autumn_harvest::time::from_std_bounded)
             .map(|d| d.as_secs());
         let effective_chain_ceiling_secs = api_state
             .max_workflow_chain_timeout()
-            .and_then(|d| jiff::SignedDuration::try_from(d).ok())
+            .and_then(autumn_harvest::time::from_std_bounded)
             .map(|d| d.as_secs());
 
         let batch_shard = runtime
@@ -20187,10 +20185,11 @@ pub(crate) async fn start_workflow(
     // `api_state.max_workflow_chain_timeout()` doubles as a default, applied by
     // `effective_chain_timeout` in the core start path.
     let info_chain_timeout =
-        info_chain_execution_timeout.and_then(|d| jiff::SignedDuration::try_from(d).ok());
-    let max_chain_timeout_ceiling = api_state
-        .max_workflow_chain_timeout()
-        .map(|d| jiff::SignedDuration::try_from(d).unwrap_or(jiff::SignedDuration::MAX));
+        info_chain_execution_timeout.and_then(autumn_harvest::time::from_std_bounded);
+    let max_chain_timeout_ceiling = api_state.max_workflow_chain_timeout().map(|d| {
+        autumn_harvest::time::from_std_bounded(d)
+            .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
+    });
 
     // Resolve effective SLA: request override → WorkflowInfo default → None.
     // `try_seconds` avoids a panic on an out-of-range untrusted `i64`, and the
@@ -20203,10 +20202,10 @@ pub(crate) async fn start_workflow(
         .sla_secs
         .filter(|&secs| secs >= 0)
         .and_then(try_seconds)
-        .or_else(|| info_sla.and_then(|d| jiff::SignedDuration::try_from(d).ok()))
+        .or_else(|| info_sla.and_then(autumn_harvest::time::from_std_bounded))
         .map(|sla| {
             info_execution_timeout
-                .and_then(|d| jiff::SignedDuration::try_from(d).ok())
+                .and_then(autumn_harvest::time::from_std_bounded)
                 .map_or(sla, |hard| sla.min(hard))
         });
 
@@ -20455,7 +20454,7 @@ pub(crate) async fn start_workflow(
             reuse_policy: request.reuse_policy.clone(),
             execution_timeout_secs: request.execution_timeout_secs.or_else(|| {
                 info_execution_timeout
-                    .and_then(|d| jiff::SignedDuration::try_from(d).ok())
+                    .and_then(autumn_harvest::time::from_std_bounded)
                     .map(|d| d.as_secs())
             }),
             memo: request.memo.clone(),
@@ -20471,7 +20470,7 @@ pub(crate) async fn start_workflow(
             severity: severity.map(str::to_string),
             max_execution_timeout_ceiling_secs: api_state
                 .max_workflow_execution_timeout()
-                .and_then(|d| jiff::SignedDuration::try_from(d).ok())
+                .and_then(autumn_harvest::time::from_std_bounded)
                 .map(|d| d.as_secs()),
             // Chain-scoped lifetime cap (issue #617): workflow-type default +
             // fleet-wide ceiling captured so the deferred fire keeps the cap.
@@ -20643,7 +20642,7 @@ pub(crate) async fn start_workflow(
                     .execution_timeout_secs
                     .map(jiff::SignedDuration::from_secs)
                     .or_else(|| {
-                        info_execution_timeout.and_then(|d| jiff::SignedDuration::try_from(d).ok())
+                        info_execution_timeout.and_then(autumn_harvest::time::from_std_bounded)
                     }),
                 memo: request.memo.clone(),
                 search_attrs: request.search_attrs.clone(),
@@ -20651,7 +20650,10 @@ pub(crate) async fn start_workflow(
                 conflict_policy,
                 trace_context: trace_ctx,
                 max_execution_timeout_ceiling: api_state.max_workflow_execution_timeout().map(
-                    |d| jiff::SignedDuration::try_from(d).unwrap_or(jiff::SignedDuration::MAX),
+                    |d| {
+                        autumn_harvest::time::from_std_bounded(d)
+                            .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
+                    },
                 ),
                 // Chain-scoped lifetime cap (issue #617): workflow-type default +
                 // fleet-wide ceiling-as-default, at parity with the per-run timeout.
@@ -20873,17 +20875,16 @@ pub(crate) async fn start_workflow(
         execution_timeout: request
             .execution_timeout_secs
             .map(jiff::SignedDuration::from_secs)
-            .or_else(|| {
-                info_execution_timeout.and_then(|d| jiff::SignedDuration::try_from(d).ok())
-            }),
+            .or_else(|| info_execution_timeout.and_then(autumn_harvest::time::from_std_bounded)),
         memo: request.memo.clone(),
         search_attrs: request.search_attrs.clone(),
         reuse_policy,
         conflict_policy,
         trace_context: trace_ctx,
-        max_execution_timeout_ceiling: api_state
-            .max_workflow_execution_timeout()
-            .map(|d| jiff::SignedDuration::try_from(d).unwrap_or(jiff::SignedDuration::MAX)),
+        max_execution_timeout_ceiling: api_state.max_workflow_execution_timeout().map(|d| {
+            autumn_harvest::time::from_std_bounded(d)
+                .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
+        }),
         // Chain-scoped lifetime cap (issue #617): workflow-type default +
         // fleet-wide ceiling-as-default, at parity with the per-run timeout.
         chain_execution_timeout: info_chain_timeout,
@@ -21375,14 +21376,16 @@ async fn batch_start_workflows(
         .cloned()
         .unwrap_or_else(|| "default".to_string());
     let max_wf_input_bytes = runtime.registry.max_workflow_input_bytes;
-    let max_exec_timeout_ceiling = api_state
-        .max_workflow_execution_timeout()
-        .map(|d| jiff::SignedDuration::try_from(d).unwrap_or(jiff::SignedDuration::MAX));
+    let max_exec_timeout_ceiling = api_state.max_workflow_execution_timeout().map(|d| {
+        autumn_harvest::time::from_std_bounded(d)
+            .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
+    });
     // Chain-scoped lifetime cap ceiling / fleet-wide default (issue #617),
     // resolved once for every batch item.
-    let max_chain_timeout_ceiling = api_state
-        .max_workflow_chain_timeout()
-        .map(|d| jiff::SignedDuration::try_from(d).unwrap_or(jiff::SignedDuration::MAX));
+    let max_chain_timeout_ceiling = api_state.max_workflow_chain_timeout().map(|d| {
+        autumn_harvest::time::from_std_bounded(d)
+            .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
+    });
 
     // ── OTel batch span (issue #357 telemetry AC) ──────────────────────────────
     // Created before any DB work. Code after the loop records the dynamic
@@ -21890,7 +21893,7 @@ async fn batch_start_workflows(
             // Both start paths take this timeout. The start caps it at the
             // fleet ceiling, and clamps the SLA to the result.
             let execution_timeout =
-                info_execution_timeout.and_then(|d| jiff::SignedDuration::try_from(d).ok());
+                info_execution_timeout.and_then(autumn_harvest::time::from_std_bounded);
             let item_workflow_retry_policy = info_retry_policy;
 
             // Start-throttle admission (issue #607) — best-effort batches only.
@@ -22019,7 +22022,7 @@ async fn batch_start_workflows(
                     // Chain-scoped lifetime cap (issue #617): workflow-type default
                     // + fleet-wide ceiling captured so a batched fire keeps the cap.
                     chain_execution_timeout_secs: info_chain_execution_timeout
-                        .and_then(|d| jiff::SignedDuration::try_from(d).ok())
+                        .and_then(autumn_harvest::time::from_std_bounded)
                         .map(|d| d.as_secs()),
                     max_workflow_chain_timeout_ceiling_secs: max_chain_timeout_ceiling
                         .map(|d| d.as_secs()),
@@ -22122,7 +22125,7 @@ async fn batch_start_workflows(
                         // + fleet-wide ceiling-as-default, at parity with the per-run
                         // ceiling threaded above.
                         chain_execution_timeout: info_chain_execution_timeout
-                            .and_then(|d| jiff::SignedDuration::try_from(d).ok()),
+                            .and_then(autumn_harvest::time::from_std_bounded),
                         max_workflow_chain_timeout_ceiling: max_chain_timeout_ceiling,
                         concurrency_key,
                         concurrency_limit,
@@ -23347,22 +23350,24 @@ pub(crate) async fn signal_with_start_workflow(
                 .execution_timeout_secs
                 .map(jiff::SignedDuration::from_secs)
                 .or_else(|| {
-                    info_execution_timeout.and_then(|d| jiff::SignedDuration::try_from(d).ok())
+                    info_execution_timeout.and_then(autumn_harvest::time::from_std_bounded)
                 }),
             memo: request.memo,
             search_attrs: request.search_attrs,
             reuse_policy,
             trace_context: trace_ctx,
-            max_execution_timeout_ceiling: api_state
-                .max_workflow_execution_timeout()
-                .map(|d| jiff::SignedDuration::try_from(d).unwrap_or(jiff::SignedDuration::MAX)),
+            max_execution_timeout_ceiling: api_state.max_workflow_execution_timeout().map(|d| {
+                autumn_harvest::time::from_std_bounded(d)
+                    .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
+            }),
             // Chain-scoped lifetime cap (issue #617): workflow-type default +
             // fleet-wide ceiling-as-default, at parity with the per-run timeout.
             chain_execution_timeout: info_chain_execution_timeout
-                .and_then(|d| jiff::SignedDuration::try_from(d).ok()),
-            max_workflow_chain_timeout_ceiling: api_state
-                .max_workflow_chain_timeout()
-                .map(|d| jiff::SignedDuration::try_from(d).unwrap_or(jiff::SignedDuration::MAX)),
+                .and_then(autumn_harvest::time::from_std_bounded),
+            max_workflow_chain_timeout_ceiling: api_state.max_workflow_chain_timeout().map(|d| {
+                autumn_harvest::time::from_std_bounded(d)
+                    .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
+            }),
             concurrency_key,
             concurrency_limit,
             concurrency_on_conflict,
@@ -24172,23 +24177,23 @@ async fn update_with_start_workflow(
         execution_timeout: request
             .execution_timeout_secs
             .map(jiff::SignedDuration::from_secs)
-            .or_else(|| {
-                info_execution_timeout.and_then(|d| jiff::SignedDuration::try_from(d).ok())
-            }),
+            .or_else(|| info_execution_timeout.and_then(autumn_harvest::time::from_std_bounded)),
         memo: request.memo,
         search_attrs: request.search_attrs,
         reuse_policy,
         trace_context: trace_ctx,
-        max_execution_timeout_ceiling: api_state
-            .max_workflow_execution_timeout()
-            .map(|d| jiff::SignedDuration::try_from(d).unwrap_or(jiff::SignedDuration::MAX)),
+        max_execution_timeout_ceiling: api_state.max_workflow_execution_timeout().map(|d| {
+            autumn_harvest::time::from_std_bounded(d)
+                .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
+        }),
         // Chain-scoped lifetime cap (issue #617): workflow-type default +
         // fleet-wide ceiling-as-default, at parity with the per-run timeout.
         chain_execution_timeout: info_chain_execution_timeout
-            .and_then(|d| jiff::SignedDuration::try_from(d).ok()),
-        max_workflow_chain_timeout_ceiling: api_state
-            .max_workflow_chain_timeout()
-            .map(|d| jiff::SignedDuration::try_from(d).unwrap_or(jiff::SignedDuration::MAX)),
+            .and_then(autumn_harvest::time::from_std_bounded),
+        max_workflow_chain_timeout_ceiling: api_state.max_workflow_chain_timeout().map(|d| {
+            autumn_harvest::time::from_std_bounded(d)
+                .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
+        }),
         concurrency_key,
         concurrency_limit,
         concurrency_on_conflict,
@@ -25218,10 +25223,10 @@ async fn rerun_workflow(
         max_workflow_input_bytes: effective_wf_cap,
         max_execution_timeout_ceiling: api_state
             .max_workflow_execution_timeout()
-            .and_then(|d| jiff::SignedDuration::try_from(d).ok()),
+            .and_then(autumn_harvest::time::from_std_bounded),
         max_workflow_chain_timeout_ceiling: api_state
             .max_workflow_chain_timeout()
-            .and_then(|d| jiff::SignedDuration::try_from(d).ok()),
+            .and_then(autumn_harvest::time::from_std_bounded),
         max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
         trace_context: runtime.registry.telemetry().capture_trace_context(),
     };
@@ -31699,14 +31704,14 @@ async fn trigger_schedule_now(
         .and_then(|(execution_timeout, sla)| clamp_info_default_sla(sla, execution_timeout));
     let info_execution_timeout = effective_info_defaults
         .and_then(|(execution_timeout, _)| execution_timeout)
-        .and_then(|d| jiff::SignedDuration::try_from(d).ok());
+        .and_then(autumn_harvest::time::from_std_bounded);
     // Chain-scoped lifetime cap default (issue #617): only registered workflows
     // carry it; DAGs have no chain-cap concept. The operator override wins
     // (issue #2406).
     let info_chain_execution_timeout = runtime
         .registry
         .chain_execution_timeout(&workflow_name)
-        .and_then(|d| jiff::SignedDuration::try_from(d).ok());
+        .and_then(autumn_harvest::time::from_std_bounded);
     let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
         runtime.registry.concurrency_policy(&workflow_name).map_or(
             (
@@ -31984,15 +31989,17 @@ async fn trigger_schedule_now(
         &mut exec_conn,
         StartWorkflowParams {
             execution_timeout: info_execution_timeout,
-            max_execution_timeout_ceiling: api_state
-                .max_workflow_execution_timeout()
-                .map(|d| jiff::SignedDuration::try_from(d).unwrap_or(jiff::SignedDuration::MAX)),
+            max_execution_timeout_ceiling: api_state.max_workflow_execution_timeout().map(|d| {
+                autumn_harvest::time::from_std_bounded(d)
+                    .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
+            }),
             // Chain-scoped lifetime cap (issue #617): workflow-type default +
             // fleet-wide ceiling-as-default, at parity with the per-run timeout.
             chain_execution_timeout: info_chain_execution_timeout,
-            max_workflow_chain_timeout_ceiling: api_state
-                .max_workflow_chain_timeout()
-                .map(|d| jiff::SignedDuration::try_from(d).unwrap_or(jiff::SignedDuration::MAX)),
+            max_workflow_chain_timeout_ceiling: api_state.max_workflow_chain_timeout().map(|d| {
+                autumn_harvest::time::from_std_bounded(d)
+                    .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
+            }),
             concurrency_key,
             concurrency_limit,
             concurrency_on_conflict,
@@ -33346,11 +33353,11 @@ pub(crate) async fn schedule_backfill_inner(
                         // throttled backfill fire then keeps the cap, like the
                         // non-throttled backfill start path.
                         chain_execution_timeout_secs: info_chain_execution_timeout
-                            .and_then(|d| jiff::SignedDuration::try_from(d).ok())
+                            .and_then(autumn_harvest::time::from_std_bounded)
                             .map(|d| d.as_secs()),
                         max_workflow_chain_timeout_ceiling_secs: api_state
                             .max_workflow_chain_timeout()
-                            .and_then(|d| jiff::SignedDuration::try_from(d).ok())
+                            .and_then(autumn_harvest::time::from_std_bounded)
                             .map(|d| d.as_secs()),
                         max_workflow_input_bytes: Some(effective_cap),
                         trace_context: None,
@@ -33480,12 +33487,12 @@ pub(crate) async fn schedule_backfill_inner(
                         // ceiling-as-default. So a whole scheduled chain is capped
                         // even when a workflow under-specifies (AC4).
                         chain_execution_timeout: info_chain_execution_timeout
-                            .and_then(|d| jiff::SignedDuration::try_from(d).ok()),
+                            .and_then(autumn_harvest::time::from_std_bounded),
                         max_workflow_chain_timeout_ceiling: api_state
                             .max_workflow_chain_timeout()
                             .map(|d| {
-                                jiff::SignedDuration::try_from(d)
-                                    .unwrap_or(jiff::SignedDuration::MAX)
+                                autumn_harvest::time::from_std_bounded(d)
+                                    .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
                             }),
                         concurrency_on_conflict:
                             autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
@@ -48820,7 +48827,12 @@ mod chrono_input_grammar_tests {
             body.exclusion_dates,
             vec![jiff::civil::date(2026, 7, 4), jiff::civil::date(2026, 7, 5)]
         );
-        for bad in [r#"["2026-07-04T23:30:00-05:00"]"#, r#"["20260704"]"#] {
+        // A date past the jiff range is refused, as the upgrade guide records.
+        for bad in [
+            r#"["2026-07-04T23:30:00-05:00"]"#,
+            r#"["20260704"]"#,
+            r#"["+10000-01-01"]"#,
+        ] {
             let json = format!(r#"{{"exclusion_dates":{bad}}}"#);
             assert!(
                 serde_json::from_str::<UpdateCalendarRequest>(&json).is_err(),
@@ -60850,6 +60862,36 @@ mod tests {
         let err = parse_workflow_cursor("not-a-date|550e8400-e29b-41d4-a716-446655440000")
             .expect_err("bad timestamp must error");
         assert!(err.to_string().contains("invalid cursor"));
+    }
+
+    /// A cursor reads every instant that `parse_from_rfc3339` read.
+    #[test]
+    fn cursor_parsers_read_the_chrono_rfc3339_grammar() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        let expected: jiff::Timestamp = "2026-01-01T00:00:00.123456789Z".parse().unwrap();
+        let ten_digits = format!("2026-01-01T00:00:00.1234567891Z|{id}");
+        assert_eq!(
+            parse_workflow_cursor(&ten_digits).unwrap().created_at,
+            expected
+        );
+        assert_eq!(
+            parse_workflow_children_cursor(&ten_digits)
+                .unwrap()
+                .started_at,
+            expected
+        );
+        let sentinel = format!("9999-12-31T23:59:59Z|{id}");
+        assert_eq!(
+            parse_workflow_cursor(&sentinel).unwrap().created_at,
+            jiff::Timestamp::MAX
+        );
+        let minus_sign = format!("2026-01-01T00:00:00\u{2212}05:00|{id}");
+        assert_eq!(
+            parse_workflow_children_cursor(&minus_sign)
+                .unwrap()
+                .started_at,
+            "2026-01-01T05:00:00Z".parse::<jiff::Timestamp>().unwrap()
+        );
     }
 
     #[test]

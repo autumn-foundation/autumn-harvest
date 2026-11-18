@@ -344,7 +344,13 @@ pub struct HistorySnapshot {
     /// (issue #772). When `Some`, the internal continue-as-new budget check reads
     /// this instead of the nominal `start + execution_timeout`. `None` (absent /
     /// legacy snapshot) falls back to no live deadline (the nominal is used).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// A `chrono` snapshot can hold a deadline past the jiff range, which
+    /// clamps on a read.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::time::serde_clamped::option::deserialize"
+    )]
     pub deadline_at: Option<jiff::Timestamp>,
     /// The spawning parent's execution id (issue #698).
     ///

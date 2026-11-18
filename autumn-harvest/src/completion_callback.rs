@@ -1517,17 +1517,23 @@ const RFC2822_ZONE_NAMES: [&str; 11] = [
     "GMT", "UT", "Z", "EST", "EDT", "CST", "CDT", "MST", "MDT", "PST", "PDT",
 ];
 
-/// Returns `false` for a trailing zone name that `chrono` refused.
+/// Returns `false` for a trailing zone that `chrono` refused.
 ///
 /// jiff reads any name of three or more letters as UTC, such as `CET`.
 /// `chrono` accepted only the names above and a military letter other than
-/// `J`. A date that `chrono` refused gives no delay, so a 413 stays
-/// permanent.
+/// `J`. jiff also reads an offset hour of 24 or 25. `chrono` refused an
+/// offset of one day or more. A date that `chrono` refused gives no delay,
+/// so a 413 stays permanent.
 fn rfc2822_zone_is_known(value: &str) -> bool {
     let zone = value
         .rsplit(|c: char| c.is_ascii_whitespace())
         .next()
         .unwrap_or("");
+    if let [b'+' | b'-', h1, h2, m1, m2] = zone.as_bytes()
+        && [h1, h2, m1, m2].iter().all(|b| b.is_ascii_digit())
+    {
+        return (h1 - b'0') * 10 + (h2 - b'0') <= 23;
+    }
     if zone.is_empty() || !zone.bytes().all(|b| b.is_ascii_alphabetic()) {
         return true;
     }
@@ -1537,10 +1543,50 @@ fn rfc2822_zone_is_known(value: &str) -> bool {
         || (zone.len() == 1 && !zone.eq_ignore_ascii_case("j"))
 }
 
+/// Removes the trailing RFC 2822 comments of `value`, as `chrono` skipped them.
+///
+/// A comment is `(...)`. It can nest, and `\` escapes the next byte. The
+/// comments start at the first `(`, because no other part of the date holds
+/// one. Text that is not a complete run of comments is kept, so the parse
+/// refuses it.
+fn strip_rfc2822_comments(value: &str) -> &str {
+    let Some(start) = value.find('(') else {
+        return value;
+    };
+    let mut rest = value[start..].as_bytes();
+    while !rest.is_empty() {
+        let Some(after) = rest.trim_ascii_start().strip_prefix(b"(") else {
+            return value;
+        };
+        let mut depth = 1_usize;
+        let mut escaped = false;
+        let mut end = None;
+        for (index, byte) in after.iter().enumerate() {
+            match (escaped, byte) {
+                (true, _) => escaped = false,
+                (false, b'\\') => escaped = true,
+                (false, b'(') => depth += 1,
+                (false, b')') if depth == 1 => {
+                    end = Some(index);
+                    break;
+                }
+                (false, b')') => depth -= 1,
+                (false, _) => {}
+            }
+        }
+        let Some(end) = end else {
+            return value;
+        };
+        rest = &after[end + 1..];
+    }
+    value[..start].trim_end()
+}
+
 /// Parse an HTTP-date in any of its three forms (RFC 9110 section 5.6.7).
 fn parse_http_date(value: &str, now: Timestamp) -> Option<Timestamp> {
-    if rfc2822_zone_is_known(value)
-        && let Ok(at) = jiff::fmt::rfc2822::DateTimeParser::new().parse_timestamp(value)
+    let without_comments = strip_rfc2822_comments(value);
+    if rfc2822_zone_is_known(without_comments)
+        && let Ok(at) = jiff::fmt::rfc2822::DateTimeParser::new().parse_timestamp(without_comments)
     {
         return Some(at);
     }
@@ -1701,6 +1747,46 @@ mod deliverer_trait_tests {
         );
         assert_eq!(
             parse_retry_after("Thu, 01 Jan 2026 00:00:30 +0000", now()),
+            Some(std::time::Duration::from_secs(30))
+        );
+    }
+
+    /// `chrono` skipped trailing RFC 2822 comments, then checked the zone.
+    #[test]
+    fn parse_retry_after_checks_the_zone_before_a_comment() {
+        let thirty = Some(std::time::Duration::from_secs(30));
+        for refused in [
+            "Thu, 01 Jan 2026 00:00:30 CET (Central European Time)",
+            "Thu, 01 Jan 2026 00:00:30 UTC (x)",
+            "Thu, 01 Jan 2026 00:00:30 CET(x)",
+            "Thu, 01 Jan 2026 00:00:30 GMT (x) trailing",
+        ] {
+            assert_eq!(parse_retry_after(refused, now()), None, "{refused}");
+        }
+        for accepted in [
+            "Thu, 01 Jan 2026 00:00:30 GMT(x)",
+            "Thu, 01 Jan 2026 00:00:30 GMT (x)",
+            "Thu, 01 Jan 2026 00:00:30 GMT (a (nested) \\) comment) (y)",
+            "Thu, 01 Jan 2026 00:00:30 +0000(x)",
+        ] {
+            assert_eq!(parse_retry_after(accepted, now()), thirty, "{accepted}");
+        }
+    }
+
+    /// `chrono` refused a numeric offset of one day or more. jiff reads an
+    /// offset hour up to 25.
+    #[test]
+    fn parse_retry_after_refuses_an_offset_of_a_day_or_more() {
+        assert_eq!(
+            parse_retry_after("Thu, 01 Jan 2026 00:00:30 +2400", now()),
+            None
+        );
+        assert_eq!(
+            parse_retry_after("Thu, 01 Jan 2026 00:00:30 -2459", now()),
+            None
+        );
+        assert_eq!(
+            parse_retry_after("Thu, 01 Jan 2026 23:59:30 +2359", now()),
             Some(std::time::Duration::from_secs(30))
         );
     }

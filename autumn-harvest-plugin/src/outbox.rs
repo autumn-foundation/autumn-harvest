@@ -619,11 +619,12 @@ pub(crate) async fn dispatch_workflow_start_request(
     let max_workflow_attempts_ceiling = registry_ext
         .as_ref()
         .and_then(|registry| registry.max_workflow_attempts_ceiling);
-    let sla = info_sla.and_then(|d| jiff::SignedDuration::try_from(d).ok());
+    let sla = info_sla.and_then(autumn_harvest::time::from_std_bounded);
     // The start clamps the timeout to the fleet ceiling, and the SLA to the
     // timeout, as on the API start path.
     let to_signed = |d: std::time::Duration| {
-        jiff::SignedDuration::try_from(d).unwrap_or(jiff::SignedDuration::MAX)
+        autumn_harvest::time::from_std_bounded(d)
+            .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
     };
     let execution_timeout = info_execution_timeout.map(to_signed);
     let max_execution_timeout_ceiling = registry_ext
@@ -633,7 +634,7 @@ pub(crate) async fn dispatch_workflow_start_request(
     // Issue #2406: an outbox start begins a new chain. It takes the chain cap
     // of the type, the operator override and the fleet chain ceiling, as the
     // API start does.
-    let to_signed_opt = |d: std::time::Duration| jiff::SignedDuration::try_from(d).ok();
+    let to_signed_opt = autumn_harvest::time::from_std_bounded;
     let chain_execution_timeout = registry_ext
         .as_ref()
         .and_then(|registry| registry.chain_execution_timeout(&request.workflow_name))

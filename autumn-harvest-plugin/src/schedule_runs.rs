@@ -314,8 +314,7 @@ pub fn parse_cursor(raw: &str) -> Result<(Timestamp, Uuid), String> {
     let (ts_part, id_part) = raw
         .split_once('|')
         .ok_or_else(|| "invalid cursor; expected '<started_at>|<execution_id>'".to_string())?;
-    let started_at = ts_part
-        .parse::<Timestamp>()
+    let started_at = autumn_harvest::time::parse::rfc3339(ts_part)
         .map_err(|_| "invalid cursor: bad timestamp".to_string())?;
     let execution_id = id_part
         .parse::<Uuid>()
@@ -634,6 +633,21 @@ mod tests {
         let (ts, id) = parse_cursor(&token).unwrap();
         assert_eq!(ts, at(12345));
         assert_eq!(id, uid(99));
+    }
+
+    /// A cursor reads every instant that `parse_from_rfc3339` read.
+    #[test]
+    fn parse_cursor_reads_the_chrono_rfc3339_grammar() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        let (ts, _) = parse_cursor(&format!("2026-01-01T00:00:00.1234567891Z|{id}")).unwrap();
+        assert_eq!(
+            ts,
+            "2026-01-01T00:00:00.123456789Z"
+                .parse::<Timestamp>()
+                .unwrap()
+        );
+        let (ts, _) = parse_cursor(&format!("9999-12-31T23:59:59Z|{id}")).unwrap();
+        assert_eq!(ts, Timestamp::MAX);
     }
 
     #[test]

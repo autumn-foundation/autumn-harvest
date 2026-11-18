@@ -203,8 +203,13 @@ pub struct HistoryExportDocument {
     /// (issue #772). The JSON replay path computes the deadline from it, as the
     /// timeout scanner does, not from the nominal `start + execution_timeout`.
     /// `None` when no absolute deadline was recorded, or a legacy export.
-    /// Non-payload operational metadata — never redacted.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Non-payload operational metadata — never redacted. A `chrono` archive
+    /// can hold a deadline past the jiff range, which clamps on a read.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::time::serde_clamped::option::deserialize"
+    )]
     pub deadline_at: Option<Timestamp>,
     /// The spawning parent's execution id (issue #698), sourced from the
     /// `harvest_workflow_executions.parent_id` column.
@@ -1423,6 +1428,16 @@ mod tests {
         assert_eq!(snapshot.deadline_at, Some(deadline));
         assert_eq!(snapshot.workflow_name, "wf");
         assert_eq!(snapshot.execution_id, exec_id);
+
+        // A `chrono` archive can hold a deadline past the jiff range.
+        let mut far: serde_json::Value = serde_json::from_str(&json).expect("export JSON");
+        far["deadline_at"] = serde_json::json!("+12026-01-01T00:00:00Z");
+        let archived: HistoryExportDocument =
+            serde_json::from_value(far.clone()).expect("a chrono archive decodes");
+        assert_eq!(archived.deadline_at, Some(Timestamp::MAX));
+        let snapshot: crate::testing::HistorySnapshot =
+            serde_json::from_value(far).expect("a chrono snapshot decodes");
+        assert_eq!(snapshot.deadline_at, Some(Timestamp::MAX));
     }
 
     /// Issue #798: a history export must carry the execution's

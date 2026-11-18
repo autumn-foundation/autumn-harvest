@@ -196,8 +196,8 @@ impl UsageParams {
         }
 
         let window = to.duration_since(from);
-        let ceiling_signed =
-            jiff::SignedDuration::try_from(ceiling).unwrap_or(jiff::SignedDuration::MAX);
+        let ceiling_signed = autumn_harvest::time::from_std_bounded(ceiling)
+            .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION);
         if window > ceiling_signed {
             let ceiling_label = format_ceiling(ceiling);
             return Err(format!(

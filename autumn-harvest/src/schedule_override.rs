@@ -242,9 +242,11 @@ struct WorkflowFieldsJson {
         skip_serializing_if = "Option::is_none"
     )]
     consecutive_failure_limit: Option<Option<u32>>,
+    // `chrono` wrote this field. Its `serde` grammar reads a stored sentinel
+    // past the jiff range and clamps it.
     #[serde(
         default,
-        deserialize_with = "present",
+        deserialize_with = "crate::time::parse::de::tristate",
         skip_serializing_if = "Option::is_none"
     )]
     end_at: Option<Option<Timestamp>>,
@@ -1651,6 +1653,21 @@ pub async fn effective_dag_from_db(
 mod tests {
     use super::*;
     use crate::dag::DagBuilder;
+
+    /// `chrono` wrote `end_at`. A stored sentinel past the jiff range clamps.
+    #[test]
+    fn workflow_fields_read_a_chrono_end_at_sentinel() {
+        let stored: WorkflowFieldsJson =
+            serde_json::from_value(serde_json::json!({"end_at": "9999-12-31T23:59:59Z"}))
+                .expect("a chrono sentinel loads");
+        assert_eq!(stored.end_at, Some(Some(Timestamp::MAX)));
+        let cleared: WorkflowFieldsJson =
+            serde_json::from_value(serde_json::json!({"end_at": null})).expect("null loads");
+        assert_eq!(cleared.end_at, Some(None));
+        let absent: WorkflowFieldsJson =
+            serde_json::from_value(serde_json::json!({})).expect("an absent key loads");
+        assert_eq!(absent.end_at, None);
+    }
 
     fn dag(name: &str, schedule: Option<Schedule>) -> RegisteredDag {
         RegisteredDag {

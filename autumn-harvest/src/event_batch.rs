@@ -94,6 +94,19 @@ struct UpsertBatchRow {
     buffered_bytes: i32,
 }
 
+/// Returns the fire deadline of a new batch, `now + max_wait`.
+///
+/// A `max_wait` past `i64::MAX` milliseconds reads as 100 years. A sum past
+/// the jiff range but inside the `chrono` range saturates to
+/// [`Timestamp::MAX`]. So a far `max_wait` does not fire the batch on its
+/// first event.
+#[must_use]
+pub fn batch_fire_at(now: Timestamp, max_wait: Duration) -> Timestamp {
+    let max_wait_dur =
+        crate::time::from_std_bounded(max_wait).unwrap_or_else(|| crate::time::days(365 * 100));
+    crate::time::checked_add_chrono_range(now, max_wait_dur).unwrap_or(now)
+}
+
 #[cfg(feature = "db")]
 #[derive(diesel::QueryableByName, Debug)]
 #[allow(dead_code)]
@@ -169,10 +182,7 @@ pub async fn admit_batched_start_with_codecs(
         return Err(HarvestError::EmptyWorkflowId);
     }
 
-    let now = Timestamp::now();
-    let max_wait_dur = crate::time::from_std_bounded(params.max_wait)
-        .unwrap_or_else(|| crate::time::days(365 * 100));
-    let initial_fire_at = now.checked_add(max_wait_dur).unwrap_or(now);
+    let initial_fire_at = batch_fire_at(Timestamp::now(), params.max_wait);
 
     let new_id = uuid::Uuid::new_v4();
     let start_options_json = serde_json::to_value(&params.start_options)
@@ -1102,4 +1112,27 @@ pub async fn list_pending_event_batches(
             }
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_fire_at_adds_max_wait() {
+        let now = Timestamp::constant(1_700_000_000, 0);
+        assert_eq!(
+            batch_fire_at(now, Duration::from_secs(60)),
+            Timestamp::constant(1_700_000_060, 0)
+        );
+    }
+
+    /// `chrono` held `now` plus 10,000 years. That deadline saturates, so the
+    /// batch does not fire on its first event.
+    #[test]
+    fn a_far_max_wait_inside_the_chrono_range_saturates() {
+        let now = Timestamp::constant(1_700_000_000, 0);
+        let ten_thousand_years = Duration::from_secs(315_576_000_000);
+        assert_eq!(batch_fire_at(now, ten_thousand_years), Timestamp::MAX);
+    }
 }

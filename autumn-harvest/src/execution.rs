@@ -1729,9 +1729,12 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
 
     // Compute deadline_at relative to target_start_time (issue #322).
     // `Timestamp + SignedDuration` panics past the jiff range, which ends in
-    // year 9999. A timeout that passes it gives no deadline, as the chain cap
-    // below does. The builder accepts a timeout of up to 292 million years.
-    let deadline_at = effective_timeout.and_then(|d| target_start_time.checked_add(d).ok());
+    // year 9999. A deadline past it, but inside the `chrono` range, saturates
+    // to `Timestamp::MAX`, so the timeout scanner still sees a deadline. A
+    // deadline past the `chrono` range gives none. The builder accepts a
+    // timeout of up to 292 million years.
+    let deadline_at =
+        effective_timeout.and_then(|d| crate::time::checked_add_chrono_range(target_start_time, d));
 
     // Clamp the SLA down to the hard timeout when sla > deadline (issue #487).
     // The hard timeout fires first, so the soft signal could never fire.
@@ -1744,7 +1747,8 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         (Some(sla), None) => Some(sla),
         (None, _) => None,
     };
-    let sla_deadline_at = effective_sla.and_then(|d| target_start_time.checked_add(d).ok());
+    let sla_deadline_at =
+        effective_sla.and_then(|d| crate::time::checked_add_chrono_range(target_start_time, d));
 
     // Chain-scoped lifetime cap (issue #617). The ceiling here acts as BOTH a cap
     // AND a fleet-wide default (AC4): a workflow that under-specifies still gets
@@ -1757,13 +1761,15 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         request.chain_execution_timeout,
         request.max_workflow_chain_timeout_ceiling,
     );
-    // `checked_add` (not `+`) because the chain ceiling doubles as the
+    // A checked sum (not `+`) because the chain ceiling doubles as the
     // effective value (AC4). An absurd operator ceiling can pass the jiff
-    // range, and `Timestamp + SignedDuration` panics on overflow. An overflow
-    // gives `None` (no chain cap) and does not crash the start path.
-    let chain_deadline_at = request
-        .inherited_chain_deadline_at
-        .or_else(|| effective_chain_timeout.and_then(|d| target_start_time.checked_add(d).ok()));
+    // range, and `Timestamp + SignedDuration` panics on overflow. A sum past
+    // the `chrono` range gives `None` (no chain cap) and does not crash the
+    // start path. A sum inside it saturates, as `chrono` held it.
+    let chain_deadline_at = request.inherited_chain_deadline_at.or_else(|| {
+        effective_chain_timeout
+            .and_then(|d| crate::time::checked_add_chrono_range(target_start_time, d))
+    });
 
     let row = NewWorkflowExecution {
         continued_from_exec_id: None,
@@ -6277,11 +6283,14 @@ pub async fn reactivate_failed_execution_at(
     // A spread redrive starts both windows at the task's slot (issue #1832).
     let now = Timestamp::now();
     let window_start = not_before.map_or(now, |at| at.max(now));
-    // A window past the jiff range gives no deadline and does not panic.
+    // A window past the jiff range saturates inside the `chrono` range, as at
+    // the start path. It does not panic.
     let new_deadline_at = execution
         .execution_timeout
-        .and_then(|d| window_start.checked_add(d).ok());
-    let new_sla_deadline_at = execution.sla.and_then(|d| window_start.checked_add(d).ok());
+        .and_then(|d| crate::time::checked_add_chrono_range(window_start, d));
+    let new_sla_deadline_at = execution
+        .sla
+        .and_then(|d| crate::time::checked_add_chrono_range(window_start, d));
 
     // Undecoded: this reads `next_event_id` only (see the loader's docs).
     let history = store::load_history_undecoded(conn, exec_id).await?;

@@ -13737,16 +13737,20 @@ fn build_child_row<'p>(
     // `resolve_child_workflow_defaults` itself does for every other,
     // immediate-use caller.
     let now = jiff::Timestamp::now();
-    // A deadline past the jiff range is stored as NULL, as at the start path.
+    // A deadline past the jiff range saturates inside the `chrono` range, as at
+    // the start path.
     let deadline_at = plan
         .defaults
         .execution_timeout
-        .and_then(|d| now.checked_add(d).ok());
-    let sla_deadline_at = plan.defaults.sla.and_then(|d| now.checked_add(d).ok());
+        .and_then(|d| crate::time::checked_add_chrono_range(now, d));
+    let sla_deadline_at = plan
+        .defaults
+        .sla
+        .and_then(|d| crate::time::checked_add_chrono_range(now, d));
     let chain_deadline_at = plan
         .defaults
         .chain_execution_timeout
-        .and_then(|d| now.checked_add(d).ok());
+        .and_then(|d| crate::time::checked_add_chrono_range(now, d));
     Ok(NewWorkflowExecution {
         continued_from_exec_id: None,
         first_exec_id: None,
@@ -14002,10 +14006,11 @@ fn resolve_child_workflow_defaults(
     let chain_execution_timeout = registry.chain_execution_timeout(workflow_name);
     let execution_timeout = execution_timeout.and_then(crate::time::from_std_bounded);
     let sla = sla.and_then(crate::time::from_std_bounded);
-    // A deadline past the jiff range is stored as NULL, as at the start path.
+    // A deadline past the jiff range saturates inside the `chrono` range, as at
+    // the start path.
     let now = jiff::Timestamp::now();
-    let deadline_at = execution_timeout.and_then(|d| now.checked_add(d).ok());
-    let sla_deadline_at = sla.and_then(|d| now.checked_add(d).ok());
+    let deadline_at = execution_timeout.and_then(|d| crate::time::checked_add_chrono_range(now, d));
+    let sla_deadline_at = sla.and_then(|d| crate::time::checked_add_chrono_range(now, d));
     // A child is its own logical workflow → fresh chain origin (issue #617).
     // Issue #2406: the fleet chain ceiling caps the chain cap of a child, so
     // an override cannot exceed it. A child type with no cap stays uncapped.
@@ -14018,7 +14023,7 @@ fn resolve_child_workflow_defaults(
     // `checked_add_signed` guards against `Duration::MAX` overflow (issue
     // #617): `DateTime + Duration` panics; yield `None` instead.
     let chain_deadline_at =
-        chain_execution_timeout.and_then(|d| jiff::Timestamp::now().checked_add(d).ok());
+        chain_execution_timeout.and_then(|d| crate::time::checked_add_chrono_range(now, d));
     ChildWorkflowDefaults {
         owner,
         runbook_url,
@@ -24571,11 +24576,11 @@ fn render_cross_shard_continue_as_new_result(
 /// exists to prevent.
 ///
 /// This is the FIRST path that resolves the declaration of the target type
-/// itself. The normal start path computes `target_start_time + d` with a
-/// plain `+` (`execution.rs`). That panics on overflow rather than persisting
-/// such a run. So a type whose declaration overflows could never have been
-/// started directly anyway. Refusing here reaches the same "no run is created with a
-/// lying field" outcome as a diagnosable terminal failure instead of a panic.
+/// itself. A deadline past the jiff range, but inside the `chrono` range,
+/// saturates to `Timestamp::MAX`, as at the start path (`execution.rs`). So
+/// this check refuses only a deadline past the `chrono` range, as
+/// `checked_add_signed` did. Refusing here gives a diagnosable terminal
+/// failure. No run is created with a lying field.
 ///
 /// Takes the **effective** timeout (already clamped by the operator's
 /// fleet-wide ceiling), so a configured ceiling rescues an otherwise
@@ -24595,7 +24600,7 @@ fn classify_successor_deadline_representable(
         // with `execution_timeout = NULL`.
         return Ok(());
     };
-    if now.checked_add(timeout).ok().is_some() {
+    if crate::time::checked_add_chrono_range(now, timeout).is_some() {
         return Ok(());
     }
     Err(format!(
@@ -24828,13 +24833,16 @@ fn resolve_continue_as_new_successor_defaults<'a>(
     let Some(info) = target_info else {
         return ContinueAsNewSuccessorDefaults {
             execution_timeout: execution.execution_timeout,
-            // The start path stores a deadline past the jiff range as NULL and
-            // keeps the duration. The successor follows the same rule.
+            // The start path saturates a deadline past the jiff range to
+            // `Timestamp::MAX`, inside the `chrono` range. The successor follows
+            // the same rule.
             deadline_at: execution
                 .execution_timeout
-                .and_then(|d| now.checked_add(d).ok()),
+                .and_then(|d| crate::time::checked_add_chrono_range(now, d)),
             sla: execution.sla,
-            sla_deadline_at: execution.sla.and_then(|d| now.checked_add(d).ok()),
+            sla_deadline_at: execution
+                .sla
+                .and_then(|d| crate::time::checked_add_chrono_range(now, d)),
             owner: execution.owner.as_deref(),
             runbook_url: execution.runbook_url.as_deref(),
             severity: execution.severity.as_deref(),
@@ -24874,15 +24882,15 @@ fn resolve_continue_as_new_successor_defaults<'a>(
         // cap is not. Narrow in practice: the clamp above already bounds the SLA
         // by a representable `execution_timeout`. So this can only fire when the
         // target declares no hard timeout at all.
-        .filter(|sla| now.checked_add(*sla).ok().is_some());
+        .filter(|sla| crate::time::checked_add_chrono_range(now, *sla).is_some());
     ContinueAsNewSuccessorDefaults {
         execution_timeout,
         // `checked_add_signed` here (unlike the verbatim arm above): these are
         // freshly converted `WorkflowInfo` durations that no start path has
         // range-checked, and `DateTime + Duration` panics on overflow.
-        deadline_at: execution_timeout.and_then(|d| now.checked_add(d).ok()),
+        deadline_at: execution_timeout.and_then(|d| crate::time::checked_add_chrono_range(now, d)),
         sla,
-        sla_deadline_at: sla.and_then(|d| now.checked_add(d).ok()),
+        sla_deadline_at: sla.and_then(|d| crate::time::checked_add_chrono_range(now, d)),
         owner: info.owner,
         runbook_url: info.runbook_url,
         severity: info.severity,
@@ -57562,6 +57570,37 @@ mod tests {
             defaults.deadline_at.is_none(),
             "an unrepresentable deadline must degrade to None, never panic"
         );
+    }
+
+    /// `chrono` held `now` plus 10,000 years, so it accepted this transition.
+    /// The deadline saturates to `Timestamp::MAX`, as at the start path.
+    #[test]
+    fn can803_cross_type_far_timeout_inside_the_chrono_range_saturates() {
+        let execution = can803_predecessor();
+        let ten_thousand_years = Duration::from_secs(315_576_000_000);
+        let mut target = can803_wf_info("paid_subscription");
+        target.execution_timeout = Some(ten_thousand_years);
+        target.sla = Some(ten_thousand_years);
+        let now = jiff::Timestamp::now();
+
+        let defaults =
+            resolve_continue_as_new_successor_defaults(&execution, Some(&target), None, None, now);
+        assert!(
+            classify_successor_deadline_representable(
+                "paid_subscription",
+                defaults.execution_timeout,
+                now,
+            )
+            .is_ok()
+        );
+        assert_eq!(defaults.deadline_at, Some(jiff::Timestamp::MAX));
+        assert!(defaults.sla.is_some());
+        assert_eq!(defaults.sla_deadline_at, Some(jiff::Timestamp::MAX));
+
+        let mut same_type = can803_predecessor();
+        same_type.execution_timeout = defaults.execution_timeout;
+        let carried = resolve_continue_as_new_successor_defaults(&same_type, None, None, None, now);
+        assert_eq!(carried.deadline_at, Some(jiff::Timestamp::MAX));
     }
 
     /// AC5: the blank / unregistered / registered matrix for a continuation

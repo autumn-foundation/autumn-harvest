@@ -78,6 +78,29 @@ pub fn from_std_bounded(duration: std::time::Duration) -> Option<SignedDuration>
         .filter(|converted| *converted <= CHRONO_MAX_DURATION)
 }
 
+/// The first second that `chrono` held, `DateTime::<Utc>::MIN_UTC`.
+const CHRONO_MIN_UTC_SECOND: i64 = -8_334_601_228_800;
+
+/// The last second that `chrono` held, `DateTime::<Utc>::MAX_UTC`.
+const CHRONO_MAX_UTC_SECOND: i64 = 8_210_266_876_799;
+
+/// Adds `duration` to `at`, as `checked_add_signed` did in `chrono`.
+///
+/// A sum inside the jiff range gives that sum. A sum past the jiff range,
+/// but inside the `chrono` range, saturates to [`Timestamp::MAX`] or
+/// [`Timestamp::MIN`]. `chrono` held that sum, so a far deadline stays far.
+/// A sum past the `chrono` range gives `None`, as `checked_add_signed` did.
+#[must_use]
+pub fn checked_add_chrono_range(at: Timestamp, duration: SignedDuration) -> Option<Timestamp> {
+    let sum = at.as_second().saturating_add(duration.as_secs());
+    match at.checked_add(duration) {
+        Ok(sum) => Some(sum),
+        Err(_) if duration.is_positive() && sum <= CHRONO_MAX_UTC_SECOND => Some(Timestamp::MAX),
+        Err(_) if duration.is_negative() && sum >= CHRONO_MIN_UTC_SECOND => Some(Timestamp::MIN),
+        Err(_) => None,
+    }
+}
+
 /// Seconds in one day of elapsed time.
 const SECONDS_PER_DAY: i64 = 86_400;
 
@@ -279,6 +302,28 @@ mod tests {
             from_std_bounded(std::time::Duration::from_secs(5)),
             Some(SignedDuration::from_secs(5))
         );
+    }
+
+    #[test]
+    fn checked_add_chrono_range_saturates_inside_the_chrono_range() {
+        let now = Timestamp::constant(1_700_000_000, 0);
+        let hour = SignedDuration::from_hours(1);
+        assert_eq!(checked_add_chrono_range(now, hour), Some(now + hour));
+        let ten_thousand_years = SignedDuration::from_secs(315_576_000_000);
+        assert_eq!(
+            checked_add_chrono_range(now, ten_thousand_years),
+            Some(Timestamp::MAX)
+        );
+        let past_chrono = SignedDuration::from_secs(9_000_000_000_000);
+        assert_eq!(checked_add_chrono_range(now, past_chrono), None);
+        let back_twenty_thousand_years = SignedDuration::from_secs(-631_152_000_000);
+        assert_eq!(
+            checked_add_chrono_range(now, back_twenty_thousand_years),
+            Some(Timestamp::MIN)
+        );
+        assert_eq!(checked_add_chrono_range(now, -past_chrono), None);
+        assert_eq!(checked_add_chrono_range(now, SignedDuration::MAX), None);
+        assert_eq!(checked_add_chrono_range(now, SignedDuration::MIN), None);
     }
 
     #[test]

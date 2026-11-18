@@ -2798,8 +2798,8 @@ async fn start_harvest_runtime(
                 // the default chain cap.
                 let ceiling = |d: Option<std::time::Duration>| {
                     d.map(|d| {
-                        autumn_harvest::jiff::SignedDuration::try_from(d)
-                            .unwrap_or(autumn_harvest::jiff::SignedDuration::MAX)
+                        autumn_harvest::time::from_std_bounded(d)
+                            .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
                     })
                 };
                 let max_execution_timeout_ceiling =
@@ -3366,9 +3366,8 @@ struct WebhookRunDefaults {
 fn webhook_run_defaults(
     registry: Option<&autumn_harvest::worker::HandlerRegistry>,
 ) -> WebhookRunDefaults {
-    let to_signed = |d: Option<std::time::Duration>| {
-        d.and_then(|d| autumn_harvest::jiff::SignedDuration::try_from(d).ok())
-    };
+    let to_signed =
+        |d: Option<std::time::Duration>| d.and_then(autumn_harvest::time::from_std_bounded);
     registry
         .and_then(|registry| {
             registry.workflows.get("webhook_delivery").map(|wf| {

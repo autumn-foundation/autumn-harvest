@@ -61,7 +61,11 @@ pub fn relaxed(text: &str) -> Result<Timestamp, jiff::Error> {
 /// The grammar is `Y-M-D`. The month and the day take one or two digits.
 /// A year of more than 4 digits needs a sign. Spaces can come around each
 /// field. The function refuses any other text, which includes a date with a
-/// time. It also refuses a year outside the jiff range.
+/// time.
+///
+/// It also refuses a year outside the jiff range, -9999 to 9999. `chrono`
+/// read such a year, but a `civil::Date` cannot hold it. Such a calendar
+/// exclusion date can match no fire date. The upgrade guide records this.
 #[must_use]
 pub fn date(text: &str) -> Option<civil::Date> {
     let (rest, year, month, day) = date_fields(text)?;
@@ -169,6 +173,13 @@ impl Fields {
             && (0..=60).contains(&self.second)
             && self.offset.abs() < SECONDS_PER_DAY;
         if !valid {
+            return None;
+        }
+        // `chrono` also refused a value that the offset moved past its range.
+        let utc_secs = self.hour * 3_600 + self.minute * 60 + self.second.min(59) - self.offset;
+        let first_day = self.year == CHRONO_MIN_YEAR && self.month == 1 && self.day == 1;
+        let last_day = self.year == CHRONO_MAX_YEAR && self.month == 12 && self.day == 31;
+        if (first_day && utc_secs < 0) || (last_day && utc_secs >= SECONDS_PER_DAY) {
             return None;
         }
         let past_end = if self.year > 0 {
@@ -445,6 +456,16 @@ mod tests {
         assert!(relaxed("2026-02-30T09:00:00Z").is_err());
         assert!(relaxed("2026-12-01T09:00:00Z trailing").is_err());
         assert!(relaxed("+262143-01-01T00:00:00Z").is_err());
+        assert!(relaxed("+262142-12-31T23:59:59-00:01").is_err());
+        assert!(relaxed("-262143-01-01T00:00:00+00:01").is_err());
+        assert_eq!(
+            relaxed("+262142-12-31T23:59:59+00:01").ok(),
+            Some(Timestamp::MAX)
+        );
+        assert_eq!(
+            relaxed("-262143-01-01T00:00:00-00:01").ok(),
+            Some(Timestamp::MIN)
+        );
         assert!(relaxed("20260-12-01T09:00:00Z").is_err());
     }
 

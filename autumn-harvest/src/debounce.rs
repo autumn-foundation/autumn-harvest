@@ -116,10 +116,37 @@ pub fn compute_fire_deadline(
     let max_wait_dur =
         crate::time::from_std_bounded(max_wait).unwrap_or_else(|| crate::time::days(365 * 100));
 
-    let trailing_edge = now.checked_add(window_dur).unwrap_or(now);
-    let cap = first_seen.checked_add(max_wait_dur).unwrap_or(first_seen);
+    // A sum past the jiff range but inside the `chrono` range saturates. So a
+    // far window or cap stays far, as it did with `chrono`.
+    let trailing_edge = crate::time::checked_add_chrono_range(now, window_dur).unwrap_or(now);
+    let cap = crate::time::checked_add_chrono_range(first_seen, max_wait_dur).unwrap_or(first_seen);
 
     trailing_edge.min(cap)
+}
+
+/// Returns the first fire deadline and the cap of a new debounce row.
+///
+/// The cap is `now + max_wait`. The first deadline is `now + window`, but
+/// never after the cap. This function is pure and unit-testable.
+#[must_use]
+pub fn admission_deadlines(
+    now: Timestamp,
+    window: Duration,
+    max_wait: Duration,
+) -> (Timestamp, Timestamp) {
+    // Clamp absurd/overflowing durations to a large-but-finite value and use
+    // checked addition so an extreme `window`/`max_wait` can never panic.
+    let window_dur =
+        crate::time::from_std_bounded(window).unwrap_or_else(|| crate::time::days(365 * 100));
+    let max_wait_dur =
+        crate::time::from_std_bounded(max_wait).unwrap_or_else(|| crate::time::days(365 * 100));
+    // A sum past the jiff range but inside the `chrono` range saturates. So a
+    // far cap does not fire the debounce at once.
+    let max_fire_at = crate::time::checked_add_chrono_range(now, max_wait_dur).unwrap_or(now);
+    let initial_fire_at = crate::time::checked_add_chrono_range(now, window_dur)
+        .unwrap_or(now)
+        .min(max_fire_at);
+    (initial_fire_at, max_fire_at)
 }
 
 // ---------------------------------------------------------------------------
@@ -405,16 +432,8 @@ pub async fn admit_debounced_start_with_codecs(
         return Err(crate::error::HarvestError::EmptyWorkflowId);
     }
 
-    let now = Timestamp::now();
-    // Clamp absurd/overflowing durations to a large-but-finite value and use
-    // checked addition so an extreme `window`/`max_wait` can never panic.
-    let window_dur = crate::time::from_std_bounded(params.window)
-        .unwrap_or_else(|| crate::time::days(365 * 100));
-    let max_wait_dur = crate::time::from_std_bounded(params.max_wait)
-        .unwrap_or_else(|| crate::time::days(365 * 100));
-
-    let max_fire_at = now.checked_add(max_wait_dur).unwrap_or(now);
-    let initial_fire_at = now.checked_add(window_dur).unwrap_or(now).min(max_fire_at);
+    let (initial_fire_at, max_fire_at) =
+        admission_deadlines(Timestamp::now(), params.window, params.max_wait);
 
     let new_id = uuid::Uuid::new_v4();
     let start_options_json = serde_json::to_value(&params.start_options)
@@ -1605,6 +1624,41 @@ mod tests {
         let max_wait = Duration::from_secs(999_999_999_999 * 86_400);
         let deadline = compute_fire_deadline(t0, window, t0, max_wait);
         assert_eq!(deadline, t0 + jiff::SignedDuration::from_secs(30));
+    }
+
+    /// `chrono` held `now` plus 10,000 years. A cap that far past the jiff
+    /// range saturates, so the debounce still fires on its window.
+    #[test]
+    fn a_far_max_wait_inside_the_chrono_range_keeps_the_window() {
+        let t0 = ts(2026, 6, 18, 10, 0, 0);
+        let thirty = Duration::from_secs(30);
+        let ten_thousand_years = Duration::from_secs(315_576_000_000);
+        let expected = t0 + jiff::SignedDuration::from_secs(30);
+        assert_eq!(
+            compute_fire_deadline(t0, thirty, t0, ten_thousand_years),
+            expected
+        );
+        assert_eq!(
+            admission_deadlines(t0, thirty, ten_thousand_years),
+            (expected, Timestamp::MAX)
+        );
+    }
+
+    /// A window that far past the jiff range fires on the cap, not at once.
+    #[test]
+    fn a_far_window_inside_the_chrono_range_fires_on_the_cap() {
+        let t0 = ts(2026, 6, 18, 10, 0, 0);
+        let hour = Duration::from_secs(3_600);
+        let ten_thousand_years = Duration::from_secs(315_576_000_000);
+        let expected = t0 + jiff::SignedDuration::from_hours(1);
+        assert_eq!(
+            compute_fire_deadline(t0, ten_thousand_years, t0, hour),
+            expected
+        );
+        assert_eq!(
+            admission_deadlines(t0, ten_thousand_years, hour),
+            (expected, expected)
+        );
     }
 
     // ── redefer_target (issue #1227, Finding 3) ─────────────────────────────
