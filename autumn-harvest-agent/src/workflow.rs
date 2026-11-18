@@ -3603,7 +3603,7 @@ pub async fn agent_model_turn(
             tenant,
             |_content| {},
             Some(&publish),
-            autumn_harvest::jiff::Timestamp::now(),
+            autumn_harvest::time::Timestamp::now(),
         )
         .await?;
     if let Some(latency) = latency {

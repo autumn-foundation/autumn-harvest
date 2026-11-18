@@ -74,7 +74,7 @@ fn temp_db_path() -> (tempfile::TempDir, std::path::PathBuf) {
 }
 
 const fn fixed_now() -> Timestamp {
-    Timestamp::from_second(1_000_000).ok().unwrap()
+    Timestamp::constant(1_000_000, 0)
 }
 
 // ── AC4(a): activity retry, then success ─────────────────────────────────────

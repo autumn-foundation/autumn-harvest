@@ -20,7 +20,7 @@ use jiff::Timestamp;
 use serde_json::{Value, json};
 
 const fn t0() -> Timestamp {
-    Timestamp::from_second(4_000_000).ok().unwrap()
+    Timestamp::constant(4_000_000, 0)
 }
 
 fn at(secs: i64) -> Timestamp {

@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 use std::time::Duration;
 
-use jiff::{SignedDuration, Timestamp};
+use autumn_harvest::time::{SignedDuration, Timestamp};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -274,9 +274,7 @@ pub fn gate_state(
         return GateState::TimedOut;
     }
     let wait = SignedDuration::try_from(timeout.get()).unwrap_or(SignedDuration::MAX);
-    let until = requested_at
-        .checked_add(wait).ok()
-        .unwrap_or(Timestamp::MAX);
+    let until = requested_at.checked_add(wait).unwrap_or(Timestamp::MAX);
     GateState::Waiting { until }
 }
 
@@ -930,8 +928,7 @@ mod tests {
     #[test]
     fn a_one_hour_gate_times_out_after_one_hour() {
         let policy = decode(json!({"approval_timeout": "1h"})).expect("decode");
-        let opened = ("2026-11-03T10:00:00Z").parse::<Timestamp>()
-            .expect("time");
+        let opened: Timestamp = "2026-11-03T10:00:00Z".parse().expect("time");
         let at = |minutes| opened + SignedDuration::from_mins(minutes);
         assert_eq!(
             policy.gate_state(opened, at(59)),
@@ -950,8 +947,8 @@ mod tests {
     #[test]
     fn a_clock_before_the_gate_still_waits() {
         let timeout = ApprovalTimeout::new(Duration::from_hours(1)).expect("1h");
-        let opened = Timestamp::from_second(10_000).ok().expect("time");
-        let earlier = Timestamp::from_second(5_000).ok().expect("time");
+        let opened = Timestamp::from_second(10_000).expect("time");
+        let earlier = Timestamp::from_second(5_000).expect("time");
         assert!(matches!(
             gate_state(opened, earlier, timeout),
             GateState::Waiting { .. }

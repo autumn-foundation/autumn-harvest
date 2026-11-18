@@ -1081,7 +1081,7 @@ mod tests {
         vec![
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::to_value(crate::AgentTask::new("hello")).unwrap(),
-                timestamp: jiff::Timestamp::now(),
+                timestamp: autumn_harvest::time::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -1288,7 +1288,7 @@ mod tests {
         let history = [
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::to_value(task).unwrap(),
-                timestamp: jiff::Timestamp::now(),
+                timestamp: autumn_harvest::time::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,

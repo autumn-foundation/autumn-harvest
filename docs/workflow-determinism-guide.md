@@ -47,7 +47,7 @@ If a workflow legitimately needs to invoke non-deterministic APIs directly, the 
 #[workflow(allow_nondeterministic_apis)]
 async fn legacy_workflow(ctx: &WorkflowContext) -> Result<(), String> {
     // HardBlockers and Warnings are now allowed at compile time
-    let now = chrono::Utc::now(); 
+    let now = jiff::Timestamp::now();
     tracing::info!("bare logging");
     Ok(())
 }
@@ -70,7 +70,8 @@ The flag also supports explicit boolean syntax:
 | | Example |
 |---|---|
 | **Disallowed** | `let now = std::time::SystemTime::now();` |
-| **Disallowed** | `let ts = chrono::Utc::now();` |
+| **Disallowed** | `let ts = jiff::Timestamp::now();` |
+| **Disallowed** | `let ts = chrono::Utc::now();` (the lint still flags a `chrono` clock read) |
 | **Disallowed** | `let t = std::time::Instant::now();` |
 | **Allowed** | `let now = ctx.now();` |
 | **Allowed** | Move the timestamp read inside an `#[activity]` and return it as the result |
@@ -83,7 +84,7 @@ Each replay produces a different "now", causing the workflow to diverge from its
 // Before — breaks replay
 #[workflow]
 async fn billing(ctx: &WorkflowContext, user_id: i64) -> Result<(), String> {
-    let invoice_date = chrono::Utc::now(); // ← HVG001
+    let invoice_date = jiff::Timestamp::now(); // ← HVG001
     // ...
 }
 
@@ -477,7 +478,7 @@ use autumn_harvest::guardrail::{GuardrailFinding, RuleCategory, Severity, rule_b
 let entry = rule_by_id("HVG001").unwrap();
 let finding = GuardrailFinding::from_rule(
     entry,
-    "chrono::Utc::now() called at workflows/billing.rs:34",
+    "jiff::Timestamp::now() called at workflows/billing.rs:34",
     Some("billing".to_string()),
     Some("src/workflows/billing.rs:34".to_string()),
 );

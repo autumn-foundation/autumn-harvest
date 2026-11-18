@@ -46,10 +46,7 @@ use jiff::Timestamp;
 use serde_json::json;
 
 const fn t0() -> Timestamp {
-    match Timestamp::from_second(4_000_000).ok() {
-        Some(t) => t,
-        None => unreachable!(),
-    }
+    Timestamp::constant(4_000_000, 0)
 }
 
 /// The maximum attempts of the always-failing, zero-delay-retry branch. Large

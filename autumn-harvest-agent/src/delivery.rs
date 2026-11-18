@@ -19,6 +19,7 @@
 //! [`Delivery`]. [`LogDelivery`] is the default.
 
 use autumn_harvest::ExecutionId;
+use autumn_harvest::time::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -185,8 +186,8 @@ impl ParkedCall {
     #[must_use]
     pub fn notice(self, now: Timestamp) -> ApprovalNotice {
         let secs = i64::try_from(self.timeout_secs).unwrap_or(i64::MAX);
-        let deadline = autumn_harvest::Some(jiff::SignedDuration::from_secs(secs))
-            .and_then(|timeout| now.checked_add(timeout).ok())
+        let deadline = now
+            .checked_add(SignedDuration::from_secs(secs))
             .unwrap_or(Timestamp::MAX);
         ApprovalNotice {
             call: self,
@@ -392,7 +393,7 @@ mod tests {
         let notice = parked(90).notice(now);
         assert_eq!(
             notice.deadline,
-            now + autumn_harvest::jiff::SignedDuration::from_secs(90)
+            now + SignedDuration::from_secs(90)
         );
         // A huge timeout saturates. It never wraps to an early deadline.
         let notice = parked(u64::MAX).notice(now);

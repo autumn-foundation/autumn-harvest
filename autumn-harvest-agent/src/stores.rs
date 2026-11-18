@@ -740,7 +740,7 @@ mod sqlite {
     }
 
     fn now_ms() -> i64 {
-        autumn_harvest::jiff::Timestamp::now().as_millisecond()
+        autumn_harvest::time::Timestamp::now().as_millisecond()
     }
 
     impl super::sealed::Sealed for SqliteAgentDb {}

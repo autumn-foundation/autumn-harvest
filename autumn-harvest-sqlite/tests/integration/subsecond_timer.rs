@@ -50,7 +50,7 @@ async fn timer_armed_at_fractional_second_does_not_fire_early() {
     rt.register_workflow(&one_second_timer_info());
 
     // Arm at t0 = 3_000_000.900 s. The TRUE 1-second deadline is 3_000_001.900 s.
-    let t0: Timestamp = DateTime::from_timestamp(3_000_000, 900_000_000).unwrap();
+    let t0: Timestamp = Timestamp::constant(3_000_000, 900_000_000);
     let exec = rt.start_workflow("one_second_timer", json!(0)).unwrap();
 
     // Drive 1 (at t0): arms the timer and blocks.

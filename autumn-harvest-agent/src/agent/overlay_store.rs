@@ -28,7 +28,6 @@
 //! [`overlay::apply`]: super::overlay::apply
 
 use std::collections::{BTreeSet, HashMap};
-use jiff::Timestamp;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use autumn_harvest::ExecutionId;
@@ -41,6 +40,7 @@ use autumn_harvest::overlay_log::{
 use autumn_harvest::overlay_log::{AutoAdoptRequest, PolicyAppend, PolicyRow, PolicyWrite};
 #[cfg(feature = "sqlite")]
 pub use autumn_harvest_sqlite::SqliteConnector;
+use autumn_harvest::time::Timestamp;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -66,7 +66,7 @@ pub const MAX_OVERLAY_BYTES: usize = 64 * 1024;
 pub type StoreClock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
 
 fn system_clock() -> StoreClock {
-    Arc::new(Utc::now)
+    Arc::new(Timestamp::now)
 }
 
 /// The number of one overlay version of a kind. The first version is 1.

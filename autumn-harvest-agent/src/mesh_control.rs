@@ -15,8 +15,9 @@
 //!
 //! [`AgentProfile::mesh`]: crate::AgentProfile::mesh
 
+use autumn_harvest::overlay_log::utc_day;
+use autumn_harvest::time::{self, Timestamp, civil};
 use serde::{Deserialize, Serialize};
-use jiff::Timestamp;
 
 use crate::agent::AgentId;
 use crate::error::AgentError;
@@ -48,20 +49,15 @@ impl BudgetPeriod {
     #[must_use]
     pub fn window(self, now: Timestamp) -> (Timestamp, Timestamp) {
         match self {
-            Self::Day => {
-                let start = autumn_harvest::time::utc_ymd_hms(now.year(), now.month(), now.day(), 0, 0, 0)
-                    .unwrap_or(now);
-                (start, start + autumn_harvest::autumn_harvest::time::days(1))
-            }
+            Self::Day => utc_day(now),
             Self::Month => {
-                let start = autumn_harvest::time::utc_ymd_hms(now.year(), now.month(), 1, 0, 0, 0)
-                    .unwrap_or(now);
-                let (year, month) = if now.month() == 12 {
-                    (now.year() + 1, 1)
-                } else {
-                    (now.year(), now.month() + 1)
-                };
-                let end = autumn_harvest::time::utc_ymd_hms(year, month, 1, 0, 0, 0)
+                let first = time::utc_date(now).first_of_month();
+                let start = utc_midnight(first).unwrap_or(now);
+                let end = first
+                    .last_of_month()
+                    .tomorrow()
+                    .ok()
+                    .and_then(utc_midnight)
                     .unwrap_or(now);
                 (start, end)
             }
@@ -69,13 +65,17 @@ impl BudgetPeriod {
                 let len = i64::try_from(secs.max(1)).unwrap_or(i64::MAX);
                 let at = now.as_second();
                 let start = at - at.rem_euclid(len);
-                let from = Timestamp::new(start, 0).ok().unwrap_or(now);
-                let until = Timestamp::new(start.saturating_add(len), 0).ok()
-                    .unwrap_or(now);
+                let from = Timestamp::from_second(start).unwrap_or(now);
+                let until = Timestamp::from_second(start.saturating_add(len)).unwrap_or(now);
                 (from, until)
             }
         }
     }
+}
+
+/// The UTC midnight at the start of `date`, or `None` past the jiff range.
+fn utc_midnight(date: civil::Date) -> Option<Timestamp> {
+    time::from_utc_datetime(date.to_datetime(civil::Time::midnight()))
 }
 
 /// A cap on the spend of one mesh in each period.

@@ -116,7 +116,7 @@ autumn-harvest-macros ──► autumn-harvest ──► autumn-web
         │                       │                │
         └── syn, quote,         └── diesel-async  └── axum 0.8
             proc-macro2             deadpool           tokio 1
-                                    chrono
+                                    jiff
                                     serde
                                     uuid
 ```
@@ -452,7 +452,7 @@ If the worker crashes and the workflow must resume on a different worker, the en
 ```rust
 pub enum WorkflowEvent {
     // Lifecycle
-    WorkflowStarted { input: serde_json::Value, timestamp: DateTime<Utc> },
+    WorkflowStarted { input: serde_json::Value, timestamp: Timestamp },
     WorkflowCompleted { output: serde_json::Value },
     WorkflowFailed { error: String },
     WorkflowCancelled { reason: String },
@@ -608,12 +608,12 @@ pub enum Schedule {
 
 pub trait Timetable: Send + Sync {
     /// Given the last run's data interval, compute the next one.
-    fn next_run(&self, last_interval: Option<DataInterval>, now: DateTime<Utc>) -> Option<DataInterval>;
+    fn next_run(&self, last_interval: Option<DataInterval>, now: Timestamp) -> Option<DataInterval>;
 }
 
 pub struct DataInterval {
-    pub start: DateTime<Utc>,
-    pub end: DateTime<Utc>,
+    pub start: Timestamp,
+    pub end: Timestamp,
 }
 ```
 

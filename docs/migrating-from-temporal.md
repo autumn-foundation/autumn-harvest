@@ -386,7 +386,7 @@ your whole application.
    nothing was due before a schedule that did not yet exist.
 
    An interval schedule re-anchors its phase to that creation moment.
-   `Schedule::Interval` computes its first slot as `Utc::now()` at the
+   `Schedule::Interval` computes its first slot as `Timestamp::now()` at the
    actual insert, plus the interval. That is not the next occurrence
    of the original Temporal schedule's own phase.
 

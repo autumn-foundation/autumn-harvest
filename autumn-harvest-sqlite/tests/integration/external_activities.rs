@@ -48,7 +48,7 @@ impl Clock {
 }
 
 const fn at(secs: i64) -> Timestamp {
-    Timestamp::from_second(secs).ok().unwrap()
+    Timestamp::constant(secs, 0)
 }
 
 /// Await one external activity. The input is its deadline in seconds.

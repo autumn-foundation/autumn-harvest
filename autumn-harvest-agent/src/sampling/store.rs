@@ -9,7 +9,7 @@
 //! its statements on the polling thread.
 
 use std::collections::HashMap;
-use jiff::Timestamp;
+use autumn_harvest::time::Timestamp;
 use std::sync::{Mutex, PoisonError};
 
 use autumn_harvest::agent_policy_log::{

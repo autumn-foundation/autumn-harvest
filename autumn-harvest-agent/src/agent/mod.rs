@@ -1485,7 +1485,7 @@ pub async fn agent(ctx: &WorkflowContext, input: serde_json::Value) -> Result<Ag
             |state: &AgentState| {
                 let (at, op) = state.next_wake(profile)?;
                 Some(Wake::new(
-                    autumn_harvest::jiff::Timestamp::from_millisecond(at).ok()?,
+                    autumn_harvest::time::Timestamp::from_millisecond(at).ok()?,
                     op,
                 ))
             },

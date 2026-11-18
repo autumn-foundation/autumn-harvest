@@ -209,7 +209,7 @@ async fn the_start_time_is_the_started_event_time() {
         row.summary
             .started_at
             .value()
-            .map(chrono::DateTime::timestamp_millis),
+            .map(|at| at.as_millisecond()),
         Some(timestamp.as_millisecond())
     );
     assert_eq!(row.summary.closed_at, Stored::Null, "a running run is open");

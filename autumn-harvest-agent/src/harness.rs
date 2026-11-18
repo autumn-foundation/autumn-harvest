@@ -758,7 +758,7 @@ impl AgentHarness {
     pub(crate) async fn check_mesh_budget(
         &self,
         mesh: Option<&str>,
-        now: jiff::Timestamp,
+        now: autumn_harvest::time::Timestamp,
     ) -> Result<(), String> {
         let Some(mesh) = mesh else {
             return Ok(());
@@ -1059,7 +1059,7 @@ impl AgentHarness {
             tenant,
             prepare,
             None,
-            autumn_harvest::jiff::Timestamp::now(),
+            autumn_harvest::time::Timestamp::now(),
         )
         .await
         .map(|(turn, _latency)| turn)
@@ -1083,7 +1083,7 @@ impl AgentHarness {
         tenant: CacheTenant,
         prepare: impl FnMut(&mut Vec<ContentPart>),
         publish: Option<&(dyn Fn(&LiveEvent) + Send + Sync)>,
-        now: jiff::Timestamp,
+        now: autumn_harvest::time::Timestamp,
     ) -> Result<(ModelTurn, Option<Duration>), String> {
         let span = tracing::info_span!(
             "agent_model_turn",
@@ -1131,7 +1131,7 @@ impl AgentHarness {
         tenant: CacheTenant,
         mut prepare: impl FnMut(&mut Vec<ContentPart>),
         publish: Option<&(dyn Fn(&LiveEvent) + Send + Sync)>,
-        now: jiff::Timestamp,
+        now: autumn_harvest::time::Timestamp,
     ) -> Result<(ModelTurn, Option<Duration>), String> {
         let live = Live {
             run_id: request.run_id.clone(),
@@ -1884,7 +1884,7 @@ impl AgentHarness {
     /// Returns the delivery error. A retryable kind retries, and so does a
     /// send over its time budget.
     pub async fn notify_approval(&self, call: ParkedCall) -> Result<(), String> {
-        let notice = call.notice(autumn_harvest::jiff::Timestamp::now());
+        let notice = call.notice(autumn_harvest::time::Timestamp::now());
         tokio::time::timeout(self.hook_timeout, self.delivery.notify_approval(&notice))
             .await
             .map_err(|_| self.hook_timed_out("ApprovalNoticeTimeout", "the approval notice"))?

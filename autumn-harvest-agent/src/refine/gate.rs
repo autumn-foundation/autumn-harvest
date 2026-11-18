@@ -714,7 +714,7 @@ impl Gate<'_> {
     async fn next(
         &self,
         name: &str,
-        opened: jiff::Timestamp,
+        opened: autumn_harvest::time::Timestamp,
         seen: Option<u64>,
         record: &mut GateRecord,
     ) -> Result<GateEvent, String> {

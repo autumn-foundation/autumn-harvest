@@ -31,10 +31,7 @@ use jiff::Timestamp;
 use serde_json::json;
 
 const fn t0() -> Timestamp {
-    match Timestamp::from_second(4_000_000).ok() {
-        Some(t) => t,
-        None => unreachable!(),
-    }
+    Timestamp::constant(4_000_000, 0)
 }
 
 /// Hedge two providers against each other and take the first to finish. Branch 0

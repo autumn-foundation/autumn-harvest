@@ -31,7 +31,7 @@
 //! [`EvalError::Unsupported`].
 
 use std::collections::BTreeSet;
-use jiff::Timestamp;
+use autumn_harvest::time::Timestamp;
 
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::types::ExecutionId;

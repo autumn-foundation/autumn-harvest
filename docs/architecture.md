@@ -1278,7 +1278,7 @@ First-class, replay-safe alternatives to the non-deterministic APIs the guardrai
 
 | Method | Returns | Captures |
 |--------|---------|----------|
-| `ctx.system_now()` | `DateTime<Utc>` | wall-clock instant at the call site |
+| `ctx.system_now()` | `jiff::Timestamp` | wall-clock instant at the call site |
 | `ctx.system_time_now()` | `std::time::SystemTime` | same instant as a `SystemTime` |
 | `ctx.new_uuid()` | `Uuid` | a fresh UUIDv7 (idempotency keys) |
 | `ctx.random_u64()` / `ctx.random_f64()` | `u64` / `f64` | a sampling draw |
@@ -1291,7 +1291,7 @@ First-class, replay-safe alternatives to the non-deterministic APIs the guardrai
 #[workflow]
 async fn notify(ctx: &WorkflowContext, event: Event) -> Result<(), String> {
     // Wall-clock decision — captured once, replayed verbatim.
-    let fresh = ctx.system_now().timestamp() - event.occurred_at < 24 * 60 * 60;
+    let fresh = ctx.system_now().as_second() - event.occurred_at < 24 * 60 * 60;
     // Idempotency key — UUIDv7 captured once; safe across retries.
     let key = ctx.new_uuid().to_string();
     // Sampling — deterministic across replays.
@@ -1309,7 +1309,7 @@ All six lower onto the single append-only `WorkflowEvent::SideEffectRecorded { k
 
 #### Absolute-deadline timer — `ctx.sleep_until` (issue #749)
 
-`ctx.sleep_until(timer_id, deadline)` is the absolute-instant companion to the relative, whole-second `ctx.timer(timer_id, secs)` — durably wait *until* a `DateTime<Utc>`, then resolve. It is the blessed, replay-safe form of the hand-rolled `ctx.timer(id, (deadline - ctx.system_now()).num_seconds() as u64)` pattern, with both foot-guns closed inside the engine: the wall clock is captured **once** via the deterministic `system_now` (frozen into history as a `SideEffectRecorded { kind: Now }` event — an **existing** variant, **no new event variant, no migration**), so every replay recomputes the identical remaining duration and resolves at the same instant on every worker; and a `deadline` at or before the captured "now" clamps the remaining duration to **zero** (fires on the next poll — never a wrapped multi-year sleep from an `as u64` underflow). Any positive sub-second remainder rounds **up** to the engine's whole-second timer granularity (nanosecond-precise, matching `wait_for_signal_timeout`), so the wait never resolves *before* `deadline`. It lowers onto the existing `TimerStarted`/`TimerFired` events and suspension path — a `sleep_until` timer is byte-identical to a `ctx.timer` timer of the same computed duration, so a non-deterministic author-supplied `deadline` surfaces as ordinary timer non-determinism (not a panic), and like `ctx.timer` exactly one timer suspends per call and it cannot share a suspension batch with activity/child-workflow/signal commands. Derive `deadline` from deterministic state (a workflow input, a prior activity output, or `ctx.system_now()`) — never `chrono::Utc::now()` directly; prefer `ctx.timer(id, secs)` for a purely *relative* wait (it skips the redundant `system_now()` capture); and note that in `WorkflowTestEnv` the internal `system_now()` reads the real wall clock rather than the virtual `ctx.now()`. See `autumn-harvest/examples/sleep_until_renewal_reminder.rs`.
+`ctx.sleep_until(timer_id, deadline)` is the absolute-instant companion to the relative, whole-second `ctx.timer(timer_id, secs)` — durably wait *until* a `jiff::Timestamp`, then resolve. It is the blessed, replay-safe form of the hand-rolled `ctx.timer(id, deadline.duration_since(ctx.system_now()).as_secs() as u64)` pattern, with both foot-guns closed inside the engine: the wall clock is captured **once** via the deterministic `system_now` (frozen into history as a `SideEffectRecorded { kind: Now }` event — an **existing** variant, **no new event variant, no migration**), so every replay recomputes the identical remaining duration and resolves at the same instant on every worker; and a `deadline` at or before the captured "now" clamps the remaining duration to **zero** (fires on the next poll — never a wrapped multi-year sleep from an `as u64` underflow). Any positive sub-second remainder rounds **up** to the engine's whole-second timer granularity (nanosecond-precise, matching `wait_for_signal_timeout`), so the wait never resolves *before* `deadline`. It lowers onto the existing `TimerStarted`/`TimerFired` events and suspension path — a `sleep_until` timer is byte-identical to a `ctx.timer` timer of the same computed duration, so a non-deterministic author-supplied `deadline` surfaces as ordinary timer non-determinism (not a panic), and like `ctx.timer` exactly one timer suspends per call and it cannot share a suspension batch with activity/child-workflow/signal commands. Derive `deadline` from deterministic state (a workflow input, a prior activity output, or `ctx.system_now()`) — never `jiff::Timestamp::now()` directly; prefer `ctx.timer(id, secs)` for a purely *relative* wait (it skips the redundant `system_now()` capture); and note that in `WorkflowTestEnv` the internal `system_now()` reads the real wall clock rather than the virtual `ctx.now()`. See `autumn-harvest/examples/sleep_until_renewal_reminder.rs`.
 
 #### Business-day timer — `ctx.timer_business_days` (issue #806)
 
@@ -1317,7 +1317,7 @@ All six lower onto the single append-only `WorkflowEvent::SideEffectRecorded { k
 
 **No new event variant, no migration.** The resolved deadline is frozen into the **existing** `SideEffectRecorded { kind: Custom, name: "__harvest_business_day:{seq}:{id}" }` variant (issue #384) and the wait rides the **existing** `TimerStarted` event. The freeze and the arm share **one** suspension batch, so arming costs one decision cycle, not two.
 
-**Determinism — the calendar is read once, ever.** The resolution runs on the **first live execution** from an anchor captured inside the freeze (never a fresh `Utc::now()` on replay). Every later replay returns the recorded value verbatim and **never re-runs the resolution**, so an operator adding a holiday after a timer is armed can never move that timer's deadline (the snapshot lookup still happens on every call, but its result is discarded on replay because `side_effect`'s matched arm never invokes the closure) — only timers armed afterwards see the edit.
+**Determinism — the calendar is read once, ever.** The resolution runs on the **first live execution** from an anchor captured inside the freeze (never a fresh `Timestamp::now()` on replay). Every later replay returns the recorded value verbatim and **never re-runs the resolution**, so an operator adding a holiday after a timer is armed can never move that timer's deadline (the snapshot lookup still happens on every call, but its result is discarded on replay because `side_effect`'s matched arm never invokes the closure) — only timers armed afterwards see the edit.
 
 **Registration** is one builder call: `HarvestBuilder::state(BusinessCalendars::builtin())`. Holidays resolve on the worker from a `BusinessCalendars` snapshot in shared state (typically loaded once at startup via `calendar::load_exclusions_for_calendar`) — no per-call DB read, no global static.
 
@@ -1557,7 +1557,7 @@ async fn charge_card(ctx: &ActivityContext, amount_cents: i64) -> Result<String,
 
 | Method | Returns |
 |--------|---------|
-| `ctx.deadline()` | `Option<DateTime<Utc>>` — the **earliest** of `started_at + start_to_close` and the cross-retry `schedule_to_close` deadline; `None` when unbounded |
+| `ctx.deadline()` | `Option<jiff::Timestamp>` — the **earliest** of `started_at + start_to_close` and the cross-retry `schedule_to_close` deadline; `None` when unbounded |
 | `ctx.time_remaining()` | `Option<Duration>` — time left, **saturating at zero** (never negative); `None` when unbounded |
 | `ctx.is_expiring_within(reserve)` | `bool` — `true` when less than `reserve` remains; **always `false` when unbounded** |
 
