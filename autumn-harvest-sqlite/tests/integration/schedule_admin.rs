@@ -73,7 +73,7 @@ fn next_run_at(rt: &SqliteRuntime, workflow: &str) -> Option<i64> {
         .find(|s| s.workflow_name == workflow)
         .expect("the schedule exists")
         .next_run_at
-        .map(|at| at.as_millisecond())
+        .map(jiff::Timestamp::as_millisecond)
 }
 
 /// `harvest.scheduler_enabled = false` stops every fire. The rows stay, and
@@ -235,7 +235,7 @@ async fn the_reader_lists_schedules_with_input_and_policy() {
     assert_eq!(listed[0].max_active_runs, 3);
     assert_eq!(listed[1].overlap_policy, OverlapPolicy::Skip);
     assert_eq!(
-        listed[1].next_run_at.map(|at| at.as_millisecond()),
+        listed[1].next_run_at.map(jiff::Timestamp::as_millisecond),
         Some(T0 + MINUTE)
     );
     assert!(reader.schedule_override("tick").unwrap().is_none());

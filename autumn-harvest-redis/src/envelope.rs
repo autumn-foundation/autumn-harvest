@@ -31,11 +31,7 @@ use crate::error::{RedisAdapterError, RedisAdapterResult};
 /// Returns [`RedisAdapterError::DurationOutOfRange`] for a delay past
 /// `i64::MAX` milliseconds. `chrono::Duration::from_std` refused such a
 /// delay, so the caller still gets the error and no task is parked.
-pub(crate) fn due_after(
-    now: Timestamp,
-    delay: Duration,
-    what: &str,
-) -> RedisAdapterResult<Timestamp> {
+pub fn due_after(now: Timestamp, delay: Duration, what: &str) -> RedisAdapterResult<Timestamp> {
     let span = autumn_harvest::time::from_std_bounded(delay).ok_or_else(|| {
         RedisAdapterError::DurationOutOfRange(format!(
             "{what}: {delay:?} is past i64::MAX milliseconds"

@@ -9,7 +9,7 @@
 ///
 /// The `chrono` range holds the whole `jiff` range, so the result is `Some`
 /// for every input.
-pub(crate) fn to_chrono(at: jiff::Timestamp) -> Option<chrono::DateTime<chrono::Utc>> {
+pub fn to_chrono(at: jiff::Timestamp) -> Option<chrono::DateTime<chrono::Utc>> {
     // jiff truncates the seconds toward zero. chrono takes floored seconds
     // and a fraction that is not negative.
     let (mut secs, mut nanos) = (at.as_second(), at.subsec_nanosecond());

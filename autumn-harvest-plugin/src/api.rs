@@ -17133,12 +17133,13 @@ fn pending_activity_deadline(
     from: jiff::Timestamp,
     timeout: jiff::SignedDuration,
 ) -> jiff::Timestamp {
-    from.checked_add(timeout)
-        .unwrap_or(if timeout.is_negative() {
+    from.checked_add(timeout).unwrap_or_else(|_| {
+        if timeout.is_negative() {
             jiff::Timestamp::MIN
         } else {
             jiff::Timestamp::MAX
-        })
+        }
+    })
 }
 
 #[cfg(test)]

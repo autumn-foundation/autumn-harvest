@@ -125,7 +125,7 @@ fn next_run_at(rt: &SqliteRuntime, workflow: &str) -> Option<i64> {
         .find(|s| s.workflow_name == workflow)
         .expect("the schedule exists")
         .next_run_at
-        .map(|at| at.as_millisecond())
+        .map(jiff::Timestamp::as_millisecond)
 }
 
 // AC1: an interval schedule starts runs on time across a reopen. The app
@@ -531,7 +531,7 @@ fn last_run_at(rt: &SqliteRuntime, workflow: &str) -> Option<i64> {
         .find(|s| s.workflow_name == workflow)
         .expect("the schedule exists")
         .last_run_at
-        .map(|at| at.as_millisecond())
+        .map(jiff::Timestamp::as_millisecond)
 }
 
 // A late fire keeps the cadence: the next slot counts from the slot, not

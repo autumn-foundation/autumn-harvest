@@ -225,7 +225,9 @@ pub fn load(
         params![
             exec.to_string(),
             filter.after_seq.unwrap_or(i64::MIN),
-            filter.since.map_or(i64::MIN, |at| at.as_microsecond()),
+            filter
+                .since
+                .map_or(i64::MIN, jiff::Timestamp::as_microsecond),
             levels,
             i64::from(filter.limit)
         ],

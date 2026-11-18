@@ -427,7 +427,7 @@ impl SqliteAuthStore {
                     token.token_hash,
                     token.scope,
                     token.created_at.as_microsecond(),
-                    token.expires_at.map(|at| at.as_microsecond()),
+                    token.expires_at.map(jiff::Timestamp::as_microsecond),
                     token.created_by,
                     token.tenant,
                 ],

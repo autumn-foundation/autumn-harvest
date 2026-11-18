@@ -547,7 +547,7 @@ pub fn active_runs(conn: &Connection, workflow_name: &str, now: i64) -> SqliteRe
 pub fn advance(conn: &Connection, due: &Due, now: i64, dispatched: bool) -> SqliteResult<()> {
     let slot = to_time(due.slot);
     let next = schedule_plan::next_slot_after_fire(&due.schedule, slot, to_time(now))
-        .map(|at| at.as_millisecond());
+        .map(jiff::Timestamp::as_millisecond);
     conn.execute(
         "UPDATE harvest_schedules SET next_run_at = ?2, \
            last_run_at = CASE WHEN ?3 THEN ?4 ELSE last_run_at END \
@@ -700,7 +700,7 @@ fn check_supported(schedule: &WorkflowSchedule) -> SqliteResult<()> {
 
 /// The first slot of `schedule` after `now`, in epoch milliseconds.
 fn first_slot(schedule: &Schedule, now: i64) -> Option<i64> {
-    schedule_plan::next_fire_after(schedule, to_time(now)).map(|at| at.as_millisecond())
+    schedule_plan::next_fire_after(schedule, to_time(now)).map(jiff::Timestamp::as_millisecond)
 }
 
 fn parse_spec(spec: &str) -> SqliteResult<Schedule> {

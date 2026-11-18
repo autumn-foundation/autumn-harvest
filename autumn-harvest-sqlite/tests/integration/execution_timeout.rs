@@ -47,7 +47,7 @@ async fn sleeps_past_deadline(ctx: &WorkflowContext, _n: i64) -> Result<i64, Str
 /// Returns its deadline in epoch milliseconds.
 #[workflow(execution_timeout = "30s")]
 async fn reports_deadline(ctx: &WorkflowContext, _n: i64) -> Result<Option<i64>, String> {
-    Ok(ctx.deadline().map(|d| d.as_millisecond()))
+    Ok(ctx.deadline().map(jiff::Timestamp::as_millisecond))
 }
 
 /// Waits forever, with a retry policy that must not apply to a timeout.

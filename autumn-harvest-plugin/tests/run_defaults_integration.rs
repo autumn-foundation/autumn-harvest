@@ -355,6 +355,8 @@ async fn deadlines(url: &str, id: Uuid) -> Deadlines {
     }
 }
 
+// Each caller compares the result with an `Option` field.
+#[allow(clippy::unnecessary_wraps)]
 const fn secs(n: i64) -> Option<jiff::SignedDuration> {
     Some(jiff::SignedDuration::from_secs(n))
 }

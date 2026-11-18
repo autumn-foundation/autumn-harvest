@@ -162,8 +162,8 @@ pub fn count(conn: &Connection, filter: &CountFilter) -> SqliteResult<Vec<Execut
         params![
             filter.workflow_name,
             serde_json::to_string(&filter.states)?,
-            filter.started_after.map(|at| at.as_microsecond()),
-            filter.started_before.map(|at| at.as_microsecond()),
+            filter.started_after.map(jiff::Timestamp::as_microsecond),
+            filter.started_before.map(jiff::Timestamp::as_microsecond),
         ],
         |row| {
             Ok(ExecutionCount {
