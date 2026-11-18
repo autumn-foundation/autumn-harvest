@@ -1662,7 +1662,7 @@ mod tests {
         let event = WorkflowEvent::MutexGranted {
             key: "ledger:acct-42".into(),
             lock_seq: 7,
-            acquired_at: Timestamp::from_second(1_700_000_000).ok().unwrap(),
+            acquired_at: Timestamp::from_second(1_700_000_000).unwrap(),
         };
         let value = serde_json::to_value(&event)?;
         assert_eq!(value["type"], "MutexGranted");
@@ -1681,7 +1681,7 @@ mod tests {
         assert_eq!(lock_seq, 7);
         assert_eq!(
             acquired_at,
-            Timestamp::from_second(1_700_000_000).ok().unwrap()
+            Timestamp::from_second(1_700_000_000).unwrap()
         );
         Ok(())
     }

@@ -1357,7 +1357,7 @@ pub(crate) struct Stamp {
     database: String,
     /// `pg_postmaster_start_time()`.
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     started_at: Timestamp,
 }
 
@@ -1834,7 +1834,7 @@ struct GateRow {
     database: String,
     /// `pg_postmaster_start_time()`.
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     started_at: Timestamp,
     /// `pg_notification_queue_usage()`.
     #[diesel(sql_type = diesel::sql_types::Double)]

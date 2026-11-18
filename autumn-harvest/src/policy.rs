@@ -1595,9 +1595,9 @@ impl WorkflowSchedule {
 
 /// Longest accepted [`Schedule::Interval`] period: 100 years of 365 days.
 ///
-/// A period of about 8.2e12 seconds or more pushes the next fire time past
-/// the last date that `chrono` holds (issue #2048). The cap sits far below
-/// that limit and far above any real cadence. [`validate_schedule`] rejects a
+/// A period of about 2.5e11 seconds or more pushes the next fire time past
+/// the last date that jiff holds, in year 9999 (issue #2048). The cap sits
+/// far below that limit and far above any real cadence. [`validate_schedule`] rejects a
 /// longer period.
 pub const MAX_INTERVAL_PERIOD: Duration = Duration::from_hours(876_000);
 
@@ -1633,7 +1633,7 @@ pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
             .map_err(|e| format!("invalid cron expression '{expr}': {e}")),
         Schedule::CronInTimezone { expr, tz } => {
             // Validate the IANA timezone name first so callers get a clear error.
-            if tz.parse::<chrono_tz::Tz>().is_err() {
+            if crate::time::zone(tz).is_none() {
                 return Err(format!(
                     "unknown timezone '{tz}'; use an IANA timezone name (e.g. \"America/Los_Angeles\", \"UTC\")"
                 ));
@@ -1654,8 +1654,8 @@ pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
         Schedule::Interval(period) if period.subsec_nanos() != 0 => Err(format!(
             "interval schedule period must be a whole number of seconds, got {period:?}"
         )),
-        // The scheduler adds the period to a timestamp. chrono cannot hold a
-        // date past year 262143. The cap keeps the sum in range (issue #2048).
+        // The scheduler adds the period to a timestamp. jiff cannot hold a
+        // date past year 9999. The cap keeps the sum in range (issue #2048).
         Schedule::Interval(period) if *period > MAX_INTERVAL_PERIOD => Err(format!(
             "interval schedule period must not exceed {} seconds, got {} seconds. \
              Use a manual schedule to stop automatic runs.",
@@ -1748,8 +1748,7 @@ pub fn compute_jitter_offset(
         return Duration::ZERO;
     }
     let jitter_nanos = u64::try_from(jitter.as_nanos()).unwrap_or(u64::MAX);
-    let fire_nanos = fire_time
-        .timestamp_nanos_opt()
+    let fire_nanos = i64::try_from(fire_time.as_nanosecond())
         .unwrap_or_default()
         .cast_unsigned();
     let mut bytes = [0u8; 24];
@@ -2696,7 +2695,7 @@ mod tests {
 
     #[test]
     fn interval_schedule_over_the_cap_is_rejected() {
-        // Adding this period to a timestamp overflows chrono (issue #2048).
+        // Each period is over the cap. The larger ones overflow a jiff timestamp (issue #2048).
         for secs in [
             MAX_INTERVAL_PERIOD.as_secs() + 1,
             8_000_000_000_000,

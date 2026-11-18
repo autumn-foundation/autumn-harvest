@@ -1106,13 +1106,13 @@ fn absence_is_decisive_loss(
     // decisive loss instead of proof of life. Floor it at zero: a
     // negative tolerance means "no tolerance", not "invert the check".
     let max_skew_secs = max_skew_secs.max(0);
-    // A very large positive value can still overflow `Duration::seconds`'s
-    // representable range and panic (issue #1401). That would abort
-    // the whole verify run instead of returning an undetermined report.
-    // Fall back to the largest representable tolerance instead. An
-    // out-of-range request means "tolerate anything." That is the safe
-    // reading of an unbounded skew allowance, not a crash.
-    let max_skew = Some(jiff::SignedDuration::from_secs(max_skew_secs)).unwrap_or(jiff::SignedDuration::MAX);
+    // A very large positive value overflowed `chrono::Duration::seconds`
+    // and panicked (issue #1401). That aborted the whole verify run instead
+    // of returning an undetermined report. `SignedDuration::from_secs` holds
+    // every `i64`, so it cannot panic. A value past the span of two
+    // timestamps means "tolerate anything", the safe reading of an
+    // unbounded skew allowance.
+    let max_skew = jiff::SignedDuration::from_secs(max_skew_secs);
     matches!(
         target_latest_event_at,
         Some(latest) if fired_at - latest > max_skew
@@ -2078,7 +2078,7 @@ mod probes {
         #[diesel(sql_type = diesel::sql_types::Uuid)]
         trigger_id: Uuid,
         #[diesel(sql_type = Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         fired_at: Timestamp,
         #[diesel(sql_type = Nullable<Integer>)]
         target_shard: Option<i32>,
@@ -4057,7 +4057,7 @@ mod probes {
                 fire.target_workflow_id,
                 fire.source_exec_id,
                 fire.source_shard,
-                fire.fired_at,
+                crate::time::utc_display(fire.fired_at),
                 fire.target_shard
             );
             if super::absence_is_decisive_loss(fire.fired_at, target_latest, max_skew_secs) {

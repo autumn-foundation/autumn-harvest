@@ -500,7 +500,7 @@ mod pg {
         #[diesel(sql_type = Text)]
         author: String,
         #[diesel(sql_type = Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         created_at: Timestamp,
     }
 
@@ -737,7 +737,7 @@ mod pg {
         #[diesel(sql_type = Text)]
         actor: String,
         #[diesel(sql_type = Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         activated_at: Timestamp,
     }
 
@@ -857,7 +857,7 @@ mod pg {
         #[diesel(sql_type = Text)]
         actor: String,
         #[diesel(sql_type = Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         changed_at: Timestamp,
     }
 

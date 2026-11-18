@@ -573,9 +573,10 @@ mod db {
     };
     use std::time::Duration;
 
-    use jiff::Timestamp;
     use diesel::prelude::*;
     use diesel_async::{AsyncPgConnection, RunQueryDsl};
+    use jiff::Timestamp;
+    use jiff_diesel::ToDiesel;
 
     use crate::error::{HarvestError, HarvestResult};
 
@@ -602,9 +603,9 @@ mod db {
         retry_max_interval_ms: Option<i64>,
         reason: Option<String>,
         updated_by: String,
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         created_at: Timestamp,
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         updated_at: Timestamp,
     }
 
@@ -831,7 +832,7 @@ mod db {
                     .map_err(crate::error::database_error)?;
                 return Ok(None);
             }
-            let now = Timestamp::now();
+            let now = Timestamp::now().to_diesel();
             let sla_secs = merged.sla.map(to_secs);
             let execution_timeout_secs = merged.execution_timeout.map(to_secs);
             let chain_execution_timeout_secs = merged.chain_execution_timeout.map(to_secs);

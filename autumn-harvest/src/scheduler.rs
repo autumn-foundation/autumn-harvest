@@ -146,9 +146,7 @@ impl ScheduleRegistrationBackoff {
         entry.failures = entry.failures.saturating_add(1);
         let delay = jiff::SignedDuration::try_from(registration_backoff_delay(entry.failures))
             .unwrap_or_else(|_| jiff::SignedDuration::from_secs(300));
-        entry.retry_at = now
-            .checked_add(delay).ok()
-            .unwrap_or(jiff::Timestamp::MAX);
+        entry.retry_at = now.checked_add(delay).unwrap_or(jiff::Timestamp::MAX);
         drop(entries);
     }
 
@@ -197,7 +195,7 @@ impl std::fmt::Display for BackfillPlanError {
 /// - For `Cron` schedules the first occurrence at or after `from` is included; subsequent
 ///   occurrences are stepped through until they exceed `to`.
 /// - For `Interval` schedules `from` is treated as the first backfill timestamp and slots are
-///   spaced by the interval duration. The plan stops at the last date that `chrono` holds.
+///   spaced by the interval duration. The plan stops at the last date that jiff holds.
 /// - `Manual` schedules and `None` return an empty list (no automatic firing times).
 ///
 /// # Errors
@@ -254,7 +252,7 @@ pub fn plan_backfill_timestamps(
                     return Err(BackfillPlanError::LimitExceeded { limit: max_count });
                 }
                 timestamps.push(cursor);
-                // Stop when the next slot passes the last date that chrono holds (issue #2048).
+                // Stop when the next slot passes the last date that jiff holds (issue #2048).
                 let Some(next) = cursor.checked_add(dur).ok() else {
                     break;
                 };
@@ -2355,7 +2353,7 @@ async fn upsert_schedule(
                 dsl::max_active_runs.eq(i32::try_from(dag.max_active_runs).unwrap_or(i32::MAX)),
                 dsl::dag_name.eq(Some(dag.name.as_str())),
                 dsl::updated_at.eq(now.to_diesel()),
-                dsl::next_run_at.eq(next_run_at),
+                dsl::next_run_at.eq(next_run_at.to_diesel()),
                 dsl::jitter_secs.eq(i64::try_from(dag.jitter.as_secs()).unwrap_or(i64::MAX)),
                 dsl::overlap_policy.eq(dag.overlap_policy.as_str()),
                 dsl::buffer_all_max.eq(i32::try_from(dag.buffer_all_max).unwrap_or(i32::MAX)),
@@ -3264,7 +3262,7 @@ async fn apply_workflow_schedule_update(
         SetExt(harvest_schedules_ext::workflow_input.eq(Some(ws.input.clone()))),
         dsl::queue_name.eq(Some(ws.queue_name.as_str())),
         dsl::updated_at.eq(now.to_diesel()),
-        dsl::next_run_at.eq(next_run_at),
+        dsl::next_run_at.eq(next_run_at.to_diesel()),
         dsl::jitter_secs.eq(i64::try_from(ws.jitter.as_secs()).unwrap_or(i64::MAX)),
         dsl::overlap_policy.eq(ws.overlap_policy.as_str()),
         dsl::buffer_all_max.eq(i32::try_from(ws.buffer_all_max).unwrap_or(i32::MAX)),
@@ -3317,7 +3315,7 @@ async fn apply_workflow_schedule_update(
         .set((
             changeset,
             dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-            dsl::fire_claimed_until.eq(Option::<Timestamp>::None),
+            dsl::fire_claimed_until.eq(Option::<crate::time::sql::SqlTimestamp>::None),
         ))
         .execute(conn)
         .await
@@ -3361,7 +3359,7 @@ async fn apply_workflow_schedule_update(
         if end_at_ok && max_runs_ok {
             diesel::update(dsl::harvest_schedules.find(existing.id))
                 .set((
-                    dsl::exhausted_at.eq(None::<Timestamp>),
+                    dsl::exhausted_at.eq(None::<crate::time::sql::SqlTimestamp>),
                     dsl::exhausted_reason.eq(None::<String>),
                     dsl::updated_at.eq(now.to_diesel()),
                 ))
@@ -3408,7 +3406,7 @@ async fn apply_workflow_schedule_update(
             .set((
                 dsl::exhausted_at.eq(Some(now).to_diesel()),
                 dsl::exhausted_reason.eq(Some(reason)),
-                dsl::next_run_at.eq(None::<Timestamp>),
+                dsl::next_run_at.eq(None::<crate::time::sql::SqlTimestamp>),
                 dsl::updated_at.eq(now.to_diesel()),
             ))
             .execute(conn)
@@ -3424,7 +3422,7 @@ async fn apply_workflow_schedule_update(
     let limit_disabled = ws.consecutive_failure_limit.is_none_or(|n| n == 0);
     if limit_disabled {
         diesel::update(dsl::harvest_schedules.find(existing.id))
-            .set(dsl::auto_paused_at.eq(None::<Timestamp>))
+            .set(dsl::auto_paused_at.eq(None::<crate::time::sql::SqlTimestamp>))
             .execute(conn)
             .await
             .map_err(crate::error::database_error)?;
@@ -3862,22 +3860,21 @@ fn scheduled_workflow_id(
     workflow_name: &str,
     scheduled_for: Timestamp,
 ) -> String {
-    let micros = scheduled_for.subsec_microsecond();
-    if micros == 0 {
-        format!(
-            "sched:{}:{}:{}",
-            schedule_id,
-            workflow_name,
-            scheduled_for.as_second()
+    // The id keeps the `chrono` split: floored seconds and a fraction that is
+    // never negative. jiff truncates both parts toward zero before 1970.
+    let (seconds, nanos) = if scheduled_for.subsec_nanosecond() < 0 {
+        (
+            scheduled_for.as_second() - 1,
+            scheduled_for.subsec_nanosecond() + 1_000_000_000,
         )
     } else {
-        format!(
-            "sched:{}:{}:{}.{:06}",
-            schedule_id,
-            workflow_name,
-            scheduled_for.as_second(),
-            micros
-        )
+        (scheduled_for.as_second(), scheduled_for.subsec_nanosecond())
+    };
+    let micros = nanos / 1_000;
+    if micros == 0 {
+        format!("sched:{schedule_id}:{workflow_name}:{seconds}")
+    } else {
+        format!("sched:{schedule_id}:{workflow_name}:{seconds}.{micros:06}")
     }
 }
 
@@ -4067,7 +4064,7 @@ async fn tick_workflow_schedules(
             .await;
             diesel::update(dsl::harvest_schedules.find(schedule.id))
                 .set((
-                    dsl::next_run_at.eq(Option::<Timestamp>::None),
+                    dsl::next_run_at.eq(Option::<crate::time::sql::SqlTimestamp>::None),
                     dsl::updated_at.eq(now.to_diesel()),
                 ))
                 .execute(conn)
@@ -4567,7 +4564,7 @@ async fn tick_one_workflow_schedule(
     // empty the plan off a stale "at limit" snapshot. The guard, with the reset
     // count, then declines to auto-pause. The schedule silently stops with
     // next_run_at = NULL (issue #360 / #1928).
-    let (db_failure_count, db_auto_paused_at): (i32, Option<Timestamp>) =
+    let (db_failure_count, db_auto_paused_at): (i32, Option<crate::time::sql::SqlTimestamp>) =
         dsl::harvest_schedules
             .find(schedule.id)
             .select((dsl::consecutive_failure_count, dsl::auto_paused_at))
@@ -4652,7 +4649,7 @@ async fn tick_one_workflow_schedule(
             )
             .set((
                 dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-                dsl::fire_claimed_until.eq(Option::<Timestamp>::None),
+                dsl::fire_claimed_until.eq(Option::<crate::time::sql::SqlTimestamp>::None),
             ))
             .execute(conn)
             .await
@@ -4764,7 +4761,7 @@ async fn tick_one_workflow_schedule(
                 .set((
                     dsl::next_run_at.eq(next.to_diesel()),
                     dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-                    dsl::fire_claimed_until.eq(Option::<Timestamp>::None),
+                    dsl::fire_claimed_until.eq(Option::<crate::time::sql::SqlTimestamp>::None),
                     dsl::updated_at.eq(now.to_diesel()),
                 ))
                 .execute(conn)
@@ -4805,7 +4802,7 @@ async fn tick_one_workflow_schedule(
         )
         .set((
             dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-            dsl::fire_claimed_until.eq(Option::<Timestamp>::None),
+            dsl::fire_claimed_until.eq(Option::<crate::time::sql::SqlTimestamp>::None),
             dsl::updated_at.eq(now.to_diesel()),
         ))
         .execute(conn)
@@ -4835,7 +4832,7 @@ async fn tick_one_workflow_schedule(
         .set((
             dsl::auto_paused_at.eq(Some(now).to_diesel()),
             dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-            dsl::fire_claimed_until.eq(Option::<Timestamp>::None),
+            dsl::fire_claimed_until.eq(Option::<crate::time::sql::SqlTimestamp>::None),
             dsl::updated_at.eq(now.to_diesel()),
         ))
         .execute(conn)
@@ -4884,9 +4881,9 @@ async fn tick_one_workflow_schedule(
         .set((
             dsl::exhausted_at.eq(Some(now).to_diesel()),
             dsl::exhausted_reason.eq(Some("end_at_reached")),
-            dsl::next_run_at.eq(Option::<Timestamp>::None),
+            dsl::next_run_at.eq(Option::<crate::time::sql::SqlTimestamp>::None),
             dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-            dsl::fire_claimed_until.eq(Option::<Timestamp>::None),
+            dsl::fire_claimed_until.eq(Option::<crate::time::sql::SqlTimestamp>::None),
             dsl::updated_at.eq(now.to_diesel()),
         ))
         .execute(conn)
@@ -4931,9 +4928,9 @@ async fn tick_one_workflow_schedule(
         .set((
             dsl::exhausted_at.eq(Some(now).to_diesel()),
             dsl::exhausted_reason.eq(Some("max_runs_exhausted")),
-            dsl::next_run_at.eq(Option::<Timestamp>::None),
+            dsl::next_run_at.eq(Option::<crate::time::sql::SqlTimestamp>::None),
             dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-            dsl::fire_claimed_until.eq(Option::<Timestamp>::None),
+            dsl::fire_claimed_until.eq(Option::<crate::time::sql::SqlTimestamp>::None),
             dsl::updated_at.eq(now.to_diesel()),
         ))
         .execute(conn)
@@ -5023,10 +5020,10 @@ async fn tick_one_workflow_schedule(
         )
         .set((
             dsl::next_run_at.eq(final_next.to_diesel()),
-            dsl::exhausted_at.eq(exhausted_at),
+            dsl::exhausted_at.eq(exhausted_at.to_diesel()),
             dsl::exhausted_reason.eq(exhausted_reason),
             dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-            dsl::fire_claimed_until.eq(Option::<Timestamp>::None),
+            dsl::fire_claimed_until.eq(Option::<crate::time::sql::SqlTimestamp>::None),
             dsl::updated_at.eq(now.to_diesel()),
         ))
         .execute(conn)
@@ -5118,7 +5115,7 @@ async fn tick_one_workflow_schedule(
                 .set((
                     dsl::next_run_at.eq(next.to_diesel()),
                     dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-                    dsl::fire_claimed_until.eq(Option::<Timestamp>::None),
+                    dsl::fire_claimed_until.eq(Option::<crate::time::sql::SqlTimestamp>::None),
                     dsl::updated_at.eq(now.to_diesel()),
                 ))
                 .execute(conn)
@@ -5184,7 +5181,7 @@ async fn tick_one_workflow_schedule(
                     dsl::next_run_at.eq(next.to_diesel()),
                     dsl::buffered_runs.eq(buffered_runs_to_json(&buffered)),
                     dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-                    dsl::fire_claimed_until.eq(Option::<Timestamp>::None),
+                    dsl::fire_claimed_until.eq(Option::<crate::time::sql::SqlTimestamp>::None),
                     dsl::updated_at.eq(now.to_diesel()),
                 ))
                 .execute(conn)
@@ -5351,15 +5348,15 @@ async fn tick_one_workflow_schedule(
         // Jitter: stall dispatch until the effective fire time has elapsed.
         // effective_fire_time = scheduled_for + hash(schedule_id, scheduled_for) % jitter_window
         let jitter_offset = compute_jitter_offset(schedule.id, *scheduled_for, jitter_window);
-        let chrono_jitter = jiff::SignedDuration::try_from(jitter_offset).unwrap_or_else(|_| {
+        let jitter = jiff::SignedDuration::try_from(jitter_offset).unwrap_or_else(|_| {
             tracing::warn!(
                 schedule_id = %schedule.id,
                 jitter_secs = schedule.jitter_secs,
-                "harvest: jitter_secs overflows chrono::Duration; falling back to zero jitter"
+                "harvest: jitter_secs overflows jiff::SignedDuration; falling back to zero jitter"
             );
             jiff::SignedDuration::ZERO
         });
-        let effective_fire_time = *scheduled_for + chrono_jitter;
+        let effective_fire_time = *scheduled_for + jitter;
         if now < effective_fire_time {
             deferred_next_run_at = Some(*original_slot);
             tracing::debug!(
@@ -5870,7 +5867,7 @@ async fn tick_one_workflow_schedule(
         // fire. Guarded by token so a slow late tick cannot overwrite a
         // successor replica's live claim if the 30 s TTL expired.
         dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-        dsl::fire_claimed_until.eq(Option::<Timestamp>::None),
+        dsl::fire_claimed_until.eq(Option::<crate::time::sql::SqlTimestamp>::None),
         // NOTE: last_catchup_dropped / last_catchup_at are intentionally NOT set
         // here. A separate conditional update persists them in the
         // `catchup_slots_dropped > 0` block above. Ordinary zero-drop ticks then
@@ -6091,13 +6088,13 @@ pub fn schedule_overdue(inputs: &OverdueInputs) -> OverdueVerdict {
         jiff::SignedDuration::try_from(inputs.jitter).unwrap_or_else(|_| jiff::SignedDuration::ZERO);
     let tick = jiff::SignedDuration::try_from(inputs.tick_interval)
         .unwrap_or_else(|_| jiff::SignedDuration::ZERO);
-    // `jiff::SignedDuration`'s `+` panics on overflow; a pathological (near-i64-ms)
+    // `jiff::SignedDuration`'s `+` panics on overflow; a pathological (near-i64-seconds)
     // interval + jitter could overflow. Treat an unrepresentable grace as "no
     // cadence" (never overdue), consistent with how the module treats a
     // non-representable interval elsewhere.
     let Some(grace) = step
-        .checked_add(&jitter)
-        .and_then(|partial| partial.checked_add(&tick))
+        .checked_add(jitter)
+        .and_then(|partial| partial.checked_add(tick))
     else {
         return OverdueVerdict::NOT_OVERDUE;
     };
@@ -6814,10 +6811,10 @@ fn eligible_slot_summary(
     if let Some(period) = interval_period(schedule)
         && let (Some(p), Some(span_now)) = (
             crate::time::num_nanoseconds(period),
-            crate::time::num_nanoseconds((now - first_due)),
+            crate::time::num_nanoseconds(now - first_due),
         )
     {
-        let end_span = end_at.and_then(|e| crate::time::num_nanoseconds((e - first_due)));
+        let end_span = end_at.and_then(|e| crate::time::num_nanoseconds(e - first_due));
         // Proceed with arithmetic only when end_at is unset or its offset fits in
         // nanoseconds; otherwise fall through to the walk path (avoids a wrong cap).
         if end_at.is_none() || end_span.is_some() {
@@ -6893,16 +6890,16 @@ fn window_eligible_slots(
     if let Some(period) = interval_period(schedule)
         && let (Some(p), Some(span_now)) = (
             crate::time::num_nanoseconds(period),
-            crate::time::num_nanoseconds((now - first_due)),
+            crate::time::num_nanoseconds(now - first_due),
         )
     {
-        let end_span = end_at.and_then(|e| crate::time::num_nanoseconds((e - first_due)));
+        let end_span = end_at.and_then(|e| crate::time::num_nanoseconds(e - first_due));
         if end_at.is_none() || end_span.is_some() {
             let Some(k_hi) = last_eligible_step(span_now, p, end_span) else {
                 return vec![];
             };
             // Smallest k with first_due + k*period >= cutoff.
-            let k_lo = match crate::time::num_nanoseconds((cutoff - first_due)) {
+            let k_lo = match crate::time::num_nanoseconds(cutoff - first_due) {
                 Some(cs) if cs > 0 => (cs + p - 1) / p, // ceil
                 _ => 0,
             };
@@ -7041,7 +7038,7 @@ pub fn parse_buffered_runs_pub(value: &serde_json::Value) -> Vec<Timestamp> {
 pub(crate) fn buffered_runs_to_json(runs: &[Timestamp]) -> serde_json::Value {
     serde_json::Value::Array(
         runs.iter()
-            .map(|t| serde_json::Value::String(crate::time::rfc3339(t)))
+            .map(|t| serde_json::Value::String(crate::time::rfc3339(*t)))
             .collect(),
     )
 }
@@ -7782,9 +7779,9 @@ async fn drain_claimed_buffered_schedule(
             dsl::runs_started.eq(dsl::runs_started + dispatched_i32),
             dsl::exhausted_at.eq(Some(now).to_diesel()),
             dsl::exhausted_reason.eq(exhausted_reason),
-            dsl::next_run_at.eq(Option::<Timestamp>::None),
+            dsl::next_run_at.eq(Option::<crate::time::sql::SqlTimestamp>::None),
             dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-            dsl::fire_claimed_until.eq(Option::<Timestamp>::None),
+            dsl::fire_claimed_until.eq(Option::<crate::time::sql::SqlTimestamp>::None),
             dsl::updated_at.eq(now.to_diesel()),
         ))
         .execute(conn)
@@ -7806,7 +7803,7 @@ async fn drain_claimed_buffered_schedule(
             dsl::buffered_runs.eq(buffered_runs_to_json(&buffered)),
             dsl::runs_started.eq(dsl::runs_started + dispatched_i32),
             dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-            dsl::fire_claimed_until.eq(Option::<Timestamp>::None),
+            dsl::fire_claimed_until.eq(Option::<crate::time::sql::SqlTimestamp>::None),
             dsl::updated_at.eq(now.to_diesel()),
         ))
         .execute(conn)
@@ -8033,7 +8030,7 @@ pub(crate) async fn maybe_reset_schedule_failure_counter(
         )
         .set((
             dsl::consecutive_failure_count.eq(0),
-            dsl::auto_paused_at.eq(Option::<Timestamp>::None),
+            dsl::auto_paused_at.eq(Option::<crate::time::sql::SqlTimestamp>::None),
             dsl::updated_at.eq(now.to_diesel()),
         ))
         .execute(conn)
@@ -8051,7 +8048,7 @@ pub(crate) async fn maybe_reset_schedule_failure_counter(
         )
         .set((
             dsl::consecutive_failure_count.eq(0),
-            dsl::auto_paused_at.eq(Option::<Timestamp>::None),
+            dsl::auto_paused_at.eq(Option::<crate::time::sql::SqlTimestamp>::None),
             dsl::updated_at.eq(now.to_diesel()),
         ))
         .execute(conn)
@@ -9043,7 +9040,7 @@ mod tests {
 
     #[test]
     fn plan_backfill_timestamps_huge_interval_returns_only_the_first_slot() {
-        // The second slot is past the last date chrono holds (issue #2048).
+        // The second slot is past the last date that jiff holds (issue #2048).
         let from = parse_utc("2026-04-01T00:00:00Z");
         let to = parse_utc("2026-04-08T00:00:00Z");
         for secs in [9_000_000_000_000_000, u64::MAX] {
@@ -9270,7 +9267,7 @@ mod tests {
 
     #[test]
     fn next_run_after_huge_interval_is_none_not_a_panic() {
-        // chrono panics on `reference + duration` past year 262143 (issue #2048).
+        // jiff panics on `reference + duration` past year 9999 (issue #2048).
         let now = parse_utc("2026-01-01T00:00:00Z");
         for secs in [8_300_000_000_000, 9_000_000_000_000_000, u64::MAX] {
             let schedule = Schedule::Interval(Duration::from_secs(secs));
@@ -9289,7 +9286,7 @@ mod tests {
 
     #[test]
     fn next_run_after_sum_stops_exactly_at_the_last_date() {
-        // The sum is valid up to the last date that chrono holds, and no further.
+        // The sum is valid up to the last date that jiff holds, and no further.
         let now = parse_utc("2026-01-01T00:00:00Z");
         let span = u64::try_from((Timestamp::MAX - now).as_secs()).unwrap();
         let fits = Schedule::Interval(Duration::from_secs(span));
@@ -9759,9 +9756,9 @@ mod tests {
 
     #[test]
     fn overdue_grace_overflow_is_not_overdue() {
-        // A pathological interval near chrono's i64-ms bound makes `grace =
-        // step + jitter + tick` overflow; the predicate must treat that as
-        // not-overdue (checked add) rather than panic.
+        // A pathological interval near the i64 millisecond bound makes a huge
+        // `grace = step + jitter + tick`. The predicate must treat it as
+        // not-overdue, and a checked add keeps it from a panic.
         let sched = Schedule::Interval(Duration::from_millis(u64::try_from(i64::MAX).unwrap()));
         let now = dt(2026, 1, 1, 0, 0, 0);
         let v = schedule_overdue(&base(
@@ -11171,8 +11168,8 @@ mod tests {
 
     #[test]
     fn window_eligible_slots_of_an_interval_past_the_end_of_time_is_empty() {
-        // The period has no nanosecond value, and its first step leaves the
-        // range of chrono. The walk stops at once.
+        // The first step of the period leaves the range of jiff. The walk
+        // stops at once.
         let huge = Schedule::Interval(Duration::from_hours(2_500_000_000_000));
         let first_due = parse_utc("2026-01-01T00:00:00Z");
         let now = first_due + jiff::SignedDuration::from_hours(2);

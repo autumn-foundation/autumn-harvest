@@ -83,10 +83,10 @@ struct VersionUsageSqlRow {
     #[diesel(sql_type = BigInt)]
     terminal_executions: i64,
     #[diesel(sql_type = Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     oldest_matching_started_at: Timestamp,
     #[diesel(sql_type = Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     newest_matching_started_at: Timestamp,
     #[diesel(sql_type = Integer)]
     shard_id: i32,

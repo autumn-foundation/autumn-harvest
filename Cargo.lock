@@ -705,7 +705,6 @@ name = "autumn-harvest-verify"
 version = "0.10.0"
 dependencies = [
  "autumn-harvest",
- "chrono",
  "clap",
  "jiff 1.0.1",
  "proc-macro2",

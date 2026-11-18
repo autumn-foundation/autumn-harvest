@@ -40,9 +40,9 @@ pub struct HarvestCalendar {
     pub description: Option<String>,
     /// `true` for built-in calendars that operators cannot delete.
     pub built_in: bool,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub created_at: jiff::Timestamp,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub updated_at: jiff::Timestamp,
 }
 
@@ -67,7 +67,7 @@ pub struct HarvestCalendarExclusion {
     pub calendar_name: String,
     #[diesel(deserialize_as = jiff_diesel::Date)]
     pub excluded_date: jiff::civil::Date,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub created_at: jiff::Timestamp,
 }
 
@@ -464,12 +464,12 @@ crate::split_queryable!(
         parent_id: Option<Uuid>,
         sticky_worker_id: Option<String>,
         queue_name: String,
-        started_at: jiff::Timestamp as jiff_diesel::Timestamp,
+        started_at: jiff::Timestamp as crate::time::sql::SqlTimestamp,
         completed_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
         execution_timeout: Option<jiff::SignedDuration> as crate::time::sql::NullablePgDuration,
         deadline_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
         search_attrs: Option<serde_json::Value>,
-        created_at: jiff::Timestamp as jiff_diesel::Timestamp,
+        created_at: jiff::Timestamp as crate::time::sql::SqlTimestamp,
         parent_close_policy: Option<String>,
         owner: Option<String>,
         severity: Option<String>,
@@ -534,7 +534,7 @@ crate::split_insertable!(
         parent_id: Option<Uuid>,
         queue_name: &'a str,
         execution_timeout: Option<jiff::SignedDuration> as crate::time::sql::PgDuration,
-        deadline_at: Option<jiff::Timestamp> as jiff_diesel::Timestamp,
+        deadline_at: Option<jiff::Timestamp> as crate::time::sql::SqlTimestamp,
         search_attrs: Option<serde_json::Value>,
         parent_close_policy: Option<String>,
         owner: Option<&'a str>,
@@ -548,13 +548,13 @@ crate::split_insertable!(
     ext harvest_workflow_executions_ext {
         run_id: Uuid,
         chain_execution_timeout: Option<jiff::SignedDuration> as crate::time::sql::PgDuration,
-        chain_deadline_at: Option<jiff::Timestamp> as jiff_diesel::Timestamp,
+        chain_deadline_at: Option<jiff::Timestamp> as crate::time::sql::SqlTimestamp,
         memo: Option<serde_json::Value>,
         assigned_build_id: Option<String>,
         runbook_url: Option<&'a str>,
         context_headers: Option<serde_json::Value>,
-        sla_deadline_at: Option<jiff::Timestamp> as jiff_diesel::Timestamp,
-        scheduled_for: Option<jiff::Timestamp> as jiff_diesel::Timestamp,
+        sla_deadline_at: Option<jiff::Timestamp> as crate::time::sql::SqlTimestamp,
+        scheduled_for: Option<jiff::Timestamp> as crate::time::sql::SqlTimestamp,
         workflow_attempt: i32,
         workflow_retry_policy: Option<serde_json::Value>,
         origin: Option<&'a str>,
@@ -588,7 +588,7 @@ pub struct HarvestEvent {
     pub event_id: i32,
     pub event_type: String,
     pub event_data: serde_json::Value,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub timestamp: jiff::Timestamp,
 }
 
@@ -613,7 +613,7 @@ pub struct HarvestPayloadRef {
     pub workflow_exec_id: Uuid,
     pub store_id: String,
     pub byte_len: i64,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub created_at: jiff::Timestamp,
 }
 
@@ -645,7 +645,7 @@ pub struct TaskQueueItem {
     pub worker_id: Option<String>,
     pub attempt: i32,
     pub max_attempts: i32,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub scheduled_at: jiff::Timestamp,
     #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
     pub started_at: Option<jiff::Timestamp>,
@@ -875,7 +875,7 @@ crate::split_queryable!(
         worker_id: Option<String>,
         attempt: i32,
         max_attempts: i32,
-        scheduled_at: jiff::Timestamp as jiff_diesel::Timestamp,
+        scheduled_at: jiff::Timestamp as crate::time::sql::SqlTimestamp,
         started_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
         completed_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
         last_heartbeat_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
@@ -928,13 +928,13 @@ crate::split_insertable!(
         input: SharedJson,
         priority: i32,
         max_attempts: i32,
-        scheduled_at: jiff::Timestamp as jiff_diesel::Timestamp,
+        scheduled_at: jiff::Timestamp as crate::time::sql::SqlTimestamp,
         heartbeat_details: Option<serde_json::Value>,
         sticky_worker_id: Option<&'a str>,
-        sticky_until: Option<jiff::Timestamp> as jiff_diesel::Timestamp,
+        sticky_until: Option<jiff::Timestamp> as crate::time::sql::SqlTimestamp,
         sticky_timeout: Option<jiff::SignedDuration> as crate::time::sql::PgDuration,
         concurrency_key: Option<&'a str>,
-        schedule_to_close_at: Option<jiff::Timestamp> as jiff_diesel::Timestamp,
+        schedule_to_close_at: Option<jiff::Timestamp> as crate::time::sql::SqlTimestamp,
         context_headers: Option<serde_json::Value>,
         session_id: Option<Uuid>,
     },
@@ -974,11 +974,11 @@ pub struct RateLimitBucket {
     pub refill_rate: f64,
     pub burst: f64,
     pub tokens: f64,
-    #[diesel(serialize_as = jiff_diesel::Timestamp, deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp, deserialize_as = crate::time::sql::SqlTimestamp)]
     pub last_refilled_at: jiff::Timestamp,
-    #[diesel(serialize_as = jiff_diesel::Timestamp, deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp, deserialize_as = crate::time::sql::SqlTimestamp)]
     pub created_at: jiff::Timestamp,
-    #[diesel(serialize_as = jiff_diesel::Timestamp, deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp, deserialize_as = crate::time::sql::SqlTimestamp)]
     pub updated_at: jiff::Timestamp,
     /// TTL'd operator override refill rate (issue #945); `None` when no
     /// override refill rate has been declared (an override may set only
@@ -1013,7 +1013,7 @@ pub struct NewRateLimitBucket<'a> {
     pub refill_rate: f64,
     pub burst: f64,
     pub tokens: f64,
-    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp)]
     pub last_refilled_at: jiff::Timestamp,
 }
 
@@ -1136,8 +1136,8 @@ crate::split_queryable!(
         max_active_runs: i32,
         is_paused: bool,
         next_run_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
-        created_at: jiff::Timestamp as jiff_diesel::Timestamp,
-        updated_at: jiff::Timestamp as jiff_diesel::Timestamp,
+        created_at: jiff::Timestamp as crate::time::sql::SqlTimestamp,
+        updated_at: jiff::Timestamp as crate::time::sql::SqlTimestamp,
         workflow_name: Option<String>,
         queue_name: Option<String>,
         paused_at: Option<jiff::Timestamp> as crate::time::sql::NullableTimestamp,
@@ -1209,7 +1209,7 @@ pub struct HarvestSignal {
     pub workflow_exec_id: Uuid,
     pub signal_name: String,
     pub payload: serde_json::Value,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub received_at: jiff::Timestamp,
     pub consumed: bool,
     pub idempotency_key: Option<String>,
@@ -1237,7 +1237,7 @@ pub struct HarvestTimer {
     pub id: Uuid,
     pub workflow_exec_id: Uuid,
     pub timer_id: String,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub fires_at: jiff::Timestamp,
     pub fired: bool,
 }
@@ -1248,7 +1248,7 @@ pub struct HarvestTimer {
 pub struct NewHarvestTimer<'a> {
     pub workflow_exec_id: Uuid,
     pub timer_id: &'a str,
-    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp)]
     pub fires_at: jiff::Timestamp,
 }
 
@@ -1270,7 +1270,7 @@ pub struct DeadLetter {
     pub input: serde_json::Value,
     pub error: String,
     pub attempts: i32,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub failed_at: jiff::Timestamp,
     pub owner: Option<String>,
     pub severity: Option<String>,
@@ -1320,12 +1320,12 @@ pub struct ExternalTask {
     pub name: String,
     pub queue: String,
     pub state: String,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub schedule_to_close_at: jiff::Timestamp,
     pub schedule_to_close_secs: i64,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub created_at: jiff::Timestamp,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub updated_at: jiff::Timestamp,
 }
 
@@ -1338,7 +1338,7 @@ pub struct NewExternalTask<'a> {
     pub activity_id: Uuid,
     pub name: &'a str,
     pub queue: &'a str,
-    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp)]
     pub schedule_to_close_at: jiff::Timestamp,
     pub schedule_to_close_secs: i64,
 }
@@ -1354,9 +1354,9 @@ pub struct NewExternalTask<'a> {
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct HarvestWorker {
     pub worker_id: String,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub started_at: jiff::Timestamp,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub last_heartbeat_at: jiff::Timestamp,
     /// JSON array of queue names polled by this worker.
     pub queues: serde_json::Value,
@@ -1426,9 +1426,9 @@ pub struct BatchJob {
     pub completed: i64,
     pub failed: i64,
     pub errors: serde_json::Value,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub created_at: jiff::Timestamp,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub updated_at: jiff::Timestamp,
     #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
     pub started_at: Option<jiff::Timestamp>,
@@ -1463,7 +1463,7 @@ pub struct NewBatchJob<'a> {
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct AuditRecord {
     pub id: Uuid,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub occurred_at: jiff::Timestamp,
     pub actor: String,
     pub operation: String,
@@ -1507,7 +1507,7 @@ pub struct NewAuditRecord<'a> {
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct AuditExportRow {
     pub id: Uuid,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub occurred_at: jiff::Timestamp,
     pub actor: String,
     pub operation: String,
@@ -1544,14 +1544,14 @@ pub struct AuditExportCursor {
     pub claim_epoch: i64,
     #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
     pub lease_until: Option<jiff::Timestamp>,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub next_attempt_at: jiff::Timestamp,
     pub consecutive_failures: i32,
     pub last_status: Option<i32>,
     pub last_error: Option<String>,
     #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
     pub last_delivered_at: Option<jiff::Timestamp>,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub updated_at: jiff::Timestamp,
     /// Set when an operator retired audit export for this shard. The row is
     /// kept rather than deleted, so `last_assigned_seq` outlives the audit rows
@@ -1589,7 +1589,7 @@ pub struct ApiToken {
     pub name: String,
     pub token_hash: String,
     pub scope: String,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub created_at: jiff::Timestamp,
     #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
     pub expires_at: Option<jiff::Timestamp>,
@@ -1647,9 +1647,9 @@ pub struct HarvestBuildPolicy {
     pub queue_name: String,
     pub build_id: String,
     pub deployment_name: Option<String>,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub created_at: jiff::Timestamp,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub updated_at: jiff::Timestamp,
     /// Ramp target build (issue #604). `None` = no ramp configured.
     pub target_build_id: Option<String>,
@@ -1685,7 +1685,7 @@ pub struct HarvestBuildCompat {
     pub id: Uuid,
     pub build_id: String,
     pub compatible_with: String,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub declared_at: jiff::Timestamp,
 }
 
@@ -1709,9 +1709,9 @@ pub struct BackfillLogRow {
     pub schedule_id: Uuid,
     pub actor: String,
     pub source: String,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub from_ts: jiff::Timestamp,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub to_ts: jiff::Timestamp,
     pub dry_run: bool,
     pub total: i32,
@@ -1720,7 +1720,7 @@ pub struct BackfillLogRow {
     pub failed: i32,
     pub status: String,
     pub error_summary: Option<String>,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub started_at: jiff::Timestamp,
     #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
     pub completed_at: Option<jiff::Timestamp>,
@@ -1734,9 +1734,9 @@ pub struct NewBackfillLogRow {
     pub schedule_id: Uuid,
     pub actor: String,
     pub source: String,
-    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp)]
     pub from_ts: jiff::Timestamp,
-    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp)]
     pub to_ts: jiff::Timestamp,
     pub dry_run: bool,
     pub total: i32,
@@ -1745,7 +1745,7 @@ pub struct NewBackfillLogRow {
     pub failed: i32,
     pub status: String,
     pub error_summary: Option<String>,
-    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp)]
     pub started_at: jiff::Timestamp,
     #[diesel(serialize_as = crate::time::sql::NullableTimestamp)]
     pub completed_at: Option<jiff::Timestamp>,
@@ -1767,9 +1767,9 @@ pub struct ScheduleDecision {
     pub decision: String,
     pub reason_code: String,
     pub detail: Option<serde_json::Value>,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub occurred_at: jiff::Timestamp,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub next_fire_at: jiff::Timestamp,
     pub shard_id: i16,
 }
@@ -1785,9 +1785,9 @@ pub struct NewScheduleDecision {
     pub decision: String,
     pub reason_code: String,
     pub detail: Option<serde_json::Value>,
-    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp)]
     pub occurred_at: jiff::Timestamp,
-    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp)]
     pub next_fire_at: jiff::Timestamp,
     pub shard_id: i16,
 }
@@ -1808,9 +1808,9 @@ pub struct CompletionTriggerDb {
     pub input_mapping: serde_json::Value,
     pub queue_name: Option<String>,
     pub is_static: bool,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub created_at: jiff::Timestamp,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub updated_at: jiff::Timestamp,
     /// Optional output guard AST (issue #810). NULL = unconditional.
     pub condition: Option<serde_json::Value>,
@@ -1838,7 +1838,7 @@ pub struct NewCompletionTriggerDb {
 pub struct CompletionTriggerFireDb {
     pub source_exec_id: Uuid,
     pub trigger_id: Uuid,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub fired_at: jiff::Timestamp,
     /// NULL = fired; `condition_unmet` / `condition_invalid` =
     /// resolved-skipped by the output guard (issue #810).
@@ -1885,7 +1885,7 @@ pub struct CompletionTriggerOutboxDb {
     pub concurrency_limit: Option<i32>,
     pub priority: serde_json::Value,
     pub max_workflow_input_bytes: i64,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub created_at: jiff::Timestamp,
     #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
     pub next_attempt_at: Option<jiff::Timestamp>,
@@ -1932,7 +1932,7 @@ pub struct CrossShardChildRow {
     pub workflow_name: String,
     /// A serialized `crate::cross_shard_child::CrossShardChildSpec`.
     pub child_spec: serde_json::Value,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub created_at: jiff::Timestamp,
     pub attempts: i32,
     pub last_error: Option<String>,
@@ -1975,7 +1975,7 @@ pub struct AdmissionGateRow {
     pub reason: String,
     pub message: Option<String>,
     pub created_by: String,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub created_at: jiff::Timestamp,
     /// `None` = no expiry; auto-ignored at/after this time.
     #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
@@ -2032,13 +2032,13 @@ pub struct CompletionDelivery {
     pub max_attempts: i32,
     /// Frozen `RetryPolicy` JSON at enqueue time.
     pub retry_policy: serde_json::Value,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub next_attempt_at: jiff::Timestamp,
     pub last_status: Option<i32>,
     pub last_error: Option<String>,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub created_at: jiff::Timestamp,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub updated_at: jiff::Timestamp,
     #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
     pub delivered_at: Option<jiff::Timestamp>,
@@ -2060,7 +2060,7 @@ pub struct NewCompletionDelivery<'a> {
     pub payload: serde_json::Value,
     pub max_attempts: i32,
     pub retry_policy: serde_json::Value,
-    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp)]
     pub next_attempt_at: jiff::Timestamp,
 }
 
@@ -2073,9 +2073,9 @@ pub struct NewCompletionDelivery<'a> {
 pub struct CompletionDeliveryClaim {
     pub state: String,
     pub attempt: i32,
-    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp)]
     pub next_attempt_at: jiff::Timestamp,
-    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp)]
     pub updated_at: jiff::Timestamp,
 }
 
@@ -2085,11 +2085,11 @@ pub struct CompletionDeliveryClaim {
 #[diesel(table_name = harvest_completion_deliveries)]
 pub struct CompletionDeliveryOutcomeUpdate {
     pub state: String,
-    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp)]
     pub next_attempt_at: jiff::Timestamp,
     pub last_status: Option<i32>,
     pub last_error: Option<String>,
-    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp)]
     pub updated_at: jiff::Timestamp,
     #[diesel(serialize_as = crate::time::sql::NullableTimestamp)]
     pub delivered_at: Option<jiff::Timestamp>,
@@ -2122,9 +2122,9 @@ pub struct HarvestSession {
     pub queue_name: String,
     /// `ACTIVE`, `BROKEN`, or `COMPLETED`.
     pub state: String,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub created_at: jiff::Timestamp,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub expires_at: jiff::Timestamp,
     #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
     pub broken_at: Option<jiff::Timestamp>,
@@ -2141,7 +2141,7 @@ pub struct NewHarvestSession<'a> {
     pub workflow_exec_id: Uuid,
     pub host_worker_id: &'a str,
     pub queue_name: &'a str,
-    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp)]
     pub expires_at: jiff::Timestamp,
 }
 
@@ -2153,7 +2153,7 @@ pub struct NewHarvestSession<'a> {
 #[derive(Debug, AsChangeset)]
 #[diesel(table_name = harvest_sessions)]
 pub struct SessionLeaseRefresh {
-    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp)]
     pub expires_at: jiff::Timestamp,
 }
 
@@ -2162,7 +2162,7 @@ pub struct SessionLeaseRefresh {
 #[diesel(table_name = harvest_sessions)]
 pub struct SessionBrokenUpdate {
     pub state: String,
-    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp)]
     pub broken_at: jiff::Timestamp,
     pub broken_reason: String,
 }
@@ -2172,7 +2172,7 @@ pub struct SessionBrokenUpdate {
 #[diesel(table_name = harvest_sessions)]
 pub struct SessionCompletedUpdate {
     pub state: String,
-    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp)]
     pub completed_at: jiff::Timestamp,
 }
 
@@ -2198,9 +2198,9 @@ pub struct ExecutionSummary {
     pub workflow_name: String,
     pub workflow_id: String,
     pub state: String,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub started_at: jiff::Timestamp,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub completed_at: jiff::Timestamp,
     pub duration_ms: Option<i64>,
     pub shard_id: i32,
@@ -2211,7 +2211,7 @@ pub struct ExecutionSummary {
     /// (issue #752). Links a demoted child to its parent for the #495 PII-erase
     /// cascade.
     pub parent_id: Option<Uuid>,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub summarized_at: jiff::Timestamp,
     /// The residence history carried over from the demoted execution row
     /// (issue #964). A cross-residence erasure can then still reach the sealed
@@ -2230,9 +2230,9 @@ pub struct NewExecutionSummary {
     pub workflow_name: String,
     pub workflow_id: String,
     pub state: String,
-    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp)]
     pub started_at: jiff::Timestamp,
-    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp)]
     pub completed_at: jiff::Timestamp,
     pub duration_ms: Option<i64>,
     pub shard_id: i32,
@@ -2266,7 +2266,7 @@ pub struct HarvestWasmModule {
     pub activity_name: String,
     pub wasm_bytes: Vec<u8>,
     pub active: bool,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub published_at: jiff::Timestamp,
 }
 
@@ -2302,9 +2302,9 @@ pub struct HarvestMutexLock {
     pub lock_key: String,
     pub holder_exec_id: Uuid,
     pub lock_seq: i64,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub acquired_at: jiff::Timestamp,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub lease_expires_at: jiff::Timestamp,
 }
 
@@ -2317,7 +2317,7 @@ pub struct NewHarvestMutexLock {
     pub lock_key: String,
     pub holder_exec_id: Uuid,
     pub lock_seq: i64,
-    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp)]
     pub lease_expires_at: jiff::Timestamp,
 }
 
@@ -2332,7 +2332,7 @@ pub struct HarvestMutexWaiter {
     pub id: i64,
     pub lock_key: String,
     pub waiter_exec_id: Uuid,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub requested_at: jiff::Timestamp,
 }
 
@@ -2361,7 +2361,7 @@ pub struct HarvestWorkflowLog {
     pub seq: i64,
     pub level: String,
     pub message: String,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub occurred_at: jiff::Timestamp,
 }
 
@@ -2389,7 +2389,7 @@ pub struct HarvestStreamChunk {
     pub workflow_exec_id: Uuid,
     pub stream_offset: i64,
     pub chunk: serde_json::Value,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub created_at: jiff::Timestamp,
 }
 

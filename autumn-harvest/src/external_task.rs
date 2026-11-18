@@ -84,9 +84,9 @@ type ExternalHandoffProjection = (
     uuid::Uuid,
     String,
     String,
-    jiff::Timestamp,
-    jiff::Timestamp,
-    jiff::Timestamp,
+    crate::time::sql::SqlTimestamp,
+    crate::time::sql::SqlTimestamp,
+    crate::time::sql::SqlTimestamp,
     i32,
 );
 
@@ -113,9 +113,9 @@ impl From<ExternalHandoffProjection> for ExternalHandoffRow {
             activity_id: ActivityExecId::from_uuid(activity_id),
             activity_name,
             state,
-            created_at,
-            updated_at,
-            deadline_at,
+            created_at: created_at.to_jiff(),
+            updated_at: updated_at.to_jiff(),
+            deadline_at: deadline_at.to_jiff(),
             shard_id,
         }
     }
@@ -144,7 +144,7 @@ pub async fn record_external_task(
     )?;
 
     // host-clock-ok: the external-task timeout scan also compares with the host clock.
-    let schedule_to_close_at = Timestamp::now().checked_add(dur).ok().ok_or_else(|| {
+    let schedule_to_close_at = Timestamp::now().checked_add(dur).map_err(|_| {
         crate::error::HarvestError::Database("Datetime addition overflow".to_string())
     })?;
 
@@ -159,7 +159,7 @@ pub async fn record_external_task(
     };
 
     diesel::insert_into(harvest_external_tasks::table)
-        .values(&row)
+        .values(row)
         .on_conflict(harvest_external_tasks::token)
         .do_nothing()
         .execute(conn)
@@ -475,7 +475,7 @@ pub async fn extend_deadline(
         let dur =
             crate::worker::chrono_duration_from_secs(extend_by_secs, "external task extend by")?;
 
-        let new_deadline = Timestamp::now().checked_add(dur).ok().ok_or_else(|| {
+        let new_deadline = Timestamp::now().checked_add(dur).map_err(|_| {
             crate::error::HarvestError::Database("Datetime addition overflow".to_string())
         })?;
 

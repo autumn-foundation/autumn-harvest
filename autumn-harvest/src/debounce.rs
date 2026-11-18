@@ -52,6 +52,7 @@
 //! [`WorkerConfig::default_debounce_max_wait`]: crate::builder::WorkerConfig::default_debounce_max_wait
 
 use std::time::Duration;
+#[cfg(feature = "db")]
 use jiff_diesel::ToDiesel;
 
 #[cfg(feature = "db")]
@@ -110,14 +111,14 @@ pub fn compute_fire_deadline(
 ) -> Timestamp {
     // Clamp absurd/overflowing durations to a large-but-finite value and use
     // checked addition so an extreme `window`/`max_wait` can never panic.
-    let window_chrono =
+    let window_dur =
         jiff::SignedDuration::try_from(window).unwrap_or_else(|_| crate::time::days(365 * 100));
-    let max_wait_chrono =
+    let max_wait_dur =
         jiff::SignedDuration::try_from(max_wait).unwrap_or_else(|_| crate::time::days(365 * 100));
 
-    let trailing_edge = now.checked_add(window_chrono).ok().unwrap_or(now);
+    let trailing_edge = now.checked_add(window_dur).unwrap_or(now);
     let cap = first_seen
-        .checked_add(max_wait_chrono).ok()
+        .checked_add(max_wait_dur)
         .unwrap_or(first_seen);
 
     trailing_edge.min(cap)
@@ -381,7 +382,7 @@ pub async fn admit_debounced_start_with_codecs(
         #[diesel(sql_type = diesel::sql_types::Text)]
         workflow_id: String,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         effective_fire_at: Timestamp,
         #[diesel(sql_type = diesel::sql_types::Integer)]
         pending_count: i32,
@@ -409,14 +410,14 @@ pub async fn admit_debounced_start_with_codecs(
     let now = Timestamp::now();
     // Clamp absurd/overflowing durations to a large-but-finite value and use
     // checked addition so an extreme `window`/`max_wait` can never panic.
-    let window_chrono = jiff::SignedDuration::try_from(params.window)
+    let window_dur = jiff::SignedDuration::try_from(params.window)
         .unwrap_or_else(|_| crate::time::days(365 * 100));
-    let max_wait_chrono = jiff::SignedDuration::try_from(params.max_wait)
+    let max_wait_dur = jiff::SignedDuration::try_from(params.max_wait)
         .unwrap_or_else(|_| crate::time::days(365 * 100));
 
-    let max_fire_at = now.checked_add(max_wait_chrono).ok().unwrap_or(now);
+    let max_fire_at = now.checked_add(max_wait_dur).unwrap_or(now);
     let initial_fire_at = now
-        .checked_add(window_chrono).ok()
+        .checked_add(window_dur)
         .unwrap_or(now)
         .min(max_fire_at);
 
@@ -579,7 +580,7 @@ struct FireDueRow {
     /// a quota (issue #1227, Finding 3). It is fetched here, under the same
     /// `FOR UPDATE` claim, rather than in a second round trip.
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     max_fire_at: Timestamp,
 }
 
@@ -1317,22 +1318,32 @@ pub(crate) fn decode_deferred_admission_fields(
             .unwrap_or(crate::types::WorkflowIdReusePolicy::AllowDuplicate),
         execution_timeout: opts
             .execution_timeout_secs
-            .and_then(chrono::Duration::try_seconds),
-        sla: opts.sla_secs.and_then(chrono::Duration::try_seconds),
+            .and_then(duration_from_secs),
+        sla: opts.sla_secs.and_then(duration_from_secs),
         max_execution_timeout_ceiling: opts
             .max_execution_timeout_ceiling_secs
-            .and_then(chrono::Duration::try_seconds),
+            .and_then(duration_from_secs),
         chain_execution_timeout: opts
             .chain_execution_timeout_secs
-            .and_then(chrono::Duration::try_seconds),
+            .and_then(duration_from_secs),
         max_workflow_chain_timeout_ceiling: opts
             .max_workflow_chain_timeout_ceiling_secs
-            .and_then(chrono::Duration::try_seconds),
+            .and_then(duration_from_secs),
         priority: opts
             .priority
             .and_then(crate::types::Priority::from_i32)
             .unwrap_or_default(),
     }
+}
+
+/// Returns `secs` as a duration, or `None` past `i64::MAX` milliseconds.
+///
+/// This keeps the bound of `chrono::Duration::try_seconds`. A stored option
+/// past that bound decodes as no limit, as it did before.
+#[cfg(feature = "db")]
+fn duration_from_secs(secs: i64) -> Option<jiff::SignedDuration> {
+    secs.checked_mul(1000)?;
+    Some(jiff::SignedDuration::from_secs(secs))
 }
 
 /// List all pending debounce records on this shard for the management API.
@@ -1358,20 +1369,20 @@ pub async fn list_pending_debounce(
         #[diesel(sql_type = diesel::sql_types::Text)]
         queue_name: String,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         effective_fire_at: Timestamp,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         max_fire_at: Timestamp,
         #[diesel(sql_type = diesel::sql_types::Integer)]
         pending_count: i32,
         #[diesel(sql_type = diesel::sql_types::Integer)]
         shard_id: i32,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         created_at: Timestamp,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         updated_at: Timestamp,
     }
 

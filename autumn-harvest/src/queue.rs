@@ -658,7 +658,7 @@ fn delay_secs(delay: SignedDuration) -> f64 {
 #[derive(diesel::QueryableByName)]
 struct ClockTimestampRow {
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     now: Timestamp,
 }
 
@@ -5182,7 +5182,7 @@ struct OwnerScanRow {
     #[diesel(sql_type = diesel::sql_types::Integer)]
     eff_priority: i32,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     due_at: Timestamp,
 }
 
@@ -5437,7 +5437,7 @@ pub async fn dispatch_probe(
         #[diesel(sql_type = diesel::sql_types::Text)]
         state: String,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         scheduled_at: Timestamp,
         #[diesel(sql_type = diesel::sql_types::Bool)]
         has_worker: bool,
@@ -5645,7 +5645,7 @@ struct PendingHintRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     queue_name: String,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     scheduled_at: Timestamp,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     priority: i32,
@@ -6273,14 +6273,14 @@ pub(crate) async fn task_deadline_for_claim(
             claim_held(&claim.worker_id, claim.attempt),
             dsl::schedule_to_close_at,
         ))
-        .first::<(Option<String>, Option<bool>, Option<Timestamp>)>(conn)
+        .first::<(Option<String>, Option<bool>, Option<crate::time::sql::SqlTimestamp>)>(conn)
         .await
         .optional()
         .map_err(crate::error::database_error)?;
     Ok(row.map(|(error, held, schedule_to_close_at)| TaskDeadline {
         error,
         claim_held: held == Some(true),
-        schedule_to_close_at,
+        schedule_to_close_at: schedule_to_close_at.map(crate::time::sql::SqlTimestamp::to_jiff),
     }))
 }
 
@@ -6720,13 +6720,14 @@ async fn defer_claimed_task(
             dsl::scheduled_at,
         ))
         .cache_prepared()
-        .get_result::<(String, i32, String, jiff::Timestamp)>(conn)
+        .get_result::<(String, i32, String, crate::time::sql::SqlTimestamp)>(conn)
         .await
         .optional()
         .map_err(crate::error::database_error)?
     else {
         return Ok(ClaimWrite::LeaseLost);
     };
+    let scheduled_at = scheduled_at.to_jiff();
     // The UPDATE already committed, so the row is durably deferred. The
     // NOTIFY is best-effort, as for the retry requeue: a failed wake must not
     // report the deferral as unpersisted. The poll loop still finds the row.
@@ -6784,8 +6785,8 @@ pub async fn release_unstarted_claim(
     .set((
         dsl::state.eq("PENDING"),
         dsl::worker_id.eq(None::<String>),
-        dsl::started_at.eq(None::<Timestamp>),
-        dsl::last_heartbeat_at.eq(None::<Timestamp>),
+        dsl::started_at.eq(None::<crate::time::sql::SqlTimestamp>),
+        dsl::last_heartbeat_at.eq(None::<crate::time::sql::SqlTimestamp>),
         // Undo the claim-time attempt increment. The task did not run.
         dsl::attempt.eq(sql::<Integer>("GREATEST(attempt - 1, 0)")),
         dsl::sticky_worker_id.eq(sql::<Nullable<Text>>(
@@ -6807,13 +6808,14 @@ pub async fn release_unstarted_claim(
             dsl::scheduled_at,
         ))
         .cache_prepared()
-        .get_result::<(String, i32, String, Timestamp)>(conn)
+        .get_result::<(String, i32, String, crate::time::sql::SqlTimestamp)>(conn)
         .await
         .optional()
         .map_err(crate::error::database_error)?
     else {
         return Ok(ClaimWrite::LeaseLost);
     };
+    let scheduled_at = scheduled_at.to_jiff();
     // The UPDATE already committed. A failed wake must not report the
     // release as unpersisted. The poll loop still finds the row.
     if let Err(error) = announce_deferred_task(
@@ -6847,7 +6849,7 @@ pub async fn running_claims_of_worker(
 ) -> HarvestResult<Vec<(TaskClaim, Option<Timestamp>)>> {
     use crate::schema::harvest_task_queue::dsl;
 
-    let rows: Vec<(Uuid, i32, Option<Timestamp>)> = dsl::harvest_task_queue
+    let rows: Vec<(Uuid, i32, Option<crate::time::sql::SqlTimestamp>)> = dsl::harvest_task_queue
         .filter(dsl::state.eq("RUNNING"))
         .filter(dsl::worker_id.eq(worker_id))
         .select((dsl::id, dsl::attempt, dsl::started_at))
@@ -6857,7 +6859,10 @@ pub async fn running_claims_of_worker(
     Ok(rows
         .into_iter()
         .map(|(task_id, attempt, started_at)| {
-            (TaskClaim::new(task_id, worker_id, attempt), started_at)
+            (
+                TaskClaim::new(task_id, worker_id, attempt),
+                started_at.map(crate::time::sql::SqlTimestamp::to_jiff),
+            )
         })
         .collect())
 }
@@ -6892,15 +6897,15 @@ pub async fn release_abandoned_claim(
         dsl::harvest_task_queue
             .find(claim.task_id)
             .filter(dsl::state.eq("RUNNING"))
-            .filter(dsl::started_at.eq(started_at)),
+            .filter(dsl::started_at.eq(started_at.to_diesel())),
     )
     .set((
         dsl::state.eq("PENDING"),
         dsl::worker_id.eq(None::<String>),
-        dsl::started_at.eq(None::<Timestamp>),
+        dsl::started_at.eq(None::<crate::time::sql::SqlTimestamp>),
         dsl::sticky_worker_id.eq(None::<String>),
-        dsl::sticky_until.eq(None::<Timestamp>),
-        dsl::last_heartbeat_at.eq(None::<Timestamp>),
+        dsl::sticky_until.eq(None::<crate::time::sql::SqlTimestamp>),
+        dsl::last_heartbeat_at.eq(None::<crate::time::sql::SqlTimestamp>),
         dsl::error.eq(None::<String>),
         dsl::scheduled_at.eq(db_clock_stamp::<diesel::sql_types::Timestamptz>()),
     ))
@@ -6913,13 +6918,14 @@ pub async fn release_abandoned_claim(
             dsl::scheduled_at,
         ))
         .cache_prepared()
-        .get_result::<(String, i32, String, Timestamp)>(conn)
+        .get_result::<(String, i32, String, crate::time::sql::SqlTimestamp)>(conn)
         .await
         .optional()
         .map_err(crate::error::database_error)?
     else {
         return Ok(ClaimWrite::LeaseLost);
     };
+    let scheduled_at = scheduled_at.to_jiff();
     if let Err(error) = announce_deferred_task(
         conn,
         claim.task_id,
@@ -7727,7 +7733,7 @@ async fn write_heartbeat(
     let updated = if let Some(details) = details {
         let update = target
             .set((
-                dsl::last_heartbeat_at.eq(stamp.to_diesel()),
+                dsl::last_heartbeat_at.eq(stamp),
                 dsl::heartbeat_details.eq(Some(details)),
             ))
             .into_boxed();
@@ -7736,7 +7742,7 @@ async fn write_heartbeat(
             .execute(conn)
             .await
     } else {
-        let update = target.set(dsl::last_heartbeat_at.eq(stamp.to_diesel())).into_boxed();
+        let update = target.set(dsl::last_heartbeat_at.eq(stamp)).into_boxed();
         fence(update, Some(claim))
             .cache_prepared()
             .execute(conn)
@@ -7858,13 +7864,14 @@ async fn requeue_for_retry_inner(
             dsl::scheduled_at,
         ))
         .cache_prepared()
-        .get_result::<(String, i32, String, jiff::Timestamp)>(conn)
+        .get_result::<(String, i32, String, crate::time::sql::SqlTimestamp)>(conn)
         .await
         .optional()
         .map_err(crate::error::database_error)?
     else {
         return Ok(false);
     };
+    let next_run = next_run.to_jiff();
 
     // Dispatch hint (issue #1312). The retry is due at `next_run`, so the
     // channel parks the reference until then.
@@ -7907,7 +7914,7 @@ async fn requeue_for_retry_inner(
 /// the task was not a claimed (`RUNNING`) workflow task.
 fn finish_workflow_backoff_requeue(
     task_id: Uuid,
-    updated: Vec<(String, i32, jiff::Timestamp)>,
+    updated: Vec<(String, i32, crate::time::sql::SqlTimestamp)>,
 ) -> HarvestResult<()> {
     let Some((queue_name, priority, next_run)) = updated.into_iter().next() else {
         return Err(crate::error::HarvestError::NotFound(format!(
@@ -7918,7 +7925,7 @@ fn finish_workflow_backoff_requeue(
     record_pending_hint(
         task_id,
         &queue_name,
-        next_run,
+        next_run.to_jiff(),
         priority,
         crate::dispatch::DispatchKind::Workflow,
     );
@@ -7936,16 +7943,17 @@ fn finish_workflow_backoff_requeue(
 #[allow(clippy::struct_field_names)]
 struct StickyRelease {
     sticky_worker_id: Option<String>,
-    sticky_until: Option<jiff::Timestamp>,
-    sticky_timeout: Option<jiff::SignedDuration>,
+    // A wrapper always binds its value, so `None` inside it binds `NULL`.
+    sticky_until: crate::time::sql::NullableTimestamp,
+    sticky_timeout: crate::time::sql::NullablePgDuration,
 }
 
 impl StickyRelease {
     const fn new() -> Self {
         Self {
             sticky_worker_id: None,
-            sticky_until: None,
-            sticky_timeout: None,
+            sticky_until: crate::time::sql::NullableTimestamp(None),
+            sticky_timeout: crate::time::sql::NullablePgDuration(None),
         }
     }
 }
@@ -7989,7 +7997,7 @@ fn workflow_backoff_set(
         ),
         SetExt(harvest_task_queue_ext::wake_requested.eq(false)),
         dsl::activity_name.eq(None::<String>),
-        dsl::timer_fires_at.eq(None::<jiff::Timestamp>),
+        dsl::timer_fires_at.eq(None::<crate::time::sql::SqlTimestamp>),
         sticky,
     )
 }
@@ -8029,7 +8037,7 @@ async fn requeue_workflow_task_with_backoff(
         workflow_backoff_set(delay, sticky),
     ))
     .returning((dsl::queue_name, dsl::priority, dsl::scheduled_at))
-    .get_results::<(String, i32, jiff::Timestamp)>(conn)
+    .get_results::<(String, i32, crate::time::sql::SqlTimestamp)>(conn)
     .await
     .map_err(crate::error::database_error)?;
 
@@ -8272,11 +8280,11 @@ async fn requeue_claimed_workflow_task_with_backoff(
             .sql(")")),
         ),
         dsl::sticky_worker_id.eq(None::<String>),
-        dsl::sticky_until.eq(None::<jiff::Timestamp>),
-        dsl::sticky_timeout.eq(None::<jiff::SignedDuration>),
+        dsl::sticky_until.eq(None::<crate::time::sql::SqlTimestamp>),
+        dsl::sticky_timeout.eq(None::<crate::time::sql::PgDuration>),
         SetExt(harvest_task_queue_ext::wake_requested.eq(false)),
         dsl::activity_name.eq(None::<String>),
-        dsl::timer_fires_at.eq(None::<jiff::Timestamp>),
+        dsl::timer_fires_at.eq(None::<crate::time::sql::SqlTimestamp>),
     ))
     .into_boxed();
     let updated = fence(update, Some(claim))
@@ -8288,7 +8296,7 @@ async fn requeue_claimed_workflow_task_with_backoff(
             sql::<diesel::sql_types::Bool>("scheduled_at <= clock_timestamp()"),
         ))
         .cache_prepared()
-        .get_results::<(String, i32, jiff::Timestamp, Option<Uuid>, bool)>(conn)
+        .get_results::<(String, i32, crate::time::sql::SqlTimestamp, Option<Uuid>, bool)>(conn)
         .await
         .map_err(crate::error::database_error)?;
     if updated.is_empty() {
@@ -8442,7 +8450,7 @@ pub async fn force_retry_activity_now(
     )
     .set(dsl::scheduled_at.eq(db_clock_stamp::<diesel::sql_types::Timestamptz>()))
     .returning((dsl::queue_name, dsl::scheduled_at))
-    .get_result::<(String, Timestamp)>(conn)
+    .get_result::<(String, crate::time::sql::SqlTimestamp)>(conn)
     .await
     .optional()
     .map_err(crate::error::database_error)?;
@@ -8451,7 +8459,7 @@ pub async fn force_retry_activity_now(
     // RUNNING and the caller's goal (retry it now) is effectively achieved.
     // already_eligible=false distinguishes this from the genuine no-op above.
     let (actual_queue, actual_scheduled_at, actually_advanced) = match advanced {
-        Some((q, stamped_at)) => (q, stamped_at, true),
+        Some((q, stamped_at)) => (q, stamped_at.to_jiff(), true),
         None => (row.queue_name, row.scheduled_at, false),
     };
 
@@ -8511,7 +8519,7 @@ struct CleanContinuationChangeset {
     /// distinct-worker set and the total counter can never disagree about
     /// whether the streak was broken.
     capability_miss_workers: Vec<String>,
-    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp)]
     scheduled_at: jiff::Timestamp,
 }
 
@@ -9739,8 +9747,8 @@ pub async fn set_task_sticky_affinity(
         diesel::update(dsl::harvest_task_queue.find(task_id))
             .set((
                 dsl::sticky_worker_id.eq(None::<String>),
-                dsl::sticky_until.eq(None::<jiff::Timestamp>),
-                dsl::sticky_timeout.eq(None::<jiff::SignedDuration>),
+                dsl::sticky_until.eq(None::<crate::time::sql::SqlTimestamp>),
+                dsl::sticky_timeout.eq(None::<crate::time::sql::PgDuration>),
             ))
             .execute(conn)
             .await
@@ -11451,7 +11459,7 @@ pub async fn sweep_terminal_tasks_into(
         #[diesel(sql_type = diesel::sql_types::Text)]
         state: String,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         completed_at: Timestamp,
     }
 
@@ -12435,7 +12443,7 @@ struct BatchedClaimCandidate {
     #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
     schedule_to_close_at: Option<Timestamp>,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     claim_due_at: Timestamp,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     sticky_rank: i32,
@@ -12544,7 +12552,7 @@ async fn fetch_claim_batch(
             cursor.map(|c| c.effective_priority),
         )
         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-            cursor.map(|c| c.claim_due_at),
+            cursor.map(|c| c.claim_due_at).to_diesel(),
         )
         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Uuid>, _>(cursor.map(|c| c.id))
         .bind::<diesel::sql_types::BigInt, _>(batch_size);
@@ -12572,7 +12580,7 @@ pub(crate) async fn db_now(conn: &mut AsyncPgConnection) -> HarvestResult<Timest
     #[derive(diesel::QueryableByName)]
     struct Now {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         now: Timestamp,
     }
     let row: Now = diesel::sql_query("SELECT clock_timestamp() AS now")
@@ -12669,7 +12677,7 @@ async fn try_claim_batched_candidate(
         )
         .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(circuit_breaker_activities)
         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
-            candidate.schedule_to_close_at,
+            candidate.schedule_to_close_at.to_diesel(),
         )
         .bind::<diesel::sql_types::Text, _>(worker_build_id)
         .load(conn)

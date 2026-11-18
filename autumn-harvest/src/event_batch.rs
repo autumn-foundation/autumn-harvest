@@ -8,6 +8,7 @@
 
 #[cfg(feature = "db")]
 use crate::cached_stmt::CachePreparedDsl as _;
+#[cfg(feature = "db")]
 use jiff_diesel::ToDiesel;
 use crate::debounce::DebounceStartOptions;
 #[cfg(feature = "db")]
@@ -81,7 +82,7 @@ struct UpsertBatchRow {
     #[diesel(sql_type = diesel::sql_types::Jsonb)]
     start_options: serde_json::Value,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     fire_at: Timestamp,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     max_size: i32,
@@ -112,7 +113,7 @@ struct FireDueBatchRow {
     #[diesel(sql_type = diesel::sql_types::Jsonb)]
     start_options: serde_json::Value,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     fire_at: Timestamp,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     max_size: i32,
@@ -169,9 +170,9 @@ pub async fn admit_batched_start_with_codecs(
     }
 
     let now = Timestamp::now();
-    let max_wait_chrono = jiff::SignedDuration::try_from(params.max_wait)
+    let max_wait_dur = jiff::SignedDuration::try_from(params.max_wait)
         .unwrap_or_else(|_| crate::time::days(365 * 100));
-    let initial_fire_at = now.checked_add(max_wait_chrono).ok().unwrap_or(now);
+    let initial_fire_at = now.checked_add(max_wait_dur).unwrap_or(now);
 
     let new_id = uuid::Uuid::new_v4();
     let start_options_json = serde_json::to_value(&params.start_options)
@@ -1055,17 +1056,17 @@ pub async fn list_pending_event_batches(
         #[diesel(sql_type = diesel::sql_types::Jsonb)]
         buffered_payloads: serde_json::Value,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         fire_at: Timestamp,
         #[diesel(sql_type = diesel::sql_types::Integer)]
         max_size: i32,
         #[diesel(sql_type = diesel::sql_types::Integer)]
         shard_id: i32,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         created_at: Timestamp,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         updated_at: Timestamp,
     }
 

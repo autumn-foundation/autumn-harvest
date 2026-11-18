@@ -274,7 +274,7 @@ macro_rules! __split_from_row {
 /// The impl covers `&Struct` only. Pass a reference, or a slice for a batch.
 ///
 /// A field whose type has no Diesel impl names a wrapper after `as`, for
-/// example `at: Option<Timestamp> as jiff_diesel::Timestamp`. The view then
+/// example `at: Option<Timestamp> as crate::time::sql::SqlTimestamp`. The view then
 /// holds the wrapper by value, converted with `From`. For an `Option` field,
 /// name the wrapper of the inner value. The view field is then
 /// `Option<Wrapper>`, so `None` still inserts `DEFAULT`.

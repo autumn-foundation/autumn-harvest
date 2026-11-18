@@ -178,7 +178,7 @@ struct RawRow {
     #[diesel(sql_type = Jsonb)]
     snapshot: Value,
     #[diesel(sql_type = Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     updated_at: Timestamp,
 }
 

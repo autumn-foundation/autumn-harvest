@@ -5,7 +5,6 @@
 //! that two workers cannot append conflicting events to the same workflow.
 
 use crate::cached_stmt::CachePreparedDsl as _;
-use jiff_diesel::ToDiesel;
 use crate::schema::harvest_workflow_executions_ext;
 use crate::table_split::SetExt;
 use diesel::BoolExpressionMethods;
@@ -16,6 +15,7 @@ use diesel::SelectableHelper;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use jiff_diesel::ToDiesel;
 
 use crate::error::HarvestResult;
 use crate::event::WorkflowEvent;
@@ -83,8 +83,8 @@ type WorkflowChildProjection = (
     uuid::Uuid,
     String,
     String,
-    jiff::Timestamp,
-    Option<jiff::Timestamp>,
+    crate::time::sql::SqlTimestamp,
+    Option<crate::time::sql::SqlTimestamp>,
     Option<String>,
     i32,
     Option<String>,
@@ -2250,8 +2250,8 @@ pub async fn load_workflow_children(
                             id,
                             workflow_name,
                             state,
-                            started_at,
-                            completed_at,
+                            started_at.to_jiff(),
+                            completed_at.map(crate::time::sql::SqlTimestamp::to_jiff),
                             error,
                             shard_id,
                             depth,
@@ -2394,8 +2394,8 @@ pub async fn load_workflow_children_multi(
                             id,
                             workflow_name,
                             state,
-                            started_at,
-                            completed_at,
+                            started_at.to_jiff(),
+                            completed_at.map(crate::time::sql::SqlTimestamp::to_jiff),
                             error,
                             shard_id,
                             depth,
@@ -2460,8 +2460,8 @@ type LineageChildProjection = (
     String,
     String,
     String,
-    jiff::Timestamp,
-    Option<jiff::Timestamp>,
+    crate::time::sql::SqlTimestamp,
+    Option<crate::time::sql::SqlTimestamp>,
     i32,
     Option<String>,
 );
@@ -2545,8 +2545,8 @@ fn lineage_child_row_from_parts(parts: LineageChildProjection) -> LineageChildRo
         workflow_name,
         workflow_id,
         state,
-        started_at,
-        completed_at,
+        started_at: started_at.to_jiff(),
+        completed_at: completed_at.map(crate::time::sql::SqlTimestamp::to_jiff),
         shard_id,
         await_mode,
         parent_close_policy,

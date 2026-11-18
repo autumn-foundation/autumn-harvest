@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 #[cfg(feature = "db")]
 use std::time::{Duration, Instant};
 
-use jiff::{SignedDuration, Timestamp};
+use jiff::Timestamp;
 use serde_json::Value;
 use tokio::sync::oneshot;
 
@@ -2517,8 +2517,8 @@ fn duration_to_millis_saturating(d: std::time::Duration) -> u64 {
 ///   whole-second granularity, so the wait never resolves *before* the
 ///   deadline.
 /// - A defensive fallback saturates to `u64::MAX` for a delta whose whole
-///   seconds overflow `i64`→`u64`. No chrono-valid `Timestamp` pair can
-///   reach it, because the chrono range caps the delta far below that. If it
+///   seconds overflow `i64`→`u64`. No valid `Timestamp` pair can reach it,
+///   because the jiff range caps the delta far below that. If it
 ///   is hit, the worker's `chrono_duration_from_secs` gives a `Config` error
 ///   at persist, like an overflowing `ctx.timer` duration.
 pub(crate) fn remaining_secs_until(deadline: Timestamp, now: Timestamp) -> u64 {
@@ -4175,7 +4175,7 @@ impl WorkflowContext {
     #[doc(hidden)]
     #[must_use]
     pub fn with_drive_clock(mut self, now: Option<Timestamp>) -> Self {
-        self.drive_clock_ms = now.map(|now| now.as_millisecond());
+        self.drive_clock_ms = now.map(Timestamp::as_millisecond);
         self
     }
 
@@ -5383,7 +5383,7 @@ impl WorkflowContext {
     fn deadline_clock_read(&self) -> Option<Timestamp> {
         match self.match_history(HistoryMatcher::match_side_effect_now_tolerant) {
             crate::replay::SideEffectNowMatch::Matched { millis } => {
-                Some(Timestamp::from_millisecond(millis).ok().unwrap_or(self.start_time))
+                Some(Timestamp::from_millisecond(millis).unwrap_or(self.start_time))
             }
             crate::replay::SideEffectNowMatch::NotRecorded => None,
             crate::replay::SideEffectNowMatch::Frontier => {
@@ -5429,7 +5429,7 @@ impl WorkflowContext {
                     name: Some(crate::replay::DEADLINE_PROBE_SIDE_EFFECT_NAME.to_string()),
                     value,
                 });
-                Some(Timestamp::from_millisecond(millis).ok().unwrap_or(self.start_time))
+                Some(Timestamp::from_millisecond(millis).unwrap_or(self.start_time))
             }
         }
     }
@@ -6100,13 +6100,13 @@ impl WorkflowContext {
     pub fn system_now(&self) -> Timestamp {
         let millis =
             self.capture_builtin(crate::event::SideEffectKind::Now, || self.live_now_millis());
-        Timestamp::from_millisecond(millis).ok().unwrap_or(self.start_time)
+        Timestamp::from_millisecond(millis).unwrap_or(self.start_time)
     }
 
     /// Deterministic wall-clock read as a [`std::time::SystemTime`].
     ///
     /// Identical capture semantics to [`system_now`](Self::system_now); use this
-    /// when you need a `SystemTime` rather than a `chrono` value. Each call
+    /// when you need a `SystemTime` rather than a `jiff` value. Each call
     /// records its own [`WorkflowEvent::SideEffectRecorded`] event.
     ///
     /// # Panics
@@ -19863,7 +19863,7 @@ mod tests {
     fn should_continue_as_new_reads_a_legacy_checkpoint_after_the_deadline_probe() {
         // A history from before #2080 with an execution timeout holds the
         // deadline clock read, then the checkpoint.
-        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
         let ctx = deadline_ctx(
             t0,
             vec![
@@ -19882,7 +19882,7 @@ mod tests {
 
     #[test]
     fn should_continue_as_new_replays_the_decision_before_the_deadline_probe() {
-        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
         let ctx = deadline_ctx(
             t0,
             vec![
@@ -20136,14 +20136,14 @@ mod tests {
 
     #[test]
     fn deadline_returns_start_plus_timeout() {
-        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
         let ctx = deadline_ctx(t0, vec![], Some(jiff::SignedDuration::from_secs(30)));
         assert_eq!(ctx.deadline(), Some(t0 + jiff::SignedDuration::from_secs(30)));
     }
 
     #[test]
     fn deadline_is_none_without_timeout() {
-        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
         let ctx = deadline_ctx(t0, vec![], None);
         assert_eq!(ctx.deadline(), None);
     }
@@ -20158,7 +20158,7 @@ mod tests {
     /// `should_continue_as_new_uses_live_effective_deadline_not_nominal`).
     #[test]
     fn deadline_public_accessor_is_nominal_not_shifted_deadline_at() {
-        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
         let timeout = jiff::SignedDuration::from_secs(30);
         // A resume shift of +120s pushes the row's `deadline_at` past start+timeout.
         let shift = jiff::SignedDuration::from_secs(120);
@@ -20181,7 +20181,7 @@ mod tests {
     /// `ctx.deadline()` falls back to `start + execution_timeout`, as before.
     #[test]
     fn deadline_falls_back_to_start_plus_timeout_without_absolute() {
-        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
         let timeout = jiff::SignedDuration::from_secs(30);
         // Explicit None threaded — must behave identically to not threading.
         let ctx = deadline_ctx(t0, vec![], Some(timeout)).with_deadline(None);
@@ -20196,7 +20196,7 @@ mod tests {
     /// The run is then nowhere near its fraction of the effective deadline.
     #[test]
     fn should_continue_as_new_reads_shifted_deadline_not_stale_start_plus_timeout() {
-        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
         let timeout = jiff::SignedDuration::from_secs(30);
         let clock = t0 + jiff::SignedDuration::from_secs(25);
         let shifted = t0 + timeout + jiff::SignedDuration::from_hours(1);
@@ -20221,7 +20221,7 @@ mod tests {
     /// immediately on resume.
     #[test]
     fn should_continue_as_new_uses_live_effective_deadline_not_nominal() {
-        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
         let timeout = jiff::SignedDuration::from_secs(30);
         // Recorded clock is PAST the nominal deadline (t0+30s): nominal fraction
         // is > 1.0, so a nominal-based check would trip.
@@ -20284,7 +20284,7 @@ mod tests {
             response_schema: None,
         };
 
-        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
         let parent = deadline_ctx(t0, vec![], Some(jiff::SignedDuration::from_secs(30)));
         // Sanity: the parent workflow context itself sees the deadline.
         assert_eq!(parent.deadline(), Some(t0 + jiff::SignedDuration::from_secs(30)));
@@ -20334,7 +20334,7 @@ mod tests {
             response_schema: None,
         };
 
-        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
         let timeout = jiff::SignedDuration::from_secs(30);
         let shifted = t0 + timeout + jiff::SignedDuration::from_hours(1);
         let parent = deadline_ctx(t0, vec![], Some(timeout)).with_deadline(Some(shifted));
@@ -20446,7 +20446,7 @@ mod tests {
 
     #[test]
     fn time_until_deadline_uses_recorded_clock() {
-        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
         let clock = t0 + jiff::SignedDuration::from_secs(10);
         // execution_timeout = 30s, recorded clock = t0+10s ⇒ 20s remaining.
         // `time_until_deadline()` reads the PUBLIC (strict) `system_now()`, so
@@ -20465,7 +20465,7 @@ mod tests {
 
     #[test]
     fn time_until_deadline_is_none_without_deadline() {
-        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
         // No execution_timeout: time_until_deadline must be None AND must not
         // consult (or record) the wall clock.
         let ctx = deadline_ctx(t0, vec![], None);
@@ -20478,7 +20478,7 @@ mod tests {
 
     #[test]
     fn should_continue_as_new_trips_on_deadline_fraction() {
-        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
         // 25s of a 30s budget consumed (0.83 ≥ 0.8) ⇒ trips, even though the
         // event count is far under the soft threshold.
         let clock = t0 + jiff::SignedDuration::from_secs(25);
@@ -20493,7 +20493,7 @@ mod tests {
 
     #[test]
     fn should_continue_as_new_not_yet_before_fraction() {
-        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
         // Only 10s of a 30s budget consumed (0.33 < 0.8) ⇒ does not trip.
         let clock = t0 + jiff::SignedDuration::from_secs(10);
         let ctx = deadline_ctx(
@@ -20677,7 +20677,7 @@ mod tests {
     /// event at the cursor is a `TimerStarted`.
     #[test]
     fn deadline_read_tolerates_non_now_cursor_event_no_divergence_no_command() {
-        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
         // execution_timeout is Some, so the deadline branch IS evaluated. But
         // the cursor holds a TimerStarted, because a pre-#772 history recorded
         // no Now here. So the tolerant read degrades to history-count-only.
@@ -20718,7 +20718,7 @@ mod tests {
         // t0 far in the past + a 30s budget ⇒ the frozen live clock
         // (Timestamp::now()) is well past the deadline, so the branch trips. The key
         // assertion is that exactly one Now side-effect command is recorded.
-        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
         let ctx = deadline_ctx(t0, vec![], Some(jiff::SignedDuration::from_secs(30)));
 
         assert!(
@@ -20765,7 +20765,7 @@ mod tests {
     /// this to a trip, so this test pins the default boundary's *effect*.
     #[test]
     fn default_fraction_does_not_trip_at_0_6_consumed() {
-        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
         // 18s of a 30s budget consumed (0.6). Remaining 12s > (1-0.8)*30 = 6s.
         let clock = t0 + jiff::SignedDuration::from_secs(18);
         let ctx = deadline_ctx(
@@ -20783,7 +20783,7 @@ mod tests {
     /// history that does not trip at 0.8 DOES trip at 0.5.
     #[test]
     fn configured_fraction_shifts_the_boundary() {
-        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
         let clock = t0 + jiff::SignedDuration::from_secs(18); // 0.6 consumed of 30s
         let policy = WorkflowHistoryPolicy::default().with_continue_as_new_deadline_fraction(0.5);
         let ctx = deadline_ctx_with_policy(
@@ -20805,7 +20805,7 @@ mod tests {
     /// remaining) still trips at the default fraction.
     #[test]
     fn deadline_in_the_past_still_trips() {
-        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
         // 40s consumed of a 30s budget ⇒ deadline already 10s in the past.
         let clock = t0 + jiff::SignedDuration::from_secs(40);
         let ctx = deadline_ctx(
@@ -20823,7 +20823,7 @@ mod tests {
     /// only trips once the deadline is reached (remaining ≤ 0).
     #[test]
     fn fraction_clamp_endpoints_behave() {
-        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
 
         // fraction 0.0: trips even at 1s consumed of a 30s budget.
         let clock = t0 + jiff::SignedDuration::from_secs(1);
@@ -20870,9 +20870,9 @@ mod tests {
     /// degrades to false, with no panic and no immediate trip.
     #[test]
     fn deadline_overflow_returns_none_and_does_not_trip() {
-        let t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
-        // ~547k years — well past chrono's representable date range when added
-        // to a 2023 start, so checked_add_signed returns None.
+        let t0 = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
+        // ~547k years — well past the jiff date range when added to a 2023
+        // start, so `checked_add` fails.
         let huge = crate::time::days(200_000_000);
         let ctx = deadline_ctx(t0, vec![recorded_now(t0)], Some(huge));
         assert_eq!(ctx.deadline(), None, "an overflowing deadline must be None");
@@ -20890,7 +20890,7 @@ mod tests {
     /// start time, not the predecessor's.
     #[test]
     fn deadline_reanchors_for_continue_as_new_successor() {
-        let predecessor_t0 = Timestamp::from_millisecond(1_700_000_000_000).ok().unwrap();
+        let predecessor_t0 = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
         let successor_t0 = predecessor_t0 + jiff::SignedDuration::from_secs(100);
         let budget = jiff::SignedDuration::from_secs(30);
 
@@ -23191,8 +23191,8 @@ mod tests {
     #[test]
     fn remaining_secs_until_truth_table() {
         let base = 1_700_000_000_000_i64;
-        let now = Timestamp::from_millisecond(base).ok().unwrap();
-        let at = |delta_ms: i64| Timestamp::from_millisecond(base + delta_ms).ok().unwrap();
+        let now = Timestamp::from_millisecond(base).unwrap();
+        let at = |delta_ms: i64| Timestamp::from_millisecond(base + delta_ms).unwrap();
 
         // Future: exactly one hour out.
         assert_eq!(remaining_secs_until(at(3_600_000), now), 3600);
@@ -23243,7 +23243,8 @@ mod tests {
         use proptest::prelude::*;
 
         fn dt(secs: i64, nanos: u32) -> Timestamp {
-            DateTime::from_timestamp(secs, nanos).expect("in-range timestamp")
+            Timestamp::new(secs, i32::try_from(nanos).expect("subsecond nanos"))
+                .expect("in-range timestamp")
         }
 
         fn config() -> proptest::test_runner::Config {
@@ -23270,7 +23271,7 @@ mod tests {
                 back_ns in 0i64..=10_000_000_000_000,
             ) {
                 let now = dt(secs, nanos);
-                let deadline = now - Duration::nanoseconds(back_ns);
+                let deadline = now - SignedDuration::from_nanos(back_ns);
                 prop_assert_eq!(super::remaining_secs_until(deadline, now), 0);
             }
 
@@ -23284,10 +23285,10 @@ mod tests {
                 delta_ns in 1i64..=10_000_000_000_000,
             ) {
                 let now = dt(secs, nanos);
-                let deadline = now + Duration::nanoseconds(delta_ns);
+                let deadline = now + SignedDuration::from_nanos(delta_ns);
                 let result = super::remaining_secs_until(deadline, now);
                 prop_assert!(result >= 1, "positive delta produced zero wait");
-                let fire_at = now + Duration::seconds(i64::try_from(result).expect("small result"));
+                let fire_at = now + SignedDuration::from_secs(i64::try_from(result).expect("small result"));
                 prop_assert!(fire_at >= deadline, "would fire early: {fire_at} < {deadline}");
             }
 
@@ -23298,7 +23299,7 @@ mod tests {
                 delta_secs in 0u64..=1_000_000,
             ) {
                 let now = dt(secs, 0);
-                let deadline = now + Duration::seconds(i64::try_from(delta_secs).expect("small"));
+                let deadline = now + SignedDuration::from_secs(i64::try_from(delta_secs).expect("small"));
                 prop_assert_eq!(super::remaining_secs_until(deadline, now), delta_secs);
             }
         }
@@ -23387,8 +23388,8 @@ mod tests {
         let frozen_millis = 1_700_000_000_000_i64;
         let deadline_millis = frozen_millis + 3_600_000;
         let d = remaining_secs_until(
-            Timestamp::from_millisecond(deadline_millis).ok().unwrap(),
-            Timestamp::from_millisecond(frozen_millis).ok().unwrap(),
+            Timestamp::from_millisecond(deadline_millis).unwrap(),
+            Timestamp::from_millisecond(frozen_millis).unwrap(),
         );
         assert_eq!(d, 3600, "fixture math must be internally consistent");
 
@@ -23414,7 +23415,7 @@ mod tests {
             },
         ];
         let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
-        let deadline = Timestamp::from_millisecond(deadline_millis).ok().unwrap();
+        let deadline = Timestamp::from_millisecond(deadline_millis).unwrap();
         let result = ctx.sleep_until("wake", deadline).await;
         assert!(
             result.is_ok(),
@@ -24154,7 +24155,9 @@ mod tests {
         let holidays: Vec<jiff::civil::Date> = (0..400)
             .filter(|i| i % 10 != 0)
             .filter_map(|i| {
-                crate::time::date_ymd(2026, 1, 1)?.checked_add_days(chrono::Days::new(i))
+                crate::time::date_ymd(2026, 1, 1)?
+                    .checked_add(jiff::Span::new().days(i))
+                    .ok()
             })
             .collect();
         let cals = crate::calendar::BusinessCalendars::new().with_calendar("biz", holidays);
@@ -33257,8 +33260,9 @@ pub(crate) fn attempt_deadline(
 /// Time left before `deadline` as of `now`, **saturating at zero** (issue
 /// #783). `None` when the attempt is unbounded.
 ///
-/// `chrono::Duration::to_std` fails only for a negative duration. A positive
-/// one cannot overflow `u64` seconds within the range of `chrono`. So
+/// The conversion to `std::time::Duration` fails only for a negative
+/// duration. A positive one cannot overflow `u64` seconds within the range
+/// of `jiff`. So
 /// `unwrap_or(ZERO)` saturates an elapsed deadline, as AC2 requires. It never
 /// mis-reports a far-future deadline as zero.
 pub(crate) fn time_remaining_from(
@@ -33267,7 +33271,7 @@ pub(crate) fn time_remaining_from(
 ) -> Option<std::time::Duration> {
     let deadline = deadline?;
     Some(
-        std::time::Duration::try_from((deadline - now))
+        std::time::Duration::try_from(deadline - now)
             .unwrap_or(std::time::Duration::ZERO),
     )
 }
@@ -33294,7 +33298,7 @@ mod activity_deadline_helper_tests {
     use std::time::Duration;
 
     fn at(secs: i64) -> jiff::Timestamp {
-        Timestamp::new(1_700_000_000 + secs, 0).ok()
+        Timestamp::new(1_700_000_000 + secs, 0)
             .expect("valid timestamp")
     }
 

@@ -793,21 +793,21 @@ pub enum HarvestBuilderError {
     },
 
     /// A workflow's `execution_timeout`, `chain_execution_timeout`, or `sla`
-    /// (issue #1163) is a `std::time::Duration` that cannot convert to a
-    /// `jiff::SignedDuration`.
+    /// (issue #1163) is a `std::time::Duration` past
+    /// [`MAX_WORKFLOW_DURATION`].
     ///
-    /// Every start path resolves these fields with
-    /// `jiff::SignedDuration::try_from(d).ok()`. On overflow, that silently
-    /// discards the declared value. The runaway cap, chain cap or SLA budget
-    /// then never applies, with no error and no log line. `task_duration`
+    /// The start paths once resolved these fields with
+    /// `chrono::Duration::from_std(d).ok()`. On overflow, that silently
+    /// discarded the declared value. The runaway cap, chain cap or SLA budget
+    /// then never applied, with no error and no log line. `task_duration`
     /// accepts up to 20 digits with checked `u64` arithmetic. So the macro can
-    /// reach a value that `jiff::SignedDuration` cannot represent, for example
+    /// reach a value past the ceiling, for example
     /// `#[workflow(execution_timeout = "999999999999d")]`. The build checks
     /// it once for every start path, including the #617 chain cap and the
     /// #743 DAG shadow `WorkflowInfo`.
     #[error(
-        "workflow '{workflow}' field '{field}' is {actual:?}, which cannot be represented as a \
-         chrono::Duration (ceiling: {ceiling:?}); lower the declared value"
+        "workflow '{workflow}' field '{field}' is {actual:?}, which is past the longest \
+         supported workflow duration (ceiling: {ceiling:?}); lower the declared value"
     )]
     UnrepresentableWorkflowDuration {
         /// The workflow name.
@@ -817,8 +817,8 @@ pub enum HarvestBuilderError {
         field: &'static str,
         /// The declared value that failed to convert.
         actual: Duration,
-        /// The largest `std::time::Duration` representable as a
-        /// `jiff::SignedDuration` (derived from `jiff::SignedDuration::MAX`).
+        /// The ceiling, [`MAX_WORKFLOW_DURATION`]. It is the range of the
+        /// `chrono::Duration` that Harvest used before jiff.
         ceiling: Duration,
     },
 
@@ -3372,7 +3372,7 @@ fn validate_workflow_schedules(
         // Validate timezone names early so operators get a typed error rather
         // than a silent bad-timezone panic at first scheduler tick.
         if let crate::policy::Schedule::CronInTimezone { tz, .. } = &schedule.schedule
-            && tz.parse::<chrono_tz::Tz>().is_err()
+            && crate::time::zone(tz).is_none()
         {
             return Err(HarvestBuilderError::UnknownTimezone { name: tz.clone() });
         }
@@ -3400,7 +3400,7 @@ fn validate_dag_schedules(dags: &[crate::info::DagInfo]) -> Result<(), HarvestBu
             continue;
         };
         if let crate::policy::Schedule::CronInTimezone { tz, .. } = schedule
-            && tz.parse::<chrono_tz::Tz>().is_err()
+            && crate::time::zone(tz).is_none()
         {
             return Err(HarvestBuilderError::UnknownTimezone { name: tz.clone() });
         }
@@ -3852,15 +3852,23 @@ fn validate_workflow_throttle_policies(
     Ok(())
 }
 
-/// Reject a workflow whose `execution_timeout`, `chain_execution_timeout`,
-/// or `sla` cannot convert to `jiff::SignedDuration` (issue #1163).
+/// The longest `execution_timeout`, `chain_execution_timeout` or `sla` that
+/// the build accepts: `i64::MAX` milliseconds.
 ///
-/// Every start path resolves these fields with
-/// `jiff::SignedDuration::try_from(d).ok()`. That silently maps an out-of-range
+/// This is the range of `chrono::Duration`, which Harvest used before jiff.
+/// A jiff duration holds more. The bound stays, so the build accepts exactly
+/// the declarations that it accepted before.
+pub const MAX_WORKFLOW_DURATION: Duration = Duration::new(9_223_372_036_854_775, 807_000_000);
+
+/// Reject a workflow whose `execution_timeout`, `chain_execution_timeout`,
+/// or `sla` is past [`MAX_WORKFLOW_DURATION`] (issue #1163).
+///
+/// The start paths once resolved these fields with
+/// `chrono::Duration::from_std(d).ok()`. That silently mapped an out-of-range
 /// `Duration` to `None`, the same as "no timeout declared". `task_duration`
 /// accepts up to 20 digits with checked `u64` arithmetic. So
 /// `#[workflow(execution_timeout = "999999999999d")]` parses, but it is past
-/// chrono's range and silently drops the hard runaway cap. The build checks
+/// the ceiling and silently dropped the hard runaway cap. The build checks
 /// every registered [`WorkflowInfo`] once. That includes the #743 DAG shadow
 /// `WorkflowInfo` from `DagInfo::as_workflow_info`, which
 /// [`HarvestBuilder::dags`] pushes into `self.workflows` before `try_build`.
@@ -3868,9 +3876,7 @@ fn validate_workflow_throttle_policies(
 fn validate_workflow_duration_fields(
     workflows: &[crate::info::WorkflowInfo],
 ) -> Result<(), HarvestBuilderError> {
-    // `jiff::SignedDuration::MAX` is positive, so `to_std()` cannot fail. The
-    // `unwrap_or` fallback only guards against a future chrono change.
-    let ceiling = std::time::Duration::try_from(jiff::SignedDuration::MAX).unwrap_or(Duration::MAX);
+    let ceiling = MAX_WORKFLOW_DURATION;
     for wf in workflows {
         let fields: [(&'static str, Option<Duration>); 3] = [
             ("execution_timeout", wf.execution_timeout),
@@ -3879,7 +3885,7 @@ fn validate_workflow_duration_fields(
         ];
         for (field, value) in fields {
             if let Some(actual) = value
-                && jiff::SignedDuration::try_from(actual).is_err()
+                && actual > ceiling
             {
                 return Err(HarvestBuilderError::UnrepresentableWorkflowDuration {
                     workflow: wf.name.to_string(),
@@ -6220,7 +6226,7 @@ mod tests {
 
     #[test]
     fn harvest_builder_rejects_workflow_schedule_over_the_interval_cap() {
-        // Adding this period to a timestamp overflows chrono (issue #2048).
+        // Adding this period to a timestamp overflows the timestamp range (issue #2048).
         let err = HarvestBuilder::new()
             .workflows(vec![fake_workflow_info()])
             .workflow_schedule(WorkflowSchedule::new(
@@ -7301,11 +7307,10 @@ mod tests {
         }
     }
 
-    /// The largest `std::time::Duration` `chrono::Duration::from_std` can
-    /// still convert. One nanosecond past this must be rejected.
+    /// The largest `std::time::Duration` that `chrono::Duration::from_std`
+    /// could convert. One nanosecond past this must be rejected.
     fn chrono_duration_ceiling() -> Duration {
-        std::time::Duration::try_from(jiff::SignedDuration::MAX)
-            .expect("chrono::Duration::MAX is positive and must convert to std::time::Duration")
+        MAX_WORKFLOW_DURATION
     }
 
     #[test]
@@ -7318,7 +7323,7 @@ mod tests {
         )];
         assert!(
             validate_workflow_duration_fields(&workflows).is_ok(),
-            "expected the exact chrono::Duration ceiling to be accepted"
+            "expected the exact workflow duration ceiling to be accepted"
         );
         assert!(
             validate_workflow_duration_fields(&[wf_info_with_durations(None, None, None)]).is_ok()
@@ -7385,7 +7390,7 @@ mod tests {
 
     /// The `999999999999d` repro from the issue: expressible through
     /// `task_duration`'s checked `u64` arithmetic (well under `u64::MAX`
-    /// seconds) but far past chrono's ceiling.
+    /// seconds) but far past [`MAX_WORKFLOW_DURATION`].
     #[test]
     fn validate_workflow_duration_fields_rejects_the_issue_repro_value() {
         let almost_2_7_billion_years = Duration::from_hours(23_999_999_999_976);

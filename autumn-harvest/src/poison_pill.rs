@@ -32,7 +32,6 @@
 //! pass. A quarantine also locks the owning execution and its open tasks.
 //! Those locks still wait, up to the session `lock_timeout`. A timeout or a
 //! deadlock on one row skips that row, not the pass.
-use jiff_diesel::ToDiesel;
 
 /// What to do with an orphaned `RUNNING` task whose claiming worker has died.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,7 +341,6 @@ pub const fn requeue_orphan_stmt() -> &'static str {
 
 #[cfg(feature = "db")]
 mod scanner {
-    use jiff::Timestamp;
     use diesel::BoolExpressionMethods;
     use diesel::ExpressionMethods;
     use diesel::OptionalExtension;
@@ -350,6 +348,8 @@ mod scanner {
     use diesel_async::AsyncConnection;
     use diesel_async::AsyncPgConnection;
     use diesel_async::RunQueryDsl;
+    use jiff::Timestamp;
+    use jiff_diesel::ToDiesel;
     use tokio_util::sync::CancellationToken;
 
     use super::{
@@ -553,7 +553,7 @@ mod scanner {
             Option<String>,
             i32,
             String,
-            Option<jiff::Timestamp>,
+            Option<crate::time::sql::SqlTimestamp>,
         );
 
         let task_id = task.id;
@@ -592,7 +592,7 @@ mod scanner {
                         && wid == worker_id
                         && strikes == prior_strikes
                         && task_type == "workflow"
-                        && started_at < cutoff => {}
+                        && started_at.to_jiff() < cutoff => {}
                 _ => return Ok(false),
             }
 
@@ -600,10 +600,10 @@ mod scanner {
                 .set((
                     dsl::state.eq("PENDING"),
                     dsl::worker_id.eq(None::<String>),
-                    dsl::started_at.eq(None::<jiff::Timestamp>),
+                    dsl::started_at.eq(None::<crate::time::sql::SqlTimestamp>),
                     dsl::sticky_worker_id.eq(None::<String>),
-                    dsl::sticky_until.eq(None::<jiff::Timestamp>),
-                    dsl::last_heartbeat_at.eq(None::<jiff::Timestamp>),
+                    dsl::sticky_until.eq(None::<crate::time::sql::SqlTimestamp>),
+                    dsl::last_heartbeat_at.eq(None::<crate::time::sql::SqlTimestamp>),
                     // Mirrors `requeue_orphan_stmt`: a stale `error` from an
                     // earlier attempt must not survive into the fresh one it
                     // no longer describes.
@@ -718,7 +718,7 @@ mod scanner {
             exec_dsl::error.eq(Some(error.to_string())),
             exec_dsl::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             // Clear active-pause metadata when a paused owner is failed (#383).
-            exec_dsl::paused_at.eq(None::<jiff::Timestamp>),
+            exec_dsl::paused_at.eq(None::<crate::time::sql::SqlTimestamp>),
             exec_dsl::pause_reason.eq(None::<String>),
             exec_dsl::pause_actor.eq(None::<String>),
         ))
@@ -814,7 +814,7 @@ mod scanner {
         Option<String>,
         i32,
         i32,
-        Option<jiff::Timestamp>,
+        Option<crate::time::sql::SqlTimestamp>,
     );
 
     /// Quarantine an orphaned poison-pill task.
@@ -955,7 +955,8 @@ mod scanner {
                                 && wid == worker_id
                                 && strikes == prior_strikes
                                 && attempt == prior_attempt
-                                && started_at == prior_started_at => {}
+                                && started_at.map(crate::time::sql::SqlTimestamp::to_jiff)
+                                    == prior_started_at => {}
                         _ => return Ok((false, None, Vec::new(), Vec::new(), Vec::new())),
                     }
                     if !worker_still_dead(conn, &worker_id, dead_secs).await? {

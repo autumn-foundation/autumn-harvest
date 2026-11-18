@@ -1929,7 +1929,7 @@ impl TaskDispatch for MemoryDispatch {
         state.released.push(lease.task_id);
         let now = Timestamp::now();
         let due = jiff::SignedDuration::try_from(delay)
-            .map_or(now, |delay| now.checked_add(delay).ok().unwrap_or(now));
+            .map_or(now, |delay| now.checked_add(delay).unwrap_or(now));
         let entry = MemoryEntry {
             due,
             redeliveries: held.entry.redeliveries.saturating_add(1),

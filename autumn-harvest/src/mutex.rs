@@ -514,7 +514,7 @@ mod db_ops {
     #[derive(diesel::QueryableByName)]
     struct AcquiredAtRow {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         acquired_at: Timestamp,
     }
 
@@ -527,7 +527,7 @@ mod db_ops {
     #[derive(diesel::QueryableByName)]
     struct WaitMetricsRow {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         requested_at: Timestamp,
         #[diesel(sql_type = diesel::sql_types::BigInt)]
         depth: i64,

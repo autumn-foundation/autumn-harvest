@@ -290,10 +290,10 @@ struct BuildPolicyRow {
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     deployment_name: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     created_at: Timestamp,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     updated_at: Timestamp,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     target_build_id: Option<String>,
@@ -1018,7 +1018,7 @@ pub async fn declare_compat(
         #[diesel(sql_type = diesel::sql_types::Text)]
         compatible_with: String,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         declared_at: Timestamp,
     }
 
@@ -1202,7 +1202,7 @@ pub async fn list_build_compat(
         #[diesel(sql_type = diesel::sql_types::Text)]
         compatible_with: String,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         declared_at: Timestamp,
     }
 

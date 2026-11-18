@@ -10,13 +10,17 @@
 //! - A read counts a month as 30 days and a day as 24 hours, as the
 //!   Postgres `justify_interval` function does.
 //!
-//! A timestamp in a query uses `jiff_diesel::Timestamp` through
-//! `jiff_diesel::ToDiesel`. A model field of type `Option<Timestamp>` uses
-//! [`NullableTimestamp`] here. One derive can then both read and write it.
+//! A timestamp in a query argument uses `jiff_diesel::Timestamp` through
+//! `jiff_diesel::ToDiesel`. A read uses [`SqlTimestamp`] here, and a model
+//! field of type `Option<Timestamp>` uses [`NullableTimestamp`]. Both read a
+//! stored value past the jiff range as [`Timestamp::MIN`] or
+//! [`Timestamp::MAX`]. `chrono` could write such a value, up to the year
+//! 262142, and Postgres can hold `infinity`. `jiff_diesel::Timestamp` fails
+//! on them, and a row that does not load cannot be cancelled or purged.
 
 use diesel::deserialize::{self, FromSql, FromSqlRow};
 use diesel::expression::AsExpression;
-use diesel::pg::data_types::PgInterval;
+use diesel::pg::data_types::{PgInterval, PgTimestamp};
 use diesel::pg::{Pg, PgValue};
 use diesel::serialize::{self, Output, ToSql};
 use diesel::sql_types::{Interval, Nullable, Timestamptz};
@@ -126,6 +130,55 @@ impl FromSql<Nullable<Interval>, Pg> for NullablePgDuration {
     }
 }
 
+/// Microseconds from the Unix epoch to the Postgres epoch, 2000-01-01.
+const PG_EPOCH_MICROS: i128 = 946_684_800_000_000;
+
+/// Reads a Postgres `timestamptz` value, clamped into the jiff range.
+fn from_pg_micros(micros: i64) -> Timestamp {
+    let nanos = (PG_EPOCH_MICROS + i128::from(micros)) * 1_000;
+    Timestamp::from_nanosecond(nanos).unwrap_or(if nanos < 0 { Timestamp::MIN } else { Timestamp::MAX })
+}
+
+/// A [`Timestamp`] that Diesel reads from a `timestamptz`, clamped into the
+/// jiff range. A write binds exactly as `jiff_diesel::Timestamp` does.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, AsExpression, FromSqlRow)]
+#[diesel(sql_type = Timestamptz)]
+pub struct SqlTimestamp(pub Timestamp);
+
+impl SqlTimestamp {
+    /// Returns the jiff value.
+    #[must_use]
+    pub const fn to_jiff(self) -> Timestamp {
+        self.0
+    }
+}
+
+impl From<Timestamp> for SqlTimestamp {
+    fn from(at: Timestamp) -> Self {
+        Self(at)
+    }
+}
+
+impl From<SqlTimestamp> for Timestamp {
+    fn from(at: SqlTimestamp) -> Self {
+        at.0
+    }
+}
+
+impl ToSql<Timestamptz, Pg> for SqlTimestamp {
+    fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Pg>) -> serialize::Result {
+        let at = jiff_diesel::Timestamp::from(self.0);
+        <jiff_diesel::Timestamp as ToSql<Timestamptz, Pg>>::to_sql(&at, &mut out.reborrow())
+    }
+}
+
+impl FromSql<Timestamptz, Pg> for SqlTimestamp {
+    fn from_sql(bytes: PgValue<'_>) -> deserialize::Result<Self> {
+        let PgTimestamp(micros) = FromSql::<Timestamptz, Pg>::from_sql(bytes)?;
+        Ok(Self(from_pg_micros(micros)))
+    }
+}
+
 /// Converts a duration to the wrapper that Diesel binds as an `interval`.
 ///
 /// `jiff_diesel::ToDiesel` does the same for a timestamp. That trait is
@@ -197,8 +250,8 @@ impl ToSql<Nullable<Timestamptz>, Pg> for NullableTimestamp {
 
 impl FromSql<Nullable<Timestamptz>, Pg> for NullableTimestamp {
     fn from_sql(bytes: PgValue<'_>) -> deserialize::Result<Self> {
-        let at: jiff_diesel::Timestamp = FromSql::<Timestamptz, Pg>::from_sql(bytes)?;
-        Ok(Self(Some(at.to_jiff())))
+        let PgTimestamp(micros) = FromSql::<Timestamptz, Pg>::from_sql(bytes)?;
+        Ok(Self(Some(from_pg_micros(micros))))
     }
 
     fn from_nullable_sql(bytes: Option<PgValue<'_>>) -> deserialize::Result<Self> {
@@ -245,6 +298,18 @@ mod tests {
             let back = to_interval(duration).map(from_interval).ok();
             assert_eq!(back, Some(duration), "{micros}");
         }
+    }
+
+    #[test]
+    fn a_stored_timestamp_past_the_jiff_range_reads_clamped() {
+        assert_eq!(from_pg_micros(0), Timestamp::constant(946_684_800, 0));
+        assert_eq!(from_pg_micros(-1), Timestamp::constant(946_684_799, 999_999_000));
+        // Postgres `infinity` and `-infinity`.
+        assert_eq!(from_pg_micros(i64::MAX), Timestamp::MAX);
+        assert_eq!(from_pg_micros(i64::MIN), Timestamp::MIN);
+        // chrono's `MAX_UTC`, in microseconds after the Postgres epoch.
+        let chrono_max = 8_210_266_876_799_999_999 - 946_684_800_000_000;
+        assert_eq!(from_pg_micros(chrono_max), Timestamp::MAX);
     }
 
     #[test]

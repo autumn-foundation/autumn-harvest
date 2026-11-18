@@ -694,7 +694,7 @@ async fn next_step<O>(
 ///
 /// The result is at least 1 ms, so the race always arms a timer.
 fn time_until(at: Timestamp, now: Timestamp) -> std::time::Duration {
-    let delta = std::time::Duration::try_from((at - now)).unwrap_or_default();
+    let delta = std::time::Duration::try_from(at - now).unwrap_or_default();
     let millis = delta.as_millis() + u128::from(!delta.subsec_nanos().is_multiple_of(1_000_000));
     std::time::Duration::from_millis(u64::try_from(millis.max(1)).unwrap_or(u64::MAX))
 }

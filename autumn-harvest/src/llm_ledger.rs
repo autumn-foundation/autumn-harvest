@@ -13,6 +13,7 @@
 //! clear. See `docs/security-posture.md`.
 
 use std::time::{Duration, Instant};
+#[cfg(feature = "db")]
 use jiff_diesel::ToDiesel;
 
 /// The longest model id the ledger accepts, in bytes.

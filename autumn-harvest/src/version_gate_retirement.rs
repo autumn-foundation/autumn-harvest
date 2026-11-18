@@ -77,10 +77,10 @@ struct RetirementCheckSqlRow {
     #[diesel(sql_type = BigInt)]
     terminal_executions: i64,
     #[diesel(sql_type = Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     oldest_blocker_started_at: Timestamp,
     #[diesel(sql_type = Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     newest_blocker_started_at: Timestamp,
     /// JSON array of UUID strings, e.g. `["uuid1","uuid2"]`.
     #[diesel(sql_type = Text)]

@@ -58,6 +58,7 @@
 
 #[cfg(feature = "db")]
 use crate::error::HarvestError;
+#[cfg(feature = "db")]
 use jiff_diesel::ToDiesel;
 use crate::error::HarvestResult;
 #[cfg(feature = "db")]
@@ -726,7 +727,7 @@ struct PausedActivityRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     paused_by: String,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     paused_at: Timestamp,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
     scope_shard_id: Option<i32>,
@@ -746,7 +747,7 @@ struct UpsertedPauseRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     paused_by: String,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     paused_at: Timestamp,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
     scope_shard_id: Option<i32>,
@@ -936,7 +937,7 @@ struct DeletedPauseRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     paused_by: String,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     paused_at: Timestamp,
 }
 

@@ -8,13 +8,13 @@
 //! operators via the management HTTP routes.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use jiff_diesel::ToDiesel;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -351,7 +351,7 @@ pub async fn register_worker<S: std::hash::BuildHasher + Send + Sync>(
             harvest_workers::status.eq(WorkerStatus::Active.as_str()),
             // Clear any stale drain deadline so a re-registering worker does not
             // inherit the deadline left behind by a prior Draining/Stopped cycle.
-            harvest_workers::drain_deadline_at.eq(Option::<Timestamp>::None),
+            harvest_workers::drain_deadline_at.eq(Option::<crate::time::sql::SqlTimestamp>::None),
             harvest_workers::max_concurrent_sessions
                 .eq(excluded(harvest_workers::max_concurrent_sessions)),
             // A re-registering worker starts with zero in-use sessions -- any
@@ -2582,14 +2582,14 @@ pub async fn list_pinned_executions(
     use diesel::sql_types::Timestamptz;
 
     type Row = (
-        Uuid,                  // harvest_task_queue.workflow_exec_id
-        Option<Timestamp>, // harvest_task_queue.sticky_until
-        Uuid,                  // harvest_workflow_executions.id
-        String,                // workflow_name
-        String,                // workflow_id
-        String,                // state
-        String,                // queue_name (from execution)
-        Timestamp,         // started_at
+        Uuid,                           // harvest_task_queue.workflow_exec_id
+        Option<crate::time::sql::SqlTimestamp>, // harvest_task_queue.sticky_until
+        Uuid,                           // harvest_workflow_executions.id
+        String,                         // workflow_name
+        String,                         // workflow_id
+        String,                         // state
+        String,                         // queue_name (from execution)
+        crate::time::sql::SqlTimestamp,         // started_at
     );
 
     let rows: Vec<Row> = harvest_task_queue::table
@@ -2631,8 +2631,8 @@ pub async fn list_pinned_executions(
                     workflow_id,
                     state,
                     queue_name,
-                    started_at,
-                    sticky_until: su,
+                    started_at: started_at.to_jiff(),
+                    sticky_until: su.to_jiff(),
                 })
             },
         )
@@ -2669,14 +2669,14 @@ pub async fn read_worker_drain_deadline(
     conn: &mut AsyncPgConnection,
     worker_id: &str,
 ) -> HarvestResult<Option<Timestamp>> {
-    let row: Option<Option<Timestamp>> = harvest_workers::table
+    let row: Option<Option<crate::time::sql::SqlTimestamp>> = harvest_workers::table
         .find(worker_id)
         .select(harvest_workers::drain_deadline_at)
         .first(conn)
         .await
         .optional()
         .map_err(crate::error::database_error)?;
-    Ok(row.flatten())
+    Ok(row.flatten().map(crate::time::sql::SqlTimestamp::to_jiff))
 }
 
 /// Read the `drain_deadline_at` for a worker that is currently `Draining`.
@@ -2692,7 +2692,7 @@ pub async fn read_draining_worker_deadline(
     conn: &mut AsyncPgConnection,
     worker_id: &str,
 ) -> HarvestResult<Option<Timestamp>> {
-    let row: Option<Option<Timestamp>> = harvest_workers::table
+    let row: Option<Option<crate::time::sql::SqlTimestamp>> = harvest_workers::table
         .find(worker_id)
         .filter(harvest_workers::status.eq(WorkerStatus::Draining.as_str()))
         .select(harvest_workers::drain_deadline_at)
@@ -2700,7 +2700,7 @@ pub async fn read_draining_worker_deadline(
         .await
         .optional()
         .map_err(crate::error::database_error)?;
-    Ok(row.flatten())
+    Ok(row.flatten().map(crate::time::sql::SqlTimestamp::to_jiff))
 }
 
 /// Request a graceful drain for the worker identified by `worker_id`.
@@ -2779,7 +2779,7 @@ pub async fn request_drain(
         )
         .set((
             harvest_workers::status.eq(WorkerStatus::Draining.as_str()),
-            harvest_workers::drain_deadline_at.eq(deadline_at),
+            harvest_workers::drain_deadline_at.eq(deadline_at.to_diesel()),
         ))
         .execute(conn)
         .await
@@ -2800,7 +2800,7 @@ pub async fn request_drain(
         // Refresh an explicit deadline on a Draining worker. Operators can then
         // extend or correct the window without a new status transition.
         diesel::update(harvest_workers::table.find(worker_id))
-            .set(harvest_workers::drain_deadline_at.eq(deadline_at))
+            .set(harvest_workers::drain_deadline_at.eq(deadline_at.to_diesel()))
             .execute(conn)
             .await
             .map_err(crate::error::database_error)?;

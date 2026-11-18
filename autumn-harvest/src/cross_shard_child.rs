@@ -438,7 +438,7 @@ pub async fn request_cross_shard_cancel(
                 harvest_cross_shard_children::cancel_reason,
                 reason,
             )),
-            harvest_cross_shard_children::last_attempt_at.eq(None::<Timestamp>),
+            harvest_cross_shard_children::last_attempt_at.eq(None::<crate::time::sql::SqlTimestamp>),
             harvest_cross_shard_children::attempts.eq(0),
         ))
         .execute(conn)
@@ -1464,7 +1464,7 @@ async fn start_child_on_target(
                 // extended this to the chain deadline, which used to be the
                 // one exception.
                 let created_at = Timestamp::now();
-                // `checked_add_signed` (not `+`): `DateTime + Duration` panics
+                // `checked_add` (not `+`): `Timestamp + SignedDuration` panics
                 // on overflow, and these seconds values are caller-supplied.
                 // `execution::start_or_load_workflow_execution`'s chain-ceiling
                 // computation uses the same guard for the same reason. `None`
@@ -1484,7 +1484,7 @@ async fn start_child_on_target(
                     first_exec_id: None,
                     chain_execution_timeout: spec
                         .chain_execution_timeout_secs
-                        .map(chrono::Duration::seconds),
+                        .map(jiff::SignedDuration::from_secs),
                     chain_deadline_at,
                     id: child_exec_id.as_uuid(),
                     workflow_name: &workflow_name,
@@ -1498,9 +1498,9 @@ async fn start_child_on_target(
                     input: codecs.encode_column(&spec.input)?.into(),
                     parent_id: Some(parent_exec_id.as_uuid()),
                     queue_name: &spec.queue_name,
-                    execution_timeout: spec.execution_timeout_secs.map(chrono::Duration::seconds),
+                    execution_timeout: spec.execution_timeout_secs.map(jiff::SignedDuration::from_secs),
                     deadline_at,
-                    sla: spec.sla_secs.map(chrono::Duration::seconds),
+                    sla: spec.sla_secs.map(jiff::SignedDuration::from_secs),
                     sla_deadline_at,
                     memo: None,
                     search_attrs: None,

@@ -321,9 +321,9 @@ mod db {
         max_concurrent: Option<i32>,
         reason: Option<String>,
         updated_by: String,
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         created_at: Timestamp,
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         updated_at: Timestamp,
     }
 

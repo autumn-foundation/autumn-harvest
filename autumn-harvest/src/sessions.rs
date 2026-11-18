@@ -523,7 +523,7 @@ pub async fn record_session_acquired(
         expires_at,
     };
     diesel::insert_into(crate::schema::harvest_sessions::table)
-        .values(&row)
+        .values(row)
         .on_conflict(dsl::id)
         .do_nothing()
         .execute(conn)
@@ -679,7 +679,7 @@ async fn resolve_broken_reason(
     use crate::schema::harvest_workers::dsl as w;
     use crate::schema::harvest_workflow_executions::dsl as e;
 
-    let worker: Option<(jiff::Timestamp, String)> = w::harvest_workers
+    let worker: Option<(crate::time::sql::SqlTimestamp, String)> = w::harvest_workers
         .filter(w::worker_id.eq(&session.host_worker_id))
         .select((w::last_heartbeat_at, w::status))
         .first(conn)
@@ -694,7 +694,7 @@ async fn resolve_broken_reason(
         Some((last_heartbeat_at, status)) => {
             let cutoff = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(worker_stale_secs);
             (
-                last_heartbeat_at <= cutoff,
+                last_heartbeat_at.to_jiff() <= cutoff,
                 status == "Draining" || status == "Stopped",
             )
         }

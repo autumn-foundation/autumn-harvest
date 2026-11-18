@@ -3,7 +3,7 @@
 use crate::event::WorkflowEvent;
 use crate::payload_codec::{LossyDecodeOutcome, PayloadCodecs};
 use crate::types::ExecutionId;
-use jiff::{SignedDuration, Timestamp};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -13,9 +13,10 @@ use std::str::FromStr;
 /// Serde adapter for `Option<jiff::SignedDuration>` as `Option<i64>` milliseconds
 /// (issue #772).
 ///
-/// `jiff::SignedDuration` (`SignedDuration`) has no serde impl. So `execution_timeout`
-/// in [`HistoryExportDocument`] and `testing::HistorySnapshot` is serialised as
-/// integer milliseconds. That is lossless for the `INTERVAL`-backed column, and
+/// `chrono::Duration` had no serde impl, so `execution_timeout` in
+/// [`HistoryExportDocument`] and `testing::HistorySnapshot` is serialised as
+/// integer milliseconds. The jiff serde format is an ISO 8601 string, so the
+/// adapter keeps the old wire format. That is lossless for the `INTERVAL`-backed column, and
 /// it matches the millisecond granularity of the deadline probe. Both structs
 /// use this module, so the exported JSON round-trips into a `HistorySnapshot`
 /// verbatim.
@@ -30,8 +31,7 @@ pub(crate) mod opt_duration_millis {
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         value
-            .as_ref()
-            .map(chrono::Duration::num_milliseconds)
+            .map(crate::time::num_milliseconds)
             .serialize(serializer)
     }
 
@@ -39,7 +39,7 @@ pub(crate) mod opt_duration_millis {
         deserializer: D,
     ) -> Result<Option<jiff::SignedDuration>, D::Error> {
         let millis: Option<i64> = Option::deserialize(deserializer)?;
-        Ok(millis.map(chrono::Duration::milliseconds))
+        Ok(millis.map(jiff::SignedDuration::from_millis))
     }
 }
 
@@ -757,7 +757,8 @@ impl MermaidExporter {
             WorkflowEvent::WorkflowExecutionTimedOut { deadline, .. } => {
                 writeln!(
                     self.out,
-                    "    Note over WF: Execution Timed Out (deadline: {deadline})"
+                    "    Note over WF: Execution Timed Out (deadline: {})",
+                    crate::time::utc_display(*deadline)
                 )?;
             }
             WorkflowEvent::WorkflowExecutionPaused { actor, reason, .. } => {

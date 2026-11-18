@@ -109,7 +109,7 @@ mod pg {
         #[diesel(sql_type = Text)]
         updated_by: String,
         #[diesel(sql_type = Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         updated_at: Timestamp,
     }
 
@@ -126,7 +126,7 @@ mod pg {
         #[diesel(sql_type = Nullable<Text>)]
         new_body: Option<String>,
         #[diesel(sql_type = Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         at: Timestamp,
     }
 

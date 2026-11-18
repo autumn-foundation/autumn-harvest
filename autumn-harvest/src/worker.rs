@@ -5903,14 +5903,37 @@ async fn run_local_activity_inline(
     Ok(LocalActivityInlineOutcome::Complete(all_new_events))
 }
 
+/// The longest duration that `chrono` held: `i64::MAX` milliseconds.
+///
+/// jiff holds a longer one. The activity duration checks keep the old bound,
+/// so a value that `chrono` refused still fails with the same error.
+const CHRONO_MAX_DURATION: jiff::SignedDuration =
+    jiff::SignedDuration::from_millis(i64::MAX);
+
 fn chrono_duration_from_std(
     duration: Duration,
     field_name: &str,
 ) -> HarvestResult<jiff::SignedDuration> {
-    jiff::SignedDuration::try_from(duration).map_err(|_| {
-        HarvestError::Config(format!(
-            "activity {field_name} duration exceeds chrono range"
-        ))
+    jiff::SignedDuration::try_from(duration)
+        .ok()
+        .filter(|duration| *duration <= CHRONO_MAX_DURATION)
+        .ok_or_else(|| {
+            HarvestError::Config(format!(
+                "activity {field_name} duration exceeds chrono range"
+            ))
+        })
+}
+
+/// Returns `at + delay`, or the nearest instant that jiff holds.
+///
+/// `chrono` held dates to year 262143, so a long delay still got a fire
+/// time. jiff stops at year 9999. A sum past that year saturates, so a
+/// timer that never fires does not panic the worker.
+fn saturating_fire_at(at: jiff::Timestamp, delay: jiff::SignedDuration) -> jiff::Timestamp {
+    at.checked_add(delay).unwrap_or(if delay.is_negative() {
+        jiff::Timestamp::MIN
+    } else {
+        jiff::Timestamp::MAX
     })
 }
 
@@ -6051,12 +6074,11 @@ async fn load_unfired_timers_by_id(
 /// Timer due-ness checks and the signal `received_at` column default both use
 /// Postgres `NOW()`. Deadlines from this clock stay comparable to them, even
 /// with worker clock skew.
-async fn db_clock_now(
-    conn: &mut AsyncPgConnection,
-) -> HarvestResult<jiff::Timestamp> {
+async fn db_clock_now(conn: &mut AsyncPgConnection) -> HarvestResult<jiff::Timestamp> {
     diesel::select(crate::cached_stmt::pg_now())
-        .get_result(conn)
+        .get_result::<crate::time::sql::SqlTimestamp>(conn)
         .await
+        .map(crate::time::sql::SqlTimestamp::to_jiff)
         .map_err(crate::error::database_error)
 }
 
@@ -6067,11 +6089,13 @@ pub(crate) fn chrono_duration_from_secs(
     let seconds = i64::try_from(seconds).map_err(|_| {
         HarvestError::Config(format!("activity {field_name} exceeds i64 seconds range"))
     })?;
-    Some(jiff::SignedDuration::from_secs(seconds)).ok_or_else(|| {
-        HarvestError::Config(format!(
-            "activity {field_name} exceeds chrono::Duration bounds"
-        ))
-    })
+    Some(jiff::SignedDuration::from_secs(seconds))
+        .filter(|duration| *duration <= CHRONO_MAX_DURATION)
+        .ok_or_else(|| {
+            HarvestError::Config(format!(
+                "activity {field_name} exceeds chrono::Duration bounds"
+            ))
+        })
 }
 
 fn next_retry_delay(
@@ -7041,7 +7065,7 @@ async fn update_workflow_execution_completed(
         // Belt-and-braces ND-block reset (issue #603). Some terminal paths
         // bypass the pause-guarded persist transaction and its clear hook.
         // They must not leave a stale block marker on a closed run.
-        dsl::nd_blocked_at.eq(None::<jiff::Timestamp>),
+        dsl::nd_blocked_at.eq(None::<crate::time::sql::SqlTimestamp>),
         SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(None::<String>)),
         dsl::nd_block_count.eq(0),
     ))
@@ -9677,7 +9701,7 @@ async fn update_workflow_execution_failed(
         // Belt-and-braces ND-block reset (issue #603). An author failure (or
         // history-cap/dispatch-error terminal) closes the run. A stale block
         // marker must not survive on a terminal row.
-        dsl::nd_blocked_at.eq(None::<jiff::Timestamp>),
+        dsl::nd_blocked_at.eq(None::<crate::time::sql::SqlTimestamp>),
         SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(None::<String>)),
         dsl::nd_block_count.eq(0),
     ))
@@ -9973,7 +9997,7 @@ async fn clear_nd_block(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> H
 
     diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
         .set((
-            dsl::nd_blocked_at.eq(None::<jiff::Timestamp>),
+            dsl::nd_blocked_at.eq(None::<crate::time::sql::SqlTimestamp>),
             SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(None::<String>)),
             dsl::nd_block_count.eq(0),
         ))
@@ -10314,8 +10338,12 @@ pub async fn persist_workflow_failure(
         jiff::Timestamp,
         Option<jiff::SignedDuration>,
     )> = retry_plan.as_ref().map(|(rid, policy, attempt, delay)| {
-        let delay_chrono = jiff::SignedDuration::try_from(*delay).unwrap_or_default();
-        let fire_at = jiff::Timestamp::now() + delay_chrono;
+        // `chrono` read a delay past `i64::MAX` milliseconds as zero.
+        let delay_chrono = jiff::SignedDuration::try_from(*delay)
+            .ok()
+            .filter(|delay| *delay <= CHRONO_MAX_DURATION)
+            .unwrap_or_default();
+        let fire_at = saturating_fire_at(jiff::Timestamp::now(), delay_chrono);
         let start_delay = (!delay.is_zero()).then_some(delay_chrono);
         (*rid, policy.clone(), *attempt, fire_at, start_delay)
     });
@@ -10707,7 +10735,7 @@ fn update_admit_duration_secs(
     now: jiff::Timestamp,
 ) -> Option<f64> {
     let admit = admit_ts?;
-    let millis = crate::time::num_milliseconds((now - admit)).max(0);
+    let millis = crate::time::num_milliseconds(now - admit).max(0);
     Some(millis as f64 / 1000.0)
 }
 
@@ -11486,7 +11514,7 @@ async fn process_mutex_releases_from_commands(
                 {
                     #[allow(clippy::cast_precision_loss)]
                     let secs =
-                        (crate::time::num_milliseconds((jiff::Timestamp::now() - acquired_at)) as f64) / 1000.0;
+                        (crate::time::num_milliseconds(jiff::Timestamp::now() - acquired_at) as f64) / 1000.0;
                     held.push(secs.max(0.0));
                 }
             }
@@ -11603,7 +11631,7 @@ async fn persist_mutex_acquire_park(
                         match crate::mutex::waiter_wait_metrics(conn, &key, exec_id).await? {
                             Some((requested_at, count)) => {
                                 #[allow(clippy::cast_precision_loss)]
-                                let secs = (crate::time::num_milliseconds((jiff::Timestamp::now() - requested_at))
+                                let secs = (crate::time::num_milliseconds(jiff::Timestamp::now() - requested_at)
                                     as f64)
                                     / 1000.0;
                                 (Some(secs.max(0.0)), u64::try_from(count).ok())
@@ -12131,8 +12159,10 @@ fn build_activity_enqueue_plan(
             )?);
         }
         if let Some(timeout) = defaults.schedule_to_close {
-            let deadline = jiff::Timestamp::now()
-                + chrono_duration_from_std(timeout, "schedule_to_close timeout")?;
+            let deadline = saturating_fire_at(
+                jiff::Timestamp::now(),
+                chrono_duration_from_std(timeout, "schedule_to_close timeout")?,
+            );
             params.schedule_to_close_at = Some(deadline);
         }
 
@@ -12579,7 +12609,7 @@ async fn persist_started_timer(
             let fire_delay =
                 chrono_duration_from_secs(timer.duration_secs, "timer duration")?;
             let db_now = db_clock_now(conn).await?;
-            db_now + fire_delay
+            saturating_fire_at(db_now, fire_delay)
         };
         let is_new = existing.is_none();
         // The suspending StartTimer's own TimerStarted (for a new timer) is
@@ -12621,7 +12651,7 @@ async fn persist_started_timer(
                 fires_at,
             };
             diesel::insert_into(harvest_timers::table)
-                .values(&new_timer)
+                .values(new_timer)
                 .execute(conn)
                 .await
                 .map_err(crate::error::database_error)?;
@@ -14307,7 +14337,7 @@ async fn persist_child_timeout_race(
                 let fire_delay =
                     chrono_duration_from_secs(timer.duration_secs, "child timeout duration")?;
                 let db_now = db_clock_now(conn).await?;
-                db_now + fire_delay
+                saturating_fire_at(db_now, fire_delay)
             };
 
             // ── append parent events in command emission order ──
@@ -14401,7 +14431,7 @@ async fn persist_child_timeout_race(
                     fires_at,
                 };
                 diesel::insert_into(harvest_timers::table)
-                    .values(&new_timer)
+                    .values(new_timer)
                     .execute(conn)
                     .await
                     .map_err(crate::error::database_error)?;
@@ -14709,7 +14739,7 @@ async fn persist_mixed_suspension_batch(
                     db_now = Some(now);
                     now
                 };
-                let fires_at = now + fire_delay;
+                let fires_at = saturating_fire_at(now, fire_delay);
                 new_timer_rows.push((timer.timer_id.clone(), fires_at));
                 fires_at
             };
@@ -14875,17 +14905,19 @@ async fn persist_mixed_suspension_batch(
 
         // Insert the durable rows for genuinely new timers.
         if !new_timer_rows.is_empty() {
-            let new_timers: Vec<NewHarvestTimer<'_>> = new_timer_rows
-                .iter()
-                .map(|(timer_id, fires_at)| NewHarvestTimer {
-                    workflow_exec_id: exec_id.as_uuid(),
-                    timer_id: timer_id.as_str(),
-                    fires_at: *fires_at,
-                })
-                .collect();
-            for chunk in new_timers.chunks(TIMER_ROWS_PER_INSERT_CHUNK) {
+            // A `serialize_as` field makes only an owned row insertable, so
+            // each chunk builds its own rows.
+            for chunk in new_timer_rows.chunks(TIMER_ROWS_PER_INSERT_CHUNK) {
+                let new_timers: Vec<NewHarvestTimer<'_>> = chunk
+                    .iter()
+                    .map(|(timer_id, fires_at)| NewHarvestTimer {
+                        workflow_exec_id: exec_id.as_uuid(),
+                        timer_id: timer_id.as_str(),
+                        fires_at: *fires_at,
+                    })
+                    .collect();
                 diesel::insert_into(harvest_timers::table)
-                    .values(chunk)
+                    .values(new_timers)
                     .execute(conn)
                     .await
                     .map_err(crate::error::database_error)?;
@@ -15180,7 +15212,7 @@ pub async fn ingest_due_timers_and_signals(
             .filter(dsl::fired.eq(false))
             // Use the database clock here so timer replay stays consistent with the
             // queue claim path, which also uses Postgres NOW().
-            .filter(dsl::fires_at.le(crate::cached_stmt::pg_now().to_diesel()))
+            .filter(dsl::fires_at.le(crate::cached_stmt::pg_now()))
             .order((dsl::fires_at.asc(), dsl::timer_id.asc()))
             .select(HarvestTimer::as_select())
             .load(&mut shared)
@@ -15994,7 +16026,7 @@ pub async fn materialize_due_child_timeout_deadlines(
         .filter(dsl::workflow_exec_id.eq(parent_exec_id.as_uuid()))
         .filter(dsl::fired.eq(false))
         .filter(dsl::timer_id.like(r"\_\_child\_timeout:%"))
-        .filter(dsl::fires_at.le(crate::cached_stmt::pg_now().to_diesel()))
+        .filter(dsl::fires_at.le(crate::cached_stmt::pg_now()))
         .order(dsl::fires_at.asc())
         .for_update()
         .select(HarvestTimer::as_select())
@@ -16977,9 +17009,12 @@ async fn task_state_and_deadline_for_update(
         .find(task_id)
         .for_update()
         .select((dsl::state, dsl::schedule_to_close_at))
-        .first(conn)
+        .first::<(String, Option<crate::time::sql::SqlTimestamp>)>(conn)
         .await
         .optional()
+        .map(|row| {
+            row.map(|(state, deadline)| (state, deadline.map(crate::time::sql::SqlTimestamp::to_jiff)))
+        })
         .map_err(crate::error::database_error)
 }
 
@@ -17453,7 +17488,7 @@ fn past_attempt_deadline(
         return false;
     };
     // A deadline before the claim leaves no budget.
-    let budget = std::time::Duration::try_from((deadline - started_at)).unwrap_or(Duration::ZERO);
+    let budget = std::time::Duration::try_from(deadline - started_at).unwrap_or(Duration::ZERO);
     elapsed >= budget
 }
 
@@ -19543,17 +19578,18 @@ async fn read_session_after_inserts(
     use diesel::result::{DatabaseErrorKind, Error as DieselError};
     use diesel_async::AsyncConnection as _;
 
-    let probe = crate::models::NewHarvestSession {
-        id: row.session_id.as_uuid(),
-        workflow_exec_id: row.exec_id.as_uuid(),
-        host_worker_id: &row.host_worker_id,
-        queue_name: &row.queue_name,
-        expires_at: jiff::Timestamp::now(),
-    };
+    let expires_at = jiff::Timestamp::now();
     let waited = conn
         .transaction::<(), DieselError, _>(async |conn| {
+            let probe = crate::models::NewHarvestSession {
+                id: row.session_id.as_uuid(),
+                workflow_exec_id: row.exec_id.as_uuid(),
+                host_worker_id: &row.host_worker_id,
+                queue_name: &row.queue_name,
+                expires_at,
+            };
             diesel::insert_into(dsl::harvest_sessions)
-                .values(&probe)
+                .values(probe)
                 .on_conflict(dsl::id)
                 .do_nothing()
                 .execute(conn)
@@ -22357,14 +22393,14 @@ async fn plan_timer_lifecycle(
         } else {
             let fire_delay = chrono_duration_from_secs(*duration_secs, "timer duration")?;
             let db_now = db_clock_now(conn).await?;
-            let fires_at = db_now + fire_delay;
+            let fires_at = saturating_fire_at(db_now, fire_delay);
             let new_timer = NewHarvestTimer {
                 workflow_exec_id: exec_id.as_uuid(),
                 timer_id: timer_id.as_str(),
                 fires_at,
             };
             diesel::insert_into(harvest_timers::table)
-                .values(&new_timer)
+                .values(new_timer)
                 .execute(conn)
                 .await
                 .map_err(crate::error::database_error)?;
@@ -29296,7 +29332,7 @@ async fn process_workflow_task(
             // chrono duration), mirroring the update-duration clamping
             // precedent.
             Some(
-                std::time::Duration::try_from((jiff::Timestamp::now() - prepared.execution.started_at))
+                std::time::Duration::try_from(jiff::Timestamp::now() - prepared.execution.started_at)
                     .map_or(0.0, |delta| delta.as_secs_f64()),
             )
         } else {
@@ -36860,7 +36896,7 @@ fn reference_outcome(
     if probe.scheduled_at > now {
         // Not yet due. Hold the reference until the due time, so the channel
         // parks it instead of cycling it once per poll.
-        let until = std::time::Duration::try_from((probe.scheduled_at - now))
+        let until = std::time::Duration::try_from(probe.scheduled_at - now)
             .unwrap_or(settings.release_backoff_cap);
         return ReferenceOutcome::Release(until.min(settings.release_backoff_cap));
     }
@@ -45051,12 +45087,12 @@ pub async fn reset_timed_out_workflow_task(
         .set((
             dsl::state.eq("PENDING"),
             dsl::worker_id.eq(None::<String>),
-            dsl::started_at.eq(None::<jiff::Timestamp>),
-            dsl::last_heartbeat_at.eq(None::<jiff::Timestamp>),
+            dsl::started_at.eq(None::<crate::time::sql::SqlTimestamp>),
+            dsl::last_heartbeat_at.eq(None::<crate::time::sql::SqlTimestamp>),
             // Clear sticky affinity so any worker can reclaim the task immediately
             // rather than waiting for the expired lease of the hung worker.
             dsl::sticky_worker_id.eq(None::<String>),
-            dsl::sticky_until.eq(None::<jiff::Timestamp>),
+            dsl::sticky_until.eq(None::<crate::time::sql::SqlTimestamp>),
             // `capability_misses` is deliberately NOT reset here (issue #804).
             //
             // It is tempting to: a workflow-task timeout usually means the handler

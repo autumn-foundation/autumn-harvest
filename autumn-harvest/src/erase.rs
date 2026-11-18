@@ -1308,10 +1308,23 @@ mod db {
                 harvest_workflow_executions_ext::legal_hold_reason,
             ))
             .for_update()
-            .first::<EraseGateRow>(conn)
+            .first::<(
+                String,
+                Option<crate::time::sql::SqlTimestamp>,
+                Option<crate::time::sql::SqlTimestamp>,
+                Option<String>,
+            )>(conn)
             .await
             .optional()
             .map_err(database_error)?
+            .map(|(state, set_at, until, reason)| {
+                (
+                    state,
+                    set_at.map(crate::time::sql::SqlTimestamp::to_jiff),
+                    until.map(crate::time::sql::SqlTimestamp::to_jiff),
+                    reason,
+                )
+            })
             .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
     }
 

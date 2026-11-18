@@ -94,7 +94,6 @@
 
 use std::collections::BTreeMap;
 
-use jiff::SignedDuration;
 use serde::{Deserialize, Serialize};
 
 use crate::event::WorkflowEvent;
@@ -671,7 +670,7 @@ fn compute_rollup(
     }
 
     TimelineRollup {
-        total_wall_clock_ms: crate::time::num_milliseconds((clock_end - started_at)).max(0),
+        total_wall_clock_ms: crate::time::num_milliseconds(clock_end - started_at).max(0),
         busy_ms,
         wait_ms,
         slowest_step: slowest,
@@ -682,7 +681,7 @@ fn compute_rollup(
 /// Non-negative milliseconds from `a` to `b` (clamped at 0 to tolerate clock
 /// skew / out-of-order timestamps).
 fn ms_between(a: jiff::Timestamp, b: jiff::Timestamp) -> i64 {
-    crate::time::num_milliseconds((b - a)).max(0)
+    crate::time::num_milliseconds(b - a).max(0)
 }
 
 /// Insert a freshly-scheduled accumulator under `key` iff none exists yet,

@@ -41,13 +41,13 @@
 //! the plaintext.
 
 use std::borrow::Cow;
-use jiff_diesel::ToDiesel;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{HarvestError, HarvestResult};
@@ -672,9 +672,9 @@ struct OverrideRow {
     buffer_all_max: Option<i32>,
     reason: Option<String>,
     updated_by: String,
-    #[diesel(serialize_as = jiff_diesel::Timestamp, deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp, deserialize_as = crate::time::sql::SqlTimestamp)]
     created_at: Timestamp,
-    #[diesel(serialize_as = jiff_diesel::Timestamp, deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp, deserialize_as = crate::time::sql::SqlTimestamp)]
     updated_at: Timestamp,
     workflow_fields: serde_json::Value,
     workflow_input: Option<serde_json::Value>,
@@ -1054,7 +1054,7 @@ async fn upsert_override(
 
     let fields = row.fields;
     let (actor, reason) = (row.actor, row.reason);
-    let now = row.updated_at;
+    let now = row.updated_at.to_diesel();
     let schedule_expr = fields.schedule.as_ref().map(schedule_to_storage);
     let max_active_runs = fields.max_active_runs.map(saturating_i32);
     let jitter_secs = fields
@@ -1208,9 +1208,10 @@ async fn delete_dag_override_returning(
             .filter(dsl::name.eq(dag_name)),
     )
     .returning(dsl::updated_at)
-    .get_result(conn)
+    .get_result::<crate::time::sql::SqlTimestamp>(conn)
     .await
     .optional()
+    .map(|version| version.map(crate::time::sql::SqlTimestamp::to_jiff))
     .map_err(crate::error::database_error)
 }
 
@@ -1338,10 +1339,11 @@ async fn copy_newest(conn: &mut AsyncPgConnection, row: &OverrideRow) -> Harvest
         .filter(dsl::kind.eq(&row.kind))
         .filter(dsl::name.eq(&row.name))
         .select(dsl::updated_at)
-        .first(conn)
+        .first::<crate::time::sql::SqlTimestamp>(conn)
         .await
         .optional()
-        .map_err(crate::error::database_error)?;
+        .map_err(crate::error::database_error)?
+        .map(crate::time::sql::SqlTimestamp::to_jiff);
     match held {
         Some(held) if held >= version => return Ok(()),
         Some(held) => {
@@ -1351,7 +1353,7 @@ async fn copy_newest(conn: &mut AsyncPgConnection, row: &OverrideRow) -> Harvest
         None => {}
     }
     diesel::insert_into(dsl::harvest_schedule_overrides)
-        .values(row)
+        .values(row.clone())
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -1379,9 +1381,10 @@ async fn bound_carry_lock_waits(conn: &mut AsyncPgConnection) -> HarvestResult<(
 /// microseconds, as Postgres stores it. So a skewed clock never gives a
 /// version at or below the floor, and the new row stays near the wall clock.
 fn next_version(now: Timestamp, floor: Option<Timestamp>) -> Timestamp {
-    use jiff::Timestamp;
-
-    let now = now.trunc_subsecs(6);
+    let whole_micros = jiff::TimestampRound::new()
+        .smallest(jiff::Unit::Microsecond)
+        .mode(jiff::RoundMode::Trunc);
+    let now = now.round(whole_micros).unwrap_or(now);
     floor.map_or(now, |floor| {
         now.max(floor + jiff::SignedDuration::from_micros(1))
     })
@@ -1400,9 +1403,10 @@ async fn read_floor(
         .filter(dsl::kind.eq(kind))
         .filter(dsl::name.eq(name))
         .select(dsl::row_updated_at)
-        .first(conn)
+        .first::<crate::time::sql::SqlTimestamp>(conn)
         .await
         .optional()
+        .map(|floor| floor.map(crate::time::sql::SqlTimestamp::to_jiff))
         .map_err(crate::error::database_error)
 }
 
@@ -1437,9 +1441,9 @@ async fn raise_floor(
             dsl::received_at.eq(diesel::dsl::now),
         ))
         .returning(dsl::row_updated_at)
-        .get_result(conn)
+        .get_result::<crate::time::sql::SqlTimestamp>(conn)
         .await
-        .map(Some)
+        .map(|floor| Some(floor.to_jiff()))
         .map_err(crate::error::database_error)
 }
 

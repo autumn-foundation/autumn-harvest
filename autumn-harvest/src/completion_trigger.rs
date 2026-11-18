@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "db")]
 use jiff_diesel::ToDiesel;
 use serde_json::Value;
 use uuid::Uuid;
@@ -676,8 +677,8 @@ struct TargetRunDefaults {
 /// Resolve the run defaults of one target type.
 ///
 /// An operator override in `cache` wins over each declared value (issues
-/// #2387 and #2406). A value past the `chrono` range drops out. A missing
-/// cache returns the declared values.
+/// #2387 and #2406). A value past the `jiff::SignedDuration` range drops
+/// out. A missing cache returns the declared values.
 #[cfg(feature = "db")]
 fn resolve_target_run_defaults(
     workflow_name: &str,
@@ -691,14 +692,14 @@ fn resolve_target_run_defaults(
     let chain = cache.map_or(declared.chain_execution_timeout, |c| {
         c.apply_chain(workflow_name, declared.chain_execution_timeout)
     });
-    let to_chrono =
+    let to_signed =
         |d: Option<std::time::Duration>| d.and_then(|d| jiff::SignedDuration::try_from(d).ok());
     TargetRunDefaults {
-        execution_timeout: to_chrono(execution_timeout),
-        chain_execution_timeout: to_chrono(chain),
-        sla: to_chrono(sla),
-        max_execution_timeout_ceiling: to_chrono(ceilings.execution_timeout),
-        max_workflow_chain_timeout_ceiling: to_chrono(ceilings.chain_timeout),
+        execution_timeout: to_signed(execution_timeout),
+        chain_execution_timeout: to_signed(chain),
+        sla: to_signed(sla),
+        max_execution_timeout_ceiling: to_signed(ceilings.execution_timeout),
+        max_workflow_chain_timeout_ceiling: to_signed(ceilings.chain_timeout),
     }
 }
 
@@ -4178,10 +4179,10 @@ mod tests {
         );
     }
 
-    /// A value past the `chrono` range drops out and never panics.
+    /// A value past the `jiff::SignedDuration` range drops out and never panics.
     #[cfg(feature = "db")]
     #[test]
-    fn a_target_drops_a_value_past_the_chrono_range() {
+    fn a_target_drops_a_value_past_the_signed_duration_range() {
         let got = resolve_target_run_defaults(
             "wf",
             TargetDeclared {

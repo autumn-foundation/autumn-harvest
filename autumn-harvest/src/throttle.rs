@@ -98,11 +98,12 @@
 //! trigger-starts.
 
 use std::time::Duration;
-use jiff_diesel::ToDiesel;
 
 #[cfg(feature = "db")]
 use crate::cached_stmt::CachePreparedDsl as _;
 use jiff::Timestamp;
+#[cfg(feature = "db")]
+use jiff_diesel::ToDiesel;
 
 /// Prefix for the per-key token bucket stored in `harvest_rate_limit_buckets`,
 /// namespaced so it can never collide with an activity rate-limit bucket key.
@@ -338,11 +339,14 @@ pub fn compute_expiry(
     schedule_to_start: Option<Duration>,
 ) -> Option<Timestamp> {
     let d = schedule_to_start?;
-    let chrono_d =
-        jiff::SignedDuration::try_from(d).unwrap_or_else(|_| crate::time::days(365 * 100));
+    let far = crate::time::days(365 * 100);
+    let d = jiff::SignedDuration::try_from(d).unwrap_or(far);
+    // jiff stops at year 9999, far below the `chrono` limit. A sum past that
+    // year takes the same 100-year clamp as a duration that does not convert.
     Some(
         deferred_at
-            .checked_add(chrono_d).ok()
+            .checked_add(d)
+            .or_else(|_| deferred_at.checked_add(far))
             .unwrap_or(deferred_at),
     )
 }
@@ -588,7 +592,7 @@ async fn existing_pending_throttle_for_workflow_id(
         #[diesel(sql_type = diesel::sql_types::Text)]
         throttle_key: String,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         deferred_at: Timestamp,
     }
     let row: Option<Row> = diesel::sql_query(
@@ -643,7 +647,7 @@ async fn insert_pending_throttle_row(
     .bind::<diesel::sql_types::Jsonb, _>(&stored_input)
     .bind::<diesel::sql_types::Jsonb, _>(start_options_json)
     .bind::<diesel::sql_types::Timestamptz, _>(deferred_at.to_diesel())
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(expires_at)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(expires_at.to_diesel())
     .bind::<diesel::sql_types::Integer, _>(params.shard_id)
     .execute(conn)
     .await
@@ -999,7 +1003,7 @@ struct FireDueRow {
     /// When the row was deferred. A backoff moves it into the future (issue
     /// #2043).
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     deferred_at: Timestamp,
 }
 
@@ -1886,7 +1890,7 @@ pub async fn list_pending_throttle(
         #[diesel(sql_type = diesel::sql_types::Text)]
         queue_name: String,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         deferred_at: Timestamp,
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
         #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
@@ -1944,7 +1948,7 @@ pub async fn throttle_backlog_by_key(
         #[diesel(sql_type = diesel::sql_types::BigInt)]
         deferred_count: i64,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         oldest_deferred_at: Timestamp,
         #[diesel(sql_type = diesel::sql_types::Integer)]
         shard_id: i32,

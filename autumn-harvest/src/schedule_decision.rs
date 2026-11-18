@@ -1,9 +1,9 @@
 use crate::models::NewScheduleDecision;
-use jiff_diesel::ToDiesel;
 use crate::schema::harvest_schedule_decisions;
 use crate::telemetry::MetricsRecorder;
-use jiff::Timestamp;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -39,7 +39,7 @@ pub async fn record_decision_graceful(
     };
 
     if let Err(e) = diesel::insert_into(harvest_schedule_decisions::table)
-        .values(&new_dec)
+        .values(new_dec)
         .execute(conn)
         .await
     {
@@ -63,7 +63,11 @@ pub async fn purge_old_schedule_decisions(
     use diesel::ExpressionMethods;
     use diesel::QueryDsl;
 
-    let cutoff = Timestamp::now() - crate::time::days(retention_days.max(0));
+    // A cutoff before the first instant that jiff holds deletes nothing, as
+    // the earlier `chrono` cutoff did. So it clamps rather than panics.
+    let cutoff = Timestamp::now()
+        .checked_sub(crate::time::days(retention_days.max(0)))
+        .unwrap_or(Timestamp::MIN);
 
     let deleted = diesel::delete(
         harvest_schedule_decisions::table

@@ -741,9 +741,10 @@ mod db {
 
     use crate::cached_stmt::CachePreparedDsl as _;
 
-    use jiff::Timestamp;
     use diesel::sql_types::{Array, BigInt, Double, Integer, Jsonb, Nullable, Text, Timestamptz};
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+    use jiff::Timestamp;
+    use jiff_diesel::ToDiesel;
     use serde::Serialize;
     use serde_json::Value;
 
@@ -901,7 +902,7 @@ mod db {
         #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
         completed_at: Option<Timestamp>,
         #[diesel(sql_type = Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         updated_at: Timestamp,
         #[diesel(sql_type = Nullable<Timestamptz>)]
         #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
@@ -2103,7 +2104,7 @@ mod db {
         .bind::<BigInt, _>(last_event_id)
         .bind::<BigInt, _>(rows_reencrypted)
         .bind::<BigInt, _>(unresolved_rows)
-        .bind::<Nullable<Timestamptz>, _>(completed_at)
+        .bind::<Nullable<Timestamptz>, _>(completed_at.to_diesel())
         .bind::<Double, _>(super::COMPLETED_CURSOR_REVALIDATION_SECS)
         .execute(conn)
         .await
@@ -2604,7 +2605,7 @@ mod db {
             };
             match read_key_state(&mut conn, key_id).await {
                 Ok(Some(row)) if row.state == "retiring" => {
-                    let since = row.retiring_since.unwrap_or_else(Utc::now);
+                    let since = row.retiring_since.unwrap_or_else(Timestamp::now);
                     // A `NULL` `elapsed_secs` (retiring_since somehow NULL on a
                     // "retiring" row) fails closed as zero elapsed, never as
                     // "already stale enough".

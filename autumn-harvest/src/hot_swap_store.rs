@@ -64,7 +64,7 @@ pub struct WorkflowModuleRow {
     pub signature: Option<String>,
     /// When the row was written.
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     pub published_at: Timestamp,
 }
 

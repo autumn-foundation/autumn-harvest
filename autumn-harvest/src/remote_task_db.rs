@@ -71,8 +71,8 @@ pub struct PollReport {
 type PageRow = (
     uuid::Uuid,
     uuid::Uuid,
-    jiff::Timestamp,
-    jiff::Timestamp,
+    crate::time::sql::SqlTimestamp,
+    crate::time::sql::SqlTimestamp,
 );
 
 /// One page of the scan.
@@ -126,7 +126,7 @@ async fn pending_page(
     let db_now = rows
         .as_slice()
         .first()
-        .map_or_else(chrono::Utc::now, |row| row.3);
+        .map_or_else(jiff::Timestamp::now, |row| row.3.to_jiff());
     let full = i64::try_from(rows.len()).is_ok_and(|n| n >= limit);
     let last = rows
         .last()
@@ -140,7 +140,7 @@ async fn pending_page(
                 token,
                 execution_id,
                 handle,
-                recorded_at,
+                recorded_at: recorded_at.to_jiff(),
             }),
             Ok(None) => {
                 tracing::warn!(

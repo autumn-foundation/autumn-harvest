@@ -110,6 +110,7 @@
 //! See `docs/audit-export.md` for the full receiver contract.
 
 use jiff::Timestamp;
+#[cfg(feature = "db")]
 use jiff_diesel::ToDiesel;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -482,11 +483,12 @@ pub fn classify_export_outcome(
         backoff.max_interval,
         u32::try_from(failures).unwrap_or(u32::MAX),
     );
-    let next_attempt_at = now
-        + jiff::SignedDuration::try_from(delay).unwrap_or_else(|_| {
-            jiff::SignedDuration::try_from(backoff.max_interval)
-                .unwrap_or_else(|_| jiff::SignedDuration::from_secs(60))
-        });
+    let delay = jiff::SignedDuration::try_from(delay).unwrap_or_else(|_| {
+        jiff::SignedDuration::try_from(backoff.max_interval)
+            .unwrap_or_else(|_| jiff::SignedDuration::from_secs(60))
+    });
+    // A delay past the jiff range saturates and does not panic.
+    let next_attempt_at = now.checked_add(delay).unwrap_or(Timestamp::MAX);
 
     ExportOutcome::Backoff {
         next_attempt_at,
@@ -2193,9 +2195,9 @@ pub async fn decommission_cursor_locked(
     diesel::update(cur::harvest_audit_export_cursor.find(shard_id))
         .set((
             cur::retired_at.eq(Some(now).to_diesel()),
-            cur::updated_at.eq(now),
+            cur::updated_at.eq(now.to_diesel()),
             cur::claim_epoch.eq(cursor.claim_epoch + 1),
-            cur::lease_until.eq(None::<Timestamp>),
+            cur::lease_until.eq(None::<crate::time::sql::SqlTimestamp>),
         ))
         .execute(conn)
         .await
@@ -2281,8 +2283,8 @@ pub async fn reactivate_cursor_locked(
     // that rule, not a live hazard.
     diesel::update(cur::harvest_audit_export_cursor.find(shard_id))
         .set((
-            cur::retired_at.eq(None::<Timestamp>),
-            cur::updated_at.eq(now),
+            cur::retired_at.eq(None::<crate::time::sql::SqlTimestamp>),
+            cur::updated_at.eq(now.to_diesel()),
             cur::claim_epoch.eq(cursor.claim_epoch + 1),
         ))
         .execute(conn)
@@ -2350,8 +2352,8 @@ pub async fn claim_shard_chained(
     use crate::schema::harvest_audit_log::dsl as log;
 
     let batch_size = batch_size.clamp(1, MAX_EXPORT_BATCH_SIZE);
-    let lease_until =
-        now + jiff::SignedDuration::try_from(lease).unwrap_or_else(|_| jiff::SignedDuration::from_secs(60));
+    let lease = jiff::SignedDuration::try_from(lease).unwrap_or_else(|_| jiff::SignedDuration::from_secs(60));
+    let lease_until = now.checked_add(lease).unwrap_or(Timestamp::MAX);
 
     Box::pin(
         conn.transaction::<Option<ClaimedBatch>, crate::error::HarvestError, _>(async |conn| {
@@ -2512,7 +2514,7 @@ pub async fn claim_shard_chained(
                 diesel::update(cur::harvest_audit_export_cursor.find(shard_id))
                     .set((
                         cur::last_assigned_seq.eq(last_assigned_seq),
-                        cur::updated_at.eq(now),
+                        cur::updated_at.eq(now.to_diesel()),
                     ))
                     .execute(conn)
                     .await
@@ -2531,7 +2533,7 @@ pub async fn claim_shard_chained(
                 .set((
                     cur::claim_epoch.eq(claim_epoch),
                     cur::lease_until.eq(Some(lease_until).to_diesel()),
-                    cur::updated_at.eq(now),
+                    cur::updated_at.eq(now.to_diesel()),
                 ))
                 .execute(conn)
                 .await
@@ -2604,13 +2606,13 @@ pub async fn apply_outcome(
             diesel::update(target)
                 .set((
                     cur::last_acked_seq.eq(*through_seq),
-                    cur::lease_until.eq(None::<Timestamp>),
-                    cur::next_attempt_at.eq(now),
+                    cur::lease_until.eq(None::<crate::time::sql::SqlTimestamp>),
+                    cur::next_attempt_at.eq(now.to_diesel()),
                     cur::consecutive_failures.eq(0),
                     cur::last_status.eq(Some(i32::from(*status))),
                     cur::last_error.eq(None::<String>),
                     cur::last_delivered_at.eq(Some(now).to_diesel()),
-                    cur::updated_at.eq(now),
+                    cur::updated_at.eq(now.to_diesel()),
                 ))
                 .execute(conn)
                 .await
@@ -2628,12 +2630,12 @@ pub async fn apply_outcome(
             // failure" invariant, enforced by simply not writing the column.
             diesel::update(target)
                 .set((
-                    cur::lease_until.eq(None::<Timestamp>),
+                    cur::lease_until.eq(None::<crate::time::sql::SqlTimestamp>),
                     cur::next_attempt_at.eq((*next_attempt_at).to_diesel()),
                     cur::consecutive_failures.eq(*consecutive_failures),
                     cur::last_status.eq(last_status.map(i32::from)),
                     cur::last_error.eq(last_error.clone()),
-                    cur::updated_at.eq(now),
+                    cur::updated_at.eq(now.to_diesel()),
                 ))
                 .execute(conn)
                 .await
@@ -2666,8 +2668,8 @@ pub async fn release_claim(
             .filter(cur::claim_epoch.eq(claim_epoch)),
     )
     .set((
-        cur::lease_until.eq(None::<Timestamp>),
-        cur::updated_at.eq(now),
+        cur::lease_until.eq(None::<crate::time::sql::SqlTimestamp>),
+        cur::updated_at.eq(now.to_diesel()),
     ))
     .execute(conn)
     .await
@@ -2811,9 +2813,10 @@ pub async fn export_lag_seconds(
     let unsequenced: Option<Timestamp> = log::harvest_audit_log
         .filter(log::export_seq.is_null())
         .select(diesel::dsl::min(log::occurred_at))
-        .first::<Option<Timestamp>>(conn)
+        .first::<Option<crate::time::sql::SqlTimestamp>>(conn)
         .await
-        .map_err(crate::error::database_error)?;
+        .map_err(crate::error::database_error)?
+        .map(crate::time::sql::SqlTimestamp::to_jiff);
 
     // The oldest `occurred_at` among the lowest `EXPORT_LAG_LOOKBACK_ROWS`
     // pending sequences, not merely the single lowest one. See the module
@@ -2839,7 +2842,7 @@ pub async fn export_lag_seconds(
     };
 
     Ok(oldest.map_or(0.0, |oldest| {
-        let secs = crate::time::num_milliseconds((now - oldest)) as f64 / 1000.0;
+        let secs = crate::time::num_milliseconds(now - oldest) as f64 / 1000.0;
         if secs.is_finite() && secs > 0.0 {
             secs
         } else {
@@ -2889,7 +2892,7 @@ pub async fn pending_and_lag(
     .map_err(crate::error::database_error)?;
 
     let lag = row.oldest.map_or(0.0, |oldest| {
-        let secs = crate::time::num_milliseconds((now - oldest)) as f64 / 1000.0;
+        let secs = crate::time::num_milliseconds(now - oldest) as f64 / 1000.0;
         if secs.is_finite() && secs > 0.0 {
             secs
         } else {
@@ -3114,13 +3117,13 @@ pub async fn rewind_cursor_locked(
                         cur::last_acked_seq.eq(to),
                         // Invalidate any in-flight delivery's acknowledgement.
                         cur::claim_epoch.eq(cursor.claim_epoch + 1),
-                        cur::lease_until.eq(None::<Timestamp>),
+                        cur::lease_until.eq(None::<crate::time::sql::SqlTimestamp>),
                         // Re-export immediately rather than serving out a backoff
                         // that belonged to a since-resolved sink failure.
-                        cur::next_attempt_at.eq(now),
+                        cur::next_attempt_at.eq(now.to_diesel()),
                         cur::consecutive_failures.eq(0),
                         cur::last_error.eq(None::<String>),
-                        cur::updated_at.eq(now),
+                        cur::updated_at.eq(now.to_diesel()),
                     ))
                     .execute(conn)
                     .await
@@ -3260,7 +3263,7 @@ async fn deliver_within_lease(
     batch: &AuditBatch<'_>,
     lease_until: Timestamp,
 ) -> SinkAttempt {
-    let remaining = std::time::Duration::try_from((lease_until - Timestamp::now()))
+    let remaining = std::time::Duration::try_from(lease_until - Timestamp::now())
         .unwrap_or(std::time::Duration::ZERO);
     tokio::time::timeout(remaining, config.sink.deliver(batch))
         .await
@@ -3960,7 +3963,7 @@ async fn export_once_via_pool(
     // then always keeps some genuine delivery time.
     let reserve = (SHARD_ACQUIRE_BOUND + ACK_QUERY_BOUND).min(config.lease / 2);
     let delivery_deadline = claim.lease_until
-        - jiff::SignedDuration::try_from(reserve).unwrap_or_else(|_| jiff::SignedDuration::ZERO);
+        - jiff::SignedDuration::try_from(reserve).unwrap_or(jiff::SignedDuration::ZERO);
 
     // The reserve is split between the reacquire below and the
     // acknowledgement query that follows it (PR #1520). The split keeps their
@@ -4341,7 +4344,7 @@ mod tests {
             seq,
             id: Uuid::from_u128(u128::try_from(seq).unwrap_or(0)),
             shard_id: Some(3),
-            occurred_at: Timestamp::from_second(1_800_000_000).ok().expect("valid ts"),
+            occurred_at: Timestamp::from_second(1_800_000_000).expect("valid ts"),
             actor: "alice".to_string(),
             operation: "workflow.cancel".to_string(),
             target_type: "workflow".to_string(),
@@ -4507,7 +4510,7 @@ mod tests {
     fn export_headers_sign_the_exact_body_with_the_605_scheme() {
         let secret = CallbackSecret::new(b"topsecret".to_vec());
         let body = serialize_batch(&[rec(1), rec(2)]).expect("serializes");
-        let now = Timestamp::from_second(1_800_000_000).ok().expect("valid ts");
+        let now = Timestamp::from_second(1_800_000_000).expect("valid ts");
         let headers = export_headers(&secret, &body, 3, 1, 2, now);
 
         let signature = headers
@@ -4526,7 +4529,7 @@ mod tests {
     #[test]
     fn export_headers_carry_the_shard_and_sequence_range() {
         let secret = CallbackSecret::new(Vec::new());
-        let now = Timestamp::from_second(1_800_000_000).ok().expect("valid ts");
+        let now = Timestamp::from_second(1_800_000_000).expect("valid ts");
         let headers = export_headers(&secret, b"body", 3, 10, 42, now);
         let get = |name: &str| {
             headers
@@ -4628,7 +4631,7 @@ mod tests {
 
     #[test]
     fn backoff_grows_exponentially_before_the_cap() {
-        let now = Timestamp::from_second(1_800_000_000).ok().expect("valid ts");
+        let now = Timestamp::from_second(1_800_000_000).expect("valid ts");
         let backoff = ExportBackoff {
             initial_interval: Duration::from_secs(1),
             backoff_coefficient: 2.0,
@@ -4737,7 +4740,7 @@ mod tests {
 
     #[test]
     fn delivery_state_reports_every_branch() {
-        let now = Timestamp::from_second(1_800_000_000).ok().expect("valid ts");
+        let now = Timestamp::from_second(1_800_000_000).expect("valid ts");
         let future = now + jiff::SignedDuration::from_secs(30);
         let past = now - jiff::SignedDuration::from_secs(30);
 

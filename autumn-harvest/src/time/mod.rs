@@ -122,6 +122,25 @@ pub fn utc_ymd_hms(
         .map(|zoned| zoned.timestamp())
 }
 
+/// Returns the instant `millis` milliseconds after the Unix epoch, clamped
+/// into the jiff range.
+///
+/// Use it to read a stored value. `chrono` could store an instant up to the
+/// year 262142, for example its `MAX_UTC` sentinel. jiff ends in the year
+/// 9999. A stored value past either end reads as [`Timestamp::MIN`] or
+/// [`Timestamp::MAX`], so an old row still loads.
+#[must_use]
+pub fn from_millisecond_clamped(millis: i64) -> Timestamp {
+    Timestamp::from_millisecond(millis).unwrap_or(if millis < 0 { Timestamp::MIN } else { Timestamp::MAX })
+}
+
+/// Returns the instant `micros` microseconds after the Unix epoch, clamped
+/// into the jiff range. See [`from_millisecond_clamped`].
+#[must_use]
+pub fn from_microsecond_clamped(micros: i64) -> Timestamp {
+    Timestamp::from_microsecond(micros).unwrap_or(if micros < 0 { Timestamp::MIN } else { Timestamp::MAX })
+}
+
 /// Returns a calendar date, or `None` for a field out of range.
 ///
 /// This replaces `chrono::NaiveDate::from_ymd_opt`.
@@ -173,6 +192,16 @@ mod tests {
         assert!(zone("utc").is_none());
         assert!(zone("Nope/Zone").is_none());
         assert!(zone("").is_none());
+    }
+
+    #[test]
+    fn clamped_reads_keep_old_chrono_sentinels_loadable() {
+        // chrono's `DateTime::<Utc>::MAX_UTC.timestamp_millis()`.
+        assert_eq!(from_millisecond_clamped(8_210_266_876_799_999), Timestamp::MAX);
+        assert_eq!(from_millisecond_clamped(i64::MIN), Timestamp::MIN);
+        assert_eq!(from_microsecond_clamped(i64::MAX), Timestamp::MAX);
+        assert_eq!(from_millisecond_clamped(1_700_000_000_123), Timestamp::constant(1_700_000_000, 123_000_000));
+        assert_eq!(from_microsecond_clamped(-1), Timestamp::constant(-1, 999_999_000));
     }
 
     #[test]

@@ -14,7 +14,6 @@
 //! abort the batch.
 
 use std::str::FromStr;
-use jiff_diesel::ToDiesel;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -174,13 +173,14 @@ mod db {
     use super::{
         BatchAction, BatchFilter, BatchJobStatus, BatchTargetError, DEFAULT_BATCH_CONCURRENCY,
     };
-    use jiff::Timestamp;
     use diesel::ExpressionMethods;
     use diesel::OptionalExtension;
     use diesel::QueryDsl;
     use diesel::SelectableHelper;
     use diesel_async::AsyncPgConnection;
     use diesel_async::RunQueryDsl;
+    use jiff::Timestamp;
+    use jiff_diesel::ToDiesel;
     use serde::Serialize;
     use serde_json::Value;
     use uuid::Uuid;

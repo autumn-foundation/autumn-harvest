@@ -90,6 +90,7 @@
 //! could collide with the sentinel string.
 
 use jiff::Timestamp;
+#[cfg(feature = "db")]
 use jiff_diesel::ToDiesel;
 #[cfg(feature = "db")]
 use diesel::sql_types::{BigInt, Double, Integer, Nullable, Text, Timestamptz};

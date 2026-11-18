@@ -13,6 +13,7 @@
 //! `docs/operations/build-ramp-guard.md` is the specification.
 
 use std::time::Duration;
+#[cfg(feature = "db")]
 use jiff_diesel::ToDiesel;
 
 /// The default time between two guard passes.
@@ -924,7 +925,7 @@ struct PolicyRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     build_id: String,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     updated_at: jiff::Timestamp,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     target_build_id: Option<String>,

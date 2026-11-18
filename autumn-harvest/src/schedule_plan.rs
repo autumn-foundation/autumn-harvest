@@ -5,8 +5,10 @@
 //! functions, so both compute the same slots. Nothing here needs a database.
 
 use jiff::Timestamp;
+use jiff::tz::TimeZone;
 
 use crate::policy::{Schedule, parse_cron};
+use crate::time::cron::CronZoned;
 
 /// A schedule prepared for repeated slot lookups.
 ///
@@ -18,7 +20,7 @@ pub struct SlotWalker {
 
 enum WalkerKind {
     Cron(croner::Cron),
-    CronInTimezone(croner::Cron, chrono_tz::Tz),
+    CronInTimezone(croner::Cron, TimeZone),
     Interval(jiff::SignedDuration),
     Never,
 }
@@ -31,7 +33,7 @@ impl SlotWalker {
             Schedule::Cron(expr) => parse_cron(expr).ok().map(WalkerKind::Cron),
             Schedule::CronInTimezone { expr, tz } => {
                 // An unknown zone never fires. Validation rejects it earlier.
-                tz.parse::<chrono_tz::Tz>().ok().and_then(|tz| {
+                crate::time::zone(tz).and_then(|tz| {
                     parse_cron(expr)
                         .ok()
                         .map(|cron| WalkerKind::CronInTimezone(cron, tz))
@@ -55,9 +57,12 @@ impl SlotWalker {
     #[must_use]
     pub fn next_after(&self, reference: Timestamp) -> Option<Timestamp> {
         match &self.kind {
-            WalkerKind::Cron(cron) => cron.find_next_occurrence(&reference, false).ok(),
+            WalkerKind::Cron(cron) => cron
+                .find_next_occurrence(&CronZoned::utc(reference), false)
+                .ok()
+                .map(|next| next.timestamp()),
             WalkerKind::CronInTimezone(cron, tz) => {
-                let local_ref = reference.with_timezone(tz);
+                let local_ref = CronZoned::new(reference, tz.clone());
                 let candidate = cron.find_next_occurrence(&local_ref, false).ok()?;
                 // Spring forward: a match in the skipped hour, such as 02:30,
                 // resolves to the first valid second after the gap. That instant
@@ -68,9 +73,9 @@ impl SlotWalker {
                 // Fall back: the strict first search already moves past the first
                 // occurrence of the repeated hour, so the hour fires once.
                 let local_next = cron.find_next_occurrence(&candidate, true).ok()?;
-                Some(local_next)
+                Some(local_next.timestamp())
             }
-            // A sum past the last date that chrono holds also means no next
+            // A sum past the last date that jiff holds also means no next
             // run (issue #2048).
             WalkerKind::Interval(duration) => reference.checked_add(*duration).ok(),
             WalkerKind::Never => None,
@@ -82,7 +87,7 @@ impl SlotWalker {
 ///
 /// Returns `None` for [`Schedule::Manual`] and for a spec that does not
 /// parse. Also returns `None` for an interval that does not advance, or that
-/// passes the last date that `chrono` holds.
+/// passes the last date that jiff holds.
 #[must_use]
 pub fn next_fire_after(schedule: &Schedule, reference: Timestamp) -> Option<Timestamp> {
     SlotWalker::new(schedule).next_after(reference)

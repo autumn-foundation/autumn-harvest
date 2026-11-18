@@ -40,6 +40,7 @@
 //! explicitly allowed.
 
 use jiff::Timestamp;
+#[cfg(feature = "db")]
 use jiff_diesel::ToDiesel;
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
@@ -869,7 +870,7 @@ pub fn build_envelope(
         state: state.as_str().to_string(),
         result,
         error,
-        completed_at: completed_at.unwrap_or_else(Utc::now),
+        completed_at: completed_at.unwrap_or_else(Timestamp::now),
     }
 }
 
@@ -1509,17 +1510,17 @@ pub fn parse_retry_after(value: &str, now: Timestamp) -> Option<std::time::Durat
         return Some(std::time::Duration::from_secs(secs));
     }
     let at = parse_http_date(value, now)?;
-    Some(std::time::Duration::try_from((at - now)).unwrap_or(std::time::Duration::ZERO))
+    Some(std::time::Duration::try_from(at - now).unwrap_or(std::time::Duration::ZERO))
 }
 
 /// Parse an HTTP-date in any of its three forms (RFC 9110 section 5.6.7).
 fn parse_http_date(value: &str, now: Timestamp) -> Option<Timestamp> {
-    if let Ok(at) = DateTime::parse_from_rfc2822(value) {
+    if let Ok(at) = jiff::fmt::rfc2822::DateTimeParser::new().parse_timestamp(value) {
         return Some(at);
     }
     // asctime, for example `Sun Nov  6 08:49:37 1994`. It is always in GMT.
-    if let Ok(naive) = jiff::civil::DateTime::parse_from_str(value, "%a %b %e %H:%M:%S %Y") {
-        return Some(naive.and_utc());
+    if let Ok(naive) = jiff::civil::DateTime::strptime("%a %b %e %H:%M:%S %Y", value) {
+        return crate::time::from_utc_datetime(naive);
     }
     parse_rfc850_date(value, now)
 }
@@ -1529,7 +1530,7 @@ fn parse_http_date(value: &str, now: Timestamp) -> Option<Timestamp> {
 /// The two-digit year gives the latest date that is not more than 50 years
 /// after `now` (RFC 9110 section 5.6.7). The cutoff compares the full
 /// timestamp, not only the year, and the window slides across a century
-/// boundary. Chrono's `%y` uses a fixed pivot instead, so this code sets the
+/// boundary. A `%y` parse uses a fixed pivot instead, so this code sets the
 /// century itself. The weekday must match the date that results.
 fn parse_rfc850_date(value: &str, now: Timestamp) -> Option<Timestamp> {
     let (weekday, rest) = value.split_once(", ")?;
@@ -1540,26 +1541,20 @@ fn parse_rfc850_date(value: &str, now: Timestamp) -> Option<Timestamp> {
     }
     let yy: i32 = two_digit_year.parse().ok()?;
     let at_year = |year: i32| {
-        jiff::civil::DateTime::parse_from_str(
-            &format!("{day_month}-{year} {time}"),
+        jiff::civil::DateTime::strptime(
             "%d-%b-%Y %H:%M:%S GMT",
+            format!("{day_month}-{year} {time}"),
         )
         .ok()
-        .map(|naive| naive.and_utc())
     };
-    let now_year = chrono::Datelike::year(&now);
+    let now = crate::time::utc_datetime(now);
+    let now_year = i32::from(now.year());
     let century = now_year - now_year.rem_euclid(100);
-    let cutoff = now.checked_add_months(chrono::Months::new(50 * 12))?;
+    // A calendar month add clamps the day to the end of a short month.
+    let cutoff = now.checked_add(jiff::Span::new().months(50 * 12)).ok()?;
     // Read the month, day and time in a leap year, so 29 February parses.
     let in_leap_year = at_year(2000)?;
-    let key = |at: Timestamp| {
-        (
-            chrono::Datelike::year(&at),
-            chrono::Datelike::month(&at),
-            chrono::Datelike::day(&at),
-            at.time(),
-        )
-    };
+    let key = |at: jiff::civil::DateTime| (i32::from(at.year()), at.month(), at.day(), at.time());
     let (_, month, day, time) = key(in_leap_year);
     let cutoff_key = key(cutoff);
     // The candidates are 100 years apart, so the latest one at or before
@@ -1570,8 +1565,31 @@ fn parse_rfc850_date(value: &str, now: Timestamp) -> Option<Timestamp> {
         .map(|base| base + yy)
         .find(|year| (*year, month, day, time) <= cutoff_key)?;
     let at = at_year(year)?;
-    let weekday: chrono::Weekday = weekday.parse().ok()?;
-    (chrono::Datelike::weekday(&at) == weekday).then_some(at)
+    if at.weekday() != parse_weekday(weekday)? {
+        return None;
+    }
+    crate::time::from_utc_datetime(at)
+}
+
+/// Parse an English weekday name, short or long, in any letter case.
+///
+/// This accepts the names that the `FromStr` impl of `chrono::Weekday`
+/// accepted, for example `Sun`, `sunday` and `SUNDAY`.
+fn parse_weekday(name: &str) -> Option<jiff::civil::Weekday> {
+    use jiff::civil::Weekday;
+    const NAMES: [(&str, Weekday); 7] = [
+        ("monday", Weekday::Monday),
+        ("tuesday", Weekday::Tuesday),
+        ("wednesday", Weekday::Wednesday),
+        ("thursday", Weekday::Thursday),
+        ("friday", Weekday::Friday),
+        ("saturday", Weekday::Saturday),
+        ("sunday", Weekday::Sunday),
+    ];
+    NAMES.iter().find_map(|&(long, weekday)| {
+        (name.eq_ignore_ascii_case(long) || name.eq_ignore_ascii_case(&long[..3]))
+            .then_some(weekday)
+    })
 }
 
 #[cfg(test)]
@@ -1811,8 +1829,9 @@ pub fn classify_outcome(
     if let Some(retry_after) = outcome.retry_after {
         delay = delay.max(retry_after.min(crate::builder::DEFAULT_RETRY_AFTER_CEILING));
     }
-    let next_attempt_at =
-        now + jiff::SignedDuration::try_from(delay).unwrap_or_else(|_| jiff::SignedDuration::from_secs(0));
+    let delay = jiff::SignedDuration::try_from(delay).unwrap_or(jiff::SignedDuration::ZERO);
+    // A delay past the jiff range saturates and does not panic.
+    let next_attempt_at = now.checked_add(delay).unwrap_or(Timestamp::MAX);
 
     OutcomeAction::Backoff {
         next_attempt_at,
@@ -2653,7 +2672,7 @@ pub async fn enqueue_completion_deliveries(
         };
 
         diesel::insert_into(crate::schema::harvest_completion_deliveries::table)
-            .values(&new_row)
+            .values(new_row)
             .on_conflict((
                 crate::schema::harvest_completion_deliveries::workflow_exec_id,
                 crate::schema::harvest_completion_deliveries::callback_index,
@@ -2748,7 +2767,7 @@ async fn claim_due_deliveries(
         diesel::sql_query(sql)
             .bind::<diesel::sql_types::Timestamptz, _>(now.to_diesel())
             .bind::<diesel::sql_types::BigInt, _>(COMPLETION_DELIVERY_FIRE_BATCH_SIZE)
-            .bind::<diesel::sql_types::Timestamptz, _>(lease_until)
+            .bind::<diesel::sql_types::Timestamptz, _>(lease_until.to_diesel())
             .bind::<diesel::sql_types::Integer, _>(sid)
             .load(conn)
             .await
@@ -2771,7 +2790,7 @@ async fn claim_due_deliveries(
         diesel::sql_query(sql)
             .bind::<diesel::sql_types::Timestamptz, _>(now.to_diesel())
             .bind::<diesel::sql_types::BigInt, _>(COMPLETION_DELIVERY_FIRE_BATCH_SIZE)
-            .bind::<diesel::sql_types::Timestamptz, _>(lease_until)
+            .bind::<diesel::sql_types::Timestamptz, _>(lease_until.to_diesel())
             .load(conn)
             .await
             .map_err(crate::error::database_error)
@@ -2931,7 +2950,7 @@ async fn apply_backoff_outcomes_batch(
 
     let ids: Vec<Uuid> = rows.iter().map(|r| r.0).collect();
     let attempts: Vec<i32> = rows.iter().map(|r| r.1).collect();
-    let next_attempt_ats: Vec<Timestamp> = rows.iter().map(|r| r.2).collect();
+    let next_attempt_ats: Vec<jiff_diesel::Timestamp> = rows.iter().map(|r| r.2.to_diesel()).collect();
     let last_statuses: Vec<Option<i32>> = rows.iter().map(|r| r.3.map(i32::from)).collect();
     let last_errors: Vec<Option<String>> = rows.iter().map(|r| r.4.clone()).collect();
 
@@ -3026,7 +3045,7 @@ async fn apply_outcome(
             )
             .set((
                 dsl::state.eq("PENDING"),
-                dsl::next_attempt_at.eq(next_attempt_at),
+                dsl::next_attempt_at.eq(next_attempt_at.to_diesel()),
                 dsl::last_status.eq(last_status.map(i32::from)),
                 dsl::last_error.eq(last_error),
                 dsl::updated_at.eq(Timestamp::now().to_diesel()),
@@ -3588,7 +3607,7 @@ pub async fn redrive_delivery_at(
             .set((
                 dsl::state.eq("PENDING"),
                 dsl::max_attempts.eq(extended_max_attempts),
-                dsl::next_attempt_at.eq(not_before.unwrap_or_else(Utc::now).to_diesel()),
+                dsl::next_attempt_at.eq(not_before.unwrap_or_else(Timestamp::now).to_diesel()),
                 dsl::last_status.eq(None::<i32>),
                 dsl::last_error.eq(None::<String>),
                 dsl::updated_at.eq(Timestamp::now().to_diesel()),

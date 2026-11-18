@@ -258,7 +258,7 @@ pub enum BlockedOn {
         /// Issue #1193: `cooldown_until` alone is NOT a safe
         /// discriminator. `CircuitBreakerPolicy::new` accepts any
         /// `std::time::Duration` for its cooldown. An organically-tripped
-        /// breaker with a cooldown outside `chrono`'s range also reports
+        /// breaker with a cooldown outside jiff's range also reports
         /// `cooldown_until: None` (see `circuit_cooldown_until` in `api.rs`).
         /// By that field alone, it looks like a forced-open breaker. This
         /// field is the fix. It comes from the registry's own flag, so it is
@@ -500,7 +500,7 @@ impl BlockedOn {
             // Keyed on `forced_open`, NOT on `cooldown_until.is_some()`
             // (PR #1365). `CircuitBreakerPolicy::new` accepts any
             // `std::time::Duration`. An organically-tripped breaker configured
-            // with a cooldown outside `chrono`'s representable range ALSO
+            // with a cooldown outside jiff's representable range ALSO
             // reports `cooldown_until: None`. By that field alone it is
             // indistinguishable from a forced-open one.
             // `forced_open` is sourced straight from the registry's own flag,
@@ -1758,6 +1758,7 @@ fn summarize_activity_cause(blocked: &BlockedOn) -> Option<String> {
             next_attempt_at.map_or_else(
                 || format!("{who} is in retry backoff after attempt {attempt}"),
                 |at| {
+                    let at = crate::time::utc_display(at);
                     format!(
                         "{who} is in retry backoff after attempt {attempt}; next attempt at {at}"
                     )
@@ -1769,6 +1770,7 @@ fn summarize_activity_cause(blocked: &BlockedOn) -> Option<String> {
             next_attempt_at,
         } => {
             let who = activity_phrase(activity_name.as_ref());
+            let next_attempt_at = crate::time::utc_display(*next_attempt_at);
             format!(
                 "{who} was deferred by the dispatcher with no failure recorded \
                      (rate limit, session capacity, or capability miss); \
@@ -1793,7 +1795,7 @@ fn summarize_activity_cause(blocked: &BlockedOn) -> Option<String> {
         // Forced vs organic is decided by `forced_open` -- the registry's own
         // flag -- NOT by whether `cooldown_until` could be computed. An
         // organically-tripped breaker configured with a cooldown outside
-        // `chrono`'s representable range also reports no `cooldown_until`
+        // jiff's representable range also reports no `cooldown_until`
         // (issue #1193). So that field alone cannot tell the two apart. The
         // messages below still land on the right one.
         BlockedOn::ActivityCircuitOpen {
@@ -1818,6 +1820,7 @@ fn summarize_activity_cause(blocked: &BlockedOn) -> Option<String> {
                 )
             },
             |until| {
+                let until = crate::time::utc_display(until);
                 format!(
                     "the circuit breaker for activity '{activity_name}' is open and will \
                          automatically admit a recovery probe at {until} -- no operator action \
@@ -1870,7 +1873,10 @@ pub fn summarize(blocked: &BlockedOn) -> String {
             format!("waiting for signal '{signal_name}' to be sent")
         }
         BlockedOn::SleepingTimer { fires_at } => {
-            format!("sleeping on a durable timer until {fires_at}")
+            format!(
+                "sleeping on a durable timer until {}",
+                crate::time::utc_display(*fires_at)
+            )
         }
         BlockedOn::PendingChild {
             child_exec_id,
@@ -1880,8 +1886,9 @@ pub fn summarize(blocked: &BlockedOn) -> String {
             fires_at,
             overdue_by_seconds,
         } => format!(
-            "a durable timer was due at {fires_at} ({overdue_by_seconds}s ago) but nothing fired \
-             it — the owning workflow task was never claimed"
+            "a durable timer was due at {} ({overdue_by_seconds}s ago) but nothing fired \
+             it — the owning workflow task was never claimed",
+            crate::time::utc_display(*fires_at)
         ),
         BlockedOn::AwaitingExternalHandoff {
             token,
@@ -1916,9 +1923,10 @@ pub fn summarize(blocked: &BlockedOn) -> String {
             reason,
             block_count,
         } => format!(
-            "replay detected non-determinism, so the engine blocked this run at {since} \
+            "replay detected non-determinism, so the engine blocked this run at {} \
              (block #{block_count}) rather than failing it; it stays blocked until the \
              divergent build is rolled back{}",
+            crate::time::utc_display(*since),
             reason
                 .as_ref()
                 .map_or_else(String::new, |r| format!(" -- recorded divergence: {r}"))
@@ -2676,7 +2684,7 @@ mod tests {
     }
 
     /// AC (issue #1193): take an ORGANIC trip whose cooldown could not be
-    /// represented, e.g. a policy cooldown outside `chrono`'s range. By
+    /// represented, e.g. a policy cooldown outside jiff's range. By
     /// `cooldown_until` alone it looks identical to a forced-open breaker. Both
     /// are `None`. `circuit_forced_open: false` is what keeps it
     /// `degraded` instead of being misreported as `stalled`.

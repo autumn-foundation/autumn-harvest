@@ -625,7 +625,7 @@ impl WorkflowSimulator {
                             WorkflowEvent::WorkflowStarted { timestamp, .. } => Some(*timestamp),
                             _ => None,
                         })
-                        .unwrap_or_else(chrono::Utc::now);
+                        .unwrap_or_else(jiff::Timestamp::now);
                     history.push(WorkflowEvent::MutexGranted {
                         key,
                         lock_seq,

@@ -55,7 +55,6 @@
 //! introduces **zero** new `WorkflowEvent` variants.
 
 use sha2::{Digest, Sha256};
-use jiff_diesel::ToDiesel;
 
 use crate::error::{HarvestError, HarvestResult};
 use crate::replay::HistoryMatcher;
@@ -714,11 +713,12 @@ pub use db::{
 
 #[cfg(feature = "db")]
 mod db {
-    use jiff::Timestamp;
     use diesel::sql_types::{
         BigInt, Bool, Integer, Jsonb, Nullable, Text, Timestamptz, Uuid as SqlUuid,
     };
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+    use jiff::Timestamp;
+    use jiff_diesel::ToDiesel;
     use serde::Serialize;
     use serde_json::Value;
     use uuid::Uuid;
@@ -1140,10 +1140,10 @@ mod db {
         #[diesel(sql_type = Nullable<Text>)]
         last_error: Option<String>,
         #[diesel(sql_type = Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         created_at: Timestamp,
         #[diesel(sql_type = Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         updated_at: Timestamp,
     }
 
@@ -2450,7 +2450,7 @@ mod db {
         #[diesel(sql_type = SqlUuid)]
         id: Uuid,
         #[diesel(sql_type = Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         migrated_at: Timestamp,
     }
 
@@ -2760,7 +2760,7 @@ mod db {
         .bind::<Text, _>(&fingerprint)
         .bind::<BigInt, _>(verified_count)
         .bind::<Integer, _>(verified_max)
-        .bind::<Nullable<Timestamptz>, _>(legal_hold_set_at)
+        .bind::<Nullable<Timestamptz>, _>(legal_hold_set_at.to_diesel())
         .execute(source)
         .await
         .map_err(database_error)?;
@@ -3505,7 +3505,7 @@ mod db {
         #[diesel(sql_type = Text)]
         workflow_id: String,
         #[diesel(sql_type = Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         created_at: Timestamp,
     }
 

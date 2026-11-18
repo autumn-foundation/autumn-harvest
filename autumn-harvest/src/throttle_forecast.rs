@@ -292,7 +292,7 @@ pub fn forecast_schedules(
     let arrivals: Vec<Arrival> = slots
         .into_iter()
         .map(|(slot, count)| Arrival {
-            at: std::time::Duration::try_from((slot - from)).unwrap_or_default(),
+            at: std::time::Duration::try_from(slot - from).unwrap_or_default(),
             count,
         })
         .collect();

@@ -58,6 +58,7 @@
 
 #[cfg(feature = "db")]
 use crate::error::HarvestError;
+#[cfg(feature = "db")]
 use jiff_diesel::ToDiesel;
 use crate::error::HarvestResult;
 #[cfg(feature = "db")]
@@ -1139,7 +1140,7 @@ struct CountRow {
 #[derive(diesel::QueryableByName)]
 struct ClockRow {
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     now: Timestamp,
 }
 
@@ -1151,7 +1152,7 @@ struct PauseRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     paused_by: String,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     paused_at: Timestamp,
 }
 
@@ -1168,7 +1169,7 @@ struct UpsertedPauseRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     paused_by: String,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     paused_at: Timestamp,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
     scope_shard_id: Option<i32>,
@@ -1583,7 +1584,7 @@ pub async fn list_paused_queues(conn: &mut AsyncPgConnection) -> HarvestResult<V
         #[diesel(sql_type = diesel::sql_types::Text)]
         paused_by: String,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         paused_at: Timestamp,
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
         scope_shard_id: Option<i32>,

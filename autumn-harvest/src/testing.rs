@@ -2199,10 +2199,10 @@ async fn query_running_executions(
         .load::<(
             uuid::Uuid,
             String,
-            jiff::Timestamp,
+            crate::time::sql::SqlTimestamp,
             Option<serde_json::Value>,
-            Option<jiff::SignedDuration>,
-            Option<jiff::Timestamp>,
+            Option<crate::time::sql::PgDuration>,
+            Option<crate::time::sql::SqlTimestamp>,
             Option<uuid::Uuid>,
             String,
             String,
@@ -2212,7 +2212,38 @@ async fn query_running_executions(
         .await
         .map_err(crate::error::database_error)?;
 
-    Ok(rows)
+    Ok(rows
+        .into_iter()
+        .map(
+            |(
+                exec_id,
+                name,
+                created,
+                headers,
+                timeout,
+                deadline,
+                parent,
+                business_id,
+                queue,
+                source,
+                continued_from,
+            )| {
+                (
+                    exec_id,
+                    name,
+                    created.to_jiff(),
+                    headers,
+                    timeout.map(|duration| duration.0),
+                    deadline.map(crate::time::sql::SqlTimestamp::to_jiff),
+                    parent,
+                    business_id,
+                    queue,
+                    source,
+                    continued_from,
+                )
+            },
+        )
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -2370,8 +2401,8 @@ async fn load_workflow_name_and_headers(
     ): (
         String,
         Option<serde_json::Value>,
-        Option<jiff::SignedDuration>,
-        Option<jiff::Timestamp>,
+        Option<crate::time::sql::PgDuration>,
+        Option<crate::time::sql::SqlTimestamp>,
         Option<uuid::Uuid>,
         String,
         String,
@@ -2406,8 +2437,8 @@ async fn load_workflow_name_and_headers(
     Ok(DbReplayMeta {
         workflow_name: name,
         headers,
-        execution_timeout,
-        deadline_at,
+        execution_timeout: execution_timeout.map(|duration| duration.0),
+        deadline_at: deadline_at.map(crate::time::sql::SqlTimestamp::to_jiff),
         // Issue #698: map the nullable `parent_id` into an `ExecutionId`.
         parent_execution_id: parent_uuid.map(ExecutionId::from_uuid),
         // Issue #698: the row's business `workflow_id`.

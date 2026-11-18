@@ -66,6 +66,7 @@
 //! a compromised Harvest process.
 
 use jiff::Timestamp;
+#[cfg(feature = "db")]
 use jiff_diesel::ToDiesel;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
@@ -1026,7 +1027,7 @@ pub(crate) async fn stamp_chain(
         let hash = link(key, &prev, newest, &record);
         ids.push(id);
         prevs.push(prev.to_vec());
-        newests.push(newest);
+        newests.push(newest.map(crate::time::sql::SqlTimestamp::from));
         hashes.push(hash.to_vec());
         prev = hash;
         let newest_at = newest_through(newest, record.occurred_at);
@@ -1256,7 +1257,7 @@ mod tests {
     }
 
     fn at(seconds: i64) -> Timestamp {
-        DateTime::from_timestamp(seconds, 123_456_000).unwrap_or_default()
+        Timestamp::new(seconds, 123_456_000).unwrap_or_default()
     }
 
     fn rec(seq: i64) -> AuditExportRecord {

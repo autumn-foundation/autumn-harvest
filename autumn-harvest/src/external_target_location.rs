@@ -1312,7 +1312,7 @@ mod tests {
         ResolvedRun {
             exec_id: ExecutionId::new_for_shard(ShardId::new(shard)),
             state: state.to_string(),
-            started_at: jiff::Timestamp::from_second(1_800_000_000 + secs).ok()
+            started_at: jiff::Timestamp::from_second(1_800_000_000 + secs)
                 .expect("valid timestamp"),
         }
     }
@@ -1557,7 +1557,7 @@ mod tests {
         let unencoded = ResolvedRun {
             exec_id: ExecutionId::new(),
             state: "RUNNING".to_string(),
-            started_at: jiff::Timestamp::from_second(1_800_000_000).ok().expect("valid"),
+            started_at: jiff::Timestamp::from_second(1_800_000_000).expect("valid"),
         };
         assert_eq!(
             merge_locations(vec![(ShardId::new(3), unencoded)], Vec::new(), false).found_shard(),

@@ -1101,7 +1101,7 @@ mod tests {
         use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken, ExternalAwaitId};
         let msg = || MSG_SECRET.to_string();
         let payload = || Some(json!({"ssn": PAYLOAD_SECRET}));
-        let now = chrono::Utc::now;
+        let now = jiff::Timestamp::now;
         vec![
             (
                 "WorkflowStarted",

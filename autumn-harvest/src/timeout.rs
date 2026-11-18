@@ -11,19 +11,19 @@
 //!   `schedule_to_start` interval has elapsed.
 
 use crate::schema::harvest_workflow_executions_ext;
-use jiff_diesel::ToDiesel;
 use crate::table_split::SetExt;
 use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::cached_stmt::CachePreparedDsl as _;
-use jiff::{SignedDuration, Timestamp};
 use diesel::{
     BoolExpressionMethods, ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper,
 };
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::{AsyncConnection, AsyncPgConnection};
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{HarvestError, HarvestResult, TimeoutType};
@@ -970,7 +970,7 @@ fn refill_groups(lanes: &[TimeoutScanLane; 4]) -> Vec<Vec<usize>> {
 #[derive(diesel::QueryableByName)]
 struct SweepStart {
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     as_of: jiff::Timestamp,
 }
 
@@ -1023,8 +1023,10 @@ async fn refill_lanes(
         })
         .collect();
     let earlier = || claims[..first].iter().chain(&between);
-    let clocks: Vec<_> = earlier().map(|c| c.clock.unwrap_or(as_of)).collect();
-    let keys: Vec<_> = earlier().map(|c| c.read_to.map(|r| r.0)).collect();
+    let clocks: Vec<_> = earlier()
+        .map(|c| c.clock.unwrap_or(as_of).to_diesel())
+        .collect();
+    let keys: Vec<_> = earlier().map(|c| c.read_to.map(|r| r.0.to_diesel())).collect();
     let ids: Vec<_> = earlier().map(|c| c.read_to.map(|r| r.1)).collect();
     let (held, owners): (Vec<uuid::Uuid>, Vec<i32>) = (0_i32..)
         .zip(earlier())
@@ -1875,14 +1877,14 @@ async fn update_workflow_execution_timed_out(
         dsl::output.eq(None::<serde_json::Value>),
         dsl::error.eq(Some(error.to_string())),
         dsl::completed_at.eq(Some(Timestamp::now()).to_diesel()),
-        dsl::paused_at.eq(None::<jiff::Timestamp>),
+        dsl::paused_at.eq(None::<crate::time::sql::SqlTimestamp>),
         dsl::pause_reason.eq(None::<String>),
         dsl::pause_actor.eq(None::<String>),
         // Belt-and-braces ND-block reset (issue #603). A TIMED_OUT
         // execution closes out permanently, so a stale block marker must
         // not survive on a terminal row. The two terminal writers in
         // worker.rs do the same.
-        dsl::nd_blocked_at.eq(None::<jiff::Timestamp>),
+        dsl::nd_blocked_at.eq(None::<crate::time::sql::SqlTimestamp>),
         SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(None::<String>)),
         dsl::nd_block_count.eq(0),
     ))
@@ -2475,7 +2477,7 @@ async fn enforce_activity_timeout(
         let (error_type, non_retryable, _) = crate::failure::parse_error_payload(&error);
         let duration_secs = enforced.handler_elapsed_secs.map_or_else(
             || {
-                std::time::Duration::try_from((Timestamp::now() - started_at))
+                std::time::Duration::try_from(Timestamp::now() - started_at)
                     .unwrap_or_default()
                     .as_secs_f64()
             },
@@ -3281,7 +3283,7 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
                 // The locked re-read below replaces trust in the scan
                 // snapshot. Older code re-verified the snapshot with filters
                 // on the claiming UPDATE.
-                let locked_row: Option<(String, jiff::Timestamp)> =
+                let locked_row: Option<(String, crate::time::sql::SqlTimestamp)> =
                     harvest_external_tasks::table
                         .find(task_id)
                         .for_update()
@@ -3293,7 +3295,9 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
                         .await
                         .optional()
                         .map_err(crate::error::database_error)?;
-                let Some((task_state, deadline)) = locked_row else {
+                let Some((task_state, deadline)) =
+                    locked_row.map(|(task_state, deadline)| (task_state, deadline.to_jiff()))
+                else {
                     // Row vanished after the scan (e.g. retention
                     // cascade-deleted the owning execution): skip.
                     return Ok(false);
@@ -4373,7 +4377,7 @@ impl OldestPendingIndeterminateAge {
 pub async fn enforce_external_signals_outbox(
     conn: &mut AsyncPgConnection,
     metrics: &(dyn MetricsRecorder + Send + Sync),
-    unknown_target_grace_window: SignedDuration,
+    unknown_target_grace_window: Duration,
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
 
@@ -4462,9 +4466,9 @@ pub async fn enforce_external_signals_outbox(
                 let (signal_id, target, signal_name, payload, idempotency_key) = event;
 
                 let age = Timestamp::now() - row.timestamp;
-                let grace_chrono = jiff::SignedDuration::try_from(unknown_target_grace_window)
+                let grace = jiff::SignedDuration::try_from(unknown_target_grace_window)
                     .unwrap_or(jiff::SignedDuration::MAX);
-                let grace_expired = age > grace_chrono;
+                let grace_expired = age > grace;
 
                 // A NotFound delivery attempt only becomes a permanent
                 // `target_unknown` failure once the grace window has elapsed.
@@ -4874,7 +4878,7 @@ type CancelStepOutcome = (
 pub async fn enforce_external_cancels_outbox(
     conn: &mut AsyncPgConnection,
     metrics: &(dyn MetricsRecorder + Send + Sync),
-    unknown_target_grace_window: SignedDuration,
+    unknown_target_grace_window: Duration,
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
 
@@ -4983,9 +4987,9 @@ pub async fn enforce_external_cancels_outbox(
                 };
 
                 let age = Timestamp::now() - row.timestamp;
-                let grace_chrono = jiff::SignedDuration::try_from(unknown_target_grace_window)
+                let grace = jiff::SignedDuration::try_from(unknown_target_grace_window)
                     .unwrap_or(jiff::SignedDuration::MAX);
-                let grace_expired = age > grace_chrono;
+                let grace_expired = age > grace;
 
                 // A NotFound delivery attempt only becomes a permanent
                 // `target_unknown` failure once the grace window has elapsed.
@@ -5558,7 +5562,7 @@ pub async fn enforce_external_cancels_outbox(
 #[allow(clippy::too_many_lines)]
 pub async fn enforce_external_awaits_outbox(
     conn: &mut AsyncPgConnection,
-    unknown_target_grace_window: SignedDuration,
+    unknown_target_grace_window: Duration,
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
 
@@ -5635,9 +5639,9 @@ pub async fn enforce_external_awaits_outbox(
                 };
 
                 let age = Timestamp::now() - row.timestamp;
-                let grace_chrono = jiff::SignedDuration::try_from(unknown_target_grace_window)
+                let grace = jiff::SignedDuration::try_from(unknown_target_grace_window)
                     .unwrap_or(jiff::SignedDuration::MAX);
-                let grace_expired = age > grace_chrono;
+                let grace_expired = age > grace;
 
                 let active_sharded_pool = sharded_pool
                     .clone()
@@ -5866,7 +5870,7 @@ pub async fn enforce_external_awaits_outbox(
 pub async fn enforce_timeouts_once(
     conn: &mut AsyncPgConnection,
     metrics: &(dyn MetricsRecorder + Send + Sync),
-    unknown_target_grace_window: SignedDuration,
+    unknown_target_grace_window: Duration,
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
     circuit_breakers: Option<&crate::circuit_breaker::CircuitBreakerRegistry>,
@@ -5915,7 +5919,7 @@ pub(crate) async fn enforce_timeouts_once_on_conn_shard(
     metric_shards: &[u16],
     task_scan: TaskScan<'_>,
     metrics: &(dyn MetricsRecorder + Send + Sync),
-    unknown_target_grace_window: SignedDuration,
+    unknown_target_grace_window: Duration,
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
     circuit_breakers: Option<&crate::circuit_breaker::CircuitBreakerRegistry>,
@@ -5978,7 +5982,7 @@ async fn enforce_timeouts_pass(
     conn_shard: Option<crate::types::ShardId>,
     task_scan: TaskScan<'_>,
     metrics: &(dyn MetricsRecorder + Send + Sync),
-    unknown_target_grace_window: SignedDuration,
+    unknown_target_grace_window: Duration,
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
     circuit_breakers: Option<&crate::circuit_breaker::CircuitBreakerRegistry>,
@@ -6275,9 +6279,9 @@ async fn enforce_timeouts_pass(
 pub fn spawn_timeout_checker(
     pool: Pool<AsyncPgConnection>,
     cancel: CancellationToken,
-    interval: SignedDuration,
+    interval: Duration,
     telemetry: std::sync::Arc<crate::telemetry::TelemetryConfig>,
-    unknown_target_grace_window: SignedDuration,
+    unknown_target_grace_window: Duration,
     sharded_pool: Option<crate::shard::ShardedDbPool>,
     shard_assignments: Vec<crate::types::ShardId>,
     circuit_breakers: std::sync::Arc<crate::circuit_breaker::CircuitBreakerRegistry>,
@@ -6324,9 +6328,9 @@ pub fn spawn_timeout_checker(
 pub fn spawn_timeout_checker_for_shard(
     pool: Pool<AsyncPgConnection>,
     cancel: CancellationToken,
-    interval: SignedDuration,
+    interval: Duration,
     telemetry: std::sync::Arc<crate::telemetry::TelemetryConfig>,
-    unknown_target_grace_window: SignedDuration,
+    unknown_target_grace_window: Duration,
     sharded_pool: Option<crate::shard::ShardedDbPool>,
     shard_assignments: Vec<crate::types::ShardId>,
     circuit_breakers: std::sync::Arc<crate::circuit_breaker::CircuitBreakerRegistry>,
@@ -6375,9 +6379,9 @@ pub fn spawn_timeout_checker_for_shard(
 pub fn spawn_coordinated_timeout_checker_for_shard(
     pool: Pool<AsyncPgConnection>,
     cancel: CancellationToken,
-    interval: SignedDuration,
+    interval: Duration,
     telemetry: std::sync::Arc<crate::telemetry::TelemetryConfig>,
-    unknown_target_grace_window: SignedDuration,
+    unknown_target_grace_window: Duration,
     sharded_pool: Option<crate::shard::ShardedDbPool>,
     shard_assignments: Vec<crate::types::ShardId>,
     circuit_breakers: std::sync::Arc<crate::circuit_breaker::CircuitBreakerRegistry>,
@@ -6424,7 +6428,7 @@ fn skip_tick(ran_last_tick: &mut bool, leader_failures: &mut crate::scanner_leas
 /// A zero interval would busy-spin and time out every checkout, so every
 /// checker gets the floor. Only a leased checker gets the cap, because the
 /// cap keeps three of its sleeps within the lease TTL.
-fn checker_interval(interval: SignedDuration, leased: bool) -> SignedDuration {
+fn checker_interval(interval: Duration, leased: bool) -> Duration {
     if leased {
         crate::scanner_lease::scanner_interval(interval)
     } else {
@@ -6449,9 +6453,9 @@ fn checker_interval(interval: SignedDuration, leased: bool) -> SignedDuration {
 pub(crate) fn spawn_timeout_checker_on_shard_pool(
     pool: Pool<AsyncPgConnection>,
     cancel: CancellationToken,
-    interval: SignedDuration,
+    interval: Duration,
     telemetry: std::sync::Arc<crate::telemetry::TelemetryConfig>,
-    unknown_target_grace_window: SignedDuration,
+    unknown_target_grace_window: Duration,
     sharded_pool: Option<crate::shard::ShardedDbPool>,
     shard_assignments: Vec<crate::types::ShardId>,
     circuit_breakers: std::sync::Arc<crate::circuit_breaker::CircuitBreakerRegistry>,
@@ -7116,7 +7120,7 @@ mod tests {
         };
         use crate::policy::CircuitBreakerPolicy;
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::time::{SignedDuration, Instant};
+        use std::time::{Duration, Instant};
 
         #[derive(Default)]
         struct Trips(AtomicUsize);
@@ -7170,7 +7174,7 @@ mod tests {
             AttemptOutcome, CircuitBreakerRegistry, ClaimKey, DispatchDecision,
         };
         use crate::policy::CircuitBreakerPolicy;
-        use std::time::{SignedDuration, Instant};
+        use std::time::{Duration, Instant};
 
         let mut policies = std::collections::HashMap::new();
         policies.insert(
@@ -7827,7 +7831,7 @@ mod tests {
         assert_eq!(checker_interval(day, false), day);
         for leased in [true, false] {
             assert_eq!(
-                checker_interval(SignedDuration::ZERO, leased),
+                checker_interval(Duration::ZERO, leased),
                 MIN_SCANNER_INTERVAL
             );
         }
@@ -8778,14 +8782,14 @@ mod tests {
         // `effective_chain_timeout(None, ceiling)` returns it verbatim.
         let effective = effective_chain_timeout(None, Some(SignedDuration::MAX));
         assert_eq!(effective, Some(SignedDuration::MAX));
-        // The start path adds it to the start instant with `checked_add_signed`.
+        // The start path adds it to the start instant with `checked_add`.
         // An overflow then yields `None` (no chain cap), not a panic. The
         // fresh-start / reset / child sites do exactly that.
         let start = Timestamp::now();
         let chain_deadline_at = effective.and_then(|d| start.checked_add(d).ok());
         assert_eq!(
             chain_deadline_at, None,
-            "Duration::MAX must overflow to None, never panic"
+            "SignedDuration::MAX must overflow to None, never panic"
         );
         // A sane duration must still produce a deadline.
         let sane = effective_chain_timeout(None, Some(SignedDuration::from_hours(1)));

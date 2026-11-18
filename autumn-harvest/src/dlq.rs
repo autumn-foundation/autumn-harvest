@@ -1982,8 +1982,8 @@ impl TimeBucketGranularity {
     #[must_use]
     pub fn format(self, ts: Timestamp) -> String {
         match self {
-            Self::Hour => ts.format("%Y-%m-%dT%H:00:00Z").to_string(),
-            Self::Day => ts.format("%Y-%m-%d").to_string(),
+            Self::Hour => ts.strftime("%Y-%m-%dT%H:00:00Z").to_string(),
+            Self::Day => ts.strftime("%Y-%m-%d").to_string(),
         }
     }
 }
@@ -2158,9 +2158,10 @@ pub fn parse_instant(
         return Ok(parsed);
     }
     if let Some(dur) = crate::task_duration(trimmed)
-        && let Ok(chrono_dur) = jiff::SignedDuration::try_from(dur)
+        && let Ok(dur) = jiff::SignedDuration::try_from(dur)
+        && let Ok(at) = now.checked_sub(dur)
     {
-        return Ok(now - chrono_dur);
+        return Ok(at);
     }
     Err(format!(
         "invalid {field} '{value}'; expected an RFC 3339 timestamp or a relative \
@@ -2525,9 +2526,22 @@ pub async fn aggregate_dead_letters(
             dsl::failed_at,
             dsl::error,
         ))
-        .load(conn)
+        .load::<(
+            Uuid,
+            Option<Uuid>,
+            Option<String>,
+            String,
+            String,
+            crate::time::sql::SqlTimestamp,
+            String,
+        )>(conn)
         .await
-        .map_err(crate::error::database_error)?;
+        .map_err(crate::error::database_error)?
+        .into_iter()
+        .map(|(id, exec_id, activity, queue, task_type, failed_at, error)| {
+            (id, exec_id, activity, queue, task_type, failed_at.to_jiff(), error)
+        })
+        .collect();
 
     let filtered_total = i64::try_from(rows.len()).unwrap_or(i64::MAX);
 

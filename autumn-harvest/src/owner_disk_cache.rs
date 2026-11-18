@@ -1971,7 +1971,7 @@ mod tests {
         if step == 0 {
             WorkflowEvent::WorkflowStarted {
                 input: json!({"secret": MARKER}),
-                timestamp: jiff::Timestamp::from_second(1_790_000_000).ok().unwrap_or_default(),
+                timestamp: jiff::Timestamp::from_second(1_790_000_000).unwrap_or_default(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,

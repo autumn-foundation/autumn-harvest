@@ -3,9 +3,9 @@
 //! `croner` implements its `CronDateTime` trait for `chrono` and for jiff
 //! 0.2, but not for jiff 1.0. [`CronZoned`] implements the trait here. It
 //! follows the jiff 0.2 implementation of `croner` line for line. That one
-//! resolves a wall clock time the same way as the `chrono` one: a repeated
-//! hour gives both instants and a skipped hour gives none. So a schedule
-//! fires at the same instants as it did under `chrono`. A sweep of two
+//! resolves a wall clock time the same way as the `chrono` one. A repeated
+//! hour gives both instants. A skipped hour gives none. So a schedule fires
+//! at the same instants as it did under `chrono`. A sweep of two
 //! years, eight zones and twelve patterns found no difference in two
 //! million comparisons.
 

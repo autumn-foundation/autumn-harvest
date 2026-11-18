@@ -1,13 +1,13 @@
 //! Workflow reset and fork recovery primitives.
 
 use std::collections::BTreeMap;
-use jiff_diesel::ToDiesel;
 use std::fmt;
 
-use jiff::Timestamp;
 use diesel::prelude::*;
 use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -1474,7 +1474,7 @@ async fn terminate_source_execution(
             harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             // Clear the now-stale pause metadata when sealing a PAUSED source so
             // the sealed row carries no residual pause state (issue #383).
-            harvest_workflow_executions::paused_at.eq(None::<jiff::Timestamp>),
+            harvest_workflow_executions::paused_at.eq(None::<crate::time::sql::SqlTimestamp>),
             harvest_workflow_executions::pause_reason.eq(None::<String>),
             harvest_workflow_executions::pause_actor.eq(None::<String>),
         ))
@@ -1565,17 +1565,23 @@ pub(crate) async fn insert_fork_row(
 ) -> Result<WorkflowExecution, diesel::result::Error> {
     // Re-compute deadline_at from the source execution's timeout so the fork
     // gets a fresh deadline anchored to its own start time (issue #243).
-    let deadline_at = source.execution_timeout.map(|d| jiff::Timestamp::now() + d);
+    // jiff stops at year 9999, far below the `chrono` limit. A stored timeout
+    // past that year yields no deadline rather than a panic.
+    let deadline_at = source
+        .execution_timeout
+        .and_then(|d| jiff::Timestamp::now().checked_add(d).ok());
     // Re-anchor the soft SLA deadline per-fork (issue #487).
-    let sla_deadline_at = source.sla.map(|d| jiff::Timestamp::now() + d);
+    let sla_deadline_at = source
+        .sla
+        .and_then(|d| jiff::Timestamp::now().checked_add(d).ok());
     // Reset deliberately starts a NEW chain origin (issue #617), like
     // `first_exec_id: None` / `schedule_id: None` below. An operator reset breaks
     // the continue-as-new lineage, as in the #488 lineage-break precedent. So the
     // chain deadline is RE-ANCHORED to the start of the fork, not carried
     // verbatim. A source with no chain cap yields `None` for both.
-    // `checked_add_signed` (not `+`): an absurd operator ceiling can make the
+    // `checked_add` (not `+`): an absurd operator ceiling can make the
     // `chain_execution_timeout` of the source reach `jiff::SignedDuration::MAX`.
-    // `DateTime + Duration` panics on overflow; yield `None` instead (issue #617).
+    // `Timestamp + SignedDuration` panics on overflow; yield `None` instead (issue #617).
     let chain_deadline_at = source
         .chain_execution_timeout
         .and_then(|d| jiff::Timestamp::now().checked_add(d).ok());
@@ -1873,7 +1879,7 @@ struct SignalForReset {
     signal_name: String,
     payload: Value,
     idempotency_key: Option<String>,
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     received_at: jiff::Timestamp,
 }
 
@@ -1891,7 +1897,7 @@ struct NewSignalForReset {
     signal_name: String,
     payload: Value,
     idempotency_key: Option<String>,
-    #[diesel(serialize_as = jiff_diesel::Timestamp)]
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp)]
     received_at: jiff::Timestamp,
 }
 
@@ -1931,7 +1937,7 @@ async fn reapply_or_drop_signals(
             })
             .collect::<Vec<_>>();
         diesel::insert_into(harvest_signals::table)
-            .values(&new_rows)
+            .values(new_rows)
             .execute(conn)
             .await
             .map_err(database_error)?;

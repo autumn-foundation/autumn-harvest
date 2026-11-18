@@ -68,7 +68,7 @@ struct WeightRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     updated_by: String,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     updated_at: Timestamp,
 }
 
@@ -222,7 +222,7 @@ pub async fn list_fairness_state(
         #[diesel(sql_type = diesel::sql_types::Double)]
         lag: f64,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
         updated_at: Timestamp,
     }
     let rows: Vec<Row> = diesel::sql_query(

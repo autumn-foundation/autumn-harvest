@@ -214,7 +214,7 @@ pub(crate) async fn dispatch_pending_updates(
 /// A task with no budget gets a fixed [`UNBUDGETED_WINDOW`].
 fn window_end(cutoff: Option<Timestamp>) -> tokio::time::Instant {
     let window = cutoff.map_or(UNBUDGETED_WINDOW, |cutoff| {
-        std::time::Duration::try_from((cutoff - Timestamp::now())).unwrap_or(Duration::ZERO) / 2
+        Duration::try_from(cutoff - Timestamp::now()).unwrap_or(Duration::ZERO) / 2
     });
     tokio::time::Instant::now() + window
 }
@@ -226,7 +226,7 @@ fn window_end(cutoff: Option<Timestamp>) -> tokio::time::Instant {
 /// past its cut-off, and the persist keeps the other half.
 fn handler_limit(cutoff: Option<Timestamp>) -> Duration {
     cutoff.map_or(UPDATE_HANDLER_TIMEOUT, |cutoff| {
-        let left = std::time::Duration::try_from((cutoff - Timestamp::now())).unwrap_or(Duration::ZERO);
+        let left = Duration::try_from(cutoff - Timestamp::now()).unwrap_or(Duration::ZERO);
         UPDATE_HANDLER_TIMEOUT.min(left / 2)
     })
 }

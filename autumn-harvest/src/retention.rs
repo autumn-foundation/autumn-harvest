@@ -2,6 +2,7 @@
 
 #[cfg(feature = "db")]
 use crate::schema::harvest_workflow_executions_ext;
+#[cfg(feature = "db")]
 use jiff_diesel::ToDiesel;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -2253,7 +2254,7 @@ impl RetentionRuntime {
                     // no retention age is configured, the common case. As a
                     // fail-safe, it also means the loosest age is unrepresentable
                     // as a `jiff::SignedDuration`. That is unreachable for validated
-                    // ages: MAX_MAX_AGE ≪ the ~292M-year range of chrono. In the
+                    // ages: MAX_MAX_AGE ≪ the range of a jiff timestamp. In the
                     // fail-safe case the workflow-history phase is skipped this
                     // tick and everything is retained. A zero cutoff would make
                     // `loose_cutoff == now` and over-select nearly every completed
@@ -2712,7 +2713,7 @@ struct CandidateExecution {
     /// Non-null: the scan filters `completed_at IS NOT NULL`. A NULL fails the
     /// load with an error, not a panic (issue #1821).
     #[diesel(sql_type = Timestamptz)]
-    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
     completed_at: Timestamp,
     /// Legal-hold columns (issue #747), read only for the per-candidate skip
     /// gate. The SELECT's WHERE clause is intentionally NOT changed — the gate
@@ -2984,13 +2985,16 @@ async fn run_shard_tick(
     let mut override_cuts: Vec<Timestamp> = Vec::new();
     for (name, secs) in config.workflow_overrides() {
         // Fail safe: omit an unrepresentable override age. That is unreachable
-        // for validated ages: MAX_MAX_AGE ≪ the ~292M-year range of chrono. Its
+        // for validated ages: MAX_MAX_AGE ≪ the range of a jiff timestamp. Its
         // rows are then never selected under a too-aggressive cutoff. With a global
         // `max_age` set they then fall back to it; without one they fall back to
         // `'-infinity'` (never selected). Retaining is the correct failure mode.
-        if let Ok(delta) = jiff::SignedDuration::try_from(Duration::from_secs(*secs)) {
+        if let Some(cut) = jiff::SignedDuration::try_from(Duration::from_secs(*secs))
+            .ok()
+            .and_then(|delta| now.checked_sub(delta).ok())
+        {
             override_cut_names.push(name.clone());
-            override_cuts.push(now - delta);
+            override_cuts.push(cut);
         }
     }
     // Per-tenant cutoffs (issue #1977), built the same way. The SQL tries the
@@ -2998,9 +3002,12 @@ async fn run_shard_tick(
     let mut tenant_cut_names: Vec<String> = Vec::new();
     let mut tenant_cuts: Vec<Timestamp> = Vec::new();
     for (tenant, secs) in config.tenant_overrides() {
-        if let Ok(delta) = jiff::SignedDuration::try_from(Duration::from_secs(*secs)) {
+        if let Some(cut) = jiff::SignedDuration::try_from(Duration::from_secs(*secs))
+            .ok()
+            .and_then(|delta| now.checked_sub(delta).ok())
+        {
             tenant_cut_names.push(tenant.clone());
-            tenant_cuts.push(now - delta);
+            tenant_cuts.push(cut);
         }
     }
     // The global fallback cutoff for un-overridden types. `None` means "no global
@@ -3009,7 +3016,7 @@ async fn run_shard_tick(
     let global_fallback: Option<Timestamp> = config
         .max_age()
         .and_then(|age| jiff::SignedDuration::try_from(age).ok())
-        .map(|delta| now - delta);
+        .and_then(|delta| now.checked_sub(delta).ok());
 
     // The candidate SQL excludes rows whose `sticky_worker_id` starts with
     // this prefix. The worker also writes that column, with its own id, when
@@ -3066,9 +3073,9 @@ async fn run_shard_tick(
 
         let lease_id_inner = lease_id.clone();
         let names_inner = override_cut_names.clone();
-        let cuts_inner = override_cuts.clone();
+        let cuts_inner: Vec<_> = override_cuts.iter().map(|cut| cut.to_diesel()).collect();
         let tenant_names_inner = tenant_cut_names.clone();
-        let tenant_cuts_inner = tenant_cuts.clone();
+        let tenant_cuts_inner: Vec<_> = tenant_cuts.iter().map(|cut| cut.to_diesel()).collect();
         let candidates = Box::pin(
             conn.transaction::<Vec<CandidateExecution>, HarvestError, _>(async |conn| {
                 // The claim asserts the fence in its own transaction (issue
@@ -3222,10 +3229,13 @@ async fn run_shard_tick(
                 .await?;
                 continue;
             };
-            let Ok(chrono_age) = jiff::SignedDuration::try_from(age) else {
-                // Unrepresentable duration (unreachable for validated ages, which
-                // are bounded by MAX_MAX_AGE ≪ chrono's ~292M-year range); fail
-                // safe toward RETAINING the row rather than deleting it. A zero
+            let Some(resolved_cutoff) = jiff::SignedDuration::try_from(age)
+                .ok()
+                .and_then(|age| now.checked_sub(age).ok())
+            else {
+                // Unrepresentable cutoff. That is unreachable for validated ages,
+                // which MAX_MAX_AGE bounds far inside the range of a jiff timestamp.
+                // Fail safe toward RETAINING the row rather than deleting it. A zero
                 // fallback would make `resolved_cutoff = now`, deleting nearly
                 // every completed row — the wrong failure mode for a retention
                 // janitor. Routine skip.
@@ -3240,7 +3250,6 @@ async fn run_shard_tick(
                 .await?;
                 continue;
             };
-            let resolved_cutoff = now - chrono_age;
             if completed_at >= resolved_cutoff {
                 // The loosest-cutoff SQL pre-filter is a superset; this type is
                 // not old enough under its own effective age. Routine skip, and
@@ -3783,6 +3792,10 @@ fn chain_link_count_sql() -> &'static str {
 #[cfg(feature = "db")]
 type HoldTimestamps = (Option<Timestamp>, Option<Timestamp>);
 
+/// [`HoldTimestamps`] as Diesel loads them.
+#[cfg(feature = "db")]
+type HoldTimestampsRow = (Option<crate::time::sql::SqlTimestamp>, Option<crate::time::sql::SqlTimestamp>);
+
 /// Best-effort, non-locking read of a candidate's legal-hold columns, used for
 /// the pre-archival re-read gate (issue #747 BLOCKER 1). A concurrently-deleted
 /// row (`None`) reports "not held" — the subsequent delete of a missing row is a
@@ -3798,11 +3811,18 @@ async fn read_candidate_hold(
             harvest_workflow_executions_ext::legal_hold_set_at,
             harvest_workflow_executions::legal_hold_until,
         ))
-        .first::<HoldTimestamps>(conn)
+        .first::<HoldTimestampsRow>(conn)
         .await
         .optional()
         .map_err(database_error)
-        .map(|opt| opt.unwrap_or((None, None)))
+        .map(|opt| {
+            opt.map_or((None, None), |(set_at, until)| {
+                (
+                    set_at.map(crate::time::sql::SqlTimestamp::to_jiff),
+                    until.map(crate::time::sql::SqlTimestamp::to_jiff),
+                )
+            })
+        })
 }
 
 #[cfg(feature = "db")]
@@ -3926,6 +3946,10 @@ async fn delete_candidate_execution(
             staging_vacated_state,
         )) = row
         {
+            let set_at = set_at.map(crate::time::sql::SqlTimestamp::to_jiff);
+            let until = until.map(crate::time::sql::SqlTimestamp::to_jiff);
+            let started_at = started_at.to_jiff();
+            let completed_at = completed_at.map(crate::time::sql::SqlTimestamp::to_jiff);
             if legal_hold_active(set_at, until, now) {
                 return Ok(CandidateDeleteOutcome::SkippedHeld);
             }
@@ -3973,7 +3997,7 @@ async fn delete_candidate_execution(
                 let completed = completed_at.unwrap_or(started_at);
                 // Clamp at 0: a `completed_at` before `started_at` (clock
                 // skew across nodes) must never produce a negative duration.
-                let duration_ms = Some(crate::time::num_milliseconds((completed - started_at)).max(0));
+                let duration_ms = Some(crate::time::num_milliseconds(completed - started_at).max(0));
                 // Payload capture is opt-in (AC3), and only ever happens
                 // under an explicit policy that asked for it. The
                 // migration-target tombstone case has no policy, so it
@@ -4033,7 +4057,7 @@ async fn delete_candidate_execution(
                 // ON CONFLICT DO NOTHING makes the demotion idempotent
                 // across a retried delete tx.
                 let inserted = diesel::insert_into(harvest_execution_summaries::table)
-                    .values(&new_summary)
+                    .values(new_summary)
                     .on_conflict(harvest_execution_summaries::execution_id)
                     .do_nothing()
                     .execute(conn)
@@ -4151,14 +4175,14 @@ async fn delete_candidate_execution(
 /// #752): the two legal-hold columns plus the demotion source columns.
 #[cfg(feature = "db")]
 type SummarySourceRow = (
-    Option<Timestamp>,     // legal_hold_set_at
-    Option<Timestamp>,     // legal_hold_until
-    String,                    // workflow_name
-    String,                    // workflow_id
-    String,                    // state
-    Timestamp,             // started_at
-    Option<Timestamp>,     // completed_at
-    i32,                       // shard_id
+    Option<crate::time::sql::SqlTimestamp>, // legal_hold_set_at
+    Option<crate::time::sql::SqlTimestamp>, // legal_hold_until
+    String,                         // workflow_name
+    String,                         // workflow_id
+    String,                         // state
+    crate::time::sql::SqlTimestamp,         // started_at
+    Option<crate::time::sql::SqlTimestamp>, // completed_at
+    i32,                            // shard_id
     Option<serde_json::Value>, // output
     Option<String>,            // error
     Option<serde_json::Value>, // search_attrs
@@ -4207,13 +4231,15 @@ pub(crate) async fn purge_expired_summaries(
         "(migrated_from_shards IS NULL OR jsonb_array_length(migrated_from_shards) = 0)";
 
     let mut counts: BTreeMap<String, u64> = BTreeMap::new();
-    let Ok(chrono_age) = jiff::SignedDuration::try_from(summary_age) else {
-        // Unrepresentable age (unreachable for validated horizons, bounded by
-        // MAX_MAX_AGE ≪ the chrono range). Fail safe toward RETAINING: GC
-        // nothing this tick. A zero cutoff would delete everything.
+    let Some(cutoff) = jiff::SignedDuration::try_from(summary_age)
+        .ok()
+        .and_then(|age| now.checked_sub(age).ok())
+    else {
+        // Unrepresentable cutoff (unreachable for validated horizons, bounded
+        // by MAX_MAX_AGE ≪ the range of a jiff timestamp). Fail safe toward
+        // RETAINING: GC nothing this tick. A zero cutoff would delete everything.
         return Ok(counts);
     };
-    let cutoff = now - chrono_age;
     let batch = i64::try_from(batch_size).unwrap_or(i64::MAX).max(1);
 
     if dry_run {
@@ -4326,11 +4352,13 @@ pub(crate) async fn purge_expired_trigger_fires(
     batch_size: usize,
     now: Timestamp,
 ) -> HarvestResult<u64> {
-    // An unrepresentable age deletes nothing, like `purge_expired_summaries`.
-    let Ok(chrono_age) = jiff::SignedDuration::try_from(summary_age) else {
+    // An unrepresentable cutoff deletes nothing, like `purge_expired_summaries`.
+    let Some(cutoff) = jiff::SignedDuration::try_from(summary_age)
+        .ok()
+        .and_then(|age| now.checked_sub(age).ok())
+    else {
         return Ok(0);
     };
-    let cutoff = now - chrono_age;
     let batch = i64::try_from(batch_size).unwrap_or(i64::MAX).max(1);
 
     let mut total: u64 = 0;
@@ -4668,9 +4696,10 @@ pub struct LegalHoldOutcome {
 mod legal_hold_db {
     use crate::schema::harvest_workflow_executions_ext;
     use crate::table_split::SetExt;
-    use jiff::Timestamp;
     use diesel::prelude::*;
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+    use jiff::Timestamp;
+    use jiff_diesel::ToDiesel;
 
     use crate::error::{HarvestError, HarvestResult, database_error};
     use crate::schema::harvest_workflow_executions;
@@ -4683,6 +4712,15 @@ mod legal_hold_db {
     type HoldColumns = (
         Option<Timestamp>,
         Option<Timestamp>,
+        Option<String>,
+        Option<String>,
+        Option<i32>,
+    );
+
+    /// [`HoldColumns`] as Diesel loads them.
+    type HoldColumnsRow = (
+        Option<crate::time::sql::SqlTimestamp>,
+        Option<crate::time::sql::SqlTimestamp>,
         Option<String>,
         Option<String>,
         Option<i32>,
@@ -4702,10 +4740,19 @@ mod legal_hold_db {
                 harvest_workflow_executions_ext::migrated_to_shard,
             ))
             .for_update()
-            .first::<HoldColumns>(conn)
+            .first::<HoldColumnsRow>(conn)
             .await
             .optional()
             .map_err(database_error)?
+            .map(|(set_at, until, reason, actor, migrated_to_shard)| {
+                (
+                    set_at.map(crate::time::sql::SqlTimestamp::to_jiff),
+                    until.map(crate::time::sql::SqlTimestamp::to_jiff),
+                    reason,
+                    actor,
+                    migrated_to_shard,
+                )
+            })
             .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
     }
 
@@ -4868,14 +4915,11 @@ mod legal_hold_db {
                     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
                         .set((
                             SetExt(
-                                harvest_workflow_executions_ext::legal_hold_set_at.eq::<Option<
-                                    Timestamp,
-                                >>(
-                                    None
-                                ),
+                                harvest_workflow_executions_ext::legal_hold_set_at
+                                    .eq::<Option<crate::time::sql::SqlTimestamp>>(None),
                             ),
                             harvest_workflow_executions::legal_hold_until
-                                .eq::<Option<Timestamp>>(None),
+                                .eq::<Option<crate::time::sql::SqlTimestamp>>(None),
                             SetExt(
                                 harvest_workflow_executions_ext::legal_hold_reason
                                     .eq::<Option<String>>(None),
