@@ -179,7 +179,10 @@ pub fn forecast_shifted(
         let walker = SlotWalker::new(schedule);
         // The walk looks for fires strictly after its reference. So it starts
         // one second before `walk_from` to include a fire at `walk_from` itself.
-        let mut cursor = walk_from - jiff::SignedDuration::from_secs(1);
+        // At the start of the jiff range the walk starts at `walk_from`.
+        let mut cursor = walk_from
+            .checked_sub(jiff::SignedDuration::from_secs(1))
+            .unwrap_or(walk_from);
         let mut read = 0;
         while let Some(next) = walker.next_after(cursor).filter(|&t| t < until) {
             cursor = next;
@@ -261,6 +264,15 @@ mod tests {
 
     const HOUR: i64 = 3_600;
     const MINUTE: Duration = Duration::from_secs(60);
+
+    /// A `from` at the start of the jiff range does not panic the walk.
+    #[test]
+    fn a_walk_from_the_start_of_the_range_does_not_panic() {
+        let a = cron("0 * * * *");
+        let until = Timestamp::MIN + jiff::SignedDuration::from_hours(3);
+        let report = forecast(&[("a", &a)], Timestamp::MIN, until, MINUTE, 2);
+        assert!(report.fires <= 3);
+    }
 
     #[test]
     fn hourly_schedules_herd_at_the_top_of_each_hour() {

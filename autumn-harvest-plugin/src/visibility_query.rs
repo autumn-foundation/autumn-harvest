@@ -559,7 +559,7 @@ impl Parser {
             };
             let value_at = self.at();
             let text = self.string_literal(name)?;
-            let ts = text.parse::<jiff::Timestamp>()
+            let ts = autumn_harvest::time::parse::rfc3339(&text)
                 .map_err(|_| format!("started_at at byte {value_at} needs an RFC 3339 time"))?;
             return Ok(SystemTest::Cmp(cmp, ts));
         }

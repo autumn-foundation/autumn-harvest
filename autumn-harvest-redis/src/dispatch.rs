@@ -222,6 +222,7 @@ impl RedisDispatchConfig {
 struct DispatchRef {
     task_id: Uuid,
     queue_name: String,
+    #[serde(deserialize_with = "autumn_harvest::time::serde_clamped::deserialize")]
     scheduled_at: Timestamp,
     #[serde(default)]
     priority: i32,

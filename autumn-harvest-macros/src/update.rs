@@ -333,7 +333,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 context_headers: opts.context_headers,
                 sla: opts.sla
                     .or(client.apply_run_defaults(info.name, info.execution_timeout, info.sla).1)
-                    .and_then(|d| ::autumn_harvest::jiff::SignedDuration::try_from(d).ok()),
+                    .and_then(::autumn_harvest::time::from_std_bounded),
                 workflow_retry_policy: Self::info().retry_policy
                     .and_then(|p| ::autumn_harvest::serde_json::to_value(&p).ok()),
                 max_workflow_attempts_ceiling: client.max_workflow_attempts(),

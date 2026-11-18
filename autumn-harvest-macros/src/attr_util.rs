@@ -253,9 +253,9 @@ pub fn first_non_ident_param<'a>(params: &'a [&syn::FnArg]) -> Option<&'a syn::P
     })
 }
 
-/// Emits `match #source { Some(d) => Some(jiff::SignedDuration::try_from(d)?), None => None }`.
-/// Rejects with a `HarvestError::Config` naming `field_name` when `d` is too
-/// large for `jiff::SignedDuration` to represent.
+/// Emits `match #source { Some(d) => Some(time::from_std_bounded(d)?), None => None }`.
+/// Rejects with a `HarvestError::Config` naming `field_name` when `d` is
+/// past `i64::MAX` milliseconds, the range that `chrono` accepted.
 ///
 /// `workflow.rs`'s `start_with_options` hard-codes this match four times:
 /// `execution_timeout`, `max_execution_timeout_ceiling`,
@@ -274,8 +274,8 @@ pub fn optional_duration_tokens(field_name: &str, source: &TokenStream) -> Token
     quote! {
         match #source {
             ::std::option::Option::Some(d) => ::std::option::Option::Some(
-                ::autumn_harvest::jiff::SignedDuration::try_from(d)
-                    .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
+                ::autumn_harvest::time::from_std_bounded(d)
+                    .ok_or_else(|| ::autumn_harvest::error::HarvestError::Config(
                         #message.to_string()
                     ))?
             ),
@@ -302,8 +302,8 @@ mod optional_duration_tokens_tests {
         let expected = quote! {
             match opts.execution_timeout.or(info.execution_timeout) {
                 ::std::option::Option::Some(d) => ::std::option::Option::Some(
-                    ::autumn_harvest::jiff::SignedDuration::try_from(d)
-                        .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
+                    ::autumn_harvest::time::from_std_bounded(d)
+                        .ok_or_else(|| ::autumn_harvest::error::HarvestError::Config(
                             "execution_timeout exceeds the duration range".to_string()
                         ))?
                 ),
@@ -327,8 +327,8 @@ mod optional_duration_tokens_tests {
         let expected = quote! {
             match opts.execution_timeout {
                 ::std::option::Option::Some(d) => ::std::option::Option::Some(
-                    ::autumn_harvest::jiff::SignedDuration::try_from(d)
-                        .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
+                    ::autumn_harvest::time::from_std_bounded(d)
+                        .ok_or_else(|| ::autumn_harvest::error::HarvestError::Config(
                             "execution_timeout exceeds the duration range".to_string()
                         ))?
                 ),
@@ -351,8 +351,8 @@ mod optional_duration_tokens_tests {
         let expected = quote! {
             match client.max_workflow_execution_timeout() {
                 ::std::option::Option::Some(d) => ::std::option::Option::Some(
-                    ::autumn_harvest::jiff::SignedDuration::try_from(d)
-                        .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
+                    ::autumn_harvest::time::from_std_bounded(d)
+                        .ok_or_else(|| ::autumn_harvest::error::HarvestError::Config(
                             "max_execution_timeout_ceiling exceeds the duration range".to_string()
                         ))?
                 ),
@@ -374,8 +374,8 @@ mod optional_duration_tokens_tests {
         let expected = quote! {
             match info.chain_execution_timeout {
                 ::std::option::Option::Some(d) => ::std::option::Option::Some(
-                    ::autumn_harvest::jiff::SignedDuration::try_from(d)
-                        .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
+                    ::autumn_harvest::time::from_std_bounded(d)
+                        .ok_or_else(|| ::autumn_harvest::error::HarvestError::Config(
                             "chain_execution_timeout exceeds the duration range".to_string()
                         ))?
                 ),
@@ -396,8 +396,8 @@ mod optional_duration_tokens_tests {
         let expected = quote! {
             match client.max_workflow_chain_timeout() {
                 ::std::option::Option::Some(d) => ::std::option::Option::Some(
-                    ::autumn_harvest::jiff::SignedDuration::try_from(d)
-                        .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
+                    ::autumn_harvest::time::from_std_bounded(d)
+                        .ok_or_else(|| ::autumn_harvest::error::HarvestError::Config(
                             "max_workflow_chain_timeout_ceiling exceeds the duration range".to_string()
                         ))?
                 ),

@@ -50,6 +50,15 @@ manifest if you name its types directly.
 The `autumn_harvest::time` helpers keep the exact results of the `chrono`
 calls. Use them where the old text or the old `i64` is a contract.
 
+`SignedDuration::try_from(d)` accepts up to `i64::MAX` seconds.
+`Duration::from_std(d)` refused a value past `i64::MAX` milliseconds. Use
+`autumn_harvest::time::from_std_bounded(d)` where that bound matters.
+
+`s.parse::<Timestamp>()` refuses some text that `parse_from_rfc3339`
+read: more than 9 fraction digits, and a U+2212 minus sign in the offset.
+It also refuses an instant after `9999-12-30T22:00:00.999999999Z`, the
+end of the jiff range.
+
 ## 3. Text and JSON
 
 - **JSON.** A `serde` timestamp is still RFC 3339 with a `Z` suffix. It now
@@ -61,13 +70,21 @@ calls. Use them where the old text or the old `i64` is a contract.
   need the old form.
 - **Fields that Harvest pins.** The audit chain, cursors and the API fields
   that `chrono` formatted with a fixed format keep their exact bytes.
+- **Durations.** A duration in a Harvest model, such as
+  `WorkflowExecution::execution_timeout`, keeps the `chrono` JSON form
+  `[seconds, nanoseconds]`. jiff writes a `SignedDuration` as an ISO 8601
+  string, such as `PT1H`. Use `autumn_harvest::time::serde_secs_nanos` on
+  your own field if an older reader expects the pair.
 
 ## 4. Range
 
 `jiff` holds the years -9999 to 9999. `chrono` held about 262 000 years.
-Harvest clamps a stored value past that range to `Timestamp::MIN` or
-`Timestamp::MAX` when it reads one. Your own code that writes such a value
-must use `Timestamp::MAX`.
+Harvest clamps a stored timestamp past that range to `Timestamp::MIN` or
+`Timestamp::MAX` when it reads one. That covers rows, stored events and
+Redis envelopes. `autumn_harvest::time::serde_clamped` does the same for
+your own JSON field. A calendar exclusion date past 9999-12-31 can match no
+fire date, so Harvest skips it on a read. Your own code that writes such a
+value must use `Timestamp::MAX`.
 
 ## 5. Time zones
 
@@ -77,8 +94,14 @@ A cron schedule in a named zone resolves the zone with
 `US/Eastern` on a Debian host without `tzdata-legacy`, comes from the copy
 that `jiff` bundles. `chrono-tz` always used its bundled copy. Each of the
 597 names that `chrono-tz` 0.10 knows still resolves, with the same case
-rules. Keep `tzdata` in step across a fleet if a zone that you schedule in
-changes its rules.
+rules. No other name resolves. `localtime`, `posixrules` and `Factory` are
+refused, as before. Keep `tzdata` in step across a fleet if a zone that you
+schedule in changes its rules.
+
+The offsets match `chrono-tz` through 2099. `chrono-tz` kept the last
+standard-time offset of a zone after 2099. jiff applies the current DST
+rule of the zone. So a preview, backfill or fire after 2099 in a DST zone
+moves by the DST delta.
 
 Call `autumn_harvest::time::zone`, not `TimeZone::get`, for a name that
 `chrono-tz` accepted. `TimeZone::get` ignores case and has no fallback.

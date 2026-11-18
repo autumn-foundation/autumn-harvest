@@ -100,6 +100,7 @@ pub struct WorkflowExecution {
     pub queue_name: String,
     pub started_at: jiff::Timestamp,
     pub completed_at: Option<jiff::Timestamp>,
+    #[serde(default, with = "crate::time::serde_secs_nanos::option")]
     pub execution_timeout: Option<jiff::SignedDuration>,
     /// Absolute UTC deadline for execution-level timeout (issue #243).
     /// Computed at start as `started_at + execution_timeout`. NULL = no deadline.
@@ -107,6 +108,7 @@ pub struct WorkflowExecution {
     /// Chain-scoped lifetime cap DURATION (issue #617). Distinct from the per-run
     /// `execution_timeout`: anchored at the chain-origin start and carried verbatim
     /// across every continue-as-new. `None` = no chain cap configured.
+    #[serde(default, with = "crate::time::serde_secs_nanos::option")]
     pub chain_execution_timeout: Option<jiff::SignedDuration>,
     /// Absolute UTC chain deadline (issue #617). Computed at the chain-origin start
     /// as `started_at + chain_execution_timeout` and copied verbatim into every
@@ -139,6 +141,7 @@ pub struct WorkflowExecution {
     pub context_headers: Option<serde_json::Value>,
     /// Optional declared SLA budget for soft breach signal (issue #487).
     /// Stored so continue-as-new / reset can re-anchor per run. `None` = no SLA.
+    #[serde(default, with = "crate::time::serde_secs_nanos::option")]
     pub sla: Option<jiff::SignedDuration>,
     /// Absolute UTC deadline for soft SLA enforcement (issue #487).
     /// Computed at start as `started_at + sla`. `None` = no SLA declared.
@@ -383,11 +386,13 @@ pub struct NewWorkflowExecution<'a> {
     pub input: SharedJson,
     pub parent_id: Option<Uuid>,
     pub queue_name: &'a str,
+    #[serde(default, with = "crate::time::serde_secs_nanos::option")]
     pub execution_timeout: Option<jiff::SignedDuration>,
     /// Absolute UTC deadline for execution-level timeout (issue #243).
     /// NULL = no deadline enforced.
     pub deadline_at: Option<jiff::Timestamp>,
     /// Chain-scoped lifetime cap DURATION (issue #617). `None` = no chain cap.
+    #[serde(default, with = "crate::time::serde_secs_nanos::option")]
     pub chain_execution_timeout: Option<jiff::SignedDuration>,
     /// Absolute UTC chain deadline (issue #617). Anchored at the chain-origin
     /// start and carried verbatim across continue-as-new. `None` = no chain cap.
@@ -404,6 +409,7 @@ pub struct NewWorkflowExecution<'a> {
     /// Ambient context headers (issue #481). `None` = no headers.
     pub context_headers: Option<serde_json::Value>,
     /// Optional declared SLA budget (issue #487). NULL = no SLA.
+    #[serde(default, with = "crate::time::serde_secs_nanos::option")]
     pub sla: Option<jiff::SignedDuration>,
     /// Absolute UTC SLA deadline (issue #487). NULL = no SLA.
     pub sla_deadline_at: Option<jiff::Timestamp>,
@@ -656,12 +662,15 @@ pub struct TaskQueueItem {
     pub heartbeat_details: Option<serde_json::Value>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Interval>)]
     #[diesel(deserialize_as = crate::time::sql::NullablePgDuration)]
+    #[serde(default, with = "crate::time::serde_secs_nanos::option")]
     pub heartbeat_timeout: Option<jiff::SignedDuration>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Interval>)]
     #[diesel(deserialize_as = crate::time::sql::NullablePgDuration)]
+    #[serde(default, with = "crate::time::serde_secs_nanos::option")]
     pub start_to_close: Option<jiff::SignedDuration>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Interval>)]
     #[diesel(deserialize_as = crate::time::sql::NullablePgDuration)]
+    #[serde(default, with = "crate::time::serde_secs_nanos::option")]
     pub schedule_to_start: Option<jiff::SignedDuration>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
     pub retry_policy: Option<serde_json::Value>,
@@ -671,6 +680,7 @@ pub struct TaskQueueItem {
     #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
     pub sticky_until: Option<jiff::Timestamp>,
     #[diesel(deserialize_as = crate::time::sql::NullablePgDuration)]
+    #[serde(default, with = "crate::time::serde_secs_nanos::option")]
     pub sticky_timeout: Option<jiff::SignedDuration>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
     pub trace_context: Option<serde_json::Value>,
@@ -825,13 +835,17 @@ pub struct NewTaskQueueItem<'a> {
     pub priority: i32,
     pub max_attempts: i32,
     pub scheduled_at: jiff::Timestamp,
+    #[serde(default, with = "crate::time::serde_secs_nanos::option")]
     pub heartbeat_timeout: Option<jiff::SignedDuration>,
+    #[serde(default, with = "crate::time::serde_secs_nanos::option")]
     pub start_to_close: Option<jiff::SignedDuration>,
+    #[serde(default, with = "crate::time::serde_secs_nanos::option")]
     pub schedule_to_start: Option<jiff::SignedDuration>,
     pub retry_policy: Option<serde_json::Value>,
     pub heartbeat_details: Option<serde_json::Value>,
     pub sticky_worker_id: Option<&'a str>,
     pub sticky_until: Option<jiff::Timestamp>,
+    #[serde(default, with = "crate::time::serde_secs_nanos::option")]
     pub sticky_timeout: Option<jiff::SignedDuration>,
     pub trace_context: Option<serde_json::Value>,
     pub concurrency_key: Option<&'a str>,
@@ -2475,6 +2489,20 @@ mod effective_terminal_state_tests {
             rebalance: super::RebalanceMarkers::default(),
             tenant: None,
         }
+    }
+
+    /// The API and older processes read a duration as `[seconds, nanoseconds]`,
+    /// the `chrono` form. The jiff string form would break them.
+    #[test]
+    fn durations_keep_the_chrono_wire_form() {
+        let mut row = stub("RUNNING");
+        row.execution_timeout = Some(jiff::SignedDuration::from_hours(1));
+        row.sla = None;
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["execution_timeout"], serde_json::json!([3600, 0]));
+        assert_eq!(json["sla"], serde_json::Value::Null);
+        let back: WorkflowExecution = serde_json::from_value(json).unwrap();
+        assert_eq!(back.execution_timeout, row.execution_timeout);
     }
 
     #[test]

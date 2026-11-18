@@ -2582,7 +2582,7 @@ pub(crate) struct StartWorkflowRequest {
     /// with it also returns `400`. Such a start is deferred, so it has no
     /// active prior to resolve at request time.
     conflict_policy: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "autumn_harvest::time::parse::de::optional")]
     start_at: Option<jiff::Timestamp>,
     #[serde(default)]
     delay: Option<String>,
@@ -3397,7 +3397,7 @@ struct CreateWorkflowScheduleRequest {
     /// Absolute UTC cutoff for this schedule (issue #478).
     /// When `next_run_at >= end_at` the scheduler stops firing and marks the schedule
     /// exhausted. `null` (the default) = no cutoff.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "autumn_harvest::time::parse::de::optional")]
     end_at: Option<jiff::Timestamp>,
     /// Total run budget for this schedule (issue #478).
     /// Once `runs_started` reaches `max_runs` the schedule is exhausted. `null` = no limit.
@@ -3489,7 +3489,7 @@ struct UpdateWorkflowScheduleRequest {
     skip_policy: Option<String>,
     #[serde(default, deserialize_with = "deserialize_tristate")]
     consecutive_failure_limit: Option<Option<u32>>,
-    #[serde(default, deserialize_with = "deserialize_tristate")]
+    #[serde(default, deserialize_with = "autumn_harvest::time::parse::de::tristate")]
     end_at: Option<Option<jiff::Timestamp>>,
     #[serde(default, deserialize_with = "deserialize_tristate")]
     max_runs: Option<Option<u32>>,
@@ -4089,6 +4089,7 @@ struct CreateGateRequest {
     /// Optional extended message for the Vantage UI.
     message: Option<String>,
     /// ISO 8601 timestamp after which the gate self-clears.
+    #[serde(default, deserialize_with = "autumn_harvest::time::parse::de::optional")]
     expires_at: Option<jiff::Timestamp>,
 }
 
@@ -4393,7 +4394,7 @@ struct CreateTokenRequest {
     #[serde(default = "default_token_scope")]
     scope: String,
     /// Optional expiry; an expired token is rejected 401 on the next request.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "autumn_harvest::time::parse::de::optional")]
     expires_at: Option<jiff::Timestamp>,
     /// Optional tenant claim (issue #1977). A tenant-bound token reaches only
     /// the runs of its tenant, through the tenant-scoped routes. It must be 1
@@ -10926,7 +10927,7 @@ async fn list_audit_records(
 }
 
 fn parse_audit_datetime(raw: &str) -> Result<jiff::Timestamp, AutumnError> {
-    raw.parse::<jiff::Timestamp>()
+    autumn_harvest::time::parse::rfc3339(raw)
         .map_err(|_| {
             AutumnError::bad_request_msg(format!(
                 "invalid datetime '{raw}'; expected RFC 3339 format, e.g. 2026-05-06T00:00:00Z"
@@ -11257,7 +11258,7 @@ pub(crate) fn parse_summary_filters(
                 filters.search_attrs.push(Value::Object(object));
             }
             "completed_after" => {
-                let dt = value.trim().parse::<jiff::Timestamp>()
+                let dt = autumn_harvest::time::parse::rfc3339(value.trim())
                     .map_err(|_| {
                         AutumnError::bad_request_msg(format!(
                             "invalid completed_after '{value}'; expected RFC 3339 (e.g. 2026-01-01T00:00:00Z)"
@@ -11266,7 +11267,7 @@ pub(crate) fn parse_summary_filters(
                 filters.completed_after = Some(dt);
             }
             "completed_before" => {
-                let dt = value.trim().parse::<jiff::Timestamp>()
+                let dt = autumn_harvest::time::parse::rfc3339(value.trim())
                     .map_err(|_| {
                         AutumnError::bad_request_msg(format!(
                             "invalid completed_before '{value}'; expected RFC 3339 (e.g. 2026-01-01T00:00:00Z)"
@@ -11928,7 +11929,7 @@ pub(crate) fn parse_workflow_filters(
             }
             // ── Issue #498: time-range, prefix, and pagination params ────────
             "started_after" => {
-                let dt = value.trim().parse::<jiff::Timestamp>()
+                let dt = autumn_harvest::time::parse::rfc3339(value.trim())
                     .map_err(|_| {
                         AutumnError::bad_request_msg(format!(
                             "invalid started_after '{value}'; expected RFC 3339 (e.g. 2026-01-01T00:00:00Z)"
@@ -11937,7 +11938,7 @@ pub(crate) fn parse_workflow_filters(
                 filters.started_after = Some(dt);
             }
             "started_before" => {
-                let dt = value.trim().parse::<jiff::Timestamp>()
+                let dt = autumn_harvest::time::parse::rfc3339(value.trim())
                     .map_err(|_| {
                         AutumnError::bad_request_msg(format!(
                             "invalid started_before '{value}'; expected RFC 3339 (e.g. 2026-01-01T00:00:00Z)"
@@ -12213,7 +12214,7 @@ fn parse_history_max_bytes(value: &str) -> Result<usize, AutumnError> {
 }
 
 fn parse_history_datetime(value: &str) -> Result<jiff::Timestamp, AutumnError> {
-    value.parse::<jiff::Timestamp>()
+    autumn_harvest::time::parse::rfc3339(value)
         .map_err(|_| {
             AutumnError::bad_request_msg(format!(
                 "invalid datetime '{value}'; expected RFC 3339 format, e.g. 2026-05-06T00:00:00Z"
@@ -14214,7 +14215,7 @@ fn parse_external_handoff_datetime(
     raw: &str,
     label: &str,
 ) -> Result<jiff::Timestamp, AutumnError> {
-    raw.parse::<jiff::Timestamp>()
+    autumn_harvest::time::parse::rfc3339(raw)
         .map_err(|_| {
             AutumnError::bad_request_msg(format!(
                 "invalid {label} '{raw}'; expected RFC 3339 format, e.g. 2026-05-08T00:00:00Z"
@@ -17112,6 +17113,42 @@ async fn get_run_chain(
     Ok(Json(response))
 }
 
+/// Returns the deadline `timeout` after `from` for a pending activity.
+///
+/// An activity timeout can be up to `i64::MAX` milliseconds, and a stored
+/// time can read clamped to the end of the jiff range. A plain sum then
+/// panics, where `chrono` reached a far year. A sum past the jiff range
+/// saturates to [`jiff::Timestamp::MAX`] or [`jiff::Timestamp::MIN`].
+fn pending_activity_deadline(
+    from: jiff::Timestamp,
+    timeout: jiff::SignedDuration,
+) -> jiff::Timestamp {
+    from.checked_add(timeout).unwrap_or(if timeout.is_negative() {
+        jiff::Timestamp::MIN
+    } else {
+        jiff::Timestamp::MAX
+    })
+}
+
+#[cfg(test)]
+mod pending_activity_deadline_tests {
+    use super::pending_activity_deadline;
+    use jiff::{SignedDuration, Timestamp};
+
+    #[test]
+    fn a_deadline_past_the_jiff_range_saturates() {
+        let now = Timestamp::constant(1_700_000_000, 0);
+        let huge = SignedDuration::from_secs(400_000_000_000);
+        assert_eq!(pending_activity_deadline(now, huge), Timestamp::MAX);
+        assert_eq!(pending_activity_deadline(Timestamp::MAX, SignedDuration::from_secs(1)), Timestamp::MAX);
+        assert_eq!(pending_activity_deadline(now, -huge), Timestamp::MIN);
+        assert_eq!(
+            pending_activity_deadline(now, SignedDuration::from_secs(30)),
+            Timestamp::constant(1_700_000_030, 0)
+        );
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn get_workflow_stack(
     Extension(api_state): Extension<HarvestApiState>,
@@ -17385,12 +17422,17 @@ async fn get_workflow_stack(
                 heartbeat_details_omitted_for_budget: false,
                 heartbeat_details_bytes,
                 next_retry_at,
-                schedule_to_start_deadline: t.schedule_to_start.map(|d| t.scheduled_at + d),
-                start_to_close_deadline: t.started_at.zip(t.start_to_close).map(|(s, d)| s + d),
+                schedule_to_start_deadline: t
+                    .schedule_to_start
+                    .map(|d| pending_activity_deadline(t.scheduled_at, d)),
+                start_to_close_deadline: t
+                    .started_at
+                    .zip(t.start_to_close)
+                    .map(|(s, d)| pending_activity_deadline(s, d)),
                 heartbeat_deadline: t
                     .last_heartbeat_at
                     .zip(t.heartbeat_timeout)
-                    .map(|(h, d)| h + d),
+                    .map(|(h, d)| pending_activity_deadline(h, d)),
                 last_failure,
             }
         })
@@ -25864,7 +25906,7 @@ async fn set_legal_hold_handler(
     let hold_until = match request.hold_until.as_deref() {
         None => None,
         Some(raw) => Some(
-            raw.parse::<jiff::Timestamp>()
+            autumn_harvest::time::parse::rfc3339(raw)
                 .map_err(|e| {
                     AutumnError::bad_request_msg(format!("invalid hold_until (RFC3339): {e}"))
                 })?,
@@ -32403,7 +32445,9 @@ async fn transition_backfill_exhausted_if_reached(
 /// Request body for `POST /admin/schedules/{id}/backfill`.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ScheduleBackfillRequest {
+    #[serde(deserialize_with = "autumn_harvest::time::parse::de::required")]
     pub from: jiff::Timestamp,
+    #[serde(deserialize_with = "autumn_harvest::time::parse::de::required")]
     pub to: jiff::Timestamp,
     #[serde(default)]
     pub dry_run: bool,
@@ -34526,9 +34570,9 @@ struct BulkDlqApiBody {
     min_attempts: Option<i32>,
     #[serde(default, alias = "task_kind")]
     task_type: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "autumn_harvest::time::parse::de::optional")]
     failed_after: Option<jiff::Timestamp>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "autumn_harvest::time::parse::de::optional")]
     failed_before: Option<jiff::Timestamp>,
     #[serde(default)]
     error_class: Option<String>,
@@ -34668,9 +34712,9 @@ struct RedriveApiBody {
     queue: Option<String>,
     #[serde(default)]
     workflow_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "autumn_harvest::time::parse::de::optional")]
     dead_lettered_after: Option<jiff::Timestamp>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "autumn_harvest::time::parse::de::optional")]
     dead_lettered_before: Option<jiff::Timestamp>,
     #[serde(default)]
     error_contains: Option<String>,
@@ -34915,7 +34959,7 @@ fn parse_utc_datetime(
     value: &str,
     field: &str,
 ) -> Result<jiff::Timestamp, AutumnError> {
-    value.parse::<jiff::Timestamp>()
+    autumn_harvest::time::parse::rfc3339(value)
         .map_err(|_| {
             AutumnError::bad_request_msg(format!("invalid {field}; expected RFC 3339 timestamp"))
         })
@@ -41047,6 +41091,7 @@ struct AuditExportRedriveRequest {
     /// Rewind to this exact sequence: records with `seq > to_seq` re-export.
     to_seq: Option<i64>,
     /// Rewind so every record at or after this instant re-exports.
+    #[serde(default, deserialize_with = "autumn_harvest::time::parse::de::optional")]
     before: Option<jiff::Timestamp>,
 }
 
@@ -48732,6 +48777,7 @@ async fn create_calendar_handler(
 #[derive(Debug, Deserialize)]
 struct UpdateCalendarRequest {
     /// Complete set of exclusion dates (replaces existing). Format: `"YYYY-MM-DD"`.
+    #[serde(deserialize_with = "autumn_harvest::time::parse::de::dates")]
     exclusion_dates: Vec<jiff::civil::Date>,
 }
 
@@ -49077,7 +49123,11 @@ fn parse_from_param(from: Option<&str>) -> Result<jiff::Timestamp, String> {
     from.map_or_else(
         || Ok(jiff::Timestamp::now()),
         |s| {
-            let dt = s.parse::<jiff::Timestamp>()
+            // jiff reads a signed six-digit year. chrono read four digits only.
+            if s.starts_with(['+', '-']) {
+                return Err(format!("invalid `from` timestamp '{s}': expected a four-digit year"));
+            }
+            let dt = autumn_harvest::time::parse::rfc3339(s)
                 .map_err(|e| format!("invalid `from` timestamp '{s}': {e}"))?;
             if autumn_harvest::time::utc_date(dt).year() > 9000 {
                 return Err(format!(
@@ -49406,7 +49456,8 @@ fn jitter_crosses_a_slot(
         return false;
     }
     let walker = autumn_harvest::schedule_plan::SlotWalker::new(schedule);
-    let mut slot = match walker.next_after(from - jiff::SignedDuration::from_secs(1)) {
+    let before = from.checked_sub(jiff::SignedDuration::from_secs(1)).unwrap_or(from);
+    let mut slot = match walker.next_after(before) {
         Some(slot) if slot < until => slot,
         _ => return false,
     };
@@ -50710,7 +50761,7 @@ async fn request_drain_handler(
     // Track whether the deadline is operator-supplied so we can avoid
     // shortening an existing window when re-draining without --deadline.
     let (deadline_at, deadline_is_explicit) = if let Some(raw) = &request.deadline_at {
-        let dt = raw.parse::<jiff::Timestamp>().map_err(|_| {
+        let dt = autumn_harvest::time::parse::rfc3339(raw).map_err(|_| {
             AutumnError::bad_request_msg(format!(
                 "invalid deadline_at '{raw}'; expected RFC 3339 (e.g. 2026-05-09T12:00:00Z)"
             ))
@@ -50720,9 +50771,13 @@ async fn request_drain_handler(
         // Compute a default deadline from the configured worker shutdown timeout so
         // operators always get a finite drain window even when they omit the field.
         let timeout = api_state.worker_shutdown_timeout();
-        let computed = jiff::SignedDuration::try_from(timeout)
-            .ok()
-            .map(|d| jiff::Timestamp::now() + d);
+        // The bound keeps the `chrono` range. A deadline past the jiff range
+        // saturates, where `chrono` reached a far year.
+        let computed = autumn_harvest::time::from_std_bounded(timeout).map(|d| {
+            jiff::Timestamp::now()
+                .checked_add(d)
+                .unwrap_or(jiff::Timestamp::MAX)
+        });
         (computed, false)
     };
 
@@ -59305,6 +59360,12 @@ mod tests {
             result.unwrap_err().contains("year must be"),
             "error message must mention the year limit"
         );
+    }
+
+    #[test]
+    fn parse_from_param_rejects_a_signed_year() {
+        assert!(parse_from_param(Some("-009999-01-02T01:59:59Z")).is_err());
+        assert!(parse_from_param(Some("+002026-06-01T09:00:00Z")).is_err());
     }
 
     #[test]

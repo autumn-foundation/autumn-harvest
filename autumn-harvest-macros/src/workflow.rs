@@ -1300,8 +1300,8 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let max_workflow_chain_timeout_ceiling = #stub_max_workflow_chain_timeout_ceiling_tokens;
 
                     let max_workflow_start_delay = {
-                        let ceiling_chrono = ::autumn_harvest::jiff::SignedDuration::try_from(client.max_workflow_start_delay())
-                            .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
+                        let ceiling_chrono = ::autumn_harvest::time::from_std_bounded(client.max_workflow_start_delay())
+                            .ok_or_else(|| ::autumn_harvest::error::HarvestError::Config(
                                 "max_workflow_start_delay ceiling exceeds the duration range".to_string()
                             ))?;
                         let requested_chrono = opts.max_workflow_start_delay.unwrap_or(ceiling_chrono);
@@ -1333,9 +1333,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         context_headers: opts.context_headers,
                         sla: opts.sla
                             .or(client.apply_run_defaults(info.name, info.execution_timeout, info.sla).1)
-                            .and_then(|d|
-                            ::autumn_harvest::jiff::SignedDuration::try_from(d).ok()
-                        ),
+                            .and_then(::autumn_harvest::time::from_std_bounded),
                         workflow_retry_policy: info.retry_policy.clone(),
                         max_workflow_attempts_ceiling: client.max_workflow_attempts(),
                         start_source: ::autumn_harvest::types::StartSource::Api,
@@ -1433,9 +1431,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         context_headers: opts.context_headers,
                         sla: opts.sla
                             .or(client.apply_run_defaults(info.name, info.execution_timeout, info.sla).1)
-                            .and_then(|d|
-                            ::autumn_harvest::jiff::SignedDuration::try_from(d).ok()
-                        ),
+                            .and_then(::autumn_harvest::time::from_std_bounded),
                         // Typed stubs already reject debounced workflows up front.
                         reject_fresh_if_debounced: false,
                         workflow_retry_policy: info.retry_policy

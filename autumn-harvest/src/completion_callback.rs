@@ -1513,9 +1513,30 @@ pub fn parse_retry_after(value: &str, now: Timestamp) -> Option<std::time::Durat
     Some(std::time::Duration::try_from(at - now).unwrap_or(std::time::Duration::ZERO))
 }
 
+/// Zone names that the `chrono` RFC 2822 parser accepted.
+const RFC2822_ZONE_NAMES: [&str; 11] =
+    ["GMT", "UT", "Z", "EST", "EDT", "CST", "CDT", "MST", "MDT", "PST", "PDT"];
+
+/// Returns `false` for a trailing zone name that `chrono` refused.
+///
+/// jiff reads any name of three or more letters as UTC, such as `CET`.
+/// `chrono` accepted only the names above and a military letter other than
+/// `J`. A date that `chrono` refused gives no delay, so a 413 stays
+/// permanent.
+fn rfc2822_zone_is_known(value: &str) -> bool {
+    let zone = value.rsplit(|c: char| c.is_ascii_whitespace()).next().unwrap_or("");
+    if zone.is_empty() || !zone.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return true;
+    }
+    RFC2822_ZONE_NAMES.iter().any(|name| zone.eq_ignore_ascii_case(name))
+        || (zone.len() == 1 && !zone.eq_ignore_ascii_case("j"))
+}
+
 /// Parse an HTTP-date in any of its three forms (RFC 9110 section 5.6.7).
 fn parse_http_date(value: &str, now: Timestamp) -> Option<Timestamp> {
-    if let Ok(at) = jiff::fmt::rfc2822::DateTimeParser::new().parse_timestamp(value) {
+    if rfc2822_zone_is_known(value)
+        && let Ok(at) = jiff::fmt::rfc2822::DateTimeParser::new().parse_timestamp(value)
+    {
         return Some(at);
     }
     // asctime, for example `Sun Nov  6 08:49:37 1994`. It is always in GMT.
@@ -1646,6 +1667,27 @@ mod deliverer_trait_tests {
         // 2026-01-01T00:00:00Z is a Thursday.
         assert_eq!(
             parse_retry_after("Thu, 01 Jan 2026 00:00:30 GMT", now()),
+            Some(std::time::Duration::from_secs(30))
+        );
+    }
+
+    /// `chrono` refused a zone name outside RFC 2822, so the delay is `None`.
+    /// A 413 with such a date then stays a permanent failure.
+    #[test]
+    fn parse_retry_after_refuses_a_zone_name_that_chrono_refused() {
+        assert_eq!(parse_retry_after("Thu, 01 Jan 2026 00:00:30 UTC", now()), None);
+        assert_eq!(parse_retry_after("Thu, 01 Jan 2026 00:00:30 CET", now()), None);
+        assert_eq!(parse_retry_after("Thu, 01 Jan 2026 00:00:30 J", now()), None);
+        assert_eq!(
+            parse_retry_after("Thu, 01 Jan 2026 00:00:30 ut", now()),
+            Some(std::time::Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse_retry_after("Wed, 31 Dec 2025 19:00:30 EST", now()),
+            Some(std::time::Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse_retry_after("Thu, 01 Jan 2026 00:00:30 +0000", now()),
             Some(std::time::Duration::from_secs(30))
         );
     }

@@ -28,15 +28,19 @@ use crate::error::{RedisAdapterError, RedisAdapterResult};
 ///
 /// # Errors
 ///
-/// Returns [`RedisAdapterError::DurationOutOfRange`] for a delay past the
-/// range of [`jiff::SignedDuration`].
+/// Returns [`RedisAdapterError::DurationOutOfRange`] for a delay past
+/// `i64::MAX` milliseconds. `chrono::Duration::from_std` refused such a
+/// delay, so the caller still gets the error and no task is parked.
 pub(crate) fn due_after(
     now: Timestamp,
     delay: Duration,
     what: &str,
 ) -> RedisAdapterResult<Timestamp> {
-    let span = jiff::SignedDuration::try_from(delay)
-        .map_err(|e| RedisAdapterError::DurationOutOfRange(format!("{what}: {e}")))?;
+    let span = autumn_harvest::time::from_std_bounded(delay).ok_or_else(|| {
+        RedisAdapterError::DurationOutOfRange(format!(
+            "{what}: {delay:?} is past i64::MAX milliseconds"
+        ))
+    })?;
     Ok(now.checked_add(span).unwrap_or(Timestamp::MAX))
 }
 
@@ -174,6 +178,7 @@ pub struct TaskEnvelope {
     #[serde(default)]
     pub attempt: i32,
     /// Earliest time at which this task became claimable.
+    #[serde(deserialize_with = "autumn_harvest::time::serde_clamped::deserialize")]
     pub scheduled_at: Timestamp,
     /// Heartbeat timeout in seconds (preserved as integer for portability).
     #[serde(default)]
@@ -191,7 +196,7 @@ pub struct TaskEnvelope {
     #[serde(default)]
     pub sticky_worker_id: Option<String>,
     /// Sticky deadline as ISO-8601 timestamp.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "autumn_harvest::time::serde_clamped::option::deserialize")]
     pub sticky_until: Option<Timestamp>,
     /// Sticky timeout in milliseconds.
     #[serde(default)]
@@ -257,6 +262,25 @@ impl TaskEnvelope {
 mod tests {
     use super::*;
 
+    /// `chrono::Duration::from_std` refused a delay past `i64::MAX`
+    /// milliseconds, so such a delay still errors and parks no task.
+    #[test]
+    fn due_after_refuses_a_delay_past_the_chrono_bound() {
+        let now = Timestamp::constant(1_700_000_000, 0);
+        let max_ms = Duration::from_millis(u64::try_from(i64::MAX).unwrap());
+        assert_eq!(due_after(now, max_ms, "retry delay").unwrap(), Timestamp::MAX);
+        let past = Duration::from_secs(10_000_000_000_000_000);
+        assert!(matches!(
+            due_after(now, past, "retry delay"),
+            Err(RedisAdapterError::DurationOutOfRange(_))
+        ));
+        assert!(due_after(now, Duration::MAX, "retry delay").is_err());
+        assert_eq!(
+            due_after(now, Duration::from_secs(5), "retry delay").unwrap(),
+            Timestamp::constant(1_700_000_005, 0)
+        );
+    }
+
     #[test]
     fn task_type_round_trips_through_json() {
         let json = serde_json::to_string(&TaskType::Workflow).unwrap();
@@ -276,6 +300,19 @@ mod tests {
         let payload = envelope.to_payload().unwrap();
         let decoded = TaskEnvelope::from_payload(&payload, "0-0").unwrap();
         assert_eq!(envelope, decoded);
+    }
+
+    /// A chrono-era envelope with a year past 9999 still loads, clamped.
+    #[test]
+    fn a_chrono_year_past_the_jiff_range_reads_clamped() {
+        let params = EnqueueParams::new("default", TaskType::Activity, serde_json::json!({}));
+        let envelope = TaskEnvelope::from_params(params, Uuid::new_v4()).unwrap();
+        let mut value = serde_json::from_str::<serde_json::Value>(&envelope.to_payload().unwrap()).unwrap();
+        value["scheduled_at"] = serde_json::json!("+12026-01-01T00:00:00Z");
+        value["sticky_until"] = serde_json::json!("+12026-01-01T00:00:00Z");
+        let decoded = TaskEnvelope::from_payload(&value.to_string(), "0-0").unwrap();
+        assert_eq!(decoded.scheduled_at, Timestamp::MAX);
+        assert_eq!(decoded.sticky_until, Some(Timestamp::MAX));
     }
 
     #[test]

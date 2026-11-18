@@ -99,6 +99,7 @@ pub enum WorkflowEvent {
         #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         input: serde_json::Value,
         /// Time when the workflow was initiated.
+        #[serde(deserialize_with = "crate::time::serde_clamped::deserialize")]
         timestamp: Timestamp,
         /// Output of the most recent prior COMPLETED run of the same schedule (issue #488).
         /// `None` for the first run, for manual (non-scheduled) starts, and when no prior
@@ -116,7 +117,11 @@ pub enum WorkflowEvent {
         /// direct/manual API starts, ad-hoc trigger-now, and pre-#508 histories. This is
         /// the pre-jitter logical slot (`scheduled_for`), NOT `effective_fire_time` and
         /// NOT the execution start wall-clock (`timestamp`). Frozen at start; replay-stable.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::time::serde_clamped::option::deserialize"
+        )]
         scheduled_time: Option<Timestamp>,
     },
     /// The workflow ran to completion without an error.
@@ -857,6 +862,7 @@ pub enum WorkflowEvent {
         attempt: u32,
         /// Wall-clock instant when the retry becomes claimable by a worker.
         /// `Timestamp::now()` for immediate retries, or `now + backoff` for delayed ones.
+        #[serde(deserialize_with = "crate::time::serde_clamped::deserialize")]
         fire_at: Timestamp,
     },
 
@@ -1367,6 +1373,38 @@ mod tests {
     use super::*;
     use crate::types::ActivityExecId;
     use jiff::Timestamp;
+
+    /// A chrono-era event with a year past 9999 still loads, clamped.
+    #[test]
+    fn a_chrono_year_past_the_jiff_range_reads_clamped() {
+        let id = ExecutionId::new();
+        let json = serde_json::json!({
+            "type": "WorkflowRetryScheduled",
+            "data": {"retry_exec_id": id, "attempt": 2, "fire_at": "+12026-01-01T00:00:00Z"},
+        });
+        let event: WorkflowEvent = serde_json::from_value(json).unwrap();
+        assert!(matches!(event, WorkflowEvent::WorkflowRetryScheduled { fire_at, .. } if fire_at == Timestamp::MAX));
+        let json = serde_json::json!({
+            "type": "WorkflowStarted",
+            "data": {
+                "input": {},
+                "timestamp": "+12026-01-01T00:00:00.000Z",
+                "scheduled_time": "+12026-01-01T00:00:00Z",
+            },
+        });
+        let event: WorkflowEvent = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            event,
+            WorkflowEvent::WorkflowStarted { timestamp, scheduled_time: Some(slot), .. }
+                if timestamp == Timestamp::MAX && slot == Timestamp::MAX
+        ));
+        let json = serde_json::json!({
+            "type": "WorkflowStarted",
+            "data": {"input": {}, "timestamp": "2026-01-01T00:00:00Z"},
+        });
+        let event: WorkflowEvent = serde_json::from_value(json).unwrap();
+        assert!(matches!(event, WorkflowEvent::WorkflowStarted { scheduled_time: None, .. }));
+    }
 
     /// Issue #2253: a state change evicts the owner's cache entry. A plain
     /// result does not.

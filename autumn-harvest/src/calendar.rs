@@ -830,14 +830,15 @@ pub async fn load_exclusions_for_calendar(
     use diesel::{ExpressionMethods, QueryDsl};
     use diesel_async::RunQueryDsl;
 
-    let rows: Vec<jiff_diesel::Date> = harvest_calendar_exclusions::table
+    // `SqlDate` skips a stored date past the jiff range, so the load succeeds.
+    let rows: Vec<crate::time::sql::SqlDate> = harvest_calendar_exclusions::table
         .filter(harvest_calendar_exclusions::calendar_name.eq(calendar_name))
         .select(harvest_calendar_exclusions::excluded_date)
         .load(conn)
         .await
         .map_err(crate::error::database_error)?;
 
-    Ok(rows.into_iter().map(jiff_diesel::Date::to_jiff).collect())
+    Ok(rows.into_iter().filter_map(|date| date.0).collect())
 }
 
 /// Batched form of [`load_exclusions_for_calendar`] for many calendar names at once.
@@ -868,7 +869,7 @@ pub async fn load_exclusions_for_calendars(
         return Ok(std::collections::HashMap::new());
     }
 
-    let rows: Vec<(String, jiff_diesel::Date)> = harvest_calendar_exclusions::table
+    let rows: Vec<(String, crate::time::sql::SqlDate)> = harvest_calendar_exclusions::table
         .filter(harvest_calendar_exclusions::calendar_name.eq_any(calendar_names))
         .select((
             harvest_calendar_exclusions::calendar_name,
@@ -881,7 +882,9 @@ pub async fn load_exclusions_for_calendars(
     let mut map: std::collections::HashMap<String, Vec<jiff::civil::Date>> =
         std::collections::HashMap::new();
     for (name, date) in rows {
-        map.entry(name).or_default().push(date.to_jiff());
+        // A stored date past the jiff range can match no fire date.
+        let Some(date) = date.0 else { continue };
+        map.entry(name).or_default().push(date);
     }
     Ok(map)
 }

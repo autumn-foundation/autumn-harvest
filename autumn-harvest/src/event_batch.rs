@@ -170,8 +170,8 @@ pub async fn admit_batched_start_with_codecs(
     }
 
     let now = Timestamp::now();
-    let max_wait_dur = jiff::SignedDuration::try_from(params.max_wait)
-        .unwrap_or_else(|_| crate::time::days(365 * 100));
+    let max_wait_dur = crate::time::from_std_bounded(params.max_wait)
+        .unwrap_or_else(|| crate::time::days(365 * 100));
     let initial_fire_at = now.checked_add(max_wait_dur).unwrap_or(now);
 
     let new_id = uuid::Uuid::new_v4();

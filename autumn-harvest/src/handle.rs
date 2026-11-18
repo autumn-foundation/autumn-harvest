@@ -1264,29 +1264,29 @@ impl WorkflowHandleClient {
         // Issue #2387: an operator override wins over the declared value.
         let (execution_timeout, sla) =
             self.apply_run_defaults(info.name, info.execution_timeout, info.sla);
-        let execution_timeout = execution_timeout.and_then(|d| jiff::SignedDuration::try_from(d).ok());
+        let execution_timeout = execution_timeout.and_then(crate::time::from_std_bounded);
         // Effective SLA clamped to at most the hard execution timeout, mirroring
         // the HTTP start route's resolution (never a soft deadline past the hard
         // one).
         let sla = sla
-            .and_then(|d| jiff::SignedDuration::try_from(d).ok())
+            .and_then(crate::time::from_std_bounded)
             .map(|sla| execution_timeout.map_or(sla, |hard| sla.min(hard)));
         // Issue #2406: the operator override of the chain cap wins too.
         let chain_execution_timeout = self
             .apply_chain_run_default(info.name, info.chain_execution_timeout)
-            .and_then(|d| jiff::SignedDuration::try_from(d).ok());
+            .and_then(crate::time::from_std_bounded);
         let max_workflow_input_bytes = self.max_workflow_input_bytes(info.max_input_bytes);
         let max_workflow_execution_timeout_ceiling = self
             .inner
             .max_workflow_execution_timeout
-            .and_then(|d| jiff::SignedDuration::try_from(d).ok());
+            .and_then(crate::time::from_std_bounded);
         let max_workflow_chain_timeout_ceiling = self
             .inner
             .max_workflow_chain_timeout
-            .and_then(|d| jiff::SignedDuration::try_from(d).ok());
+            .and_then(crate::time::from_std_bounded);
         let max_workflow_start_delay =
-            jiff::SignedDuration::try_from(self.inner.max_workflow_start_delay)
-                .unwrap_or_else(|_| crate::time::days(365));
+            crate::time::from_std_bounded(self.inner.max_workflow_start_delay)
+                .unwrap_or_else(|| crate::time::days(365));
 
         ResolvedStartDefaults {
             concurrency_key,

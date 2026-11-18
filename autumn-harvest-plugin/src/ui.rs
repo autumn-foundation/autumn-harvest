@@ -1775,7 +1775,7 @@ fn parse_started_bound(
     let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
         return (None, String::new(), None);
     };
-    trimmed.parse::<Timestamp>().map_or_else(
+    autumn_harvest::time::parse::rfc3339(trimmed).map_or_else(
         |_| {
             (
                 None,
@@ -3458,7 +3458,7 @@ fn parse_dead_letter_time_filter(
     let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
         return (None, String::new(), None);
     };
-    let Ok(parsed) = trimmed.parse::<Timestamp>() else {
+    let Ok(parsed) = autumn_harvest::time::parse::rfc3339(trimmed) else {
         return (
             None,
             trimmed.to_string(),
@@ -10609,12 +10609,12 @@ async fn execute_schedule_trigger_ui(
         .registry()
         .chain_execution_timeout(workflow_name)
         .filter(|_| !is_dag)
-        .and_then(|d| jiff::SignedDuration::try_from(d).ok());
+        .and_then(autumn_harvest::time::from_std_bounded);
     let max_workflow_chain_timeout_ceiling = runtime
         .registry()
         .max_workflow_chain_timeout
         .filter(|_| !is_dag)
-        .and_then(|d| jiff::SignedDuration::try_from(d).ok());
+        .and_then(autumn_harvest::time::from_std_bounded);
     let result = start_or_load_workflow_execution_with_metrics_and_codecs(
         conn,
         StartWorkflowParams {
@@ -12485,7 +12485,7 @@ impl BackfillFormParams {
         include_paused: bool,
     ) -> Result<Self, String> {
         let parse_one = |label: &str, raw: &str| {
-            raw.trim().parse::<Timestamp>()
+            autumn_harvest::time::parse::rfc3339(raw.trim())
                 .map_err(|_| {
                     format!(
                         "invalid {label} '{raw}': expected an RFC 3339 instant, \

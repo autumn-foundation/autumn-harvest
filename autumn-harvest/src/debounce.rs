@@ -112,9 +112,9 @@ pub fn compute_fire_deadline(
     // Clamp absurd/overflowing durations to a large-but-finite value and use
     // checked addition so an extreme `window`/`max_wait` can never panic.
     let window_dur =
-        jiff::SignedDuration::try_from(window).unwrap_or_else(|_| crate::time::days(365 * 100));
+        crate::time::from_std_bounded(window).unwrap_or_else(|| crate::time::days(365 * 100));
     let max_wait_dur =
-        jiff::SignedDuration::try_from(max_wait).unwrap_or_else(|_| crate::time::days(365 * 100));
+        crate::time::from_std_bounded(max_wait).unwrap_or_else(|| crate::time::days(365 * 100));
 
     let trailing_edge = now.checked_add(window_dur).unwrap_or(now);
     let cap = first_seen
@@ -410,10 +410,10 @@ pub async fn admit_debounced_start_with_codecs(
     let now = Timestamp::now();
     // Clamp absurd/overflowing durations to a large-but-finite value and use
     // checked addition so an extreme `window`/`max_wait` can never panic.
-    let window_dur = jiff::SignedDuration::try_from(params.window)
-        .unwrap_or_else(|_| crate::time::days(365 * 100));
-    let max_wait_dur = jiff::SignedDuration::try_from(params.max_wait)
-        .unwrap_or_else(|_| crate::time::days(365 * 100));
+    let window_dur = crate::time::from_std_bounded(params.window)
+        .unwrap_or_else(|| crate::time::days(365 * 100));
+    let max_wait_dur = crate::time::from_std_bounded(params.max_wait)
+        .unwrap_or_else(|| crate::time::days(365 * 100));
 
     let max_fire_at = now.checked_add(max_wait_dur).unwrap_or(now);
     let initial_fire_at = now
@@ -1605,6 +1605,17 @@ mod tests {
         // A zero window means every request fires immediately (trailing edge = now).
         let deadline = compute_fire_deadline(t0, Duration::ZERO, t0, Duration::from_secs(300));
         assert_eq!(deadline, t0, "zero window should produce fire_at = now");
+    }
+
+    /// chrono read a `max_wait` past `i64::MAX` milliseconds as 100 years.
+    /// The debounce then still fires on its window, not at once.
+    #[test]
+    fn a_max_wait_past_the_chrono_range_keeps_the_window() {
+        let t0 = ts(2026, 6, 18, 10, 0, 0);
+        let window = Duration::from_secs(30);
+        let max_wait = Duration::from_secs(999_999_999_999 * 86_400);
+        let deadline = compute_fire_deadline(t0, window, t0, max_wait);
+        assert_eq!(deadline, t0 + jiff::SignedDuration::from_secs(30));
     }
 
     // ── redefer_target (issue #1227, Finding 3) ─────────────────────────────

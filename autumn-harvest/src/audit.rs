@@ -1933,6 +1933,15 @@ pub async fn list_audit(
         .map_err(database_error)
 }
 
+/// Returns the audit purge cutoff, `retention_days` before `now`.
+///
+/// A cutoff before the jiff range gives `Timestamp::MIN`. It predates every
+/// row, as the old `chrono` cutoff did, so the purge cannot panic.
+fn audit_purge_cutoff(now: jiff::Timestamp, retention_days: i64) -> jiff::Timestamp {
+    now.checked_sub(crate::time::days(retention_days))
+        .unwrap_or(jiff::Timestamp::MIN)
+}
+
 /// Delete audit records older than `retention_days` days.
 ///
 /// Called by the retention subsystem on its configured cadence. Returns the
@@ -2108,7 +2117,7 @@ pub async fn purge_old_audit_records(
 ) -> HarvestResult<usize> {
     use diesel_async::RunQueryDsl as _;
 
-    let cutoff = jiff::Timestamp::now() - crate::time::days(retention_days);
+    let cutoff = audit_purge_cutoff(jiff::Timestamp::now(), retention_days);
 
     // Delete an aged row UNLESS export is live AND that row is still pending.
     //
@@ -2289,6 +2298,14 @@ struct PurgeCount {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_purge_cutoff_saturates_before_the_jiff_range() {
+        let now = jiff::Timestamp::constant(1_700_000_000, 0);
+        assert_eq!(audit_purge_cutoff(now, 1), jiff::Timestamp::constant(1_699_913_600, 0));
+        assert_eq!(audit_purge_cutoff(now, 10_000_000), jiff::Timestamp::MIN);
+        assert_eq!(audit_purge_cutoff(now, i64::MAX), jiff::Timestamp::MIN);
+    }
 
     #[test]
     fn operation_constants_are_distinct() {

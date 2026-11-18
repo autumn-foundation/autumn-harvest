@@ -205,7 +205,7 @@ impl WorkflowCountParams {
                     }
                 }
                 "started_after" => {
-                    let dt = value.trim().parse::<Timestamp>()
+                    let dt = autumn_harvest::time::parse::rfc3339(value.trim())
                         .map_err(|_| {
                             format!(
                                 "invalid started_after '{value}'; expected RFC 3339 \
@@ -215,7 +215,7 @@ impl WorkflowCountParams {
                     params.started_after = Some(dt);
                 }
                 "started_before" => {
-                    let dt = value.trim().parse::<Timestamp>()
+                    let dt = autumn_harvest::time::parse::rfc3339(value.trim())
                         .map_err(|_| {
                             format!(
                                 "invalid started_before '{value}'; expected RFC 3339 \

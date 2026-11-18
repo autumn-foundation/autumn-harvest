@@ -259,9 +259,45 @@ impl FromSql<Nullable<Timestamptz>, Pg> for NullableTimestamp {
     }
 }
 
+/// Converts a Postgres `date` day count to a jiff date.
+///
+/// It returns `None` for a date past the jiff range. `chrono` could store a
+/// date up to the year 262142, and Postgres can hold `infinity`.
+fn from_pg_days(days: i32) -> Option<jiff::civil::Date> {
+    let span = jiff::Span::new().try_days(i64::from(days)).ok()?;
+    jiff::civil::date(2000, 1, 1).checked_add(span).ok()
+}
+
+/// A calendar date that Diesel reads from a `date` column.
+///
+/// `jiff_diesel::Date` fails on a stored date past the jiff range, so one
+/// such row fails the whole query. This wrapper reads it as `None`, and the
+/// caller skips it. No fire date that jiff holds can match such a date.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, FromSqlRow)]
+pub struct SqlDate(pub Option<jiff::civil::Date>);
+
+impl FromSql<diesel::sql_types::Date, Pg> for SqlDate {
+    fn from_sql(bytes: PgValue<'_>) -> deserialize::Result<Self> {
+        let diesel::pg::data_types::PgDate(days) =
+            FromSql::<diesel::sql_types::Date, Pg>::from_sql(bytes)?;
+        Ok(Self(from_pg_days(days)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_date_past_the_jiff_range_reads_as_none() {
+        assert_eq!(from_pg_days(0), Some(jiff::civil::date(2000, 1, 1)));
+        assert_eq!(from_pg_days(-1), Some(jiff::civil::date(1999, 12, 31)));
+        let last = jiff::civil::Date::MAX.since(jiff::civil::date(2000, 1, 1)).unwrap().get_days();
+        assert_eq!(from_pg_days(last), Some(jiff::civil::Date::MAX));
+        assert_eq!(from_pg_days(last + 1), None);
+        assert_eq!(from_pg_days(i32::MAX), None);
+        assert_eq!(from_pg_days(i32::MIN), None);
+    }
 
     #[test]
     fn a_write_splits_days_from_microseconds() {

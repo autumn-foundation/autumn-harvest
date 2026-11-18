@@ -2154,7 +2154,7 @@ pub fn parse_instant(
     now: Timestamp,
 ) -> Result<Timestamp, String> {
     let trimmed = value.trim();
-    if let Ok(parsed) = trimmed.parse::<Timestamp>() {
+    if let Ok(parsed) = crate::time::parse::rfc3339(trimmed) {
         return Ok(parsed);
     }
     if let Some(dur) = crate::task_duration(trimmed)
@@ -2583,6 +2583,19 @@ async fn load_workflow_names(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `chrono` held a far-future sentinel and read more than 9 fraction
+    /// digits. Both still parse.
+    #[test]
+    fn parse_instant_reads_what_chrono_read() {
+        let now = Timestamp::constant(1_700_000_000, 0);
+        assert_eq!(parse_instant("until", "9999-12-31T23:59:59Z", now), Ok(Timestamp::MAX));
+        assert_eq!(
+            parse_instant("since", "2026-01-01T00:00:00.1234567891Z", now),
+            Ok(Timestamp::constant(1_767_225_600, 123_456_789))
+        );
+        assert!(parse_instant("since", "soon", now).is_err());
+    }
 
     fn aead_codecs() -> PayloadCodecs {
         let codecs = PayloadCodecs::default();

@@ -4177,6 +4177,18 @@ pub async fn sweep_exporting(
     .await
 }
 
+/// Returns `true` when the straggler `grace` after `upper` has passed.
+///
+/// A grace past the `chrono` range, `i64::MAX` milliseconds, never passes,
+/// as `chrono::Duration::from_std` failed for it. A due time past the jiff
+/// range has not passed either, so the check cannot panic.
+#[cfg(feature = "db")]
+fn straggler_grace_elapsed(upper: Timestamp, grace: Duration, now: Timestamp) -> bool {
+    crate::time::from_std_bounded(grace)
+        .and_then(|grace| upper.checked_add(grace).ok())
+        .is_some_and(|due| due <= now)
+}
+
 /// The shared body of [`sweep`] and [`evaluate`].
 ///
 /// One implementation so a read-only status report and the pass it predicts can
@@ -4315,8 +4327,7 @@ async fn sweep_inner(
                     && gate.allows_straggler_delete()
                     && reason != SCAN_BUDGET_REASON
                     && let Some(grace) = opts.straggler_grace
-                    && let Ok(grace) = jiff::SignedDuration::try_from(grace)
-                    && upper + grace <= now
+                    && straggler_grace_elapsed(upper, grace, now)
                 {
                     outcome.straggler_rows_deleted += delete_orphan_rows(
                         conn,
@@ -7061,6 +7072,17 @@ pub fn migration_plan(opts: &EnableOptions, now: Timestamp) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn straggler_grace_elapsed_never_panics_on_a_huge_grace() {
+        let upper = Timestamp::constant(1_700_000_000, 0);
+        let now = upper + jiff::SignedDuration::from_secs(120);
+        assert!(straggler_grace_elapsed(upper, Duration::from_secs(60), now));
+        assert!(!straggler_grace_elapsed(upper, Duration::from_secs(600), now));
+        assert!(!straggler_grace_elapsed(upper, Duration::from_secs(400_000_000_000), now));
+        assert!(!straggler_grace_elapsed(upper, Duration::from_secs(i64::MAX as u64), now));
+    }
 
     /// Each layout path installs the entity projection trigger next to the
     /// guard, and drops the old copy before the legacy table attaches (issue

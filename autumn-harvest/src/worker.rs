@@ -13734,8 +13734,9 @@ fn build_child_row<'p>(
     // `resolve_child_workflow_defaults` itself does for every other,
     // immediate-use caller.
     let now = jiff::Timestamp::now();
-    let deadline_at = plan.defaults.execution_timeout.map(|d| now + d);
-    let sla_deadline_at = plan.defaults.sla.map(|d| now + d);
+    // A deadline past the jiff range is stored as NULL, as at the start path.
+    let deadline_at = plan.defaults.execution_timeout.and_then(|d| now.checked_add(d).ok());
+    let sla_deadline_at = plan.defaults.sla.and_then(|d| now.checked_add(d).ok());
     let chain_deadline_at = plan
         .defaults
         .chain_execution_timeout
@@ -13993,18 +13994,20 @@ fn resolve_child_workflow_defaults(
     let (execution_timeout, sla) =
         registry.apply_run_defaults(workflow_name, execution_timeout, sla);
     let chain_execution_timeout = registry.chain_execution_timeout(workflow_name);
-    let execution_timeout = execution_timeout.and_then(|d| jiff::SignedDuration::try_from(d).ok());
-    let sla = sla.and_then(|d| jiff::SignedDuration::try_from(d).ok());
-    let deadline_at = execution_timeout.map(|d| jiff::Timestamp::now() + d);
-    let sla_deadline_at = sla.map(|d| jiff::Timestamp::now() + d);
+    let execution_timeout = execution_timeout.and_then(crate::time::from_std_bounded);
+    let sla = sla.and_then(crate::time::from_std_bounded);
+    // A deadline past the jiff range is stored as NULL, as at the start path.
+    let now = jiff::Timestamp::now();
+    let deadline_at = execution_timeout.and_then(|d| now.checked_add(d).ok());
+    let sla_deadline_at = sla.and_then(|d| now.checked_add(d).ok());
     // A child is its own logical workflow → fresh chain origin (issue #617).
     // Issue #2406: the fleet chain ceiling caps the chain cap of a child, so
     // an override cannot exceed it. A child type with no cap stays uncapped.
     let chain_ceiling = registry
         .max_workflow_chain_timeout
-        .and_then(|d| jiff::SignedDuration::try_from(d).ok());
+        .and_then(crate::time::from_std_bounded);
     let chain_execution_timeout = chain_execution_timeout
-        .and_then(|d| jiff::SignedDuration::try_from(d).ok())
+        .and_then(crate::time::from_std_bounded)
         .map(|d| chain_ceiling.map_or(d, |ceiling| d.min(ceiling)));
     // `checked_add_signed` guards against `Duration::MAX` overflow (issue
     // #617): `DateTime + Duration` panics; yield `None` instead.
@@ -16681,8 +16684,8 @@ async fn create_detached_child_executions(
         // Issue #2387: an operator SLA override wins over the declared one. A
         // detached child resolves no `execution_timeout`, so only the SLA applies.
         let (_, child_sla) = registry.apply_run_defaults(workflow_name, None, child_sla);
-        let child_sla = child_sla.and_then(|d| jiff::SignedDuration::try_from(d).ok());
-        let child_sla_deadline_at = child_sla.map(|d| jiff::Timestamp::now() + d);
+        let child_sla = child_sla.and_then(crate::time::from_std_bounded);
+        let child_sla_deadline_at = child_sla.and_then(|d| jiff::Timestamp::now().checked_add(d).ok());
         // A detached child accumulates its own history/DLQ/active-execution
         // footprint exactly like any other registry-aware start. So it is
         // resolved against and enforced under its OWN declared quota (issue
@@ -16869,7 +16872,8 @@ pub(crate) fn deadline_would_be_exceeded(
     now: jiff::Timestamp,
     retry_delay: jiff::SignedDuration,
 ) -> bool {
-    deadline.is_some_and(|d| now + retry_delay >= d)
+    // A retry past the jiff range is past every deadline that jiff can hold.
+    deadline.is_some_and(|d| now.checked_add(retry_delay).map_or(true, |next| next >= d))
 }
 
 /// Returns `true` when the cross-retry wall-clock deadline would be exceeded
@@ -19044,7 +19048,12 @@ async fn handle_session_acquire(
     let eligible_since = task.created_at.unwrap_or(task.scheduled_at);
     let acquisition_timeout_exceeded = task
         .schedule_to_start
-        .is_some_and(|budget| jiff::Timestamp::now() >= eligible_since + budget);
+        .is_some_and(|budget| {
+            // A due time past the jiff range is never reached, as under chrono.
+            eligible_since
+                .checked_add(budget)
+                .is_ok_and(|due| jiff::Timestamp::now() >= due)
+        });
     if acquisition_timeout_exceeded {
         return record_session_acquire_schedule_to_start_timeout(
             &mut conn,
@@ -24802,12 +24811,11 @@ fn resolve_continue_as_new_successor_defaults<'a>(
     let Some(info) = target_info else {
         return ContinueAsNewSuccessorDefaults {
             execution_timeout: execution.execution_timeout,
-            // Plain `+` (not `checked_add_signed`) preserves the pre-#803 path
-            // exactly. Safe because the value is a stored duration that was
-            // already validated when the chain's first run started.
-            deadline_at: execution.execution_timeout.map(|d| now + d),
+            // The start path stores a deadline past the jiff range as NULL and
+            // keeps the duration. The successor follows the same rule.
+            deadline_at: execution.execution_timeout.and_then(|d| now.checked_add(d).ok()),
             sla: execution.sla,
-            sla_deadline_at: execution.sla.map(|d| now + d),
+            sla_deadline_at: execution.sla.and_then(|d| now.checked_add(d).ok()),
             owner: execution.owner.as_deref(),
             runbook_url: execution.runbook_url.as_deref(),
             severity: execution.severity.as_deref(),
@@ -56291,6 +56299,16 @@ mod tests {
     }
 
     #[test]
+    fn deadline_would_be_exceeded_true_when_the_retry_overflows_the_range() {
+        let now = jiff::Timestamp::now();
+        assert!(deadline_would_be_exceeded(
+            Some(jiff::Timestamp::MAX),
+            now,
+            jiff::SignedDuration::from_secs(400_000_000_000)
+        ));
+    }
+
+    #[test]
     fn deadline_would_be_exceeded_false_after_a_resume_shift() {
         // Issue #609: a pause/resume cycle that completes while the attempt is
         // in flight shifts the row's deadline forward. The fresh (shifted) value
@@ -57290,6 +57308,21 @@ mod tests {
             rebalance: crate::models::RebalanceMarkers::default(),
             tenant: None,
         }
+    }
+
+    /// A stored timeout past the jiff range gives a NULL successor deadline.
+    /// It does not panic the worker.
+    #[test]
+    fn same_type_successor_with_a_huge_stored_timeout_has_no_deadline() {
+        let mut execution = can803_predecessor();
+        execution.execution_timeout = Some(jiff::SignedDuration::from_secs(400_000_000_000));
+        execution.sla = Some(jiff::SignedDuration::from_secs(400_000_000_000));
+        let now = jiff::Timestamp::now();
+        let defaults =
+            resolve_continue_as_new_successor_defaults(&execution, None, None, None, now);
+        assert_eq!(defaults.execution_timeout, execution.execution_timeout);
+        assert_eq!(defaults.deadline_at, None);
+        assert_eq!(defaults.sla_deadline_at, None);
     }
 
     /// AC1/AC4: a same-type continuation (`new_workflow_type: None`) keeps the

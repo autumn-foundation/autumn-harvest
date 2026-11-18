@@ -5732,7 +5732,10 @@ fn resume_deadline_shifts(
     // execution deadline forward by the time spent paused, so paused
     // wall-clock does not count against the workflow's `execution_timeout`.
     // `None` (no deadline) stays `None`.
-    let new_deadline_at = execution.deadline_at.map(|d| d + pause_span);
+    // A shift past the jiff range saturates, so the deadline stays "not due".
+    let new_deadline_at = execution
+        .deadline_at
+        .map(|d| d.checked_add(pause_span).unwrap_or(jiff::Timestamp::MAX));
     // Also push the soft SLA deadline forward (issue #487). A workflow paused
     // mid-flight should not breach its SLA while paused. BUT only suspend a
     // deadline that was still ahead when the pause began. A deadline already
@@ -5742,7 +5745,7 @@ fn resume_deadline_shifts(
     let new_sla_deadline_at = execution
         .sla_deadline_at
         .map(|d| match execution.paused_at {
-            Some(p) if d > p => d + pause_span,
+            Some(p) if d > p => d.checked_add(pause_span).unwrap_or(jiff::Timestamp::MAX),
             _ => d,
         });
 
@@ -10809,7 +10812,7 @@ mod non_terminal_sql_tests {
 #[cfg(test)]
 mod pause_helper_tests {
     use super::{
-        MAX_PAUSE_SHIFT_MICROS, clamped_pause_shift_micros, pause_timeout_exceeded,
+        MAX_PAUSE_SHIFT_MICROS, clamped_pause_shift_micros, pause_timeout_exceeded, resume_deadline_shifts,
         shift_external_schedule_to_close_on_resume_query, shift_schedule_to_close_on_resume_query,
     };
     use jiff::{SignedDuration, Timestamp};
@@ -10845,6 +10848,21 @@ mod pause_helper_tests {
             clamped_pause_shift_micros(SignedDuration::from_secs(-5)),
             -5_000_000
         );
+    }
+
+    /// A clamped chrono-era deadline reads as `Timestamp::MAX`. A resume then
+    /// keeps it at `MAX` and does not panic.
+    #[test]
+    fn resume_shift_saturates_a_deadline_at_the_end_of_the_range() {
+        let mut execution = crate::reset::tests::execution_in_state("PAUSED");
+        let resumed_at = jiff::Timestamp::constant(1_700_000_000, 0);
+        execution.paused_at = Some(resumed_at - SignedDuration::from_hours(1));
+        execution.deadline_at = Some(jiff::Timestamp::MAX);
+        execution.sla_deadline_at = Some(jiff::Timestamp::MAX);
+        let shifts = resume_deadline_shifts(&execution, resumed_at);
+        assert_eq!(shifts.pause_span, SignedDuration::from_hours(1));
+        assert_eq!(shifts.new_deadline_at, Some(jiff::Timestamp::MAX));
+        assert_eq!(shifts.new_sla_deadline_at, Some(jiff::Timestamp::MAX));
     }
 
     #[test]

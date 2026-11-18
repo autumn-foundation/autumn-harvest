@@ -4912,7 +4912,7 @@ mod tests {
              operator to force-close it: {summary}"
         );
         assert!(
-            summary.contains(&until.to_string()),
+            summary.contains(&crate::time::utc_display(until)),
             "the summary must state the automatic-recovery deadline: {summary}"
         );
         assert!(

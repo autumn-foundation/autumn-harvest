@@ -18,6 +18,40 @@ use crate::schema::{harvest_external_tasks, harvest_workflow_executions};
 use crate::store;
 use crate::types::{ActivityExecId, ExecutionId, ExternalActivityToken};
 
+/// The last second that `chrono` could hold, `DateTime::<Utc>::MAX_UTC`.
+const CHRONO_MAX_UTC_SECOND: i64 = 8_210_266_876_799;
+
+/// Returns the external-task deadline `dur` after `now`.
+///
+/// A deadline past the jiff range saturates to `Timestamp::MAX`, as the
+/// worker timer does. A deadline past the old `chrono` range still fails, as
+/// `checked_add_signed` failed for it.
+fn external_deadline(now: Timestamp, dur: jiff::SignedDuration) -> HarvestResult<Timestamp> {
+    match now.checked_add(dur) {
+        Ok(deadline) => Ok(deadline),
+        Err(_) if now.as_second().saturating_add(dur.as_secs()) <= CHRONO_MAX_UTC_SECOND => {
+            Ok(Timestamp::MAX)
+        }
+        Err(_) => Err(HarvestError::Database("Datetime addition overflow".to_string())),
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    #[test]
+    fn external_deadline_saturates_inside_the_chrono_range() {
+        let now = Timestamp::constant(1_700_000_000, 0);
+        let hour = jiff::SignedDuration::from_hours(1);
+        assert_eq!(external_deadline(now, hour).unwrap(), now + hour);
+        let far = jiff::SignedDuration::from_secs(400_000_000_000);
+        assert_eq!(external_deadline(now, far).unwrap(), Timestamp::MAX);
+        let past_chrono = jiff::SignedDuration::from_secs(9_000_000_000_000);
+        assert!(external_deadline(now, past_chrono).is_err());
+    }
+}
+
 /// External activity states persisted in `harvest_external_tasks`.
 pub const KNOWN_EXTERNAL_TASK_STATES: &[&str] =
     &["PENDING", "COMPLETED", "FAILED", "TIMED_OUT", "CANCELLED"];
@@ -144,9 +178,7 @@ pub async fn record_external_task(
     )?;
 
     // host-clock-ok: the external-task timeout scan also compares with the host clock.
-    let schedule_to_close_at = Timestamp::now().checked_add(dur).map_err(|_| {
-        crate::error::HarvestError::Database("Datetime addition overflow".to_string())
-    })?;
+    let schedule_to_close_at = external_deadline(Timestamp::now(), dur)?;
 
     let row = NewExternalTask {
         token: token.as_uuid(),
@@ -475,9 +507,7 @@ pub async fn extend_deadline(
         let dur =
             crate::worker::signed_duration_from_secs(extend_by_secs, "external task extend by")?;
 
-        let new_deadline = Timestamp::now().checked_add(dur).map_err(|_| {
-            crate::error::HarvestError::Database("Datetime addition overflow".to_string())
-        })?;
+        let new_deadline = external_deadline(Timestamp::now(), dur)?;
 
         diesel::update(harvest_external_tasks::table.find(task.id))
             .set((

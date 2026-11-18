@@ -1065,7 +1065,7 @@ impl Target {
         if text == LATEST {
             return Some(Self::Latest);
         }
-        text.parse::<Timestamp>()
+        autumn_harvest::time::parse::rfc3339(text)
             .ok()
             .map(Self::At)
     }

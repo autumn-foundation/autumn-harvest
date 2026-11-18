@@ -9,15 +9,20 @@
 //! - The duration helpers keep the `i64` results and truncation rules of
 //!   the `chrono` accessors that they replace.
 //! - [`cron`] lets `croner` walk a jiff zoned date and time.
+//! - [`parse`] reads input text that `chrono` read, such as a request field.
 //! - `sql` maps a duration to a Postgres `interval` as Diesel mapped one.
 //!
 //! A timestamp in JSON uses the jiff `serde` format. It is RFC 3339 with a
 //! `Z` suffix and the fewest fraction digits that keep the value exact.
 //! `chrono` wrote 3, 6 or 9 digits. Each library reads the output of the
-//! other, so a stored value stays readable.
+//! other, so a stored value stays readable. [`serde_clamped`] also reads a
+//! stored year past the jiff range.
 
 pub mod cron;
 pub mod format;
+pub mod parse;
+pub mod serde_clamped;
+pub mod serde_secs_nanos;
 #[cfg(feature = "db")]
 pub mod sql;
 
@@ -27,21 +32,50 @@ pub use jiff::{SignedDuration, Timestamp, civil};
 
 /// Returns the IANA time zone `name`, as `chrono-tz` resolved it.
 ///
-/// jiff reads the host database first. A Debian or Ubuntu host without the
-/// `tzdata-legacy` package lacks the old link names, such as `US/Eastern`.
-/// `chrono-tz` always knew them. So a name that the host lacks falls back
-/// to the database that jiff bundles. A stored schedule in such a zone then
-/// still fires.
+/// A name is valid only if the database that jiff bundles holds it with the
+/// exact case. `chrono-tz` matched a name with its exact case too, and jiff
+/// ignores case. The bundled names are the 597 names of `chrono-tz` 0.10,
+/// plus `Factory`, which `chrono-tz` left out, so this function refuses it.
+/// A host database can also hold `localtime` and `posixrules`. They follow
+/// the zone of each host, so two hosts could disagree on one schedule.
 ///
-/// `chrono-tz` matched a name with its exact case. jiff ignores case. This
-/// function refuses a name that differs in case from the zone that it finds,
-/// so it accepts the names that `chrono-tz` accepted.
+/// The host database supplies the rules of a valid name when it holds the
+/// name. A Debian or Ubuntu host without the `tzdata-legacy` package lacks
+/// the old link names, such as `US/Eastern`. The bundled copy then supplies
+/// the rules, so a stored schedule in such a zone still fires.
 #[must_use]
 pub fn zone(name: &str) -> Option<TimeZone> {
-    let found = TimeZone::get(name)
-        .or_else(|_| jiff::tz::TimeZoneDatabase::bundled().get(name))
-        .ok()?;
-    (found.iana_name() == Some(name)).then_some(found)
+    if name == NOT_IN_CHRONO_TZ {
+        return None;
+    }
+    let bundled = jiff::tz::TimeZoneDatabase::bundled()
+        .get(name)
+        .ok()
+        .filter(|found| found.iana_name() == Some(name))?;
+    match TimeZone::get(name) {
+        Ok(host) if host.iana_name() == Some(name) => Some(host),
+        _ => Some(bundled),
+    }
+}
+
+/// The one bundled zone name that `chrono-tz` did not accept.
+const NOT_IN_CHRONO_TZ: &str = "Factory";
+
+/// The longest duration that `chrono::Duration::from_std` accepted.
+///
+/// That bound is `i64::MAX` milliseconds, about 292 million years.
+pub const CHRONO_MAX_DURATION: SignedDuration = SignedDuration::from_millis(i64::MAX);
+
+/// Converts a standard duration as `chrono::Duration::from_std(d).ok()` did.
+///
+/// `SignedDuration::try_from` accepts up to `i64::MAX` seconds. `chrono`
+/// refused a value past `i64::MAX` milliseconds. Code that dropped or
+/// replaced such a value keeps that result through this function.
+#[must_use]
+pub fn from_std_bounded(duration: std::time::Duration) -> Option<SignedDuration> {
+    SignedDuration::try_from(duration)
+        .ok()
+        .filter(|converted| *converted <= CHRONO_MAX_DURATION)
 }
 
 /// Seconds in one day of elapsed time.
@@ -195,6 +229,14 @@ mod tests {
     }
 
     #[test]
+    fn zone_refuses_names_that_chrono_tz_refused() {
+        assert!(zone("localtime").is_none());
+        assert!(zone("posixrules").is_none());
+        assert!(zone("Factory").is_none());
+        assert!(zone("America/New_York").is_some());
+    }
+
+    #[test]
     fn clamped_reads_keep_old_chrono_sentinels_loadable() {
         // chrono's `DateTime::<Utc>::MAX_UTC.timestamp_millis()`.
         assert_eq!(from_millisecond_clamped(8_210_266_876_799_999), Timestamp::MAX);
@@ -202,6 +244,15 @@ mod tests {
         assert_eq!(from_microsecond_clamped(i64::MAX), Timestamp::MAX);
         assert_eq!(from_millisecond_clamped(1_700_000_000_123), Timestamp::constant(1_700_000_000, 123_000_000));
         assert_eq!(from_microsecond_clamped(-1), Timestamp::constant(-1, 999_999_000));
+    }
+
+    #[test]
+    fn from_std_bounded_keeps_the_chrono_range() {
+        let max_ms = std::time::Duration::from_millis(u64::try_from(i64::MAX).unwrap());
+        assert_eq!(from_std_bounded(max_ms), Some(CHRONO_MAX_DURATION));
+        assert_eq!(from_std_bounded(max_ms + std::time::Duration::from_millis(1)), None);
+        assert_eq!(from_std_bounded(std::time::Duration::from_secs(i64::MAX as u64)), None);
+        assert_eq!(from_std_bounded(std::time::Duration::from_secs(5)), Some(SignedDuration::from_secs(5)));
     }
 
     #[test]

@@ -5521,11 +5521,11 @@ async fn tick_one_workflow_schedule(
                     // normal start path does.
                     chain_execution_timeout_secs: registry
                         .chain_execution_timeout(wf_name)
-                        .and_then(|d| jiff::SignedDuration::try_from(d).ok())
+                        .and_then(crate::time::from_std_bounded)
                         .map(|d| d.as_secs()),
                     max_workflow_chain_timeout_ceiling_secs: registry
                         .max_workflow_chain_timeout
-                        .and_then(|d| jiff::SignedDuration::try_from(d).ok())
+                        .and_then(crate::time::from_std_bounded)
                         .map(|d| d.as_secs()),
                     max_workflow_input_bytes: Some(effective_cap),
                     trace_context: None,
@@ -5609,10 +5609,10 @@ async fn tick_one_workflow_schedule(
                     // it is a pure cap, not a fleet-wide default.
                     chain_execution_timeout: registry
                         .chain_execution_timeout(wf_name)
-                        .and_then(|d| jiff::SignedDuration::try_from(d).ok()),
+                        .and_then(crate::time::from_std_bounded),
                     max_workflow_chain_timeout_ceiling: registry
                         .max_workflow_chain_timeout
-                        .and_then(|d| jiff::SignedDuration::try_from(d).ok()),
+                        .and_then(crate::time::from_std_bounded),
                     concurrency_key,
                     concurrency_limit,
                     concurrency_on_conflict,
@@ -6741,8 +6741,7 @@ pub(crate) fn catchup_run_plan(
             }
         }
         CatchupPolicy::Window(window) => {
-            let cutoff = now
-                - jiff::SignedDuration::try_from(window).unwrap_or_else(|_| jiff::SignedDuration::ZERO);
+            let cutoff = catchup_window_cutoff(now, window);
             let summary = eligible_slot_summary(schedule, first_due, now, end_at);
             let run_dates = window_eligible_slots(schedule, first_due, now, end_at, cutoff);
             let fired = run_dates.len() as u64;
@@ -6756,6 +6755,18 @@ pub(crate) fn catchup_run_plan(
                 dropped: summary.eligible_count.saturating_sub(fired),
             }
         }
+    }
+}
+
+/// Returns the oldest slot time that a catch-up `window` still fires.
+///
+/// A window past the `chrono` range, `i64::MAX` milliseconds, gives `now`, as
+/// `chrono::Duration::from_std` failed for it. A cutoff before the jiff range
+/// gives `Timestamp::MIN`, so every missed slot is in the window, as in chrono.
+fn catchup_window_cutoff(now: Timestamp, window: std::time::Duration) -> Timestamp {
+    match crate::time::from_std_bounded(window) {
+        Some(window) => now.checked_sub(window).unwrap_or(Timestamp::MIN),
+        None => now,
     }
 }
 
@@ -7507,11 +7518,11 @@ async fn drain_claimed_buffered_schedule(
                     // buffered-drain fire keeps the cap.
                     chain_execution_timeout_secs: registry
                         .chain_execution_timeout(wf_name)
-                        .and_then(|d| jiff::SignedDuration::try_from(d).ok())
+                        .and_then(crate::time::from_std_bounded)
                         .map(|d| d.as_secs()),
                     max_workflow_chain_timeout_ceiling_secs: registry
                         .max_workflow_chain_timeout
-                        .and_then(|d| jiff::SignedDuration::try_from(d).ok())
+                        .and_then(crate::time::from_std_bounded)
                         .map(|d| d.as_secs()),
                     max_workflow_input_bytes: Some(effective_cap),
                     trace_context: None,
@@ -7595,10 +7606,10 @@ async fn drain_claimed_buffered_schedule(
                     // site's own throttled sibling.
                     chain_execution_timeout: registry
                         .chain_execution_timeout(wf_name)
-                        .and_then(|d| jiff::SignedDuration::try_from(d).ok()),
+                        .and_then(crate::time::from_std_bounded),
                     max_workflow_chain_timeout_ceiling: registry
                         .max_workflow_chain_timeout
-                        .and_then(|d| jiff::SignedDuration::try_from(d).ok()),
+                        .and_then(crate::time::from_std_bounded),
                     concurrency_key,
                     concurrency_limit,
                     concurrency_on_conflict,
@@ -8068,6 +8079,19 @@ pub(crate) async fn maybe_reset_schedule_failure_counter(
 mod tests {
     use super::*;
     use jiff::Timestamp;
+
+    #[test]
+    fn catchup_window_cutoff_keeps_the_chrono_result_for_huge_windows() {
+        let now = Timestamp::constant(1_700_000_000, 0);
+        assert_eq!(
+            catchup_window_cutoff(now, Duration::from_secs(60)),
+            Timestamp::constant(1_699_999_940, 0)
+        );
+        // A window before year -9999 keeps every missed slot.
+        assert_eq!(catchup_window_cutoff(now, Duration::from_secs(400_000_000_000)), Timestamp::MIN);
+        // chrono refused a window past `i64::MAX` milliseconds and used zero.
+        assert_eq!(catchup_window_cutoff(now, Duration::from_secs(i64::MAX as u64)), now);
+    }
 
     /// Pins a hazard for a failed batched `calendar::load_exclusions_for_calendars`.
     ///

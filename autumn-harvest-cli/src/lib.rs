@@ -2096,7 +2096,7 @@ enum ShardCommand {
         /// `next_scan_cursor`. Without this, a shard whose oldest rows are
         /// permanently blocked (an active session, a parked child) makes
         /// every repeated call re-examine the same rows forever.
-        #[arg(long, requires = "after_execution_id")]
+        #[arg(long, requires = "after_execution_id", value_parser = autumn_harvest::time::parse::relaxed)]
         after_created_at: Option<jiff::Timestamp>,
         /// See `--after-created-at`; both must be supplied together.
         #[arg(long, requires = "after_created_at")]
@@ -2168,7 +2168,7 @@ enum ShardCommand {
         /// this, a shard whose oldest seals are permanently still-live or
         /// unreachable makes every repeated call re-examine the same rows
         /// forever. Copy both fields verbatim from a prior run's resume hint.
-        #[arg(long, requires = "after_execution_id")]
+        #[arg(long, requires = "after_execution_id", value_parser = autumn_harvest::time::parse::relaxed)]
         after_migrated_at: Option<jiff::Timestamp>,
         /// See `--after-migrated-at`; both must be supplied together.
         #[arg(long, requires = "after_migrated_at")]
@@ -13690,7 +13690,8 @@ pub fn build_bootstrap_token(
 /// jiff also reads shorter forms and an RFC 9557 time zone annotation.
 /// Postgres can refuse those. This check keeps the shape that `chrono` read:
 /// a full date, `T`, `t` or a space, a full time, an optional fraction, and
-/// `Z`, `z` or a `+HH:MM` offset.
+/// `Z`, `z` or a `+HH:MM` offset. Like `chrono`, it refuses an offset hour
+/// past 23 and an offset minute past 59. jiff reads an offset hour up to 25.
 fn has_rfc3339_shape(text: &str) -> bool {
     let bytes = text.as_bytes();
     let digits = |range: std::ops::Range<usize>| {
@@ -13720,7 +13721,9 @@ fn has_rfc3339_shape(text: &str) -> bool {
     }
     match rest {
         [b'Z' | b'z'] => true,
-        [b'+' | b'-', h1, h2, b':', m1, m2] => [h1, h2, m1, m2].iter().all(|b| b.is_ascii_digit()),
+        [b'+' | b'-', h1, h2, b':', m1, m2] if [h1, h2, m1, m2].iter().all(|b| b.is_ascii_digit()) => {
+            (h1 - b'0') * 10 + (h2 - b'0') <= 23 && (m1 - b'0') * 10 + (m2 - b'0') <= 59
+        }
         _ => false,
     }
 }
@@ -13754,7 +13757,10 @@ pub fn build_bootstrap_token_for_tenant(
                 "token bootstrap: --expires-at '{e}' is not a valid RFC 3339 timestamp: {reason}"
             ))
         };
-        e.parse::<autumn_harvest::jiff::Timestamp>().map_err(|source| invalid(&source))?;
+        // This parse reads what `chrono` read, such as a fraction of more than
+        // 9 digits or a year 9999 instant past the jiff range. Postgres still
+        // receives the raw text.
+        autumn_harvest::time::parse::rfc3339(e).map_err(|source| invalid(&source))?;
         if !has_rfc3339_shape(e) {
             return Err(invalid(&"it is not in the strict RFC 3339 form"));
         }
@@ -18334,6 +18340,52 @@ mod token_bootstrap_tests {
             "2027-01-01T00:00:00",
             "2027-02-30T00:00:00Z",
         ] {
+            assert!(build_bootstrap_token("n", "read", Some(bad), "op").is_err(), "{bad}");
+        }
+    }
+
+    /// `--after-created-at` reads the `chrono` display form, as the `chrono`
+    /// argument type did.
+    #[test]
+    fn rebalance_cursor_reads_the_chrono_display_form() {
+        let cli = Cli::try_parse_from([
+            "harvest",
+            "shard",
+            "rebalance",
+            "--shard",
+            "1=postgres://a",
+            "--from",
+            "1",
+            "--to",
+            "2",
+            "--after-created-at",
+            "2026-12-01 09:00:00 UTC",
+            "--after-execution-id",
+            "00000000-0000-0000-0000-000000000001",
+        ])
+        .expect("the chrono display form should parse");
+        let Commands::Shard {
+            command: ShardCommand::Rebalance { after_created_at, .. },
+        } = cli.command
+        else {
+            panic!("expected shard rebalance");
+        };
+        let expected = "2026-12-01T09:00:00Z".parse::<jiff::Timestamp>().unwrap();
+        assert_eq!(after_created_at, Some(expected));
+    }
+
+    /// The expiry check accepts and refuses what `chrono` `parse_from_rfc3339` did.
+    #[test]
+    fn bootstrap_expiry_keeps_the_chrono_accepted_set() {
+        for good in [
+            "2027-01-01T00:00:00.1234567890Z",
+            "9999-12-31T23:59:59Z",
+            "2027-01-01T00:00:00+23:59",
+        ] {
+            let token = build_bootstrap_token("n", "read", Some(good), "op");
+            assert!(token.is_ok_and(|t| t.insert_sql.contains(good)), "{good}");
+        }
+        for bad in ["2027-01-01T00:00:00+24:30", "2027-01-01T00:00:00+25:00", "2027-01-01T00:00:00+01:60"] {
             assert!(build_bootstrap_token("n", "read", Some(bad), "op").is_err(), "{bad}");
         }
     }

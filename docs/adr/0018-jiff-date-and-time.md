@@ -33,8 +33,12 @@ Accepted.
    host database, when present, takes precedence, so a zone follows the
    newest rules on the host. `autumn_harvest::time::zone` resolves a name.
    It falls back to the bundled copy for a name that the host lacks, and
-   it keeps the case rule of `chrono-tz`. Each of the 597 names of
-   `chrono-tz` 0.10 resolves, with the same offsets.
+   it keeps the case rule of `chrono-tz`. It accepts exactly the 597 names
+   of `chrono-tz` 0.10. It refuses `Factory`, and the host-only names
+   `localtime` and `posixrules`. Each name resolves with the same offsets
+   through 2099. After 2099, `chrono-tz` kept the last standard-time
+   offset. jiff applies the current DST rule of the zone, so a DST zone
+   differs by its DST delta after 2099.
 3. Diesel reads and writes through wrapper types:
    - `jiff-diesel` 1.0 for `timestamptz`, `timestamp` and `date`. A query
      argument uses `jiff_diesel::ToDiesel::to_diesel`.
@@ -57,7 +61,12 @@ Accepted.
 6. A `serde` timestamp uses the jiff format: RFC 3339, a `Z` suffix and
    the fewest fraction digits that keep the value exact. `chrono` wrote 0,
    3, 6 or 9 digits. Each library reads the output of the other, so stored
-   JSON stays readable in both directions.
+   JSON stays readable in both directions. A stored event or Redis envelope
+   reads its timestamps through `time::serde_clamped`. It reads a year that
+   `chrono` wrote past 9999 as `Timestamp::MAX`.
+   A model duration keeps the `chrono` form `[seconds, nanoseconds]` through
+   `time::serde_secs_nanos`. The jiff form is an ISO 8601 string, and the
+   two forms cannot read each other.
 7. `chrono` stays a dependency of `autumn-harvest-plugin` only behind its
    `webhooks` and `sqlite` features. `autumn-web` 0.10 holds `chrono`
    types in its webhook delivery log and its tenant restore target. The
@@ -72,8 +81,9 @@ Accepted.
   method.
 - A `chrono` sentinel at the end of its range, such as
   `DateTime::<Utc>::MAX_UTC`, is past the jiff range, which ends in the
-  year 9999. A reader of stored data clamps such a value to
-  `Timestamp::MAX`.
+  year 9999. A reader of a stored timestamp clamps such a value to
+  `Timestamp::MAX`. A calendar exclusion date past 9999-12-31 can match no
+  fire date, so a read skips it.
 - A JSON timestamp can have fewer fraction digits than before. A client
   that compares timestamp strings byte for byte, not as instants, sees the
   change.

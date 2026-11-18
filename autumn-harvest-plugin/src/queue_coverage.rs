@@ -558,7 +558,10 @@ pub(crate) async fn fetch_potentially_live_workers(
     use diesel_async::RunQueryDsl;
 
     let stale_secs = i64::try_from(worker_stale_threshold.as_secs()).unwrap_or(i64::MAX);
-    let cutoff = Timestamp::now() - jiff::SignedDuration::from_secs(stale_secs);
+    // A threshold past the jiff range gives the earliest cutoff, not a panic.
+    let cutoff = Timestamp::now()
+        .checked_sub(jiff::SignedDuration::from_secs(stale_secs))
+        .unwrap_or(Timestamp::MIN);
 
     let rows: Vec<HarvestWorker> = harvest_workers::table
         .select(HarvestWorker::as_select())
