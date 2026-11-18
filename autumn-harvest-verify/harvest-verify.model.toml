@@ -84,11 +84,11 @@
 # model error, not a warning, because an unexplained rule is how a model rots.
 #
 # The version string is printed with every verdict ("no non-determinism found,
-# under model 2026.10.2, up to boundaries ..."), so a verdict can always be
+# under model 2026.11.18, up to boundaries ..."), so a verdict can always be
 # traced to the rules that produced it. Bump the date component when rows change,
 # or when the analysis gives another structure manifest for the same MIR.
 
-version = "2026.10.2"
+version = "2026.11.18"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # AMBIENT TYPES — statics of these types are taint roots
@@ -2470,6 +2470,10 @@ reason = "tracing::field::debug — the `?field` sigil's half of the pair above,
 [[std_free_fn]]
 path = "task_duration"
 reason = "autumn_harvest::task_duration (`autumn-harvest/src/lib.rs`), a `[[trusted]]` crate's free function that parses a `&str` into an `Option<Duration>`. rustc trims it to one segment in every `#[activity]` info body. Verified in the dumps: `_4 = task_duration(move _5)` with `_5: &str` and `_4: std::option::Option<std::time::Duration>`. Pure string parsing: no clock, no ambient state."
+
+[[std_free_fn]]
+path = "from_millisecond_clamped"
+reason = "autumn_harvest::time::from_millisecond_clamped (`autumn-harvest/src/time/mod.rs`, ADR 0018), a `[[trusted]]` crate's free function. It turns an `i64` of milliseconds into a `jiff::Timestamp` and clamps a value past the jiff range. rustc trims it to one segment in the `autumn-harvest-agent` wake-time closure, so no receiver at the call site names its crate. Pure arithmetic: no clock, no ambient state."
 
 [[trusted]]
 name = "core"
