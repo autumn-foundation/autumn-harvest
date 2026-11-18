@@ -705,7 +705,7 @@ async fn a_failed_direct_restore_keeps_the_waiting_target() {
     // then refuses the restore.
     let refused = a
         .fleet
-        .restore(&key, Some(jiff::Timestamp::UNIX_EPOCH))
+        .restore(&key, Some(chrono::DateTime::UNIX_EPOCH))
         .await
         .expect_err("no replica reaches the target");
     assert!(
