@@ -230,6 +230,23 @@ async fn a_tick_without_memory_writes_cannot_edit_the_state_memory() {
             Vec::new()
         };
         assert_eq!(entries(&state), want, "allow_memory_writes = {allow}");
+        // The prompt names the `memory` tool only when the tick has it.
+        let system = &systems(&model)[0];
+        let offered = model.requests()[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == MEMORY_TOOL);
+        assert_eq!(offered, allow);
+        assert_eq!(
+            system.contains("Edit them with the `memory` tool"),
+            allow,
+            "{system}"
+        );
+        assert_eq!(
+            system.contains("This run has no `memory` tool"),
+            !allow,
+            "{system}"
+        );
         if !allow {
             let result = serde_json::to_string(&model.requests()[1].messages).unwrap();
             assert!(result.contains("read-only"), "{result}");

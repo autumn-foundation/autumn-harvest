@@ -52,8 +52,8 @@ use crate::harness::{
 use crate::heartbeat::{HeartbeatTask, agent_heartbeat_info};
 use crate::loop_guard::{LoopTracker, LoopVerdict, warning_note};
 use crate::memory::{
-    MEMORY_TOOL, MemoryBlock, MemoryOp, MemoryScope, MemorySnapshot, MemoryTool, apply_to,
-    edit_result,
+    MEMORY_TOOL, MemoryBlock, MemoryOp, MemoryScope, MemorySnapshot, MemoryTool,
+    READ_ONLY_SNAPSHOT_PATCH, SnapshotAccess, apply_to, edit_result,
 };
 use crate::mesh::{
     DELEGATE_TOOL, DelegateArgs, DelegationRecord, INVALID_NAME, Mandate, Peer, Refusal,
@@ -1563,10 +1563,16 @@ async fn system_prompt(
         .execute_activity(&agent_memory_snapshot_info(), scope.clone())
         .await
         .map_err(|e| e.to_string())?;
-    let prompt = system.as_ref().map_or_else(
-        || snapshot.text().to_owned(),
-        |system| format!("{system}\n\n{}", snapshot.text()),
-    );
+    // The prompt must not name a tool that the run lacks. The gate keeps the
+    // edit head in the replay of a history from before the change.
+    let text = if task.memory_tool_scope().is_none() && ctx.patched(READ_ONLY_SNAPSHOT_PATCH) {
+        crate::memory::with_access(snapshot.text(), SnapshotAccess::Read)
+    } else {
+        snapshot.text().to_owned()
+    };
+    let prompt = system
+        .as_ref()
+        .map_or_else(|| text.clone(), |system| format!("{system}\n\n{text}"));
     Ok((Some(prompt), snapshot.labels()))
 }
 
