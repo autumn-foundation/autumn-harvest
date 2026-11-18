@@ -25,6 +25,25 @@ pub use format::{SecondsFormat, rfc3339, rfc3339_opts, utc_display};
 pub use jiff::tz::TimeZone;
 pub use jiff::{SignedDuration, Timestamp, civil};
 
+/// Returns the IANA time zone `name`, as `chrono-tz` resolved it.
+///
+/// jiff reads the host database first. A Debian or Ubuntu host without the
+/// `tzdata-legacy` package lacks the old link names, such as `US/Eastern`.
+/// `chrono-tz` always knew them. So a name that the host lacks falls back
+/// to the database that jiff bundles. A stored schedule in such a zone then
+/// still fires.
+///
+/// `chrono-tz` matched a name with its exact case. jiff ignores case. This
+/// function refuses a name that differs in case from the zone that it finds,
+/// so it accepts the names that `chrono-tz` accepted.
+#[must_use]
+pub fn zone(name: &str) -> Option<TimeZone> {
+    let found = TimeZone::get(name)
+        .or_else(|_| jiff::tz::TimeZoneDatabase::bundled().get(name))
+        .ok()?;
+    (found.iana_name() == Some(name)).then_some(found)
+}
+
 /// Seconds in one day of elapsed time.
 const SECONDS_PER_DAY: i64 = 86_400;
 
@@ -144,6 +163,17 @@ pub fn from_utc_datetime(datetime: civil::DateTime) -> Option<Timestamp> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zone_resolves_legacy_links_and_keeps_case() {
+        assert!(zone("Europe/Paris").is_some());
+        assert!(zone("US/Eastern").is_some());
+        assert!(zone("UTC").is_some());
+        assert!(zone("europe/paris").is_none());
+        assert!(zone("utc").is_none());
+        assert!(zone("Nope/Zone").is_none());
+        assert!(zone("").is_none());
+    }
 
     #[test]
     fn days_is_whole_days_of_elapsed_time() {

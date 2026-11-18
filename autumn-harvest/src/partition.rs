@@ -104,7 +104,6 @@
 
 #[cfg(feature = "db")]
 use std::future::Future;
-use jiff_diesel::ToDiesel;
 #[cfg(feature = "db")]
 use std::pin::Pin;
 use std::time::Duration;
@@ -115,6 +114,8 @@ use jiff::Timestamp;
 use diesel::sql_types::{Array, BigInt, Bool, Nullable, Text, Timestamptz, Uuid as SqlUuid};
 #[cfg(feature = "db")]
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+#[cfg(feature = "db")]
+use jiff_diesel::ToDiesel;
 
 #[cfg(feature = "db")]
 use crate::error::{HarvestError, HarvestResult, database_error};
@@ -411,9 +412,11 @@ pub const SWEEP_REASONS: &[&str] = &[
 #[must_use]
 pub fn cohort_start(ts: Timestamp, width_secs: i64) -> Timestamp {
     let width = width_secs.max(1);
-    let floored = ts.as_second().div_euclid(width) * width;
-    Timestamp::new(floored, 0).ok()
-        .unwrap_or(Timestamp::MIN)
+    // Floor to the whole second below, as `chrono` did. jiff truncates toward
+    // zero, so a negative instant with a fraction moves down one second.
+    let seconds = ts.as_second() - i64::from(ts.subsec_nanosecond() < 0);
+    let floored = seconds.div_euclid(width) * width;
+    Timestamp::new(floored, 0).unwrap_or(Timestamp::MIN)
 }
 
 /// The partition table name for a cohort start.
@@ -423,7 +426,7 @@ pub fn cohort_start(ts: Timestamp, width_secs: i64) -> Timestamp {
 /// any width down to one second.
 #[must_use]
 pub fn partition_name(cohort_start: Timestamp) -> String {
-    format!("{PARTITION_PREFIX}{}", cohort_start.format("%Y%m%d%H%M%S"))
+    format!("{PARTITION_PREFIX}{}", cohort_start.strftime("%Y%m%d%H%M%S"))
 }
 
 // ── Configuration ──────────────────────────────────────────────────────────
@@ -875,19 +878,19 @@ fn parse_bound_literal(raw: &str) -> Option<Timestamp> {
     if inner.eq_ignore_ascii_case("-infinity") || inner.eq_ignore_ascii_case("infinity") {
         return None;
     }
+    // A space in a jiff format matches zero or more whitespace. `%:::z` reads
+    // `+HH`, `+HH:MM` and `+HH:MM:SS`. `%z` reads `+HHMM`.
     for fmt in [
-        "%Y-%m-%d %H:%M:%S%.f%#z",
-        "%Y-%m-%d %H:%M:%S%.f",
-        "%Y-%m-%d %H:%M:%S%:z",
+        "%Y-%m-%d %H:%M:%S%.f %:::z",
+        "%Y-%m-%d %H:%M:%S%.f %z",
     ] {
-        if let Ok(dt) = DateTime::parse_from_str(inner, fmt) {
-            return Some(dt);
-        }
-        if let Ok(naive) = jiff::civil::DateTime::parse_from_str(inner, fmt) {
-            return Some(Utc.from_utc_datetime(&naive));
+        if let Ok(ts) = Timestamp::strptime(fmt, inner) {
+            return Some(ts);
         }
     }
-    None
+    jiff::civil::DateTime::strptime("%Y-%m-%d %H:%M:%S%.f", inner)
+        .ok()
+        .and_then(crate::time::from_utc_datetime)
 }
 
 // ── Catalog helpers ────────────────────────────────────────────────────────
@@ -997,7 +1000,7 @@ fn compare_partitions(a: &PartitionInfo, b: &PartitionInfo) -> std::cmp::Orderin
 /// Format a timestamp as a SQL literal.
 ///
 /// The only value interpolated into partition DDL. RFC 3339 output from
-/// `chrono` cannot contain a quote, so this is not an injection vector. The
+/// [`crate::time::rfc3339`] cannot contain a quote, so this is not an injection vector. The
 /// value still goes through one audited helper, not ad hoc at each call site.
 fn ts_literal(ts: Timestamp) -> String {
     format!("'{}'", crate::time::rfc3339(ts))
@@ -1035,7 +1038,8 @@ async fn ensure_cohort_with_width(
     let lower = cohort_start(ts, width);
     let Some(upper) = lower.checked_add(jiff::SignedDuration::from_secs(width)).ok() else {
         return Err(HarvestError::Database(format!(
-            "cohort starting at {lower} overflows when advanced by {width}s"
+            "cohort starting at {} overflows when advanced by {width}s",
+            crate::time::utc_display(lower)
         )));
     };
     let name = partition_name(lower);

@@ -30,7 +30,6 @@
 //! `formal/verus/src/overlay_log.rs` proves the kernel.
 
 use jiff::Timestamp;
-use jiff_diesel::ToDiesel;
 
 /// The `author_kind` of a version that an operator wrote.
 pub const AUTHOR_OPERATOR: &str = "operator";
@@ -306,11 +305,10 @@ pub struct OverlayRow {
 /// The start and the end of the UTC day of `at`.
 #[must_use]
 pub fn utc_day(at: Timestamp) -> (Timestamp, Timestamp) {
-    let start = crate::time::utc_date(at)
-        .and_hms_opt(0, 0, 0)
-        .map_or(at, |midnight| midnight.and_utc());
+    let midnight = crate::time::utc_date(at).to_datetime(jiff::civil::Time::midnight());
+    let start = crate::time::from_utc_datetime(midnight).unwrap_or(at);
     let end = start
-        .checked_add(crate::time::days(1)).ok()
+        .checked_add(crate::time::days(1))
         .unwrap_or(Timestamp::MAX);
     (start, end)
 }
@@ -475,10 +473,11 @@ pub use pg::{
 /// `ProfileOverlayStore`, which does.
 #[cfg(feature = "db")]
 mod pg {
-    use jiff::Timestamp;
     use diesel::QueryableByName;
     use diesel::sql_types::{BigInt, Binary, Bool, Nullable, Text, Timestamptz};
     use diesel_async::{AsyncPgConnection, RunQueryDsl};
+    use jiff::Timestamp;
+    use jiff_diesel::ToDiesel;
 
     use super::{
         AUTHOR_AUTO, ActivateDecision, ActivateOutcome, ActivationRow, AutoAdoptRaw,

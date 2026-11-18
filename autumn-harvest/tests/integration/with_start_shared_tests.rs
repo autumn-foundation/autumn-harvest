@@ -176,7 +176,7 @@ async fn set_state(conn: &mut AsyncPgConnection, id: ExecutionId, state: &str) {
     diesel::update(wf::table.find(id.as_uuid()))
         .set((
             wf::state.eq(state),
-            wf::completed_at.eq((state != "PAUSED").then(chrono::Utc::now).to_diesel()),
+            wf::completed_at.eq((state != "PAUSED").then(jiff::Timestamp::now).to_diesel()),
         ))
         .execute(conn)
         .await

@@ -28,7 +28,6 @@ toml = { workspace = true }
 autumn-harvest = { version = "0.10.0", path = "../autumn-harvest", default-features = false, features = ["testing"] }
 tempfile = "3"
 # The end-to-end structure test runs the core upgrade check (issue #1995).
-chrono = { workspace = true }
 jiff = { workspace = true }
 tokio = { workspace = true }
 

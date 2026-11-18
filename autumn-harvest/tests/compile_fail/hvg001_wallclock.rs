@@ -4,7 +4,6 @@ use autumn_harvest::prelude::*;
 async fn bad_workflow(_ctx: &WorkflowContext) -> Result<(), String> {
     let _ = jiff::Timestamp::now();
     let _ = jiff::ZonedDateTime::now();
-    let _ = jiff::ZonedDateTime::now();
     Ok(())
 }
 

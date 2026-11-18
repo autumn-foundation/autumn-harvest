@@ -37,12 +37,13 @@
 //! stay in their stored form, so codec ciphertext stays ciphertext.
 
 use std::collections::BTreeMap;
-use jiff_diesel::ToDiesel;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use jiff::Timestamp;
+#[cfg(feature = "db")]
+use jiff_diesel::ToDiesel;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -116,14 +117,13 @@ pub fn archive_prefix(
 /// A cohort bound is whole seconds. The legacy upper bound is the conversion
 /// instant, so it keeps its microseconds.
 fn key_bound(bound: Option<Timestamp>) -> String {
-    use jiff::Timestamp;
     bound.map_or_else(
         || "min".to_string(),
         |ts| {
-            if ts.nanosecond() == 0 {
-                ts.format("%Y%m%dT%H%M%SZ").to_string()
+            if ts.subsec_nanosecond() == 0 {
+                ts.strftime("%Y%m%dT%H%M%SZ").to_string()
             } else {
-                ts.format("%Y%m%dT%H%M%S%.6fZ").to_string()
+                ts.strftime("%Y%m%dT%H%M%S%.6fZ").to_string()
             }
         },
     )

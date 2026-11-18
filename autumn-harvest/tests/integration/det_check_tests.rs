@@ -56,6 +56,20 @@ fn det001_flags_chrono_local_now() {
 }
 
 #[test]
+fn det001_flags_each_jiff_clock_read() {
+    for call in [
+        "jiff::Timestamp::now()",
+        "Timestamp::now()",
+        "jiff::ZonedDateTime::now()",
+        "jiff::Zoned::now()",
+    ] {
+        let src = wf(&format!("let _t = {call};"));
+        let report = check_source(&src, "test.rs");
+        assert!(report.findings.iter().any(|f| f.rule_id == "DET001"), "{call}");
+    }
+}
+
+#[test]
 fn det001_is_hard_blocker() {
     let src = wf("let _t = std::time::SystemTime::now();");
     let report = check_source(&src, "test.rs");

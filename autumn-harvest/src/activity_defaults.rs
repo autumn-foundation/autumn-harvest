@@ -70,7 +70,7 @@ use crate::workflow_retry::{RetryLimits, RetryLimitsPatch};
 /// The longest timeout that an override can set: 100 years.
 ///
 /// A schedule adds `schedule_to_close` to its time. A sum past the range of
-/// `chrono` panics, so the write refuses a value above this bound.
+/// `jiff` panics, so the write refuses a value above this bound.
 pub const MAX_ACTIVITY_TIMEOUT: Duration = crate::run_defaults::MAX_RUN_DEFAULT;
 
 /// The largest cap that an override can set.
@@ -300,6 +300,7 @@ mod db {
     use jiff::Timestamp;
     use diesel::prelude::*;
     use diesel_async::{AsyncPgConnection, RunQueryDsl};
+    use jiff_diesel::ToDiesel;
 
     use crate::error::{HarvestError, HarvestResult};
     use crate::run_defaults::{MAX_RETRY_INTERVAL, check_retry_limits, check_retry_patch};
@@ -560,8 +561,8 @@ mod db {
                     dsl::max_concurrent.eq(max_concurrent),
                     dsl::reason.eq(change.reason),
                     dsl::updated_by.eq(change.actor),
-                    dsl::created_at.eq(now),
-                    dsl::updated_at.eq(now),
+                    dsl::created_at.eq(now.to_diesel()),
+                    dsl::updated_at.eq(now.to_diesel()),
                 ))
                 .on_conflict(dsl::activity_name)
                 .do_update()
@@ -576,7 +577,7 @@ mod db {
                     dsl::max_concurrent.eq(max_concurrent),
                     dsl::reason.eq(change.reason),
                     dsl::updated_by.eq(change.actor),
-                    dsl::updated_at.eq(now),
+                    dsl::updated_at.eq(now.to_diesel()),
                 ))
                 .execute(conn)
                 .await
@@ -591,7 +592,7 @@ mod db {
     /// The columns hold whole milliseconds. So the write refuses a timeout
     /// under 1 ms and one with a part of a millisecond. A zero timeout ends
     /// each attempt at once. A timeout over [`MAX_ACTIVITY_TIMEOUT`] can pass
-    /// the range of `chrono` when a schedule adds it to its time. The retry
+    /// the range of `jiff` when a schedule adds it to its time. The retry
     /// fields follow the rules of the workflow retry override.
     ///
     /// # Errors

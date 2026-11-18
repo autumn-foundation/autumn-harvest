@@ -469,6 +469,28 @@ mod tests {
     }
 
     #[test]
+    fn a_jiff_clock_read_is_a_source_before_the_trusted_crate() {
+        let m = model();
+        for path in [
+            "autumn_harvest::jiff::Timestamp::now",
+            "jiff::Timestamp::now",
+            "jiff::ZonedDateTime::now",
+            "jiff::tz::TimeZone::system",
+        ] {
+            let classes = classify(&m, path, None);
+            assert!(
+                matches!(classes.first(), Some(CallClass::Source(_))),
+                "{path}: the source row must be reported first: {classes:?}"
+            );
+        }
+        let pure = classify(&m, "jiff::Timestamp::as_second", None);
+        assert!(
+            !pure.iter().any(|c| matches!(c, CallClass::Source(_))),
+            "jiff arithmetic is not a source: {pure:?}"
+        );
+    }
+
+    #[test]
     fn trusted_needs_an_explicit_crate_root() {
         let m = model();
         assert_eq!(

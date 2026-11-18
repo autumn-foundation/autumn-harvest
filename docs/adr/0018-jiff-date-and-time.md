@@ -1,0 +1,82 @@
+# ADR 0018: Dates and times use jiff
+
+## Status
+
+Accepted.
+
+## Context
+
+- Harvest used `chrono` 0.4 for every instant and every elapsed time, and
+  `chrono-tz` for cron schedules in a named time zone.
+- `chrono` keeps an instant as a `DateTime<Utc>` and an elapsed time as a
+  `TimeDelta`. The zone is a type parameter. Code that needs a zone at run
+  time, such as a cron schedule in a user's zone, needs a second crate.
+- `jiff` 1.0 shipped on 2026-11-15 with a stability commitment for 1.x. It
+  has one type for an instant (`Timestamp`), one for an exact elapsed time
+  (`SignedDuration`), and one for a zoned value (`ZonedDateTime`). It
+  bundles the IANA database and resolves a zone name at run time.
+- Diesel has no `jiff` feature. A foreign trait cannot be implemented for a
+  foreign type, so Harvest cannot add the Diesel impls itself.
+- Some text that holds a timestamp is a contract. The audit chain hashes
+  one, a cursor encodes one, and API fields return one. `chrono` and `jiff`
+  print different text for the same instant.
+
+## Decision
+
+1. An instant is a `jiff::Timestamp`. An elapsed time is a
+   `jiff::SignedDuration`. A calendar date is a `jiff::civil::Date`. A
+   named zone is a `jiff::tz::TimeZone`. These types are in the public API.
+   `autumn_harvest::jiff` re-exports the crate, as `autumn_harvest::chrono`
+   did before.
+2. `jiff` builds with `tzdb-bundle-always`. A host without
+   `/usr/share/zoneinfo` still resolves a zone name, as `chrono-tz` did. A
+   host database, when present, takes precedence, so a zone follows the
+   newest rules on the host. `autumn_harvest::time::zone` resolves a name.
+   It falls back to the bundled copy for a name that the host lacks, and
+   it keeps the case rule of `chrono-tz`. Each of the 597 names of
+   `chrono-tz` 0.10 resolves, with the same offsets.
+3. Diesel reads and writes through wrapper types:
+   - `jiff-diesel` 1.0 for `timestamptz`, `timestamp` and `date`. A query
+     argument uses `jiff_diesel::ToDiesel::to_diesel`.
+   - `autumn_harvest::time::sql` for an `interval`. `PgDuration` keeps the
+     rules of the Diesel `chrono` feature: whole days in `days`, the rest
+     in `microseconds`, and a 30-day month on a read.
+   - A derived model keeps jiff field types and names the wrapper with
+     `#[diesel(serialize_as, deserialize_as)]`. The `split_queryable!` and
+     `split_insertable!` macros take the same wrapper after `as`.
+4. `croner` keeps its parser. `autumn_harvest::time::cron::CronZoned`
+   implements the `croner` time trait for a jiff 1.0 `ZonedDateTime`. It
+   follows the jiff 0.2 implementation in `croner` line for line. A sweep
+   of two years, eight zones and twelve patterns found no difference from
+   `croner` on `chrono` in two million comparisons.
+5. Contract text keeps the bytes that `chrono` wrote.
+   `autumn_harvest::time::format` writes the `to_rfc3339`,
+   `to_rfc3339_opts` and `Display` forms of `chrono` exactly. A sweep of
+   400 000 instants over every format found no difference. New text uses
+   the jiff formats.
+6. A `serde` timestamp uses the jiff format: RFC 3339, a `Z` suffix and
+   the fewest fraction digits that keep the value exact. `chrono` wrote 0,
+   3, 6 or 9 digits. Each library reads the output of the other, so stored
+   JSON stays readable in both directions.
+7. `chrono` stays a dependency of `autumn-harvest-plugin` only behind its
+   `webhooks` feature. `autumn-web` 0.10 holds `chrono` types in its
+   webhook API, and the plugin converts at that boundary.
+
+## Consequences
+
+- An embedder that names a Harvest time type changes its own code. The
+  upgrade guide `docs/upgrading/chrono-to-jiff.md` maps each type and
+  method.
+- A `chrono` sentinel at the end of its range, such as
+  `DateTime::<Utc>::MAX_UTC`, is past the jiff range, which ends in the
+  year 9999. A reader of stored data clamps such a value to
+  `Timestamp::MAX`.
+- A JSON timestamp can have fewer fraction digits than before. A client
+  that compares timestamp strings byte for byte, not as instants, sees the
+  change.
+- The determinism lint and the MIR verifier flag `jiff` clock reads, and
+  still flag `chrono` clock reads in user code.
+- `chrono-tz` compiled its zone rules into the binary. `jiff` prefers the
+  host database. Two hosts with different `tzdata` packages can disagree on
+  a zone whose rules changed between those packages. Set `TZDIR` to one
+  copy, or keep `tzdata` in step across a fleet, where that matters.

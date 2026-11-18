@@ -95,7 +95,6 @@
 //! accepting the gate.
 
 use jiff::Timestamp;
-use jiff_diesel::ToDiesel;
 use std::fmt;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -934,12 +933,13 @@ pub fn resolve_metrics_with_global_fallback(
 
 #[cfg(feature = "db")]
 pub mod db {
-    use super::{AdmissionGate, AdmissionGateId, DateTime, GateScope, MAX_ACTIVE_GATES, Utc, Uuid};
+    use super::{AdmissionGate, AdmissionGateId, GateScope, MAX_ACTIVE_GATES, Timestamp, Uuid};
     use crate::error::{HarvestResult, database_error};
     use crate::models::{AdmissionGateRow, NewAdmissionGateRow};
     use crate::schema::harvest_admission_gates;
     use diesel::{BoolExpressionMethods, ExpressionMethods, NullableExpressionMethods, QueryDsl};
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+    use jiff_diesel::ToDiesel;
 
     /// Convert a DB row into an in-memory [`AdmissionGate`].
     ///
@@ -978,7 +978,7 @@ pub mod db {
             .filter(
                 g::expires_at
                     .is_null()
-                    .or(g::expires_at.assume_not_null().gt(now)),
+                    .or(g::expires_at.assume_not_null().gt(now.to_diesel())),
             )
             .order_by(g::created_at.asc())
             .load::<AdmissionGateRow>(conn)
@@ -1041,7 +1041,7 @@ pub mod db {
                 .filter(
                     g::expires_at
                         .is_null()
-                        .or(g::expires_at.assume_not_null().gt(now)),
+                        .or(g::expires_at.assume_not_null().gt(now.to_diesel())),
                 )
                 .count()
                 .get_result::<i64>(conn)
@@ -1067,7 +1067,7 @@ pub mod db {
             };
 
             let row: AdmissionGateRow = diesel::insert_into(g::harvest_admission_gates)
-                .values(&new_gate)
+                .values(new_gate)
                 .get_result(conn)
                 .await
                 .map_err(database_error)?;

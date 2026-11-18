@@ -587,7 +587,13 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
             let path_str = path_to_string(&expr_path.path);
 
             // HVG001: WallClock
-            if path_str == "chrono::Utc::now"
+            if path_str == "jiff::Timestamp::now"
+                || path_str == "Timestamp::now"
+                || path_str == "jiff::ZonedDateTime::now"
+                || path_str == "ZonedDateTime::now"
+                || path_str == "jiff::Zoned::now"
+                || path_str == "Zoned::now"
+                || path_str == "chrono::Utc::now"
                 || path_str == "Utc::now"
                 || path_str == "chrono::Local::now"
                 || path_str == "Local::now"
@@ -862,8 +868,8 @@ pub fn load_catalog_metadata() -> HashMap<String, RuleInfo> {
         RuleInfo {
             id: "HVG001".to_string(),
             severity: "HardBlocker".to_string(),
-            explanation: "Reading wall-clock time inside a workflow (std::time::Instant::now(), SystemTime::now(), chrono::Utc::now(), etc.) produces a different value on every replay. The workflow engine re-executes the function body deterministically against recorded history; a fresh timestamp breaks that contract and causes a non-determinism error.".to_string(),
-            alternative: "Use ctx.now() (WorkflowContext) to read the workflow-logical clock, which returns the WorkflowStarted timestamp and replays identically on every subsequent run. For a real wall-clock instant captured at the call site (e.g. \"skip the notification if the event is older than 24h *now*\"), use ctx.system_now() -> DateTime<Utc> (or ctx.system_time_now() -> SystemTime), which captures the current time once and replays it deterministically via a recorded SideEffectRecorded event.".to_string(),
+            explanation: "Reading wall-clock time inside a workflow (std::time::Instant::now(), SystemTime::now(), jiff::Timestamp::now(), chrono::Utc::now(), etc.) produces a different value on every replay. The workflow engine re-executes the function body deterministically against recorded history; a fresh timestamp breaks that contract and causes a non-determinism error.".to_string(),
+            alternative: "Use ctx.now() (WorkflowContext) to read the workflow-logical clock, which returns the WorkflowStarted timestamp and replays identically on every subsequent run. For a real wall-clock instant captured at the call site (e.g. \"skip the notification if the event is older than 24h *now*\"), use ctx.system_now() -> jiff::Timestamp (or ctx.system_time_now() -> SystemTime), which captures the current time once and replays it deterministically via a recorded SideEffectRecorded event.".to_string(),
         },
         RuleInfo {
             id: "HVG002".to_string(),
@@ -937,6 +943,52 @@ pub fn load_catalog_metadata() -> HashMap<String, RuleInfo> {
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod hvg001_clock_tests {
+    //! Visitor-level tests for HVG001: each clock read that the rule names.
+    //!
+    //! Harvest moved from `chrono` to `jiff` (ADR 0018). A workflow can call
+    //! either crate, so the rule flags the clock reads of both.
+
+    use super::{DeterminismVisitor, load_catalog_metadata};
+    use syn::visit::Visit as _;
+
+    fn hvg001_count(body: &str) -> usize {
+        let src = format!("async fn wf(ctx: &WorkflowContext) -> Result<(), String> {{ {body} Ok(()) }}");
+        let item_fn: syn::ItemFn = syn::parse_str(&src).expect("test source must parse");
+        let mut visitor = DeterminismVisitor::new(load_catalog_metadata());
+        visitor.context_param_name = Some("ctx".to_string());
+        visitor.visit_item_fn(&item_fn);
+        visitor.findings.iter().filter(|f| f.rule_id == "HVG001").count()
+    }
+
+    #[test]
+    fn every_jiff_clock_read_is_flagged() {
+        for call in [
+            "jiff::Timestamp::now()",
+            "Timestamp::now()",
+            "jiff::ZonedDateTime::now()",
+            "ZonedDateTime::now()",
+            "jiff::Zoned::now()",
+            "Zoned::now()",
+        ] {
+            assert_eq!(hvg001_count(&format!("let _t = {call};")), 1, "{call}");
+        }
+    }
+
+    #[test]
+    fn every_chrono_clock_read_is_still_flagged() {
+        for call in ["chrono::Utc::now()", "Utc::now()", "chrono::Local::now()", "Local::now()"] {
+            assert_eq!(hvg001_count(&format!("let _t = {call};")), 1, "{call}");
+        }
+    }
+
+    #[test]
+    fn the_workflow_clock_is_not_flagged() {
+        assert_eq!(hvg001_count("let _t = ctx.now();"), 0);
+    }
+}
 
 #[cfg(test)]
 mod hvg011_tests {
