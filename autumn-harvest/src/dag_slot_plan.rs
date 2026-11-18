@@ -77,33 +77,57 @@ pub fn plan(dag: &DagDefinition, report: &DagSlackReport, slots: NonZeroUsize) -
         }
     }
 
-    // The ready heap pops the smallest `(latest start, index)` first.
+    // The ready heap holds tasks that need a slot. It pops the smallest
+    // `(latest start, index)` first.
     let priority = |i: usize| Reverse((report.tasks[i].latest_start, i));
-    let mut ready: BinaryHeap<_> = (0..n).filter(|&i| waiting[i] == 0).map(priority).collect();
+    let mut ready = BinaryHeap::new();
     let mut free: BTreeSet<usize> = (0..slots.get()).collect();
     let mut running: BinaryHeap<Reverse<(u128, usize)>> = BinaryHeap::new();
     let mut start = vec![0u128; n];
     let mut slot = vec![None; n];
     let mut now = 0u128;
 
+    // A finished task releases its downstream tasks. A zero-duration task
+    // finishes when it is ready, so it releases its own downstream tasks at
+    // once. This happens before any dispatch at the same time.
+    let mut finished: Vec<usize> = Vec::new();
+    for i in (0..n).filter(|&i| waiting[i] == 0) {
+        if durations[i] == 0 {
+            finished.push(i);
+        } else {
+            ready.push(priority(i));
+        }
+    }
+
     loop {
-        // Start ready tasks while a slot is free. A zero-duration task needs none.
-        let mut held = Vec::new();
-        while let Some(Reverse((_, i))) = ready.pop() {
-            if durations[i] == 0 {
-                start[i] = now;
-                running.push(Reverse((now, i)));
-            } else if let Some(s) = free.pop_first() {
+        while let Some(i) = finished.pop() {
+            for &down in &downstreams[i] {
+                waiting[down] -= 1;
+                if waiting[down] > 0 {
+                    continue;
+                }
+                start[down] = now;
+                if durations[down] == 0 {
+                    finished.push(down);
+                } else {
+                    ready.push(priority(down));
+                }
+            }
+        }
+
+        // Start ready tasks while a slot is free. Blocked tasks stay in the heap.
+        while !free.is_empty() {
+            let Some(Reverse((_, i))) = ready.pop() else {
+                break;
+            };
+            if let Some(s) = free.pop_first() {
                 start[i] = now;
                 slot[i] = Some(s);
                 running.push(Reverse((now.saturating_add(durations[i]), i)));
-            } else {
-                held.push(priority(i));
             }
         }
-        ready.extend(held);
 
-        // Move the clock to the next finish and release its downstream tasks.
+        // Move the clock to the next finish.
         let Some(Reverse((finish, _))) = running.peek().copied() else {
             break;
         };
@@ -116,12 +140,7 @@ pub fn plan(dag: &DagDefinition, report: &DagSlackReport, slots: NonZeroUsize) -
             if let Some(s) = slot[i] {
                 free.insert(s);
             }
-            for &down in &downstreams[i] {
-                waiting[down] -= 1;
-                if waiting[down] == 0 {
-                    ready.push(priority(down));
-                }
-            }
+            finished.push(i);
         }
     }
 
@@ -295,6 +314,33 @@ mod tests {
         let p = plan(&dag, &report, slots(1));
         assert_eq!(p.tasks[0].slot, None);
         assert_eq!(p.makespan, secs(2));
+    }
+
+    #[test]
+    fn a_zero_duration_task_releases_its_downstream_before_dispatch() {
+        // a (0s) -> b (10s), with independent c (1s) and d (1s).
+        let mut builder = DagBuilder::new();
+        let ta = builder.activity(a);
+        let _tb = builder.activity(b).upstream(&ta);
+        let _tc = builder.activity(c);
+        let _td = builder.activity(d);
+        let dag = builder.build().unwrap();
+        let report = DagSlackAnalyzer::new(dag.clone())
+            .mock_duration("a", Duration::ZERO)
+            .mock_duration("b", secs(10))
+            .analyze();
+        let p = plan(&dag, &report, slots(2));
+        assert_eq!(p.tasks[1].start, Duration::ZERO);
+        assert_eq!(p.makespan, secs(10));
+        assert_eq!(fewest_slots(&dag, &report).get(), 2);
+    }
+
+    #[test]
+    fn one_slot_starts_the_least_slack_task_first() {
+        let (dag, report) = fan();
+        let p = plan(&dag, &report, slots(1));
+        assert_eq!(p.makespan, secs(12));
+        assert_eq!(p.tasks[2].start, Duration::ZERO);
     }
 
     #[test]
