@@ -852,3 +852,9 @@ harness = false
 name = "dag_retry_envelope_profile"
 required-features = ["testing"]
 harness = false
+
+# Deterministic (non-criterion) profiling harness for
+# `worker_outlier::TaskOutcomeWindow` record/snapshot.
+[[bench]]
+name = "worker_outlier_window_profile"
+harness = false
