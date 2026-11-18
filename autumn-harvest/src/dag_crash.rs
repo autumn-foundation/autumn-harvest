@@ -182,6 +182,20 @@ impl<'a> DagCrashPlanner<'a> {
     }
 
     /// Run time of the DAG for the given task durations.
+    ///
+    /// Clone-class note: this forward-pass loop repeats verbatim in
+    /// `DagLeverage::makespan_with`. The `to_duration` helper below also
+    /// repeats verbatim there, and a third time in `dag_slack::to_duration`.
+    /// Apply any change to one loop or helper to its siblings.
+    ///
+    /// Two instances of the loop, three of `to_duration`. `dag_crash.rs`
+    /// landed in PR #2720. `dag_leverage.rs` carries no own history past a
+    /// branch-merge squash (issue #2708), so no co-change or missed-fix
+    /// exists to cite for either clone class. The merge bar needs rule of
+    /// three with a shown mechanism, or a missed-fix. Neither applies yet,
+    /// so the loop stays duplicated. `to_duration` clears the instance
+    /// count on its own. Each copy is a six-line saturating conversion —
+    /// an idiom, not a decision. So it stays duplicated too.
     fn makespan_of(&self, durations: &[u128]) -> u128 {
         let tasks = self.dag.tasks();
         let mut finish = vec![0u128; tasks.len()];

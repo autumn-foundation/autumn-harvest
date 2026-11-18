@@ -48,6 +48,11 @@ impl<'a> DagLeverage<'a> {
     /// Run time of the DAG when task `index` takes `duration` instead.
     ///
     /// Returns `None` when `index` is out of range.
+    ///
+    /// Clone-class note: the forward-pass loop below repeats verbatim in
+    /// `DagCrashPlanner::makespan_of`. See that function's own note for the
+    /// instance count and the history search. The `to_duration` helper at
+    /// the end of this file is the same note's other clone class.
     #[must_use]
     pub fn makespan_with(&self, index: usize, duration: Duration) -> Option<Duration> {
         let tasks = self.dag.tasks();
@@ -111,6 +116,10 @@ impl<'a> DagLeverage<'a> {
 }
 
 /// Convert nanoseconds to a `Duration`, saturating at `Duration::MAX`.
+///
+/// Clone-class note: this function repeats verbatim in `dag_crash.rs` and
+/// in `dag_slack::to_duration`. See `DagCrashPlanner::makespan_of` for the
+/// instance count and the history search.
 fn to_duration(nanos: u128) -> Duration {
     u64::try_from(nanos / 1_000_000_000).map_or(Duration::MAX, |secs| {
         // The remainder is below 1e9, so it fits in `u32`.

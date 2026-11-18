@@ -174,6 +174,11 @@ impl DagSlackAnalyzer {
 }
 
 /// Convert nanoseconds to a `Duration`, saturating at `Duration::MAX`.
+///
+/// Clone-class note: this function repeats verbatim in `dag_crash.rs` and
+/// `dag_leverage.rs`, each as a private copy instead of a call to this
+/// `pub(crate)` one. See `DagCrashPlanner::makespan_of` in `dag_crash.rs`
+/// for the instance count and the history search.
 pub(crate) fn to_duration(nanos: u128) -> Duration {
     u64::try_from(nanos / 1_000_000_000).map_or(Duration::MAX, |secs| {
         // The remainder is below 1e9, so it fits in `u32`.
