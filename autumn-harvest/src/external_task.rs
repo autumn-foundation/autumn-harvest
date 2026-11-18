@@ -138,7 +138,7 @@ pub async fn record_external_task(
     queue: &str,
     schedule_to_close_secs: u64,
 ) -> HarvestResult<()> {
-    let dur = crate::worker::chrono_duration_from_secs(
+    let dur = crate::worker::signed_duration_from_secs(
         schedule_to_close_secs,
         "external task schedule to close",
     )?;
@@ -473,7 +473,7 @@ pub async fn extend_deadline(
         let activity_id = ActivityExecId::from_uuid(task.activity_id);
 
         let dur =
-            crate::worker::chrono_duration_from_secs(extend_by_secs, "external task extend by")?;
+            crate::worker::signed_duration_from_secs(extend_by_secs, "external task extend by")?;
 
         let new_deadline = Timestamp::now().checked_add(dur).map_err(|_| {
             crate::error::HarvestError::Database("Datetime addition overflow".to_string())

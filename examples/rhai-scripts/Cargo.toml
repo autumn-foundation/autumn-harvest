@@ -14,7 +14,6 @@ path = "src/main.rs"
 # The backend-neutral determinism core only: no Diesel, no Postgres.
 autumn-harvest = { version = "0.10.0", path = "../../autumn-harvest", default-features = false }
 autumn-harvest-sqlite = { version = "0.10.0", path = "../../autumn-harvest-sqlite" }
-chrono = { workspace = true }
 jiff = { workspace = true }
 # `no_time` removes `timestamp()`, so a script body cannot read the clock.
 # `serde` converts script values to and from the JSON that history stores.

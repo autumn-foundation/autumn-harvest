@@ -5906,20 +5906,20 @@ async fn run_local_activity_inline(
 /// The longest duration that `chrono` held: `i64::MAX` milliseconds.
 ///
 /// jiff holds a longer one. The activity duration checks keep the old bound,
-/// so a value that `chrono` refused still fails with the same error.
-const CHRONO_MAX_DURATION: jiff::SignedDuration =
+/// so a value that `chrono` refused still fails.
+const MAX_ACTIVITY_DURATION: jiff::SignedDuration =
     jiff::SignedDuration::from_millis(i64::MAX);
 
-fn chrono_duration_from_std(
+fn bounded_duration_from_std(
     duration: Duration,
     field_name: &str,
 ) -> HarvestResult<jiff::SignedDuration> {
     jiff::SignedDuration::try_from(duration)
         .ok()
-        .filter(|duration| *duration <= CHRONO_MAX_DURATION)
+        .filter(|duration| *duration <= MAX_ACTIVITY_DURATION)
         .ok_or_else(|| {
             HarvestError::Config(format!(
-                "activity {field_name} duration exceeds chrono range"
+                "activity {field_name} duration exceeds the duration range"
             ))
         })
 }
@@ -6082,7 +6082,7 @@ async fn db_clock_now(conn: &mut AsyncPgConnection) -> HarvestResult<jiff::Times
         .map_err(crate::error::database_error)
 }
 
-pub(crate) fn chrono_duration_from_secs(
+pub(crate) fn signed_duration_from_secs(
     seconds: u64,
     field_name: &str,
 ) -> HarvestResult<jiff::SignedDuration> {
@@ -6090,10 +6090,10 @@ pub(crate) fn chrono_duration_from_secs(
         HarvestError::Config(format!("activity {field_name} exceeds i64 seconds range"))
     })?;
     Some(jiff::SignedDuration::from_secs(seconds))
-        .filter(|duration| *duration <= CHRONO_MAX_DURATION)
+        .filter(|duration| *duration <= MAX_ACTIVITY_DURATION)
         .ok_or_else(|| {
             HarvestError::Config(format!(
-                "activity {field_name} exceeds chrono::Duration bounds"
+                "activity {field_name} exceeds the duration bounds"
             ))
         })
 }
@@ -6140,7 +6140,7 @@ fn next_retry_delay(
     let delay = crate::policy::resolve_retry_after_hint(failure.retry_after, retry_after_ceiling)
         .unwrap_or(policy_delay);
 
-    chrono_duration_from_std(delay, "retry delay").map(Some)
+    bounded_duration_from_std(delay, "retry delay").map(Some)
 }
 
 /// The delay before the retry of a timed-out attempt (issue #1809).
@@ -9885,7 +9885,7 @@ async fn block_workflow_for_non_determinism(
     details: &crate::error::NonDeterministicDetails,
 ) -> HarvestResult<()> {
     let backoff = nd_block_backoff_jittered(execution.nd_block_count, task);
-    let backoff_chrono = jiff::SignedDuration::try_from(backoff).unwrap_or_default();
+    let backoff_duration = jiff::SignedDuration::try_from(backoff).unwrap_or_default();
     let error_owned = error.to_string();
     let patch = nd_search_attrs_patch(details);
     let task_id = task.id;
@@ -9930,7 +9930,7 @@ async fn block_workflow_for_non_determinism(
         }
 
         crate::store::update_search_attrs(conn, exec_id, &patch).await?;
-        queue::requeue_workflow_task_nd_blocked(conn, task_id, backoff_chrono, &error_owned)
+        queue::requeue_workflow_task_nd_blocked(conn, task_id, backoff_duration, &error_owned)
             .await?;
         Ok(false)
     }))
@@ -10339,12 +10339,12 @@ pub async fn persist_workflow_failure(
         Option<jiff::SignedDuration>,
     )> = retry_plan.as_ref().map(|(rid, policy, attempt, delay)| {
         // `chrono` read a delay past `i64::MAX` milliseconds as zero.
-        let delay_chrono = jiff::SignedDuration::try_from(*delay)
+        let delay_duration = jiff::SignedDuration::try_from(*delay)
             .ok()
-            .filter(|delay| *delay <= CHRONO_MAX_DURATION)
+            .filter(|delay| *delay <= MAX_ACTIVITY_DURATION)
             .unwrap_or_default();
-        let fire_at = saturating_fire_at(jiff::Timestamp::now(), delay_chrono);
-        let start_delay = (!delay.is_zero()).then_some(delay_chrono);
+        let fire_at = saturating_fire_at(jiff::Timestamp::now(), delay_duration);
+        let start_delay = (!delay.is_zero()).then_some(delay_duration);
         (*rid, policy.clone(), *attempt, fire_at, start_delay)
     });
 
@@ -12121,7 +12121,7 @@ fn build_activity_enqueue_plan(
 
         if let Some(timeout) = defaults.heartbeat_timeout {
             params.heartbeat_timeout =
-                Some(chrono_duration_from_std(timeout, "heartbeat timeout")?);
+                Some(bounded_duration_from_std(timeout, "heartbeat timeout")?);
         }
         // Issue #620: call-site override → activity default → builder default.
         // Reserved session-internal activities skip the builder floor (see the
@@ -12141,7 +12141,7 @@ fn build_activity_enqueue_plan(
         );
         if let Some(timeout) = effective_stc {
             params.start_to_close =
-                Some(chrono_duration_from_std(timeout, "start_to_close timeout")?);
+                Some(bounded_duration_from_std(timeout, "start_to_close timeout")?);
         }
         // Issue #606: a per-call schedule_to_start override takes priority over
         // the activity's registered default, like retry_policy_override /
@@ -12153,7 +12153,7 @@ fn build_activity_enqueue_plan(
             .schedule_to_start_override
             .or(defaults.schedule_to_start);
         if let Some(timeout) = effective_schedule_to_start {
-            params.schedule_to_start = Some(chrono_duration_from_std(
+            params.schedule_to_start = Some(bounded_duration_from_std(
                 timeout,
                 "schedule_to_start timeout",
             )?);
@@ -12161,7 +12161,7 @@ fn build_activity_enqueue_plan(
         if let Some(timeout) = defaults.schedule_to_close {
             let deadline = saturating_fire_at(
                 jiff::Timestamp::now(),
-                chrono_duration_from_std(timeout, "schedule_to_close timeout")?,
+                bounded_duration_from_std(timeout, "schedule_to_close timeout")?,
             );
             params.schedule_to_close_at = Some(deadline);
         }
@@ -12607,7 +12607,7 @@ async fn persist_started_timer(
             ext.fires_at
         } else {
             let fire_delay =
-                chrono_duration_from_secs(timer.duration_secs, "timer duration")?;
+                signed_duration_from_secs(timer.duration_secs, "timer duration")?;
             let db_now = db_clock_now(conn).await?;
             saturating_fire_at(db_now, fire_delay)
         };
@@ -14335,7 +14335,7 @@ async fn persist_child_timeout_race(
                 ext.fires_at
             } else {
                 let fire_delay =
-                    chrono_duration_from_secs(timer.duration_secs, "child timeout duration")?;
+                    signed_duration_from_secs(timer.duration_secs, "child timeout duration")?;
                 let db_now = db_clock_now(conn).await?;
                 saturating_fire_at(db_now, fire_delay)
             };
@@ -14731,7 +14731,7 @@ async fn persist_mixed_suspension_batch(
             let fires_at = if let Some(ext) = existing {
                 ext.fires_at
             } else {
-                let fire_delay = chrono_duration_from_secs(timer.duration_secs, "timer duration")?;
+                let fire_delay = signed_duration_from_secs(timer.duration_secs, "timer duration")?;
                 let now = if let Some(now) = db_now {
                     now
                 } else {
@@ -22390,7 +22390,7 @@ async fn plan_timer_lifecycle(
         let fires_at = if let Some(ref ext) = existing {
             ext.fires_at
         } else {
-            let fire_delay = chrono_duration_from_secs(*duration_secs, "timer duration")?;
+            let fire_delay = signed_duration_from_secs(*duration_secs, "timer duration")?;
             let db_now = db_clock_now(conn).await?;
             let fires_at = saturating_fire_at(db_now, fire_delay);
             let new_timer = NewHarvestTimer {
@@ -22960,9 +22960,9 @@ async fn requeue_child_spawn_admission_error(
         "child spawn could not be admitted; deferring the retry with a bounded \
          jittered backoff rather than failing the execution or hot-spinning",
     );
-    let backoff_chrono =
+    let backoff_duration =
         jiff::SignedDuration::try_from(backoff).unwrap_or_else(|_| jiff::SignedDuration::from_secs(5));
-    queue::requeue_workflow_task_for_quota_retry(conn, task_id, backoff_chrono, &error.to_string())
+    queue::requeue_workflow_task_for_quota_retry(conn, task_id, backoff_duration, &error.to_string())
         .await?;
     Ok(())
 }
@@ -23056,9 +23056,9 @@ async fn recover_from_child_quota_exceeded(
          a bounded jittered backoff rather than immediately re-driving it or \
          failing the execution over an unrelated tenant's quota",
     );
-    let backoff_chrono =
+    let backoff_duration =
         jiff::SignedDuration::try_from(backoff).unwrap_or_else(|_| jiff::SignedDuration::from_secs(5));
-    queue::requeue_workflow_task_for_quota_retry(conn, task_id, backoff_chrono, &error.to_string())
+    queue::requeue_workflow_task_for_quota_retry(conn, task_id, backoff_duration, &error.to_string())
         .await?;
     Ok(true)
 }
@@ -29327,8 +29327,8 @@ async fn process_workflow_task(
     let canary_roundtrip_secs =
         if is_canary && matches!(&outcome, WorkflowOutcome::Completed { .. }) {
             // Round-trip = start-requested → completed wall-clock (AC5). Clamp a
-            // clock-skew negative delta to 0 (`.to_std()` errs on a negative
-            // chrono duration), mirroring the update-duration clamping
+            // clock-skew negative delta to 0 (the std conversion errs on a negative
+            // signed duration), mirroring the update-duration clamping
             // precedent.
             Some(
                 std::time::Duration::try_from(jiff::Timestamp::now() - prepared.execution.started_at)
@@ -52271,15 +52271,15 @@ mod tests {
     }
 
     #[test]
-    fn havoc_chrono_duration_panic() {
+    fn havoc_duration_out_of_bounds() {
         let max_safe_secs = i64::MAX as u64;
-        let result = chrono_duration_from_secs(max_safe_secs, "timeout");
+        let result = signed_duration_from_secs(max_safe_secs, "timeout");
         assert!(result.is_err());
         assert!(
             result
                 .unwrap_err()
                 .to_string()
-                .contains("exceeds chrono::Duration bounds")
+                .contains("exceeds the duration bounds")
         );
     }
 
@@ -54387,7 +54387,7 @@ mod tests {
         assert_eq!(worker_stale_secs(Duration::from_millis(100)), 1);
         // Doubling happens before rounding: 1500ms -> 3s, not 2s.
         assert_eq!(worker_stale_secs(Duration::from_millis(1500)), 3);
-        // Absurd values clamp instead of overflowing downstream chrono math.
+        // Absurd values clamp instead of overflowing downstream duration math.
         assert_eq!(
             worker_stale_secs(Duration::from_secs(u64::MAX)),
             crate::poison_pill::MAX_WORKER_STALE_SECS

@@ -269,8 +269,8 @@ pub fn first_non_ident_param<'a>(params: &'a [&syn::FnArg]) -> Option<&'a syn::P
 /// parity with" the pre-existing `execution_timeout` pair above it. It was
 /// added with the chain-cap fields, issue #617. The duplication was a
 /// deliberate copy, not a coincidence.
-pub fn optional_chrono_duration_tokens(field_name: &str, source: &TokenStream) -> TokenStream {
-    let message = format!("{field_name} exceeds chrono duration range");
+pub fn optional_duration_tokens(field_name: &str, source: &TokenStream) -> TokenStream {
+    let message = format!("{field_name} exceeds the duration range");
     quote! {
         match #source {
             ::std::option::Option::Some(d) => ::std::option::Option::Some(
@@ -285,8 +285,8 @@ pub fn optional_chrono_duration_tokens(field_name: &str, source: &TokenStream) -
 }
 
 #[cfg(test)]
-mod optional_chrono_duration_tokens_tests {
-    use super::optional_chrono_duration_tokens;
+mod optional_duration_tokens_tests {
+    use super::optional_duration_tokens;
     use quote::quote;
 
     /// Pins the exact shape `workflow.rs`'s `start_with_options`/
@@ -294,7 +294,7 @@ mod optional_chrono_duration_tokens_tests {
     /// before this extraction, for both of their shared fields.
     #[test]
     fn reproduces_the_execution_timeout_match_workflow_rs_and_signal_with_start_shared() {
-        let out = optional_chrono_duration_tokens(
+        let out = optional_duration_tokens(
             "execution_timeout",
             &quote! { opts.execution_timeout.or(info.execution_timeout) },
         )
@@ -304,7 +304,7 @@ mod optional_chrono_duration_tokens_tests {
                 ::std::option::Option::Some(d) => ::std::option::Option::Some(
                     ::autumn_harvest::jiff::SignedDuration::try_from(d)
                         .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
-                            "execution_timeout exceeds chrono duration range".to_string()
+                            "execution_timeout exceeds the duration range".to_string()
                         ))?
                 ),
                 ::std::option::Option::None => ::std::option::Option::None,
@@ -319,7 +319,7 @@ mod optional_chrono_duration_tokens_tests {
     /// the source expression, not the shared match shape.
     #[test]
     fn reproduces_the_execution_timeout_match_update_with_start_variant() {
-        let out = optional_chrono_duration_tokens(
+        let out = optional_duration_tokens(
             "execution_timeout",
             &quote! { opts.execution_timeout },
         )
@@ -329,7 +329,7 @@ mod optional_chrono_duration_tokens_tests {
                 ::std::option::Option::Some(d) => ::std::option::Option::Some(
                     ::autumn_harvest::jiff::SignedDuration::try_from(d)
                         .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
-                            "execution_timeout exceeds chrono duration range".to_string()
+                            "execution_timeout exceeds the duration range".to_string()
                         ))?
                 ),
                 ::std::option::Option::None => ::std::option::Option::None,
@@ -343,7 +343,7 @@ mod optional_chrono_duration_tokens_tests {
     /// sites. Only the field name, hence the error message, varies here.
     #[test]
     fn reproduces_the_max_execution_timeout_ceiling_match_shared_by_all_three_call_sites() {
-        let out = optional_chrono_duration_tokens(
+        let out = optional_duration_tokens(
             "max_execution_timeout_ceiling",
             &quote! { client.max_workflow_execution_timeout() },
         )
@@ -353,7 +353,7 @@ mod optional_chrono_duration_tokens_tests {
                 ::std::option::Option::Some(d) => ::std::option::Option::Some(
                     ::autumn_harvest::jiff::SignedDuration::try_from(d)
                         .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
-                            "max_execution_timeout_ceiling exceeds chrono duration range".to_string()
+                            "max_execution_timeout_ceiling exceeds the duration range".to_string()
                         ))?
                 ),
                 ::std::option::Option::None => ::std::option::Option::None,
@@ -366,7 +366,7 @@ mod optional_chrono_duration_tokens_tests {
     /// The two chain-cap fields (issue #617) are `start_with_options`-only.
     #[test]
     fn reproduces_the_chain_execution_timeout_match() {
-        let out = optional_chrono_duration_tokens(
+        let out = optional_duration_tokens(
             "chain_execution_timeout",
             &quote! { info.chain_execution_timeout },
         )
@@ -376,7 +376,7 @@ mod optional_chrono_duration_tokens_tests {
                 ::std::option::Option::Some(d) => ::std::option::Option::Some(
                     ::autumn_harvest::jiff::SignedDuration::try_from(d)
                         .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
-                            "chain_execution_timeout exceeds chrono duration range".to_string()
+                            "chain_execution_timeout exceeds the duration range".to_string()
                         ))?
                 ),
                 ::std::option::Option::None => ::std::option::Option::None,
@@ -388,7 +388,7 @@ mod optional_chrono_duration_tokens_tests {
 
     #[test]
     fn reproduces_the_max_workflow_chain_timeout_ceiling_match() {
-        let out = optional_chrono_duration_tokens(
+        let out = optional_duration_tokens(
             "max_workflow_chain_timeout_ceiling",
             &quote! { client.max_workflow_chain_timeout() },
         )
@@ -398,7 +398,7 @@ mod optional_chrono_duration_tokens_tests {
                 ::std::option::Option::Some(d) => ::std::option::Option::Some(
                     ::autumn_harvest::jiff::SignedDuration::try_from(d)
                         .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
-                            "max_workflow_chain_timeout_ceiling exceeds chrono duration range".to_string()
+                            "max_workflow_chain_timeout_ceiling exceeds the duration range".to_string()
                         ))?
                 ),
                 ::std::option::Option::None => ::std::option::Option::None,
@@ -412,9 +412,9 @@ mod optional_chrono_duration_tokens_tests {
     /// name at a call site is caught here, not silently accepted.
     #[test]
     fn error_message_names_the_field() {
-        let out = optional_chrono_duration_tokens("sla", &quote! { opts.sla }).to_string();
+        let out = optional_duration_tokens("sla", &quote! { opts.sla }).to_string();
         assert!(
-            out.contains("\"sla exceeds chrono duration range\""),
+            out.contains("\"sla exceeds the duration range\""),
             "{out}"
         );
     }

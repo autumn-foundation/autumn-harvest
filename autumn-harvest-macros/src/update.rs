@@ -171,10 +171,10 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // `update_with_start` resolves the same three run defaults as the typed
     // `start` stub (issues #2387, #2406 and #2511). An option of the call wins
     // over an operator override, which wins over the declared value. See
-    // `optional_chrono_duration_tokens`'s doc comment for the clone class this
+    // `optional_duration_tokens`'s doc comment for the clone class this
     // and `workflow.rs`'s two typed stubs share.
     let update_with_start_execution_timeout_tokens =
-        crate::attr_util::optional_chrono_duration_tokens(
+        crate::attr_util::optional_duration_tokens(
             "execution_timeout",
             &quote! {
                 opts.execution_timeout
@@ -182,17 +182,17 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             },
         );
     let update_with_start_max_execution_timeout_ceiling_tokens =
-        crate::attr_util::optional_chrono_duration_tokens(
+        crate::attr_util::optional_duration_tokens(
             "max_execution_timeout_ceiling",
             &quote! { client.max_workflow_execution_timeout() },
         );
     let update_with_start_chain_execution_timeout_tokens =
-        crate::attr_util::optional_chrono_duration_tokens(
+        crate::attr_util::optional_duration_tokens(
             "chain_execution_timeout",
             &quote! { client.apply_chain_run_default(info.name, info.chain_execution_timeout) },
         );
     let update_with_start_max_workflow_chain_timeout_ceiling_tokens =
-        crate::attr_util::optional_chrono_duration_tokens(
+        crate::attr_util::optional_duration_tokens(
             "max_workflow_chain_timeout_ceiling",
             &quote! { client.max_workflow_chain_timeout() },
         );

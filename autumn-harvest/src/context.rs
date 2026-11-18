@@ -2519,7 +2519,7 @@ fn duration_to_millis_saturating(d: std::time::Duration) -> u64 {
 /// - A defensive fallback saturates to `u64::MAX` for a delta whose whole
 ///   seconds overflow `i64`→`u64`. No valid `Timestamp` pair can reach it,
 ///   because the jiff range caps the delta far below that. If it
-///   is hit, the worker's `chrono_duration_from_secs` gives a `Config` error
+///   is hit, the worker's `signed_duration_from_secs` gives a `Config` error
 ///   at persist, like an overflowing `ctx.timer` duration.
 pub(crate) fn remaining_secs_until(deadline: Timestamp, now: Timestamp) -> u64 {
     let delta = deadline.duration_since(now);

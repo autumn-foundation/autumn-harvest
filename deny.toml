@@ -484,7 +484,26 @@ allow-wildcard-paths = true
 highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"
-deny = []
+# ADR 0018: Harvest uses `jiff` for dates and times. These bans keep `chrono`
+# and `chrono-tz` out of every crate that Harvest writes. A crate may depend
+# on them only when it is a listed wrapper. `autumn-harvest-plugin` converts at
+# the `autumn-web` boundary, whose API holds `chrono` types. The other
+# wrappers are third-party crates that Harvest does not control.
+deny = [
+    { crate = "chrono", wrappers = [
+        "autumn-harvest-plugin",
+        "autumn-web",
+        "chrono-tz",
+        "croner",
+        "diesel",
+        "smop",
+        "tokio-cron-scheduler",
+    ], reason = "Harvest uses jiff (ADR 0018)" },
+    { crate = "chrono-tz", wrappers = [
+        "autumn-web",
+        "tokio-cron-scheduler",
+    ], reason = "Harvest uses jiff (ADR 0018)" },
+]
 skip = []
 skip-tree = []
 

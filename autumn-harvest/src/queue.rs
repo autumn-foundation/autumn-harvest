@@ -1169,7 +1169,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         (Some(worker), Some(timeout)) => {
             let chrono_timeout = jiff::SignedDuration::try_from(timeout).map_err(|_| {
                 crate::error::HarvestError::Config(
-                    "sticky_timeout exceeds chrono duration range".to_string(),
+                    "sticky_timeout exceeds the duration range".to_string(),
                 )
             })?;
             Some((worker, chrono_timeout))
@@ -1501,7 +1501,7 @@ pub async fn enqueue_batch(
         {
             let chrono_timeout = SignedDuration::try_from(timeout).map_err(|_| {
                 crate::error::HarvestError::Config(
-                    "sticky_timeout exceeds chrono duration range".to_string(),
+                    "sticky_timeout exceeds the duration range".to_string(),
                 )
             })?;
             diesel::sql_query(
@@ -9656,7 +9656,7 @@ impl<'a> StickyHint<'a> {
     fn chrono_timeout(self) -> HarvestResult<jiff::SignedDuration> {
         jiff::SignedDuration::try_from(self.timeout).map_err(|_| {
             crate::error::HarvestError::Config(
-                "sticky_timeout exceeds chrono duration range".to_string(),
+                "sticky_timeout exceeds the duration range".to_string(),
             )
         })
     }

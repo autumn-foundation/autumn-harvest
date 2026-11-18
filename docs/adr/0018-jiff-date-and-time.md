@@ -59,8 +59,11 @@ Accepted.
    3, 6 or 9 digits. Each library reads the output of the other, so stored
    JSON stays readable in both directions.
 7. `chrono` stays a dependency of `autumn-harvest-plugin` only behind its
-   `webhooks` feature. `autumn-web` 0.10 holds `chrono` types in its
-   webhook API, and the plugin converts at that boundary.
+   `webhooks` and `sqlite` features. `autumn-web` 0.10 holds `chrono`
+   types in its webhook delivery log and its tenant restore target. The
+   plugin converts at that boundary, in `chrono_boundary.rs`. No other
+   Harvest crate depends on `chrono` or `chrono-tz`. `deny.toml` bans both
+   crates, and lists the crates that may still wrap them.
 
 ## Consequences
 

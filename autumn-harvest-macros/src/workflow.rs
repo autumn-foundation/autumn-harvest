@@ -1134,10 +1134,10 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let declared_children_expr = declaration_expr(attrs.declared_children.as_deref());
 
     // Shared by `start_with_options` and `signal_with_start` below, which
-    // read both fields identically (see `optional_chrono_duration_tokens`'s
+    // read both fields identically (see `optional_duration_tokens`'s
     // doc comment). An operator override in the client cache wins over the
     // declared value (issue #2387).
-    let stub_execution_timeout_tokens = crate::attr_util::optional_chrono_duration_tokens(
+    let stub_execution_timeout_tokens = crate::attr_util::optional_duration_tokens(
         "execution_timeout",
         &quote! {
             opts.execution_timeout
@@ -1145,19 +1145,19 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     );
     let stub_max_execution_timeout_ceiling_tokens =
-        crate::attr_util::optional_chrono_duration_tokens(
+        crate::attr_util::optional_duration_tokens(
             "max_execution_timeout_ceiling",
             &quote! { client.max_workflow_execution_timeout() },
         );
     // Shared by `start_with_options` and `signal_with_start` (issue #2406).
     // `update.rs` resolves the same values for `update_with_start` (issue
     // #2511). The operator override of the chain cap wins.
-    let stub_chain_execution_timeout_tokens = crate::attr_util::optional_chrono_duration_tokens(
+    let stub_chain_execution_timeout_tokens = crate::attr_util::optional_duration_tokens(
         "chain_execution_timeout",
         &quote! { client.apply_chain_run_default(info.name, info.chain_execution_timeout) },
     );
     let stub_max_workflow_chain_timeout_ceiling_tokens =
-        crate::attr_util::optional_chrono_duration_tokens(
+        crate::attr_util::optional_duration_tokens(
             "max_workflow_chain_timeout_ceiling",
             &quote! { client.max_workflow_chain_timeout() },
         );
@@ -1302,7 +1302,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let max_workflow_start_delay = {
                         let ceiling_chrono = ::autumn_harvest::jiff::SignedDuration::try_from(client.max_workflow_start_delay())
                             .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
-                                "max_workflow_start_delay ceiling exceeds chrono duration range".to_string()
+                                "max_workflow_start_delay ceiling exceeds the duration range".to_string()
                             ))?;
                         let requested_chrono = opts.max_workflow_start_delay.unwrap_or(ceiling_chrono);
                         requested_chrono.min(ceiling_chrono)

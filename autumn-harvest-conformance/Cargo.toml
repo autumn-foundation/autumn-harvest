@@ -16,7 +16,6 @@ readme = "README.md"
 [dev-dependencies]
 autumn-harvest = { version = "0.10.0", path = "../autumn-harvest", features = ["db", "testing", "debugger"] }
 autumn-harvest-sqlite = { version = "0.10.0", path = "../autumn-harvest-sqlite" }
-chrono = { workspace = true }
 jiff = { workspace = true }
 deadpool = { workspace = true }
 diesel = { workspace = true }

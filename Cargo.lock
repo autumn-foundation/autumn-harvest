@@ -73,7 +73,6 @@ dependencies = [
  "autumn-harvest",
  "autumn-harvest-agent",
  "autumn-harvest-sqlite",
- "chrono",
  "clap",
  "deadpool",
  "diesel",
@@ -431,7 +430,6 @@ dependencies = [
  "autumn-harvest",
  "autumn-harvest-agent",
  "autumn-harvest-sqlite",
- "chrono",
  "clap",
  "jiff 1.0.1",
  "proptest",
@@ -456,8 +454,6 @@ dependencies = [
  "autumn-harvest-agent",
  "autumn-harvest-macros",
  "base64 0.23.1",
- "chrono",
- "chrono-tz",
  "criterion",
  "croner 4.0.3",
  "deadpool",
@@ -519,7 +515,6 @@ dependencies = [
  "autumn-harvest",
  "autumn-harvest-sqlite",
  "base64 0.23.1",
- "chrono",
  "deadpool",
  "diesel",
  "diesel-async",
@@ -549,7 +544,6 @@ name = "autumn-harvest-cli"
 version = "0.10.0"
 dependencies = [
  "autumn-harvest",
- "chrono",
  "clap",
  "crossterm",
  "diesel-async",
@@ -575,7 +569,6 @@ version = "0.10.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-sqlite",
- "chrono",
  "deadpool",
  "diesel",
  "diesel-async",
@@ -652,7 +645,6 @@ version = "0.10.0"
 dependencies = [
  "async-trait",
  "autumn-harvest",
- "chrono",
  "deadpool",
  "diesel",
  "diesel-async",
@@ -686,7 +678,6 @@ name = "autumn-harvest-sqlite"
 version = "0.10.0"
 dependencies = [
  "autumn-harvest",
- "chrono",
  "jiff 1.0.1",
  "rusqlite",
  "serde",
@@ -1767,7 +1758,6 @@ version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
- "arbitrary",
  "iana-time-zone",
  "js-sys",
  "num-traits",
@@ -3779,7 +3769,6 @@ version = "0.10.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-sqlite",
- "chrono",
  "diesel",
  "diesel-async",
  "jiff 1.0.1",
@@ -6225,7 +6214,6 @@ version = "0.10.0"
 dependencies = [
  "autumn-harvest-agent",
  "autumn-harvest-sqlite",
- "chrono",
  "clap",
  "jiff 1.0.1",
  "tempfile",
@@ -6490,7 +6478,6 @@ version = "0.10.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-sqlite",
- "chrono",
  "jiff 1.0.1",
  "rhai",
  "rusqlite",
@@ -6736,7 +6723,6 @@ name = "saga-choreography"
 version = "0.10.0"
 dependencies = [
  "autumn-harvest",
- "chrono",
  "jiff 1.0.1",
  "serde_json",
  "tokio",

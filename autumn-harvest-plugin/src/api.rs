@@ -13189,7 +13189,7 @@ fn try_seconds(secs: i64) -> Option<jiff::SignedDuration> {
 ///
 /// That bound is the range of `chrono::Duration::from_std`. The start routes
 /// keep it, so a delay or a delay cap converts exactly as it did before jiff.
-fn std_to_chrono_range(duration: Duration) -> Option<jiff::SignedDuration> {
+fn std_to_bounded_duration(duration: Duration) -> Option<jiff::SignedDuration> {
     if duration > autumn_harvest::builder::MAX_WORKFLOW_DURATION {
         return None;
     }
@@ -19272,7 +19272,7 @@ pub(crate) async fn start_workflow(
             }
             return AutumnError::bad_request_msg(err_msg).into_response();
         }
-        let Some(delay) = std_to_chrono_range(std_d) else {
+        let Some(delay) = std_to_bounded_duration(std_d) else {
             return AutumnError::bad_request_msg("delay duration overflow").into_response();
         };
         Some(delay)
@@ -19282,7 +19282,7 @@ pub(crate) async fn start_workflow(
 
     if let Some(sa) = request.start_at {
         let max_delay_bound =
-            std_to_chrono_range(max_delay).unwrap_or_else(|| autumn_harvest::time::days(365));
+            std_to_bounded_duration(max_delay).unwrap_or_else(|| autumn_harvest::time::days(365));
         // jiff ends in the year 9999. A later cap saturates, so every
         // `start_at` is within it, as it was under chrono.
         let max_start_at = jiff::Timestamp::now()
@@ -19314,7 +19314,7 @@ pub(crate) async fn start_workflow(
         }
     }
 
-    let max_delay_bound = std_to_chrono_range(max_delay);
+    let max_delay_bound = std_to_bounded_duration(max_delay);
 
     // Issue #252: compute effective cap; enforcement happens inside
     // start_or_load_workflow_execution so duplicate-resolution (409) runs first.
