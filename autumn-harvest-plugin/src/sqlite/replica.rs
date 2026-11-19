@@ -359,7 +359,7 @@ impl Replicas {
         // pending target cannot tell them apart, so the open waits for the
         // return. A refused open of a stale-epoch open also frees the drain.
         if let Some(Entry::Pending { from, .. }) = &unreturned
-            && *from != current
+            && !same_file(from, &current)
         {
             return Err(format!(
                 "a restore of {key} is ending: open the tenant again once it returns"
@@ -367,15 +367,13 @@ impl Replicas {
         }
         let seen = unreturned.as_ref().map_or(entry, before_request);
         let resolution = resolve_target(held(seen, &current));
-        let superseded = matches!(resolution, Resolution::Superseded);
+        // A file with no record predates the record. Its record did not move.
+        let moved = recorded.is_some_and(|recorded| !same_file(recorded.trim(), &current));
+        let replaced = replaced(&resolution, moved);
         let target = match resolution {
             Resolution::Apply(target) => Some(target),
             Resolution::Nothing | Resolution::Superseded => None,
         };
-        // A file with no record predates the record. A superseded target
-        // then shows that the database is a new file.
-        let replaced =
-            target.is_some() || recorded.map_or(superseded, |recorded| recorded.trim() != current);
         if !path.exists() || replaced {
             self.drop_parked(key);
             match target {
@@ -1012,22 +1010,41 @@ fn identity_or_none(database: &Path) -> Result<String, String> {
     }
 }
 
+/// The identity of the file at `database`. Not the length or the mtime: an
+/// ordinary write changes them.
 fn file_identity(database: &Path) -> std::io::Result<String> {
     let meta = std::fs::metadata(database)?;
+    let born = meta.created().map(|born| {
+        born.duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos())
+    });
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        Ok(format!("{}:{}", meta.dev(), meta.ino()))
+        Ok(unix_identity(meta.dev(), meta.ino(), born.ok()))
     }
     #[cfg(not(unix))]
     {
-        let nanos = meta
-            .created()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |since| since.as_nanos());
-        // Not the length: an ordinary checkpoint changes it.
-        Ok(nanos.to_string())
+        Ok(born?.to_string())
     }
+}
+
+/// The Unix identity `<dev>:<ino>:<birth ns>`. A new file can reuse the
+/// inode of a removed file. The birth time tells the two files apart
+/// (issue #2721). A file system with no birth time gives `<dev>:<ino>`.
+#[cfg(unix)]
+fn unix_identity(dev: u64, ino: u64, born: Option<u128>) -> String {
+    born.map_or_else(
+        || format!("{dev}:{ino}"),
+        |born| format!("{dev}:{ino}:{born}"),
+    )
+}
+
+/// Whether the identities `a` and `b` name one database file. Each field
+/// that both hold must be equal. A record from before issue #2721 holds no
+/// birth time, so it compares the device and the inode only.
+fn same_file(a: &str, b: &str) -> bool {
+    a.split(':').zip(b.split(':')).all(|(a, b)| a == b)
 }
 
 /// The point in time of a requested restore.
@@ -1198,13 +1215,25 @@ fn resolve_target<T>(held: Held<T>) -> Resolution<T> {
     }
 }
 
+/// Whether the open finds a new database file. A target that applies or
+/// that a later restore superseded shows one. Otherwise only a moved
+/// record shows one. A new file can reuse the identity of the recorded
+/// file, so a superseded target counts even with an unmoved record (issue
+/// #2721). `formal/verus/src/restore_target.rs` proves it.
+const fn replaced<T>(resolution: &Resolution<T>, moved: bool) -> bool {
+    match resolution {
+        Resolution::Nothing => moved,
+        _ => true,
+    }
+}
+
 /// `entry`, seen from the database file `current`.
 fn held(entry: Option<Entry>, current: &str) -> Held<Target> {
     match entry {
         None => Held::Nothing,
         Some(Entry::Committed { target, of }) => Held::Committed {
             target,
-            current: of == current,
+            current: same_file(&of, current),
         },
         Some(Entry::Pending {
             target,
@@ -1212,7 +1241,7 @@ fn held(entry: Option<Entry>, current: &str) -> Held<Target> {
             previous,
         }) => Held::Pending {
             target,
-            moved: from != current,
+            moved: !same_file(&from, current),
             previous,
         },
     }
@@ -1658,6 +1687,157 @@ mod tests {
         assert_eq!(entry(&path), None);
     }
 
+    /// The direct restore can put the database on the inode of the recorded
+    /// file. The superseded target still shows a new file, so the open
+    /// follows the latest replica (issue #2721).
+    #[test]
+    fn a_superseded_target_follows_a_reused_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = replicas(dir.path());
+        let (key, path, db) = shipped_acme(dir.path(), &replicas);
+        harvest_restore(&replicas, &key, &db, unreachable());
+
+        replicas.release(&key);
+        replace_database(&db);
+        // The record now names the new file, as a reused identity does.
+        record_database(&path, &db).unwrap();
+        replicas.prepare(&key, &path, &db, None).unwrap();
+        assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 6);
+        assert_eq!(entry(&path), None);
+    }
+
+    /// A new file can reuse the inode of a removed file. Its birth time
+    /// differs, so its identity differs too (issue #2721).
+    #[cfg(unix)]
+    #[test]
+    fn a_new_file_on_a_reused_inode_has_a_new_identity() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let db = database(dir.path(), "acme.db");
+        // A file system with no birth time cannot tell the two files apart.
+        if std::fs::metadata(&db).unwrap().created().is_err() {
+            return;
+        }
+        let first = database_identity(&db).unwrap();
+        assert_eq!(first.split(':').count(), 3, "{first}");
+        let inode = std::fs::metadata(&db).unwrap().ino();
+        // A parallel test can take the free inode. So try again until the
+        // new file reuses it.
+        for _ in 0..100 {
+            std::fs::remove_file(&db).unwrap();
+            // The birth time comes from a coarse clock. One tick is a few ms.
+            std::thread::sleep(Duration::from_millis(20));
+            database(dir.path(), "acme.db");
+            if std::fs::metadata(&db).unwrap().ino() == inode {
+                assert_ne!(first, database_identity(&db).unwrap());
+                return;
+            }
+        }
+        eprintln!("the file system reused no inode: only the format is checked");
+    }
+
+    /// The Unix identity holds the device, the inode and the birth time.
+    /// Two files on one inode differ by their birth time (issue #2721).
+    #[cfg(unix)]
+    #[test]
+    fn the_unix_identity_holds_the_birth_time() {
+        assert_eq!(unix_identity(1, 2, Some(3)), "1:2:3");
+        assert_eq!(unix_identity(1, 2, None), "1:2");
+        assert!(!same_file(
+            &unix_identity(1, 2, Some(3)),
+            &unix_identity(1, 2, Some(4))
+        ));
+    }
+
+    /// Two identities name one file when each field that both hold is
+    /// equal. A record from before issue #2721 holds no birth time.
+    #[test]
+    fn same_file_compares_the_fields_that_both_hold() {
+        assert!(same_file("1:2:3", "1:2:3"));
+        assert!(!same_file("1:2:3", "1:2:4"), "a reused inode");
+        assert!(!same_file("1:2:3", "1:5:3"), "another inode");
+        assert!(same_file("1:2", "1:2:3"), "an older record");
+        assert!(same_file("1:2:3", "1:2"), "an older record");
+        assert!(!same_file("1:2", "1:5:3"));
+        assert!(same_file(NONE, NONE));
+        assert!(!same_file(NONE, "1:2:3"), "a missing file");
+        assert!(same_file("123", "123"), "a creation time");
+        assert!(!same_file("123", "124"), "a creation time");
+    }
+
+    /// The identity of `database` without its birth time, as a release
+    /// before issue #2721 recorded it.
+    #[cfg(unix)]
+    fn older_identity(database: &Path) -> String {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::metadata(database).unwrap();
+        format!("{}:{}", meta.dev(), meta.ino())
+    }
+
+    /// An open after an upgrade reads a record with no birth time. The
+    /// database file did not change, so the open keeps the Harvest file.
+    #[cfg(unix)]
+    #[test]
+    fn an_older_record_keeps_its_harvest_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = replicas(dir.path());
+        let (key, path, db) = shipped_acme(dir.path(), &replicas);
+        write_atomic(&suffixed(&path, IDENTITY_SUFFIX), &older_identity(&db)).unwrap();
+        replicas.prepare(&key, &path, &db, None).unwrap();
+        assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 1);
+    }
+
+    /// A committed target from before an upgrade names its file with no
+    /// birth time. It still applies while that file is current. A target
+    /// that no replica reaches refuses the open. A superseded one would not.
+    #[cfg(unix)]
+    #[test]
+    fn an_older_committed_target_still_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = replicas(dir.path());
+        let (key, path, db) = shipped_acme(dir.path(), &replicas);
+        let committed = Entry::Committed {
+            target: Target::of(unreachable()),
+            of: older_identity(&db),
+        };
+        write_entry(&path, Some(&committed)).unwrap();
+        let refused = replicas.prepare(&key, &path, &db, None).unwrap_err();
+        assert!(
+            refused.contains("cannot reach the restore target"),
+            "{refused}"
+        );
+        assert_eq!(entry(&path), Some(committed));
+    }
+
+    /// A pending target from before an upgrade names its file with no birth
+    /// time. The file did not move, so the restore did not publish.
+    #[cfg(unix)]
+    #[test]
+    fn an_older_pending_target_sees_an_unmoved_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = replicas(dir.path());
+        let (key, path, db) = shipped_acme(dir.path(), &replicas);
+        let pending = Entry::Pending {
+            target: Target::of(unreachable()),
+            from: older_identity(&db),
+            previous: None,
+        };
+        write_entry(&path, Some(&pending)).unwrap();
+        replicas.prepare(&key, &path, &db, None).unwrap();
+        assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 1);
+        assert_eq!(entry(&path), None);
+    }
+
+    /// `replaced` sees a new database file when a target applies, when a
+    /// later restore superseded the target, or when the record moved.
+    #[test]
+    fn replaced_sees_a_superseded_target() {
+        assert!(replaced(&Resolution::Superseded::<Target>, false));
+        assert!(replaced(&Resolution::Apply(Target::Latest), false));
+        assert!(!replaced(&Resolution::Nothing::<Target>, false));
+        assert!(replaced(&Resolution::Nothing::<Target>, true));
+    }
+
     /// A direct restore that fails leaves the database. The target still
     /// applies, so this open refuses as the target asks.
     #[test]
@@ -1883,33 +2063,31 @@ mod tests {
         assert_eq!(entry(&path), None);
     }
 
-    /// A superseded target restores the Harvest file only when the file has
-    /// no database record. A file that follows the database stays.
+    /// A superseded target shows a new database file. The open restores the
+    /// Harvest file, with a database record or without one. The record can
+    /// name a new file that reuses the recorded identity (issue #2721).
     #[test]
-    fn a_superseded_target_restores_only_a_file_with_no_record() {
-        let dir = tempfile::tempdir().unwrap();
-        let replicas = replicas(dir.path());
-        let (key, path, db) = shipped_acme(dir.path(), &replicas);
-        let gone = Entry::Committed {
-            target: Target::Latest,
-            of: "1:1".to_owned(),
-        };
-        write_entry(&path, Some(&gone)).unwrap();
-        replicas.prepare(&key, &path, &db, None).unwrap();
-        assert_eq!(
-            autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(),
-            1,
-            "kept"
-        );
-
-        write_entry(&path, Some(&gone)).unwrap();
-        std::fs::remove_file(suffixed(&path, IDENTITY_SUFFIX)).unwrap();
-        replicas.prepare(&key, &path, &db, None).unwrap();
-        assert_eq!(
-            autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(),
-            6,
-            "restored"
-        );
+    fn a_superseded_target_restores_the_harvest_file() {
+        for recorded in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let replicas = replicas(dir.path());
+            let (key, path, db) = shipped_acme(dir.path(), &replicas);
+            let gone = Entry::Committed {
+                target: Target::Latest,
+                of: "1:1".to_owned(),
+            };
+            write_entry(&path, Some(&gone)).unwrap();
+            if !recorded {
+                std::fs::remove_file(suffixed(&path, IDENTITY_SUFFIX)).unwrap();
+            }
+            replicas.prepare(&key, &path, &db, None).unwrap();
+            assert_eq!(
+                autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(),
+                6,
+                "recorded: {recorded}"
+            );
+            assert_eq!(entry(&path), None, "recorded: {recorded}");
+        }
     }
 
     /// A restart after a failed restore keeps the earlier target that the

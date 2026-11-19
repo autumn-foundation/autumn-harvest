@@ -287,7 +287,12 @@ sequenceDiagram
 - Do not run a direct restore of a tenant while a `HarvestFleet::restore`
   of it runs. A direct restore that publishes just before the
   `HarvestFleet::restore` returns can take its target.
-- On Unix the database identity is the device and inode. Elsewhere it is
+- On Unix the database identity is the device, the inode and the birth
+  time. A new file can reuse the inode of a removed file, and the birth
+  time tells them apart (issue #2721). A file system with no birth time
+  gives the device and inode only. Two direct restores before the next
+  open can then keep the old Harvest file, when the new file reuses the
+  inode of the recorded file. Elsewhere the identity is
   the creation time, which Windows can keep across a rename. A direct
   `DatabaseFleet::restore` on Windows can then keep the old Harvest file,
   or the target of an earlier `HarvestFleet::restore`. Use
