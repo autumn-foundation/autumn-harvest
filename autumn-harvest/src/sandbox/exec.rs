@@ -32,7 +32,7 @@
 //! microVM ends after one run.
 
 use std::io::{self, Read as _, Write as _};
-use std::os::fd::{AsRawFd, FromRawFd as _, OwnedFd};
+use std::os::fd::{AsFd as _, AsRawFd, FromRawFd as _, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
@@ -45,7 +45,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::capture::StreamCapture;
 use super::error::SandboxError;
-use super::fs_isolation::{FS_FAILED, FsIsolation, FsPlan};
+use super::fs_isolation::{FS_FAILED, FsIsolation, FsPlan, PivotDirs, ROOT_NAME, WORK_NAME};
 use super::guest::PlanExecutor;
 use super::outcome::{
     MAX_SKIP_REASON_BYTES, MISSING_OUTPUT_REASON, NOT_A_DIRECTORY_REASON, OutputFile, RunStatus,
@@ -183,11 +183,11 @@ pub async fn execute_plan(
         .transpose()?;
     // The work directory belongs to the executor until the files are in
     // place. So no other process of the code uid can plant a link there.
-    let work = WorkDir::create(&options.scratch_root)?;
+    let mut work = WorkDir::create(&options.scratch_root)?;
     write_files(work.path(), plan, run_as)?;
     work.hand_over(run_as)?;
 
-    let fs = fs_plan(options, &work, plan)?;
+    let fs = fs_plan(options, &mut work, plan)?;
     let setup = ChildSetup::new(
         plan,
         run_as,
@@ -286,17 +286,15 @@ pub async fn execute_plan(
 /// The steps of the private file system of a run, or `None` for a shared one.
 fn fs_plan(
     options: &ExecOptions,
-    work: &WorkDir,
+    work: &mut WorkDir,
     plan: &ExecPlan,
 ) -> Result<Option<FsPlan>, SandboxError> {
-    let root = options
-        .fs
-        .needs_root()
-        .then(|| work.create_root())
-        .transpose()?;
+    if options.fs.needs_root() {
+        work.create_root()?;
+    }
     options
         .fs
-        .prepare(root.as_deref(), work.path(), plan.limits.memory_bytes)
+        .prepare(work.pivot_dirs(), work.path(), plan.limits.memory_bytes)
 }
 
 /// How the main process ended.
@@ -1271,6 +1269,9 @@ struct WorkDir {
     /// through `path`. The cleanup finds both directories through their
     /// handles.
     handle: std::fs::File,
+    /// The open directory for the new root of a pivot. The child setup
+    /// names it by its descriptor, so it stays open until the run ends.
+    root: Option<std::fs::File>,
     removed: bool,
 }
 
@@ -1279,7 +1280,7 @@ impl WorkDir {
     /// new parent with mode `0711`.
     fn create(root: &Path) -> Result<Self, SandboxError> {
         let parent = root.join(format!("harvest-sbx-{}", uuid::Uuid::new_v4().simple()));
-        let path = parent.join("work");
+        let path = parent.join(WORK_NAME);
         let opened = std::fs::DirBuilder::new()
             .mode(0o711)
             .create(&parent)
@@ -1304,24 +1305,36 @@ impl WorkDir {
             parent_handle,
             path,
             handle,
+            root: None,
             removed: false,
         })
     }
 
-    /// Create the empty directory that holds the new root of a pivot. Only
-    /// the executor can use it, and the removal of the parent takes it.
-    fn create_root(&self) -> Result<PathBuf, SandboxError> {
-        let root = self.parent.join("root");
-        std::fs::DirBuilder::new()
+    /// Create and open the empty directory that holds the new root of a
+    /// pivot. Only the executor can use it, and the removal of the parent
+    /// takes it.
+    fn create_root(&mut self) -> Result<(), SandboxError> {
+        let root = self.parent.join(ROOT_NAME);
+        let opened = std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&root)
+            .and_then(|()| open_directory(&root))
             .map_err(|e| {
                 SandboxError::Unavailable(format!(
                     "could not create the root directory {}: {e}",
                     root.display()
                 ))
             })?;
-        Ok(root)
+        self.root = Some(opened);
+        Ok(())
+    }
+
+    /// The open directories of a pivot, after [`Self::create_root`].
+    fn pivot_dirs(&self) -> Option<PivotDirs<'_>> {
+        self.root.as_ref().map(|root| PivotDirs {
+            root: root.as_fd(),
+            work: self.handle.as_fd(),
+        })
     }
 
     /// Give the directory to the code uid.

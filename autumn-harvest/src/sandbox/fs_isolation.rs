@@ -11,8 +11,9 @@
 //! so the child allocates nothing.
 
 use std::collections::BTreeSet;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::io;
+use std::os::fd::{AsRawFd as _, BorrowedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::FileTypeExt as _;
 use std::path::{Component, Path, PathBuf};
@@ -59,6 +60,13 @@ const DEVICES: &[&str] = &[
     "/dev/tty",
 ];
 
+/// The name of the directory for the new root of a pivot, in the parent of
+/// the work directory.
+pub(super) const ROOT_NAME: &str = "root";
+
+/// The name of the work directory, in the same parent.
+pub(super) const WORK_NAME: &str = "work";
+
 /// The size of the `tmpfs` that holds the mount points of the new root.
 const ROOT_TMPFS_OPTIONS: &str = "mode=755,size=1m";
 
@@ -90,12 +98,20 @@ pub enum FsIsolation {
     ///
     /// A mask hides a path, not an inode. A hard link, a bind mount or a
     /// path that the list omits still reaches the data. Sibling runs in the
-    /// scratch root stay visible. A mask does not hide `/proc`, and a
-    /// non-root worker shares its uid with the code. Use
-    /// [`FsIsolation::Pivot`] to close these gaps.
+    /// scratch root stay visible.
+    ///
+    /// A mask does not hide `/proc`. Under a non-root worker, the code has
+    /// the uid of the worker. So it reads each masked path through
+    /// `/proc/<pid>/root` of the worker. A mask stops a mistake. It does not
+    /// stop code that looks for a path. Use [`FsIsolation::Pivot`] for code
+    /// that you do not trust.
     Mask(Vec<PathBuf>),
     /// A new root. It holds the `read_only` paths, the work directory, a
     /// private `/tmp` and a few device nodes, and nothing else.
+    ///
+    /// A listed link points at its final target in the new root, and the
+    /// pivot binds that target. An entry under a bound directory or a
+    /// listed link adds no mount point, but its target is bound.
     Pivot {
         /// The absolute host paths that the code can read. The code cannot
         /// write them.
@@ -119,8 +135,8 @@ impl FsIsolation {
 
     /// Compute each step of the child setup, or `None` for `Shared`.
     ///
-    /// `root` is an empty directory for the new root. `work` is the work
-    /// directory of the run. `tmp_bytes` bounds the private `/tmp`.
+    /// `dirs` holds the open directories of a pivot. `work` is the path of
+    /// the work directory. `tmp_bytes` bounds the private `/tmp`.
     ///
     /// # Errors
     ///
@@ -128,7 +144,7 @@ impl FsIsolation {
     /// NUL or `..`, or does not exist for a mask.
     pub(super) fn prepare(
         &self,
-        root: Option<&Path>,
+        dirs: Option<PivotDirs<'_>>,
         work: &Path,
         tmp_bytes: u64,
     ) -> Result<Option<FsPlan>, SandboxError> {
@@ -136,13 +152,25 @@ impl FsIsolation {
             Self::Shared => Ok(None),
             Self::Mask(paths) => mask_plan(paths, work).map(Some),
             Self::Pivot { read_only } => {
-                let root = root.ok_or_else(|| {
+                let dirs = dirs.ok_or_else(|| {
                     SandboxError::Unavailable("a pivot needs a directory for its root".into())
                 })?;
-                pivot_plan(read_only, root, work, tmp_bytes).map(Some)
+                pivot_plan(read_only, dirs, work, tmp_bytes).map(Some)
             }
         }
     }
+}
+
+/// The directories of a pivot, opened before the fork.
+///
+/// `root` is the empty entry [`ROOT_NAME`], and `work` is the entry
+/// [`WORK_NAME`], of one parent directory.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PivotDirs<'a> {
+    /// The empty directory for the new root.
+    pub(super) root: BorrowedFd<'a>,
+    /// The work directory.
+    pub(super) work: BorrowedFd<'a>,
 }
 
 /// One mount step of the child. Each value holds only what the child needs.
@@ -165,14 +193,44 @@ enum Step {
         flags: libc::c_ulong,
         options: CString,
     },
+    /// Open the directory `path` again, in the new mount namespace. Check
+    /// that it is the directory of `fd`, then put it at `fd`.
+    Reopen {
+        fd: libc::c_int,
+        path: CString,
+    },
+    /// Make the `tmpfs` at `path` the working directory.
+    Enter(CString),
+    /// Tell a test that the child is at this step, then wait for the test.
+    #[cfg(test)]
+    Pause {
+        ready: libc::c_int,
+        resume: libc::c_int,
+    },
 }
 
 /// The steps that build the file system of one run.
+///
+/// A pivot step names a path relative to the working directory, never a
+/// path from `/` through the scratch root. A process of the same uid can
+/// rename each directory of the scratch root. So the child anchors itself on
+/// the open root directory, and it checks each lookup by name.
 #[derive(Debug, Clone)]
 pub(super) struct FsPlan {
     steps: Vec<Step>,
-    /// The new root and the work directory, for a pivot.
-    pivot: Option<(CString, CString)>,
+    pivot: Option<Pivot>,
+}
+
+/// The anchor and the target of a pivot.
+#[derive(Debug, Clone)]
+struct Pivot {
+    /// The open directory for the new root. The child enters it before the
+    /// new mount namespace, which moves the working directory into that
+    /// namespace. A descriptor stays in the old namespace, so no mount can
+    /// use it.
+    root: libc::c_int,
+    /// The work directory, as a path in the new root.
+    work: CString,
 }
 
 impl FsPlan {
@@ -197,6 +255,18 @@ impl FsPlan {
         // SAFETY: each call below is an async-signal-safe system call. Each
         // pointer is a valid C string that lives as long as `self`.
         unsafe {
+            // A process of the same uid can open `/proc/<pid>/root` of a
+            // dumpable child, and plant a link in the new root. The flag
+            // also closes the id maps, so it comes after them. `exec` sets
+            // it again for the code.
+            if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
+                return Err(failed());
+            }
+            if let Some(pivot) = &self.pivot
+                && libc::fchdir(pivot.root) != 0
+            {
+                return Err(failed());
+            }
             if libc::unshare(libc::CLONE_NEWNS) != 0 {
                 return Err(failed());
             }
@@ -221,8 +291,8 @@ impl FsPlan {
                     return Err(failed());
                 }
             }
-            if let Some((root, work)) = &self.pivot
-                && !pivot_into(root, work)
+            if let Some(pivot) = &self.pivot
+                && !pivot_into(&pivot.work)
             {
                 return Err(failed());
             }
@@ -347,23 +417,108 @@ unsafe fn run_step(step: &Step) -> bool {
                     options.as_ptr().cast(),
                 ) == 0
             }
+            Step::Reopen { fd, path } => reopen(*fd, path),
+            Step::Enter(path) => enter(path),
+            #[cfg(test)]
+            Step::Pause { ready, resume } => {
+                // The test reads the dumpable flag of the child.
+                let mut byte =
+                    u8::try_from(libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0)).unwrap_or(u8::MAX);
+                libc::write(*ready, (&raw const byte).cast(), 1) == 1
+                    && libc::read(*resume, (&raw mut byte).cast(), 1) == 1
+            }
         }
     }
 }
 
-/// Enter the new root, drop the old one and return to the work directory.
+/// Whether the descriptors `a` and `b` name the same file.
+///
+/// # Safety
+///
+/// Only async-signal-safe system calls.
+unsafe fn same_file(a: libc::c_int, b: libc::c_int) -> bool {
+    // SAFETY: stat is plain data, and all zeros is a valid value. fstat
+    // writes only into its buffer.
+    unsafe {
+        let mut left: libc::stat = std::mem::zeroed();
+        let mut right: libc::stat = std::mem::zeroed();
+        libc::fstat(a, &raw mut left) == 0
+            && libc::fstat(b, &raw mut right) == 0
+            && left.st_dev == right.st_dev
+            && left.st_ino == right.st_ino
+    }
+}
+
+/// Open the directory `path` in the new namespace, and put it at `fd` when
+/// it is the same directory.
+///
+/// A swapped name opens another file, or a link that `O_NOFOLLOW` refuses.
+/// Both fail the run.
+///
+/// # Safety
+///
+/// Only async-signal-safe system calls. The string stays valid.
+unsafe fn reopen(fd: libc::c_int, path: &CStr) -> bool {
+    // SAFETY: the caller upholds the contract above.
+    unsafe {
+        let new = libc::open(
+            path.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        );
+        if new < 0 {
+            return false;
+        }
+        let moved = same_file(new, fd) && libc::dup3(new, fd, libc::O_CLOEXEC) == fd;
+        libc::close(new) == 0 && moved
+    }
+}
+
+/// Make the `tmpfs` at `path` the working directory.
+///
+/// Only the new mount is a `tmpfs` with a device other than that of its
+/// parent. A process of the same uid cannot mount in this namespace, so a
+/// swapped name fails the check.
+///
+/// # Safety
+///
+/// Only async-signal-safe system calls. The string stays valid.
+unsafe fn enter(path: &CStr) -> bool {
+    // SAFETY: the caller upholds the contract above. statfs and stat are
+    // plain data, and all zeros is a valid value.
+    unsafe {
+        let fd = libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        );
+        if fd < 0 {
+            return false;
+        }
+        let mut fs: libc::statfs = std::mem::zeroed();
+        let mut own: libc::stat = std::mem::zeroed();
+        let mut up: libc::stat = std::mem::zeroed();
+        let entered = libc::fstatfs(fd, &raw mut fs) == 0
+            && i128::from(fs.f_type) == i128::from(libc::TMPFS_MAGIC)
+            && libc::fstat(fd, &raw mut own) == 0
+            && libc::fstatat(fd, c"..".as_ptr(), &raw mut up, 0) == 0
+            && own.st_dev != up.st_dev
+            && libc::fchdir(fd) == 0;
+        libc::close(fd) == 0 && entered
+    }
+}
+
+/// Make the working directory the root, drop the old root, and go to the
+/// work directory.
 ///
 /// `pivot_root(".", ".")` stacks the old root on the new one. The lazy
 /// unmount then removes it, so no put-old directory is needed.
 ///
 /// # Safety
 ///
-/// Only async-signal-safe system calls. The strings stay valid.
-unsafe fn pivot_into(root: &CString, work: &CString) -> bool {
+/// Only async-signal-safe system calls. The string stays valid.
+unsafe fn pivot_into(work: &CStr) -> bool {
     // SAFETY: the caller upholds the contract above.
     unsafe {
-        libc::chdir(root.as_ptr()) == 0
-            && libc::syscall(libc::SYS_pivot_root, c".".as_ptr(), c".".as_ptr()) == 0
+        libc::syscall(libc::SYS_pivot_root, c".".as_ptr(), c".".as_ptr()) == 0
             && libc::umount2(c".".as_ptr(), libc::MNT_DETACH) == 0
             && libc::chdir(work.as_ptr()) == 0
     }
@@ -462,7 +617,26 @@ fn inherited_flags(path: &Path) -> Result<libc::c_ulong, SandboxError> {
     // SAFETY: statvfs is plain data, and all zeros is a valid value.
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: statvfs reads a valid C string and writes only into `stat`.
-    if unsafe { libc::statvfs(c.as_ptr(), &raw mut stat) } != 0 {
+    let rc = unsafe { libc::statvfs(c.as_ptr(), &raw mut stat) };
+    flags_of(rc, &stat, path)
+}
+
+/// [`inherited_flags`] for the open directory `fd` at `path`.
+fn inherited_flags_of(fd: BorrowedFd<'_>, path: &Path) -> Result<libc::c_ulong, SandboxError> {
+    // SAFETY: statvfs is plain data, and all zeros is a valid value.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: fstatvfs reads an open descriptor and writes only into `stat`.
+    let rc = unsafe { libc::fstatvfs(fd.as_raw_fd(), &raw mut stat) };
+    flags_of(rc, &stat, path)
+}
+
+/// The mount flags in `stat`, which a call with the result `rc` filled.
+fn flags_of(
+    rc: libc::c_int,
+    stat: &libc::statvfs,
+    path: &Path,
+) -> Result<libc::c_ulong, SandboxError> {
+    if rc != 0 {
         return Err(config(format!(
             "cannot read the mount flags of {}: {}",
             path.display(),
@@ -477,23 +651,24 @@ fn inherited_flags(path: &Path) -> Result<libc::c_ulong, SandboxError> {
     Ok(flags & !libc::MS_RDONLY)
 }
 
-/// The path of `path` inside the new root `root`.
-fn inside(root: &Path, path: &Path) -> PathBuf {
-    root.join(path.strip_prefix("/").unwrap_or(path))
+/// The path of the absolute `path` in the new root, relative to that root.
+fn inside(path: &Path) -> PathBuf {
+    path.strip_prefix("/").unwrap_or(path).to_path_buf()
 }
 
-/// Add each ancestor of `dst` inside `root` to `dirs`.
-fn add_parents(dirs: &mut BTreeSet<PathBuf>, root: &Path, dst: &Path) {
+/// Add each ancestor of the relative path `dst` to `dirs`.
+fn add_parents(dirs: &mut BTreeSet<PathBuf>, dst: &Path) {
     for ancestor in dst.ancestors().skip(1) {
-        if ancestor.starts_with(root) && ancestor != root {
+        if !ancestor.as_os_str().is_empty() {
             dirs.insert(ancestor.to_path_buf());
         }
     }
 }
 
-/// The steps of a pivot, built one entry at a time.
+/// The steps of a pivot, built one entry at a time. Each path in a step is
+/// relative to the new root.
 struct PivotBuild<'a> {
-    root: &'a Path,
+    open: PivotDirs<'a>,
     work: &'a Path,
     /// The directories to make in the new root. A set sorts a parent before
     /// its children.
@@ -507,9 +682,9 @@ struct PivotBuild<'a> {
 }
 
 impl<'a> PivotBuild<'a> {
-    const fn new(root: &'a Path, work: &'a Path) -> Self {
+    const fn new(open: PivotDirs<'a>, work: &'a Path) -> Self {
         Self {
-            root,
+            open,
             work,
             dirs: BTreeSet::new(),
             leaves: Vec::new(),
@@ -530,8 +705,8 @@ impl<'a> PivotBuild<'a> {
 
     /// Bind the host path `src` read-only at the same path in the new root.
     fn bind_read_only(&mut self, src: &Path, is_dir: bool) -> Result<(), SandboxError> {
-        let dst = inside(self.root, src);
-        add_parents(&mut self.dirs, self.root, &dst);
+        let dst = inside(src);
+        add_parents(&mut self.dirs, &dst);
         if is_dir {
             self.bound_dirs.push(src.to_path_buf());
             self.dirs.insert(dst.clone());
@@ -557,19 +732,21 @@ impl<'a> PivotBuild<'a> {
         }
         // The device list binds these nodes. A `nodev` bind here would stop
         // that bind from opening the node.
-        if DEVICES.iter().any(|device| path == Path::new(device)) {
+        if DEVICES.iter().any(|device| path == Path::new(device))
+            || !self.seen.insert(path.to_path_buf())
+        {
             return Ok(());
         }
-        // A link of the list shows the paths under it, and a directory made
-        // at the same place would collide with it. So an entry under a link
-        // adds nothing, whatever the order of the list.
+        // A bound directory or a listed link shows the paths under it, and a
+        // mount point made at the same place would collide with it. So such
+        // an entry adds no mount point, whatever the order of the list. Its
+        // target can still lie outside each bound path.
         if self.is_shown(path)
             || links
                 .iter()
                 .any(|link| path != *link && path.starts_with(link))
-            || !self.seen.insert(path.to_path_buf())
         {
-            return Ok(());
+            return self.add_target(path);
         }
         let Ok(meta) = std::fs::symlink_metadata(path) else {
             return Ok(());
@@ -582,34 +759,51 @@ impl<'a> PivotBuild<'a> {
 
     /// Recreate the link `path`, and bind its target.
     ///
-    /// A link needs its target. A resolver file in `/run` is one case, a
-    /// runtime directory with a version is another. Only the target is bound,
-    /// never the directory above it.
+    /// The new link points at the canonical target, not at the next link of
+    /// a chain. So the new root needs no link in the middle of a chain. A
+    /// broken link keeps its target, and stays broken.
     fn add_link(&mut self, path: &Path) -> Result<(), SandboxError> {
-        let target = std::fs::read_link(path)
-            .map_err(|e| config(format!("cannot read the link {}: {e}", path.display())))?;
-        let dst = inside(self.root, path);
-        add_parents(&mut self.dirs, self.root, &dst);
+        let target = match std::fs::canonicalize(path) {
+            Ok(real) => real,
+            Err(_) => std::fs::read_link(path)
+                .map_err(|e| config(format!("cannot read the link {}: {e}", path.display())))?,
+        };
+        let dst = inside(path);
+        add_parents(&mut self.dirs, &dst);
         self.leaves.push(Step::Symlink {
             target: cstring(&target)?,
             dst: cstring(&dst)?,
         });
-        if let Ok(real) = std::fs::canonicalize(path)
-            && let Ok(target_meta) = std::fs::metadata(&real)
-            && (target_meta.is_file() || target_meta.is_dir())
-            && !self.is_shown(&real)
-            && self.seen.insert(real.clone())
+        self.add_target(path)
+    }
+
+    /// Bind the file or the directory that `path` resolves to, unless an
+    /// entry shows it.
+    ///
+    /// A link needs its target. A resolver file in `/run` is one case, a
+    /// runtime directory with a version is another. Only the target is bound,
+    /// never the directory above it.
+    fn add_target(&mut self, path: &Path) -> Result<(), SandboxError> {
+        let Ok(real) = std::fs::canonicalize(path) else {
+            return Ok(());
+        };
+        let Ok(meta) = std::fs::metadata(&real) else {
+            return Ok(());
+        };
+        if !(meta.is_file() || meta.is_dir())
+            || self.is_shown(&real)
+            || !self.seen.insert(real.clone())
         {
-            if self.covers_scratch(&real) {
-                return Err(config(format!(
-                    "the target {} of the link {} covers /tmp or the work directory",
-                    real.display(),
-                    path.display()
-                )));
-            }
-            self.bind_read_only(&real, target_meta.is_dir())?;
+            return Ok(());
         }
-        Ok(())
+        if self.covers_scratch(&real) {
+            return Err(config(format!(
+                "the target {} of the path {} covers /tmp or the work directory",
+                real.display(),
+                path.display()
+            )));
+        }
+        self.bind_read_only(&real, meta.is_dir())
     }
 
     /// Bind the device nodes that exist on the host.
@@ -619,8 +813,8 @@ impl<'a> PivotBuild<'a> {
             if !std::fs::metadata(path).is_ok_and(|m| m.file_type().is_char_device()) {
                 continue;
             }
-            let dst = inside(self.root, path);
-            add_parents(&mut self.dirs, self.root, &dst);
+            let dst = inside(path);
+            add_parents(&mut self.dirs, &dst);
             self.leaves.push(Step::Touch(cstring(&dst)?));
             self.leaves.push(Step::Bind {
                 src: cstring(path)?,
@@ -631,28 +825,41 @@ impl<'a> PivotBuild<'a> {
         Ok(())
     }
 
-    /// Bind the work directory read-write.
+    /// Bind the work directory read-write. The source is the open
+    /// directory, not its name.
     fn add_work(&mut self) -> Result<(), SandboxError> {
-        let dst = inside(self.root, self.work);
-        add_parents(&mut self.dirs, self.root, &dst);
+        let dst = inside(self.work);
+        add_parents(&mut self.dirs, &dst);
         self.dirs.insert(dst.clone());
+        let fd = self.open.work;
         self.leaves.push(Step::Bind {
-            src: cstring(self.work)?,
+            src: cstring(Path::new(&format!("/proc/self/fd/{}", fd.as_raw_fd())))?,
             dst: cstring(&dst)?,
-            remount: inherited_flags(self.work)? | libc::MS_NOSUID | libc::MS_NODEV,
+            remount: inherited_flags_of(fd, self.work)? | libc::MS_NOSUID | libc::MS_NODEV,
         });
         Ok(())
     }
 
-    /// Put the steps in order: the roots, the directories, then the leaves.
+    /// Put the steps in order: the anchor, the roots, the directories, then
+    /// the leaves.
+    ///
+    /// The child starts in the root directory. The `tmpfs` goes on that
+    /// exact directory. The work directory is opened again in the new
+    /// namespace. The child then enters the new `tmpfs`.
     fn finish(self, tmp_bytes: u64) -> Result<FsPlan, SandboxError> {
-        let tmp = inside(self.root, Path::new("/tmp"));
+        let tmp = PathBuf::from("tmp");
+        let up = Path::new("..");
         let mut steps = vec![
             Step::Tmpfs {
-                dst: cstring(self.root)?,
+                dst: c".".to_owned(),
                 flags: libc::MS_NOSUID | libc::MS_NODEV,
                 options: CString::new(ROOT_TMPFS_OPTIONS).map_err(|e| config(e.to_string()))?,
             },
+            Step::Reopen {
+                fd: self.open.work.as_raw_fd(),
+                path: cstring(&up.join(WORK_NAME))?,
+            },
+            Step::Enter(cstring(&up.join(ROOT_NAME))?),
             Step::Mkdir(cstring(&tmp)?),
             Step::Tmpfs {
                 dst: cstring(&tmp)?,
@@ -670,7 +877,10 @@ impl<'a> PivotBuild<'a> {
         steps.extend(self.leaves);
         Ok(FsPlan {
             steps,
-            pivot: Some((cstring(self.root)?, cstring(self.work)?)),
+            pivot: Some(Pivot {
+                root: self.open.root.as_raw_fd(),
+                work: cstring(self.work)?,
+            }),
         })
     }
 }
@@ -678,7 +888,7 @@ impl<'a> PivotBuild<'a> {
 /// The steps of a pivot.
 fn pivot_plan(
     read_only: &[PathBuf],
-    root: &Path,
+    dirs: PivotDirs<'_>,
     work: &Path,
     tmp_bytes: u64,
 ) -> Result<FsPlan, SandboxError> {
@@ -690,7 +900,7 @@ fn pivot_plan(
             std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
         })
         .collect();
-    let mut build = PivotBuild::new(root, work);
+    let mut build = PivotBuild::new(dirs, work);
     for path in read_only {
         build.add_entry(path, &links)?;
     }
@@ -1097,18 +1307,16 @@ mod tests {
 
     #[test]
     fn a_pivot_path_over_tmp_or_the_work_directory_is_refused() {
-        let work = tempfile::tempdir().unwrap();
+        let layout = Layout::new();
         for bad in [
             PathBuf::from("/tmp"),
             PathBuf::from("/"),
-            work.path().into(),
+            layout.work.clone(),
         ] {
             let fs = FsIsolation::Pivot {
                 read_only: vec![bad.clone()],
             };
-            let err = fs
-                .prepare(Some(Path::new("/r")), work.path(), 1 << 20)
-                .expect_err("the path must be refused");
+            let err = layout.prepare(&fs).expect_err("the path must be refused");
             assert!(matches!(err, SandboxError::Config(_)), "{bad:?}: {err:?}");
         }
     }
@@ -1136,22 +1344,18 @@ mod tests {
         let fs = FsIsolation::Pivot {
             read_only: vec!["/usr/../etc".into()],
         };
-        let err = fs
-            .prepare(Some(Path::new("/r")), Path::new("/w"), 0)
+        let err = Layout::new()
+            .prepare(&fs)
             .expect_err("`..` must be refused");
         assert!(matches!(err, SandboxError::Config(_)), "{err:?}");
     }
 
     #[test]
     fn a_pivot_skips_a_missing_read_only_path() {
-        let work = tempfile::tempdir().unwrap();
         let fs = FsIsolation::Pivot {
             read_only: vec!["/no/such/path/for/harvest".into()],
         };
-        let plan = fs
-            .prepare(Some(Path::new("/r")), work.path(), 1 << 20)
-            .unwrap()
-            .unwrap();
+        let plan = Layout::new().plan(&fs);
         assert!(plan.pivot.is_some());
     }
 
@@ -1264,12 +1468,11 @@ mod tests {
 
     #[test]
     fn a_path_with_a_nul_byte_is_refused() {
-        let work = tempfile::tempdir().unwrap();
         let fs = FsIsolation::Pivot {
             read_only: vec![PathBuf::from("/usr\0x")],
         };
-        let err = fs
-            .prepare(Some(Path::new("/r")), work.path(), 0)
+        let err = Layout::new()
+            .prepare(&fs)
             .expect_err("a NUL byte must be refused");
         assert!(matches!(err, SandboxError::Config(_)), "{err:?}");
     }
@@ -1412,15 +1615,14 @@ mod tests {
 
     #[test]
     fn a_link_to_the_work_directory_is_refused() {
-        let work = tempfile::tempdir().unwrap();
         let holder = tempfile::tempdir().unwrap();
         let link = holder.path().join("up");
         std::os::unix::fs::symlink("/", &link).unwrap();
         let fs = FsIsolation::Pivot {
             read_only: vec![link],
         };
-        let err = fs
-            .prepare(Some(Path::new("/r")), work.path(), 1 << 20)
+        let err = Layout::new()
+            .prepare(&fs)
             .expect_err("the target covers the work directory");
         assert!(matches!(err, SandboxError::Config(_)), "{err:?}");
     }
@@ -1454,5 +1656,334 @@ mod tests {
                 "{err:?}"
             );
         }
+    }
+
+    /// A directory that every uid can enter.
+    fn open_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
+    /// The default list and `extra`.
+    fn pivot_with(extra: &[&Path]) -> FsIsolation {
+        let mut read_only: Vec<PathBuf> = PIVOT_READ_ONLY.iter().map(PathBuf::from).collect();
+        read_only.extend(extra.iter().map(|path| path.to_path_buf()));
+        FsIsolation::Pivot { read_only }
+    }
+
+    #[tokio::test]
+    async fn a_pivot_follows_a_link_chain() {
+        if !needs_isolation().await {
+            return;
+        }
+        // A resolver file is often a link to a link to the file.
+        let (_dir, file) = secret_dir();
+        let listed = open_dir();
+        let shown = listed.path().join("secret.db");
+        std::fs::copy(&file, &shown).unwrap();
+        for (target, extra) in [(file, None), (shown, Some(listed.path()))] {
+            let middle_dir = open_dir();
+            let middle = middle_dir.path().join("current");
+            std::os::unix::fs::symlink(&target, &middle).unwrap();
+            let holder = open_dir();
+            let link = holder.path().join("resolv.conf");
+            std::os::unix::fs::symlink(&middle, &link).unwrap();
+            let mut paths = vec![link.as_path()];
+            paths.extend(extra);
+            let out = run(pivot_with(&paths), &format!("cat {}", link.display())).await;
+            assert_eq!(out.stdout, "s3cret", "{target:?}: {}", out.stderr);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pivot_binds_the_target_of_a_shown_link() {
+        if !needs_isolation().await {
+            return;
+        }
+        // A tool under a bound directory is often a link to a runtime.
+        let (_dir, file) = secret_dir();
+        let bound = open_dir();
+        let tool = bound.path().join("tool");
+        std::os::unix::fs::symlink(&file, &tool).unwrap();
+        let holder = open_dir();
+        let alias = holder.path().join("alias");
+        std::os::unix::fs::symlink(bound.path(), &alias).unwrap();
+        let alias_tool = alias.join("tool");
+        for (parent, entry) in [(bound.path(), &tool), (alias.as_path(), &alias_tool)] {
+            let out = run(
+                pivot_with(&[parent, entry]),
+                &format!("cat {}", entry.display()),
+            )
+            .await;
+            assert_eq!(out.stdout, "s3cret", "{entry:?}: {}", out.stderr);
+        }
+    }
+
+    #[test]
+    fn a_link_in_a_chain_points_at_its_target() {
+        let (_dir, file) = secret_dir();
+        let middle_dir = open_dir();
+        let middle = middle_dir.path().join("current");
+        std::os::unix::fs::symlink(&file, &middle).unwrap();
+        let holder = open_dir();
+        let link = holder.path().join("resolv.conf");
+        std::os::unix::fs::symlink(&middle, &link).unwrap();
+        let layout = Layout::new();
+        let plan = layout.plan(&FsIsolation::Pivot {
+            read_only: vec![link.clone()],
+        });
+        let real = std::fs::canonicalize(&file).unwrap();
+        let found = plan.steps.iter().any(|step| {
+            matches!(step, Step::Symlink { target, dst }
+                if target.as_bytes() == real.as_os_str().as_bytes()
+                    && dst.to_bytes().ends_with(b"resolv.conf"))
+        });
+        assert!(found, "{plan:?}");
+    }
+
+    #[test]
+    fn each_pivot_step_is_relative() {
+        let (dir, file) = secret_dir();
+        let holder = open_dir();
+        let link = holder.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let layout = Layout::new();
+        let plan = layout.plan(&pivot_with(&[dir.path(), &link]));
+        let mut checked = 0;
+        for step in &plan.steps {
+            let dst = match step {
+                Step::Mkdir(dst) | Step::Touch(dst) => dst,
+                Step::Symlink { dst, .. } | Step::Bind { dst, .. } | Step::Tmpfs { dst, .. } => dst,
+                Step::Reopen { .. } | Step::Enter(_) | Step::Pause { .. } => continue,
+            };
+            let dst = Path::new(std::ffi::OsStr::from_bytes(dst.to_bytes()));
+            assert!(dst.is_relative(), "{step:?}");
+            assert!(
+                !dst.components().any(|c| matches!(c, Component::ParentDir)),
+                "{step:?}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 10, "{plan:?}");
+    }
+
+    /// The scratch layout of one run: a parent that holds `root` and `work`,
+    /// opened as the executor opens them.
+    struct Layout {
+        _scratch: tempfile::TempDir,
+        parent: PathBuf,
+        root: PathBuf,
+        work: PathBuf,
+        root_dir: std::fs::File,
+        work_dir: std::fs::File,
+    }
+
+    impl Layout {
+        fn new() -> Self {
+            let scratch = open_dir();
+            let parent = scratch.path().join("run");
+            std::fs::create_dir(&parent).unwrap();
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o711)).unwrap();
+            let root = parent.join(ROOT_NAME);
+            let work = parent.join(WORK_NAME);
+            std::fs::create_dir(&root).unwrap();
+            std::fs::create_dir(&work).unwrap();
+            std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o777)).unwrap();
+            Self {
+                root_dir: std::fs::File::open(&root).unwrap(),
+                work_dir: std::fs::File::open(&work).unwrap(),
+                _scratch: scratch,
+                parent,
+                root,
+                work,
+            }
+        }
+
+        fn prepare(&self, fs: &FsIsolation) -> Result<Option<FsPlan>, SandboxError> {
+            use std::os::fd::AsFd as _;
+            let dirs = PivotDirs {
+                root: self.root_dir.as_fd(),
+                work: self.work_dir.as_fd(),
+            };
+            fs.prepare(Some(dirs), &self.work, 1 << 20)
+        }
+
+        fn plan(&self, fs: &FsIsolation) -> FsPlan {
+            self.prepare(fs).unwrap().unwrap()
+        }
+    }
+
+    /// Run `code` in a child with `plan`. The child waits at step `at`
+    /// while `swap` runs in this process. Returns the output, and the
+    /// dumpable flag of the child at that step.
+    fn run_paused(
+        mut plan: FsPlan,
+        at: usize,
+        swap: impl FnOnce() + Send + 'static,
+        code: &str,
+    ) -> (io::Result<std::process::Output>, Option<u8>) {
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::process::CommandExt as _;
+        let (mut ready_r, ready_w) = std::io::pipe().unwrap();
+        let (resume_r, mut resume_w) = std::io::pipe().unwrap();
+        plan.steps.insert(
+            at,
+            Step::Pause {
+                ready: ready_w.as_raw_fd(),
+                resume: resume_r.as_raw_fd(),
+            },
+        );
+        let waiter = std::thread::spawn(move || {
+            let mut byte = [0_u8; 1];
+            ready_r.read_exact(&mut byte).ok()?;
+            swap();
+            resume_w.write_all(&byte).unwrap();
+            Some(byte[0])
+        });
+        let root = is_root();
+        // SAFETY: geteuid and getegid have no preconditions.
+        let ids = (!root).then(|| unsafe { (libc::geteuid(), libc::getegid()) });
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", code])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // SAFETY: the closure makes async-signal-safe system calls only.
+        unsafe {
+            command.pre_exec(move || {
+                if !root && libc::unshare(libc::CLONE_NEWUSER) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                plan.apply(ids)
+            });
+        }
+        let spawned = command.spawn();
+        drop(ready_w);
+        drop(resume_r);
+        let output = spawned.and_then(std::process::Child::wait_with_output);
+        (output, waiter.join().unwrap())
+    }
+
+    fn entries(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect()
+    }
+
+    /// The index of the first step after the anchor.
+    fn first_mkdir(plan: &FsPlan) -> usize {
+        plan.steps
+            .iter()
+            .position(|step| matches!(step, Step::Mkdir(_)))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_swapped_root_leaves_no_trace() {
+        if !needs_isolation().await {
+            return;
+        }
+        let layout = Layout::new();
+        let decoy = open_dir();
+        let plan = layout.plan(&FsIsolation::pivot());
+        let at = first_mkdir(&plan);
+        let (parent, root, work, target) = (
+            layout.parent.clone(),
+            layout.root.clone(),
+            layout.work.clone(),
+            decoy.path().to_path_buf(),
+        );
+        let swap = move || {
+            for (path, name) in [(&root, "root.old"), (&work, "work.old")] {
+                std::fs::rename(path, parent.join(name)).unwrap();
+                std::os::unix::fs::symlink(&target, path).unwrap();
+            }
+        };
+        let (out, _) = run_paused(plan, at, swap, "echo ok > out.txt && cat out.txt");
+        assert_eq!(
+            entries(decoy.path()),
+            Vec::<PathBuf>::new(),
+            "the swap reached the host"
+        );
+        let out = out.expect("the run passed its check before the swap");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "ok\n",
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let written = layout.parent.join("work.old").join("out.txt");
+        assert_eq!(std::fs::read_to_string(written).unwrap(), "ok\n");
+    }
+
+    #[tokio::test]
+    async fn a_swap_before_the_check_fails_closed() {
+        if !needs_isolation().await {
+            return;
+        }
+        for (name, link) in [
+            (ROOT_NAME, true),
+            (ROOT_NAME, false),
+            (WORK_NAME, true),
+            (WORK_NAME, false),
+        ] {
+            let layout = Layout::new();
+            let decoy = open_dir();
+            let plan = layout.plan(&FsIsolation::pivot());
+            let (parent, target) = (layout.parent.clone(), decoy.path().to_path_buf());
+            let swap = move || {
+                let path = parent.join(name);
+                std::fs::rename(&path, parent.join(format!("{name}.old"))).unwrap();
+                if link {
+                    std::os::unix::fs::symlink(&target, &path).unwrap();
+                } else {
+                    std::fs::create_dir(&path).unwrap();
+                }
+            };
+            let (out, _) = run_paused(plan, 1, swap, "echo ok");
+            let case = format!("{name}, link {link}");
+            assert_eq!(entries(decoy.path()), Vec::<PathBuf>::new(), "{case}");
+            if !link {
+                let swapped = layout.parent.join(name);
+                assert_eq!(entries(&swapped), Vec::<PathBuf>::new(), "{case}");
+            }
+            let err = out.expect_err("a swapped directory must fail the run");
+            assert_eq!(err.raw_os_error(), Some(FS_FAILED), "{case}: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_child_is_not_dumpable_during_the_setup() {
+        if !needs_isolation().await {
+            return;
+        }
+        let layout = Layout::new();
+        let plan = layout.plan(&FsIsolation::pivot());
+        let (out, dumpable) = run_paused(plan, 0, || {}, "true");
+        out.expect("the run must start");
+        assert_eq!(dumpable, Some(0));
+    }
+
+    #[tokio::test]
+    async fn the_code_is_dumpable_again() {
+        if !needs_isolation().await {
+            return;
+        }
+        // A process that is not dumpable has its `/proc` files owned by
+        // root, or by the overflow uid in a user namespace.
+        let (_dir, file) = secret_dir();
+        let out = run(
+            FsIsolation::Mask(vec![file]),
+            "id -u; stat -c %u /proc/$$/environ",
+        )
+        .await;
+        let lines: Vec<&str> = out.stdout.lines().collect();
+        assert_eq!(lines.len(), 2, "{}", out.stderr);
+        assert_eq!(lines[0], lines[1], "{}", out.stdout);
     }
 }

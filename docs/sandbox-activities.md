@@ -224,13 +224,21 @@ let backend = ProcessBackend::new(ExecOptions {
   `PIVOT_READ_ONLY`: `/usr`, the library directories, and a few files of
   `/etc`. It mounts no `/proc`. The code cannot write a `read_only` path.
   A runtime in another directory, such as `/opt/node`, needs that directory
-  in `read_only`. A path that does not exist is skipped.
+  in `read_only`. A path that does not exist is skipped. A listed link
+  points at its final target in the new root, and the pivot binds that
+  target. So a chain of links works. An entry under a bound directory, such
+  as a link in `/usr/local/bin`, gets its target bound too.
 - **`Mask`** fails open. A directory shows empty. A file, or a socket,
   reads as `/dev/null`. A mask hides a path, not an inode, so a hard link or
   a second path still reaches the data. It does not hide the other runs in
   the scratch root, and it does not hide `/proc`. Each path must be
   absolute and must exist. It must not hold `..` or cover the work
   directory. Otherwise the run is refused with a config error.
+- **`Mask` is not a boundary under a non-root worker.** The code has the
+  uid of the worker, so it can open `/proc/<pid>/root` of the worker. That
+  path shows the file system of the worker, with no mask. A mask stops a
+  mistake. It does not stop code that looks for a path. Use `Pivot` for
+  code that you do not trust.
 - Both settings need a mount namespace. A non-root worker enters it through
   its user namespace. When the host refuses, the run fails closed with
   `SandboxUnavailable`. `sandbox::fs_isolation::fs_isolation_available()`
