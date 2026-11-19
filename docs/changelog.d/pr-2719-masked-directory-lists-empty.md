@@ -13,4 +13,5 @@ criterion 1 of `DESIGN-2697.md` say that the directory lists as empty.
 - Tests: `a_masked_directory_lists_as_empty` now checks the exit code of
   `ls`. Its old pipe into `wc -l` printed 0 for an error too.
   `a_masked_directory_hides_its_files` checks `ENOENT`.
-  `a_masked_directory_is_read_only` checks mode `555` and a failed write.
+  `a_masked_directory_is_read_only` checks mode `555`, and `EROFS` for
+  a `touch` and a `chmod`.
