@@ -102,6 +102,21 @@ impl BreakerBucket {
     pub const fn attempts(&self) -> u64 {
         self.first_attempts + self.retries
     }
+
+    /// Count one attempt that reaches the dependency, and classify it.
+    const fn count_attempt(&mut self, attempt: u32, failed: bool) -> AttemptOutcome {
+        if attempt == 1 {
+            self.first_attempts += 1;
+        } else {
+            self.retries += 1;
+        }
+        if failed {
+            self.failures += 1;
+            AttemptOutcome::RetryableFailure
+        } else {
+            AttemptOutcome::Success
+        }
+    }
 }
 
 /// One change of the breaker state.
@@ -288,20 +303,8 @@ pub fn simulate(
                 continue;
             }
         };
-        if attempt == 1 {
-            bucket.first_attempts += 1;
-        } else {
-            bucket.retries += 1;
-        }
         let failed = outage.contains(&at);
-        if failed {
-            bucket.failures += 1;
-        }
-        let outcome = if failed {
-            AttemptOutcome::RetryableFailure
-        } else {
-            AttemptOutcome::Success
-        };
+        let outcome = bucket.count_attempt(attempt, failed);
         if let Some(transition) = registry.on_result(FORECAST_ACTIVITY, outcome, token, now) {
             report.changes.push(BreakerChange {
                 at: Duration::from_nanos(at),
@@ -396,7 +399,7 @@ mod tests {
         assert_eq!(report.calls, 2000);
         assert_eq!(report.succeeded, 2000);
         assert_eq!(report.short_circuits(), 0);
-        assert!(report.changes.is_empty());
+        assert_eq!(report.changes, Vec::new());
         assert_eq!(report.detection_lag(), None);
         assert_eq!(report.recovery_lag(), None);
     }
