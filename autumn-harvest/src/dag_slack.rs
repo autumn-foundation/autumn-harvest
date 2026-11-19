@@ -276,4 +276,17 @@ mod tests {
         assert_eq!(report.makespan, path.total_duration);
         assert_eq!(report.critical_indices(), path.path_indices);
     }
+
+    #[test]
+    fn to_duration_splits_whole_seconds_and_remainder() {
+        assert_eq!(to_duration(0), Duration::ZERO);
+        assert_eq!(to_duration(1_500_000_000), Duration::new(1, 500_000_000));
+    }
+
+    #[test]
+    fn to_duration_saturates_past_u64_max_seconds() {
+        let max_secs_nanos = u128::from(u64::MAX) * 1_000_000_000;
+        assert_eq!(to_duration(max_secs_nanos), Duration::new(u64::MAX, 0));
+        assert_eq!(to_duration(max_secs_nanos + 1_000_000_000), Duration::MAX);
+    }
 }
