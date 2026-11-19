@@ -18829,18 +18829,18 @@ async fn take_timed_out_claim_once(
 
 /// Lower clamp on an open-circuit deferral, so a probe that is due at once
 /// cannot spin the claim loop hot (issue #1809).
-const CIRCUIT_DEFER_MIN: Duration = Duration::from_millis(100);
+pub(crate) const CIRCUIT_DEFER_MIN: Duration = Duration::from_millis(100);
 /// Upper clamp on an open-circuit deferral (issue #1809). A forced-open
 /// breaker, or a probe in flight, reports no time until the next probe. The
 /// task then checks again at least this often, so it runs soon after a
 /// recovery.
-const CIRCUIT_DEFER_MAX: Duration = Duration::from_secs(30);
+pub(crate) const CIRCUIT_DEFER_MAX: Duration = Duration::from_secs(30);
 /// Lower bound on a deferral when no probe is scheduled (issue #1809). A
 /// forced-open breaker, or a probe in flight, reports no probe time. The
 /// cooldown then says nothing about when work can run, so a short one must not
 /// set a short poll. Without this bound, a large backlog under a forced-open
 /// breaker is rewritten about ten times a second.
-const CIRCUIT_DEFER_UNSCHEDULED: Duration = Duration::from_secs(5);
+pub(crate) const CIRCUIT_DEFER_UNSCHEDULED: Duration = Duration::from_secs(5);
 
 /// The delay of a task that an open breaker defers (issue #1809).
 ///

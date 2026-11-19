@@ -241,6 +241,8 @@ pub mod backup_verify;
 pub mod batch;
 /// Batch workflow start types: caps and per-item request/result structs (issue #357).
 pub mod batch_start;
+/// Breaker forecast: how much a circuit breaker shields a dependency in an outage.
+pub mod breaker_forecast;
 /// Worker build-id routing for safe rolling deploys (issue #171).
 #[cfg(feature = "db")]
 pub mod build_routing;

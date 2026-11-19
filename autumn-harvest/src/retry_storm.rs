@@ -311,7 +311,7 @@ pub fn simulate(
 }
 
 /// Refuse a scenario that the simulator cannot model.
-fn validate(scenario: &StormScenario) -> Result<(), StormError> {
+pub(crate) fn validate(scenario: &StormScenario) -> Result<(), StormError> {
     let rate = scenario.arrivals_per_sec;
     if !rate.is_finite() || rate <= 0.0 {
         return Err(StormError::InvalidRate);
@@ -363,7 +363,7 @@ fn record(buckets: &mut Vec<StormBucket>, at: u64, width: u64) -> &mut StormBuck
     clippy::cast_precision_loss,
     reason = "the estimate is checked against the cap before the cast"
 )]
-fn arrivals_before(rate: f64, traffic: u64) -> Result<u64, StormError> {
+pub(crate) fn arrivals_before(rate: f64, traffic: u64) -> Result<u64, StormError> {
     let estimate = (traffic as f64 / 1e9 * rate).ceil();
     if estimate >= MAX_SIMULATED_EVENTS as f64 {
         return Err(StormError::TooManyEvents);
@@ -382,11 +382,11 @@ fn arrivals_before(rate: f64, traffic: u64) -> Result<u64, StormError> {
     clippy::cast_precision_loss,
     reason = "the index is below the event cap and the rate is positive"
 )]
-fn arrival_at(rate: f64, index: u64) -> u64 {
+pub(crate) fn arrival_at(rate: f64, index: u64) -> u64 {
     (index as f64 * 1e9 / rate).round() as u64
 }
 
-fn nanos(d: Duration) -> u64 {
+pub(crate) fn nanos(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
