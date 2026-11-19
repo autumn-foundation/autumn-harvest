@@ -49,11 +49,11 @@ Statements: 3. Tables with no usable index: `harvest_dead_letters`.
 
 ## `dead_letter_count`
 
-Statements: 1. Tables with no usable index: none.
+Statements: 1. Tables with no usable index: `harvest_dead_letter_counts`.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT COUNT(*) FROM "harvest_dead_letters"` | `harvest_dead_letters`: Bitmap Heap Scan on `idx_harvest_dl_queue_failed` |
+| 1 | `SELECT COALESCE(SUM(entries), 0)::BIGINT AS entries FROM harvest_dead_letter_counts` | `harvest_dead_letter_counts`: no usable index |
 
 ## `dead_letter_with_codecs`
 

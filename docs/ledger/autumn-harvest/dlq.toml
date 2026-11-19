@@ -28,8 +28,8 @@ plan = "docs/ledger/plans/autumn-harvest/dlq.md"
 driver = "per_tick"
 backend = ["postgres"]
 kind = ["read"]
-tables = ["harvest_dead_letters"]
-measured = "docs/performance-gauge-sample-interval.md"
+tables = ["harvest_dead_letter_counts"]
+measured = "docs/performance-dlq-depth-counter.md"
 plan = "docs/ledger/plans/autumn-harvest/dlq.md"
 
 ["dead_letter_with_codecs"]

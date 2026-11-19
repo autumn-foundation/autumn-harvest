@@ -638,6 +638,20 @@ error, worker panic, timeout misconfiguration, or a replay determinism error.
 Old DLQ entries are not growth. Page on new entries or increasing gauge depth,
 not on a stable backlog that is already being drained under an incident ticket.
 
+The gauge reads `harvest_dead_letter_counts`. Triggers on `harvest_dead_letters`
+keep it exact. A write with the triggers off makes it drift: for example,
+`ALTER TABLE ... DISABLE TRIGGER` or `session_replication_role = replica`. A
+drift is a constant offset, so it does not fire this rule. To see a drift,
+compare the gauge with `SELECT count(*) FROM harvest_dead_letters` on that
+shard. To repair it, run this in its own transaction:
+
+```sql
+SELECT harvest_dead_letter_recount();
+```
+
+It locks the table, counts it, and blocks dead-letter writes until it
+commits. At 1,000,000 rows that takes about 150 ms.
+
 ### Safe actions
 
 Stop the producer or pause schedules if new DLQ entries are flooding in. Fix

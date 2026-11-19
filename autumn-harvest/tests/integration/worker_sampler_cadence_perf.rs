@@ -29,6 +29,10 @@
 //! Before its fix, one stranded-work call took minutes at 100,000 pending rows.
 //! Set `PERF_SKIP_STRANDED=1` to leave that statement out of a run.
 //!
+//! `zz_capture_dead_letter_write_costs` measures the other side of the DLQ
+//! depth counter: the cost of each dead-letter insert and discard. It seeds
+//! only the dead letters of each size.
+//!
 //! The capture is `#[ignore]`d. It needs a superuser and a preloaded
 //! `pg_stat_statements`. `HARVEST_TEST_DATABASE_URL` names an admin URL.
 //! Without it the harness starts a Postgres container. Output goes to
@@ -113,7 +117,7 @@ const KINDS: [Kind; 7] = [
     },
     Kind {
         label: "dlq (dead_letter_count)",
-        fragment: "FROM \"harvest_dead_letters\"",
+        fragment: "FROM harvest_dead_letter_counts",
     },
     Kind {
         label: "queue pause (paused_queue_names)",
@@ -138,6 +142,22 @@ fn queue_names() -> Vec<String> {
     (0..QUEUES).map(|i| format!("q{i}")).collect()
 }
 
+/// Inserts `dead_letters` rows with production-sized payloads.
+fn dead_letter_seed_sql(dead_letters: i64) -> String {
+    format!(
+        "INSERT INTO harvest_dead_letters \
+             (id, original_task_id, queue_name, task_type, activity_name, input, error, \
+              attempts, failed_at, workflow_name) \
+         SELECT gen_random_uuid(), gen_random_uuid(), \
+                'q' || floor({QUEUES} * power(random(), 3))::int, 'activity', \
+                'act' || (g % 60), \
+                jsonb_build_object('order', g, 'pad', repeat('x', 100 + (random() * 300)::int)), \
+                'activity failed: ' || repeat('e', 200 + (random() * 600)::int), \
+                5, now() - (random() * interval '30 days'), 'wf' || (g % 30) \
+         FROM generate_series(1, {dead_letters}) g;"
+    )
+}
+
 /// Seeds the backlog of `queue_age_gauge_perf`, the dead letters and the
 /// rate-limit buckets.
 async fn seed(conn: &mut AsyncPgConnection, size: &Size) {
@@ -147,6 +167,7 @@ async fn seed(conn: &mut AsyncPgConnection, size: &Size) {
         buckets,
         ..
     } = size;
+    let dead_letter_sql = dead_letter_seed_sql(*dead_letters);
     let sql = format!(
         "SELECT setseed(0.42); \
          INSERT INTO harvest_workflow_executions \
@@ -194,16 +215,7 @@ async fn seed(conn: &mut AsyncPgConnection, size: &Size) {
                 'COMPLETED', 'act' || (g % 60), now() - (random() * interval '1 hour') \
          FROM generate_series(1, {pending}) g; \
          DROP TABLE ex; \
-         INSERT INTO harvest_dead_letters \
-             (id, original_task_id, queue_name, task_type, activity_name, input, error, \
-              attempts, failed_at, workflow_name) \
-         SELECT gen_random_uuid(), gen_random_uuid(), \
-                'q' || floor({QUEUES} * power(random(), 3))::int, 'activity', \
-                'act' || (g % 60), \
-                jsonb_build_object('order', g, 'pad', repeat('x', 100 + (random() * 300)::int)), \
-                'activity failed: ' || repeat('e', 200 + (random() * 600)::int), \
-                5, now() - (random() * interval '30 days'), 'wf' || (g % 30) \
-         FROM generate_series(1, {dead_letters}) g; \
+         {dead_letter_sql} \
          INSERT INTO harvest_rate_limit_buckets \
              (key, refill_rate, burst, tokens, last_refilled_at, created_at, updated_at) \
          SELECT CASE WHEN g % 10 = 0 THEN 'rl' || g ELSE 'dyn-rate:tenant-' || g END, \
@@ -343,7 +355,7 @@ async fn explain(conn: &mut AsyncPgConnection, queues: &[String]) -> String {
         ),
         (
             "dead_letter_count",
-            "SELECT COUNT(*) FROM harvest_dead_letters".to_owned(),
+            autumn_harvest::dlq::DLQ_DEPTH_SQL.to_owned(),
         ),
     ];
     let mut out = String::new();
@@ -480,6 +492,241 @@ async fn zz_capture_worker_sampler_statement_costs() {
     }
     std::fs::write(dir.join(format!("{label}-statement-costs.md")), &table).expect("write table");
     eprintln!("{table}");
+}
+
+/// Dead letters that one write phase inserts.
+const WRITES: usize = 200;
+
+/// Rows in one batch of the batch-discard phase.
+const DISCARD_BATCH: usize = 100;
+
+/// Connections of the concurrent-insert phase.
+const WRITERS: usize = 8;
+
+/// Inserts of each connection in the concurrent-insert phase.
+const WRITES_PER_WRITER: usize = 50;
+
+#[derive(diesel::QueryableByName)]
+struct TimedStatRow {
+    #[diesel(sql_type = Text)]
+    query: String,
+    #[diesel(sql_type = BigInt)]
+    calls: i64,
+    #[diesel(sql_type = BigInt)]
+    buffers: i64,
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    total_ms: f64,
+}
+
+/// Calls, buffers and time of the statements that contain `fragment`.
+async fn timed_cost(
+    conn: &mut AsyncPgConnection,
+    db_name: &str,
+    fragment: &str,
+) -> (i64, i64, f64) {
+    let rows: Vec<TimedStatRow> = diesel::sql_query(format!(
+        "SELECT query, calls, (shared_blks_hit + shared_blks_read) AS buffers, \
+                total_exec_time AS total_ms \
+         FROM pg_stat_statements \
+         WHERE dbid = (SELECT oid FROM pg_database WHERE datname = '{db_name}')"
+    ))
+    .load(conn)
+    .await
+    .expect("pg_stat_statements must be preloaded");
+    rows.iter()
+        .filter(|r| r.query.contains(fragment))
+        .fold((0, 0, 0.0), |(c, b, t), r| {
+            (c + r.calls, b + r.buffers, t + r.total_ms)
+        })
+}
+
+async fn reset_stats(conn: &mut AsyncPgConnection, db_name: &str) {
+    diesel::sql_query(format!(
+        "SELECT pg_stat_statements_reset(0, \
+                (SELECT oid FROM pg_database WHERE datname = '{db_name}'), 0)"
+    ))
+    .execute(conn)
+    .await
+    .expect("pg_stat_statements_reset needs a superuser");
+}
+
+fn write_entry(n: usize) -> autumn_harvest::dlq::NewDeadLetterEntry {
+    autumn_harvest::dlq::NewDeadLetterEntry {
+        original_task_id: uuid::Uuid::new_v4(),
+        queue_name: "q0".to_owned(),
+        task_type: "activity".to_owned(),
+        workflow_exec_id: None,
+        activity_name: Some("act0".to_owned()),
+        input: json!({ "order": n, "pad": "x".repeat(300) }),
+        error: format!("activity failed: {}", "e".repeat(400)),
+        attempts: 5,
+        owner: None,
+        severity: None,
+    }
+}
+
+/// One row of the write-cost table.
+fn write_row(table: &mut String, size: &str, label: &str, (calls, buffers, ms): (i64, i64, f64)) {
+    let per = |v: f64| if calls == 0 { 0.0 } else { v / calls as f64 };
+    let _ = writeln!(
+        table,
+        "| {size} | {label} | {calls} | {buffers} | {:.1} | {:.3} |",
+        per(buffers as f64),
+        per(ms)
+    );
+}
+
+/// Measures the dead-letter writes on one size: single inserts, single
+/// discards, batch discards and concurrent inserts.
+async fn measure_writes(admin: &str, size: &Size, table: &mut String) {
+    let db = ThrowawayDb::create_on(admin, "dlq_write_cost").await;
+    let db_name = db.name().to_owned();
+    let mut conn = AsyncPgConnection::establish(&db.url())
+        .await
+        .expect("connection");
+    conn.batch_execute("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
+        .await
+        .expect("pg_stat_statements extension");
+    // Nested statements count too, so the counter update of a trigger shows
+    // as its own row. A top-level row still includes its nested buffers.
+    conn.batch_execute("SET pg_stat_statements.track = 'all'")
+        .await
+        .expect("track nested statements");
+    conn.batch_execute(&format!(
+        "SELECT setseed(0.42); {}",
+        dead_letter_seed_sql(size.dead_letters)
+    ))
+    .await
+    .expect("seed the dead letters");
+    conn.batch_execute("VACUUM ANALYZE harvest_dead_letters")
+        .await
+        .expect("vacuum");
+    // One untimed insert and discard warm the plan cache.
+    let warm = autumn_harvest::dlq::dead_letter(&mut conn, &write_entry(0))
+        .await
+        .expect("warm insert");
+    autumn_harvest::dlq::discard_dead_letters_batch(&mut conn, &[warm])
+        .await
+        .expect("warm discard");
+
+    let insert = "INSERT INTO \"harvest_dead_letters\"";
+    let delete = "DELETE FROM \"harvest_dead_letters\"";
+    let counter = "UPDATE harvest_dead_letter_counts";
+
+    reset_stats(&mut conn, &db_name).await;
+    let mut ids = Vec::with_capacity(WRITES);
+    for n in 0..WRITES {
+        ids.push(
+            autumn_harvest::dlq::dead_letter(&mut conn, &write_entry(n))
+                .await
+                .expect("insert"),
+        );
+    }
+    let cost = timed_cost(&mut conn, &db_name, insert).await;
+    write_row(table, size.name, "insert, one row", cost);
+    let cost = timed_cost(&mut conn, &db_name, counter).await;
+    write_row(
+        table,
+        size.name,
+        "insert, one row: nested counter update",
+        cost,
+    );
+
+    reset_stats(&mut conn, &db_name).await;
+    for id in &ids {
+        autumn_harvest::dlq::discard_dead_letters_batch(&mut conn, &[*id])
+            .await
+            .expect("discard");
+    }
+    let cost = timed_cost(&mut conn, &db_name, delete).await;
+    write_row(table, size.name, "discard, one row", cost);
+    let cost = timed_cost(&mut conn, &db_name, counter).await;
+    write_row(
+        table,
+        size.name,
+        "discard, one row: nested counter update",
+        cost,
+    );
+
+    let mut ids = Vec::with_capacity(WRITES * 2);
+    for n in 0..WRITES * 2 {
+        ids.push(
+            autumn_harvest::dlq::dead_letter(&mut conn, &write_entry(n))
+                .await
+                .expect("insert"),
+        );
+    }
+    reset_stats(&mut conn, &db_name).await;
+    for batch in ids.chunks(DISCARD_BATCH) {
+        autumn_harvest::dlq::discard_dead_letters_batch(&mut conn, batch)
+            .await
+            .expect("batch discard");
+    }
+    let cost = timed_cost(&mut conn, &db_name, delete).await;
+    write_row(table, size.name, "discard, 100 rows", cost);
+    let cost = timed_cost(&mut conn, &db_name, counter).await;
+    write_row(
+        table,
+        size.name,
+        "discard, 100 rows: nested counter update",
+        cost,
+    );
+
+    reset_stats(&mut conn, &db_name).await;
+    let url = db.url();
+    let started = std::time::Instant::now();
+    let writers: Vec<_> = (0..WRITERS)
+        .map(|w| {
+            let url = url.clone();
+            tokio::spawn(async move {
+                let mut conn = AsyncPgConnection::establish(&url)
+                    .await
+                    .expect("writer connection");
+                for n in 0..WRITES_PER_WRITER {
+                    autumn_harvest::dlq::dead_letter(&mut conn, &write_entry(w * 1000 + n))
+                        .await
+                        .expect("concurrent insert");
+                }
+            })
+        })
+        .collect();
+    for writer in writers {
+        writer.await.expect("writer task");
+    }
+    let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let cost = timed_cost(&mut conn, &db_name, insert).await;
+    write_row(
+        table,
+        size.name,
+        &format!("insert, {WRITERS} connections ({wall_ms:.0} ms wall)"),
+        cost,
+    );
+    drop(conn);
+    drop(db);
+}
+
+/// Writes the per-call cost of the dead-letter writes for every size.
+#[tokio::test]
+#[ignore = "evidence generator, not a CI assertion -- see \
+            docs/performance-dlq-depth-counter.md"]
+async fn zz_capture_dead_letter_write_costs() {
+    let (admin, _guard) = setup_server().await;
+    let label = std::env::var("PERF_LABEL").unwrap_or_else(|_| "write-baseline".to_owned());
+    let mut table = format!(
+        "-- {label}: dead-letter writes, {WRITES} single writes, \
+         {DISCARD_BATCH}-row batches, {WRITERS} x {WRITES_PER_WRITER} concurrent inserts\n\
+         | size | statement | calls | buffers | buffers per call | ms per call |\n\
+         |:--|:--|--:|--:|--:|--:|\n"
+    );
+    for size in &SIZES {
+        measure_writes(&admin, size, &mut table).await;
+        eprintln!("{table}");
+    }
+    std::fs::write(
+        artifact_dir().join(format!("{label}-write-costs.md")),
+        &table,
+    )
+    .expect("write table");
 }
 
 /// The stranded-work demand query as it stood before its `PAUSED` gate became a

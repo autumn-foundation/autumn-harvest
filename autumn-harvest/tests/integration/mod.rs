@@ -180,6 +180,7 @@ mod delayed_start_tests;
 mod det_check_tests;
 mod determinism_static_analysis_docs;
 mod dispatch_tests;
+mod dlq_depth_counter_tests;
 mod docs_guard_support;
 mod drain_release_tests;
 #[cfg(feature = "db")]

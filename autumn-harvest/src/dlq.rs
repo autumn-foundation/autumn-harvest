@@ -3,6 +3,12 @@
 //! Tasks that exhaust all retry attempts are moved to the `harvest_dead_letters`
 //! table for post-mortem inspection and potential manual reprocessing. This is
 //! the final resting place for permanently failed tasks.
+//!
+//! Triggers keep the DLQ depth in `harvest_dead_letter_counts`. Each insert
+//! and delete statement updates one counter row in its own transaction. In a
+//! `REPEATABLE READ` transaction, that update can fail with a serialization
+//! error when another writer changed the row. Retry the transaction, as for
+//! any write at that level. The engine writes at `READ COMMITTED`.
 
 use crate::schema::harvest_workflow_executions_ext;
 use jiff_diesel::ToDiesel;
@@ -800,21 +806,36 @@ pub async fn dead_letter_with_codecs(
         .ok_or_else(|| HarvestError::Database("insert returned no ID".into()))
 }
 
+/// The DLQ depth statement of [`dead_letter_count`].
+///
+/// Triggers on `harvest_dead_letters` keep `harvest_dead_letter_counts`
+/// exact. The sum of its rows is the committed row count of the DLQ. So the
+/// statement reads a few rows at any DLQ size, not each dead letter.
+pub const DLQ_DEPTH_SQL: &str = concat!(
+    "SELECT COALESCE(SUM(entries), 0)::BIGINT AS entries ",
+    "FROM harvest_dead_letter_counts",
+);
+
+#[derive(diesel::QueryableByName)]
+struct DepthRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    entries: i64,
+}
+
 /// Count the total number of entries in the dead-letter queue.
+///
+/// The count is exact. It reads the counter of [`DLQ_DEPTH_SQL`], so its
+/// cost does not grow with the DLQ.
 ///
 /// # Errors
 ///
 /// Returns [`HarvestError::Database`] on query failure.
 pub async fn dead_letter_count(conn: &mut AsyncPgConnection) -> HarvestResult<i64> {
-    use crate::schema::harvest_dead_letters::dsl;
-
-    let count: i64 = dsl::harvest_dead_letters
-        .count()
+    let row: DepthRow = diesel::sql_query(DLQ_DEPTH_SQL)
         .get_result(conn)
         .await
         .map_err(crate::error::database_error)?;
-
-    Ok(count)
+    Ok(row.entries)
 }
 
 /// The age in whole seconds of the newest dead letter, or `NULL` with none.

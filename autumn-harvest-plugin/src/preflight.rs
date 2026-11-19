@@ -450,6 +450,14 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
     ("harvest_signals", &["SELECT", "INSERT", "UPDATE"]),
     ("harvest_timers", &["SELECT", "INSERT", "UPDATE", "DELETE"]),
     ("harvest_dead_letters", &["SELECT", "INSERT", "DELETE"]),
+    // A trigger on each dead-letter insert and delete updates the DLQ depth
+    // counter. It runs as the writer, so a missing grant fails that write.
+    // An insert adds a counter row when every row is locked. The DLQ gauge
+    // reads the table.
+    (
+        "harvest_dead_letter_counts",
+        &["SELECT", "INSERT", "UPDATE"],
+    ),
     ("harvest_external_tasks", &["SELECT", "INSERT", "UPDATE"]),
     ("harvest_workers", &["SELECT", "INSERT", "UPDATE"]),
     // Each worker heartbeat upserts its stats and prunes old rows (issue
@@ -2508,6 +2516,17 @@ mod tests {
             .find(|(name, _)| *name == "harvest_partition_exports")
             .map(|(_, privileges)| *privileges);
         assert_eq!(log, Some(&["SELECT", "INSERT"][..]));
+    }
+
+    /// Each dead-letter write updates the DLQ depth counter through a
+    /// trigger. A missing grant fails the failure transaction.
+    #[test]
+    fn the_dlq_depth_counter_is_covered_by_the_privilege_probe() {
+        let covered = HARVEST_WRITE_PRIVILEGE_REQUIREMENTS
+            .iter()
+            .find(|(name, _)| *name == "harvest_dead_letter_counts")
+            .map(|(_, privileges)| *privileges);
+        assert_eq!(covered, Some(&["SELECT", "INSERT", "UPDATE"][..]));
     }
 
     /// A reshard carry reads, writes and deletes the override floors. A

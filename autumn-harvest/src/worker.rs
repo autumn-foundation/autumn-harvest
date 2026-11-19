@@ -32594,6 +32594,9 @@ fn spawn_rate_limit_sampler(
 /// Periodically sample the dead-letter queue entry count and forward it to
 /// the configured [`MetricsRecorder`](crate::telemetry::MetricsRecorder).
 ///
+/// The count is exact, and its read does not grow with the DLQ. See
+/// [`crate::dlq::DLQ_DEPTH_SQL`].
+///
 /// Runs on the same cadence as the queue-depth sampler. For sharded
 /// deployments the caller should spawn one instance per shard, passing the
 /// shard-specific pool; single-shard deployments pass their single pool and

@@ -127,6 +127,7 @@ ends. The test fails when a single sampler uses `poll_interval`.
 
 - At 1,000,000 dead letters one DLQ count reads 744,158 buffers. A counter
   table would make it constant, but it adds a write to each dead letter.
+  Done: [`performance-dlq-depth-counter.md`](performance-dlq-depth-counter.md).
 - The stranded-work query still reads each claimable pending row. One elected
   sampler per shard would cut the calls by the worker count.
 - `concurrency_key_stats` scans the whole task queue. No index covers its
