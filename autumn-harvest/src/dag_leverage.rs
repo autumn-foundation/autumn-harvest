@@ -7,7 +7,7 @@
 //! which activity to optimize first.
 
 use crate::dag::DagDefinition;
-use crate::dag_slack::DagSlackReport;
+use crate::dag_slack::{DagSlackReport, to_duration};
 use std::time::Duration;
 
 /// Effect of making one task instant.
@@ -35,6 +35,14 @@ impl<'a> DagLeverage<'a> {
     /// # Panics
     ///
     /// Panics when the report and the DAG hold a different number of tasks.
+    ///
+    /// Clone-class note: this panic check, and the makespan forward pass
+    /// inside `makespan_with` below, repeat verbatim in
+    /// [`crate::dag_crash::DagCrashPlanner`]. Apply a change in either
+    /// check, or in the forward-pass formula, to both modules.
+    ///
+    /// Two instances only, so the merge-evidence bar (rule of three, or a
+    /// missed-fix) is not met. See the note on `DagCrashPlanner::new`.
     #[must_use]
     pub fn new(dag: &'a DagDefinition, report: &'a DagSlackReport) -> Self {
         assert_eq!(
@@ -108,14 +116,6 @@ impl<'a> DagLeverage<'a> {
         ranking.sort_by(|x, y| y.saved.cmp(&x.saved).then(x.index.cmp(&y.index)));
         ranking
     }
-}
-
-/// Convert nanoseconds to a `Duration`, saturating at `Duration::MAX`.
-fn to_duration(nanos: u128) -> Duration {
-    u64::try_from(nanos / 1_000_000_000).map_or(Duration::MAX, |secs| {
-        // The remainder is below 1e9, so it fits in `u32`.
-        Duration::new(secs, (nanos % 1_000_000_000) as u32)
-    })
 }
 
 #[cfg(test)]

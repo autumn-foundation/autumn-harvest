@@ -12,7 +12,7 @@
 //! The plan then stops and reports the deadline as missed.
 
 use crate::dag::DagDefinition;
-use crate::dag_slack::DagSlackReport;
+use crate::dag_slack::{DagSlackReport, to_duration};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -78,6 +78,17 @@ impl<'a> DagCrashPlanner<'a> {
     /// # Panics
     ///
     /// Panics when the report and the DAG hold a different number of tasks.
+    ///
+    /// Clone-class note: this panic check, and the makespan forward pass in
+    /// `makespan_of` below, repeat verbatim in
+    /// [`crate::dag_leverage::DagLeverage`]. Apply a change in either check,
+    /// or in the forward-pass formula, to both modules.
+    ///
+    /// Two instances only. `dag_leverage.rs` predates this file by issue
+    /// #2720, which adds this file by copying the shared skeleton. No
+    /// commit touches both files, so neither a co-change nor a missed-fix
+    /// exists to cite. The merge-evidence bar (rule of three, or a
+    /// missed-fix) is not met. See the note on `DagLeverage::new`.
     #[must_use]
     pub fn new(dag: &'a DagDefinition, report: &'a DagSlackReport) -> Self {
         assert_eq!(
@@ -211,14 +222,6 @@ fn step_cost(nanos: u128, rate: u64) -> u128 {
     let whole = (nanos / 1_000_000_000).saturating_mul(rate);
     let part = (nanos % 1_000_000_000 * rate).div_ceil(1_000_000_000);
     whole.saturating_add(part)
-}
-
-/// Convert nanoseconds to a `Duration`, saturating at `Duration::MAX`.
-fn to_duration(nanos: u128) -> Duration {
-    u64::try_from(nanos / 1_000_000_000).map_or(Duration::MAX, |secs| {
-        // The remainder is below 1e9, so it fits in `u32`.
-        Duration::new(secs, (nanos % 1_000_000_000) as u32)
-    })
 }
 
 #[cfg(test)]
