@@ -9,7 +9,7 @@ criterion 1 of `DESIGN-2697.md` say that the directory lists as empty.
 - The mount stays read-only, `nosuid`, `nodev` and `noexec`, so the code
   cannot write the directory. The mask still shows no host data.
 - A file or a socket mask is unchanged. It still binds `/dev/null`.
-- No new `WorkflowEvent` variant, no migration.
+- No migration. No `WorkflowEvent` variant. No replay impact.
 - Tests: `a_masked_directory_lists_as_empty` now checks the exit code of
   `ls`. Its old pipe into `wc -l` printed 0 for an error too.
   `a_masked_directory_hides_its_files` checks `ENOENT`.

@@ -226,11 +226,12 @@ let backend = ProcessBackend::new(ExecOptions {
   A runtime in another directory, such as `/opt/node`, needs that directory
   in `read_only`. A path that does not exist is skipped.
 - **`Mask`** fails open. A directory lists as empty, and the code cannot
-  write it. A file, or a socket, reads as `/dev/null`. A mask hides a path, not an inode, so a hard link or
-  a second path still reaches the data. It does not hide the other runs in
-  the scratch root, and it does not hide `/proc`. Each path must be
-  absolute and must exist. It must not hold `..` or cover the work
-  directory. Otherwise the run is refused with a config error.
+  write it. A file, or a socket, reads as `/dev/null`. A mask hides a
+  path, not an inode, so a hard link or a second path still reaches the
+  data. It does not hide the other runs in the scratch root, and it does
+  not hide `/proc`. Each path must be absolute and must exist. It must not
+  hold `..` or cover the work directory. Otherwise the run is refused with
+  a config error.
 - Both settings need a mount namespace. A non-root worker enters it through
   its user namespace. When the host refuses, the run fails closed with
   `SandboxUnavailable`. `sandbox::fs_isolation::fs_isolation_available()`
