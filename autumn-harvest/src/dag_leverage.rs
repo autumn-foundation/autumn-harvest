@@ -89,14 +89,57 @@ impl<'a> DagLeverage<'a> {
     /// The most valuable task comes first. Equal savings keep index order.
     #[must_use]
     pub fn rank(&self) -> Vec<TaskLeverage> {
+        let tasks = self.dag.tasks();
+        let levels = self.dag.execution_levels();
+        let durations: Vec<u128> = self
+            .report
+            .tasks
+            .iter()
+            .map(|task| task.duration.as_nanos())
+            .collect();
+        // `finish[i]` is the longest path that ends at task `i`.
+        let mut finish = vec![0u128; tasks.len()];
+        let mut base = 0u128;
+        for level in levels {
+            for &i in level {
+                let start = tasks[i]
+                    .upstreams
+                    .iter()
+                    .map(|&up| finish[up])
+                    .max()
+                    .unwrap_or(0);
+                finish[i] = start.saturating_add(durations[i]);
+                base = base.max(finish[i]);
+            }
+        }
+        // `tail[i]` is the longest path that starts at task `i`.
+        let mut tail = durations.clone();
+        for level in levels.iter().rev() {
+            for &i in level {
+                for &up in &tasks[i].upstreams {
+                    tail[up] = tail[up].max(durations[up].saturating_add(tail[i]));
+                }
+            }
+        }
+        let base_free = to_duration(base);
         let mut ranking: Vec<TaskLeverage> = self
             .report
             .tasks
             .iter()
             .map(|task| {
-                let free = self
-                    .makespan_with(task.index, Duration::ZERO)
-                    .unwrap_or(self.report.makespan);
+                // A task on no longest path leaves the run time unchanged
+                // when it takes no time, because a longest path avoids it.
+                let off_path = task.index < tasks.len()
+                    && finish[task.index]
+                        .saturating_add(tail[task.index])
+                        .saturating_sub(durations[task.index])
+                        < base;
+                let free = if off_path {
+                    base_free
+                } else {
+                    self.makespan_with(task.index, Duration::ZERO)
+                        .unwrap_or(self.report.makespan)
+                };
                 TaskLeverage {
                     index: task.index,
                     name: task.name.clone(),
@@ -180,6 +223,30 @@ mod tests {
         assert_eq!(lever.makespan_with(1, secs(4)), Some(secs(7)));
         assert_eq!(lever.makespan_with(2, secs(30)), Some(secs(33)));
         assert_eq!(lever.makespan_with(9, secs(1)), None);
+    }
+
+    #[test]
+    fn rank_matches_a_full_recompute_for_every_task() {
+        let mut builder = DagBuilder::new();
+        let ta = builder.activity(a);
+        let tb = builder.activity(b).upstream(&ta);
+        let tc = builder.activity(c).upstream(&ta);
+        let td = builder.activity(d).upstream(&tb).upstream(&tc);
+        let _te = builder.activity(a).upstream(&td);
+        let _tf = builder.activity(b).upstream(&tc);
+        let dag = builder.build().unwrap();
+        let report = DagSlackAnalyzer::new(dag.clone())
+            .mock_duration("a", secs(2))
+            .mock_duration("b", secs(5))
+            .mock_duration("c", secs(5))
+            .mock_duration("d", secs(1))
+            .analyze();
+        let lever = DagLeverage::new(&dag, &report);
+        for row in lever.rank() {
+            let free = lever.makespan_with(row.index, Duration::ZERO).unwrap();
+            assert_eq!(row.makespan_if_free, free, "task {}", row.index);
+            assert_eq!(row.saved, report.makespan.saturating_sub(free));
+        }
     }
 
     #[test]
