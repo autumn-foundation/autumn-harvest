@@ -869,6 +869,7 @@ mod tests {
             &format!("cat {}", file.display()),
         )
         .await;
+        assert_eq!(out.status, RunStatus::Exited { code: 1 });
         assert_eq!(out.stdout, "");
         assert!(
             out.stderr.contains("No such file or directory"),
@@ -1213,12 +1214,20 @@ mod tests {
         }
         let (dir, _file) = secret_dir();
         let path = dir.path().display();
+        // A non-root worker owns the mask root, so mode `555` alone does not
+        // stop a `chmod`. Only the read-only mount gives `EROFS` here.
         let out = run(
             FsIsolation::Mask(vec![dir.path().to_path_buf()]),
-            &format!("touch {path}/x 2>/dev/null; echo rc=$?; stat -c %a {path}"),
+            &format!("touch {path}/x; chmod 755 {path}; stat -c %a {path}"),
         )
         .await;
-        assert_eq!(out.stdout, "rc=1\n555\n", "{}", out.stderr);
+        assert_eq!(out.stdout, "555\n", "{}", out.stderr);
+        assert_eq!(
+            out.stderr.matches("Read-only file system").count(),
+            2,
+            "{}",
+            out.stderr
+        );
     }
 
     #[tokio::test]
