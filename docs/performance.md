@@ -2051,7 +2051,9 @@ fleet reaches 10.
 workers of 4 claim loops each on one table, with a backlog of 6,000
 workflows. It runs the cap off, then 4 slots, each on its own database. Each
 arm takes the claim rate before the stall as the median of three 1 s
-windows. One transaction then holds `ACCESS EXCLUSIVE` on
+windows. It takes them after the backlog top-up, directly before the lock.
+A top-up seed slows the claims, so an earlier rate is not a fair base. One
+transaction then holds `ACCESS EXCLUSIVE` on
 `harvest_task_queue` for 3 s. After the lift, a 1 s window slides in 100 ms
 steps until it reaches 90% of the rate before the stall. The test fails if
 that takes more than 10 s.
