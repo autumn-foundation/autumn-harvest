@@ -129,8 +129,9 @@ ends. The test fails when a single sampler uses `poll_interval`.
   table would make it constant, but it adds a write to each dead letter.
 - The stranded-work query still reads each claimable pending row. One elected
   sampler per shard would cut the calls by the worker count.
-- `concurrency_key_stats` scans the whole task queue. No index covers its
-  PENDING rows.
+- `concurrency_key_stats` scanned the whole task queue, because no index
+  covered its PENDING rows. `idx_harvest_tq_concurrency_live` now covers them.
+  See `docs/performance-concurrency-live-index.md`.
 
 ## 🔬 Reproduce
 

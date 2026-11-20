@@ -675,6 +675,8 @@ re-evaluated on the next poll — no dedicated worker process, no extra table, n
 background coordinator. The partial index
 `harvest_task_queue_concurrency_key_running` makes the saturation check O(log n)
 on RUNNING rows with a non-NULL key; activities without a cap pay zero overhead.
+The partial index `idx_harvest_tq_concurrency_live` holds the live rows with a
+key and a cap. The concurrency gauges read it, not the whole task queue.
 
 Inspect live stats with the CLI:
 

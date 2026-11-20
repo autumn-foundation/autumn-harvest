@@ -1,0 +1,39 @@
+-- concurrency_key_stats
+GroupAggregate  (cost=580.91..583.46 rows=57 width=33) (actual time=1.488..1.696 rows=56 loops=1)
+  Group Key: concurrency_key, task_type
+  Buffers: shared hit=499
+  ->  Sort  (cost=580.91..581.16 rows=99 width=28) (actual time=1.475..1.522 rows=1181 loops=1)
+        Sort Key: concurrency_key, task_type
+        Sort Method: quicksort  Memory: 113kB
+        Buffers: shared hit=499
+        ->  Bitmap Heap Scan on harvest_task_queue  (cost=5.16..577.63 rows=99 width=28) (actual time=0.209..1.047 rows=1181 loops=1)
+              Recheck Cond: ((concurrency_key IS NOT NULL) AND (concurrency_cap IS NOT NULL) AND (state = ANY ('{PENDING,RUNNING}'::text[])))
+              Filter: ((queue_name = ANY ('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])) AND ((state = 'PENDING'::text) OR ((state = 'RUNNING'::text) AND (worker_id IS NOT NULL))))
+              Heap Blocks: exact=495
+              Buffers: shared hit=499
+              ->  Bitmap Index Scan on idx_harvest_tq_concurrency_live  (cost=0.00..5.09 rows=162 width=0) (actual time=0.150..0.150 rows=1181 loops=1)
+                    Buffers: shared hit=4
+Planning:
+  Buffers: shared hit=8
+Planning Time: 0.440 ms
+Execution Time: 1.747 ms
+
+-- sample_rate_limit_buckets
+Seq Scan on harvest_rate_limit_buckets  (cost=0.00..29.00 rows=91 width=34) (actual time=0.008..0.076 rows=100 loops=1)
+  Filter: (((key)::text !~~ 'dyn-rate:%'::text) AND ((key)::text !~~ 'start-throttle:%'::text))
+  Rows Removed by Filter: 900
+  Buffers: shared hit=14
+Planning Time: 0.056 ms
+Execution Time: 0.090 ms
+
+-- dead_letter_count
+Aggregate  (cost=3042.29..3042.30 rows=1 width=8) (actual time=12.101..12.102 rows=1 loops=1)
+  Buffers: shared hit=323
+  ->  Index Only Scan using idx_harvest_dl_failed_at on harvest_dead_letters  (cost=0.29..2792.29 rows=100000 width=0) (actual time=0.013..7.604 rows=100000 loops=1)
+        Heap Fetches: 0
+        Buffers: shared hit=323
+Planning:
+  Buffers: shared read=3
+Planning Time: 0.074 ms
+Execution Time: 12.117 ms
+

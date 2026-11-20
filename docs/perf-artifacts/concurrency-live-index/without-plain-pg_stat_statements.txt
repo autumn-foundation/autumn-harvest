@@ -1,0 +1,14 @@
+calls=2000 buffers=26425 dirtied=640 wal_records=16085 wal_fpi=543 wal_bytes=4718531 | INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "priority",
+calls=2001 buffers=194580 dirtied=14 wal_records=18176 wal_fpi=5 wal_bytes=1358777 | WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS
+calls=2000 buffers=38132 dirtied=16 wal_records=12057 wal_fpi=4 wal_bytes=1010891 | UPDATE "harvest_task_queue" SET "state" = $1, "output" = $2, "heartbeat_details" = $3, "error" = $4, "completed_at" = $5 WHERE (("harvest_ta
+calls=2000 buffers=10003 dirtied=0 wal_records=7 wal_fpi=0 wal_bytes=425 | UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, attempt = GREATEST(attempt - 1, 0) WHERE id = $1 AND s
+calls=2001 buffers=0 dirtied=0 wal_records=0 wal_fpi=0 wal_bytes=0 | BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+calls=2001 buffers=0 dirtied=0 wal_records=0 wal_fpi=0 wal_bytes=0 | COMMIT
+calls=2000 buffers=0 dirtied=0 wal_records=0 wal_fpi=0 wal_bytes=0 | SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)
+calls=2000 buffers=0 dirtied=0 wal_records=0 wal_fpi=0 wal_bytes=0 | SELECT pg_try_advisory_xact_lock_shared($1, $2) AS acquired
+calls=2000 buffers=0 dirtied=0 wal_records=0 wal_fpi=0 wal_bytes=0 | SELECT txid_current_if_assigned()
+calls=2001 buffers=0 dirtied=0 wal_records=0 wal_fpi=0 wal_bytes=0 | SET LOCAL enable_bitmapscan = off
+calls=2001 buffers=0 dirtied=0 wal_records=0 wal_fpi=0 wal_bytes=0 | SET LOCAL enable_sort = off
+calls=2001 buffers=0 dirtied=0 wal_records=0 wal_fpi=0 wal_bytes=0 | SET LOCAL jit = off
+calls=2001 buffers=0 dirtied=0 wal_records=0 wal_fpi=0 wal_bytes=0 | SET LOCAL plan_cache_mode = force_generic_plan
+calls=2000 buffers=8000 dirtied=0 wal_records=0 wal_fpi=0 wal_bytes=0 | UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, attempt = GREATEST(attempt - 1, 0) WHERE id = $1 AND s

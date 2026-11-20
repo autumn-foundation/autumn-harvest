@@ -5939,7 +5939,11 @@ pub struct ConcurrencyKeyWorkflow {
 /// Named, not inlined, so the drift guard can read BOTH this and
 /// [`CONCURRENCY_ATTRIBUTION_SQL`]. It asserts they share the same row filter.
 /// A check of one side alone cannot detect drift in the other.
-const CONCURRENCY_STATS_SQL: &str = "SELECT \
+///
+/// The filter implies the predicate of `idx_harvest_tq_concurrency_live`. So
+/// the statement reads the live keyed rows only, not the whole queue. A plan
+/// gate in `concurrency_live_index_tests` reads this text.
+pub const CONCURRENCY_STATS_SQL: &str = "SELECT \
              concurrency_key AS key, \
              task_type, \
              MAX(concurrency_cap)::INT4 AS max_concurrent, \
@@ -6043,8 +6047,9 @@ pub async fn concurrency_key_workflows(
 ///
 /// Named, not inlined, so a unit test can assert it shares the row filter of
 /// [`concurrency_key_stats`]. The two are separate statements and could
-/// otherwise drift.
-const CONCURRENCY_ATTRIBUTION_SQL: &str = "SELECT \
+/// otherwise drift. The shared filter also lets it use
+/// `idx_harvest_tq_concurrency_live`.
+pub const CONCURRENCY_ATTRIBUTION_SQL: &str = "SELECT \
              t.concurrency_key AS key, \
              t.task_type, \
              e.workflow_name \
