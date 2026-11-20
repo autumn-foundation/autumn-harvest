@@ -747,6 +747,7 @@ mod tests {
     use super::*;
     use crate::sandbox::error::SandboxError;
     use crate::sandbox::exec::{ExecOptions, execute_plan};
+    use crate::sandbox::isolation_gate::host_has;
     use crate::sandbox::outcome::{RunStatus, SandboxOutcome};
     use crate::sandbox::policy::{NetworkPolicy, SandboxPolicy};
     use crate::sandbox::request::SandboxRequest;
@@ -810,11 +811,14 @@ mod tests {
         (dir, file)
     }
 
+    /// The `what` of each mount namespace probe.
+    const MOUNT_NS: &str = "mount namespace for the executor";
+
     async fn needs_isolation() -> bool {
-        if fs_isolation_available().await {
+        if host_has(fs_isolation_available().await, MOUNT_NS) {
             return true;
         }
-        eprintln!("skipped: this host has no mount namespace for the executor");
+        eprintln!("skipped: this host has no {MOUNT_NS}");
         false
     }
 
@@ -1356,10 +1360,12 @@ mod tests {
         })
         .join()
         .unwrap();
-        match leaked {
-            Some(leaked) => assert!(!leaked, "the mask leaked into the shared root"),
-            None => eprintln!("skipped: this host refuses a private mount namespace"),
-        }
+        let Some(leaked) = leaked else {
+            host_has(false, "private mount namespace for a root worker");
+            eprintln!("skipped: this host refuses a private mount namespace");
+            return;
+        };
+        assert!(!leaked, "the mask leaked into the shared root");
     }
 
     /// A strict umask of the worker must not close the directories of the
@@ -1381,7 +1387,7 @@ mod tests {
                 .build()
                 .unwrap();
             runtime.block_on(async {
-                if !fs_isolation_available().await {
+                if !host_has(fs_isolation_available().await, MOUNT_NS) {
                     return None;
                 }
                 let code = "cat /etc/passwd > /dev/null && echo ok; umask";
@@ -1391,7 +1397,7 @@ mod tests {
         .join()
         .unwrap();
         let Some(out) = out else {
-            eprintln!("skipped: this host has no mount namespace for the executor");
+            eprintln!("skipped: this host has no {MOUNT_NS}");
             return;
         };
         assert_eq!(out.stdout, "ok\n0077\n", "{}", out.stderr);
@@ -1478,7 +1484,7 @@ mod tests {
             &SandboxRequest::new("sh", "true"),
         )
         .await;
-        if fs_isolation_available().await {
+        if host_has(fs_isolation_available().await, MOUNT_NS) {
             result.expect("the probe says the host can isolate");
         } else {
             let err = result.expect_err("no isolation, so the run must fail closed");

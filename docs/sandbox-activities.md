@@ -603,6 +603,11 @@ the heavy crates again. Unset these settings before you run the alias.
 The alias uses its own flag set, so it shares no build cache with `cargo test`.
 Pass a test filter after `--`, for example `cargo sandbox-test -- exec`.
 
+A test that needs a mount or a network namespace skips on a host without
+one. The skip passes without a sign. Set `HARVEST_TEST_REQUIRE_ISOLATION=1`
+to make each such skip fail, as CI does. On Ubuntu, a non-root user can then
+need `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`.
+
 ```sh
 cargo sandbox-test
 cargo test -p autumn-harvest-sandbox-guest

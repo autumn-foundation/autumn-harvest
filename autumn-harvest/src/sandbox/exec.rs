@@ -1772,6 +1772,7 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+    use crate::sandbox::isolation_gate::host_has;
     use crate::sandbox::outcome::RunStatus;
     use crate::sandbox::policy::{NetworkPolicy, SandboxPolicy};
     use crate::sandbox::request::{SandboxFile, SandboxRequest};
@@ -2868,7 +2869,7 @@ mod tests {
             .plan(&sh("cat /proc/net/dev"))
             .unwrap();
         let result = execute_plan(&denied, &options(), &CancellationToken::new()).await;
-        if network_isolation_available().await {
+        if host_has(network_isolation_available().await, "network namespace") {
             let out = result.expect("isolation is available");
             let interfaces: Vec<&str> = out
                 .stdout
