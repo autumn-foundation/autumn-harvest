@@ -1,0 +1,15 @@
+# Ledger profiles for `autumn-harvest/src/gauge_election.rs`. See `docs/ledger/README.md`.
+
+["db::fresh_gauge_sample"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_gauge_samples"]
+measured = "unmeasured"
+
+["db::publish_gauge_sample"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_gauge_samples"]
+measured = "unmeasured"
