@@ -306,8 +306,8 @@ PREPARE
          Buffers: shared hit=31
  Planning:
    Buffers: shared hit=2167
- Planning Time: 9.871 ms
- Execution Time: 5.455 ms
+ Planning Time: 10.116 ms
+ Execution Time: 4.587 ms
 (302 rows)
 
 ROLLBACK

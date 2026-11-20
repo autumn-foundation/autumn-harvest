@@ -7,7 +7,7 @@ PREPARE
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     QUERY PLAN                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    
 ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Nested Loop Left Join (actual rows=1 loops=1)
-   Buffers: shared hit=9774
+   Buffers: shared hit=9749
    CTE worker_info
      ->  Result (actual rows=1 loops=1)
            Buffers: shared hit=2
@@ -107,18 +107,18 @@ PREPARE
      ->  HashAggregate (actual rows=0 loops=1)
            Group Key: t.concurrency_key, t.task_type
            Batches: 1  Memory Usage: 24kB
-           Buffers: shared hit=9677
+           Buffers: shared hit=9652
            ->  Hash Semi Join (actual rows=0 loops=1)
                  Hash Cond: (t.concurrency_key = seek_pending_keys.concurrency_key)
-                 Buffers: shared hit=9677
+                 Buffers: shared hit=9652
                  ->  Index Scan using harvest_task_queue_running_worker_idx on harvest_task_queue t (actual rows=10000 loops=1)
-                       Buffers: shared hit=9677
+                       Buffers: shared hit=9652
                  ->  Hash (actual rows=20 loops=1)
                        Buckets: 1024  Batches: 1  Memory Usage: 9kB
                        ->  CTE Scan on seek_pending_keys (actual rows=20 loops=1)
    CTE seek_candidate
      ->  Limit (actual rows=1 loops=1)
-           Buffers: shared hit=9743
+           Buffers: shared hit=9718
            InitPlan 12 (returns $17)
              ->  Result (actual rows=1 loops=1)
            InitPlan 13 (returns $18)
@@ -133,34 +133,34 @@ PREPARE
              ->  Function Scan on unnest marked_2 (actual rows=0 loops=1)
                    Filter: ("left"(marked, 1) = '\x01'::text)
            ->  LockRows (actual rows=1 loops=1)
-                 Buffers: shared hit=9743
+                 Buffers: shared hit=9718
                  ->  Sort (actual rows=1 loops=1)
                        Sort Key: (CASE WHEN ((harvest_task_queue_2.sticky_worker_id = $1) AND (harvest_task_queue_2.sticky_until > now())) THEN 1 ELSE 0 END) DESC, (CASE WHEN (($4 IS NOT NULL) AND ($4 > 0)) THEN (harvest_task_queue_2.priority + (floor((EXTRACT(epoch FROM (now() - harvest_task_queue_2.scheduled_at)) / ($4)::numeric)))::integer) ELSE harvest_task_queue_2.priority END) DESC, ((harvest_task_queue_2.scheduled_at + CASE WHEN (harvest_task_queue_2.new_start AND (harvest_task_queue_2.attempt = 0)) THEN '00:00:30'::interval ELSE '00:00:00'::interval END))
                        Sort Method: quicksort  Memory: 31kB
-                       Buffers: shared hit=9741
+                       Buffers: shared hit=9716
                        ->  Nested Loop (actual rows=32 loops=1)
                              Join Filter: ((harvest_task_queue_2.task_type <> 'activity'::text) OR (harvest_task_queue_2.activity_name IS NULL) OR (harvest_task_queue_2.activity_name <> ALL (paused_activities_2.names)))
-                             Buffers: shared hit=9735
+                             Buffers: shared hit=9710
                              ->  CTE Scan on paused_activities paused_activities_2 (actual rows=1 loops=1)
                              ->  Nested Loop (actual rows=32 loops=1)
                                    Join Filter: (harvest_task_queue_2.queue_name <> ALL (paused_queues_2.names))
-                                   Buffers: shared hit=9735
+                                   Buffers: shared hit=9710
                                    ->  CTE Scan on paused_queues paused_queues_2 (actual rows=1 loops=1)
                                    ->  Nested Loop (actual rows=32 loops=1)
                                          Join Filter: ((harvest_task_queue_2.required_capabilities IS NULL) OR (NOT (SubPlan 22)))
-                                         Buffers: shared hit=9735
+                                         Buffers: shared hit=9710
                                          ->  CTE Scan on worker_info (actual rows=1 loops=1)
                                                Buffers: shared hit=2
                                          ->  Tid Scan on harvest_task_queue harvest_task_queue_2 (actual rows=32 loops=1)
                                                TID Cond: (ctid = ANY ($18))
                                                Filter: (((session_id IS NULL) OR (sticky_worker_id = $1)) AND (state = $17) AND (scheduled_at <= now()) AND ((schedule_to_close_at IS NULL) OR (schedule_to_close_at > now())) AND ((sticky_worker_id IS NULL) OR (sticky_worker_id = $1) OR (sticky_until IS NULL) OR (sticky_until <= now())) AND ((task_type <> 'activity'::text) OR (activity_name IS NULL) OR (required_capabilities IS NOT NULL) OR (activity_name <> ALL ($6))) AND ((task_type <> 'activity'::text) OR (activity_name IS NULL) OR (activity_name <> ALL ($19))) AND ((workflow_exec_id IS NULL) OR (NOT (hashed SubPlan 21))) AND ((concurrency_key IS NULL) OR (concurrency_cap IS NULL) OR (COALESCE((SubPlan 15), '0'::bigint) < concurrency_cap)) AND ((task_type <> 'workflow'::text) OR (workflow_exec_id IS NULL) OR (NOT (hashed SubPlan 19))) AND ((required_build_id IS NULL) OR (($3 <> ''::text) AND ((required_build_id = $3) OR (hashed SubPlan 17)))) AND ((rate_limit_key IS NULL) OR (activity_name = ANY ($5)) OR (hashed SubPlan 24)))
-                                               Buffers: shared hit=9733
+                                               Buffers: shared hit=9708
                                                SubPlan 21
                                                  ->  CTE Scan on expired_runs x (never executed)
                                                SubPlan 15
                                                  ->  CTE Scan on seek_running_counts rc (actual rows=0 loops=32)
                                                        Filter: ((concurrency_key = harvest_task_queue_2.concurrency_key) AND (task_type = harvest_task_queue_2.task_type))
-                                                       Buffers: shared hit=9677
+                                                       Buffers: shared hit=9652
                                                SubPlan 19
                                                  ->  Index Only Scan using idx_harvest_we_paused on harvest_workflow_executions e (never executed)
                                                        Heap Fetches: 0
@@ -291,22 +291,22 @@ PREPARE
                              Buffers: shared hit=4
    CTE claim_window_fallback
      ->  Result (actual rows=1 loops=1)
-           Buffers: shared hit=9743
+           Buffers: shared hit=9718
            InitPlan 55 (returns $72)
              ->  CTE Scan on seek_candidate seek_candidate_2 (actual rows=1 loops=1)
-                   Buffers: shared hit=9743
+                   Buffers: shared hit=9718
            InitPlan 56 (returns $73)
              ->  CTE Scan on seek_contended (never executed)
            InitPlan 57 (returns $74)
              ->  CTE Scan on seek_bounds (never executed)
    ->  CTE Scan on claim_window_fallback fb (actual rows=1 loops=1)
-         Buffers: shared hit=9743
+         Buffers: shared hit=9718
    ->  CTE Scan on claimed (actual rows=1 loops=1)
          Buffers: shared hit=31
  Planning:
-   Buffers: shared hit=2124 read=29
- Planning Time: 7.207 ms
- Execution Time: 9.796 ms
+   Buffers: shared hit=2138 read=29
+ Planning Time: 9.507 ms
+ Execution Time: 10.027 ms
 (301 rows)
 
 ROLLBACK

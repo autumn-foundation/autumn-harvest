@@ -104,21 +104,26 @@ PREPARE
            ->  CTE Scan on seek_heads seek_heads_1 (actual rows=32 loops=1)
                  Filter: ((seek_concurrency_key IS NOT NULL) AND (seek_concurrency_cap IS NOT NULL))
    CTE seek_running_counts
-     ->  Nested Loop (actual rows=20 loops=1)
+     ->  Nested Loop (actual rows=0 loops=1)
            Buffers: shared hit=22
-           ->  CTE Scan on seek_pending_keys k (actual rows=20 loops=1)
-           ->  Aggregate (actual rows=1 loops=20)
+           ->  HashAggregate (actual rows=20 loops=1)
+                 Group Key: seek_pending_keys.concurrency_key
+                 Batches: 1  Memory Usage: 40kB
+                 ->  CTE Scan on seek_pending_keys (actual rows=20 loops=1)
+           ->  HashAggregate (actual rows=0 loops=20)
+                 Group Key: t.task_type
+                 Batches: 1  Memory Usage: 24kB
                  Buffers: shared hit=22
                  ->  Index Scan using harvest_task_queue_concurrency_key_running on harvest_task_queue t (actual rows=0 loops=20)
-                       Index Cond: (concurrency_key = k.concurrency_key)
-                       Filter: ((worker_id IS NOT NULL) AND (task_type = k.task_type))
+                       Index Cond: (concurrency_key = seek_pending_keys.concurrency_key)
+                       Filter: (worker_id IS NOT NULL)
                        Buffers: shared hit=22
    CTE seek_candidate
      ->  Limit (actual rows=1 loops=1)
            Buffers: shared hit=87
-           InitPlan 12 (returns $19)
+           InitPlan 12 (returns $18)
              ->  Result (actual rows=1 loops=1)
-           InitPlan 13 (returns $20)
+           InitPlan 13 (returns $19)
              ->  Nested Loop Anti Join (actual rows=32 loops=1)
                    Join Filter: ((b.bound_pinned OR (w.seek_rank = 0)) AND ((b.bound_pinned AND (w.seek_rank = 0)) OR (w.seek_priority < b.bound_priority) OR ((w.seek_priority = b.bound_priority) AND (w.seek_due > b.bound_due))))
                    Rows Removed by Join Filter: 32
@@ -126,7 +131,7 @@ PREPARE
                    ->  CTE Scan on seek_heads w (actual rows=32 loops=1)
                          Buffers: shared hit=24
                    ->  CTE Scan on seek_bounds b (actual rows=1 loops=32)
-           InitPlan 14 (returns $21)
+           InitPlan 14 (returns $20)
              ->  Function Scan on unnest marked_2 (actual rows=0 loops=1)
                    Filter: ("left"(marked, 1) = '\x01'::text)
            ->  LockRows (actual rows=1 loops=1)
@@ -149,15 +154,14 @@ PREPARE
                                          ->  CTE Scan on worker_info (actual rows=1 loops=1)
                                                Buffers: shared hit=2
                                          ->  Tid Scan on harvest_task_queue harvest_task_queue_2 (actual rows=32 loops=1)
-                                               TID Cond: (ctid = ANY ($20))
-                                               Filter: (((session_id IS NULL) OR (sticky_worker_id = $1)) AND (state = $19) AND (scheduled_at <= now()) AND ((schedule_to_close_at IS NULL) OR (schedule_to_close_at > now())) AND ((sticky_worker_id IS NULL) OR (sticky_worker_id = $1) OR (sticky_until IS NULL) OR (sticky_until <= now())) AND ((task_type <> 'activity'::text) OR (activity_name IS NULL) OR (required_capabilities IS NOT NULL) OR (activity_name <> ALL ($6))) AND ((task_type <> 'activity'::text) OR (activity_name IS NULL) OR (activity_name <> ALL ($21))) AND ((workflow_exec_id IS NULL) OR (NOT (hashed SubPlan 21))) AND ((concurrency_key IS NULL) OR (concurrency_cap IS NULL) OR (COALESCE((SubPlan 15), '0'::bigint) < concurrency_cap)) AND ((task_type <> 'workflow'::text) OR (workflow_exec_id IS NULL) OR (NOT (hashed SubPlan 19))) AND ((required_build_id IS NULL) OR (($3 <> ''::text) AND ((required_build_id = $3) OR (hashed SubPlan 17)))) AND ((rate_limit_key IS NULL) OR (activity_name = ANY ($5)) OR (hashed SubPlan 24)))
+                                               TID Cond: (ctid = ANY ($19))
+                                               Filter: (((session_id IS NULL) OR (sticky_worker_id = $1)) AND (state = $18) AND (scheduled_at <= now()) AND ((schedule_to_close_at IS NULL) OR (schedule_to_close_at > now())) AND ((sticky_worker_id IS NULL) OR (sticky_worker_id = $1) OR (sticky_until IS NULL) OR (sticky_until <= now())) AND ((task_type <> 'activity'::text) OR (activity_name IS NULL) OR (required_capabilities IS NOT NULL) OR (activity_name <> ALL ($6))) AND ((task_type <> 'activity'::text) OR (activity_name IS NULL) OR (activity_name <> ALL ($20))) AND ((workflow_exec_id IS NULL) OR (NOT (hashed SubPlan 21))) AND ((concurrency_key IS NULL) OR (concurrency_cap IS NULL) OR (COALESCE((SubPlan 15), '0'::bigint) < concurrency_cap)) AND ((task_type <> 'workflow'::text) OR (workflow_exec_id IS NULL) OR (NOT (hashed SubPlan 19))) AND ((required_build_id IS NULL) OR (($3 <> ''::text) AND ((required_build_id = $3) OR (hashed SubPlan 17)))) AND ((rate_limit_key IS NULL) OR (activity_name = ANY ($5)) OR (hashed SubPlan 24)))
                                                Buffers: shared hit=78
                                                SubPlan 21
                                                  ->  CTE Scan on expired_runs x (never executed)
                                                SubPlan 15
-                                                 ->  CTE Scan on seek_running_counts rc (actual rows=1 loops=32)
+                                                 ->  CTE Scan on seek_running_counts rc (actual rows=0 loops=32)
                                                        Filter: ((concurrency_key = harvest_task_queue_2.concurrency_key) AND (task_type = harvest_task_queue_2.task_type))
-                                                       Rows Removed by Filter: 19
                                                        Buffers: shared hit=22
                                                SubPlan 19
                                                  ->  Index Only Scan using idx_harvest_we_paused on harvest_workflow_executions e (never executed)
@@ -173,17 +177,17 @@ PREPARE
                                                  Filter: (((value ? 'Exact'::text) AND (((worker_info.labels ->> ((value -> 'Exact'::text) ->> 'key'::text)) IS NULL) OR ((worker_info.labels ->> ((value -> 'Exact'::text) ->> 'key'::text)) <> ((value -> 'Exact'::text) ->> 'value'::text)))) OR ((value ? 'In'::text) AND (((worker_info.labels ->> ((value -> 'In'::text) ->> 'key'::text)) IS NULL) OR (NOT (((value -> 'In'::text) -> 'values'::text) @> jsonb_build_array((worker_info.labels ->> ((value -> 'In'::text) ->> 'key'::text))))))))
    CTE seek_held
      ->  Result (never executed)
-           One-Time Filter: (NOT $38)
-           InitPlan 26 (returns $36)
+           One-Time Filter: (NOT $37)
+           InitPlan 26 (returns $35)
              ->  Result (never executed)
-           InitPlan 27 (returns $37)
+           InitPlan 27 (returns $36)
              ->  Nested Loop Anti Join (never executed)
                    Join Filter: ((b_2.bound_pinned OR (w_1.seek_rank = 0)) AND ((b_2.bound_pinned AND (w_1.seek_rank = 0)) OR (w_1.seek_priority < b_2.bound_priority) OR ((w_1.seek_priority = b_2.bound_priority) AND (w_1.seek_due > b_2.bound_due))))
                    ->  CTE Scan on seek_heads w_1 (never executed)
                    ->  CTE Scan on seek_bounds b_2 (never executed)
-           InitPlan 28 (returns $38)
+           InitPlan 28 (returns $37)
              ->  CTE Scan on seek_candidate (never executed)
-           InitPlan 29 (returns $39)
+           InitPlan 29 (returns $38)
              ->  Function Scan on unnest marked_3 (never executed)
                    Filter: ("left"(marked, 1) = '\x01'::text)
            ->  Nested Loop (never executed)
@@ -194,8 +198,8 @@ PREPARE
                              ->  CTE Scan on paused_queues paused_queues_3 (never executed)
                        ->  CTE Scan on paused_activities paused_activities_3 (never executed)
                  ->  Tid Scan on harvest_task_queue harvest_task_queue_3 (never executed)
-                       TID Cond: (ctid = ANY ($37))
-                       Filter: (((session_id IS NULL) OR (sticky_worker_id = $1)) AND (state = $36) AND (scheduled_at <= now()) AND ((schedule_to_close_at IS NULL) OR (schedule_to_close_at > now())) AND ((sticky_worker_id IS NULL) OR (sticky_worker_id = $1) OR (sticky_until IS NULL) OR (sticky_until <= now())) AND ((task_type <> 'activity'::text) OR (activity_name IS NULL) OR (required_capabilities IS NOT NULL) OR (activity_name <> ALL ($6))) AND ((task_type <> 'activity'::text) OR (activity_name IS NULL) OR (activity_name <> ALL ($39))) AND ((workflow_exec_id IS NULL) OR (NOT (hashed SubPlan 36))) AND ((concurrency_key IS NULL) OR (concurrency_cap IS NULL) OR (COALESCE((SubPlan 30), '0'::bigint) < concurrency_cap)) AND ((task_type <> 'workflow'::text) OR (workflow_exec_id IS NULL) OR (NOT (hashed SubPlan 34))) AND ((required_build_id IS NULL) OR (($3 <> ''::text) AND ((required_build_id = $3) OR (hashed SubPlan 32)))) AND ((rate_limit_key IS NULL) OR (activity_name = ANY ($5)) OR (hashed SubPlan 39)))
+                       TID Cond: (ctid = ANY ($36))
+                       Filter: (((session_id IS NULL) OR (sticky_worker_id = $1)) AND (state = $35) AND (scheduled_at <= now()) AND ((schedule_to_close_at IS NULL) OR (schedule_to_close_at > now())) AND ((sticky_worker_id IS NULL) OR (sticky_worker_id = $1) OR (sticky_until IS NULL) OR (sticky_until <= now())) AND ((task_type <> 'activity'::text) OR (activity_name IS NULL) OR (required_capabilities IS NOT NULL) OR (activity_name <> ALL ($6))) AND ((task_type <> 'activity'::text) OR (activity_name IS NULL) OR (activity_name <> ALL ($38))) AND ((workflow_exec_id IS NULL) OR (NOT (hashed SubPlan 36))) AND ((concurrency_key IS NULL) OR (concurrency_cap IS NULL) OR (COALESCE((SubPlan 30), '0'::bigint) < concurrency_cap)) AND ((task_type <> 'workflow'::text) OR (workflow_exec_id IS NULL) OR (NOT (hashed SubPlan 34))) AND ((required_build_id IS NULL) OR (($3 <> ''::text) AND ((required_build_id = $3) OR (hashed SubPlan 32)))) AND ((rate_limit_key IS NULL) OR (activity_name = ANY ($5)) OR (hashed SubPlan 39)))
                        SubPlan 36
                          ->  CTE Scan on expired_runs x_1 (never executed)
                        SubPlan 30
@@ -237,24 +241,24 @@ PREPARE
    CTE run_expired_now
      ->  Result (actual rows=1 loops=1)
            Buffers: shared hit=1
-           InitPlan 46 (returns $60)
+           InitPlan 46 (returns $59)
              ->  Nested Loop (actual rows=0 loops=1)
                    Join Filter: (c_1.workflow_exec_id = e_2.id)
                    Buffers: shared hit=1
-                   InitPlan 44 (returns $58)
+                   InitPlan 44 (returns $57)
                      ->  CTE Scan on fresh_now (never executed)
-                   InitPlan 45 (returns $59)
+                   InitPlan 45 (returns $58)
                      ->  CTE Scan on fresh_now fresh_now_1 (never executed)
                    ->  CTE Scan on candidate c_1 (actual rows=1 loops=1)
                    ->  Index Scan using idx_harvest_we_canary_order on harvest_workflow_executions e_2 (actual rows=0 loops=1)
-                         Filter: ((deadline_at < $58) OR (chain_deadline_at < $59))
+                         Filter: ((deadline_at < $57) OR (chain_deadline_at < $58))
                          Buffers: shared hit=1
    CTE rate_limit_debit
      ->  Update on harvest_rate_limit_buckets b_5 (actual rows=0 loops=1)
-           InitPlan 48 (returns $62)
+           InitPlan 48 (returns $61)
              ->  CTE Scan on run_expired_now (actual rows=1 loops=1)
            ->  Result (actual rows=0 loops=1)
-                 One-Time Filter: (NOT $62)
+                 One-Time Filter: (NOT $61)
                  ->  Nested Loop (actual rows=0 loops=1)
                        ->  CTE Scan on candidate (actual rows=1 loops=1)
                              Filter: (activity_name <> ALL ($5))
@@ -264,11 +268,11 @@ PREPARE
    CTE claimed
      ->  Update on harvest_task_queue harvest_task_queue_4 (actual rows=1 loops=1)
            Buffers: shared hit=27
-           InitPlan 53 (returns $70)
+           InitPlan 53 (returns $69)
              ->  CTE Scan on run_expired_now run_expired_now_1 (actual rows=1 loops=1)
                    Buffers: shared hit=1
            ->  Result (actual rows=1 loops=1)
-                 One-Time Filter: (NOT $70)
+                 One-Time Filter: (NOT $69)
                  Buffers: shared hit=6
                  ->  Nested Loop (actual rows=1 loops=1)
                        Buffers: shared hit=5
@@ -290,12 +294,12 @@ PREPARE
    CTE claim_window_fallback
      ->  Result (actual rows=1 loops=1)
            Buffers: shared hit=87
-           InitPlan 55 (returns $74)
+           InitPlan 55 (returns $73)
              ->  CTE Scan on seek_candidate seek_candidate_2 (actual rows=1 loops=1)
                    Buffers: shared hit=87
-           InitPlan 56 (returns $75)
+           InitPlan 56 (returns $74)
              ->  CTE Scan on seek_contended (never executed)
-           InitPlan 57 (returns $76)
+           InitPlan 57 (returns $75)
              ->  CTE Scan on seek_bounds (never executed)
    ->  CTE Scan on claim_window_fallback fb (actual rows=1 loops=1)
          Buffers: shared hit=87
@@ -303,8 +307,8 @@ PREPARE
          Buffers: shared hit=27
  Planning:
    Buffers: shared hit=2128
- Planning Time: 7.501 ms
- Execution Time: 2.024 ms
-(299 rows)
+ Planning Time: 8.380 ms
+ Execution Time: 1.988 ms
+(303 rows)
 
 ROLLBACK

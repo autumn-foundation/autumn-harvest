@@ -1991,35 +1991,62 @@ macro_rules! claim_candidate_rows_sql {
     };
 }
 
-/// The running count of each pending pair of key and task type in `$keys`.
+/// The running count per concurrency key, for the keys in `$keys`.
 ///
-/// Each pair gets one probe of `harvest_task_queue_concurrency_key_running`.
-/// So the count reads the running rows of its own keys only. A count over
-/// all pairs at once let the planner read every `RUNNING` row instead. That
-/// cost about 1,000 buffers per keyed claim. Postgres does not pull up a
-/// subquery with an aggregate. So the `LATERAL` count stays one probe per
-/// pair, whatever the estimate.
-///
-/// A pair with no running row gets a count of 0. The gate reads the count
-/// with `COALESCE(..., 0)`, so its result does not change. Each pending-keys
-/// CTE is `SELECT DISTINCT`, so each pair has one row.
-/// `docs/performance-keyed-claim-running-counts.md` has the measurements.
+/// The full scan reads this form. Its keys are the due keys of the whole
+/// backlog, so they can be many. One pass over the running rows then can
+/// cost less than one probe per key. The planner picks between the two by
+/// its estimates. The window reads `claim_window_running_counts_sql!`.
 macro_rules! claim_running_counts_sql {
     ($name:literal, $keys:literal) => {
         concat!(
             $name,
             " AS MATERIALIZED ( \
-             SELECT k.concurrency_key, k.task_type, c.running_count \
-             FROM ",
+             SELECT t.concurrency_key, t.task_type, COUNT(*) AS running_count \
+             FROM harvest_task_queue t \
+             WHERE t.state = 'RUNNING' \
+               AND t.worker_id IS NOT NULL \
+               AND t.concurrency_key IN (SELECT concurrency_key FROM ",
             $keys,
-            " k \
+            ") \
+             GROUP BY t.concurrency_key, t.task_type \
+         )"
+        )
+    };
+}
+
+/// The running count per concurrency key and task type, for the keys of a
+/// window in `$keys`.
+///
+/// Each distinct key gets one probe of
+/// `harvest_task_queue_concurrency_key_running`. So the count reads the
+/// running rows of the window keys only. A window holds few keys, so a probe
+/// per key always costs little. The form of `claim_running_counts_sql!` let
+/// the planner read every `RUNNING` row instead. On the measured fixture,
+/// that cost about 1,000 buffers per keyed claim.
+///
+/// Postgres does not pull up a subquery with an aggregate or a `DISTINCT`.
+/// So the plan stays one probe per key, whatever the estimates. The probe
+/// groups by task type, so a key with two task types costs one probe. The
+/// `GROUP BY` gives one row per pair, and only for a pair with running rows.
+/// The gate reads a missing pair as 0 with `COALESCE(..., 0)`.
+/// `docs/performance-keyed-claim-running-counts.md` has the measurements.
+macro_rules! claim_window_running_counts_sql {
+    ($name:literal, $keys:literal) => {
+        concat!(
+            $name,
+            " AS MATERIALIZED ( \
+             SELECT k.concurrency_key, c.task_type, c.running_count \
+             FROM (SELECT DISTINCT concurrency_key FROM ",
+            $keys,
+            ") k \
              CROSS JOIN LATERAL ( \
-                 SELECT COUNT(*) AS running_count \
+                 SELECT t.task_type, COUNT(*) AS running_count \
                  FROM harvest_task_queue t \
                  WHERE t.concurrency_key = k.concurrency_key \
-                   AND t.task_type = k.task_type \
                    AND t.state = 'RUNNING' \
                    AND t.worker_id IS NOT NULL \
+                 GROUP BY t.task_type \
              ) c \
          )"
         )
@@ -2261,7 +2288,7 @@ macro_rules! claim_seek_ctes_sql {
              WHERE seek_concurrency_key IS NOT NULL \
                AND seek_concurrency_cap IS NOT NULL \
          ), ",
-            claim_running_counts_sql!("seek_running_counts", "seek_pending_keys"),
+            claim_window_running_counts_sql!("seek_running_counts", "seek_pending_keys"),
             ", "
         )
     };
@@ -2423,7 +2450,7 @@ macro_rules! claim_deep_seek_ctes_sql {
              WHERE seek_concurrency_key IS NOT NULL \
                AND seek_concurrency_cap IS NOT NULL \
          ), ",
-            claim_running_counts_sql!("seek_deep_running_counts", "seek_deep_pending_keys"),
+            claim_window_running_counts_sql!("seek_deep_running_counts", "seek_deep_pending_keys"),
             ", "
         )
     };
@@ -2584,15 +2611,16 @@ macro_rules! claim_full_scan_fallback_sql {
 // aggregate never pays for a key whose only PENDING rows are in the future,
 // which `candidate` can never select. A queue with a large future-dated
 // backfill beside a few due rows must not scan and dedupe the whole backfill
-// on every claim. `concurrency_running_counts` counts the RUNNING rows of
-// exactly those pairs into one `MATERIALIZED` lookup table. It runs once per
-// claim, not once per row.
+// on every claim. `concurrency_running_counts` aggregates the RUNNING
+// population for exactly those pairs into one `MATERIALIZED` lookup table.
+// It runs once per claim, not once per row.
 //
 // The per-row check becomes `COALESCE(single-row lookup, 0) < cap`. Its
 // semantics are identical to the original `COUNT(*) < cap`.
 // `COALESCE(..., 0)` reproduces the implicit zero of the correlated subquery
-// for a key with no RUNNING rows. `concurrency_running_counts` gives such a
-// pair a count of 0, so the lookup finds 0 either way.
+// for a key with no RUNNING rows. `concurrency_running_counts` never
+// materializes a zero-count row, because `GROUP BY` emits only groups that
+// exist.
 //
 // The `claimed` CTE has its own recheck under `pg_try_advisory_xact_lock`.
 // It runs the same correlated subquery on the one candidate only. It is not
@@ -2666,13 +2694,13 @@ macro_rules! claim_full_scan_fallback_sql {
 /// bound from columns already on `harvest_task_queue`. The `NOTE` above
 /// `claim_task_query` says why this was rewritten and what it replaced.
 /// Both are `MATERIALIZED` for the same "evaluated once per claim" reason as
-/// `paused_queues`/`paused_activities`. `concurrency_running_counts`
-/// probes the RUNNING rows of each pair of `concurrency_pending_keys` on
-/// purpose. It does not read the whole RUNNING population. A deployment can
-/// have many more distinct `concurrency_key` values with RUNNING work than
-/// the current PENDING backlog of this queue set touches. The count must not
-/// pay for keys this claim attempt cannot select. See
-/// `claim_running_counts_sql!`.
+/// `paused_queues`/`paused_activities`. `concurrency_running_counts` is
+/// scoped to `WHERE t.concurrency_key IN (SELECT ... FROM
+/// concurrency_pending_keys)` on purpose. It does not aggregate the whole
+/// RUNNING population. A deployment can have many more distinct
+/// `concurrency_key` values with RUNNING work than the current PENDING
+/// backlog of this queue set touches. The aggregate must not pay for keys
+/// this claim attempt cannot select.
 // The body is one SQL statement, built with `concat!`. The line count is the
 // query's, not control flow's. `claim_task` carried the same allow before this
 // query was extracted for shape-testing.
@@ -13742,19 +13770,16 @@ mod tests {
         assert!(
             sql.contains(
                 "concurrency_running_counts AS MATERIALIZED ( \
-             SELECT k.concurrency_key, k.task_type, c.running_count \
-             FROM concurrency_pending_keys k \
-             CROSS JOIN LATERAL ( \
-                 SELECT COUNT(*) AS running_count \
-                 FROM harvest_task_queue t \
-                 WHERE t.concurrency_key = k.concurrency_key \
-                   AND t.task_type = k.task_type \
-                   AND t.state = 'RUNNING' \
-                   AND t.worker_id IS NOT NULL \
-             ) c"
+             SELECT t.concurrency_key, t.task_type, COUNT(*) AS running_count \
+             FROM harvest_task_queue t \
+             WHERE t.state = 'RUNNING' \
+               AND t.worker_id IS NOT NULL \
+               AND t.concurrency_key IN (SELECT concurrency_key FROM concurrency_pending_keys) \
+             GROUP BY t.concurrency_key, t.task_type"
             ),
-            "concurrency_running_counts must count per pre-filtered pair \
-             and keep the worker_id IS NOT NULL guard; got:\n{sql}"
+            "concurrency_running_counts must narrow to the pre-filtered key \
+             set and preserve the worker_id IS NOT NULL guard the old \
+             correlated subquery had; got:\n{sql}"
         );
         assert!(
             sql.contains(
@@ -13809,7 +13834,7 @@ mod tests {
             sql.matches("concurrency_pending_keys").count(),
             2,
             "concurrency_pending_keys: one CTE definition + one reference \
-             from concurrency_running_counts; got:\n{sql}"
+             from concurrency_running_counts's IN (...); got:\n{sql}"
         );
         assert_eq!(
             sql.matches("concurrency_running_counts").count(),
@@ -13819,59 +13844,72 @@ mod tests {
         );
     }
 
-    /// Each running-count CTE of each claim form probes the key index once
-    /// per pending pair. A scan of every `RUNNING` row is the cost that this
-    /// form removes. `keyed_claim_running_counts_tests` measures it.
-    ///
-    /// The gate reads one count per pair with a scalar subquery. So each
-    /// pending-keys CTE must give each pair once, with `SELECT DISTINCT`.
+    /// Each window count CTE of each claim form probes the key index once per
+    /// pending key. A scan of every `RUNNING` row is the cost that this form
+    /// removes. `keyed_claim_running_counts_tests` measures it. The full scan
+    /// keeps one pass, so the planner can choose by its estimates.
     #[test]
-    fn every_running_count_probes_once_per_distinct_pending_pair() {
+    fn window_running_counts_probe_once_per_pending_key() {
         let mut variants: Vec<&str> = vec![
             claim_task_full_scan_query(),
             claim_task_by_id_query(),
             claim_task_by_id_query_fenced(),
         ];
+        for fenced in [false, true] {
+            variants.push(owned_claim_by_id_query(fenced));
+            variants.push(owned_claim_by_execution_query(fenced));
+        }
         for kind in [None, Some(TaskType::Workflow), Some(TaskType::Activity)] {
             for fenced in [false, true] {
                 for fairness in [ClaimFairness::Off, ClaimFairness::Keys] {
                     variants.push(claim_query_for(kind, fenced, fairness));
                     variants.push(owned_claim_query_for(kind, fenced, fairness));
                 }
+                for owned in [false, true] {
+                    variants.push(window_claim_query_for(kind, fenced, owned));
+                }
             }
         }
-        let pairs = [
-            ("concurrency_running_counts", "concurrency_pending_keys"),
-            ("seek_running_counts", "seek_pending_keys"),
-            ("seek_deep_running_counts", "seek_deep_pending_keys"),
-        ];
+        let probe = |counts: &str, keys: &str| {
+            format!(
+                "{counts} AS MATERIALIZED ( \
+                 SELECT k.concurrency_key, c.task_type, c.running_count \
+                 FROM (SELECT DISTINCT concurrency_key FROM {keys}) k \
+                 CROSS JOIN LATERAL ( \
+                 SELECT t.task_type, COUNT(*) AS running_count FROM harvest_task_queue t \
+                 WHERE t.concurrency_key = k.concurrency_key \
+                 AND t.state = 'RUNNING' AND t.worker_id IS NOT NULL \
+                 GROUP BY t.task_type ) c )"
+            )
+        };
+        let single_pass = "concurrency_running_counts AS MATERIALIZED ( \
+             SELECT t.concurrency_key, t.task_type, COUNT(*) AS running_count \
+             FROM harvest_task_queue t WHERE t.state = 'RUNNING' \
+             AND t.worker_id IS NOT NULL \
+             AND t.concurrency_key IN (SELECT concurrency_key FROM concurrency_pending_keys) \
+             GROUP BY t.concurrency_key, t.task_type )";
         for sql in variants {
             let sql = sql.split_whitespace().collect::<Vec<_>>().join(" ");
             let mut found = 0;
-            for (counts, keys) in pairs {
-                if !sql.contains(&format!("{counts} AS MATERIALIZED")) {
-                    continue;
+            for (counts, keys) in [
+                ("seek_running_counts", "seek_pending_keys"),
+                ("seek_deep_running_counts", "seek_deep_pending_keys"),
+            ] {
+                if sql.contains(&format!("{counts} AS MATERIALIZED")) {
+                    found += 1;
+                    assert_eq!(
+                        sql.matches(&probe(counts, keys)).count(),
+                        1,
+                        "{counts} must probe once per key of {keys}; got:\n{sql}"
+                    );
                 }
+            }
+            if sql.contains("concurrency_running_counts AS MATERIALIZED") {
                 found += 1;
-                let probe = format!(
-                    "{counts} AS MATERIALIZED ( \
-                     SELECT k.concurrency_key, k.task_type, c.running_count \
-                     FROM {keys} k CROSS JOIN LATERAL ( \
-                     SELECT COUNT(*) AS running_count FROM harvest_task_queue t \
-                     WHERE t.concurrency_key = k.concurrency_key \
-                     AND t.task_type = k.task_type \
-                     AND t.state = 'RUNNING' AND t.worker_id IS NOT NULL ) c )"
-                );
                 assert_eq!(
-                    sql.matches(&probe).count(),
+                    sql.matches(single_pass).count(),
                     1,
-                    "{counts} must count once per pair of {keys}; got:\n{sql}"
-                );
-                assert_eq!(
-                    sql.matches(&format!("{keys} AS MATERIALIZED ( SELECT DISTINCT "))
-                        .count(),
-                    1,
-                    "{keys} must give each pair once; got:\n{sql}"
+                    "the full scan keeps one pass over the running rows; got:\n{sql}"
                 );
             }
             assert!(found > 0, "a claim form has a running count; got:\n{sql}");

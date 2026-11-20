@@ -22,10 +22,12 @@ same macro builds `concurrency_running_counts` and `seek_deep_running_counts`.
 
 ## Facts (white hat)
 
-Design-time `psql` runs on PG 16, with the background of
-`concurrency_live_index_perf`: 100,000 pending rows, 2,000 pending keyed rows
-and 1,000 `RUNNING` keyed rows. Queue `w` adds 20 keys with 1 running row
-each. Each run applies the claim settings and a generic plan.
+Design-time `psql` runs on PG 16, with no committed artifact. The seed has
+the background of `concurrency_live_index_perf`: 100,000 pending rows,
+2,000 pending keyed rows and 1,000 `RUNNING` keyed rows. Queue `w` adds 200
+pending rows and 20 running rows on 20 keys. Each run applies the claim
+settings and a generic plan. The committed plans of the Ledger page read
+1,001 and 22 on the fixture of the harness.
 
 | form | plan of the count | count buffers |
 |:--|:--|--:|
@@ -35,15 +37,16 @@ each. Each run applies the claim settings and a generic plan.
 - `harvest_task_queue_concurrency_key_running` is on `(concurrency_key)`
   where `state = 'RUNNING' AND concurrency_key IS NOT NULL`. An equality on
   the key proves that predicate.
-- Postgres does not pull up a subquery with an aggregate. So a `LATERAL`
-  count stays a nested loop with one probe per pair, whatever the estimate.
-- Each pending-keys CTE is `SELECT DISTINCT concurrency_key, task_type`. So
-  each pair has one row, and the gate lookup returns one row at most.
-- The gate reads `COALESCE(lookup, 0)`. Today a pair with no running row has
-  no row. With a `LATERAL` count it has a row with 0. The gate result is the
-  same.
+- Postgres does not pull up a subquery with an aggregate or a `DISTINCT`.
+  So a `LATERAL` count stays a nested loop with one probe per key, whatever
+  the estimate.
+- The gate reads `COALESCE(lookup, 0)`. A pair with no running row has no
+  row today, and the gate reads 0.
 - Each candidate row of a scan has its pair in the pending keys of that scan.
   So a count for a pair that is not a pending pair is never read.
+- A window holds at most a few hundred rows, so its pending keys are few. The
+  full scan reads the due keys of the whole backlog, so its keys can be
+  thousands.
 
 ## Brainstorm (green hat)
 
@@ -55,15 +58,20 @@ each. Each run applies the claim settings and a generic plan.
 5. A counter table of running tasks per pair.
 6. Count in the candidate gate per row, with no CTE.
 7. Use `idx_harvest_tq_concurrency_live` from the gauge change.
+8. A `LATERAL` count per distinct pending key, grouped by task type.
+9. Option 1 or 8 for the window CTEs only. The full scan keeps one pass.
 
 ## Reverse brainstorm: how to make it worse
 
 | way to fail | guard in this design |
 |:--|:--|
 | Count running rows with no worker | The probe keeps `t.worker_id IS NOT NULL`. A DB test seeds such rows. |
-| Merge the counts of two task types | The probe matches the task type of the pair. A DB test seeds a key with two types. |
-| Return two rows for one pair, so the gate lookup fails | A shape test pins `SELECT DISTINCT` in each pending-keys CTE. |
-| Let the planner go back to a scan of every running row | A buffer gate seeds many foreign running rows and bounds the reads. A plan check names the key index. |
+| Merge the counts of two task types | The probe groups by task type. A DB test seeds a key with two types. |
+| Return two rows for one pair, so the gate lookup fails | The probe takes each key once with `DISTINCT` and groups by task type. |
+| Read a key twice when it is pending under two task types | One probe per key, not per pair. |
+| Emit a zero row for each pending pair, so the per-row gate lookup scans a long CTE | `GROUP BY` emits only pairs with running rows, as before. |
+| Probe once per key over a backlog of thousands of due keys | The full scan keeps one pass. The planner picks a probe per key only when it costs less. |
+| Let the planner go back to a scan of every running row | A buffer gate seeds many foreign running rows and bounds the reads. A plan check counts the probes. |
 | Read the count once per candidate row | The CTE stays `MATERIALIZED`. A shape test pins it. |
 | Depend on an index that is not on `trunk-dev` | The probe has no cap test, so only the existing key index matches. |
 | Change the authoritative recheck in `claimed` | The recheck text does not change. Its shape test stays. |
@@ -78,36 +86,44 @@ each. Each run applies the claim settings and a generic plan.
   completion. Option 4 does not change the plan, as the issue records.
   Option 5 adds a write to every task. Option 6 is the per-row correlated
   count that the CTE replaced. Option 7 needs a cap test, which changes the
-  count: a running row with a key and no cap counts today. A probe costs
-  about 2 buffers for each pending pair, so 20 keys cost about 40.
-- **Yellow.** Option 1 reads about 2 buffers per pending pair and one heap
-  page for each running row of that pair. A keyed claim no longer pays for
+  count: a running row with a key and no cap counts today. Option 1 reads a
+  key twice when it is pending under two task types. It also emits a zero
+  row for each pair. On the full scan it probes once per due key of the
+  backlog.
+- **Yellow.** Option 8 reads 1 to 2 buffers per pending key and one heap
+  page for each running row of that key. A keyed claim no longer pays for
   the running rows of other keys. It needs no migration and no new write.
-- **Green.** Options 1 to 7.
-- **Blue.** Build option 1 in the one macro, so all three CTEs change.
-  Prove it with a buffer gate and a result test first. Update the shape
-  tests. Measure with `concurrency_live_index_perf` and record the result on
-  a Ledger page.
+- **Green.** Options 1 to 9.
+- **Blue.** Build options 8 and 9: a new macro for the two window CTEs. Prove
+  it with a buffer gate and a result test first. Update the shape tests.
+  Measure with `concurrency_live_index_perf` and record the result on a
+  Ledger page.
 
 ## Decision
 
-`claim_running_counts_sql!` counts per pending pair:
+`claim_window_running_counts_sql!` builds `seek_running_counts` and
+`seek_deep_running_counts`. It counts per distinct pending key:
 
 ```sql
-SELECT k.concurrency_key, k.task_type, c.running_count
-FROM <keys> k
+SELECT k.concurrency_key, c.task_type, c.running_count
+FROM (SELECT DISTINCT concurrency_key FROM <keys>) k
 CROSS JOIN LATERAL (
-    SELECT COUNT(*) AS running_count
+    SELECT t.task_type, COUNT(*) AS running_count
     FROM harvest_task_queue t
     WHERE t.concurrency_key = k.concurrency_key
-      AND t.task_type = k.task_type
       AND t.state = 'RUNNING'
       AND t.worker_id IS NOT NULL
+    GROUP BY t.task_type
 ) c
 ```
 
-No migration. No new index. The recheck in `claimed` and
+`concurrency_running_counts` keeps `claim_running_counts_sql!`, the one-pass
+form. No migration. No new index. The recheck in `claimed` and
 `release_claim_if_over_cap` do not change.
+
+The first draft used option 1 for all three CTEs. Review found the zero
+rows, the double read and the cost on a backlog of many due keys. So the
+design moved to options 8 and 9.
 
 ## Acceptance criteria
 
@@ -119,13 +135,13 @@ No migration. No new index. The recheck in `claimed` and
 
 ## Test plan
 
-- RED: `keyed_claim_running_counts_tests` plans each of the three count CTEs
-  under the claim settings. The fixture has many running rows of other keys
-  and with no key. The gate bounds the buffers, names the key index, and
-  checks that more foreign running rows add no reads. A result test compares
-  each count with a direct count per pair.
-- RED: the shape test pins the per-pair form and `SELECT DISTINCT` in each
-  pending-keys CTE.
+- RED: `keyed_claim_running_counts_tests` plans each window count CTE under
+  the claim settings. The fixture has many running rows of other keys. The
+  gate bounds the buffers and counts the key probes. A growth gate checks
+  that more foreign running rows add no reads. A result test compares each
+  count of all three CTEs with a direct count per pair.
+- RED: the shape test pins the per-key text of the window CTEs and the
+  one-pass text of the full scan, in every claim form.
 - GREEN: the macro change. The claim shape tests, `claim_concurrency_tests`,
   `claim_seek_tests` and the window tests pass.
 - Evidence: `concurrency_live_index_perf`, before and after, on the branch of

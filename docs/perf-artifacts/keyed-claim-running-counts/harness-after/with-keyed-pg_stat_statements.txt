@@ -1,6 +1,6 @@
-queryid=-6102119957381765031 calls=2000 buffers=30411 dirtied=657 wal_records=18146 wal_fpi=551 wal_bytes=4783070 | INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "priority", 
-queryid=3896940679221439308 calls=2001 buffers=228773 dirtied=16 wal_records=22448 wal_fpi=7 wal_bytes=1668264 | WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS 
-queryid=7498369179075929952 calls=2000 buffers=38178 dirtied=16 wal_records=12147 wal_fpi=4 wal_bytes=1032817 | UPDATE "harvest_task_queue" SET "state" = $1, "output" = $2, "heartbeat_details" = $3, "error" = $4, "completed_at" = $5 WHERE (("harvest_ta
+queryid=9074351924064275067 calls=2000 buffers=30412 dirtied=647 wal_records=18148 wal_fpi=539 wal_bytes=4769907 | INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "priority", 
+queryid=1408069727466236779 calls=2001 buffers=228835 dirtied=13 wal_records=22453 wal_fpi=6 wal_bytes=1655200 | WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels ), paused_queues AS 
+queryid=-3545196984755500142 calls=2000 buffers=38162 dirtied=16 wal_records=12130 wal_fpi=4 wal_bytes=1031002 | UPDATE "harvest_task_queue" SET "state" = $1, "output" = $2, "heartbeat_details" = $3, "error" = $4, "completed_at" = $5 WHERE (("harvest_ta
 queryid=-3522561194240678862 calls=2001 buffers=0 dirtied=0 wal_records=0 wal_fpi=0 wal_bytes=0 | BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
 queryid=2064869707185898531 calls=2001 buffers=0 dirtied=0 wal_records=0 wal_fpi=0 wal_bytes=0 | COMMIT
 queryid=-3889171640443073754 calls=2000 buffers=0 dirtied=0 wal_records=0 wal_fpi=0 wal_bytes=0 | SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)
@@ -10,6 +10,6 @@ queryid=7073046051058922704 calls=2001 buffers=0 dirtied=0 wal_records=0 wal_fpi
 queryid=3319322631360006103 calls=2001 buffers=0 dirtied=0 wal_records=0 wal_fpi=0 wal_bytes=0 | SET LOCAL enable_sort = off
 queryid=6688818924043720772 calls=2001 buffers=0 dirtied=0 wal_records=0 wal_fpi=0 wal_bytes=0 | SET LOCAL jit = off
 queryid=5308637398989670268 calls=2001 buffers=0 dirtied=0 wal_records=0 wal_fpi=0 wal_bytes=0 | SET LOCAL plan_cache_mode = force_generic_plan
-queryid=7611711274298013106 calls=2000 buffers=10010 dirtied=0 wal_records=0 wal_fpi=0 wal_bytes=0 | UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, attempt = GREATEST(attempt - 1, 0) WHERE id = $1 AND s
-queryid=5169168166169071637 calls=2000 buffers=8000 dirtied=0 wal_records=0 wal_fpi=0 wal_bytes=0 | UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, attempt = GREATEST(attempt - 1, 0) WHERE id = $1 AND s
-queryid=-1046773497687307987 calls=2000 buffers=8000 dirtied=0 wal_records=0 wal_fpi=0 wal_bytes=0 | UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, attempt = GREATEST(attempt - 1, 0) WHERE id = $1 AND s
+queryid=1707610168534902231 calls=2000 buffers=10010 dirtied=0 wal_records=0 wal_fpi=0 wal_bytes=0 | UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, attempt = GREATEST(attempt - 1, 0) WHERE id = $1 AND s
+queryid=3723596661716545974 calls=2000 buffers=8000 dirtied=0 wal_records=0 wal_fpi=0 wal_bytes=0 | UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, attempt = GREATEST(attempt - 1, 0) WHERE id = $1 AND s
+queryid=-8986602324243172382 calls=2000 buffers=8000 dirtied=0 wal_records=0 wal_fpi=0 wal_bytes=0 | UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, attempt = GREATEST(attempt - 1, 0) WHERE id = $1 AND s

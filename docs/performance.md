@@ -971,12 +971,6 @@ same key rather than a small operator-facing pause table, so its cost is
 *depth*-dependent. The fix replaces it with two `MATERIALIZED` CTEs, computed
 once per claim rather than once per candidate row:
 
-> **Follow-up (issue #2744):** `concurrency_running_counts` now counts with
-> one `LATERAL` probe of `harvest_task_queue_concurrency_key_running` per
-> pending pair. The text below is the form of issue #247. Its plan could
-> read every `RUNNING` row. See
-> [the keyed claim page](performance-keyed-claim-running-counts.md).
-
 ```sql
 concurrency_pending_keys AS MATERIALIZED (
     SELECT DISTINCT concurrency_key, task_type
@@ -1431,11 +1425,12 @@ four largest queues. "64 queues" polls all of them.
   reads 80 times the buffers, and it spills its sort from 100K.
 - **The new claim does not.** From 10K to 1M its buffers grow 5 times on
   4 queues and 2 times on 64 queues, for 100 times the backlog.
-- **The rest follows the `RUNNING` population.** `seek_running_counts`
-  walks every `RUNNING` row: 9 rows at 1K, 897 at 100K and the fleet cap of
-  1,024 at 1M. Since issue #2744 it reads only the running rows of the
-  window keys. See
-  [the keyed claim page](performance-keyed-claim-running-counts.md). The dead tuples at the head cost a heap visit once, until
+- **The rest followed the `RUNNING` population.** Before issue #2744,
+  `seek_running_counts` walked every `RUNNING` row: 9 rows at 1K, 897 at
+  100K and the fleet cap of 1,024 at 1M. It now reads only the running rows
+  of the window keys. See
+  [the keyed claim page](performance-keyed-claim-running-counts.md). The
+  dead tuples at the head cost a heap visit once, until
   Postgres marks their index entries dead.
 - **A small backlog costs more, in milliseconds.** At 1K the window reads
   almost every row by index. The old full scan reads the small table at
@@ -2705,8 +2700,8 @@ from the benchmark are directly comparable.
 * `cargo xtask perf claim-batched-seek-and-refine` —
   regenerates that evidence from a clean checkout.
 * [`docs/performance-keyed-claim-running-counts.md`](performance-keyed-claim-running-counts.md)
-  — a keyed claim counted every running task (issue #2744). A count per
-  pending key cuts the keyed claim from 1,094 to 112 buffers per call.
+  — a keyed claim counted every running task (issue #2744). A window count
+  per pending key cuts the keyed claim from 1,094 to 112 buffers per call.
 * [`docs/performance-task-queue-hygiene.md`](performance-task-queue-hygiene.md) —
   claim latency after 1M terminal task rows, before and after the
   terminal-task janitor and table tuning (issue #1811).
