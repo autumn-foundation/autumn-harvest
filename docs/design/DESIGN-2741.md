@@ -12,7 +12,7 @@ change is in test code, the CI workflow and the docs.
 
 ## 1. Facts
 
-- Each runtime test in `sandbox::fs_isolation` skips when
+- Most runtime tests in `sandbox::fs_isolation` skip when
   `fs_isolation_available()` is false.
 - `the_probe_matches_the_run` and the network test in `sandbox::exec`
   do not skip. They test the fail-closed path instead. That path is
@@ -45,7 +45,7 @@ namespaces, because both probes fail for the same reason.
 
 | Fault | Answer |
 |---|---|
-| A typo in the variable name | One constant. A test reads the CI workflow for the same name |
+| A typo in the variable name | One constant. A test parses the CI workflow for the same name |
 | A value such as `true` turns nothing on | Accept `0`, `1` or an empty value only. Any other value panics |
 | A value that is not UTF-8 | Panic, as for an unknown value |
 | A test calls the probe directly and bypasses the gate | Route each probe call in the tests through the gate |
@@ -55,41 +55,43 @@ namespaces, because both probes fail for the same reason.
 | The runner refuses user namespaces, so CI goes red | A Linux step sets the sysctl to `0` when it exists. It prints the old value first |
 | The sysctl does not exist on the kernel | The step checks for the file first |
 | The panic does not say what to do | The message names the sysctl |
-| Tests that need root skip in CI | Not a probe skip. Out of scope here |
+| Tests that need root skip in CI | Not a probe skip. Out of scope here, see issue #2757 |
 
 ## 4. Six hats
 
-- **White (facts).** More than twenty tests depend on a probe. CI runs
-  them as a non-root user. Nothing in CI shows whether they ran.
+- **White (facts).** Most runtime tests in `fs_isolation`, and some tests
+  in `exec`, depend on a namespace. CI runs them as a non-root user. Nothing in CI shows whether they ran.
 - **Red (feel).** A green job that tested nothing is worse than a red job.
   A developer does not want a local run to fail for a host reason. So the
   rule is opt-in.
 - **Black (risk).** The first CI run can go red. The sysctl weakens the
-  runner a little, but the runner is temporary. A wrong value of the
-  variable can turn the gate off without a sign, so a wrong value panics.
+  runner a little, but the runner is temporary. A typo in the value can
+  turn the gate off. So an unknown value panics.
 - **Yellow (gain).** A return of the `mode=000` mask of #2719 now fails CI.
   The same gate covers the network namespace at no extra cost.
 - **Green (new ideas).** A later change can run the root-only tests with
   `sudo`, as the `Sandbox (KVM)` workflow does.
 - **Blue (process).** Red: unit tests for the rule and the wiring test.
-  Green: the gate module, the test changes and the CI step. Refactor: one
-  helper per call shape, and the docs.
+  Green: the gate module, the test changes and the CI step. Refactor: the
+  `MOUNT_NS` constant, a YAML parse in the wiring test, and the docs.
 
 ## 5. Design
 
 ```rust
 // sandbox/isolation_gate.rs, compiled for Linux tests only.
-pub(crate) const REQUIRE_VAR: &str = "HARVEST_TEST_REQUIRE_ISOLATION";
+pub const REQUIRE_VAR: &str = "HARVEST_TEST_REQUIRE_ISOLATION";
 
 /// Returns `available`. Panics when it is false and CI requires isolation.
-pub(crate) fn host_has(available: bool, what: &str) -> bool;
+/// Panics also on a value other than `0`, `1` or empty.
+pub fn host_has(available: bool, what: &str) -> bool;
 ```
 
 - `needs_isolation()` in `fs_isolation` calls `host_has`.
 - The umask test, the shared-root test and `the_probe_matches_the_run`
   call `host_has` before they skip or take the fail-closed branch.
 - The network test in `exec` calls `host_has` before its fail-closed
-  branch.
+  branch. The process-limit test calls it before it skips for want of a
+  user namespace.
 - The Linux CI step relaxes the AppArmor sysctl, then runs
   `cargo sandbox-test` with the variable set.
 

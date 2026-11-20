@@ -1,8 +1,9 @@
 //! The gate for tests that need a namespace (issue #2741).
 //!
 //! A test that needs a namespace skips on a host without one. The skip
-//! passes, and libtest hides its output. So CI could pass with no isolation
-//! test run. CI sets [`REQUIRE_VAR`] to `1`, and each such skip then fails.
+//! passes, and libtest hides its output. Without the gate, CI can pass with
+//! no isolation test run. CI sets [`REQUIRE_VAR`] to `1`, and each such skip
+//! then fails.
 
 use std::env::VarError;
 
@@ -11,12 +12,13 @@ pub const REQUIRE_VAR: &str = "HARVEST_TEST_REQUIRE_ISOLATION";
 
 /// Returns `available`. Panics when it is false and [`REQUIRE_VAR`] is `1`.
 ///
-/// `what` names the missing namespace in the panic message.
+/// Panics also when [`REQUIRE_VAR`] holds a value other than `0`, `1` or
+/// empty. `what` names the missing namespace in the panic message.
 pub fn host_has(available: bool, what: &str) -> bool {
     check(available, required(&std::env::var(REQUIRE_VAR)), what)
 }
 
-/// Reads the value of [`REQUIRE_VAR`]. An unknown value panics, so a typo
+/// Parses a value of [`REQUIRE_VAR`]. An unknown value panics, so a typo
 /// cannot turn the gate off.
 fn required(value: &Result<String, VarError>) -> bool {
     match value.as_deref() {
@@ -30,7 +32,7 @@ fn check(available: bool, required: bool, what: &str) -> bool {
     assert!(
         available || !required,
         "{REQUIRE_VAR}=1, but this host has no {what}. \
-         Allow user namespaces, for example with \
+         For a non-root user, allow user namespaces, for example with \
          `sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`."
     );
     available
@@ -77,21 +79,38 @@ mod tests {
         required(&Err(VarError::NotUnicode(std::ffi::OsString::from("x"))));
     }
 
-    /// CI must set the variable on the sandbox test step. Otherwise the
-    /// gate stays off and the skips stay silent.
+    /// The value of [`REQUIRE_VAR`] in the `env` of a step or a job.
+    fn env_value(node: &serde_yaml::Value) -> Option<&str> {
+        node.get("env")?.get(REQUIRE_VAR)?.as_str()
+    }
+
+    /// CI must set the variable on each step that runs `cargo sandbox-test`.
+    /// Otherwise the gate stays off and the skips stay silent.
     #[test]
     fn ci_requires_isolation_for_the_sandbox_tests() {
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.github/workflows/ci.yml");
-        let workflow = std::fs::read_to_string(&path)
+        let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-        let step = workflow
-            .split("\n      - name: ")
-            .find(|step| step.contains("run: cargo sandbox-test"))
-            .expect("ci.yml must run `cargo sandbox-test`");
-        assert!(
-            step.contains(&format!("{REQUIRE_VAR}: \"1\"")),
-            "the `cargo sandbox-test` step must set {REQUIRE_VAR}: \"1\":\n{step}"
-        );
+        let workflow: serde_yaml::Value = serde_yaml::from_str(&text).expect("ci.yml must parse");
+        let jobs = workflow["jobs"].as_mapping().expect("ci.yml has jobs");
+        let mut found = 0;
+        for (name, job) in jobs {
+            let steps = job.get("steps").and_then(serde_yaml::Value::as_sequence);
+            for step in steps.into_iter().flatten() {
+                let run = step.get("run").and_then(serde_yaml::Value::as_str);
+                if !run.is_some_and(|run| run.trim().starts_with("cargo sandbox-test")) {
+                    continue;
+                }
+                found += 1;
+                let value = env_value(step).or_else(|| env_value(job));
+                assert_eq!(
+                    value,
+                    Some("1"),
+                    "a `cargo sandbox-test` step of job {name:?} must set {REQUIRE_VAR}: \"1\""
+                );
+            }
+        }
+        assert!(found > 0, "ci.yml must run `cargo sandbox-test`");
     }
 }

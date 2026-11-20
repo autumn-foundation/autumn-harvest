@@ -811,7 +811,7 @@ mod tests {
         (dir, file)
     }
 
-    /// The `what` of each mount namespace probe.
+    /// Names the executor mount namespace in each skip line and gate panic.
     const MOUNT_NS: &str = "mount namespace for the executor";
 
     async fn needs_isolation() -> bool {

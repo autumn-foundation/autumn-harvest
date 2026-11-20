@@ -1816,7 +1816,10 @@ mod tests {
                     }
                     stderr = out.stderr;
                 }
-                Err(SandboxError::Unavailable(m)) if m.contains("user namespace") => return,
+                Err(SandboxError::Unavailable(m)) if m.contains("user namespace") => {
+                    host_has(false, "user namespace");
+                    return;
+                }
                 // EAGAIN: the worker uid is at its process limit.
                 Err(SandboxError::Unavailable(m)) if m.contains("(os error 11)") => stderr = m,
                 Err(e) => panic!("{e:?}"),
