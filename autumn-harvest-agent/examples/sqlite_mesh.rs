@@ -360,29 +360,13 @@ impl Outcome {
     }
 }
 
-/// The stack of the thread that runs the mesh.
+/// Run the mesh on the main thread.
 ///
-/// A debug build polls the mesh through deep frames. The Windows main thread
-/// has 1 MiB, and `agent_refine` overflowed it with the same shape. A spawned
-/// thread gets the stack that the spawn asks for. 8 MiB is the Linux default
-/// for a main thread.
-///
-/// Reproduce a small main stack on Linux with `ulimit -s 512`.
-const MESH_STACK_BYTES: usize = 8 * 1024 * 1024;
-
-fn main() -> Result<(), Box<dyn Error>> {
-    let mesh = std::thread::Builder::new()
-        .name("sqlite-mesh".to_owned())
-        .stack_size(MESH_STACK_BYTES)
-        .spawn(|| {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| e.to_string())?;
-            runtime.block_on(mesh_main()).map_err(|e| e.to_string())
-        })?;
-    let result = mesh.join().map_err(|_| "the mesh thread panicked")?;
-    result.map_err(Into::into)
+/// A debug build of the mesh once overflowed a 512 KiB main thread. The
+/// engine now keeps large futures on the heap (issue #2752).
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    mesh_main().await
 }
 
 /// Run the mesh, print each line and check each claim.

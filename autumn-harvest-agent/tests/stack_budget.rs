@@ -36,9 +36,15 @@ use autumn_harvest_sqlite::{ExecutionId, RunState, SqliteRuntime};
 
 /// The stack of the thread that runs one walk.
 ///
-/// The Windows main thread has 1 MiB. Windows and coverage builds make larger
-/// frames than a Linux debug build. So the budget is a quarter of that stack.
-const STACK_BUDGET: usize = 256 * 1024;
+/// The Windows main thread has 1 MiB. A Linux debug build of the deepest walk
+/// needs about 370 KiB, test frames included. Windows makes larger frames, so
+/// its budget is larger. Each budget leaves at least a quarter of that main
+/// thread free.
+const STACK_BUDGET: usize = if cfg!(windows) {
+    768 * 1024
+} else {
+    512 * 1024
+};
 
 /// The walk that the child runs. A parent test sets it.
 const PROBE_ENV: &str = "AGENT_STACK_PROBE";
@@ -188,7 +194,10 @@ impl Walk {
         sqlite::send(&mut self.rt, &id, &AgentOp::message(TASK), Some("op")).unwrap();
         sqlite::drive(&mut self.rt, &id).await.unwrap();
         let state = sqlite::state(&self.rt, &id).await.unwrap().unwrap();
-        assert!(state.last_answer.is_some(), "the op gave no answer: {state:?}");
+        assert!(
+            state.last_answer.is_some(),
+            "the op gave no answer: {state:?}"
+        );
     }
 
     /// One refine run from `source`, approved at the gate.

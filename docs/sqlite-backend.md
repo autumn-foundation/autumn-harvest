@@ -385,6 +385,23 @@ timers do (issue #2276). A `run_until_blocked_as_of` drive therefore keeps one
 clock: the timers, the activities, the ledger rows and the clock reads all use
 the time that the call names.
 
+### The stack of the caller thread (issue #2752)
+
+The runtime polls each workflow on the thread that awaits the drive. A debug
+build makes large poll frames, so that thread needs room. The Windows main
+thread has 1 MiB, and a durable agent op once overflowed it.
+
+The engine now builds each large child future on the heap, with
+[`autumn_harvest::frame::boxed`](../autumn-harvest/src/frame.rs). A debug build
+of each agent workflow fits in 512 KiB on Linux and macOS, and in 768 KiB on
+Windows. The `stack_budget` test of `autumn-harvest-agent` holds these
+bounds in CI. An optimized build needs much less.
+
+A workflow of your own can still make large futures. If a debug build
+overflows, box the large child futures with `boxed`. Or drive the runtime
+on a thread that you spawn with a larger stack, as `autumn-harvest-cli`
+does.
+
 ### Cancel and terminate
 
 Stop a run with `cancel` (cooperative) or `terminate` (at once). Both take a

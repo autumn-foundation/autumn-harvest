@@ -2304,7 +2304,8 @@ pub(crate) async fn drive_workflow(
     tracing::Span,
     Option<crate::shard::ShardRouter>,
 ) {
-    drive_workflow_keep(ctx, handler, input, span_meta, None)
+    // On the heap, the drive adds no debug frame to each caller (issue #2752).
+    crate::frame::boxed(|| drive_workflow_keep(ctx, handler, input, span_meta, None))
         .await
         .into_tuple()
 }
@@ -2323,7 +2324,8 @@ pub(crate) async fn drive_workflow_keep(
 ) -> DriveResult {
     let ctx = std::sync::Arc::new(ctx);
     let future = owned_handler_future(&ctx, handler, input);
-    drive_cycle(ctx, future, span_meta, None, keep).await
+    // On the heap, the cycle adds no debug frame to each caller (issue #2752).
+    crate::frame::boxed(|| drive_cycle(ctx, future, span_meta, None, keep)).await
 }
 
 /// Runs the next cycle of a resident workflow (issue #1798).
@@ -2337,7 +2339,7 @@ pub(crate) async fn drive_resumed(
     span_meta: Option<&WorkflowExecuteSpanMeta>,
     key: crate::resident::ResidentKey,
 ) -> DriveResult {
-    drive_cycle(ctx, future, span_meta, Some(false), Some(key)).await
+    crate::frame::boxed(|| drive_cycle(ctx, future, span_meta, Some(false), Some(key))).await
 }
 
 /// Opens the `harvest.workflow.execute` span of one cycle.

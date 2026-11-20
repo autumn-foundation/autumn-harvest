@@ -122,6 +122,7 @@ use serde_json::Value;
 
 use crate::context::WorkflowContext;
 use crate::error::HarvestResult;
+use crate::frame::boxed;
 
 /// The signal name that carries an [`EntityMessage`].
 pub const ENTITY_OP_SIGNAL: &str = "harvest.entity.op";
@@ -454,8 +455,7 @@ where
         Fut: Future<Output = Result<S, String>>,
     {
         // No hook means no clock read and no timer, so old histories replay.
-        self.run_loop(handler, |_: &S| None::<Wake<O>>, |_: &mut S| false)
-            .await
+        boxed(|| self.run_loop(handler, |_: &S| None::<Wake<O>>, |_: &mut S| false)).await
     }
 
     /// Run the loop like [`run`](Self::run), and also run the op of `wake` at
@@ -495,7 +495,7 @@ where
         Fut: Future<Output = Result<S, String>>,
         W: FnMut(&S) -> Option<Wake<O>>,
     {
-        self.run_loop(handler, wake, |_: &mut S| false).await
+        boxed(|| self.run_loop(handler, wake, |_: &mut S| false)).await
     }
 
     /// Run the loop like [`run_with_wakes`](Self::run_with_wakes), and also
@@ -536,7 +536,9 @@ where
         W: FnMut(&S) -> Option<Wake<O>>,
         C: FnMut(&mut S) -> bool,
     {
-        self.run_loop(handler, wake, take).await
+        // On the heap, the loop adds no debug frame to the workflow that
+        // runs it (issue #2752).
+        boxed(|| self.run_loop(handler, wake, take)).await
     }
 
     /// The loop of [`run`](Self::run), [`run_with_wakes`](Self::run_with_wakes)
@@ -585,7 +587,8 @@ where
         let mut requested = false;
 
         loop {
-            let message = match next_step(ctx, &mut waiting, wake(&checkpoint.state)).await? {
+            let step = boxed(|| next_step(ctx, &mut waiting, wake(&checkpoint.state)));
+            let message = match step.await? {
                 Step::Message(raw) => {
                     run.op_bytes += json_len(&raw)?;
                     serde_json::from_value::<EntityMessage<O>>(raw)
@@ -594,13 +597,17 @@ where
                 Step::Wake(op) => Ok(EntityMessage::op(op)),
             };
             match message {
-                Ok(EntityMessage::Op { op }) => match handler(checkpoint.state.clone(), op).await {
-                    Ok(next) => {
-                        checkpoint.state = next;
-                        checkpoint.stats.applied += 1;
+                // A handler future can be large. On the heap, it adds no
+                // debug frame to this loop or to its callers (issue #2752).
+                Ok(EntityMessage::Op { op }) => {
+                    match boxed(|| handler(checkpoint.state.clone(), op)).await {
+                        Ok(next) => {
+                            checkpoint.state = next;
+                            checkpoint.stats.applied += 1;
+                        }
+                        Err(error) => record_failure(&mut checkpoint.stats, error),
                     }
-                    Err(error) => record_failure(&mut checkpoint.stats, error),
-                },
+                }
                 Ok(EntityMessage::Delete) => {
                     waiting.extend(ctx.drain_signals_raw(ENTITY_OP_SIGNAL)?);
                     if waiting.is_empty() {

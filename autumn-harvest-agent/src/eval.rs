@@ -146,6 +146,7 @@ use std::time::Duration;
 use autumn_harvest::erase::is_erasure_tombstone;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::failure::parse_typed_payload;
+use autumn_harvest::frame::boxed;
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::testing::WorkflowTestEnv;
 use autumn_harvest::types::ActivityExecId;
@@ -1069,7 +1070,8 @@ async fn run_with_routes(
     for (name, payload) in &recording.signals {
         env = env.queue_signal(name.clone(), payload.clone());
     }
-    let outcome = env.run(agent_loop_info().handler, input).await;
+    // On the heap, the run adds no debug frame to the probe (issue #2752).
+    let outcome = boxed(|| env.run(agent_loop_info().handler, input)).await;
 
     let candidate_turns = model_turns(outcome.events())?;
     let (replayed, stubbed, cap_reached, root, mut routes, candidate_calls) = {
