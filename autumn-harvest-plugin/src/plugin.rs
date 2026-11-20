@@ -3687,8 +3687,10 @@ mod tests {
         assert_eq!(switches.explicit(HarvestLoop::Batch), Some(true));
         assert_eq!(switches.explicit(HarvestLoop::Scheduler), None);
 
-        // Retention is off in this build, so its task is off.
-        assert_eq!(switches.explicit(HarvestLoop::Retention), Some(false));
+        // The default build keeps audit retention, so the role places the
+        // janitor. `process_role` tests the build with retention off.
+        assert!(builder.retention_config().enabled());
+        assert_eq!(switches.explicit(HarvestLoop::Retention), None);
 
         // A config that does not load gives no worker switch.
         let bad = MockEnv::new().with("AUTUMN_HARVEST__WORKER_ENABLED", "maybe");

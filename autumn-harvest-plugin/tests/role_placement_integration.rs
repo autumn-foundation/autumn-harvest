@@ -154,16 +154,16 @@ async fn start(client: &TestClient) -> String {
         .to_owned()
 }
 
-/// The status of one run, in lower case.
+/// The state of one run, in lower case.
 async fn status(client: &TestClient, id: &str) -> String {
     let run: Value = client
         .get(&format!("/api/harvest/workflows/{id}"))
         .send()
         .await
         .json();
-    run["status"]
+    run["execution"]["state"]
         .as_str()
-        .unwrap_or_else(|| panic!("no status: {run}"))
+        .unwrap_or_else(|| panic!("no state: {run}"))
         .to_ascii_lowercase()
 }
 

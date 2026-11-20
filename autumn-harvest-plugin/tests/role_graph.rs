@@ -94,7 +94,11 @@ fn workdir(name: &str) -> std::path::PathBuf {
 #[test]
 fn the_graph_lists_each_harvest_task_and_the_roles_that_run_it() {
     let stdout = dump("AUTUMN_DUMP_GRAPH", &workdir("role_graph"));
-    let graph = autumn_web::graph::manifest::parse_manifest_dump(&stdout)
+    // The test harness prints the test name on the line of the marker, so
+    // the dump starts at the marker, not at a line start.
+    let marker = autumn_web::graph::manifest::ARCHITECTURE_GRAPH_MARKER;
+    let dump = stdout.find(marker).map_or("", |at| &stdout[at..]);
+    let graph = autumn_web::graph::manifest::parse_manifest_dump(dump)
         .unwrap_or_else(|| panic!("no graph in the child output: {stdout}"));
     let graph = serde_json::to_value(&graph).expect("the graph serializes");
     let tasks: Vec<&Value> = graph["nodes"]
