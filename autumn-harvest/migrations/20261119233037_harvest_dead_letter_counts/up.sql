@@ -10,7 +10,7 @@
 -- Each `INSERT` and `DELETE` statement on `harvest_dead_letters` inserts one
 -- delta row: its row count, negative for a delete. The row commits or rolls
 -- back with the statement, so the sum is the exact committed count. A
--- `TRUNCATE` empties the counter. An `UPDATE` changes no count.
+-- `TRUNCATE` truncates the counter too. An `UPDATE` changes no count.
 --
 -- A writer only inserts. It reads no counter row and locks none. So a writer
 -- never waits for another writer, and it cannot raise a serialization failure
@@ -121,9 +121,17 @@ AS $harvest_dead_letter_count_apply_body$
 DECLARE
     delta BIGINT;
 BEGIN
-    -- A truncate holds `ACCESS EXCLUSIVE`, so no fold runs now.
+    -- `TRUNCATE` removes each dead letter, also one that committed after the
+    -- snapshot of this transaction. A `DELETE` would keep the delta row of
+    -- such a letter, so the reset is a `TRUNCATE` too. The truncate of the
+    -- DLQ holds `ACCESS EXCLUSIVE`, so no writer or fold runs now.
     IF TG_OP = 'TRUNCATE' THEN
-        DELETE FROM harvest_dead_letter_counts;
+        BEGIN
+            TRUNCATE harvest_dead_letter_counts;
+        EXCEPTION WHEN object_in_use THEN
+            -- The same statement truncates the counter, so its rows are gone.
+            DELETE FROM harvest_dead_letter_counts;
+        END;
         RETURN NULL;
     END IF;
     -- `changed` is the transition table of the statement.

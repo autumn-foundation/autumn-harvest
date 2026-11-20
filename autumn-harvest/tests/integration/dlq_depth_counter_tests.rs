@@ -515,3 +515,41 @@ async fn the_counter_stays_small_under_many_writes() {
     assert_exact(&mut f.conn, "a fold").await;
     assert_eq!(gauge(&mut f.conn).await, WRITES);
 }
+
+/// `TRUNCATE` removes each dead letter, also one that committed after the
+/// snapshot of the truncating transaction. The counter reset must match it.
+#[tokio::test]
+async fn a_truncate_on_an_old_snapshot_resets_every_counter_row() {
+    let mut f = fixture("dlq_depth_truncate_rr").await;
+    insert_rows(&mut f.conn, 2).await;
+    let mut truncator = begin_with_snapshot(&f.db.url(), "REPEATABLE READ").await;
+    // This delta row commits after the snapshot of the truncating transaction.
+    dlq::dead_letter(&mut f.conn, &entry(1))
+        .await
+        .expect("insert");
+    truncator
+        .batch_execute("TRUNCATE harvest_dead_letters; COMMIT;")
+        .await
+        .expect("truncate");
+    assert_exact(&mut f.conn, "a truncate on an old snapshot").await;
+    assert_eq!(gauge(&mut f.conn).await, 0);
+
+    // A truncate of many tables can name the counter too, in either order.
+    for tables in [
+        "harvest_dead_letters, harvest_dead_letter_counts",
+        "harvest_dead_letter_counts, harvest_dead_letters",
+    ] {
+        insert_rows(&mut f.conn, 3).await;
+        f.conn
+            .batch_execute(&format!("TRUNCATE {tables}"))
+            .await
+            .unwrap_or_else(|e| panic!("TRUNCATE {tables}: {e}"));
+        assert_exact(&mut f.conn, tables).await;
+        insert_rows(&mut f.conn, 1).await;
+        assert_exact(&mut f.conn, "an insert after a truncate of both tables").await;
+        f.conn
+            .batch_execute("TRUNCATE harvest_dead_letters")
+            .await
+            .expect("truncate");
+    }
+}
