@@ -1,0 +1,19 @@
+keyed_claim_running_counts_tests: buffers of one window count CTE call.
+Local runs on PG 16.15 with HARVEST_TEST_DATABASE_URL, debug build.
+The readings come from a temporary print in call_buffers.
+
+before: the window CTEs read claim_running_counts_sql! (one pass)
+  each_running_count_reads_only_the_rows_of_its_own_keys
+    seek_running_counts          978  (bound 50: FAILED)
+  foreign_running_rows_add_no_reads_to_a_count
+    seek_running_counts          978 before growth, 11 after growth
+    seek_deep_running_counts     978 before growth, 11 after growth
+    (the old plan changed with the statistics)
+
+after: the window CTEs read claim_window_running_counts_sql! (one probe per key)
+  each_running_count_reads_only_the_rows_of_its_own_keys
+    seek_running_counts          7
+    seek_deep_running_counts     7
+  foreign_running_rows_add_no_reads_to_a_count
+    seek_running_counts          7 before growth, 11 after growth
+    seek_deep_running_counts     7 before growth, 11 after growth

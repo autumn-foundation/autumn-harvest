@@ -1,0 +1,104 @@
+BEGIN
+INSERT 0 8000
+ANALYZE
+SET
+SET
+SET
+SET
+PREPARE
+PREPARE
+                                                                                         QUERY PLAN                                                                                          
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate (actual rows=1 loops=1)
+   Buffers: shared hit=18618
+   CTE concurrency_pending_keys
+     ->  HashAggregate (actual rows=8020 loops=1)
+           Group Key: harvest_task_queue.concurrency_key, harvest_task_queue.task_type
+           Batches: 1  Memory Usage: 913kB
+           Buffers: shared hit=2576
+           ->  Gather (actual rows=8040 loops=1)
+                 Workers Planned: 1
+                 Workers Launched: 1
+                 Buffers: shared hit=2576
+                 ->  HashAggregate (actual rows=4020 loops=2)
+                       Group Key: harvest_task_queue.concurrency_key, harvest_task_queue.task_type
+                       Batches: 1  Memory Usage: 465kB
+                       Buffers: shared hit=2576
+                       Worker 0:  Batches: 1  Memory Usage: 465kB
+                       ->  Parallel Seq Scan on harvest_task_queue (actual rows=5000 loops=2)
+                             Filter: ((concurrency_key IS NOT NULL) AND (concurrency_cap IS NOT NULL) AND (state = 'PENDING'::text) AND (scheduled_at <= now()) AND (queue_name = ANY ($1)))
+                             Rows Removed by Filter: 51500
+                             Buffers: shared hit=2576
+   CTE concurrency_running_counts
+     ->  HashAggregate (actual rows=0 loops=1)
+           Group Key: t.concurrency_key, t.task_type
+           Batches: 1  Memory Usage: 24kB
+           Buffers: shared hit=18618
+           ->  Nested Loop (actual rows=0 loops=1)
+                 Buffers: shared hit=18618
+                 ->  HashAggregate (actual rows=8020 loops=1)
+                       Group Key: concurrency_pending_keys.concurrency_key
+                       Batches: 1  Memory Usage: 929kB
+                       Buffers: shared hit=2576
+                       ->  CTE Scan on concurrency_pending_keys (actual rows=8020 loops=1)
+                             Buffers: shared hit=2576
+                 ->  Index Scan using harvest_task_queue_concurrency_key_running on harvest_task_queue t (actual rows=0 loops=8020)
+                       Index Cond: (concurrency_key = concurrency_pending_keys.concurrency_key)
+                       Filter: (worker_id IS NOT NULL)
+                       Buffers: shared hit=16042
+   ->  CTE Scan on concurrency_running_counts (actual rows=0 loops=1)
+         Buffers: shared hit=18618
+ Planning:
+   Buffers: shared hit=227
+ Planning Time: 0.840 ms
+ Execution Time: 22.815 ms
+(43 rows)
+
+                                                                                         QUERY PLAN                                                                                          
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate (actual rows=1 loops=1)
+   Buffers: shared hit=18616
+   CTE concurrency_pending_keys
+     ->  HashAggregate (actual rows=8020 loops=1)
+           Group Key: harvest_task_queue.concurrency_key, harvest_task_queue.task_type
+           Batches: 1  Memory Usage: 913kB
+           Buffers: shared hit=2576
+           ->  Gather (actual rows=8040 loops=1)
+                 Workers Planned: 1
+                 Workers Launched: 1
+                 Buffers: shared hit=2576
+                 ->  HashAggregate (actual rows=4020 loops=2)
+                       Group Key: harvest_task_queue.concurrency_key, harvest_task_queue.task_type
+                       Batches: 1  Memory Usage: 465kB
+                       Buffers: shared hit=2576
+                       Worker 0:  Batches: 1  Memory Usage: 465kB
+                       ->  Parallel Seq Scan on harvest_task_queue (actual rows=5000 loops=2)
+                             Filter: ((concurrency_key IS NOT NULL) AND (concurrency_cap IS NOT NULL) AND (state = 'PENDING'::text) AND (scheduled_at <= now()) AND (queue_name = ANY ($1)))
+                             Rows Removed by Filter: 51500
+                             Buffers: shared hit=2576
+   CTE concurrency_running_counts
+     ->  Nested Loop (actual rows=0 loops=1)
+           Buffers: shared hit=18616
+           ->  HashAggregate (actual rows=8020 loops=1)
+                 Group Key: concurrency_pending_keys.concurrency_key
+                 Batches: 1  Memory Usage: 929kB
+                 Buffers: shared hit=2576
+                 ->  CTE Scan on concurrency_pending_keys (actual rows=8020 loops=1)
+                       Buffers: shared hit=2576
+           ->  HashAggregate (actual rows=0 loops=8020)
+                 Group Key: t.task_type
+                 Batches: 1  Memory Usage: 24kB
+                 Buffers: shared hit=16040
+                 ->  Index Scan using harvest_task_queue_concurrency_key_running on harvest_task_queue t (actual rows=0 loops=8020)
+                       Index Cond: (concurrency_key = concurrency_pending_keys.concurrency_key)
+                       Filter: (worker_id IS NOT NULL)
+                       Buffers: shared hit=16040
+   ->  CTE Scan on concurrency_running_counts (actual rows=0 loops=1)
+         Buffers: shared hit=18616
+ Planning:
+   Buffers: shared hit=20
+ Planning Time: 0.457 ms
+ Execution Time: 22.511 ms
+(43 rows)
+
+ROLLBACK

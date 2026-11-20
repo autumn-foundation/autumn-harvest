@@ -228,6 +228,8 @@ mod hot_code_swap_tests;
 mod idempotency_tests;
 mod integration_e2e;
 #[cfg(feature = "db")]
+mod keyed_claim_running_counts_tests;
+#[cfg(feature = "db")]
 mod late_signal_completion_tests;
 #[cfg(feature = "db")]
 mod legal_hold_tests;

@@ -1992,6 +1992,11 @@ macro_rules! claim_candidate_rows_sql {
 }
 
 /// The running count per concurrency key, for the keys in `$keys`.
+///
+/// The full scan reads this form. Its keys are the due keys of the whole
+/// backlog, so they can be many. One pass over the running rows then can
+/// cost less than one probe per key. The planner picks between the two by
+/// its estimates. The window reads `claim_window_running_counts_sql!`.
 macro_rules! claim_running_counts_sql {
     ($name:literal, $keys:literal) => {
         concat!(
@@ -2005,6 +2010,44 @@ macro_rules! claim_running_counts_sql {
             $keys,
             ") \
              GROUP BY t.concurrency_key, t.task_type \
+         )"
+        )
+    };
+}
+
+/// The running count per concurrency key and task type, for the keys of a
+/// window in `$keys`.
+///
+/// Each distinct key gets one probe of
+/// `harvest_task_queue_concurrency_key_running`. So the count reads the
+/// running rows of the window keys only. A window holds few keys, so a probe
+/// per key always costs little. The form of `claim_running_counts_sql!` let
+/// the planner read every `RUNNING` row instead. On the measured fixture,
+/// that cost about 1,000 buffers per keyed claim.
+///
+/// Postgres does not pull up a subquery with an aggregate or a `DISTINCT`.
+/// So the plan stays one probe per key, whatever the estimates. The probe
+/// groups by task type, so a key with two task types costs one probe. The
+/// `GROUP BY` gives one row per pair, and only for a pair with running rows.
+/// The gate reads a missing pair as 0 with `COALESCE(..., 0)`.
+/// `docs/performance-keyed-claim-running-counts.md` has the measurements.
+macro_rules! claim_window_running_counts_sql {
+    ($name:literal, $keys:literal) => {
+        concat!(
+            $name,
+            " AS MATERIALIZED ( \
+             SELECT k.concurrency_key, c.task_type, c.running_count \
+             FROM (SELECT DISTINCT concurrency_key FROM ",
+            $keys,
+            ") k \
+             CROSS JOIN LATERAL ( \
+                 SELECT t.task_type, COUNT(*) AS running_count \
+                 FROM harvest_task_queue t \
+                 WHERE t.concurrency_key = k.concurrency_key \
+                   AND t.state = 'RUNNING' \
+                   AND t.worker_id IS NOT NULL \
+                 GROUP BY t.task_type \
+             ) c \
          )"
         )
     };
@@ -2245,7 +2288,7 @@ macro_rules! claim_seek_ctes_sql {
              WHERE seek_concurrency_key IS NOT NULL \
                AND seek_concurrency_cap IS NOT NULL \
          ), ",
-            claim_running_counts_sql!("seek_running_counts", "seek_pending_keys"),
+            claim_window_running_counts_sql!("seek_running_counts", "seek_pending_keys"),
             ", "
         )
     };
@@ -2407,7 +2450,7 @@ macro_rules! claim_deep_seek_ctes_sql {
              WHERE seek_concurrency_key IS NOT NULL \
                AND seek_concurrency_cap IS NOT NULL \
          ), ",
-            claim_running_counts_sql!("seek_deep_running_counts", "seek_deep_pending_keys"),
+            claim_window_running_counts_sql!("seek_deep_running_counts", "seek_deep_pending_keys"),
             ", "
         )
     };
@@ -13827,6 +13870,78 @@ mod tests {
             "concurrency_running_counts: one CTE definition + one reference \
              from the candidate-side COALESCE lookup; got:\n{sql}"
         );
+    }
+
+    /// Each window count CTE of each claim form probes the key index once per
+    /// pending key. A scan of every `RUNNING` row is the cost that this form
+    /// removes. `keyed_claim_running_counts_tests` measures it. The full scan
+    /// keeps one pass, so the planner can choose by its estimates.
+    #[test]
+    fn window_running_counts_probe_once_per_pending_key() {
+        let mut variants: Vec<&str> = vec![
+            claim_task_full_scan_query(),
+            claim_task_by_id_query(),
+            claim_task_by_id_query_fenced(),
+        ];
+        for fenced in [false, true] {
+            variants.push(owned_claim_by_id_query(fenced));
+            variants.push(owned_claim_by_execution_query(fenced));
+        }
+        for kind in [None, Some(TaskType::Workflow), Some(TaskType::Activity)] {
+            for fenced in [false, true] {
+                for fairness in [ClaimFairness::Off, ClaimFairness::Keys] {
+                    variants.push(claim_query_for(kind, fenced, fairness));
+                    variants.push(owned_claim_query_for(kind, fenced, fairness));
+                }
+                for owned in [false, true] {
+                    variants.push(window_claim_query_for(kind, fenced, owned));
+                }
+            }
+        }
+        let probe = |counts: &str, keys: &str| {
+            format!(
+                "{counts} AS MATERIALIZED ( \
+                 SELECT k.concurrency_key, c.task_type, c.running_count \
+                 FROM (SELECT DISTINCT concurrency_key FROM {keys}) k \
+                 CROSS JOIN LATERAL ( \
+                 SELECT t.task_type, COUNT(*) AS running_count FROM harvest_task_queue t \
+                 WHERE t.concurrency_key = k.concurrency_key \
+                 AND t.state = 'RUNNING' AND t.worker_id IS NOT NULL \
+                 GROUP BY t.task_type ) c )"
+            )
+        };
+        let single_pass = "concurrency_running_counts AS MATERIALIZED ( \
+             SELECT t.concurrency_key, t.task_type, COUNT(*) AS running_count \
+             FROM harvest_task_queue t WHERE t.state = 'RUNNING' \
+             AND t.worker_id IS NOT NULL \
+             AND t.concurrency_key IN (SELECT concurrency_key FROM concurrency_pending_keys) \
+             GROUP BY t.concurrency_key, t.task_type )";
+        for sql in variants {
+            let sql = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+            let mut found = 0;
+            for (counts, keys) in [
+                ("seek_running_counts", "seek_pending_keys"),
+                ("seek_deep_running_counts", "seek_deep_pending_keys"),
+            ] {
+                if sql.contains(&format!("{counts} AS MATERIALIZED")) {
+                    found += 1;
+                    assert_eq!(
+                        sql.matches(&probe(counts, keys)).count(),
+                        1,
+                        "{counts} must probe once per key of {keys}; got:\n{sql}"
+                    );
+                }
+            }
+            if sql.contains("concurrency_running_counts AS MATERIALIZED") {
+                found += 1;
+                assert_eq!(
+                    sql.matches(single_pass).count(),
+                    1,
+                    "the full scan keeps one pass over the running rows; got:\n{sql}"
+                );
+            }
+            assert!(found > 0, "a claim form has a running count; got:\n{sql}");
+        }
     }
 
     // ── Batched seek-and-refine claim (issue #1340) ──────────────────────────
