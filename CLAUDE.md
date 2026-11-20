@@ -158,6 +158,11 @@ projection of entity snapshot events. The trigger
 `harvest_entity_state_projection_trg` writes it on `INSERT` into
 `harvest_events`, so it never rewrites an event.
 
+`harvest_external_outbox_pending` (issue #2724) is not an exception either.
+The trigger `harvest_external_outbox_projection_trg` adds a row for each
+external request, and a resolution deletes it. The outbox claims read it,
+and keep their own resolution check.
+
 If you add another exception, it belongs in this list, with its own scope
 guarantee and its own proof.
 
@@ -183,8 +188,9 @@ That order is load-bearing.
 
 The partition layout changes rebuild `harvest_events` with `LIKE`, which copies
 no triggers. `enable_sql`, `migration_plan_steps` and `disable_partitioning`
-reinstall the guard and the entity projection trigger. `operator_triggers`
-exempts both by their exact shape. A new layout path must do the same.
+reinstall the guard, the entity projection trigger and the external outbox
+trigger. `operator_triggers` exempts the three by their exact shape. A new
+layout path must do the same.
 
 A test fixture that must rewrite a row calls `append_only::with_guard_off`. It
 turns off every trigger for one transaction and needs a superuser. Production

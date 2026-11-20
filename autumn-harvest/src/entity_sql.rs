@@ -230,7 +230,7 @@ pub(crate) fn run_cancellable(
     source: EntitySqlSource,
     cancel: &Arc<AtomicBool>,
 ) -> Result<EntitySqlRows, EntitySqlError> {
-    let (conn, budget) = open(record)?;
+    let (mut conn, budget) = open(record)?;
     let deadline = Instant::now() + MAX_QUERY_TIME;
     let memory_at_start = sqlite_memory_used();
     let cancel = Arc::clone(cancel);
@@ -257,11 +257,7 @@ pub(crate) fn run_cancellable(
             "the statement returns no columns".to_string(),
         ));
     }
-    let columns: Vec<String> = stmt
-        .column_names()
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+    let columns: Vec<String> = stmt.column_names().map(str::to_string).collect();
     let bound: Vec<rusqlite::types::Value> = params.iter().map(to_sql).collect();
     let mut rows = stmt
         .query(rusqlite::params_from_iter(bound))
@@ -385,7 +381,7 @@ const DENIED_FUNCTIONS: &[&str] = &["load_extension", "fts3_tokenizer"];
 /// The setup runs before the authorizer. After it, only reads and functions
 /// pass.
 fn open(record: &EntityRecord) -> Result<(Connection, Budget), EntitySqlError> {
-    let conn = Connection::open_in_memory().map_err(|e| sql_error(&e))?;
+    let mut conn = Connection::open_in_memory().map_err(|e| sql_error(&e))?;
     conn.execute_batch("PRAGMA temp_store = MEMORY;")
         .map_err(|e| sql_error(&e))?;
     conn.execute_batch(SCHEMA).map_err(|e| sql_error(&e))?;

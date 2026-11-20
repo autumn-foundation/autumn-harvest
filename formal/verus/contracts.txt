@@ -534,34 +534,34 @@ fn clone(& self) -> (r: Self) ensures r ==* self,
 }
 impl Copy for ProcessRole {
 }
-pub open spec fn spec_role_default(role: Option < ProcessRole >) -> bool { match role { Some(ProcessRole::Web) => false, _ => true, } }
-pub open spec fn spec_switch_value(explicit: Option < bool >, default: bool) -> bool { match explicit { Some(value) => value, None => default, } }
-pub open spec fn spec_contradicts(explicit: Option < bool >, role: Option < ProcessRole >) -> bool { match explicit { Some(value) => role.is_some() && value != spec_role_default(role), None => false, } }
-pub fn role_default(role: Option < ProcessRole >) -> (r: bool) ensures r == spec_role_default(role),
-pub fn switch_value(explicit: Option < bool >, default: bool) -> (r: bool) ensures r == spec_switch_value(explicit, default),
-pub fn contradicts_role(explicit: Option < bool >, role: Option < ProcessRole >) -> (r: bool) ensures r == spec_contradicts(explicit, role),
-pub fn resolve_switch(explicit: Option < bool >, role: Option < ProcessRole >) -> (r: (bool, bool)) ensures r.0 == spec_switch_value(explicit, spec_role_default(role)), r.1 == spec_contradicts(explicit, role),
-pub proof fn theorem_a_web_role_runs_nothing_by_default() ensures ! spec_switch_value(None, spec_role_default(Some(ProcessRole::Web))),
-pub proof fn theorem_a_worker_or_combined_role_runs_both_by_default(role: ProcessRole) requires role != ProcessRole::Web, ensures spec_switch_value(None, spec_role_default(Some(role))),
-pub proof fn theorem_no_role_keeps_the_old_default() ensures spec_switch_value(None, spec_role_default(None)),
-pub proof fn theorem_an_explicit_value_wins(value: bool, role: Option < ProcessRole >) ensures spec_switch_value(Some(value), spec_role_default(role)) == value,
-pub proof fn theorem_a_warning_marks_each_override(explicit: Option < bool >, role: Option < ProcessRole >,) ensures role.is_some() ==> (spec_contradicts(explicit, role) <==> spec_switch_value(explicit, spec_role_default(role),) != spec_role_default(role)), role.is_none() ==>! spec_contradicts(explicit, role),
 pub enum RetentionRunOn { Scheduler, All, }
 impl Clone for RetentionRunOn {
 fn clone(& self) -> (r: Self) ensures r ==* self,
 }
 impl Copy for RetentionRunOn {
 }
-pub open spec fn spec_retention_placed(run_on: RetentionRunOn, scheduler: bool) -> bool { match run_on { RetentionRunOn::Scheduler => scheduler, RetentionRunOn::All => true, } }
-pub open spec fn spec_runs_retention(enabled: bool, run_on: RetentionRunOn, scheduler: bool,) -> bool { enabled && spec_retention_placed(run_on, scheduler) }
-pub fn retention_placed(run_on: RetentionRunOn, scheduler: bool) -> (r: bool) ensures r == spec_retention_placed(run_on, scheduler),
-pub fn runs_retention(enabled: bool, run_on: RetentionRunOn, scheduler: bool) -> (r: bool) ensures r == spec_runs_retention(enabled, run_on, scheduler),
-pub proof fn theorem_retention_follows_the_scheduler(enabled: bool, scheduler: bool) ensures spec_runs_retention(enabled, RetentionRunOn::Scheduler, scheduler) == (enabled && scheduler),
-pub proof fn theorem_a_web_role_runs_no_retention_by_default(enabled: bool) ensures ! spec_runs_retention(enabled, RetentionRunOn::Scheduler, spec_switch_value(None, spec_role_default(Some(ProcessRole::Web))),),
-pub proof fn theorem_other_roles_run_retention_by_default(role: Option < ProcessRole >) requires role != Some(ProcessRole::Web), ensures spec_runs_retention(true, RetentionRunOn::Scheduler, spec_switch_value(None, spec_role_default(role)),),
-pub proof fn theorem_an_explicit_scheduler_moves_retention(enabled: bool, scheduler: bool, role: Option < ProcessRole >,) ensures spec_runs_retention(enabled, RetentionRunOn::Scheduler, spec_switch_value(Some(scheduler), spec_role_default(role)),) == (enabled && scheduler),
-pub proof fn theorem_run_on_all_runs_retention_everywhere(enabled: bool, scheduler: bool) ensures spec_runs_retention(enabled, RetentionRunOn::All, scheduler) == enabled,
-pub proof fn theorem_disabled_retention_never_runs(run_on: RetentionRunOn, scheduler: bool) ensures ! spec_runs_retention(false, run_on, scheduler),
+pub open spec fn spec_base_default(role: Option < ProcessRole >) -> bool { match role { Some(ProcessRole::Web) => false, _ => true, } }
+pub open spec fn spec_runs_plugin(preset: Option < bool >, runs_parent: bool, base_runs_parent: bool,) -> bool { match preset { Some(value) => value && base_runs_parent, None => runs_parent, } }
+pub open spec fn spec_switch_value(explicit: Option < bool >, default: bool) -> bool { match explicit { Some(value) => value, None => default, } }
+pub open spec fn spec_contradicts(explicit: Option < bool >, role_default: Option < bool >) -> bool { match (explicit, role_default) { (Some(value), Some(default)) => value != default, _ => false, } }
+pub open spec fn spec_default(role_default: Option < bool >) -> bool { match role_default { Some(default) => default, None => true, } }
+pub open spec fn spec_retention_switch(enabled: bool, run_on: RetentionRunOn, scheduler: Option < bool >,) -> Option < bool > { if ! enabled { Some(false) } else { match run_on { RetentionRunOn::All => Some(true), RetentionRunOn::Scheduler => scheduler, } } }
+pub open spec fn spec_old_retention(enabled: bool, run_on: RetentionRunOn, scheduler: bool,) -> bool { enabled && match run_on { RetentionRunOn::Scheduler => scheduler, RetentionRunOn::All => true, } }
+pub fn switch_value(explicit: Option < bool >, default: bool) -> (r: bool) ensures r == spec_switch_value(explicit, default),
+pub fn contradicts_role(explicit: Option < bool >, role_default: Option < bool >) -> (r: bool) ensures r == spec_contradicts(explicit, role_default),
+pub fn resolve_switch(explicit: Option < bool >, role_default: Option < bool >) -> (r: (bool, bool)) ensures r.0 == spec_switch_value(explicit, spec_default(role_default)), r.1 == spec_contradicts(explicit, role_default),
+pub fn retention_switch(enabled: bool, run_on: RetentionRunOn, scheduler: Option < bool >) -> (r: Option < bool >) ensures r == spec_retention_switch(enabled, run_on, scheduler),
+pub proof fn theorem_an_explicit_value_wins(value: bool, default: bool) ensures spec_switch_value(Some(value), default) == value,
+pub proof fn theorem_no_role_keeps_the_old_default() ensures spec_switch_value(None, spec_default(None)),
+pub proof fn theorem_a_warning_marks_each_override(explicit: Option < bool >, role_default: Option < bool >,) ensures role_default.is_some() ==> (spec_contradicts(explicit, role_default) <==> spec_switch_value(explicit, spec_default(role_default)) != spec_default(role_default,)), role_default.is_none() ==>! spec_contradicts(explicit, role_default),
+pub proof fn theorem_a_preset_stays_within_its_base(preset: Option < bool >) ensures ! spec_runs_plugin(preset, false, false),
+pub proof fn theorem_a_preset_turns_one_capability_off(runs_parent: bool, base_runs_parent: bool) ensures ! spec_runs_plugin(Some(false), runs_parent, base_runs_parent), spec_runs_plugin(None, runs_parent, base_runs_parent) == runs_parent,
+pub proof fn theorem_a_built_in_role_keeps_its_janitor(enabled: bool, run_on: RetentionRunOn, scheduler: Option < bool >, role: Option < ProcessRole >,) ensures spec_switch_value(spec_retention_switch(enabled, run_on, scheduler), spec_base_default(role),) == spec_old_retention(enabled, run_on, spec_switch_value(scheduler, spec_base_default(role)),),
+pub proof fn theorem_an_explicit_scheduler_moves_retention(enabled: bool, scheduler: bool, default: bool,) ensures spec_switch_value(spec_retention_switch(enabled, RetentionRunOn::Scheduler, Some(scheduler)), default,) == (enabled && scheduler),
+pub proof fn theorem_maintenance_places_retention_with_no_switch(enabled: bool, default: bool) ensures spec_switch_value(spec_retention_switch(enabled, RetentionRunOn::Scheduler, None), default) == (enabled && default),
+pub proof fn theorem_a_web_role_runs_no_janitor_by_default(enabled: bool) ensures ! spec_switch_value(spec_retention_switch(enabled, RetentionRunOn::Scheduler, None), spec_base_default(Some(ProcessRole::Web)),),
+pub proof fn theorem_run_on_all_runs_retention_everywhere(enabled: bool, scheduler: Option < bool >, default: bool,) ensures spec_switch_value(spec_retention_switch(enabled, RetentionRunOn::All, scheduler), default) == enabled,
+pub proof fn theorem_disabled_retention_never_runs(run_on: RetentionRunOn, scheduler: Option < bool >, default: bool,) ensures ! spec_switch_value(spec_retention_switch(false, run_on, scheduler), default),
 
 ## formal/verus/src/refine_gate.rs
 pub enum GateEvent { Deadline, Unreadable, Reject, Activated, Refused, Conflict, }
@@ -620,6 +620,8 @@ pub enum Held < T > { Nothing, Committed { target: T, current: bool }, Pending {
 pub enum Resolution < T > { Nothing, Apply(T), Superseded, }
 pub open spec fn spec_resolve < T > (held: Held < T >) -> Resolution < T > { match held { Held::Nothing => Resolution::Nothing, Held::Committed { target, current } => if current { Resolution::Apply(target) } else { Resolution::Superseded }, Held::Pending { target, moved, previous } => if moved { Resolution::Apply(target) } else { match previous { Some(previous) => Resolution::Apply(previous), None => Resolution::Nothing, } }, } }
 pub fn resolve_target < T > (held: Held < T >) -> (r: Resolution < T >) ensures r == spec_resolve(held), held is Nothing ==> r is Nothing, r is Superseded <==> (held is Committed &&! held -> current), held is Pending && held -> moved ==> r == Resolution::Apply(held -> Pending_target),
+pub open spec fn spec_replaced < T > (resolution: Resolution < T >, moved: bool) -> bool { ! (resolution is Nothing) || moved }
+pub fn replaced < T > (resolution:& Resolution < T >, moved: bool) -> (r: bool) ensures r == spec_replaced(* resolution, moved), * resolution is Superseded ==> r,
 pub enum Entry < T > { Committed { target: T, of: nat }, Pending { target: T, from: nat, previous: Option < T > }, }
 pub open spec fn held < T > (entry: Option < Entry < T >>, current: nat) -> Held < T > { match entry { None => Held::Nothing, Some(Entry::Committed { target, of }) => Held::Committed { target, current: of == current }, Some(Entry::Pending { target, from, previous }) => Held::Pending { target, moved: from != current, previous, }, } }
 pub open spec fn applies < T > (entry: Option < Entry < T >>, current: nat) -> Option < T > { match spec_resolve(held(entry, current)) { Resolution::Apply(target) => Some(target), _ => None, } }
@@ -630,6 +632,7 @@ pub enum Run < T > { Idle, Asked { target: T, written: Option < Entry < T >> }, 
 pub struct World < T > { pub db: nat, pub file: Option < Entry < T >>, pub run: Run < T >, pub want: Option < T >, }
 pub enum Step < T > { Ask { target: T }, Release, Publish { ok: bool, to: nat }, Return, End, EndFails, Direct { ok: bool, to: nat }, Open, Delete { to: nat }, }
 pub open spec fn opens < T > (w: World < T >) -> Option < T > { match w.run { Run::Asked { written,..} => applies(seen(w.file, written), w.db), Run::Published { pending,..} => applies(seen(w.file, Some(pending)), w.db), _ => applies(w.file, w.db), } }
+pub open spec fn resolves < T > (w: World < T >) -> Resolution < T > { match w.run { Run::Asked { written,..} => spec_resolve(held(seen(w.file, written), w.db)), Run::Published { pending,..} => spec_resolve(held(seen(w.file, Some(pending)), w.db)), _ => spec_resolve(held(w.file, w.db)), } }
 pub open spec fn rewritten < T > (w: World < T >, target: T, written: Option < Entry < T >>) -> Entry < T > { Entry::Pending { target, from: w.db, previous: applies(settle(seen(w.file, written), w.db), w.db), } }
 pub open spec fn released < T > (w: World < T >) -> World < T > { match w.run { Run::Asked { target, written } => { let entry = rewritten(w, target, written); World { file: Some(entry), run: Run::Asked { target, written: Some(entry) },..w } }, _ => World { file: settle(w.file, w.db),..w }, } }
 pub open spec fn refused < T > (w: World < T >) -> bool { match w.run { Run::Asked { written,..} => match written { Some(entry) => moved_pending(w, entry), None => false, }, Run::Published { pending,..} => moved_pending(w, pending), _ => false, } }
@@ -649,6 +652,7 @@ proof fn lemma_restore_then_direct < T > (w: World < T >, target: T, to: nat, ok
 else { Some(target) }
 , { let asked = step(w, Step::Ask { target }); theorem_each_step_keeps_the_invariant(w, Step::Ask { target }); let drained = step(asked, Step::Release); theorem_each_step_keeps_the_invariant(asked, Step::Release); let published = step(drained, Step::Publish { ok: true, to }); theorem_each_step_keeps_the_invariant(drained, Step::Publish { ok: true, to }); let returned = step(published, Step::Return); theorem_each_step_keeps_the_invariant(published, Step::Return); let ended = step(returned, Step::End); theorem_each_step_keeps_the_invariant(returned, Step::End); theorem_each_step_keeps_the_invariant(ended, Step::Direct { ok, to: again }); }
 pub proof fn theorem_a_direct_restore_supersedes_the_target < T > (w: World < T >, target: T, to: nat, again: nat,) requires inv(w), w.run is Idle, to != w.db, again != to, ensures opens(restore_then_direct(w, target, to, true, again)) == None::< T >,
+pub proof fn theorem_a_superseded_target_shows_a_new_file < T > (w: World < T >, target: T, to: nat, again: nat,) requires inv(w), w.run is Idle, to != w.db, again != to, ensures resolves(restore_then_direct(w, target, to, true, again)) is Superseded, spec_replaced(resolves(restore_then_direct(w, target, to, true, again)), false),
 pub proof fn theorem_a_failed_direct_restore_keeps_the_target < T > (w: World < T >, target: T, to: nat, again: nat,) requires inv(w), w.run is Idle, to != w.db, ensures opens(restore_then_direct(w, target, to, false, again)) == Some(target),
 pub proof fn theorem_a_release_before_the_drain_does_no_harm < T > (w: World < T >, target: T, stale: nat, to: nat,) requires inv(w), w.run is Idle, stale != w.db, to != stale, ensures ({ let asked = step(w, Step::Ask { target }); let replaced = step(asked, Step::Direct { ok: true, to: stale }); refused(replaced) && ({ let drained = step(replaced, Step::Release); let published = step(drained, Step::Publish { ok: true, to }); let ended = step(step(published, Step::Return), Step::End); opens(ended) == Some(target) }) }),
 pub proof fn theorem_an_open_before_the_return_refuses < T > (w: World < T >, target: T, to: nat) requires inv(w), w.run is Idle, to != w.db, ensures ({ let drained = step(step(w, Step::Ask { target }), Step::Release); valid(drained, Step::Publish { ok: true, to }) && refused(step(drained, Step::Publish { ok: true, to }),) }),

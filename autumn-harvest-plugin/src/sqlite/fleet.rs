@@ -311,25 +311,13 @@ impl HarvestFleet {
     /// # Errors
     ///
     /// [`HarvestSqliteError::Fleet`] when the fleet refuses the restore.
-    /// [`HarvestSqliteError::Tenant`] when `target` has no `chrono` value.
-    /// Each `jiff` instant has one, so that error does not occur.
     pub async fn restore(
         &self,
         key: &FleetDbKey,
         target: Option<jiff::Timestamp>,
     ) -> Result<autumn_web::replication::RestoreOutcome, HarvestSqliteError> {
-        // `DatabaseFleet::restore` takes a `chrono` target.
-        let fleet_target = target
-            .map(|at| {
-                crate::chrono_boundary::to_chrono(at).ok_or_else(|| {
-                    HarvestSqliteError::Tenant(format!(
-                        "the restore target {at} has no chrono value"
-                    ))
-                })
-            })
-            .transpose()?;
         let Some(replicas) = &self.shared.replicas else {
-            let restored = self.shared.fleet.restore(key, fleet_target).await?;
+            let restored = self.shared.fleet.restore(key, target).await?;
             self.shared.wake_now(key);
             return Ok(restored);
         };
@@ -340,7 +328,7 @@ impl HarvestFleet {
         let task = tokio::spawn(async move {
             let _turn = shared.restore_turn.lock().await;
             replicas.request_restore(&owned, target);
-            let restored = shared.fleet.restore(&owned, fleet_target).await;
+            let restored = shared.fleet.restore(&owned, target).await;
             replicas.restore_returned(&owned);
             // The end waits for an open that holds the target lock.
             let (ended, ok) = (owned.clone(), restored.is_ok());
