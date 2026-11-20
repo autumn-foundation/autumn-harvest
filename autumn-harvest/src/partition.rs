@@ -279,6 +279,40 @@ fn not_the_append_only_guard_sql() -> String {
     )
 }
 
+/// A SQL predicate that is true unless `con` is harvest's own foreign key
+/// (`harvest_events_workflow_exec_id_fkey`). Expects the alias `con`
+/// (`pg_constraint`).
+///
+/// The exemption matches the identity, as for
+/// [`not_the_append_only_guard_sql`]: name, type and shape -- `ON DELETE
+/// CASCADE`, `ON UPDATE NO ACTION`, `(workflow_exec_id)` referencing
+/// `harvest_workflow_executions(id)`.
+///
+/// Clone-class note (jscpd, min-tokens 50): this fragment used to repeat
+/// verbatim in [`unreplayable_constraints`], in [`enable_sql`]'s
+/// in-transaction recheck, and in
+/// [`unreplayable_constraints_guard_sql`]'s scripted recheck. All three
+/// refuse an operator constraint that `CREATE TABLE ... (LIKE ...)`
+/// cannot carry forward. Harvest's own foreign key is the one
+/// constraint every one of them must still exempt, by this same name
+/// and shape (issue #958). Unlike the sibling cohort-`CHECK` exemption,
+/// this one never varies by cutover, so one constant serves every
+/// caller.
+const NOT_HARVEST_FK_SQL: &str = "NOT (con.conname = 'harvest_events_workflow_exec_id_fkey' \
+     AND con.contype = 'f' \
+     AND NOT con.condeferrable \
+     AND con.confdeltype = 'c' \
+     AND con.confupdtype = 'a' \
+     AND con.confrelid = 'harvest_workflow_executions'::regclass \
+     AND (SELECT array_agg(a.attname::text ORDER BY k) \
+            FROM generate_subscripts(con.conkey, 1) k \
+            JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = con.conkey[k] \
+         ) = ARRAY['workflow_exec_id'] \
+     AND (SELECT array_agg(a.attname::text ORDER BY k) \
+            FROM generate_subscripts(con.confkey, 1) k \
+            JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = con.confkey[k] \
+         ) = ARRAY['id'])";
+
 /// The `COMMENT` `enable` stamps on `idx_harvest_we_created_at`.
 ///
 /// Stamped the moment `enable` actually creates that index. Never stamped
@@ -2234,22 +2268,7 @@ pub async fn unreplayable_constraints(conn: &mut AsyncPgConnection) -> HarvestRe
                 )
             )
             AND con.contype IN ('c', 'f', 'x')
-            AND NOT (
-                con.conname = 'harvest_events_workflow_exec_id_fkey'
-                AND con.contype = 'f'
-                AND NOT con.condeferrable
-                AND con.confdeltype = 'c'
-                AND con.confupdtype = 'a'
-                AND con.confrelid = 'harvest_workflow_executions'::regclass
-                AND (SELECT array_agg(a.attname::text ORDER BY k)
-                       FROM generate_subscripts(con.conkey, 1) k
-                       JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = con.conkey[k]
-                    ) = ARRAY['workflow_exec_id']
-                AND (SELECT array_agg(a.attname::text ORDER BY k)
-                       FROM generate_subscripts(con.confkey, 1) k
-                       JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = con.confkey[k]
-                    ) = ARRAY['id']
-            )
+            AND {NOT_HARVEST_FK_SQL}
             AND NOT (
                 con.conname IN (
                     '{LEGACY_PARTITION}_cohort_ck',
@@ -2887,22 +2906,7 @@ recreate it including `cohort` yourself, then re-run.', bad_idx;
       JOIN pg_namespace n ON n.oid = c.relnamespace
      WHERE c.relname = '{LEGACY_PARTITION}' AND n.nspname = current_schema()
        AND con.contype IN ('c', 'f', 'x')
-       AND NOT (
-           con.conname = 'harvest_events_workflow_exec_id_fkey'
-           AND con.contype = 'f'
-           AND NOT con.condeferrable
-           AND con.confdeltype = 'c'
-           AND con.confupdtype = 'a'
-           AND con.confrelid = 'harvest_workflow_executions'::regclass
-           AND (SELECT array_agg(a.attname::text ORDER BY k)
-                  FROM generate_subscripts(con.conkey, 1) k
-                  JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = con.conkey[k]
-               ) = ARRAY['workflow_exec_id']
-           AND (SELECT array_agg(a.attname::text ORDER BY k)
-                  FROM generate_subscripts(con.confkey, 1) k
-                  JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = con.confkey[k]
-               ) = ARRAY['id']
-       )
+       AND {NOT_HARVEST_FK_SQL}
        AND NOT (
            con.conname IN ('{LEGACY_PARTITION}_cohort_ck', '{LEGACY_PARTITION}_cohort_ck{LEGACY_RENAME_SUFFIX}')
            AND con.contype = 'c'
@@ -6170,22 +6174,7 @@ fn unreplayable_constraints_guard_sql(tag: &str, cutover_lit: &str) -> String {
          )\n       \
          )\n       \
          AND con.contype IN ('c', 'f', 'x')\n       \
-         AND NOT (\n           \
-         con.conname = 'harvest_events_workflow_exec_id_fkey'\n           \
-         AND con.contype = 'f'\n           \
-         AND NOT con.condeferrable\n           \
-         AND con.confdeltype = 'c'\n           \
-         AND con.confupdtype = 'a'\n           \
-         AND con.confrelid = 'harvest_workflow_executions'::regclass\n           \
-         AND (SELECT array_agg(a.attname::text ORDER BY k)\n                  \
-         FROM generate_subscripts(con.conkey, 1) k\n                  \
-         JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = con.conkey[k]\n               \
-         ) = ARRAY['workflow_exec_id']\n           \
-         AND (SELECT array_agg(a.attname::text ORDER BY k)\n                  \
-         FROM generate_subscripts(con.confkey, 1) k\n                  \
-         JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = con.confkey[k]\n               \
-         ) = ARRAY['id']\n       \
-         )\n       \
+         AND {NOT_HARVEST_FK_SQL}\n       \
          AND NOT (\n           \
          con.conname IN (\n               \
          '{LEGACY_PARTITION}_cohort_ck',\n               \
