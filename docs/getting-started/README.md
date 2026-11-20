@@ -59,10 +59,14 @@ Start with [Chapter 1 →](01-project-skeleton.md)
 - **Disaster recovery.** [`cross-region-dr.md`](../cross-region-dr.md) — per-shard
   cross-region replication, a fencing mechanism, a measured RPO, and the
   operator-initiated failover runbook.
-- **Upgrading.** [`upgrading/0.10.0.md`](../upgrading/0.10.0.md) is the
-  current 0.9.0 → 0.10.0 upgrade guide — the `autumn-web` 0.10 bump, MSRV
-  1.97, the process-role defaults for `web` replicas, seven table and column
-  migrations and the fleet rules for the new features.
+- **Upgrading.** [`upgrading/0.11.0.md`](../upgrading/0.11.0.md) is the
+  current 0.10.0 → 0.11.0 upgrade guide — the `autumn-web` 0.11 bump, Harvest
+  runtimes as Autumn background tasks, the move from `chrono` to `jiff`, the
+  table, index and trigger migrations and the fleet rules for the new
+  features. [`upgrading/0.10.0.md`](../upgrading/0.10.0.md) covers the
+  previous 0.9.0 → 0.10.0 hop: the `autumn-web` 0.10 bump, MSRV 1.97, the
+  process-role defaults for `web` replicas, seven table and column migrations
+  and the fleet rules for the 0.10.0 features.
   [`upgrading/0.9.0.md`](../upgrading/0.9.0.md) covers the previous
   0.8.0 → 0.9.0 hop: the `schemars` 1.x bump, the split Diesel tables, four
   index and table migrations and the fleet rules for the 0.9.0 agent
@@ -103,6 +107,12 @@ Start with [Chapter 1 →](01-project-skeleton.md)
   [`activity-default-overrides.md`](../operations/activity-default-overrides.md)
   changes the retry policy, the timeouts and the cap of an activity type at
   runtime.
+- **Batch claim.** [`claim-batch.md`](../operations/claim-batch.md) lets
+  one claim statement take up to 2, 4 or 8 task rows. It is off by default.
+- **Pre-deploy analyses.**
+  [`dag-and-retry-analyses.md`](../dag-and-retry-analyses.md) checks DAG
+  slack, retry envelopes, retry storms, throttle waits, run shapes and
+  schedule herds before a deploy, with no database.
 - **Cost-aware deferral.** [`cost-deferral.md`](../cost-deferral.md) holds
   named activity types while the autumn-web cost signal is high.
 - **Runbooks.**

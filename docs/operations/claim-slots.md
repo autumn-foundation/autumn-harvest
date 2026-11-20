@@ -56,3 +56,8 @@ A cap below the claim loops of the fleet lowers the claim rate of an
 uncontended shard. See [`docs/performance.md`](../performance.md) §
 "Claim slots" for a measurement. Use the cap when claim latency rises with
 the number of claimers, for example after a `VACUUM` or a lock stall.
+
+## See also
+
+- [`claim-batch.md`](claim-batch.md): one claim statement takes up to 2, 4
+  or 8 rows. A batch takes one slot per statement.

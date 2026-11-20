@@ -28,9 +28,9 @@ is [`DESIGN-2471.md`](design/DESIGN-2471.md).
 
 ```toml
 [dependencies]
-autumn-web = { version = "0.10", features = ["sqlite"] }
-autumn-harvest = { version = "0.10", default-features = false }
-autumn-harvest-plugin = { version = "0.10", features = ["sqlite"] }
+autumn-web = { version = "0.11", features = ["sqlite"] }
+autumn-harvest = { version = "0.11", default-features = false }
+autumn-harvest-plugin = { version = "0.11", features = ["sqlite"] }
 ```
 
 The feature is a backend flip, like `autumn-web/sqlite`, which it turns on.
@@ -701,7 +701,8 @@ HarvestPlugin::new()
   Catch-up is always off. The engine ignores the jitter of a code schedule,
   because one writer has no fleet to spread. The admin routes refuse a
   `jitter_secs` above zero.
-- **Not ported.** Backfill, `/runs`, `/decisions` and `/preview` answer
+- **Not ported.** Backfill, `/runs`, `/decisions`, `/preview` and the
+  [herd forecast](management-api.md#schedule-herd-forecast) (`/herd`) answer
   `501`.
 
 A tenant driver fires the schedules that its own file stores. Only the

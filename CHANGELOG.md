@@ -7,6 +7,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-20
+
+### Upgraded
+
+- **`autumn-web` 0.11 (issue #2480).** `autumn-harvest-plugin` now depends on `autumn-web` 0.11, which adds role-aware background tasks (autumn#3545). An app that mounts `HarvestPlugin` bumps `autumn-web` to `"0.11"` in the same change. A leftover `"0.10"` builds two copies, and `HarvestPlugin` does not match the app's `AppBuilder`. `diesel` moves to 2.4, `diesel-async` to 0.10, `rusqlite` to 0.42 and `libsqlite3-sys` to 0.40, which fixes RUSTSEC-2026-0459. See [`docs/upgrading/autumn-web-0.11.md`](docs/upgrading/autumn-web-0.11.md) and [`docs/upgrading/0.11.0.md`](docs/upgrading/0.11.0.md) §1.1.
+
+- **Dates and times use `jiff` (ADR 0018).** Each instant, duration, calendar date and time zone of the public API is a `jiff` 1.0 type. `autumn_harvest::jiff` re-exports the crate, and `autumn_harvest::chrono` is gone. No Harvest crate depends on `chrono`. No migration runs and no stored data changes. See [`docs/upgrading/chrono-to-jiff.md`](docs/upgrading/chrono-to-jiff.md).
+
+### Changed
+
+- **Harvest runtimes are Autumn background tasks (issue #2480).** The worker, the scheduler, the retention janitor and the batch executor run as the Autumn tasks `harvest.worker`, `harvest.scheduler`, `harvest.retention` and `harvest.batch`. Autumn places each one by the process role, and a `[roles.<name>]` preset places them through the capabilities `harvest.worker`, `harvest.scheduler` and `harvest.maintenance`. The Autumn drain stops the loops. See [`docs/upgrading/0.11.0.md`](docs/upgrading/0.11.0.md) §1.2.
+
+- **Breaking and behavior changes.** Batch and webhook-delivery starts take the execution timeout of the type (issue #2417). A refine run waits for an adoption, and each adoption writes a lesson (issues #2381 and #2382). An agent reset removes lessons, counts memory entries and erases transcripts (issues #2382 and #2604). A sample run under a mandate counts each draw (issue #2449). A gated tool call sends an approval notice (issue #2603). `WorkerConfig`, `ScannerConfig`, `ExecOptions` and many agent types gain public fields and variants, and `TranscriptStore` is async. Each has its own section in [`docs/upgrading/0.11.0.md`](docs/upgrading/0.11.0.md) §1.
+
+- **Turn on the new features after the roll.** A `0.10.0` process cannot decode the new strategies, refusals and agent ops, and does not know the new override routes and columns. Change no schedule override and no shard routing until every process runs `0.11.0`. See [`docs/upgrading/0.11.0.md`](docs/upgrading/0.11.0.md) §3.
+
+### Added
+
+- **Runtime overrides of activity defaults (issues #2410 and #2411).** `PATCH /admin/activity-types/{activity_name}/defaults` takes the retry policy, the four timeouts and the `max_concurrent` cap of an activity type. A cap change also sets the cap of the live task rows. See [`docs/operations/activity-default-overrides.md`](docs/operations/activity-default-overrides.md).
+
+- **Schedule input overrides (issue #2412).** `PATCH /admin/schedules/{id}` on a code-declared workflow schedule takes `input`. The input is stored in the payload codec form, and the codec rotation sweep re-encodes it.
+
+- **Claim slots and the batch claim (issues #2421 and #2693).** `WorkerConfig::with_claim_slots_per_shard` caps the claim statements that run at once on one shard, across the fleet. `WorkerConfig::with_claim_batch_max` lets one claim statement take up to 2, 4 or 8 rows. Both are off by default. See [`docs/operations/claim-slots.md`](docs/operations/claim-slots.md) and [`docs/operations/claim-batch.md`](docs/operations/claim-batch.md).
+
+- **Pre-deploy analyses.** DAG slack, leverage, crash and worker-demand plans, the DAG and activity retry envelopes, the retry storm and throttle forecasts, the shape census, and the schedule herd forecast with `GET /admin/schedules/herd` and `harvest schedule herd`. Each analysis is pure and sends no SQL, apart from the herd route that reads the schedules. See [`docs/dag-and-retry-analyses.md`](docs/dag-and-retry-analyses.md).
+
+- **External activities on SQLite (issue #2607).** `ctx.execute_activity_external` parks a SQLite run. `SqliteRuntime::complete_external`, `fail_external`, `extend_external_deadline` and `list_external_handoffs` settle and read the handoffs.
+
+- **A private file system for the process sandbox (issues #2697, #2715 and #2719).** `ExecOptions::fs` takes `FsIsolation::Mask` or `FsIsolation::Pivot`. A host that refuses the mount namespace fails the run closed.
+
+- **`HarvestPlugin` on SQLite.** `HarvestPlugin::agent` hosts the durable agent on both backends (issue #2641). A tenant Harvest file ships with its database (issue #2649), and a closed tenant wakes when its next timer or schedule is due (issue #2650). The overlay store opens on a connection factory (issue #2656).
+
+- **Inference strategies (epic #2438).** The vote (issue #2444), the model cascade (issue #2445), step-level beam search (issue #2446) and the dataset sweep (issue #2448). A durable agent op and a delegation can run a strategy, and a mandate bounds the draws of a subtree (issues #2449 and #2610). The `sweep` workflow tool starts a sweep from a running agent (issue #2716). `examples/agent-strategies` and ADR 0017 cover them.
+
+- **The refine loop (issues #2381, #2382, #2383, #2577 and #2579).** An adoption gate with approve, edit and reject, a lesson library per kind, a keyed live fork, per-turn probe rows and a live rule in selection. The `agent_refine` example, a guide section and ADR 0016 cover them.
+
+- **Agent models and stores.** The `anthropic` feature adds `anthropic::ClaudeModel` (issue #2605). The `openai` feature adds `openai::OpenAiModel` for any OpenAI-compatible endpoint (PR #2633). Durable episode, memory and transcript stores ship for SQLite and Postgres (issue #2604).
+
+- **Agent operations.** Reload the profile of a running agent with `Control::ReloadProfile` and `harvest agents reload` (issue #2658). A gated tool call sends an approval notice (issue #2603). An unanswered durable peer has a verdict and a key (issue #2484).
+
+- **Examples.** `examples/rhai-scripts` runs a Rhai script as one durable workflow on SQLite (PR #2590). `autumn-harvest-agent/examples/sqlite_mesh.rs` runs a small mesh (issue #2486).
+
+### Fixed
+
+- **The reshard override carry (issues #2413 and #2602).** The carry of a DAG schedule override fences both shards, keeps a clear across a retry, and stays safe under any routing change.
+
+- **SQLite fleet restores (issues #2660, #2721, #2753 and #2759).** A direct fleet restore supersedes a pending Harvest target. A reused database identity no longer hides a restore. A failed removal of the restore target, and a failed sidecar move, refuse the open.
+
+- **A queued signal that wins a race (issue #2603).** A `ctx.race()` that a signal settles on its first poll arms no other branch, so its replay no longer diverges.
+
+- **A read-only agent run refuses a workspace change (issue #2692).** Before, the run reported success and dropped the change.
+
+- **A consolidation pass sets no output cap (issues #2695 and #2696).** A capped reply that does not parse ends as `OutputCapped`.
+
+- **A debug-build agent workflow fits a small stack (issue #2752).** `autumn_harvest::frame::boxed` moves the large child futures to the heap.
+
+### Performance
+
+- **Hot statements stay prepared, and the hot path sends fewer round trips (issues #2651 and #2654).** Planner runs per bench run fall from 172,247 to 11,795 with the cache, and the `throughput` cell moves from 47.8 to 82.0 workflows/s. See [`docs/performance-hot-path-statement-cache.md`](docs/performance-hot-path-statement-cache.md) and [`docs/performance-hot-path-round-trips.md`](docs/performance-hot-path-round-trips.md).
+
+- **Claim path.** The window refines by TID (issue #2547), the window splits from the full claim (issue #2680), an activity start merges its claim lock (PR #2683), a keyed claim counts only its own keys (issue #2744), and by-id and by-execution row guards keep their key index (issues #2713 and #2751). A NOTIFY cuts the settle once (issue #2653).
+
+- **Gauges.** Each database gauge sampler runs on `WorkerConfig::gauge_sample_interval`, 15 s by default (issue #2668). One elected worker reads each shard (issue #2679). The DLQ depth reads a counter (issue #2677), and the concurrency gauges read a live-row index (issue #2678).
+
+- **Indexes and scans.** Open-timer lookups read only the open timers (issue #2643). Five redundant indexes are gone (issue #2684). An idle external-outbox claim reads a pending table (issue #2724). The tenant LLM spend read is index-only (issue #1997). The heartbeat task-stats prune reads only old rows (PR #2655), and the retention pass keeps its statements prepared.
+
+### Documentation
+
+- **0.11.0 upgrade guide.** [`docs/upgrading/0.11.0.md`](docs/upgrading/0.11.0.md) is new. The post-tag sections of the 0.10.0 guide move into it, and the 0.10.0 guide returns to the text that shipped with 0.10.0, with the MSRV correction of PR #2596. The rolling-deploy contract lists the known limits for 0.10 and 0.11.
+
+- **Errata.** The 0.9.0 and 0.10.0 guides state MSRV 1.97.0 (PR #2596). The agent-mesh guide states the run id, roster and reply rules (issue #2485).
+
+### Testing
+
+- **CI fails when it cannot run an isolation test (issues #2741 and #2757).** `HARVEST_TEST_REQUIRE_ISOLATION=1` turns a skipped namespace test into a failure, and CI runs the root-only mount tests.
+
+- **Crate packaging on release PRs (issue #1988).** `cargo xtask check crate-packaging` packages and verifies each publishable crate. [`docs/releasing.md`](docs/releasing.md) gives the publish order, and [`docs/upgrading/README.md`](docs/upgrading/README.md#support-window) states the support window.
+
+- **Comment hygiene is at zero (PR #2682).** Review-round archaeology and contractions fail the build anywhere.
+
 ## [0.10.0] - 2026-11-05
 
 ### Upgraded
@@ -89,7 +169,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Breaking and behavior changes.** The `schema` feature uses `schemars` 1.x, so a type that derives the 0.8 `JsonSchema` no longer builds, and a schema contract from 0.8.0 reports three schema-form deltas once (PR #2504); `harvest_workflow_executions`, `harvest_task_queue` and `harvest_schedules` split into a core and an `_ext` Diesel declaration, so a moved column changes its path and `WorkflowExecution` holds its rebalance columns in `rebalance` (issue #2492); `WorkerConfig`, `SqliteError` and the agent request, task, profile, report and evaluation types gain public fields or variants; `load_skill` is a reserved tool name (issue #2373); and `eval::Candidate::model` checks the model before the first call (issue #2375). Each has its own section and check in [`docs/upgrading/0.9.0.md`](docs/upgrading/0.9.0.md) §1. `autumn-web` stays at 0.9 and the MSRV stays at 1.88.0.
+- **Breaking and behavior changes.** The `schema` feature uses `schemars` 1.x, so a type that derives the 0.8 `JsonSchema` no longer builds, and a schema contract from 0.8.0 reports three schema-form deltas once (PR #2504); `harvest_workflow_executions`, `harvest_task_queue` and `harvest_schedules` split into a core and an `_ext` Diesel declaration, so a moved column changes its path and `WorkflowExecution` holds its rebalance columns in `rebalance` (issue #2492); `WorkerConfig`, `SqliteError` and the agent request, task, profile, report and evaluation types gain public fields or variants; `load_skill` is a reserved tool name (issue #2373); and `eval::Candidate::model` checks the model before the first call (issue #2375). Each has its own section and check in [`docs/upgrading/0.9.0.md`](docs/upgrading/0.9.0.md) §1. `autumn-web` stays at 0.9. The MSRV moves from 1.88.0 to 1.97.0: the published 0.9.0 crates declare 1.97.0 (corrected by PR #2596).
 
 - **Turn on the new agent features after the roll.** A 0.8.0 worker cannot replay the recorded overlay read, and it drops the skills, draw and context-reset fields. Install an overlay store, a proposer or a scorer, and set skills, draws or a context reset, only after every worker runs 0.9.0. See [`docs/upgrading/0.9.0.md`](docs/upgrading/0.9.0.md) §3.
 

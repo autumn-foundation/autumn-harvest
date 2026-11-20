@@ -630,13 +630,13 @@ HarvestPlugin::new()
 
     #[test]
     fn a_checkout_run_takes_the_autumn_web_requirement_of_the_plugin() {
-        let plugin = "[dependencies]\nautumn-web = \"0.10\"\n\n[dev-dependencies]\nautumn-web = { version = \"0.10\", features = [\"mcp\"] }\n";
+        let plugin = "[dependencies]\nautumn-web = \"0.11\"\n\n[dev-dependencies]\nautumn-web = { version = \"0.11\", features = [\"mcp\"] }\n";
         let requirement = plain_requirement(plugin, "autumn-web");
-        assert_eq!(requirement.as_deref(), Some("0.10"));
-        let toml = "[dependencies]\nautumn-web = \"0.9\"\nautumn-harvest = \"0.9\"\n";
+        assert_eq!(requirement.as_deref(), Some("0.11"));
+        let toml = "[dependencies]\nautumn-web = \"0.10\"\nautumn-harvest = \"0.10\"\n";
         let text = point_at_checkout(toml, "/repo", requirement.as_deref()).unwrap();
         assert!(
-            text.starts_with("[dependencies]\nautumn-web = \"0.10\"\n"),
+            text.starts_with("[dependencies]\nautumn-web = \"0.11\"\n"),
             "{text}"
         );
         assert!(plain_requirement("[dependencies]\nserde = \"1\"\n", "autumn-web").is_none());

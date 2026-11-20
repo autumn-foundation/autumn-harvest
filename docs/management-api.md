@@ -30,6 +30,7 @@ New route families added in **0.5.0** (all in the contract; each has a CLI verb)
 - `POST /workflows/{id}/activities/{activity_exec_id}/fail-now` — force-fail one hung in-flight activity (#765).
 - `GET /workflows/{id}/completion-deliveries` + `.../redrive` — durable completion-callback deliveries (#605).
 - `PATCH /admin/schedules/{id}` — in-place cron/input edit without recreate (#771).
+- `GET /admin/schedules/herd` — the moments when many schedules start runs together. See [Schedule herd forecast](#schedule-herd-forecast).
 - `GET /admin/status` — one-call rolled-up health verdict (#679).
 - `GET /admin/config` — redacted effective runtime config (#695).
 - `GET /admin/usage` — per-tenant/per-workflow historical usage report (#596).
@@ -1047,3 +1048,117 @@ for the full walkthrough and the
 [idempotency chapter](getting-started/06-idempotency.md#idempotent-signal-delivery)
 for the surrounding idempotency story (including `signal-with-start` for the
 first-delivery case).
+
+## Schedule herd forecast
+
+`GET /admin/schedules/herd` finds the moments when many schedules start
+runs together. Each schedule passes validation alone. So twenty schedules on
+`0 * * * *` start twenty runs at the top of each hour, and nothing warns.
+The route is read-only. It reads every schedule row on every shard and
+writes nothing.
+
+### Parameters
+
+| Parameter | Default | Range | Meaning |
+|---|---|---|---|
+| `from` | now | RFC 3339 UTC, year 9000 or earlier | The start of the window. |
+| `hours` | `24` | 1 to 744 | The length of the window. |
+| `bucket_secs` | `60` | 1 to 86400 | The width of one bucket. |
+| `min_herd` | `2` | 2 or more | The fewest schedules in one bucket that make a herd. |
+| `limit` | `50` | 1 to 500 | The most spots to list. |
+
+The route clamps `hours`, `bucket_secs`, `min_herd` and `limit` into their
+range. It does not refuse them. A `from` that does not parse answers `400`.
+
+### How it forecasts
+
+- It walks each active cron schedule over `[from, from + hours)`. It puts
+  each start into the bucket that starts at a whole multiple of
+  `bucket_secs` since the Unix epoch.
+- A start is the slot plus the jitter of its schedule, as the scheduler
+  computes it.
+- Each schedule stops at its `end_at` and at the end of its `max_runs`
+  budget, as in the scheduler.
+- **Calendar exclusions are not applied yet.** A slot that a calendar skips
+  still counts.
+
+### Response
+
+```json
+{
+  "from": "2026-12-01T00:00:00Z",
+  "until": "2026-12-02T00:00:00Z",
+  "bucket_secs": 60,
+  "min_herd": 2,
+  "fires": 72,
+  "spot_count": 24,
+  "spots": [
+    {
+      "at": "2026-12-01T00:00:00Z",
+      "size": 2,
+      "schedules": [
+        { "id": "…", "name": "billing" },
+        { "id": "…", "name": "etl" }
+      ]
+    }
+  ],
+  "offenders": [
+    { "id": "…", "name": "billing", "spots": 24, "jitter_secs": 0 },
+    { "id": "…", "name": "etl", "spots": 24, "jitter_secs": 0 }
+  ],
+  "unanchored": [],
+  "inactive": [],
+  "truncated": [],
+  "status": "complete",
+  "unavailable_shards": []
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `fires` | The runs that start inside the window, over every active schedule. |
+| `spot_count` | The spots before `limit` applies. |
+| `spots` | The buckets with at least `min_herd` schedules. The largest comes first. Spots of equal size are in time order. |
+| `offenders` | Each schedule in a spot, the one in the most spots first. Move these schedules first, or give them a wider `jitter_secs`. |
+| `unanchored` | Interval schedules. Their fire times depend on their last run, so the route does not forecast them. |
+| `inactive` | Paused, auto-paused, exhausted, manual and unparsable schedules. The scheduler fires none of them. |
+| `truncated` | Schedules that the forecast cut short. See below. |
+| `status` | `complete`, or `partial` when a shard did not answer. |
+| `unavailable_shards` | The shards that did not answer, each with `shard_id` and `reason`. |
+
+A schedule name is its DAG name, else its workflow name. The route keys each
+schedule by its row id, so two rows with one name stay two schedules.
+
+`truncated` lists these schedules:
+
+- a schedule with more than 100,000 fires in the window;
+- a schedule with a run budget and too many slots before the window, or with
+  an overdue `next_run_at`. Its budget at the window is unknown;
+- a schedule whose jitter can carry a run past its next slot. Its catch-up
+  policy then decides which later slots run.
+
+The SQLite backend answers `501` for this route. See
+[`sqlite-plugin.md`](sqlite-plugin.md#schedules).
+
+### CLI usage
+
+```bash
+# The herds of the next 24 hours, in 60 s buckets.
+harvest schedule herd
+
+# A week ahead, in 5-minute buckets, herds of three or more.
+harvest schedule herd --hours 168 --bucket-secs 300 --min-herd 3
+
+# A fixed window, as the raw JSON body.
+harvest schedule herd --from 2026-12-01T00:00:00Z --limit 500 --output json
+```
+
+The flags map onto the query parameters: `--from`, `--hours`,
+`--bucket-secs`, `--min-herd` and `--limit`. By default the command prints
+a table of the herds, then a table of the schedules to move first, with
+their jitter. It warns when the report is partial. `--output json` prints
+the raw body.
+
+The forecast is pure arithmetic in `autumn_harvest::schedule_herd`. See
+[`dag-and-retry-analyses.md`](dag-and-retry-analyses.md#schedule-herds-schedule_herd)
+for the library and its limits.
