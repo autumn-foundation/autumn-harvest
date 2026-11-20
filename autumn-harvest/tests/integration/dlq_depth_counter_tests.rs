@@ -574,3 +574,28 @@ async fn a_truncate_on_an_old_snapshot_resets_every_counter_row() {
             .expect("truncate");
     }
 }
+
+/// At `REPEATABLE READ` the seed would count a snapshot from before its lock.
+/// It would then miss each row that committed in the wait, and no trigger
+/// existed to count it. So the migration must refuse that level.
+#[tokio::test]
+async fn the_migration_refuses_an_isolation_level_above_read_committed() {
+    let mut f = fixture("dlq_depth_migrate_rr").await;
+    let dir = counter_migration_dir();
+    run_migration_file(&mut f.conn, &dir.join("down.sql")).await;
+    let up = std::fs::read_to_string(dir.join("up.sql")).expect("read up.sql");
+    let refused = f
+        .conn
+        .batch_execute(&format!(
+            "BEGIN ISOLATION LEVEL REPEATABLE READ;\n{up}\n;\nCOMMIT;"
+        ))
+        .await;
+    let _ = f.conn.batch_execute("ROLLBACK").await;
+    let error = refused.expect_err("the migration must refuse REPEATABLE READ");
+    assert!(
+        error.to_string().contains("READ COMMITTED"),
+        "the error must name the level to use: {error}"
+    );
+    run_migration_file(&mut f.conn, &dir.join("up.sql")).await;
+    assert_exact(&mut f.conn, "a migration at READ COMMITTED after a refusal").await;
+}

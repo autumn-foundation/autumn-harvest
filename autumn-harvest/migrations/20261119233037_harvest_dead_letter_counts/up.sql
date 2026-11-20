@@ -49,8 +49,19 @@ SET LOCAL lock_timeout = '5s';
 -- A `DO` block, because the test bundle runs this file in autocommit mode,
 -- where a bare `LOCK TABLE` is an error. In the migration transaction, the
 -- lock holds until the commit.
+--
+-- The seed must read a snapshot from after the lock. At `READ COMMITTED`
+-- each statement takes a new snapshot. At a higher level the snapshot can
+-- come from before the lock, and the seed would then miss each row that
+-- committed in the wait. No trigger counted those rows either. So the
+-- migration refuses a higher level. `harvest migrate` pins the level.
 DO $harvest_dead_letter_counts_lock$
 BEGIN
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION
+            'migration 20261119233037_harvest_dead_letter_counts needs READ COMMITTED, not %; set default_transaction_isolation for this session',
+            current_setting('transaction_isolation');
+    END IF;
     LOCK TABLE harvest_dead_letters IN SHARE ROW EXCLUSIVE MODE;
 END
 $harvest_dead_letter_counts_lock$;

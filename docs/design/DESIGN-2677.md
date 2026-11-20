@@ -96,6 +96,7 @@ documentation, and integration. They found these defects.
 | V9 | The docs cited the wrong baseline file, an uncommitted second run and an unmeasured seed time. | The perf page cites only committed artifacts. |
 | V10 | Codex: a writer that folds scans the whole counter. Under a held snapshot that scan grows with the flood, inside a failure transaction. | The trigger only inserts. The timeout pass folds once per tick, off the write path, whether metrics are on or off. `writers_only_insert_and_the_timeout_pass_folds` proves both. |
 | V11 | Codex: at `REPEATABLE READ`, the truncate trigger deleted only the counter rows of its snapshot. | The trigger truncates the counter. `a_truncate_on_an_old_snapshot_resets_every_counter_row` proves it. |
+| V12 | Codex: a Diesel run of the exported `MIGRATIONS` at a `REPEATABLE READ` default seeds from a snapshot older than its lock. | The migration raises at any level above `READ COMMITTED`, before the lock. `the_migration_refuses_an_isolation_level_above_read_committed` proves it. |
 
 ### 0.6 Decision
 

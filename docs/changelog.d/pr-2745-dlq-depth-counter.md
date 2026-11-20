@@ -33,9 +33,10 @@ stays exact, so the `harvest_dlq_growth` alert keeps its meaning.
   table. A long open snapshot does not slow the writers.
 - **Preflight.** `dlq_read_access` reads one row of `harvest_dead_letters`
   as well as the depth.
-- **Migration runner.** `migrate::apply_in_transaction` pins
-  `READ COMMITTED`, so a body that counts after a lock sees every committed
-  row.
+- **Isolation.** `migrate::apply_in_transaction` pins `READ COMMITTED`,
+  so a body that counts after a lock sees every committed row. The
+  migration itself refuses a higher level, so a Diesel run of `MIGRATIONS`
+  at a `REPEATABLE READ` default fails loudly, not with a short seed.
 - **Harness.** `worker_sampler_cadence_perf` gains
   `zz_capture_dead_letter_write_costs`, with a held-snapshot phase and a
   `PERF_WITHOUT_COUNTER=1` baseline mode.
