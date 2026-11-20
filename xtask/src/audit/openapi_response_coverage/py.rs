@@ -497,7 +497,7 @@ pub fn to_usize(value: isize) -> usize {
     usize::try_from(value).unwrap_or(0)
 }
 
-fn spans_of(captures: &fancy_regex::Captures<'_>) -> Rc<[Option<(usize, usize)>]> {
+fn spans_of(captures: &fancy_regex::Captures<'_, str>) -> Rc<[Option<(usize, usize)>]> {
     (0..captures.len())
         .map(|index| {
             captures
