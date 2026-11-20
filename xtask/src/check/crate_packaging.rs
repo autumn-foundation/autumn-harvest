@@ -19,6 +19,10 @@
 //!
 //! A dependency is a normal or build dependency, or a dev dependency with a
 //! version. Cargo removes a path-only dev dependency from the package.
+//! `cargo metadata` shows such a dependency with the requirement `*`. A
+//! path dev dependency with `version = "*"` looks the same, so the plan
+//! check skips it. The full check still fails on it, and crates.io refuses
+//! a `*` requirement.
 //!
 //! The full check then runs `cargo package --locked` for each crate in one
 //! run. Cargo verifies each crate against a local registry that holds its
@@ -135,6 +139,13 @@ pub fn run(mut args: Args) -> Result<ExitCode> {
             Ok(status.success())
         },
         |path| std::fs::metadata(path).ok().map(|meta| meta.len()),
+        |path| {
+            if path.exists() {
+                std::fs::remove_file(path)
+                    .with_context(|| format!("removing the old {}", path.display()))?;
+            }
+            Ok(())
+        },
     )?;
     Ok(report.emit())
 }
@@ -396,13 +407,15 @@ fn fail(report: &mut Report, title: &str, findings: &[String], hint: &str) {
 /// Runs the check on the parsed inputs.
 ///
 /// `package` runs `cargo package` and returns true on success. `size`
-/// returns the size of a file, or `None` when it is missing.
+/// returns the size of a file, or `None` when it is missing. `remove`
+/// deletes a file if it exists.
 fn evaluate(
     workspace: Option<&Workspace>,
     doc: Option<&str>,
     args: Args,
     package: impl FnOnce(&[String]) -> Result<bool>,
     size: impl Fn(&Path) -> Option<u64>,
+    mut remove: impl FnMut(&Path) -> Result<()>,
 ) -> Result<Report> {
     let mut report = Report::new();
     // A gate that read no crate list must not print OK.
@@ -468,10 +481,7 @@ fn evaluate(
         .collect();
     // An old file from an earlier run must not pass the size check.
     for (_, path) in &files {
-        if path.exists() {
-            std::fs::remove_file(path)
-                .with_context(|| format!("removing the old {}", path.display()))?;
-        }
+        remove(path)?;
     }
     if !package(&package_args(&order, args))? {
         report.fail("cargo package failed. Read the cargo output above.");
@@ -500,7 +510,7 @@ fn evaluate(
         return Ok(report);
     }
     report.out(format!(
-        "OK: {} crates package for crates.io, in the documented order: {}.",
+        "OK: {} crates package for crates.io: {}.",
         order.len(),
         order.join(", ")
     ));
@@ -676,6 +686,56 @@ mod tests {
             "1. `outside`\n{ORDER_START}\n\n1. `core`: the base crate.\n2. `app`\n{ORDER_END}\n3. `after`\n"
         );
         assert_eq!(parse_order(&text), Ok(order(&["core", "app"])));
+    }
+
+    #[test]
+    fn the_order_reads_crlf_and_indented_items() {
+        let text = format!("{ORDER_START}\r\n  1. `core`\r\n  2. `app`\r\n{ORDER_END}\r\n");
+        assert_eq!(parse_order(&text), Ok(order(&["core", "app"])));
+    }
+
+    #[test]
+    fn one_unpublished_dependency_is_one_finding() {
+        let members = vec![
+            member("core", &[("tool", true), ("tool", true), ("core", true)]),
+            unpublished("tool"),
+        ];
+        assert_eq!(
+            plan_findings(&members, &order(&["core"])),
+            ["core: depends on tool, which sets `publish = false`."]
+        );
+    }
+
+    #[test]
+    fn metadata_reads_renamed_registry_and_multi_registry_entries() {
+        let metadata = serde_json::json!({
+            "workspace_members": ["core 1", "app 1"],
+            "target_directory": "/r/target",
+            "packages": [
+                {
+                    "id": "core 1", "name": "core", "version": "1.0.0",
+                    "description": "Core.", "license": "MIT",
+                    "publish": ["crates-io", "private"], "dependencies": []
+                },
+                {
+                    "id": "app 1", "name": "app", "version": "1.0.0",
+                    "description": "App.", "license": "MIT", "publish": null,
+                    "dependencies": [
+                        { "name": "core", "rename": "base", "kind": null, "req": "^1.0.0", "path": "/r/core" },
+                        { "name": "core", "kind": "dev", "req": "^0.9" },
+                        { "name": "core", "kind": null, "req": "^1.0.0", "path": "/r/core",
+                          "target": "cfg(unix)", "optional": true }
+                    ]
+                }
+            ]
+        });
+        let parsed = parse_metadata(&metadata).expect("workspace");
+        assert!(parsed.members[0].publishable);
+        let core = Edge {
+            name: "core".into(),
+            kept: true,
+        };
+        assert_eq!(parsed.members[1].edges, [core.clone(), core]);
     }
 
     #[test]
@@ -871,6 +931,7 @@ mod tests {
                 Ok(true)
             },
             |path| (path == Path::new("/t/package/core-1.0.0.crate")).then_some(WARN_CRATE_BYTES),
+            |_| Ok(()),
         )
         .expect("evaluate");
         assert_eq!(seen, ["package", "--locked", "-p", "core", "-p", "app"]);
@@ -900,6 +961,7 @@ mod tests {
             annotate,
             |_| Ok(true),
             |_| Some(WARN_CRATE_BYTES),
+            |_| Ok(()),
         )
         .expect("evaluate");
         assert_eq!(report.code(), 0, "{}", report.stderr());
@@ -913,15 +975,53 @@ mod tests {
     }
 
     #[test]
+    fn stale_crate_files_are_removed_before_the_package_run() {
+        let ws = two_crates();
+        let text = doc(&["core", "app"]);
+        let events = std::cell::RefCell::new(Vec::new());
+        let report = evaluate(
+            Some(&ws),
+            Some(&text),
+            FULL,
+            |_| {
+                events.borrow_mut().push("package".to_owned());
+                Ok(true)
+            },
+            |_| Some(1024),
+            |path| {
+                events.borrow_mut().push(path.display().to_string());
+                Ok(())
+            },
+        )
+        .expect("evaluate");
+        assert_eq!(report.code(), 0, "{}", report.stderr());
+        assert_eq!(
+            events.into_inner(),
+            [
+                "/t/package/core-1.0.0.crate",
+                "/t/package/app-1.0.0.crate",
+                "package"
+            ]
+        );
+    }
+
+    #[test]
     fn a_clean_full_run_passes() {
         let ws = two_crates();
         let text = doc(&["core", "app"]);
-        let report =
-            evaluate(Some(&ws), Some(&text), FULL, |_| Ok(true), |_| Some(1024)).expect("evaluate");
+        let report = evaluate(
+            Some(&ws),
+            Some(&text),
+            FULL,
+            |_| Ok(true),
+            |_| Some(1024),
+            |_| Ok(()),
+        )
+        .expect("evaluate");
         assert_eq!(report.code(), 0, "{}", report.stderr());
         assert_eq!(
             report.stdout(),
-            "OK: 2 crates package for crates.io, in the documented order: core, app.\n"
+            "OK: 2 crates package for crates.io: core, app.\n"
         );
     }
 
@@ -935,6 +1035,7 @@ mod tests {
             PLAN,
             |_| panic!("no package run"),
             |_| panic!("no size read"),
+            |_| Ok(()),
         )
         .expect("evaluate");
         assert_eq!(report.code(), 0, "{}", report.stderr());
@@ -954,6 +1055,7 @@ mod tests {
             FULL,
             |_| panic!("no package run"),
             |_| panic!("no size read"),
+            |_| Ok(()),
         )
         .expect("evaluate");
         assert_eq!(report.code(), 1);
@@ -974,6 +1076,7 @@ mod tests {
             FULL,
             |_| Ok(false),
             |_| panic!("no size read"),
+            |_| Ok(()),
         )
         .expect("evaluate");
         assert_eq!(report.code(), 1);
@@ -990,8 +1093,15 @@ mod tests {
             (Some(&empty), Some(text.as_str())),
             (Some(&ws), None),
         ] {
-            let report =
-                evaluate(workspace, page, PLAN, |_| panic!("no run"), |_| None).expect("evaluate");
+            let report = evaluate(
+                workspace,
+                page,
+                PLAN,
+                |_| panic!("no run"),
+                |_| None,
+                |_| Ok(()),
+            )
+            .expect("evaluate");
             assert_eq!(report.code(), 1);
             assert!(
                 report.stderr().contains("The check fails closed."),
@@ -1010,6 +1120,7 @@ mod tests {
             PLAN,
             |_| panic!("no run"),
             |_| None,
+            |_| Ok(()),
         )
         .expect("evaluate");
         assert_eq!(report.code(), 1);

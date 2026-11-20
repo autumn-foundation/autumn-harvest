@@ -23,5 +23,5 @@ Publishing stays manual. CI holds no registry token. The design is in
 
 Tests: unit tests in `xtask/src/check/crate_packaging.rs`. Three guard
 tests in `autumn-harvest/tests/integration/release_pr_ci.rs` check the
-release job, the lint step, and that no release workflow holds a registry
+release job, the lint step, and that no workflow holds a registry
 token or publishes.

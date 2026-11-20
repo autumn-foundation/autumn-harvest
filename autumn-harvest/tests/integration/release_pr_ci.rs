@@ -192,38 +192,61 @@ fn release_pr_packages_every_publishable_crate() {
             "the release PR runs the full check, with no `{flag}`:\n{runs}"
         );
     }
-    assert_ne!(
+    assert_eq!(
         doc["jobs"]["crate-packaging"]["if"].as_str(),
-        None,
+        Some("github.event.pull_request.draft == false"),
         "a draft release PR skips the slow packaging build"
     );
 }
 
-/// Publishing stays manual. No release job holds a registry token.
+/// Publishing stays manual. No workflow holds a registry token or publishes.
 #[test]
-fn no_release_workflow_holds_a_registry_token_or_publishes() {
+fn no_workflow_holds_a_registry_token_or_publishes() {
     let release_pr = parse_workflow(RELEASE_PR);
+    let job = &release_pr["jobs"]["crate-packaging"];
     assert!(
-        release_pr["jobs"]["crate-packaging"].is_mapping(),
+        job.is_mapping(),
         "{RELEASE_PR} must have a `crate-packaging` job"
     );
-    let job = serde_yaml::to_string(&release_pr["jobs"]["crate-packaging"]).expect("job");
+    let text = serde_yaml::to_string(job).expect("job");
     assert!(
-        !job.contains("secrets."),
-        "the packaging job must read no secret:\n{job}"
+        !text.contains("secrets."),
+        "the packaging job must read no secret:\n{text}"
     );
-    let permissions = &release_pr["jobs"]["crate-packaging"]["permissions"];
+    assert_eq!(
+        release_pr["permissions"]["contents"].as_str(),
+        Some("read"),
+        "the release PR token must be read-only"
+    );
     assert!(
-        permissions.is_null() || permissions["contents"].as_str() == Some("read"),
-        "the packaging job must keep the read-only token: {permissions:?}"
+        job["permissions"].is_null() || job["permissions"]["contents"].as_str() == Some("read"),
+        "the packaging job must keep the read-only token: {:?}",
+        job["permissions"]
     );
-    for rel in [RELEASE_PR, ".github/workflows/release.yml"] {
-        let text = std::fs::read_to_string(super::ci_run_coverage::repo_root().join(rel))
-            .expect("workflow");
-        for needle in ["CARGO_REGISTRY_TOKEN", "NPM_TOKEN", "NODE_AUTH_TOKEN"] {
+
+    let dir = super::ci_run_coverage::repo_root().join(".github/workflows");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&dir).expect("workflows") {
+        let path = entry.expect("entry").path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("yml") {
+            continue;
+        }
+        checked += 1;
+        let rel = format!(
+            ".github/workflows/{}",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        );
+        let text = std::fs::read_to_string(&path).expect("workflow");
+        for needle in [
+            "CARGO_REGISTRY_TOKEN",
+            "NPM_TOKEN",
+            "NODE_AUTH_TOKEN",
+            "crates-io-auth-action",
+            "publish-crates",
+        ] {
             assert!(!text.contains(needle), "{rel} must not hold `{needle}`");
         }
-        for run in workflow_run_commands(&parse_workflow(rel)) {
+        for run in workflow_run_commands(&parse_workflow(&rel)) {
             for needle in ["cargo publish", "npm publish"] {
                 assert!(
                     !run.contains(needle),
@@ -232,6 +255,7 @@ fn no_release_workflow_holds_a_registry_token_or_publishes() {
             }
         }
     }
+    assert!(checked > 1, "no workflow was read from {}", dir.display());
 }
 
 /// Each pull request checks the publish order, so a new crate cannot reach
