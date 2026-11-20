@@ -1,4 +1,4 @@
-## Concurrency gauges read only the live keyed rows (issue #2678)
+## Concurrency gauges read only the live keyed rows (issue #2678, PR #2746)
 
 `queue::concurrency_key_stats` feeds the gauges `harvest.concurrency.in_flight`
 and `harvest.concurrency.deferred`. No index held its `PENDING` rows with a
