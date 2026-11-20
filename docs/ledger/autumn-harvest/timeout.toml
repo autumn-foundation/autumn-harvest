@@ -12,24 +12,24 @@ plan = "docs/ledger/plans/autumn-harvest/timeout.md"
 driver = "per_tick"
 backend = ["postgres"]
 kind = ["read"]
-tables = ["harvest_events", "harvest_workflow_executions"]
-measured = "unmeasured"
+tables = ["harvest_events", "harvest_external_outbox_pending", "harvest_workflow_executions"]
+measured = "docs/performance-external-outbox-idle.md"
 plan = "docs/ledger/plans/autumn-harvest/timeout.md"
 
 ["enforce_external_cancels_outbox"]
 driver = "per_tick"
 backend = ["postgres"]
 kind = ["read"]
-tables = ["harvest_events", "harvest_workflow_executions"]
-measured = "unmeasured"
+tables = ["harvest_events", "harvest_external_outbox_pending", "harvest_workflow_executions"]
+measured = "docs/performance-external-outbox-idle.md"
 plan = "docs/ledger/plans/autumn-harvest/timeout.md"
 
 ["enforce_external_signals_outbox"]
 driver = "per_tick"
 backend = ["postgres"]
 kind = ["read"]
-tables = ["harvest_events", "harvest_workflow_executions"]
-measured = "docs/performance-external-outbox-scan.md"
+tables = ["harvest_events", "harvest_external_outbox_pending", "harvest_workflow_executions"]
+measured = "docs/performance-external-outbox-idle.md"
 plan = "docs/ledger/plans/autumn-harvest/timeout.md"
 
 ["enforce_external_task_timeouts"]
