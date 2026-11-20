@@ -18,6 +18,8 @@ name: Sandbox (KVM)
 
 on:
   pull_request:
+    # `ready_for_review` runs the job when a draft becomes ready.
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - "autumn-harvest/src/sandbox/**"
       - "autumn-harvest/Cargo.toml"
@@ -104,7 +106,7 @@ jobs:
         run: >-
           cargo test -p autumn-harvest --no-default-features --features sandbox-activities --lib
           sandbox::firecracker::kvm_tests -- --ignored --skip root_ --test-threads=1
-      - name: Run the root tests, the jailer and snapshot tests among them
+      - name: Run the root tests with sudo
         run: |
           bin="$(cargo test -p autumn-harvest --no-default-features --features sandbox-activities \
             --lib --no-run --message-format=json \

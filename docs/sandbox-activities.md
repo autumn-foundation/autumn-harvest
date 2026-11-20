@@ -627,10 +627,10 @@ non-root user. To allow it, run
 `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`. The change
 lasts until the next reboot.
 
-A test that needs root has a name that starts with `root_`, and it is
-ignored. No test skips on a non-root worker (issue #2757). As root, run the
-mount tests with the filter `sandbox::fs_isolation::tests::root_` and
-`--ignored`.
+A test that needs root has a name that starts with `root_` and has
+`#[ignore]`. No test that is not ignored skips for lack of root (issue
+#2757). As root, run the mount tests with the filter
+`sandbox::fs_isolation::tests::root_` and `--ignored`.
 
 The `Sandbox (KVM)` workflow boots real microVMs on a GitHub runner with
 `/dev/kvm`. It runs on each pull request that changes the sandbox code, and

@@ -1599,18 +1599,22 @@ mod tests {
             if unsafe { libc::unshare(libc::CLONE_FS | libc::CLONE_NEWNS) } != 0 {
                 return None;
             }
-            // SAFETY: mount reads valid C strings.
-            let shared = unsafe {
-                libc::mount(
-                    std::ptr::null(),
-                    c"/".as_ptr(),
-                    std::ptr::null(),
-                    libc::MS_REC | libc::MS_SHARED,
-                    std::ptr::null(),
-                )
-            };
-            if shared != 0 {
-                return None;
+            // Private first, then shared, gives this thread a new peer
+            // group. A leak then stays out of the host namespace.
+            for flags in [libc::MS_PRIVATE, libc::MS_SHARED] {
+                // SAFETY: mount reads valid C strings.
+                let changed = unsafe {
+                    libc::mount(
+                        std::ptr::null(),
+                        c"/".as_ptr(),
+                        std::ptr::null(),
+                        libc::MS_REC | flags,
+                        std::ptr::null(),
+                    )
+                };
+                if changed != 0 {
+                    return None;
+                }
             }
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
