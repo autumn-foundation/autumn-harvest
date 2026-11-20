@@ -44,6 +44,7 @@ such claims about twice a second.
 | The backfill misses a request that commits during the migration. | `CREATE TRIGGER` takes `SHARE ROW EXCLUSIVE`. No insert runs until the commit, so the backfill sees each committed request. |
 | The worker role cannot write the new table. Every request insert fails. | The upgrade guide lists the grants, as for `harvest_entity_state`. |
 | Concurrent resolutions deadlock on the pending row. | The claim locks the event row only, as before. A resolution deletes the pending row last, after its other locks. |
+| The claim locks a row that it then discards. | The lock sits inside the event probe, after the type, key and resolution checks. It still locks the event row only. |
 
 ## Six thinking hats
 

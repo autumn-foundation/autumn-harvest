@@ -253,7 +253,8 @@ pub const fn workflow_history_ceiling_query() -> &'static str {
      WHERE event_count >= $1"
 }
 
-/// The one query shape behind all three external-outbox scanners.
+/// The one query shape behind all three external-outbox scanners (issue
+/// #1486). `docs/performance-external-outbox-scan.md` measures its pins.
 ///
 /// The three scanners differ only in the request type they claim, the two
 /// events that resolve it, and the payload key that correlates them. The
@@ -272,8 +273,8 @@ pub const fn workflow_history_ceiling_query() -> &'static str {
 ///
 /// A trigger keeps one row in `harvest_external_outbox_pending` for each
 /// unresolved request. See [`crate::external_outbox`]. The claim reads that
-/// table, so its cost follows the backlog and not the history. An idle claim
-/// reads one index page.
+/// table, so its cost follows the backlog and not the history. After a
+/// vacuum, an idle claim reads no buffer.
 ///
 /// The claim keeps each predicate of the legacy query on the event row. So
 /// it selects a subset of the legacy rows. The table holds each unresolved
@@ -283,9 +284,9 @@ pub const fn workflow_history_ceiling_query() -> &'static str {
 /// # Why both joins are a `LATERAL`, and the resolution check is not
 ///
 /// A `LIMIT 1` inside a `LATERAL` cannot be pulled up into the outer query,
-/// so a correlated probe is structural. Each subquery returns at most one
-/// row with or without that `LIMIT`, because each probe is by primary key.
-/// So the pin changes no result.
+/// so a correlated probe is structural. Each probe matches one row by a
+/// unique id, so the pin changes no result. On the partitioned layout the
+/// event probe reads one index of each partition.
 ///
 /// The executions pin was free when measured: 6,350 buffers as an ordinary
 /// `INNER JOIN` against 6,358. It buys a plan that cannot change shape with
@@ -294,8 +295,8 @@ pub const fn workflow_history_ceiling_query() -> &'static str {
 /// The event pin is load-bearing. A plain join lets the planner read the
 /// request rows through `idx_harvest_events_external_outbox_pending`. The
 /// literal `event_type` makes that index usable. An equivalence class
-/// carries the literal over a join qual too, so `ev.event_type =
-/// p.request_type` does not stop it. On a small fixture the planner chose
+/// carries the literal over a join qual too. A qual such as `ev.event_type
+/// = p.request_type` would not stop it either. On a small fixture the planner chose
 /// that walk under a `Materialize`. The walk reads the whole history again.
 ///
 /// `e` is a subquery, so `FOR UPDATE OF e` takes its lock inside it. The lock
@@ -321,12 +322,14 @@ pub const fn workflow_history_ceiling_query() -> &'static str {
 /// append order. `id` is append order and decides every tie.
 ///
 /// `idx_harvest_external_outbox_pending_claim` leads with `request_type` and
-/// supplies that order. The ordered scan stops after one row.
+/// supplies that order for a backlog. The ordered scan then stops after one
+/// row. An empty or small table plans a scan and a sort, which cost almost
+/// nothing: 0 buffers idle, and 13 with one request.
 ///
 /// The result names the columns of [`crate::models::HarvestEvent`]. A cached
 /// statement must name its columns, so each scanner keeps its plan prepared.
-/// Each event type in the text is a literal, so the generic plan reads one
-/// prefix of the claim index.
+/// Each event type in the text is a literal, so a generic plan of the claim
+/// index reads one prefix of it.
 macro_rules! external_outbox_claim_query {
     (requested = $requested:literal, resolved = ($first:literal, $second:literal), key = $key:literal) => {
         concat!(

@@ -1,8 +1,8 @@
 # An idle external-outbox claim no longer reads the request history (issue #2724)
 
 The three external-outbox claims read a pending table now. An idle claim
-read every request that the deployment ever made. It now reads 0 buffers
-for each call, whatever the history holds.
+read every request that the deployment ever made. After a vacuum of the
+table, it reads 0 buffers for each call, whatever the history holds.
 
 ## 🎯 Workload
 
@@ -21,7 +21,7 @@ The fixture is the one from the issue. The scripts are in
   `ExternalSignalDelivered` marker. 80% are on terminal runs.
 - No pending request.
 
-Postgres 16.15. Each figure is `pg_stat_statements` shared buffers over 10
+Postgres 16.15. `sweep-after.txt` holds the per-size output. Each figure is `pg_stat_statements` shared buffers over 10
 calls of the generic plan, as the scanner keeps the statement prepared.
 
 ## 📈 Profile (before)
@@ -50,8 +50,10 @@ trigger `harvest_external_outbox_projection_trg` keeps it on `INSERT` into
 - A resolution deletes each row of its run with the same type and key.
 
 The claim reads the table in `(requested_at, event_row_id)` order. It finds
-each event by primary key in a `LATERAL` probe, and keeps each legacy
-predicate there. See `external_outbox_claim_query!` in `timeout.rs`.
+each event by its id in a `LATERAL` probe, and keeps each legacy predicate
+there. The lock moves into that probe. So it comes after the type, key and
+resolution checks, and it still locks the event row only. See
+`external_outbox_claim_query!` in `timeout.rs`.
 
 ## 📊 Measurement
 
@@ -63,22 +65,23 @@ Buffers for each idle claim:
 | 50,000 | 222,042 | 0 | 361 |
 | 200,000 | 942,191 | 0 | 1,394 |
 
-**Steady state** is the table after a vacuum pass. Each claim reads an
-empty index, so it reads no buffer. The first `EXPLAIN` of a session reads
-6 buffers, which are catalog reads, not table reads.
+**Steady state** is the table after a vacuum pass. The table is empty, so
+the plan is a scan and a sort of no rows, and a call reads no buffer. The
+first `EXPLAIN` of a session reports 6 buffers. Once a backlog grows, the
+plan reads `idx_harvest_external_outbox_pending_claim` in order instead.
 
 **Churn not yet vacuumed** is the worst case. `history.sql` loads the whole
 history in two statements with no vacuum between them. So each request adds
-a row, and its resolution deletes it. The claim then reads the leaf pages of
-the dead index entries: about one page for each 110 entries. The first claim
+a row, and its resolution deletes it. The claim then reads the pages of the
+dead entries: about one page for each 140 entries. The first claim
 also visits each dead heap tuple once and marks its entry dead. That claim
 read 4,323, 17,369 and 90,017 buffers at the three sizes. Later claims read
 only the leaf pages.
 
 In a live deployment, autovacuum removes the dead entries. The migration
 sets a fixed threshold of 1,000 dead rows on the table, so a pass starts
-after 1,000 resolutions, whatever the table size. That keeps the read near
-ten leaf pages.
+after 1,000 resolutions, whatever the table size. That keeps the read under
+ten pages.
 
 One pending request at H = 200k (`one-pending-h200k.txt`): **13 buffers**
 for each claim. The legacy claim reads the whole history first, so it costs
@@ -94,16 +97,18 @@ at least 942,191.
 | request | 1,007 | 1,494 to 1,534 | 191 to 262 ms | 511 to 560 ms |
 | resolution | 1,123 to 1,128 | 1,271 | 199 to 228 ms | 292 to 301 ms |
 
-So a request costs about 490 more bytes of WAL and 33 µs. A resolution costs
-about 149 bytes and 9 µs. The request adds one heap row and three index
+So a request costs about 490 to 530 more bytes of WAL and about 30 µs. A
+resolution costs about 145 bytes and 9 µs. `wal-runs.txt` holds the runs. The request adds one heap row and three index
 entries, and the trigger runs one resolution probe. The other event types do
 not call the function: the `WHEN` clause filters them in the executor.
 
 ## 🗄️ Migration cost
 
 The backfill reads each request once and probes its resolution. It took
-1.37 s at H = 200k. `CREATE TRIGGER` holds `SHARE ROW EXCLUSIVE` on
-`harvest_events` until the commit, so event appends wait that long.
+1.4 s at H = 200k (`backfill-h200k.txt`). `CREATE TRIGGER` holds `SHARE ROW
+EXCLUSIVE` on `harvest_events` until the commit. The foreign key holds it on
+`harvest_workflow_executions`. So event appends, run starts and run state
+changes wait that long.
 
 ## ✅ Equivalence
 
@@ -117,7 +122,8 @@ The backfill reads each request once and probes its resolution. It took
   statements and orders, and compares the table with the legacy predicate.
 - `external_outbox_pending_tests::an_idle_claim_does_not_read_the_resolved_history`
   bounds the idle claim of each family to 16 buffers over 3,000 resolved
-  requests. The legacy claim read 12,035.
+  requests. In the red run of this gate, before the change, the legacy
+  claim read 12,035.
 
 ## 🔬 Reproduce
 
@@ -147,7 +153,8 @@ to `20261114213149`. Run `wal.sql` on a fresh database at each schema.
   share of a mixed workload, as the issue states.
 - **`idx_harvest_events_external_outbox_pending` stays.** A worker of the
   previous release claims through it during a rolling deploy. A later
-  release can drop it. Each request then saves about 103 bytes of WAL.
+  release can drop it. `performance-external-outbox-scan.md` measured its
+  cost at about 103 bytes of WAL for each request.
 
 ## See also
 

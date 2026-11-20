@@ -7,6 +7,12 @@ obvious index fix as a **271% regression**, and filed a findings issue rather
 than a PR. This page measures the fix that works: the indexes and a query
 rewrite, together, because neither half stands alone.
 
+> **Superseded in part.** Issue #2724 replaced the outer scan of this page.
+> The claims now read `harvest_external_outbox_pending`, so the
+> `ORDER BY e.timestamp, e.id` pin below no longer ships. The resolution
+> indexes and the executions pin still ship. See
+> [`performance-external-outbox-idle.md`](performance-external-outbox-idle.md).
+
 ## 🎯 Workload
 
 `enforce_external_signals_outbox` (`timeout.rs`), and its `..._cancels_...` and

@@ -2,12 +2,13 @@
 
 An idle external-outbox claim no longer reads the request history. Before,
 each claim walked every request the deployment ever made: 942,191 buffers
-at 200,000 resolved requests and no pending request. Now it reads 0.
+at 200,000 resolved requests and no pending request. After a vacuum of the
+new table, it reads 0.
 
 Migration `20261119232545` adds `harvest_external_outbox_pending`, one row
 for each unresolved signal, cancel or await request. An `AFTER INSERT`
-trigger on `harvest_events` adds the row with the request and deletes it
-with the resolution, in the same transaction, on every insert path. A
+trigger on `harvest_events` adds the row with the request. It deletes the
+row with the resolution, in the same transaction, on every insert path. A
 request whose run already holds its resolution adds no row, so the insert
 order is unimportant. The migration backfills each unresolved request.
 
@@ -22,7 +23,7 @@ reinstalls the trigger, and `operator_triggers` exempts it. The startup
 preflight checks `SELECT`, `INSERT` and `DELETE` on the table.
 
 Evidence: `external_outbox_pending_tests` gates the trigger, the backfill,
-each layout change, a `DEFAULT` partition drain, the idle claim cost, and a
-property test against the legacy unresolved set. Write cost: about 490 bytes
-of WAL and 33 µs for each request. See
+each layout change and a `DEFAULT` partition drain. It also bounds the idle
+claim, and a property test compares the table with the legacy set. Write
+cost: about 490 to 530 bytes of WAL and about 30 µs for each request. See
 `docs/performance-external-outbox-idle.md` and `docs/design/DESIGN-2724.md`.

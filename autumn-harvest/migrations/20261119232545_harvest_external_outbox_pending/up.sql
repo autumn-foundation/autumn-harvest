@@ -26,16 +26,17 @@
 -- ## Lock cost
 --
 -- `CREATE TRIGGER` takes `SHARE ROW EXCLUSIVE` on `harvest_events` until the
--- commit, and the foreign key takes it on `harvest_workflow_executions`. So
--- no event insert runs while the backfill reads, and the backfill sees each
--- committed request. Event appends wait for the backfill. It reads each
--- request once: 1.4 s for 200,000 requests in a measured run. A held lock
--- fails the migration after 5 s, and the operator runs it again.
+-- commit. So no event insert runs while the backfill reads, and the backfill
+-- sees each committed request. The foreign key takes the same lock on
+-- `harvest_workflow_executions`. So event appends, run starts and run state
+-- changes wait for the backfill. It reads each request once: 1.4 s for
+-- 200,000 requests in a measured run. A held lock fails the migration after
+-- 5 s, and the operator runs it again.
 SET LOCAL lock_timeout = '5s';
 
 -- Each resolution deletes a row, so the table churns. The claim reads the
 -- leaf pages of its dead index entries until vacuum removes them: about one
--- page for each 110 entries. The default threshold scales with the table, so
+-- page for each 140 entries. The default threshold scales with the table, so
 -- a drained backlog can leave many dead entries. A fixed threshold starts
 -- vacuum after 1,000 dead rows, whatever the table size. Analyze uses the
 -- same threshold, so the estimate follows a drained backlog.
