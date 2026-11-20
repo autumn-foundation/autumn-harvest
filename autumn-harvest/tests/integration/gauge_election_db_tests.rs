@@ -961,20 +961,40 @@ async fn a_fleet_reads_each_shard_once_per_interval_and_emits_unchanged_values()
                 .iter()
                 .map(|r| r.shard_reads(scanner, shard))
                 .sum();
+            let baseline_ticks = unelected
+                .iter()
+                .map(|r| r.shard_passes(scanner, shard))
+                .max()
+                .unwrap_or(0);
             eprintln!(
                 "{scanner} shard {shard}: elected reads={reads} over {ticks} ticks; \
-                 unelected reads={baseline}"
+                 unelected reads={baseline} over {baseline_ticks} ticks"
             );
             assert!(ticks > 0, "{scanner} must run on shard {shard}");
+            assert!(
+                baseline_ticks > 0,
+                "{scanner} must run unelected on shard {shard}"
+            );
             // One read per tick, plus a first-tick read on each standby.
             assert!(
                 reads <= ticks + FLEET,
                 "{scanner} shard {shard}: the fleet must read the shard about once \
                  per interval, saw {reads} reads in {ticks} ticks"
             );
+            // The two runs get different tick counts on a busy runner. So the
+            // check compares reads per tick, not totals. Three workers read
+            // three times per tick without election, and about once with it.
+            // The check asks for half that gap, so runner noise cannot fail it.
+            let rate = |reads: usize, ticks: usize| {
+                f64::from(u32::try_from(reads).expect("fits"))
+                    / f64::from(u32::try_from(ticks).expect("fits"))
+            };
+            let (elected_rate, baseline_rate) =
+                (rate(reads, ticks), rate(baseline, baseline_ticks));
             assert!(
-                baseline >= reads * 2,
-                "{scanner} shard {shard}: election must cut the reads of {FLEET} workers"
+                baseline_rate >= elected_rate * 1.5,
+                "{scanner} shard {shard}: election must cut the reads of {FLEET} workers, \
+                 saw {elected_rate:.2} reads per tick against {baseline_rate:.2}"
             );
         }
         assert_eq!(
