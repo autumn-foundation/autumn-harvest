@@ -2848,6 +2848,9 @@ standalone note rather than part of the claim-path attribution table above:
   — the DLQ depth gauge read every dead letter: 744,158 buffers per call at
   1M dead letters. A counter of delta rows, kept by triggers, makes it 1
   buffer. A one-row dead-letter write costs about 2 to 4 buffers more.
+* [`docs/performance-concurrency-live-index.md`](performance-concurrency-live-index.md)
+  — the concurrency gauge read the whole task queue (issue #2678). A partial
+  index on the live keyed rows cuts each call by 93% at each size.
 * [`docs/performance-completion-trigger-outbox-queue.md`](performance-completion-trigger-outbox-queue.md)
   — the per-row `harvest_schedules` lookup in
   `completion_trigger::enforce_completion_triggers_outbox`'s cross-shard
@@ -3158,11 +3161,13 @@ standalone note rather than part of the claim-path attribution table above:
   — the retention candidate loop planned five statements per candidate.
   `cached_stmt` keeps them prepared (`pg_stat_statements`, `retention_reclaim_bench`).
 * [`docs/performance-claim-release-guard.md`](performance-claim-release-guard.md)
-  — a by-id task row statement could leave the primary key for a partial
-  index that matched its `state` or `worker_id` guard (issue #2713). A `CASE`
-  guard keeps each one on the primary key. On a 1M-row fixture, a recheck
-  reads 24 → 6 buffers at 20 rows per worker, and 201 → 6 after an idle
-  analyze.
+  — a by-id or by-execution task row statement could leave its key index
+  for a partial index that matched its `state` or `worker_id` guard (issue
+  #2713). A `CASE` guard keeps each one on its key index. On a 1M-row
+  fixture, a recheck reads 24 → 6 buffers at 20 rows per worker, and
+  201 → 6 after an idle analyze. A wake re-pend reads 1,411 → 4 after an
+  idle analyze. A workflow task index keeps a wake at 4 buffers for a run
+  with 50,000 rows.
 * [`docs/performance-claim-by-id-guard.md`](performance-claim-by-id-guard.md)
   — after an idle analyze, the by-id claim and the owner take read a
   live-row partial index instead of a full index (issue #2751). A `CASE`

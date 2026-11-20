@@ -133,8 +133,9 @@ ends. The test fails when a single sampler uses `poll_interval`.
   sampler per shard cuts the calls by the worker count. Issue #2679 does
   that for each database gauge sampler. See
   `docs/design/DESIGN-gauge-sampler-election.md`.
-- `concurrency_key_stats` scans the whole task queue. No index covers its
-  PENDING rows.
+- `concurrency_key_stats` scanned the whole task queue, because no index
+  covered its PENDING rows. `idx_harvest_tq_concurrency_live` now covers them.
+  See [the live keyed index page](performance-concurrency-live-index.md).
 
 ## 🔬 Reproduce
 

@@ -1,0 +1,198 @@
+# The concurrency gauge read the whole task queue
+
+This page follows issue #2678. `queue::concurrency_key_stats` feeds the gauges
+`harvest.concurrency.in_flight` and `harvest.concurrency.deferred`. It counts
+the `PENDING` and `RUNNING` rows with a concurrency key and a cap. No index
+held the `PENDING` rows with a key. So each call was a sequential scan of
+`harvest_task_queue`, in parallel at the medium and large sizes. `docs/design/DESIGN-2678.md` records the
+decision.
+
+## 🎯 Workload
+
+Two harnesses, PG 16, `pg_stat_statements`, default `shared_buffers`. Evidence
+is calls, buffers and WAL, not wall-clock.
+
+1. **Read.** `autumn-harvest/tests/integration/worker_sampler_cadence_perf.rs`
+   replays 20 poll ticks of two workers at three sizes. It is the harness of
+   `docs/performance-gauge-sample-interval.md`, unchanged. Its fixture has
+   10,000, 100,000 and 300,000 pending rows. About 3,450 live rows hold a key
+   and a cap at the large size.
+2. **Write.** `autumn-harvest/tests/integration/concurrency_live_index_perf.rs`
+   runs 2,000 tasks through `queue::enqueue`, `queue::claim_task` and
+   `queue::complete_claimed_task`. Inside, `enqueue` and
+   `complete_task_inner` send the writes. One phase gives each task a key and
+   a high cap. The other gives no key. The background holds 100,000 pending
+   rows with no key and 3,000 live keyed rows. The harness runs once with the
+   index and once after `DROP INDEX`.
+
+## 📈 Profile (before)
+
+`concurrency_key_stats` buffers per call
+(`docs/perf-artifacts/worker-sampler-cadence/after-statement-costs.md`, the
+state on `trunk-dev` before this change):
+
+| pending rows | buffers per call |
+|--:|--:|
+| 10,000 | 672 |
+| 100,000 | 6,794 |
+| 300,000 | 20,230 |
+
+The cost follows the table. At 300,000 pending rows the scan read about
+630,000 rows to return 56 groups.
+
+## 🧭 Plan
+
+Before, at the large size (`after-large-explain.txt`):
+
+```
+Finalize GroupAggregate
+  ->  Gather Merge
+        ->  Parallel Seq Scan on harvest_task_queue  (rows=1150 loops=3)
+              Rows Removed by Filter: 208850
+```
+
+After (`live-index-large-explain.txt`):
+
+```
+GroupAggregate  (rows=56)
+  Buffers: shared hit=1467 read=6
+  ->  Sort
+        ->  Bitmap Heap Scan on harvest_task_queue  (rows=3449)
+              Heap Blocks: exact=1467
+              ->  Bitmap Index Scan on idx_harvest_tq_concurrency_live  (rows=3449)
+                    Buffers: shared read=6
+```
+
+## 💡 Hypothesis
+
+A partial index on the live rows with a key and a cap makes the read follow
+the keyed rows. Only keyed rows enter it, so a write of a row with no key
+pays nothing.
+
+## 🔧 Change
+
+`20261119233226_harvest_task_queue_concurrency_live_index` builds:
+
+```sql
+CREATE INDEX idx_harvest_tq_concurrency_live
+    ON harvest_task_queue (concurrency_key, task_type)
+    WHERE concurrency_key IS NOT NULL
+      AND concurrency_cap IS NOT NULL
+      AND state IN ('PENDING', 'RUNNING');
+```
+
+No query text changes.
+
+## 📊 Measurement
+
+### Read
+
+`concurrency_key_stats` buffers per call
+(`docs/perf-artifacts/worker-sampler-cadence/live-index-statement-costs.md`):
+
+| pending rows | before | after | change |
+|--:|--:|--:|--:|
+| 10,000 | 672 | 44 | −93.5% |
+| 100,000 | 6,794 | 499 | −92.7% |
+| 300,000 | 20,230 | 1,473 | −92.7% |
+
+At the large size, 3,449 live rows hold a key and a cap. One call reads 6
+index pages and 1,467 heap pages, so the cost follows the keyed rows.
+
+The other statements of the harness read the same buffers as in
+`after-statement-costs.md`, with one exception. At the medium size `oldest_pending_ages` read 875 buffers against
+1,614. Its plan does not use the index. A direct `EXPLAIN` on a fresh medium
+fixture reads 1,361 buffers with and without the index
+(`oldest-pending-ages-*-medium.txt`, seeded with `medium-fixture.sql`). So
+the difference comes from the
+state of the run, not from the index.
+
+### Write
+
+Per call (`docs/perf-artifacts/concurrency-live-index/write-costs.md`):
+
+| phase | statement | buffers before | buffers after | WAL records before | WAL records after | WAL bytes before | WAL bytes after |
+|:--|:--|--:|--:|--:|--:|--:|--:|
+| keyed | enqueue | 13.2 | 15.2 | 8.05 | 9.07 | 2,309 | 2,401 |
+| keyed | claim | 1,094.2 | 1,096.3 | 10.12 | 11.17 | 746 | 825 |
+| keyed | `release_claim_if_over_cap` | 4.0 | 4.0 | 0 | 0 | 0 | 0 |
+| keyed | complete | 19.1 | 19.1 | 6.07 | 6.07 | 516 | 516 |
+| plain | enqueue | 13.2 | 13.2 | 8.05 | 8.04 | 2,334 | 2,381 |
+| plain | claim | 97.3 | 97.3 | 9.09 | 9.09 | 685 | 681 |
+| plain | complete | 19.1 | 19.1 | 6.03 | 6.03 | 506 | 506 |
+
+- A keyed enqueue adds one index entry: one WAL record, 92 bytes, and two
+  buffers.
+- A keyed claim adds one index entry for the `RUNNING` version of the row:
+  one WAL record and 79 bytes.
+- A completion adds none. A finished row is not live.
+- A row with no key pays nothing. Its WAL record counts do not change. The
+  plain enqueue bytes differ by 47, because the size of each full-page image
+  varies from run to run.
+- One keyed task costs 3,742 WAL bytes in all, against 3,571 before. That is
+  4.8% more.
+- Two operator cap rewrites, `set_live_activity_caps` and
+  `raise_waiting_concurrency_caps`, change only `concurrency_cap`. Before, no
+  index held that column, so their updates could be HOT. The predicate of the
+  index names it, so the updates are not HOT now. Each adds one entry to each
+  index of the row. The rewrites are rare, so the harness does not measure
+  them.
+
+## Other readers
+
+- `concurrency_key_workflows` has the same row filter. Its plan gate shows a
+  bitmap scan of the new index.
+- The `concurrency_pending_keys` step of the full claim reads the due keyed
+  rows. Only a fallback claim runs it. The claim turns off bitmap scans and
+  sorts (`CLAIM_PLAN_SETTINGS_SQL`). With those settings, on the large
+  fixture, the step read 20,154 buffers in a sequential scan. With the index
+  it reads 3,444 in an index scan, 83% fewer
+  (`docs/perf-artifacts/concurrency-live-index/pending-keys-*-large.txt`).
+  `large-fixture.sql` in that directory seeds the fixture.
+- `raise_waiting_concurrency_caps` finds the live workflow rows of one type
+  with `concurrency_cap < $2`. That test implies a cap. On the large fixture
+  it read 635,675 buffers through the primary key. With the index it reads
+  3,422 (`raise-caps-*-large.txt`, from `raise-caps.sql`).
+- The cap re-check inside the claim statement and `release_claim_if_over_cap`
+  count `RUNNING` rows.
+  Their count has no `concurrency_cap IS NOT NULL` filter, so the planner
+  cannot prove the predicate of the index. They keep
+  `harvest_task_queue_concurrency_key_running`.
+
+## Follow-ups
+
+- A keyed claim reads about 1,090 buffers, against 97 for a plain claim. The
+  index does not cause this cost, and it does not change it. The step
+  `seek_running_counts` reads every `RUNNING` row through
+  `harvest_task_queue_running_worker_idx`. It then joins them to the pending
+  keys. So each keyed claim reads about one buffer for each running task
+  (`keyed-claim-plan.txt`, from `keyed-claim.sql` on
+  `keyed-claim-fixture.sql`). Issue #2744 tracked it. PR #2761 now probes
+  the running rows of each pending key. See
+  [the keyed claim running counts page](performance-keyed-claim-running-counts.md).
+- An index-only form (`INCLUDE (state, worker_id, concurrency_cap,
+  queue_name)`) read 27 buffers on a vacuumed fixture, in a design-time run
+  with no committed artifact. A live queue churns, so its rows are seldom
+  all-visible. The design keeps the plain form.
+
+## 🔬 Reproduce
+
+```sh
+PERF_LABEL=live-index HARVEST_TEST_DATABASE_URL=postgres://… cargo test -p autumn-harvest \
+  --test integration -- --ignored --exact \
+  worker_sampler_cadence_perf::zz_capture_worker_sampler_statement_costs --nocapture
+HARVEST_TEST_DATABASE_URL=postgres://… cargo test -p autumn-harvest \
+  --test integration -- --ignored --exact \
+  concurrency_live_index_perf::zz_capture_concurrency_live_index_write_costs --nocapture
+```
+
+The `psql` artifacts run on a database with every migration applied. Seed it,
+then run the statement file:
+
+```sh
+psql -d <db> -f docs/perf-artifacts/concurrency-live-index/large-fixture.sql
+psql -d <db> -c 'VACUUM ANALYZE harvest_task_queue'
+psql -d <db> -f docs/perf-artifacts/concurrency-live-index/pending-keys.sql
+```
+
+Drop `idx_harvest_tq_concurrency_live` first for a "before" run.

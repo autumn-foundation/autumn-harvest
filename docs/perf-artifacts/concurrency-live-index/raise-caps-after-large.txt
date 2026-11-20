@@ -1,0 +1,49 @@
+                                                                                                 QUERY PLAN
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Update on harvest_task_queue t (actual rows=0 loops=1)
+   Buffers: shared hit=324 read=3098 dirtied=121 written=1
+   CTE batch
+     ->  Limit (actual rows=13 loops=1)
+           Buffers: shared hit=29 read=2933 dirtied=14 written=1
+           ->  LockRows (actual rows=13 loops=1)
+                 Buffers: shared hit=29 read=2933 dirtied=14 written=1
+                 ->  Sort (actual rows=13 loops=1)
+                       Sort Key: t_1.id
+                       Sort Method: quicksort  Memory: 25kB
+                       Buffers: shared hit=3 read=2933 written=1
+                       ->  Hash Join (actual rows=13 loops=1)
+                             Hash Cond: (e.id = t_1.workflow_exec_id)
+                             Buffers: shared read=2933 written=1
+                             ->  Bitmap Heap Scan on harvest_workflow_executions e (actual rows=4286 loops=1)
+                                   Recheck Cond: (workflow_name = $1)
+                                   Filter: (state <> ALL ('{COMPLETED,FAILED,CANCELLED,TIMED_OUT,CONTINUED_AS_NEW,TERMINATED}'::text[]))
+                                   Rows Removed by Filter: 714
+                                   Heap Blocks: exact=2586
+                                   Buffers: shared read=2631 written=1
+                                   ->  Bitmap Index Scan on idx_harvest_wfx_workflow_identity (actual rows=5000 loops=1)
+                                         Index Cond: (workflow_name = $1)
+                                         Buffers: shared read=45
+                             ->  Hash (actual rows=303 loops=1)
+                                   Buckets: 1024  Batches: 1  Memory Usage: 29kB
+                                   Buffers: shared read=302
+                                   ->  Bitmap Heap Scan on harvest_task_queue t_1 (actual rows=303 loops=1)
+                                         Recheck Cond: ((concurrency_key IS NOT NULL) AND (task_type = 'workflow'::text) AND (concurrency_cap IS NOT NULL) AND (state = ANY ('{PENDING,RUNNING}'::text[])))
+                                         Filter: (concurrency_cap < $2)
+                                         Heap Blocks: exact=298
+                                         Buffers: shared read=302
+                                         ->  Bitmap Index Scan on idx_harvest_tq_concurrency_live (actual rows=303 loops=1)
+                                               Index Cond: ((concurrency_key IS NOT NULL) AND (task_type = 'workflow'::text))
+                                               Buffers: shared read=4
+   ->  Nested Loop (actual rows=13 loops=1)
+         Buffers: shared hit=59 read=2955 dirtied=14 written=1
+         ->  CTE Scan on batch (actual rows=13 loops=1)
+               Buffers: shared hit=29 read=2933 dirtied=14 written=1
+         ->  Index Scan using harvest_task_queue_pkey on harvest_task_queue t (actual rows=1 loops=13)
+               Index Cond: (id = batch.id)
+               Buffers: shared hit=30 read=22
+ Planning:
+   Buffers: shared hit=1142 read=145
+ Planning Time: 3.316 ms
+ Execution Time: 25.785 ms
+(45 rows)
+
