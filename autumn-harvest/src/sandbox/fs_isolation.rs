@@ -691,14 +691,19 @@ fn resolve(path: &Path) -> Resolved {
     use std::collections::VecDeque;
     use std::ffi::OsString;
 
+    // `Path::components` drops a `.` and a trailing `/`. Both ask the
+    // kernel for a directory, so the split keeps them as a `.` name.
     fn names(path: &Path) -> VecDeque<OsString> {
-        path.components()
-            .filter_map(|c| match c {
-                Component::Normal(name) => Some(name.to_os_string()),
-                Component::ParentDir => Some(OsString::from("..")),
-                Component::RootDir | Component::CurDir | Component::Prefix(_) => None,
-            })
-            .collect()
+        let bytes = path.as_os_str().as_bytes();
+        let mut names: VecDeque<OsString> = bytes
+            .split(|byte| *byte == b'/')
+            .filter(|name| !name.is_empty())
+            .map(|name| std::ffi::OsStr::from_bytes(name).to_os_string())
+            .collect();
+        if bytes.len() > 1 && bytes.ends_with(b"/") {
+            names.push_back(OsString::from("."));
+        }
+        names
     }
 
     let proc = Path::new("/proc");
@@ -708,6 +713,10 @@ fn resolve(path: &Path) -> Resolved {
     while let Some(name) = rest.pop_front() {
         if real.starts_with(proc) {
             return out;
+        }
+        // The name before a `.` is a directory, as the check below holds.
+        if name == "." {
+            continue;
         }
         if name == ".." {
             real.pop();
@@ -1859,6 +1868,27 @@ mod tests {
             matches!(step, Step::Bind { src, .. } if src.as_bytes() == secret.as_os_str().as_bytes())
         });
         assert!(!leaked, "{plan:?}");
+    }
+
+    #[test]
+    fn a_file_with_a_trailing_slash_binds_nothing() {
+        // The kernel refuses `file/` and `file/.` with `ENOTDIR`.
+        let (dir, file) = secret_dir();
+        let secret = std::fs::canonicalize(&file).unwrap();
+        for suffix in ["/", "/."] {
+            let holder = open_dir();
+            let link = holder.path().join("link");
+            let target = format!("{}{suffix}", file.display());
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let plan = Layout::new().plan(&FsIsolation::Pivot {
+                read_only: vec![link],
+            });
+            let leaked = plan.steps.iter().any(|step| {
+                matches!(step, Step::Bind { src, .. } if src.as_bytes() == secret.as_os_str().as_bytes())
+            });
+            assert!(!leaked, "{target}: {plan:?}");
+        }
+        drop(dir);
     }
 
     #[test]
