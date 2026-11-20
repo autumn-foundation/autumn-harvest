@@ -64,8 +64,9 @@ derives from the window form of the default claim. Three parts change:
 
 1. `seek_candidate` locks up to 2, 4 or 8 rows with
    `FOR UPDATE SKIP LOCKED`.
-2. `candidate` keeps those rows in claim order, up to the second row with a
-   concurrency key or a rate-limit key. That is the key cut.
+2. `candidate` keeps those rows in claim order. It stops before the first
+   row after row 1 that carries a concurrency key or a rate-limit key. That
+   is the key cut.
 3. `run_expired_now` lists the rows whose run passed its deadline. The
    claim takes only the other rows.
 

@@ -1123,7 +1123,7 @@ range. It does not refuse them. A `from` that does not parse answers `400`.
 | `unanchored` | Interval schedules. Their fire times depend on their last run, so the route does not forecast them. |
 | `inactive` | Paused, auto-paused, exhausted, manual and unparsable schedules. The scheduler fires none of them. |
 | `truncated` | Schedules that the forecast cut short. See below. |
-| `status` | `complete`, or `partial` when a shard did not answer. |
+| `status` | `complete`; `partial` when a shard did not answer; `unavailable` when no shard answered. An `unavailable` report is empty. |
 | `unavailable_shards` | The shards that did not answer, each with `shard_id` and `reason`. |
 
 A schedule name is its DAG name, else its workflow name. The route keys each
@@ -1156,8 +1156,9 @@ harvest schedule herd --from 2026-12-01T00:00:00Z --limit 500 --output json
 The flags map onto the query parameters: `--from`, `--hours`,
 `--bucket-secs`, `--min-herd` and `--limit`. By default the command prints
 a table of the herds, then a table of the schedules to move first, with
-their jitter. It warns when the report is partial. `--output json` prints
-the raw body.
+their jitter. It warns when the report is partial. An `unavailable` report
+prints as an empty forecast with no warning. `--output json` prints the raw
+body.
 
 The forecast is pure arithmetic in `autumn_harvest::schedule_herd`. See
 [`dag-and-retry-analyses.md`](dag-and-retry-analyses.md#schedule-herds-schedule_herd)

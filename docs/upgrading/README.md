@@ -194,8 +194,12 @@ These 0.11 behaviors need care during the roll.
   mixed fleet can pass the cap. Set the cap after the roll, on every
   worker.
 - **Agent features.** A 0.10 worker cannot decode the new strategies, the
-  new refusals and the `ReloadProfile` op, and does not register the new
-  agent activities. Turn them on after the roll. See
+  new refusals and the `ReloadProfile` op. Turn them on after the roll. A
+  0.10 worker also does not register the new agent activities. A 0.11 run
+  uses some of them with no opt-in: a gated tool call runs
+  `agent_approval_notice`, a new `agent_refine` run opens the adoption gate,
+  and an erase counts the stores. So upgrade every worker that hosts agent
+  workflows or agent activities before a new agent run starts. See
   [0.11.0 §3](0.11.0.md#3-rolling-deploy-turn-on-new-features-after-the-roll).
 
 ## Rolling deploy order
