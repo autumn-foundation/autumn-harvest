@@ -203,6 +203,10 @@ fn release_pr_packages_every_publishable_crate() {
 #[test]
 fn no_release_workflow_holds_a_registry_token_or_publishes() {
     let release_pr = parse_workflow(RELEASE_PR);
+    assert!(
+        release_pr["jobs"]["crate-packaging"].is_mapping(),
+        "{RELEASE_PR} must have a `crate-packaging` job"
+    );
     let job = serde_yaml::to_string(&release_pr["jobs"]["crate-packaging"]).expect("job");
     assert!(
         !job.contains("secrets."),

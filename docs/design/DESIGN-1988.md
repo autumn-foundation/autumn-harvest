@@ -14,18 +14,19 @@ token, and `release.yml` gets no `cargo publish` or `npm publish` step.
 
 ## 2. Facts
 
-- The workspace has 29 members. Eight have no `publish` key, so they go to
-  crates.io. Every other member already sets `publish = false`.
+- At the time of writing, eight workspace members have no `publish` key.
+  They go to crates.io. Each other member already sets `publish = false`.
 - `cargo package --workspace` also packages the `publish = false` members.
-  It fails on the first unpublished path dependency. So the check names
+  It fails on the first unpublished path dependency. Thus the check names
   each publishable crate with `-p`.
 - `cargo package` with several `-p` flags verifies each crate against a
   local overlay registry. A dependency on a sibling crate of the same
   version resolves with no upload. It needs no token.
 - `cargo package` only warns about a missing `description` or `license`.
   crates.io refuses the upload.
-- crates.io refuses a `.crate` file over 10 MiB. Today `autumn-harvest` is
-  8.5 MiB. Its `tests/` tree is 16 MiB of 38 MiB before compression.
+- crates.io refuses a `.crate` file over 10 MiB. At the time of writing,
+  `autumn-harvest` is above the 8 MiB warning. Its `tests/` tree is about
+  40% of the crate before compression.
 - No page holds the release steps. `SECURITY.md` says that security fixes
   go into the newest minor release only.
 
@@ -65,7 +66,7 @@ Options for each question. The chosen option is in bold.
 
 ## 5. Six thinking hats
 
-- **White (facts).** Section 2. Eight crates. Cargo orders and verifies a
+- **White (facts).** Section 2. Cargo orders and verifies a
   multi-crate package run. The size limit is 10 MiB.
 - **Red (feeling).** A failed publish after the tag is stressful. Each
   crate on crates.io is permanent. The check must give a clear list, not a

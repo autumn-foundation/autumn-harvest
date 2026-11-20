@@ -37,11 +37,11 @@ Harvest is at 0.x. A minor release can change the API and the schema.
 - An older minor release gets no fixes after the next minor release ships.
   To get a fix, upgrade to the newest minor release.
 - Upgrade one minor release at a time. Each hop has its own guide above.
-- N-1 is supported only as a peer of N during a rolling deploy. See
+- N-1 gets no fixes. It runs beside N only during a rolling deploy. See
   [Supported version skew](#supported-version-skew).
 
 [`SECURITY.md`](../../SECURITY.md) applies the same window to security
-fixes. A 1.0 release will state a longer window.
+fixes. Version 1.0 gets a longer window.
 [`docs/releasing.md`](../releasing.md) gives the release steps.
 
 ## Supported version skew
