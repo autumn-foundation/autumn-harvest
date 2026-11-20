@@ -1,23 +1,30 @@
 //! Keep the tracing callsite cache stable in the library tests.
 //!
-//! tracing-core caches an `Interest` for each callsite. While fewer than
-//! two dispatchers are live, a rebuild asks only the dispatcher of its own
-//! thread, and it holds no lock. So a thread with no dispatcher can store
+//! tracing-core caches an `Interest` for each callsite. A new dispatcher
+//! sets a flag when it finds no other live dispatcher. While that flag is
+//! on, the first registration of a callsite asks only the dispatcher of its
+//! own thread, and it holds no lock. So another test thread can store
 //! `never` after a log test made its capture. The span of that test then
 //! goes disabled (issue #2762, `docs/design/DESIGN-2762.md`).
 //!
-//! Two keepers live for the whole process, so a rebuild always holds the
-//! lock. A constructor makes them before `main`, so before any test runs.
+//! A constructor makes two keepers before `main`. The second keeper finds
+//! the first one live, so the flag goes off before any test runs. One
+//! keeper is not enough: it finds no other dispatcher, so the flag stays on.
 
 use std::sync::OnceLock;
 
-/// The keepers. Each is a `NoSubscriber`, so it adds no interest.
+/// The keepers. They live for the whole process.
+///
+/// Each is a `NoSubscriber`. It answers `never` and enables nothing. It has
+/// no level hint, so the max level stays at TRACE. A test sees the same
+/// spans and events.
 static KEEPERS: OnceLock<[tracing::Dispatch; 2]> = OnceLock::new();
 
 /// Make the keepers before `main`.
 ///
-/// This needs only the allocator and the locks of tracing-core. It does
-/// not panic.
+/// Safety argument for `ctor(unsafe)`: the body uses only the allocator and
+/// the locks of tracing-core. Its only `unwrap` is on a lock that cannot be
+/// poisoned before `main`.
 #[ctor::ctor(unsafe)]
 fn install() {
     KEEPERS.get_or_init(|| [keeper(), keeper()]);
@@ -41,7 +48,10 @@ mod tests {
     const FIRST: &str = "trace-keepers-first";
 
     /// The longest time that the gate holds a registration.
-    const HOLD: Duration = Duration::from_secs(1);
+    ///
+    /// With the keepers live, each new dispatcher of the binary waits this
+    /// long, so it is short.
+    const HOLD: Duration = Duration::from_millis(250);
 
     /// The span that only this test uses.
     fn probe() -> tracing::Span {
@@ -77,7 +87,8 @@ mod tests {
                     .release
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                // A timeout is the expected end while the keepers are live.
+                // With the keepers, the capture waits for this lock. So the
+                // release comes after this timeout.
                 let _ = release.recv_timeout(HOLD);
             }
             Interest::never()
@@ -126,7 +137,7 @@ mod tests {
             .spawn(move || tracing::dispatcher::with_default(&gate, || drop(probe())))
             .expect("spawn the first thread");
         entered_rx
-            .recv_timeout(HOLD * 10)
+            .recv_timeout(HOLD * 40)
             .expect("the first thread registers the probe");
         // The capture comes while the first registration is open.
         let capture = tracing::Dispatch::new(tracing_subscriber::registry());

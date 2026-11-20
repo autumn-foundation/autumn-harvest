@@ -6,24 +6,31 @@ middle of the test. The events of the test stayed enabled.
 
 ## 1. Facts
 
-tracing-core 0.1.36 is the latest release. It caches an `Interest` for
-each callsite. A rebuild sets that cache for all callsites. The flag
-`has_just_one` selects how a rebuild finds its dispatchers:
+The workspace locks tracing-core 0.1.36, the latest release on
+2026-11-20. It caches an `Interest` for each callsite. Two paths set that
+cache:
 
-- With the flag off, a rebuild holds a lock on the list of live
-  dispatchers. Each new dispatcher takes the write lock, so the rebuilds
-  occur one at a time.
-- With the flag on, a rebuild asks only the default dispatcher of its own
+- A new dispatcher rebuilds every callsite under the write lock of the
+  list of live dispatchers.
+- The first hit of a callsite registers that callsite.
+
+The flag `has_just_one` selects how a registration finds its dispatchers:
+
+- With the flag off, it holds the read lock and asks each live
+  dispatcher. So a registration and a rebuild never overlap.
+- With the flag on, it asks only the default dispatcher of its own
   thread. It holds no lock.
 
-The flag is on at process start. A new dispatcher sets it again from the
-count of live dispatchers. So the flag stays on until two dispatchers are
-live at one time.
+The flag is on at process start. Only a new dispatcher changes it. The
+flag goes off when that dispatcher finds another live dispatcher, and it
+goes on when it finds none.
 
 The race:
 
-1. Thread X has no dispatcher. It hits the span callsite first. The flag
-   is on, so X asks only the no-op dispatcher. That answer is `never`.
+1. Thread X hits the span callsite first. The flag is on, so X asks only
+   its own dispatcher. That is the no-op dispatcher, or a capture at
+   `WARN`, as in `mcp_unserved`. Either answers `never` for an `INFO`
+   span.
 2. Before X stores `never`, the test thread makes its capture
    dispatcher. That rebuild sets the callsite to `sometimes`.
 3. The first call of the test creates the span.
@@ -54,8 +61,9 @@ The chosen option is in bold.
 | Failure | Rule |
 |---|---|
 | The keeper comes after the first callsite hit. | A constructor makes the keepers before `main`. |
-| Only one dispatcher is live, so the flag comes on again. | Two keepers live for the whole process. |
-| A keeper changes what a test sees. | Each keeper is a `NoSubscriber`. It answers `never`, so it adds no interest. |
+| One keeper registers alone, so the flag stays on until the first capture. | The second keeper finds the first one live, so the flag goes off before `main`. |
+| A keeper changes what a test sees. | Each keeper is a `NoSubscriber`. It answers `never` and enables nothing. It has no level hint, so the max level stays at TRACE. A test sees the same spans and events. |
+| The regression test slows the other tests. | Its gate holds for 250 ms at most. Each new dispatcher waits for that time once. |
 | The race is too rare to catch in CI. | A test holds thread X inside its first registration, so the race occurs each time. |
 | A later change removes the keepers. | That test fails when it runs alone. |
 
@@ -70,6 +78,8 @@ The chosen option is in bold.
   dependencies outside its own project, and it is MIT or Apache-2.0.
 - **Yellow (benefits).** Each log capture test in the plugin library gets
   the fix: `durable_route`, `process_role`, `mcp_unserved` and `plugin`.
+  The binaries in `autumn-harvest-plugin/tests/` do not link the module.
+  None of them captures logs today.
 - **Green (ideas).** A test subscriber can block in `register_callsite`.
   That holds thread X at step 1, so the race occurs each time.
 - **Blue (process).** Red test first, then the keepers, then remove
@@ -81,8 +91,9 @@ The chosen option is in bold.
   `#[ctor]` function makes two `NoSubscriber` dispatchers. A `static`
   keeps them for the whole process.
 - `capture()` in `durable_route.rs` loses its `KEEP`.
-- Production code does not change. An application sets one global
-  dispatcher, so the fast path asks the right dispatcher.
+- Production code does not change. With one global dispatcher, the fast
+  path on each thread asks that dispatcher. The race needs a thread whose
+  default is not the only live dispatcher. That is an upstream defect.
 
 ## 6. Acceptance
 
