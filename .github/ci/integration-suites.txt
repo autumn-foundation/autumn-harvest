@@ -182,7 +182,6 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          mutex_tests
 linux        autumn-harvest         integration                      -                          notify_post_commit_tests
 linux        autumn-harvest         integration                      -                          notify_stage_probe_tests
-linux        autumn-harvest         integration                      -                          owner_decider_tests
 linux        autumn-harvest         integration                      -                          owner_failover_tests
 linux        autumn-harvest         integration                      -                          owner_wake_db_tests
 linux        autumn-harvest         integration                      -                          owner_wake_worker_tests
@@ -220,7 +219,6 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          retention_candidate_scan_index_tests
 linux        autumn-harvest         integration                      -                          retention_overrides_tests
 linux        autumn-harvest         integration                      -                          retention_summary_tests
-linux        autumn-harvest         integration                      -                          retry_after_tests
 linux        autumn-harvest         integration                      -                          retry_budget_tests
 linux        autumn-harvest         integration                      -                          retry_chain_routing_tests
 linux        autumn-harvest         integration                      -                          retry_clock_skew_tests
@@ -311,9 +309,11 @@ linux        autumn-harvest         integration                      testing    
 linux        autumn-harvest         integration                      testing                    dispatch_tests
 linux        autumn-harvest         integration                      testing                    llm_ledger_tests
 linux        autumn-harvest         integration                      testing                    nd_block
+linux        autumn-harvest         integration                      testing                    owner_decider_tests
 linux        autumn-harvest         integration                      testing                    remote_task_db_tests
 linux        autumn-harvest         integration                      testing                    replay_canary_tests
 linux        autumn-harvest         integration                      testing                    replayer_integration_tests
+linux        autumn-harvest         integration                      testing                    retry_after_tests
 linux        autumn-harvest         integration                      testing                    scheduled_time_tests
 linux        autumn-harvest         integration                      testing                    scheduler_carryover_tests
 linux        autumn-harvest         integration                      testing                    shard_rebalance_db_tests

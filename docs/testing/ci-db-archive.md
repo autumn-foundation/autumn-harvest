@@ -95,3 +95,10 @@ holds every crate, target and feature of a live-DB row. It checks that
 each row gives one term of the filterset, and that the shard index maps to
 the partition. Its image pre-pull tests run on Unix only.
 `ci_run_coverage.rs` checks that `ci.yml` calls each mode.
+
+The coverage nightly does not use the archive. It runs each row with the
+crate defaults and the features of that row only. So a core live-DB suite
+that names `testing` needs `testing` in its own `linux` row. Otherwise the
+nightly compiles the gated code out, as in issue #2723.
+`every_live_db_suite_that_names_testing_runs_with_testing` in
+`ci_run_coverage.rs` checks this.
