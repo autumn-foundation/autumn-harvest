@@ -405,7 +405,13 @@ impl Replicas {
             // applies again at the next open, so a failed removal refuses
             // this open. The runtime then writes no run that the next open
             // rolls back (issue #2753).
-            _ => write_entry(path, None)?,
+            _ => write_entry(path, None).map_err(|error| {
+                format!(
+                    "the Harvest file of {key} is at its restore target, but the target \
+                     stays, so the open refuses: {error}. Open the tenant again once the \
+                     target file can be removed"
+                )
+            })?,
         }
         Ok(())
     }
@@ -1270,13 +1276,18 @@ fn read_entry(path: &Path) -> Result<Option<Entry>, String> {
 fn write_entry(path: &Path, entry: Option<&Entry>) -> Result<(), String> {
     let file = suffixed(path, TARGET_SUFFIX);
     let Some(entry) = entry else {
-        return match std::fs::remove_file(&file) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(format!("cannot remove {}: {error}", file.display())),
-        };
+        return remove_if_present(&file);
     };
     write_atomic(&file, &entry.render())
+}
+
+/// Remove `file`. A missing file is not an error. Any other error is.
+fn remove_if_present(file: &Path) -> Result<(), String> {
+    match std::fs::remove_file(file) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("cannot remove {}: {error}", file.display())),
+    }
 }
 
 /// The entry from before a request that wrote `entry`.
@@ -1401,9 +1412,10 @@ fn publish(staging: &Path, path: &Path, replace: bool) -> Result<(), String> {
     } else {
         None
     };
-    // The frames of the old file must not replay onto the restored one.
+    // The frames of the old file must not replay onto the restored one. A
+    // sidecar that stays refuses the publish, and the old file stays whole.
     for sidecar in sidecars(path) {
-        remove_quietly(&sidecar);
+        remove_if_present(&sidecar)?;
     }
     std::fs::rename(staging, path).map_err(|error| error.to_string())
 }
@@ -2405,6 +2417,25 @@ mod tests {
         drop(theirs);
     }
 
+    /// A sidecar of the old file that stays refuses the publish. Its frames
+    /// would replay onto the restored file.
+    #[test]
+    fn a_sidecar_that_stays_refuses_the_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("acme.harvest.db");
+        std::fs::write(&path, b"old").unwrap();
+        let wal = suffixed(&path, "-wal");
+        std::fs::create_dir(&wal).unwrap();
+        std::fs::write(wal.join("frames"), b"").unwrap();
+        let staging = dir.path().join("staging.db");
+        std::fs::write(&staging, b"restored").unwrap();
+
+        let error = publish(&staging, &path, true).expect_err("the WAL stays");
+        assert!(error.contains("cannot remove"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"old", "the old file stays");
+        assert!(staging.exists(), "the caller discards the staging file");
+    }
+
     /// A slot database ships under its slot prefix.
     #[test]
     fn a_slot_replica_sits_under_the_slot_prefix() {
@@ -2589,20 +2620,31 @@ mod tests {
         (replicas, key, path, db)
     }
 
+    /// Open `key` while its target is blocked. The open must refuse at the
+    /// removal of the target, after the restore.
+    fn refuse_at_the_target(replicas: &Replicas, key: &FleetDbKey, path: &Path, db: &Path) {
+        let refused = replicas.prepare(key, path, db, None);
+        let error = refused.expect_err("the target stays, so the open refuses");
+        assert!(error.contains("cannot remove"), "{error}");
+    }
+
     /// A failed removal of the target refuses the open. No runtime then
     /// writes a run that the next open rolls back (issue #2753).
     #[test]
     fn a_failed_target_removal_refuses_the_open() {
         let dir = tempfile::tempdir().unwrap();
         let (replicas, key, path, db) = a_blocked_target(dir.path());
-        let refused = replicas.prepare(&key, &path, &db, None);
-        let error = refused.expect_err("the target stays, so the open refuses");
-        assert!(error.contains("cannot remove"), "{error}");
+        refuse_at_the_target(&replicas, &key, &path, &db);
         assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 6);
         assert_eq!(
             std::fs::read_to_string(suffixed(&path, IDENTITY_SUFFIX)).unwrap(),
             database_identity(&db).unwrap(),
             "the record is written before the target goes"
+        );
+        let kept = std::fs::read_to_string(suffixed(&path, ".restore-target.kept")).unwrap();
+        assert!(
+            matches!(Entry::parse(&kept), Some(Entry::Committed { .. })),
+            "the target stays for the next open"
         );
     }
 
@@ -2612,11 +2654,14 @@ mod tests {
     fn a_retry_after_a_failed_removal_keeps_the_harvest_file_at_the_target() {
         let dir = tempfile::tempdir().unwrap();
         let (replicas, key, path, db) = a_blocked_target(dir.path());
-        assert!(replicas.prepare(&key, &path, &db, None).is_err());
-        let target = suffixed(&path, TARGET_SUFFIX);
-        unblock(&target);
+        refuse_at_the_target(&replicas, &key, &path, &db);
+        unblock(&suffixed(&path, TARGET_SUFFIX));
         assert!(matches!(entry(&path), Some(Entry::Committed { .. })));
 
+        // A mark on the file shows that the retry restores it again.
+        let runtime = autumn_harvest_sqlite::SqliteRuntime::open_replicated(&path).unwrap();
+        runtime.raise_fleet_epoch(9).unwrap();
+        drop(runtime);
         replicas.prepare(&key, &path, &db, None).unwrap();
         assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 6);
         assert_eq!(entry(&path), None, "the retry removes the target");

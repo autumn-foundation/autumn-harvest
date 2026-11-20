@@ -6,21 +6,26 @@ runtime wrote runs. The target stayed, so the next open applied it again
 and lost those runs.
 
 - **Fix.** `prepare` removes the target with `write_entry(path, None)?`, as
-  its `Pending` branch writes. A failed removal now refuses the open, and
-  the error names the target file. The order stays: the database record is
-  written before the target goes.
+  its `Pending` branch writes. A failed removal now refuses the open. The
+  error names the tenant and the target file. The order stays: the
+  database record is written before the target goes.
+- **Publish.** `publish` removed the sidecars of the old Harvest file
+  quietly before the rename. An old WAL that stayed could replay onto the
+  restored file. A sidecar that stays now refuses the publish, and the old
+  file stays whole.
 - **Retry.** A retry applies the same target again. The refused open wrote
   no run, so the Harvest file is still at the target, and the retry loses
   nothing.
 - **Proof.** `formal/verus/src/restore_target.rs` adds the step
-  `OpenFails`. `theorem_a_failed_open_applies_the_same_target` shows that a
-  failed open keeps the entry and the next open applies the same target.
-  `theorem_a_kept_target_must_refuse_the_open` shows that an open that
-  keeps the target and does not refuse breaks the invariant.
+  `OpenFails`: an open that fails at any point changes no entry.
+  `theorem_a_kept_target_must_refuse_the_open` shows the old fault. A kept
+  target that applies breaks the invariant. A kept target that a later
+  restore superseded makes each later open replace the Harvest file again.
 - **Invariants.** No `WorkflowEvent` variant and no migration.
   `harvest_events` is not rewritten.
-- **Tests.** `a_failed_target_removal_refuses_the_open` and
-  `a_retry_after_a_failed_removal_keeps_the_harvest_file_at_the_target` in
-  `replica.rs`. A test destination puts a non-empty directory at the target
-  path during the restore, so the removal fails on each OS. Production code
-  has no fault seam.
+- **Tests.** `a_failed_target_removal_refuses_the_open`,
+  `a_retry_after_a_failed_removal_keeps_the_harvest_file_at_the_target` and
+  `a_sidecar_that_stays_refuses_the_publish` in `replica.rs`. A test
+  destination puts a non-empty directory at the target path during the
+  restore, so the removal fails on each OS. Production code has no fault
+  seam.

@@ -658,7 +658,7 @@ pub proof fn theorem_a_release_before_the_drain_does_no_harm < T > (w: World < T
 pub proof fn theorem_an_open_before_the_return_refuses < T > (w: World < T >, target: T, to: nat) requires inv(w), w.run is Idle, to != w.db, ensures ({ let drained = step(step(w, Step::Ask { target }), Step::Release); valid(drained, Step::Publish { ok: true, to }) && refused(step(drained, Step::Publish { ok: true, to }),) }),
 pub proof fn theorem_a_failed_open_applies_the_same_target < T > (w: World < T >) requires inv(w), ensures inv(step(w, Step::OpenFails)), opens(step(w, Step::OpenFails)) == opens(w),
 pub open spec fn kept_quietly < T > (w: World < T >) -> World < T > { World { want: None,..w } }
-pub proof fn theorem_a_kept_target_must_refuse_the_open < T > (w: World < T >, target: T) requires inv(w), w.run is Idle, opens(w) == Some(target), ensures ! inv(kept_quietly(w)), opens(kept_quietly(w)) == Some(target),
+pub proof fn theorem_a_kept_target_must_refuse_the_open < T > (w: World < T >) requires inv(w), w.run is Idle, ! (resolves(w) is Nothing), ensures spec_replaced(resolves(kept_quietly(w)), false), resolves(w) is Apply ==>! inv(kept_quietly(w)) && opens(kept_quietly(w)) == opens(w),
 
 ## formal/verus/src/scan_skip.rs
 pub open spec fn skips(next: Seq < usize >, dead: Set < int >, k: int) -> bool { forall | m: int | k <= m < next [k] ==> #[trigger] dead.contains(m) }
