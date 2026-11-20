@@ -127,6 +127,9 @@ impl<Q: Query> Query for CachePrepared<Q> {
     type SqlType = Q::SqlType;
 }
 
+/// Diesel runs only a marked statement type.
+impl<Q> diesel::query_dsl::RunQueryDslSupport for CachePrepared<Q> {}
+
 impl<Q: QueryFragment<Pg>> QueryFragment<Pg> for CachePrepared<Q> {
     fn walk_ast<'b>(&'b self, pass: AstPass<'_, 'b, Pg>) -> QueryResult<()> {
         self.statement.walk_ast(pass)

@@ -78,6 +78,7 @@ allos        autumn-harvest-plugin  effective_config_http_tests      -          
 allos        autumn-harvest-plugin  gate_no_global_install           -                          -
 allos        autumn-harvest-plugin  oidc_login                       oidc                       -
 allos        autumn-harvest-plugin  openapi_spec                     -                          -
+allos        autumn-harvest-plugin  role_graph                       -                          -
 allos        autumn-harvest-plugin  security                         -                          -
 allos        autumn-harvest-plugin  sse_stream_tests                 -                          -
 allos        autumn-harvest-plugin  standalone_admin_auth            -                          -
@@ -162,6 +163,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          fanout_result_writer_db_tests
 linux        autumn-harvest         integration                      -                          force_fail
 linux        autumn-harvest         integration                      -                          fork_tests
+linux        autumn-harvest         integration                      -                          gauge_election_db_tests
 linux        autumn-harvest         integration                      -                          group_commit_db_tests
 linux        autumn-harvest         integration                      -                          history_ceiling_claim_tests
 linux        autumn-harvest         integration                      -                          history_crash_tests
@@ -404,6 +406,7 @@ linux        autumn-harvest-plugin  replay_sample_export_integration  -         
 linux        autumn-harvest-plugin  retirement_check_integration     -                          -
 linux        autumn-harvest-plugin  retry_chain_routing_integration  -                          -
 linux        autumn-harvest-plugin  retry_override_integration       -                          -
+linux        autumn-harvest-plugin  role_placement_integration       -                          -
 linux        autumn-harvest-plugin  run_chain_integration            -                          -
 linux        autumn-harvest-plugin  run_defaults_integration         -                          -
 linux        autumn-harvest-plugin  runner_orphan_gate_integration   -                          -

@@ -2859,6 +2859,9 @@ impl diesel::query_builder::Query for CachedClaimQuery<'_> {
     type SqlType = diesel::sql_types::Untyped;
 }
 
+/// Diesel runs only a marked statement type.
+impl diesel::query_dsl::RunQueryDslSupport for CachedClaimQuery<'_> {}
+
 impl diesel::query_builder::QueryFragment<diesel::pg::Pg> for CachedClaimQuery<'_> {
     fn walk_ast<'b>(
         &'b self,
@@ -7997,28 +8000,28 @@ impl StickyRelease {
 /// - `timer_fires_at` is cleared. A backoff is not a timer wake, so the marker
 ///   must not name a stale timer when the row is due again (issue #1402).
 /// - `sticky` is `Some` to release sticky affinity, `None` to keep it.
-fn workflow_backoff_set(
-    delay: SignedDuration,
-    sticky: Option<StickyRelease>,
-) -> impl AsChangeset<
-    Target = crate::schema::harvest_task_queue::table,
-    Changeset: diesel::query_builder::QueryFragment<diesel::pg::Pg> + Send,
-> {
-    use crate::schema::harvest_task_queue::dsl;
-    use diesel::dsl::sql;
-    use diesel::sql_types::{Double, Timestamptz};
+///
+/// It is a macro, so each caller sees the concrete changeset type. Diesel
+/// checks that type before it allows a `WHERE` clause on the update.
+macro_rules! workflow_backoff_set {
+    ($delay:expr, $sticky:expr) => {{
+        use crate::schema::harvest_task_queue::dsl;
+        use diesel::dsl::sql;
+        use diesel::sql_types::{Double, Timestamptz};
 
-    (
-        dsl::scheduled_at.eq(
-            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
-                .bind::<Double, _>(delay_secs(delay))
-                .sql(")"),
-        ),
-        SetExt(harvest_task_queue_ext::wake_requested.eq(false)),
-        dsl::activity_name.eq(None::<String>),
-        dsl::timer_fires_at.eq(None::<crate::time::sql::SqlTimestamp>),
-        sticky,
-    )
+        let sticky: Option<StickyRelease> = $sticky;
+        (
+            dsl::scheduled_at.eq(
+                sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
+                    .bind::<Double, _>(delay_secs($delay))
+                    .sql(")"),
+            ),
+            SetExt(harvest_task_queue_ext::wake_requested.eq(false)),
+            dsl::activity_name.eq(None::<String>),
+            dsl::timer_fires_at.eq(None::<crate::time::sql::SqlTimestamp>),
+            sticky,
+        )
+    }};
 }
 
 /// Re-pend a `RUNNING` workflow task to `PENDING` with a backoff (issue #1751).
@@ -8026,7 +8029,7 @@ fn workflow_backoff_set(
 /// The one `UPDATE` behind [`requeue_workflow_task_nd_blocked`],
 /// [`requeue_workflow_task_after_panic`], and
 /// [`requeue_workflow_task_for_quota_retry`]. The caller picks the sticky
-/// policy. See [`workflow_backoff_set`] for the shared columns.
+/// policy. See [`workflow_backoff_set!`] for the shared columns.
 ///
 /// No `pg_notify`: the task is not claimable until `scheduled_at`, so waking
 /// pollers early would be pure noise.
@@ -8050,7 +8053,7 @@ async fn requeue_workflow_task_with_backoff(
     ))
     .set((
         PendingRequeueChangeset::new(previous_error.to_string()),
-        workflow_backoff_set(delay, sticky),
+        workflow_backoff_set!(delay, sticky),
     ))
     .returning((dsl::queue_name, dsl::priority, dsl::scheduled_at))
     .get_results::<(String, i32, crate::time::sql::SqlTimestamp)>(conn)
@@ -8061,7 +8064,7 @@ async fn requeue_workflow_task_with_backoff(
 }
 
 /// Build the backoff `UPDATE` text so a no-DB test can assert its shape
-/// (issue #1751). Uses the same [`workflow_backoff_set`] as production.
+/// (issue #1751). Uses the same [`workflow_backoff_set!`] as production.
 #[cfg(test)]
 fn workflow_backoff_sql(
     changeset: PendingRequeueChangeset,
@@ -8075,7 +8078,7 @@ fn workflow_backoff_sql(
     let query = diesel::update(dsl::harvest_task_queue.find(Uuid::nil()).filter(
         crate::row_guard::row_guard(dsl::state.eq("RUNNING").and(dsl::task_type.eq("workflow"))),
     ))
-    .set((changeset, workflow_backoff_set(delay, sticky)));
+    .set((changeset, workflow_backoff_set!(delay, sticky)));
     debug_query::<Pg, _>(&query).to_string()
 }
 
@@ -8091,7 +8094,7 @@ fn workflow_backoff_sql(
 /// extends it. Any worker can claim the row after that time, so a kept pin
 /// cannot starve the retry. This holds for a shard-admission rejection too.
 ///
-/// All other columns follow [`workflow_backoff_set`].
+/// All other columns follow [`workflow_backoff_set!`].
 ///
 /// # Errors
 ///
@@ -8112,7 +8115,7 @@ pub async fn requeue_workflow_task_for_quota_retry(
 ///
 /// This path releases sticky affinity. The pinned worker runs the divergent
 /// build, so any worker must be able to claim the retry, such as one on the
-/// rolled-back build. All other columns follow [`workflow_backoff_set`].
+/// rolled-back build. All other columns follow [`workflow_backoff_set!`].
 ///
 /// # Errors
 ///
@@ -8138,7 +8141,7 @@ pub async fn requeue_workflow_task_nd_blocked(
 /// backoff is handled on the next dispatch. The shared changeset resets
 /// `crash_strikes`, so the poison-pill reclaimer never trips on a panic loop.
 /// No `FOR UPDATE` guard is needed. The claim-layer `PAUSED` gate defers a
-/// re-pended task. All other columns follow [`workflow_backoff_set`].
+/// re-pended task. All other columns follow [`workflow_backoff_set!`].
 ///
 /// # Errors
 ///

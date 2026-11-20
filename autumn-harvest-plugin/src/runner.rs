@@ -11,9 +11,9 @@ use autumn_harvest::effective_config::{
     DispatchConfigView, EffectiveConfigView, PayloadCapsView, PoolConfigView, ShardedInfo,
 };
 use autumn_harvest::policy::WorkflowSchedule;
-use autumn_harvest::retention::{RetentionConfig, RetentionRuntime};
+use autumn_harvest::retention::{PreparedRetention, RetentionConfig, RetentionRuntime};
 use autumn_harvest::scheduler::{
-    DagCatalog, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
+    DagCatalog, PreparedScheduler, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
 };
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::types::ShardId;
@@ -28,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::api::{HarvestApiRuntime, HarvestRetentionRuntime};
 use crate::config::{HarvestRedisConfig, HarvestRuntimeConfig, OrphanStartupAction};
+use crate::process_role::HarvestLoop;
 use crate::state::{AppDbPool, HarvestDbPool};
 use crate::worker_queues::WorkerQueues;
 use crate::workflow_reachability::{
@@ -58,6 +59,8 @@ pub struct HarvestRunnerResources {
     /// gate itself, so [`HarvestRunner::start`] does not run it a second time
     /// (issue #1128). See [`HarvestRunnerResources::with_startup_orphan_gate_already_run`].
     startup_orphan_gate_already_run: bool,
+    /// The Autumn background tasks that run the loops. `None` spawns them.
+    hosted: Option<crate::background::HostedLoops>,
 }
 
 impl HarvestRunnerResources {
@@ -71,7 +74,24 @@ impl HarvestRunnerResources {
             shard_router: None,
             sharded_pool: None,
             startup_orphan_gate_already_run: false,
+            hosted: None,
         }
+    }
+
+    /// Give each placed loop to an Autumn background task, not to
+    /// `tokio::spawn`.
+    #[must_use]
+    pub(crate) fn with_hosted_loops(mut self, loops: crate::background::HostedLoops) -> Self {
+        self.hosted = Some(loops);
+        self
+    }
+
+    /// The Autumn role of the injected app state.
+    ///
+    /// `None` when no app state is set, as in a standalone runner.
+    #[must_use]
+    pub fn role(&self) -> Option<&autumn_web::config::Role> {
+        self.app_state.as_ref().map(AppState::role)
     }
 
     /// Inject application state for workflows or activities that expect it.
@@ -741,21 +761,24 @@ impl DeferredAuditExportInstall {
 /// The startup line of a process with retention on but not placed (issue
 /// #2478).
 const RETENTION_NOT_PLACED_LOG: &str = "harvest retention janitor not started on this runtime: \
-     harvest.retention.run_on = \"scheduler\" and this process runs no scheduler. Set run_on = \
-     \"all\" to run it here";
+     the role does not run harvest.maintenance, or harvest.scheduler_enabled = false. Set \
+     run_on = \"all\" to run it here";
 
-/// The background tasks that one runtime spawns (issue #2477).
+/// The background tasks that one runtime starts (issue #2477).
 ///
-/// `HarvestRunner::start` reads every spawn decision from here, so a test of
+/// `HarvestRunner::start` reads every start decision from here, so a test of
 /// the plan covers the wiring of the switches. The test
 /// `each_role_places_each_runtime` pins the table of each runtime on each
-/// role (issue #2478).
+/// role (issue #2478). The Harvest capabilities of the role give each
+/// default. See [`crate::process_role`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SpawnPlan {
     /// The local worker and its poll loops.
     worker: bool,
     /// The local scheduler.
     scheduler: bool,
+    /// The batch executor.
+    batch: bool,
     /// Where the retention janitor runs (issue #2478).
     retention: RetentionSpawn,
 }
@@ -767,7 +790,7 @@ enum RetentionSpawn {
     Off,
     /// This process runs the janitor.
     Here,
-    /// Retention is on, but `run_on` places it on other processes.
+    /// Retention is on, but this process does not run it.
     Elsewhere,
 }
 
@@ -775,18 +798,15 @@ impl SpawnPlan {
     /// The plan of one process. `retention_enabled` is
     /// `RetentionConfig::enabled`.
     const fn new(
-        switches: crate::process_role::ProcessSwitches,
+        switches: &crate::process_role::ProcessSwitches,
         run_on: crate::config::RetentionRunOn,
         retention_enabled: bool,
     ) -> Self {
         Self {
             worker: switches.worker.enabled,
             scheduler: switches.scheduler.enabled,
-            retention: if crate::process_role::runs_retention(
-                retention_enabled,
-                run_on,
-                switches.scheduler.enabled,
-            ) {
+            batch: switches.batch(),
+            retention: if switches.retention(retention_enabled, run_on) {
                 RetentionSpawn::Here
             } else if retention_enabled {
                 RetentionSpawn::Elsewhere
@@ -796,10 +816,10 @@ impl SpawnPlan {
         }
     }
 
-    /// The batch executor. Only the worker process runs it, so executors do
-    /// not compete for the same job rows.
+    /// The batch executor. Executors claim job rows, so concurrent
+    /// executors stay correct.
     const fn batch(self) -> bool {
-        self.worker
+        self.batch
     }
 
     /// The codec refresh loop. A worker refreshes its key in its own timeout
@@ -815,9 +835,8 @@ impl SpawnPlan {
         !self.worker
     }
 
-    /// Retention is on, but `run_on` places it on other processes (issue
-    /// #2478). The API then reports `placed_elsewhere`, and `run-now`
-    /// names the fix.
+    /// Retention is on, but this process does not run it (issue #2478).
+    /// The API then reports `placed_elsewhere`, and `run-now` names the fix.
     const fn retention_placed_elsewhere(self) -> bool {
         matches!(self.retention, RetentionSpawn::Elsewhere)
     }
@@ -1050,6 +1069,12 @@ pub struct HarvestRunner {
     /// an API-only process — no `Worker`, which spawns its own copy instead
     /// (issue #1429). `stop` cancels and joins it.
     dispatch_metrics_sampler: Option<(CancellationToken, JoinHandle<()>)>,
+    /// The loops given to Autumn background tasks, if any. The Autumn drain
+    /// signals them before `stop` runs.
+    hosted: Option<crate::background::HostedLoops>,
+    /// The stop of each hosted loop. `stop` waits for each one, so an abort
+    /// of an Autumn task cannot cut a drain short.
+    hosted_stops: Vec<crate::background::HostedStop>,
 }
 
 /// Background batch-operations executor handle (issue #102).
@@ -1069,21 +1094,12 @@ impl BatchRuntime {
         tick_interval: std::time::Duration,
     ) -> Self {
         let cancel = CancellationToken::new();
-        let cancel_for_task = cancel.clone();
-        let handle = tokio::spawn(async move {
-            loop {
-                if cancel_for_task.is_cancelled() {
-                    return;
-                }
-                if let Err(error) = run_executor_once(&pool, &executor_config).await {
-                    tracing::warn!(%error, "batch executor tick failed");
-                }
-                tokio::select! {
-                    () = cancel_for_task.cancelled() => return,
-                    () = tokio::time::sleep(tick_interval) => {}
-                }
-            }
-        });
+        let handle = tokio::spawn(run_batch_executor(
+            pool,
+            executor_config,
+            tick_interval,
+            cancel.clone(),
+        ));
         Self { cancel, handle }
     }
 
@@ -1091,6 +1107,45 @@ impl BatchRuntime {
         self.cancel.cancel();
         if let Err(error) = self.handle.await {
             tracing::warn!(error = %error, "harvest batch executor task failed during shutdown");
+        }
+    }
+}
+
+/// The batch executor loop. It ticks until `stop` is cancelled.
+async fn run_batch_executor(
+    pool: ShardedDbPool,
+    executor_config: BatchExecutorConfig,
+    tick_interval: std::time::Duration,
+    stop: CancellationToken,
+) {
+    loop {
+        if stop.is_cancelled() {
+            return;
+        }
+        if let Err(error) = run_executor_once(&pool, &executor_config).await {
+            tracing::warn!(%error, "batch executor tick failed");
+        }
+        tokio::select! {
+            () = stop.cancelled() => return,
+            () = tokio::time::sleep(tick_interval) => {}
+        }
+    }
+}
+
+/// Run `worker` until `stop` is cancelled, then drain it.
+///
+/// `Worker::shutdown` asks the worker to stop. The call then waits for
+/// `Worker::run` to drain and return.
+async fn run_worker_until(worker: Arc<Worker>, pool: DbPool, stop: CancellationToken) {
+    let run = worker.run(&pool);
+    tokio::pin!(run);
+    tokio::select! {
+        // A worker that stops by itself ends the call.
+        biased;
+        () = &mut run => {}
+        () = stop.cancelled() => {
+            worker.shutdown();
+            run.await;
         }
     }
 }
@@ -1236,16 +1291,14 @@ impl HarvestRunner {
 
         // Issue #2477: an unset switch follows the role of the app state. A
         // runner with no app state has no role and keeps both switches on.
-        let switches = config.process_switches(resources.process_role());
+        let switches = config.process_switches(resources.role());
         switches.log();
-        if let Some(state) = resources.app_state.as_ref() {
-            crate::process_role::warn_preset_overrides(state.role());
-        }
         let plan = SpawnPlan::new(
-            switches,
+            &switches,
             config.retention.run_on,
             built.retention().enabled(),
         );
+        let hosted = resources.hosted.clone();
         let worker_enabled = plan.worker;
         let scheduler_enabled = plan.scheduler;
         worker_queues.log(worker_enabled);
@@ -1491,34 +1544,53 @@ impl HarvestRunner {
         let worker_id = worker
             .as_ref()
             .map(|_| prepared.worker_runtime_config.worker_id.clone());
-        let worker_handle = worker.as_ref().map(|worker| {
+        // With a host, each loop goes to its Autumn background task, which
+        // runs it until the Autumn drain. Otherwise the runner spawns it.
+        let mut hosted_stops = Vec::new();
+        let worker_handle = worker.as_ref().and_then(|worker| {
             let worker = Arc::clone(worker);
             let pool = harvest_pool.clone();
-            tokio::spawn(async move {
-                worker.run(&pool).await;
-            })
+            if let Some(hosted) = &hosted {
+                hosted_stops.push(hosted.put_detached(HarvestLoop::Worker, move |stop| {
+                    run_worker_until(worker, pool, stop)
+                }));
+                None
+            } else {
+                Some(tokio::spawn(async move {
+                    worker.run(&pool).await;
+                }))
+            }
         });
-        let scheduler = if scheduler_enabled {
-            Some(SchedulerRuntime::spawn_sharded(
+        let prepared_scheduler = scheduler_enabled.then(|| {
+            SchedulerRuntime::prepare_sharded(
                 prepared.storage_pool.sharded_pool().clone(),
                 shard_router.clone(),
                 Arc::clone(&registry),
                 Arc::clone(&dag_catalog),
                 Arc::clone(&workflow_schedules),
-            ))
-        } else {
-            None
-        };
-        let scheduler_monitor = scheduler
+            )
+        });
+        let scheduler_monitor = prepared_scheduler
             .as_ref()
-            .map_or_else(SchedulerMonitor::offline, SchedulerRuntime::monitor);
+            .map_or_else(SchedulerMonitor::offline, PreparedScheduler::monitor);
+        let scheduler = prepared_scheduler.and_then(|scheduler| {
+            if let Some(hosted) = &hosted {
+                hosted_stops.push(
+                    hosted.put_detached(HarvestLoop::Scheduler, move |stop| scheduler.run(stop)),
+                );
+                None
+            } else {
+                Some(scheduler.spawn())
+            }
+        });
         // The API reads archived history back through the same archiver
         // (issue #1983).
         let api_history_archiver = prepared.history_archiver.clone();
-        // Issue #2478: retention runs where the scheduler runs, unless
-        // `run_on = "all"`. So a `web` replica runs no delete sweep.
-        let retention = if plan.retention() {
-            RetentionRuntime::spawn_with_hooks(
+        // Issue #2478: an explicit `scheduler_enabled` moves retention with
+        // it. With none, `harvest.maintenance` places it. So a `web` replica
+        // runs no delete sweep.
+        let prepared_retention = if plan.retention() {
+            RetentionRuntime::prepare_with_hooks(
                 prepared.storage_pool.sharded_pool().clone(),
                 prepared.retention_config.clone(),
                 Arc::clone(&registry.telemetry().metrics),
@@ -1554,20 +1626,38 @@ impl HarvestRunner {
             );
             None
         };
-        let retention_monitor = retention.as_ref().map(RetentionRuntime::monitor);
-        let retention_trigger = retention.as_ref().map(RetentionRuntime::trigger_sender);
-        // Batch operations executor (issue #102). Only the worker-owning
-        // process spawns it, so no executors compete for the same job rows.
+        let retention_monitor = prepared_retention.as_ref().map(PreparedRetention::monitor);
+        let retention_trigger = prepared_retention
+            .as_ref()
+            .map(PreparedRetention::trigger_sender);
+        let retention = prepared_retention.and_then(|retention| {
+            if let Some(hosted) = &hosted {
+                hosted_stops.push(
+                    hosted.put_detached(HarvestLoop::Retention, move |stop| retention.run(stop)),
+                );
+                None
+            } else {
+                Some(retention.spawn())
+            }
+        });
+        // Batch operations executor (issue #102). The role places it with
+        // the `harvest.maintenance` capability.
         let batch = if plan.batch() {
-            Some(BatchRuntime::spawn(
-                prepared.storage_pool.sharded_pool().clone(),
-                BatchExecutorConfig {
-                    concurrency: config.batch.concurrency,
-                    metrics: Arc::clone(&registry.telemetry().metrics),
-                    payload_codecs: registry.payload_codecs().clone(),
-                },
-                std::time::Duration::from_millis(config.batch.tick_interval_ms),
-            ))
+            let pool = prepared.storage_pool.sharded_pool().clone();
+            let executor_config = BatchExecutorConfig {
+                concurrency: config.batch.concurrency,
+                metrics: Arc::clone(&registry.telemetry().metrics),
+                payload_codecs: registry.payload_codecs().clone(),
+            };
+            let tick = std::time::Duration::from_millis(config.batch.tick_interval_ms);
+            if let Some(hosted) = &hosted {
+                hosted_stops.push(hosted.put_detached(HarvestLoop::Batch, move |stop| {
+                    run_batch_executor(pool, executor_config, tick, stop)
+                }));
+                None
+            } else {
+                Some(BatchRuntime::spawn(pool, executor_config, tick))
+            }
         } else {
             None
         };
@@ -1619,6 +1709,8 @@ impl HarvestRunner {
             dispatch_install_generation,
             dispatch_shard_generations,
             dispatch_metrics_sampler,
+            hosted,
+            hosted_stops,
         })
     }
 
@@ -1686,7 +1778,24 @@ impl HarvestRunner {
             dispatch_install_generation,
             dispatch_shard_generations,
             dispatch_metrics_sampler,
+            hosted,
+            hosted_stops,
         } = self;
+        // Signal each hosted loop. A loop that no task took never ran, so it
+        // is dropped. A host that starts no background task is one example:
+        // the one-off task mode of Autumn.
+        for hosted_stop in &hosted_stops {
+            hosted_stop.signal();
+        }
+        if let Some(hosted) = hosted {
+            let dropped = hosted.clear();
+            if !dropped.is_empty() {
+                tracing::info!(
+                    runtimes = ?dropped,
+                    "harvest runtimes not started: no Autumn background task took them"
+                );
+            }
+        }
 
         {
             let _dispatch_start_guard = DISPATCH_START_LOCK.lock().await;
@@ -1734,6 +1843,11 @@ impl HarvestRunner {
             && let Err(error) = worker_handle.await
         {
             tracing::warn!(error = %error, "harvest worker task failed during shutdown");
+        }
+        // The worker drain and an open retention pass finish here, with the
+        // budget of the shutdown hook.
+        for hosted_stop in &hosted_stops {
+            hosted_stop.wait().await;
         }
         // Send the wakes of the last writes before the runtime can stop the
         // notify senders (issue #1796).
@@ -3139,6 +3253,35 @@ mod tests {
         );
     }
 
+    /// A cancelled token ends the batch loop before its first tick, so it
+    /// reads no database.
+    #[tokio::test]
+    async fn the_batch_loop_returns_on_a_cancelled_token() {
+        let stop = tokio_util::sync::CancellationToken::new();
+        stop.cancel();
+        let executor_config = autumn_harvest::batch::BatchExecutorConfig {
+            concurrency: 1,
+            metrics: std::sync::Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+            payload_codecs: autumn_harvest::payload_codec::PayloadCodecs::default(),
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::run_batch_executor(
+                ShardedDbPool::single(tagged_pool(1)),
+                executor_config,
+                std::time::Duration::from_secs(60),
+                stop,
+            ),
+        )
+        .await
+        .expect("the loop returns at once");
+    }
+
+    /// The role of `base`, as `AppState::role` gives it.
+    fn role_of(base: autumn_web::config::ProcessRole) -> autumn_web::config::Role {
+        autumn_web::config::Role::from(base)
+    }
+
     /// Issue #2477: each role gives its spawn plan. A `web` replica spawns
     /// no worker, scheduler or batch executor, but keeps its codec key fresh.
     #[test]
@@ -3150,9 +3293,10 @@ mod tests {
         use crate::process_role::ProcessSwitches;
 
         // (worker, scheduler, batch, codec refresh) for each input.
-        let plan = |worker, scheduler, role| {
-            let switches = ProcessSwitches::resolve(worker, scheduler, role);
-            let plan = SpawnPlan::new(switches, RetentionRunOn::Scheduler, true);
+        let plan = |worker, scheduler, role: Option<ProcessRole>| {
+            let role = role.map(role_of);
+            let switches = ProcessSwitches::resolve(worker, scheduler, role.as_ref());
+            let plan = SpawnPlan::new(&switches, RetentionRunOn::Scheduler, true);
             (
                 plan.worker,
                 plan.scheduler,
@@ -3186,7 +3330,10 @@ mod tests {
     ///   notifications that wake the waiters.
     /// - A `Worker` samples dispatch metrics itself. Only a process with no
     ///   `Worker` runs the sampler, so no process emits a gauge twice.
+    ///
+    /// A named role sets each Harvest capability on its own.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn each_role_places_each_runtime() {
         use autumn_web::config::ProcessRole;
 
@@ -3209,9 +3356,9 @@ mod tests {
             notify_sender: bool,
             codec_refresh: bool,
         }
-        let row = |role, run_on| {
+        let row = |role: Option<&autumn_web::config::Role>, run_on| {
             let switches = ProcessSwitches::resolve(None, None, role);
-            let plan = SpawnPlan::new(switches, run_on, true);
+            let plan = SpawnPlan::new(&switches, run_on, true);
             Row {
                 worker: plan.worker,
                 scheduler: plan.scheduler,
@@ -3244,39 +3391,74 @@ mod tests {
             codec_refresh: false,
         };
         let scheduler = RetentionRunOn::Scheduler;
-        assert_eq!(row(Some(ProcessRole::Web), scheduler), web);
-        assert_eq!(row(Some(ProcessRole::Worker), scheduler), full);
-        assert_eq!(row(Some(ProcessRole::Combined), scheduler), full);
+        let (web_role, worker_role, combined_role) = (
+            role_of(ProcessRole::Web),
+            role_of(ProcessRole::Worker),
+            role_of(ProcessRole::Combined),
+        );
+        assert_eq!(row(Some(&web_role), scheduler), web);
+        assert_eq!(row(Some(&worker_role), scheduler), full);
+        assert_eq!(row(Some(&combined_role), scheduler), full);
         assert_eq!(row(None, scheduler), full, "a standalone runner");
 
         // `run_on = "all"` keeps the behaviour before issue #2478.
         let all = RetentionRunOn::All;
         assert_eq!(
-            row(Some(ProcessRole::Web), all),
+            row(Some(&web_role), all),
             Row {
                 retention: true,
                 retention_placed_elsewhere: false,
                 ..web
             }
         );
-        for role in [Some(ProcessRole::Worker), Some(ProcessRole::Combined), None] {
+        for role in [Some(&worker_role), Some(&combined_role), None] {
             assert_eq!(row(role, all), full, "{role:?}");
         }
+
+        // A named role turns off the Harvest worker and keeps the rest.
+        let cron = crate::process_role::tests::resolve_role(
+            "role = \"cron\"\n[roles.cron]\nbase = \"worker\"\n\
+             capabilities = { \"harvest.worker\" = false }\n",
+        );
+        assert_eq!(
+            row(Some(&cron), scheduler),
+            Row {
+                worker: false,
+                dispatch_metrics_sampler: true,
+                codec_refresh: true,
+                ..full
+            }
+        );
+        // A named role turns off maintenance: no janitor, no batch.
+        let lean = crate::process_role::tests::resolve_role(
+            "role = \"lean\"\n[roles.lean]\nbase = \"worker\"\n\
+             capabilities = { \"harvest.maintenance\" = false }\n",
+        );
+        assert_eq!(
+            row(Some(&lean), scheduler),
+            Row {
+                batch: false,
+                retention: false,
+                retention_placed_elsewhere: true,
+                ..full
+            }
+        );
     }
 
-    /// Issue #2478: retention follows the resolved scheduler switch, so an
-    /// explicit scheduler value moves it. Retention that is off never runs.
+    /// Issue #2478: an explicit scheduler value moves retention with it.
+    /// Retention that is off never runs.
     #[test]
-    fn retention_follows_the_resolved_scheduler() {
+    fn retention_follows_an_explicit_scheduler() {
         use autumn_web::config::ProcessRole;
 
         use super::SpawnPlan;
         use crate::config::RetentionRunOn;
         use crate::process_role::ProcessSwitches;
 
-        let retention = |scheduler, role, run_on, enabled| {
-            let switches = ProcessSwitches::resolve(None, scheduler, role);
-            SpawnPlan::new(switches, run_on, enabled).retention()
+        let retention = |scheduler, role: Option<ProcessRole>, run_on, enabled| {
+            let role = role.map(role_of);
+            let switches = ProcessSwitches::resolve(None, scheduler, role.as_ref());
+            SpawnPlan::new(&switches, run_on, enabled).retention()
         };
         let web = Some(ProcessRole::Web);
         let worker = Some(ProcessRole::Worker);
@@ -3295,8 +3477,9 @@ mod tests {
                         !retention(scheduler, role, run_on, false),
                         "{role:?} {run_on:?} {scheduler:?}"
                     );
-                    let switches = ProcessSwitches::resolve(None, scheduler, role);
-                    let plan = SpawnPlan::new(switches, run_on, false);
+                    let role = role.map(role_of);
+                    let switches = ProcessSwitches::resolve(None, scheduler, role.as_ref());
+                    let plan = SpawnPlan::new(&switches, run_on, false);
                     assert!(!plan.retention_placed_elsewhere(), "off is not elsewhere");
                 }
             }
@@ -3309,8 +3492,8 @@ mod tests {
     fn the_resources_give_the_role_of_their_app_state() {
         let bare = HarvestRunnerResources::new(tagged_pool(1));
         assert_eq!(bare.process_role(), None);
-        let switches =
-            crate::config::HarvestRuntimeConfig::default().process_switches(bare.process_role());
+        assert!(bare.role().is_none());
+        let switches = crate::config::HarvestRuntimeConfig::default().process_switches(bare.role());
         assert!(switches.worker.enabled && switches.scheduler.enabled);
 
         let with_state = bare.with_app_state(autumn_web::AppState::for_test());
@@ -3637,6 +3820,8 @@ mod tests {
             dispatch_install_generation: generation,
             dispatch_shard_generations: Vec::new(),
             dispatch_metrics_sampler: None,
+            hosted: None,
+            hosted_stops: Vec::new(),
         }
     }
 

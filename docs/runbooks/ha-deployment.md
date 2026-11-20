@@ -151,8 +151,8 @@ Expected steady-state: `lost_race / claimed ≈ 0` for fast schedules (< tick in
 Set `AUTUMN_ROLE=web` or `AUTUMN_ROLE=worker` on each replica. A `web`
 replica runs no Harvest worker and no scheduler tick. Only the `worker`
 replicas tick and claim, so the contract above holds among them. The
-retention janitor follows the scheduler, so it runs on the `worker`
-replicas only (issue #2478). See
+retention janitor follows the `harvest.maintenance` capability, so it
+runs on the `worker` replicas only (issue #2478). See
 [`docs/operations/process-roles.md`](../operations/process-roles.md).
 
 ### Multi-Shard
@@ -347,11 +347,58 @@ FROM harvest_scanner_leases
 ORDER BY shard_id, scanner;
 ```
 
+### One gauge read per shard
+
+The database gauge samplers use the same lease, one row per shard and
+sampler (issue #2679). The key is `gauge:v1:<sampler>`. A sampler with inputs
+adds `:sha256:<hex>` of them, for example its queues.
+
+- **The holder** reads the shard and writes the read to
+  `harvest_gauge_samples`.
+- **A standby** uses that row while it is younger than three sample
+  intervals. Otherwise it reads the shard itself (`fail_open`).
+- **Every replica still emits each gauge.** A handover changes who reads,
+  not who emits. No alert or dashboard query changes.
+
+The lease TTL is at least three sample intervals, 45 s by default. A crashed
+holder leaves a gauge at most four intervals old. A graceful stop hands over
+on the next tick. The `elect` setting above turns this election off too.
+
+A held or DR-fenced shard runs no election. Under a DR pin, each lease and
+row write checks the fence first.
+
+Limits:
+
+- Workers with other queues or thresholds elect their own leader. Expect one
+  read per shard and interval for each input set.
+- A standby tick still costs a lease upsert and a row read. A one-worker
+  fleet gains nothing, so it can set `elect = false`.
+- One sampler loop reads every shard in turn. A loop that takes longer than
+  three intervals loses its leases, and the standbys read the shards
+  themselves. Raise `gauge_sample_interval` if that happens.
+- A standby emits the leader's read. A gauge that grows with time, such as
+  the oldest pending age, is up to one interval behind.
+- A lease row of an input set that no worker uses stays in
+  `harvest_scanner_leases`. Its sample row goes after one day.
+
+```promql
+# Gauge reads per shard. Expect about one per sample interval and input set,
+# not N.
+sum by (scanner, shard) (rate(harvest_scanner_pass_total{scanner=~"gauge_.*",role!="standby"}[5m]))
+```
+
+A non-zero `fail_open` rate for a gauge sampler means a failed lease query,
+or a missing or old row. The first tick before a leader writes is
+`fail_open` too. Check that the
+`20261119232341_harvest_gauge_samples` migration ran. The storage role needs
+`SELECT`, `INSERT`, `UPDATE` and `DELETE` on `harvest_gauge_samples`.
+
 ### Known limits
 
-- Only the timeout checker uses the lease. The poison-pill reclaimer,
-  session-slot reconciler, pause auto-resume, quota reconcile, audit export
-  and the metric samplers still run on every replica.
+- The timeout checker and the database gauge samplers use the lease. The
+  poison-pill reclaimer, session-slot reconciler, pause auto-resume, quota
+  reconcile and audit export still run on every replica. So do the gauge
+  samplers that read no table.
 - Only the holder's settings and registries apply to the pass. Give every
   replica that shares a database the same codecs, history ceiling and
   scanner settings. A holder whose pass keeps failing gives up the lease.
