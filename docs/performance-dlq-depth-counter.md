@@ -175,8 +175,9 @@ needs.
 
 ## Follow-ups
 
-- One elected sampler per shard (#2679) would cut the calls of the other
-  samplers by the worker count. The DLQ read no longer needs it.
+- One elected sampler per shard (#2679, PR #2750) now cuts the calls of
+  every gauge sampler by the worker count. The DLQ read no longer needed it,
+  and it costs 1 buffer when it runs.
 
 ## 🔬 Reproduce
 

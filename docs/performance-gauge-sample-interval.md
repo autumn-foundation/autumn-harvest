@@ -116,7 +116,8 @@ at 500 ms. After is 240 calls at 15 s:
 | large | 5.53 B, plus stranded-work calls of more than 300 s | 292 M | — |
 
 A worker with a sharded pool runs the fleet-wide samplers once for each shard,
-so multiply by the shard count.
+so multiply by the shard count. Since issue #2679, one elected worker reads
+each shard. So the fleet pays these figures once, not once per worker.
 
 `stranded_demand_matches_the_reference_query` proves that the rewrite returns
 the same groups as the old query. `gauge_samplers_wait_for_the_gauge_interval_not_the_poll_interval`
@@ -129,7 +130,9 @@ ends. The test fails when a single sampler uses `poll_interval`.
   table would make it constant, but it adds a write to each dead letter.
   Done: [`performance-dlq-depth-counter.md`](performance-dlq-depth-counter.md).
 - The stranded-work query still reads each claimable pending row. One elected
-  sampler per shard would cut the calls by the worker count.
+  sampler per shard cuts the calls by the worker count. Issue #2679 does
+  that for each database gauge sampler. See
+  `docs/design/DESIGN-gauge-sampler-election.md`.
 - `concurrency_key_stats` scans the whole task queue. No index covers its
   PENDING rows.
 

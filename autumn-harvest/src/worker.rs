@@ -32228,12 +32228,13 @@ fn spawn_queue_depth_sampler(
     // default shard only (issue #522 review). Every worker aggregates the
     // same full set, so all workers emit a consistent
     // `harvest.queue.depth{queue}` value.
-    pools: Vec<DbPool>,
+    pools: Vec<GaugeShard>,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     queues: Vec<String>,
     interval: Duration,
     circuit_breaker_activities: Vec<String>,
+    election: crate::gauge_election::GaugeElection,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // No recorder configured: never issue the sampler SQL. The per-event
@@ -32241,6 +32242,17 @@ fn spawn_queue_depth_sampler(
         if !telemetry.metrics.is_enabled() {
             return;
         }
+        let inputs = serde_json::json!({
+            "queues": sorted_set(&queues),
+            "circuit_breakers": sorted_set(&circuit_breaker_activities),
+            "cap": crate::telemetry::QUEUE_DEPTH_CAP.get(),
+        });
+        let mut slots = gauge_slots(
+            &election,
+            crate::gauge_election::GaugeSampler::QueueDepth,
+            &inputs,
+            &pools,
+        );
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -32263,7 +32275,7 @@ fn spawn_queue_depth_sampler(
             // pre-aggregation single-pool path, which skipped the sample on read
             // failure (#522).
             let mut read_failed = false;
-            for pool in &pools {
+            for (shard, slot) in pools.iter().zip(slots.iter_mut()) {
                 // Selected against `cancel` (issue #1426), mirroring
                 // `spawn_schedule_overdue_sampler`. A cancelled acquisition
                 // abandons the rest of this tick's shards, same as any
@@ -32271,7 +32283,7 @@ fn spawn_queue_depth_sampler(
                 // loop.
                 let get_result = tokio::select! {
                     () = cancel.cancelled() => None,
-                    result = pool.get() => Some(result),
+                    result = shard.pool.get() => Some(result),
                 };
                 let Some(get_result) = get_result else {
                     read_failed = true;
@@ -32288,15 +32300,24 @@ fn spawn_queue_depth_sampler(
                         continue;
                     }
                 };
-                match queue::bounded_queue_depths(
-                    &mut conn,
-                    &queues,
-                    crate::telemetry::QUEUE_DEPTH_CAP,
-                )
-                .await
-                {
-                    Ok(depths) => {
-                        for (queue_name, depth) in depths {
+                // The elected worker reads the shard. The others use its row.
+                let sampled = slot
+                    .sample(&mut conn, &*telemetry.metrics, async |conn| {
+                        let depths = queue::bounded_queue_depths(
+                            conn,
+                            &queues,
+                            crate::telemetry::QUEUE_DEPTH_CAP,
+                        )
+                        .await?;
+                        let ages =
+                            queue::oldest_pending_ages(conn, &queues, &circuit_breaker_activities)
+                                .await?;
+                        Ok(QueueDepthRead { depths, ages })
+                    })
+                    .await;
+                match sampled {
+                    Ok((read, _role)) => {
+                        for (queue_name, depth) in read.depths {
                             let total = depth_by_queue.entry(queue_name).or_insert(0);
                             *total = queue::add_bounded_depth(
                                 *total,
@@ -32304,23 +32325,13 @@ fn spawn_queue_depth_sampler(
                                 crate::telemetry::QUEUE_DEPTH_CAP.get(),
                             );
                         }
-                    }
-                    Err(error) => {
-                        tracing::debug!(error = %error, "queue depth sample failed");
-                        read_failed = true;
-                    }
-                }
-                match queue::oldest_pending_ages(&mut conn, &queues, &circuit_breaker_activities)
-                    .await
-                {
-                    Ok(ages) => {
-                        for (queue_name, age_secs) in ages {
-                            let slot = age_by_queue.entry(queue_name).or_insert(0.0);
-                            *slot = slot.max(age_secs);
+                        for (queue_name, age_secs) in read.ages {
+                            let age = age_by_queue.entry(queue_name).or_insert(0.0);
+                            *age = age.max(age_secs);
                         }
                     }
                     Err(error) => {
-                        tracing::debug!(error = %error, "oldest pending age sample failed");
+                        tracing::debug!(error = %error, "queue depth sample failed");
                         read_failed = true;
                     }
                 }
@@ -32350,6 +32361,7 @@ fn spawn_queue_depth_sampler(
                 break;
             }
         }
+        release_gauge_slots(&mut slots, &pools).await;
     })
 }
 
@@ -32361,11 +32373,12 @@ fn spawn_queue_depth_sampler(
 ///  - A `DEBUG` trace if any tasks are pending while the cap is saturated
 fn spawn_concurrency_sampler(
     // One pool per shard to aggregate over (see `spawn_queue_depth_sampler`).
-    pools: Vec<DbPool>,
+    pools: Vec<GaugeShard>,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     queues: Vec<String>,
     interval: Duration,
+    election: crate::gauge_election::GaugeElection,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // No recorder configured, and no DEBUG subscriber would observe the
@@ -32382,6 +32395,12 @@ fn spawn_concurrency_sampler(
         {
             return;
         }
+        let mut slots = gauge_slots(
+            &election,
+            crate::gauge_election::GaugeSampler::Concurrency,
+            &serde_json::json!({ "queues": sorted_set(&queues) }),
+            &pools,
+        );
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -32399,7 +32418,7 @@ fn spawn_concurrency_sampler(
             // Skip the whole tick on any shard read failure so a partial aggregate
             // does not under-report concurrency during a storage outage (#522).
             let mut read_failed = false;
-            for pool in &pools {
+            for (shard, slot) in pools.iter().zip(slots.iter_mut()) {
                 // Selected against `cancel` (issue #1426), mirroring
                 // `spawn_schedule_overdue_sampler`. A cancelled acquisition
                 // abandons the rest of this tick's shards, same as any
@@ -32407,7 +32426,7 @@ fn spawn_concurrency_sampler(
                 // loop.
                 let get_result = tokio::select! {
                     () = cancel.cancelled() => None,
-                    result = pool.get() => Some(result),
+                    result = shard.pool.get() => Some(result),
                 };
                 let Some(get_result) = get_result else {
                     read_failed = true;
@@ -32424,8 +32443,17 @@ fn spawn_concurrency_sampler(
                         continue;
                     }
                 };
-                match queue::concurrency_key_stats(&mut conn, &queues).await {
-                    Ok(stats) => {
+                let sampled = slot
+                    .sample(&mut conn, &*telemetry.metrics, async |conn| {
+                        let stats = queue::concurrency_key_stats(conn, &queues).await?;
+                        Ok(stats
+                            .into_iter()
+                            .map(ConcurrencyRead::from)
+                            .collect::<Vec<_>>())
+                    })
+                    .await;
+                match sampled {
+                    Ok((stats, _role)) => {
                         for stat in &stats {
                             // Grouped by (key, task_type) so workflow and activity
                             // budgets for the same key do not collide on the label.
@@ -32476,6 +32504,7 @@ fn spawn_concurrency_sampler(
                 break;
             }
         }
+        release_gauge_slots(&mut slots, &pools).await;
     })
 }
 
@@ -32485,10 +32514,11 @@ fn spawn_concurrency_sampler(
 /// Stops when the cancellation token fires.
 fn spawn_rate_limit_sampler(
     // One pool per shard to aggregate over (see `spawn_queue_depth_sampler`).
-    pools: Vec<DbPool>,
+    pools: Vec<GaugeShard>,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     interval: Duration,
+    election: crate::gauge_election::GaugeElection,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // No recorder configured: never issue the sampler SQL (issue #1428,
@@ -32496,6 +32526,12 @@ fn spawn_rate_limit_sampler(
         if !telemetry.metrics.is_enabled() {
             return;
         }
+        let mut slots = gauge_slots(
+            &election,
+            crate::gauge_election::GaugeSampler::RateLimit,
+            &serde_json::Value::Null,
+            &pools,
+        );
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -32522,7 +32558,7 @@ fn spawn_rate_limit_sampler(
             // Skip the whole tick on any shard read failure so a partial aggregate
             // does not under-report available tokens during a storage outage (#522).
             let mut read_failed = false;
-            for pool in &pools {
+            for (shard, slot) in pools.iter().zip(slots.iter_mut()) {
                 // Selected against `cancel` (issue #1426), mirroring
                 // `spawn_schedule_overdue_sampler`. A cancelled acquisition
                 // abandons the rest of this tick's shards, same as any
@@ -32530,7 +32566,7 @@ fn spawn_rate_limit_sampler(
                 // loop.
                 let get_result = tokio::select! {
                     () = cancel.cancelled() => None,
-                    result = pool.get() => Some(result),
+                    result = shard.pool.get() => Some(result),
                 };
                 let Some(get_result) = get_result else {
                     read_failed = true;
@@ -32548,10 +32584,18 @@ fn spawn_rate_limit_sampler(
                     }
                 };
 
-                let result = queue::sample_rate_limit_buckets(&mut conn).await;
+                let result = slot
+                    .sample(&mut conn, &*telemetry.metrics, async |conn| {
+                        let buckets = queue::sample_rate_limit_buckets(conn).await?;
+                        Ok(buckets
+                            .into_iter()
+                            .map(RateLimitRead::from)
+                            .collect::<Vec<_>>())
+                    })
+                    .await;
 
                 match result {
-                    Ok(buckets) => {
+                    Ok((buckets, _role)) => {
                         for bucket in buckets {
                             *tokens_by_key.entry(bucket.key.clone()).or_insert(0.0) +=
                                 bucket.estimated_tokens;
@@ -32588,6 +32632,7 @@ fn spawn_rate_limit_sampler(
                 break;
             }
         }
+        release_gauge_slots(&mut slots, &pools).await;
     })
 }
 
@@ -32604,11 +32649,11 @@ fn spawn_rate_limit_sampler(
 ///
 /// Stops when the cancellation token fires.
 fn spawn_dlq_depth_sampler(
-    pool: DbPool,
+    shard: GaugeShard,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
-    shard_id: u16,
     interval: Duration,
+    election: crate::gauge_election::GaugeElection,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // No recorder configured: never issue the sampler SQL (issue #1428,
@@ -32616,6 +32661,15 @@ fn spawn_dlq_depth_sampler(
         if !telemetry.metrics.is_enabled() {
             return;
         }
+        let shard_id = u16::try_from(shard.shard.as_i32()).unwrap_or(0);
+        let pool = shard.pool.clone();
+        let shards = vec![shard];
+        let mut slots = gauge_slots(
+            &election,
+            crate::gauge_election::GaugeSampler::Dlq,
+            &serde_json::Value::Null,
+            &shards,
+        );
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -32642,8 +32696,13 @@ fn spawn_dlq_depth_sampler(
                 }
             };
 
-            match crate::dlq::dead_letter_count(&mut conn).await {
-                Ok(count) => {
+            let sampled = slots[0]
+                .sample(&mut conn, &*telemetry.metrics, async |conn| {
+                    crate::dlq::dead_letter_count(conn).await
+                })
+                .await;
+            match sampled {
+                Ok((count, _role)) => {
                     if count < 0 {
                         tracing::warn!(
                             shard_id,
@@ -32663,6 +32722,7 @@ fn spawn_dlq_depth_sampler(
                 break;
             }
         }
+        release_gauge_slots(&mut slots, &shards).await;
     })
 }
 
@@ -32682,15 +32742,22 @@ fn spawn_dlq_depth_sampler(
 #[cfg(feature = "db")]
 fn spawn_queue_pause_sampler(
     // One pool per shard to aggregate over (see spawn_queue_depth_sampler).
-    pools: Vec<DbPool>,
+    pools: Vec<GaugeShard>,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     interval: Duration,
+    election: crate::gauge_election::GaugeElection,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if !telemetry.metrics.is_enabled() {
             return;
         }
+        let mut slots = gauge_slots(
+            &election,
+            crate::gauge_election::GaugeSampler::QueuePause,
+            &serde_json::Value::Null,
+            &pools,
+        );
         // Queues reported paused on the previous cycle, so a resume can be
         // zero-filled exactly once rather than leaving a stale `1`.
         let mut previously_paused: std::collections::BTreeSet<String> =
@@ -32706,7 +32773,7 @@ fn spawn_queue_pause_sampler(
                 std::collections::BTreeSet::new();
             let mut read_failed = false;
 
-            for pool in &pools {
+            for (shard, slot) in pools.iter().zip(slots.iter_mut()) {
                 // Selected against `cancel` (issue #1426), mirroring
                 // `spawn_schedule_overdue_sampler`. A cancelled acquisition
                 // abandons the rest of this tick's shards, same as any
@@ -32714,7 +32781,7 @@ fn spawn_queue_pause_sampler(
                 // loop.
                 let get_result = tokio::select! {
                     () = cancel.cancelled() => None,
-                    result = pool.get() => Some(result),
+                    result = shard.pool.get() => Some(result),
                 };
                 let Some(get_result) = get_result else {
                     read_failed = true;
@@ -32724,8 +32791,13 @@ fn spawn_queue_pause_sampler(
                     read_failed = true;
                     continue;
                 };
-                match crate::queue_pause::paused_queue_names(&mut conn).await {
-                    Ok(names) => currently_paused.extend(names),
+                let sampled = slot
+                    .sample(&mut conn, &*telemetry.metrics, async |conn| {
+                        crate::queue_pause::paused_queue_names(conn).await
+                    })
+                    .await;
+                match sampled {
+                    Ok((names, _role)) => currently_paused.extend(names),
                     Err(error) => {
                         read_failed = true;
                         tracing::debug!(error = %error, "queue pause sample failed");
@@ -32748,6 +32820,7 @@ fn spawn_queue_pause_sampler(
                 break;
             }
         }
+        release_gauge_slots(&mut slots, &pools).await;
     })
 }
 
@@ -34008,7 +34081,7 @@ async fn sample_one_shard(
 /// with no such worker are counted as stranded and emitted via
 /// `harvest.shard.stranded_pending`.
 #[cfg(feature = "db")]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn spawn_stranded_work_sampler(
     sharded_pool: crate::shard::ShardedDbPool,
     freshness_window: Duration,
@@ -34021,8 +34094,33 @@ fn spawn_stranded_work_sampler(
     // Map of activity_name → required_capabilities JSON for activities that
     // declare `requires`; back-fills the eligibility gate for un-snapshotted rows.
     activity_requirements: std::collections::HashMap<String, serde_json::Value>,
+    election: crate::gauge_election::GaugeElection,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // Iterate ALL shards so unassigned writable shards with stranded
+        // work are surfaced, not just the shards this worker covers.
+        let shards: Vec<GaugeShard> = sharded_pool
+            .iter_shards()
+            .map(|(shard_id, pool)| GaugeShard {
+                shard: shard_id,
+                fence: Some(shard_id),
+                pool: pool.clone(),
+            })
+            .collect();
+        // A map has no order, so the key reads it sorted.
+        let requirements: std::collections::BTreeMap<&String, &serde_json::Value> =
+            activity_requirements.iter().collect();
+        let inputs = serde_json::json!({
+            "circuit_breakers": sorted_set(&circuit_breaker_activities),
+            "requirements": requirements,
+            "freshness_ms": u64::try_from(freshness_window.as_millis()).unwrap_or(u64::MAX),
+        });
+        let mut slots = gauge_slots(
+            &election,
+            crate::gauge_election::GaugeSampler::StrandedWork,
+            &inputs,
+            &shards,
+        );
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -34032,176 +34130,162 @@ fn spawn_stranded_work_sampler(
                 break;
             }
 
-            // Iterate ALL shards so unassigned writable shards with stranded
-            // work are surfaced, not just the shards this worker covers.
-            for (shard_id, shard_pool) in sharded_pool.iter_shards() {
+            for (shard, slot) in shards.iter().zip(slots.iter_mut()) {
+                let shard_id = shard.shard;
                 let shard_u16 = u16::try_from(shard_id.as_i32()).unwrap_or(0);
-
-                // Claimable pending demands for this shard, grouped by
-                // (queue, required_capabilities, ...) so coverage can honour the
-                // same eligibility claim_task enforces (issue #522 review).
-                let mut demands: Vec<crate::queue::ClaimablePendingDemand> = {
-                    // Selected against `cancel` (issue #1426): an unselected
-                    // `pool.get()` here can park shutdown forever. Cancellation
-                    // abandons the remaining shards this tick, same as the
-                    // multi-pool samplers above.
-                    let get_result = tokio::select! {
-                        () = cancel.cancelled() => break,
-                        result = shard_pool.get() => result,
-                    };
-                    let mut conn = match get_result {
-                        Ok(conn) => conn,
-                        Err(error) => {
-                            tracing::debug!(
-                                shard_id = %shard_id.as_i32(),
-                                error = %error,
-                                "stranded-work sampler could not acquire DB connection"
-                            );
-                            continue;
-                        }
-                    };
-                    match crate::queue::claimable_pending_demand_by_queue(
-                        &mut conn,
-                        &circuit_breaker_activities,
-                    )
-                    .await
-                    {
-                        Ok(demands) => demands,
-                        Err(error) => {
-                            tracing::debug!(
-                                shard_id = %shard_id.as_i32(),
-                                error = %error,
-                                "stranded-work count query failed"
-                            );
-                            continue;
-                        }
+                // Selected against `cancel`: an unselected `pool.get()` here
+                // can park shutdown forever. Cancellation abandons the
+                // remaining shards this tick, same as the multi-pool samplers
+                // above.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => break,
+                    result = shard.pool.get() => result,
+                };
+                let mut conn = match get_result {
+                    Ok(conn) => conn,
+                    Err(error) => {
+                        tracing::debug!(
+                            shard_id = %shard_id.as_i32(),
+                            error = %error,
+                            "stranded-work sampler could not acquire DB connection"
+                        );
+                        continue;
                     }
                 };
-
-                // Back-fill effective requirements for activity rows that did not
-                // snapshot required_capabilities (legacy/manual enqueues). The
-                // coverage check below then applies the same activity eligibility
-                // claim_task's $6 gate enforces.
-                crate::queue::apply_activity_requirements(&mut demands, &activity_requirements);
-
-                if demands.is_empty() {
-                    // No claimable work — emit 0 so the gauge resets cleanly.
-                    telemetry
-                        .metrics
-                        .record_shard_stranded_pending(shard_u16, 0);
-                    continue;
-                }
-
-                // Healthy active workers assigned to this shard. Kept whole (not
-                // collapsed to queue names) so the capability check below can see
-                // each worker's polled queues *and* labels.
-                let covering_workers: Vec<crate::workers::WorkerRow> = {
-                    // Selected against `cancel` (issue #1426); see the demands
-                    // acquisition above.
-                    let get_result = tokio::select! {
-                        () = cancel.cancelled() => break,
-                        result = shard_pool.get() => result,
-                    };
-                    let Ok(mut conn) = get_result else {
-                        continue;
-                    };
-                    let filters = crate::workers::WorkerFilters {
-                        status: Some(crate::workers::WorkerStatus::Active.as_str().to_string()),
-                        shard_id: Some(shard_id.as_i32()),
-                        health: Some(crate::workers::WorkerHealth::Healthy),
-                        limit: i64::MAX,
-                        ..Default::default()
-                    };
-                    match crate::workers::list_workers(&mut conn, &filters, freshness_window).await
-                    {
-                        Ok(workers) => workers,
-                        Err(error) => {
-                            tracing::debug!(
-                                error = %error,
-                                "worker list query failed for stranded-work sampler"
-                            );
-                            continue;
-                        }
-                    }
-                };
-
-                // Build compatibility set for this shard (issue #171 routing).
-                // Used to honour the same required_build_id eligibility
-                // claim_task enforces. On load failure fall back to an empty set
-                // (the exact-match rule still applies).
-                let compat_set = {
-                    // Selected against `cancel` (issue #1426); see the demands
-                    // acquisition above.
-                    let get_result = tokio::select! {
-                        () = cancel.cancelled() => break,
-                        result = shard_pool.get() => result,
-                    };
-                    let Ok(mut conn) = get_result else {
-                        continue;
-                    };
-                    crate::build_routing::load_compat_set(&mut conn)
+                // The elected worker computes the count. The others use its row.
+                let sampled = slot
+                    .sample(&mut conn, &*telemetry.metrics, async |conn| {
+                        stranded_pending_on_shard(
+                            conn,
+                            shard_id,
+                            freshness_window,
+                            &circuit_breaker_activities,
+                            &activity_requirements,
+                        )
                         .await
-                        .unwrap_or_default()
-                };
-
-                // A demand is covered when some covering worker polls its queue.
-                // That worker also satisfies its required_capabilities (the
-                // same Exact/In label match claim_task applies). It is
-                // build-eligible for its required_build_id (the same exact or
-                // compatible rule). When an unexpired sticky lease holds the
-                // row, it *is* the lease owner, because only the owner can
-                // claim until the lease expires. All
-                // constraints are checked against the *same* worker so a task
-                // needing several is not falsely covered by different workers
-                // each satisfying only one. No requirement ⇒ that dimension is
-                // trivially satisfied; unparseable capabilities fall back to the
-                // other dimensions so the sampler never fabricates a
-                // false-positive stranded signal.
-                let demand_covered = |demand: &crate::queue::ClaimablePendingDemand| -> bool {
-                    let reqs = demand.required_capabilities.as_ref().and_then(|caps| {
-                        serde_json::from_value::<Vec<crate::eligibility::Requirement>>(caps.clone())
-                            .ok()
-                    });
-                    covering_workers.iter().any(|w| {
-                        let polls_queue = w.worker.queues.as_array().is_some_and(|qs| {
-                            qs.iter()
-                                .any(|v| v.as_str() == Some(demand.queue_name.as_str()))
-                        });
-                        if !polls_queue {
-                            return false;
-                        }
-                        if demand
-                            .sticky_owner
-                            .as_deref()
-                            .is_some_and(|owner| owner != w.worker.worker_id)
-                        {
-                            return false;
-                        }
-                        if !compat_set
-                            .is_eligible(&w.worker.build_id, demand.required_build_id.as_deref())
-                        {
-                            return false;
-                        }
-                        reqs.as_ref().is_none_or(|reqs| {
-                            let labels =
-                                crate::payload_codec::string_valued_labels(&w.worker.labels);
-                            crate::eligibility::matches_requirements(reqs, &labels)
-                        })
                     })
-                };
-
-                // Sum pending tasks across demands no covering worker can claim.
-                let stranded: u64 = demands
-                    .iter()
-                    .filter(|demand| !demand_covered(demand))
-                    .map(|demand| u64::try_from(demand.count).unwrap_or(0))
-                    .sum();
-                telemetry
-                    .metrics
-                    .record_shard_stranded_pending(shard_u16, stranded);
+                    .await;
+                match sampled {
+                    Ok((stranded, _role)) => {
+                        telemetry
+                            .metrics
+                            .record_shard_stranded_pending(shard_u16, stranded);
+                    }
+                    // A failed read skips the emit, so the gauge holds.
+                    Err(error) => {
+                        tracing::debug!(
+                            shard_id = %shard_id.as_i32(),
+                            error = %error,
+                            "stranded-work sample failed"
+                        );
+                    }
+                }
             }
         }
+        release_gauge_slots(&mut slots, &shards).await;
     })
+}
+
+/// The claimable pending tasks on one shard that no covering live worker can
+/// claim.
+///
+/// One connection runs the three reads in turn. A failed demand or worker
+/// read fails the sample. A failed compatibility read falls back to an empty
+/// set, so the exact-match rule still applies.
+#[cfg(feature = "db")]
+async fn stranded_pending_on_shard(
+    conn: &mut AsyncPgConnection,
+    shard_id: crate::types::ShardId,
+    freshness_window: Duration,
+    circuit_breaker_activities: &[String],
+    activity_requirements: &std::collections::HashMap<String, serde_json::Value>,
+) -> HarvestResult<u64> {
+    // Claimable pending demands for this shard, grouped by
+    // (queue, required_capabilities, ...) so coverage can honour the
+    // same eligibility claim_task enforces.
+    let mut demands =
+        crate::queue::claimable_pending_demand_by_queue(conn, circuit_breaker_activities).await?;
+
+    // Back-fill effective requirements for activity rows that did not
+    // snapshot required_capabilities (legacy/manual enqueues). The
+    // coverage check below then applies the same activity eligibility
+    // claim_task's $6 gate enforces.
+    crate::queue::apply_activity_requirements(&mut demands, activity_requirements);
+
+    if demands.is_empty() {
+        // No claimable work. A 0 resets the gauge cleanly.
+        return Ok(0);
+    }
+
+    // Healthy active workers assigned to this shard. Kept whole (not
+    // collapsed to queue names) so the capability check below can see
+    // each worker's polled queues *and* labels.
+    let filters = crate::workers::WorkerFilters {
+        status: Some(crate::workers::WorkerStatus::Active.as_str().to_string()),
+        shard_id: Some(shard_id.as_i32()),
+        health: Some(crate::workers::WorkerHealth::Healthy),
+        limit: i64::MAX,
+        ..Default::default()
+    };
+    let covering_workers = crate::workers::list_workers(conn, &filters, freshness_window).await?;
+
+    // Build compatibility set for this shard (build routing).
+    // Used to honour the same required_build_id eligibility
+    // claim_task enforces. On load failure fall back to an empty set
+    // (the exact-match rule still applies).
+    let compat_set = crate::build_routing::load_compat_set(conn)
+        .await
+        .unwrap_or_default();
+
+    // A demand is covered when some covering worker polls its queue.
+    // That worker also satisfies its required_capabilities (the
+    // same Exact/In label match claim_task applies). It is
+    // build-eligible for its required_build_id (the same exact or
+    // compatible rule). When an unexpired sticky lease holds the
+    // row, it *is* the lease owner, because only the owner can
+    // claim until the lease expires. All
+    // constraints are checked against the *same* worker so a task
+    // needing several is not falsely covered by different workers
+    // each satisfying only one. No requirement ⇒ that dimension is
+    // trivially satisfied; unparseable capabilities fall back to the
+    // other dimensions so the sampler never fabricates a
+    // false-positive stranded signal.
+    let demand_covered = |demand: &crate::queue::ClaimablePendingDemand| -> bool {
+        let reqs = demand.required_capabilities.as_ref().and_then(|caps| {
+            serde_json::from_value::<Vec<crate::eligibility::Requirement>>(caps.clone()).ok()
+        });
+        covering_workers.iter().any(|w| {
+            let polls_queue = w.worker.queues.as_array().is_some_and(|qs| {
+                qs.iter()
+                    .any(|v| v.as_str() == Some(demand.queue_name.as_str()))
+            });
+            if !polls_queue {
+                return false;
+            }
+            if demand
+                .sticky_owner
+                .as_deref()
+                .is_some_and(|owner| owner != w.worker.worker_id)
+            {
+                return false;
+            }
+            if !compat_set.is_eligible(&w.worker.build_id, demand.required_build_id.as_deref()) {
+                return false;
+            }
+            reqs.as_ref().is_none_or(|reqs| {
+                let labels = crate::payload_codec::string_valued_labels(&w.worker.labels);
+                crate::eligibility::matches_requirements(reqs, &labels)
+            })
+        })
+    };
+
+    // Sum pending tasks across demands no covering worker can claim.
+    let stranded: u64 = demands
+        .iter()
+        .filter(|demand| !demand_covered(demand))
+        .map(|demand| u64::try_from(demand.count).unwrap_or(0))
+        .sum();
+    Ok(stranded)
 }
 
 // ---------------------------------------------------------------------------
@@ -34613,12 +34697,140 @@ fn spawn_pause_auto_resumer(
     })
 }
 
+/// One shard that a gauge sampler reads.
+#[derive(Clone)]
+struct GaugeShard {
+    /// The shard of the lease row and of the shared sample.
+    shard: crate::types::ShardId,
+    /// The shard of the DR write fence. `None` names the worker database.
+    fence: Option<crate::types::ShardId>,
+    /// The pool of this shard.
+    pool: DbPool,
+}
+
+/// The per-shard read of the queue-depth sampler.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct QueueDepthRead {
+    /// Bounded pending depth per queue.
+    depths: Vec<(String, i64)>,
+    /// Oldest claimable pending age per queue, in seconds.
+    ages: Vec<(String, f64)>,
+}
+
+/// The fields of one concurrency group that the concurrency sampler uses.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ConcurrencyRead {
+    key: String,
+    task_type: String,
+    max_concurrent: i32,
+    in_flight: i64,
+    pending: i64,
+}
+
+impl From<queue::ConcurrencyKeyStats> for ConcurrencyRead {
+    fn from(stat: queue::ConcurrencyKeyStats) -> Self {
+        Self {
+            key: stat.key,
+            task_type: stat.task_type,
+            max_concurrent: stat.max_concurrent,
+            in_flight: stat.in_flight,
+            pending: stat.pending,
+        }
+    }
+}
+
+/// One rate-limit bucket that the rate-limit sampler uses.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RateLimitRead {
+    key: String,
+    refill_rate: f64,
+    estimated_tokens: f64,
+}
+
+impl From<queue::RateLimitBucketSample> for RateLimitRead {
+    fn from(bucket: queue::RateLimitBucketSample) -> Self {
+        Self {
+            key: bucket.key,
+            refill_rate: bucket.refill_rate,
+            estimated_tokens: bucket.estimated_tokens,
+        }
+    }
+}
+
+/// `items`, sorted and without duplicates, for a lease key.
+///
+/// A set of queues or activities has no order. One set must give one key.
+fn sorted_set(items: &[String]) -> Vec<&str> {
+    let mut sorted: Vec<&str> = items.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    sorted
+}
+
+/// One election slot per shard for `sampler`, keyed by its `inputs`.
+fn gauge_slots(
+    election: &crate::gauge_election::GaugeElection,
+    sampler: crate::gauge_election::GaugeSampler,
+    inputs: &serde_json::Value,
+    shards: &[GaugeShard],
+) -> Vec<crate::gauge_election::GaugeSlot> {
+    let key = crate::gauge_election::gauge_lease_key(sampler, inputs);
+    shards
+        .iter()
+        .map(|shard| {
+            crate::gauge_election::GaugeSlot::new(
+                election,
+                sampler,
+                key.clone(),
+                shard.shard,
+                shard.fence,
+            )
+        })
+        .collect()
+}
+
+/// Expire each lease that a stopping sampler led.
+///
+/// A standby then leads on its next tick, not after the TTL. Best effort,
+/// and bounded like the timeout checker release. A failure leaves the lease
+/// to expire. The shards release together, each within its own bound. So a
+/// slow shard cannot use up the time of the others.
+async fn release_gauge_slots(
+    slots: &mut [crate::gauge_election::GaugeSlot],
+    shards: &[GaugeShard],
+) {
+    let releases = slots
+        .iter_mut()
+        .zip(shards)
+        .filter(|(slot, _)| slot.has_led())
+        .map(|(slot, shard)| async move {
+            let release = async {
+                let mut conn = shard.pool.get().await.map_err(|e| e.to_string())?;
+                slot.release(&mut conn).await.map_err(|e| e.to_string())
+            };
+            let outcome =
+                tokio::time::timeout(crate::scanner_lease::LEASE_RELEASE_BOUND, release).await;
+            let error = match outcome {
+                Ok(Ok(())) => return,
+                Ok(Err(error)) => error,
+                Err(_elapsed) => "timed out".to_string(),
+            };
+            tracing::debug!(
+                sampler = slot.sampler().as_str(),
+                shard = slot.shard().as_i32(),
+                error = %error,
+                "gauge sampler lease release failed"
+            );
+        });
+    futures::future::join_all(releases).await;
+}
+
 /// What the database gauge samplers read (issue #2668).
 struct GaugeSamplerInputs {
     /// One pool for each shard. The fleet-wide gauges sum over them.
-    pools: Vec<DbPool>,
-    /// The DLQ shard label and pool of each DLQ sampler.
-    dlq_pools: Vec<(u16, DbPool)>,
+    pools: Vec<GaugeShard>,
+    /// The shard and pool of each DLQ sampler.
+    dlq_pools: Vec<GaugeShard>,
     /// The pools of the stranded-work sampler. `None` without a sharded pool.
     stranded: Option<crate::shard::ShardedDbPool>,
     /// The queues that this worker polls.
@@ -34631,6 +34843,8 @@ struct GaugeSamplerInputs {
     soft_threshold: u64,
     /// How recent a heartbeat must be for a worker to cover a shard.
     stranded_freshness: Duration,
+    /// How workers share the reads. One elected worker reads each shard.
+    election: crate::gauge_election::GaugeElection,
 }
 
 /// The tasks that [`spawn_gauge_samplers`] starts.
@@ -34678,6 +34892,10 @@ impl GaugeSamplerHandles {
 /// The stranded-work sampler starts only with a sharded pool and a metrics
 /// recorder. Each other sampler returns at once when no recorder is set. The
 /// concurrency sampler also stays on for a DEBUG subscriber.
+///
+/// With election on, one worker reads each shard for each sampler. The
+/// others use its read. Every worker still emits each gauge. See
+/// [`crate::gauge_election`].
 fn spawn_gauge_samplers(
     config: &WorkerRuntimeConfig,
     inputs: GaugeSamplerInputs,
@@ -34694,6 +34912,7 @@ fn spawn_gauge_samplers(
         activity_requirements,
         soft_threshold,
         stranded_freshness,
+        election,
     } = inputs;
     let stranded_work = stranded
         .filter(|_| telemetry.metrics.is_enabled())
@@ -34706,6 +34925,7 @@ fn spawn_gauge_samplers(
                 interval,
                 circuit_breaker_activities.clone(),
                 activity_requirements,
+                election.clone(),
             )
         });
     GaugeSamplerHandles {
@@ -34716,6 +34936,7 @@ fn spawn_gauge_samplers(
             queues.clone(),
             interval,
             circuit_breaker_activities,
+            election.clone(),
         ),
         concurrency: spawn_concurrency_sampler(
             pools.clone(),
@@ -34723,17 +34944,25 @@ fn spawn_gauge_samplers(
             telemetry.clone(),
             queues,
             interval,
+            election.clone(),
         ),
         rate_limit: spawn_rate_limit_sampler(
             pools.clone(),
             cancel.clone(),
             telemetry.clone(),
             interval,
+            election.clone(),
         ),
         dlq_depth: dlq_pools
             .into_iter()
-            .map(|(shard_id, pool)| {
-                spawn_dlq_depth_sampler(pool, cancel.clone(), telemetry.clone(), shard_id, interval)
+            .map(|shard| {
+                spawn_dlq_depth_sampler(
+                    shard,
+                    cancel.clone(),
+                    telemetry.clone(),
+                    interval,
+                    election.clone(),
+                )
             })
             .collect(),
         queue_pause: spawn_queue_pause_sampler(
@@ -34741,6 +34970,7 @@ fn spawn_gauge_samplers(
             cancel.clone(),
             telemetry.clone(),
             interval,
+            election.clone(),
         ),
         history_oversized: spawn_history_oversized_sampler(
             pools.clone(),
@@ -34748,12 +34978,14 @@ fn spawn_gauge_samplers(
             telemetry.clone(),
             soft_threshold,
             interval,
+            election.clone(),
         ),
         workflow_active: spawn_workflow_active_sampler(
             pools,
             cancel.clone(),
             telemetry.clone(),
             interval,
+            election,
         ),
         stranded_work,
     }
@@ -34768,11 +35000,12 @@ fn spawn_gauge_samplers(
 /// operator uses the hard ceiling or a manual continue-as-new.
 fn spawn_history_oversized_sampler(
     // One pool per shard to aggregate over (see `spawn_queue_depth_sampler`).
-    pools: Vec<DbPool>,
+    pools: Vec<GaugeShard>,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     soft_threshold: u64,
     interval: Duration,
+    election: crate::gauge_election::GaugeElection,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // No recorder configured: never issue the sampler SQL (issue #1428,
@@ -34780,6 +35013,12 @@ fn spawn_history_oversized_sampler(
         if !telemetry.metrics.is_enabled() {
             return;
         }
+        let mut slots = gauge_slots(
+            &election,
+            crate::gauge_election::GaugeSampler::HistoryOversized,
+            &serde_json::json!({ "soft_threshold": soft_threshold }),
+            &pools,
+        );
         let mut reported_workflows = std::collections::HashSet::new();
         loop {
             tokio::select! {
@@ -34796,7 +35035,7 @@ fn spawn_history_oversized_sampler(
             // (or the zero-fill below) must not clear the gauge during an outage
             // (#522).
             let mut read_failed = false;
-            for pool in &pools {
+            for (shard, slot) in pools.iter().zip(slots.iter_mut()) {
                 // Selected against `cancel` (issue #1426), mirroring
                 // `spawn_schedule_overdue_sampler`. A cancelled acquisition
                 // abandons the rest of this tick's shards, same as any
@@ -34804,7 +35043,7 @@ fn spawn_history_oversized_sampler(
                 // loop.
                 let get_result = tokio::select! {
                     () = cancel.cancelled() => None,
-                    result = pool.get() => Some(result),
+                    result = shard.pool.get() => Some(result),
                 };
                 let Some(get_result) = get_result else {
                     read_failed = true;
@@ -34822,8 +35061,13 @@ fn spawn_history_oversized_sampler(
                     }
                 };
 
-                match sample_history_oversized_counts(&mut conn, soft_threshold).await {
-                    Ok(counts) => {
+                let sampled = slot
+                    .sample(&mut conn, &*telemetry.metrics, async |conn| {
+                        sample_history_oversized_counts(conn, soft_threshold).await
+                    })
+                    .await;
+                match sampled {
+                    Ok((counts, _role)) => {
                         for (workflow_name, count) in counts {
                             *count_by_workflow.entry(workflow_name).or_insert(0) += count;
                         }
@@ -34862,6 +35106,7 @@ fn spawn_history_oversized_sampler(
                 break;
             }
         }
+        release_gauge_slots(&mut slots, &pools).await;
     })
 }
 
@@ -34913,7 +35158,9 @@ async fn sample_history_oversized_counts(
 ///
 /// Bounded by construction so the `state` metric label can only ever be one
 /// of two values — the cardinality-safety guarantee is the enum itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum ActiveWorkflowState {
     /// A `RUNNING` execution (issue #603 nd-blocked runs stay `RUNNING`).
     Running,
@@ -35063,16 +35310,23 @@ pub(crate) fn merge_active_shard_counts(
 /// `spawn_queue_depth_sampler`).
 fn spawn_workflow_active_sampler(
     // One pool per shard to aggregate over (see `spawn_queue_depth_sampler`).
-    pools: Vec<DbPool>,
+    pools: Vec<GaugeShard>,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     interval: Duration,
+    election: crate::gauge_election::GaugeElection,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // No recorder configured: never issue the sampler SQL.
         if !telemetry.metrics.is_enabled() {
             return;
         }
+        let mut slots = gauge_slots(
+            &election,
+            crate::gauge_election::GaugeSampler::WorkflowActive,
+            &serde_json::Value::Null,
+            &pools,
+        );
         let mut reported: std::collections::HashSet<(String, ActiveWorkflowState)> =
             std::collections::HashSet::new();
         loop {
@@ -35085,7 +35339,7 @@ fn spawn_workflow_active_sampler(
             // shard's per-(workflow, state) counts for a fleet-wide gauge.
             let mut per_shard: Vec<Vec<(String, ActiveWorkflowState, u64)>> = Vec::new();
             let mut read_failed = false;
-            for pool in &pools {
+            for (shard, slot) in pools.iter().zip(slots.iter_mut()) {
                 // Selected against `cancel` (issue #1426), mirroring
                 // `spawn_schedule_overdue_sampler`. A cancelled acquisition
                 // abandons the rest of this tick's shards, same as any
@@ -35093,7 +35347,7 @@ fn spawn_workflow_active_sampler(
                 // loop.
                 let get_result = tokio::select! {
                     () = cancel.cancelled() => None,
-                    result = pool.get() => Some(result),
+                    result = shard.pool.get() => Some(result),
                 };
                 let Some(get_result) = get_result else {
                     read_failed = true;
@@ -35111,8 +35365,13 @@ fn spawn_workflow_active_sampler(
                     }
                 };
 
-                match sample_active_workflow_counts(&mut conn).await {
-                    Ok(rows) => per_shard.push(rows),
+                let sampled = slot
+                    .sample(&mut conn, &*telemetry.metrics, async |conn| {
+                        sample_active_workflow_counts(conn).await
+                    })
+                    .await;
+                match sampled {
+                    Ok((rows, _role)) => per_shard.push(rows),
                     Err(error) => {
                         tracing::debug!(error = %error, "active workflow sample failed");
                         read_failed = true;
@@ -35143,6 +35402,7 @@ fn spawn_workflow_active_sampler(
                 break;
             }
         }
+        release_gauge_slots(&mut slots, &pools).await;
     })
 }
 
@@ -39359,33 +39619,47 @@ impl Worker {
         // backlog and throttling on non-default shards too. Otherwise use the
         // single default pool (legacy behavior). All workers aggregate the
         // same full set, so the gauges stay consistent across the fleet.
-        #[cfg(feature = "db")]
-        let sampler_pools: Vec<DbPool> = self.config.sharded_pool.as_ref().map_or_else(
-            || vec![pool.clone()],
-            |sp| sp.iter_shards().map(|(_, p)| p.clone()).collect(),
+        //
+        // Without a sharded pool, the one database keys its lease and its
+        // shared sample as shard 0, and its DR fence as the worker database.
+        let single = |shard: crate::types::ShardId| GaugeShard {
+            shard,
+            fence: None,
+            pool: pool.clone(),
+        };
+        let sampler_pools: Vec<GaugeShard> = self.config.sharded_pool.as_ref().map_or_else(
+            || vec![single(crate::types::ShardId::new(0))],
+            |sp| {
+                sp.iter_shards()
+                    .map(|(shard, p)| GaugeShard {
+                        shard,
+                        fence: Some(shard),
+                        pool: p.clone(),
+                    })
+                    .collect()
+            },
         );
-        #[cfg(not(feature = "db"))]
-        let sampler_pools: Vec<DbPool> = vec![pool.clone()];
 
         // DLQ depth gauge: one sampler per shard assignment, so each shard that
         // this worker owns is reported. With no assignment, one sampler reads
         // shard 0. A sharded pool gives each sampler its shard pool (fix #5).
-        let mut dlq_pools: Vec<(u16, DbPool)> = self
+        let mut dlq_pools: Vec<GaugeShard> = self
             .config
             .shard_assignments
             .iter()
             .map(|shard| {
-                let shard_id = u16::try_from(shard.as_i32()).unwrap_or(0);
-                let shard_pool = self
-                    .config
-                    .sharded_pool
-                    .as_ref()
-                    .map_or_else(|| pool.clone(), |sp| sp.pool_for(*shard).clone());
-                (shard_id, shard_pool)
+                self.config.sharded_pool.as_ref().map_or_else(
+                    || single(*shard),
+                    |sp| GaugeShard {
+                        shard: *shard,
+                        fence: Some(*shard),
+                        pool: sp.pool_for(*shard).clone(),
+                    },
+                )
             })
             .collect();
         if dlq_pools.is_empty() {
-            dlq_pools.push((0, pool.clone()));
+            dlq_pools.push(single(crate::types::ShardId::new(0)));
         }
         // Every sampler that reads the database for a gauge runs on
         // `gauge_sample_interval` (issue #2668).
@@ -39406,6 +39680,11 @@ impl Worker {
                 // The heartbeat sets the freshness window, so the liveness
                 // check agrees with the heartbeat.
                 stranded_freshness: self.config.worker_heartbeat_interval.saturating_mul(2),
+                election: crate::gauge_election::GaugeElection::new(
+                    &self.config.scanner,
+                    self.config.worker_id.clone(),
+                    self.config.gauge_sample_interval,
+                ),
             },
             &self.shutdown,
             self.registry.telemetry(),
@@ -39916,7 +40195,7 @@ impl Worker {
         // grace window.
         #[cfg(feature = "db")]
         let schedule_overdue_sampler = Some(spawn_schedule_overdue_sampler(
-            sampler_pools,
+            sampler_pools.into_iter().map(|shard| shard.pool).collect(),
             self.shutdown.clone(),
             self.registry.telemetry().clone(),
             self.config.poll_interval,
@@ -46795,6 +47074,15 @@ mod tests {
         }
     }
 
+    /// Shard 0 on `pool`, as a worker without a sharded pool reads it.
+    fn test_gauge_shard(pool: &DbPool) -> GaugeShard {
+        GaugeShard {
+            shard: crate::types::ShardId::new(0),
+            fence: None,
+            pool: pool.clone(),
+        }
+    }
+
     /// Spawns the four samplers issue #1428 named, against the same `pool`,
     /// `cancel`, `telemetry`, and `interval`. The extra per-sampler
     /// arguments (queue names, shard id, soft threshold) are representative
@@ -46805,27 +47093,37 @@ mod tests {
         telemetry: &Arc<crate::telemetry::TelemetryConfig>,
         interval: Duration,
     ) -> Vec<tokio::task::JoinHandle<()>> {
+        let election = crate::gauge_election::GaugeElection::unelected();
         vec![
             spawn_concurrency_sampler(
-                vec![pool.clone()],
+                vec![test_gauge_shard(pool)],
                 cancel.clone(),
                 telemetry.clone(),
                 vec!["default".to_string()],
                 interval,
+                election.clone(),
             ),
             spawn_rate_limit_sampler(
-                vec![pool.clone()],
+                vec![test_gauge_shard(pool)],
                 cancel.clone(),
                 telemetry.clone(),
                 interval,
+                election.clone(),
             ),
-            spawn_dlq_depth_sampler(pool.clone(), cancel.clone(), telemetry.clone(), 0, interval),
+            spawn_dlq_depth_sampler(
+                test_gauge_shard(pool),
+                cancel.clone(),
+                telemetry.clone(),
+                interval,
+                election.clone(),
+            ),
             spawn_history_oversized_sampler(
-                vec![pool.clone()],
+                vec![test_gauge_shard(pool)],
                 cancel.clone(),
                 telemetry.clone(),
                 100,
                 interval,
+                election,
             ),
         ]
     }
@@ -46941,11 +47239,12 @@ mod tests {
         let listener = accept_counting_pool().await;
         let cancel = CancellationToken::new();
         let handle = spawn_concurrency_sampler(
-            vec![listener.pool.clone()],
+            vec![test_gauge_shard(&listener.pool)],
             cancel.clone(),
             telemetry,
             vec!["default".to_string()],
             interval,
+            crate::gauge_election::GaugeElection::unelected(),
         );
 
         // The accept is real loopback I/O, not paused time. A slow runner can
@@ -47000,14 +47299,21 @@ mod tests {
     /// Every gauge sampler input points at the one counting pool.
     fn counting_gauge_inputs(pool: &DbPool) -> GaugeSamplerInputs {
         GaugeSamplerInputs {
-            pools: vec![pool.clone()],
-            dlq_pools: vec![(0, pool.clone())],
+            pools: vec![test_gauge_shard(pool)],
+            dlq_pools: vec![test_gauge_shard(pool)],
             stranded: Some(crate::shard::ShardedDbPool::single(pool.clone())),
             queues: vec!["default".to_string()],
             circuit_breaker_activities: Vec::new(),
             activity_requirements: std::collections::HashMap::new(),
             soft_threshold: 100,
             stranded_freshness: Duration::from_secs(10),
+            // Election on, as in a default worker. The counting pool never
+            // connects, so these tests prove the cadence, not the election.
+            election: crate::gauge_election::GaugeElection::new(
+                &crate::scanner_lease::ScannerConfig::default(),
+                "counting-worker",
+                Duration::from_secs(3),
+            ),
         }
     }
 
