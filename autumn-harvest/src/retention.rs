@@ -35,6 +35,8 @@ use crate::error::{HarvestError, HarvestResult, database_error};
 #[cfg(feature = "db")]
 use crate::models::NewExecutionSummary;
 #[cfg(feature = "db")]
+use crate::prepared_loop::PreparedLoop;
+#[cfg(feature = "db")]
 use crate::schema::harvest_workflow_executions;
 #[cfg(feature = "db")]
 use crate::schema::{
@@ -1991,6 +1993,55 @@ pub struct RetentionRuntime {
     monitor: RetentionMonitor,
 }
 
+/// A retention janitor loop that is built but not yet running.
+///
+/// [`RetentionRuntime::prepare_with_hooks`] builds it. Its monitor and its
+/// trigger work before the loop runs. A trigger sent before then runs at the
+/// first tick.
+#[cfg(feature = "db")]
+#[derive(Debug)]
+#[must_use = "a prepared janitor does nothing until it runs"]
+pub struct PreparedRetention {
+    task: PreparedLoop,
+    trigger_tx: mpsc::Sender<()>,
+    monitor: RetentionMonitor,
+}
+
+#[cfg(feature = "db")]
+impl PreparedRetention {
+    /// The monitor of this janitor.
+    #[must_use]
+    pub fn monitor(&self) -> RetentionMonitor {
+        self.monitor.clone()
+    }
+
+    /// The channel that asks the janitor for an immediate tick.
+    #[must_use]
+    pub fn trigger_sender(&self) -> mpsc::Sender<()> {
+        self.trigger_tx.clone()
+    }
+
+    /// Run the loop in the current task until `host` is cancelled.
+    ///
+    /// The loop stops at its next safe point and returns. See
+    /// [`PreparedLoop::run`].
+    pub async fn run(self, host: CancellationToken) {
+        self.task.run(host).await;
+    }
+
+    /// Spawn the loop on a new Tokio task.
+    #[must_use]
+    pub fn spawn(self) -> RetentionRuntime {
+        let (shutdown, handle) = self.task.spawn();
+        RetentionRuntime {
+            shutdown,
+            trigger_tx: self.trigger_tx,
+            handle,
+            monitor: self.monitor,
+        }
+    }
+}
+
 /// The optional hooks a [`RetentionRuntime`] calls.
 ///
 /// Start from [`RetentionHooks::default`] and add hooks with the `with_*`
@@ -2090,13 +2141,29 @@ impl RetentionRuntime {
         Self::spawn_inner(pools, config, metrics, hooks)
     }
 
-    #[allow(clippy::too_many_lines)]
     fn spawn_inner(
         pools: ShardedDbPool,
         config: RetentionConfig,
         metrics: Arc<dyn MetricsRecorder>,
         hooks: RetentionHooks,
     ) -> Option<Self> {
+        Self::prepare_with_hooks(pools, config, metrics, hooks).map(PreparedRetention::spawn)
+    }
+
+    /// Build the janitor loop of [`Self::spawn_with_hooks`], but do not spawn
+    /// it.
+    ///
+    /// Returns `None` when nothing in `config` is enabled. The caller runs the
+    /// loop with [`PreparedRetention::run`], or spawns it with
+    /// [`PreparedRetention::spawn`].
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
+    pub fn prepare_with_hooks(
+        pools: ShardedDbPool,
+        config: RetentionConfig,
+        metrics: Arc<dyn MetricsRecorder>,
+        hooks: RetentionHooks,
+    ) -> Option<PreparedRetention> {
         let RetentionHooks {
             archiver,
             offloader,
@@ -2135,14 +2202,16 @@ impl RetentionRuntime {
         let shutdown_task = shutdown.clone();
         let monitor_task = monitor.clone();
         let (trigger_tx, mut trigger_rx) = mpsc::channel(1);
-        // Issue #797: declare the loop before its first iteration so the
-        // `scanner_liveness` check expects it and grants it boot grace.
-        let owner = crate::scanner_health::register_scanner(
-            metrics.as_ref(),
-            crate::scanner_health::Scanner::Retention,
-            config.tick_interval(),
-        );
-        let handle = tokio::spawn(async move {
+        let task = async move {
+            // Issue #797: declare the loop before its first iteration so the
+            // `scanner_liveness` check expects it and grants it boot grace.
+            // The loop declares itself when it starts. A prepared loop that
+            // never runs then leaves no entry behind.
+            let owner = crate::scanner_health::register_scanner(
+                metrics.as_ref(),
+                crate::scanner_health::Scanner::Retention,
+                config.tick_interval(),
+            );
             let mut scan_cursors: HashMap<ShardId, Option<RetentionScanCursor>> = HashMap::new();
             // See `run_partition_maintenance_pass`'s review finding on
             // `resume_cursors`. Local state this task owns outright, for
@@ -2640,12 +2709,11 @@ impl RetentionRuntime {
             // scanner set. A panic unwinds past here, so a panicked loop stays
             // registered and correctly ages into `Wedged`.
             crate::scanner_health::deregister_scanner(owner);
-        });
+        };
 
-        Some(Self {
-            shutdown,
+        Some(PreparedRetention {
+            task: PreparedLoop::new(shutdown, task),
             trigger_tx,
-            handle,
             monitor,
         })
     }

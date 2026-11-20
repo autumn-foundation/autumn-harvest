@@ -26,8 +26,9 @@
 //!
 //! The insert bridge implements [`InsertValues`]. Diesel exposes it only with
 //! its `i-implement-a-third-party-backend-and-opt-into-breaking-changes`
-//! feature. A diesel upgrade can change that trait. The tests in this module
-//! and `table_split_db_tests` fail first when it does.
+//! feature. So does `ReturningQuerySource`, which [`split_table!`] bridges
+//! for a `RETURNING` clause. A diesel upgrade can change either one. The
+//! tests in this module and `table_split_db_tests` fail first when it does.
 
 use diesel::insertable::{CanInsertInSingleQuery, InsertValues};
 use diesel::pg::Pg;
@@ -164,6 +165,16 @@ macro_rules! split_table {
             type Count = diesel::query_source::Once;
         }
         $(impl diesel::SelectableExpression<$core::table> for $ext::$column {})*
+        // Diesel checks a `RETURNING` clause against a wrapper of the
+        // statement table. The wrapper holds the physical table once too.
+        impl<__K> diesel::query_source::AppearsInFromClause<$ext::table>
+            for diesel::query_builder::returning::ReturningQuerySource<__K, $core::table>
+        {
+            type Count = diesel::query_source::Once;
+        }
+        $(impl<__K> diesel::SelectableExpression<
+            diesel::query_builder::returning::ReturningQuerySource<__K, $core::table>,
+        > for $ext::$column {})*
         impl $crate::table_split::CoreTable for $core::table {
             type Ext = $ext::table;
         }

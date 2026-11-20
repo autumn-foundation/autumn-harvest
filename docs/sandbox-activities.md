@@ -230,12 +230,13 @@ let backend = ProcessBackend::new(ExecOptions {
   bound directory such as `/usr/local/bin`. A link into `/proc` stays a
   link, and the pivot binds nothing in `/proc`. The setup needs `/proc` in
   the worker.
-- **`Mask`** fails open. A directory shows empty. A file, or a socket,
-  reads as `/dev/null`. A mask hides a path, not an inode, so a hard link or
-  a second path still reaches the data. It does not hide the other runs in
-  the scratch root, and it does not hide `/proc`. Each path must be
-  absolute and must exist. It must not hold `..` or cover the work
-  directory. Otherwise the run is refused with a config error.
+- **`Mask`** fails open. A directory lists as empty, and the code cannot
+  write it. A file, or a socket, reads as `/dev/null`. A mask hides a
+  path, not an inode, so a hard link or a second path still reaches the
+  data. It does not hide the other runs in the scratch root, and it does
+  not hide `/proc`. Each path must be absolute and must exist. It must not
+  hold `..` or cover the work directory. Otherwise the run is refused with
+  a config error.
 - **`Mask` is not a boundary under a non-root worker.** The code has the
   uid of the worker, so it can open `/proc/<pid>/root` of the worker. That
   path shows the file system of the worker, with no mask. A mask stops a

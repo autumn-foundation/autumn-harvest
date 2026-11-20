@@ -67,8 +67,9 @@ pub struct HarvestReadinessConfig {
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum RetentionRunOn {
-    /// Run retention where the resolved scheduler runs. This is the default.
-    /// A `web` role runs no scheduler, so it runs no retention.
+    /// The default. An explicit `scheduler_enabled` moves retention with
+    /// it. With none, the `harvest.maintenance` capability of the role
+    /// decides. A `web` role runs no retention.
     #[default]
     Scheduler,
     /// Run retention on each process. This is the behaviour before issue
@@ -339,14 +340,30 @@ impl HarvestRuntimeConfig {
     ///
     /// `role` is the Autumn process role, or `None` with no `AppState`.
     #[must_use]
-    pub const fn process_switches(
+    pub fn process_switches(
         &self,
-        role: Option<autumn_web::config::ProcessRole>,
+        role: Option<&autumn_web::config::Role>,
     ) -> crate::process_role::ProcessSwitches {
         crate::process_role::ProcessSwitches::resolve(
             self.worker_enabled,
             self.scheduler_enabled,
             role,
+        )
+    }
+
+    /// The explicit switch of each Harvest runtime.
+    ///
+    /// `retention_enabled` is `RetentionConfig::enabled` of the build.
+    #[must_use]
+    pub const fn loop_switches(
+        &self,
+        retention_enabled: bool,
+    ) -> crate::process_role::LoopSwitches {
+        crate::process_role::LoopSwitches::new(
+            self.worker_enabled,
+            self.scheduler_enabled,
+            retention_enabled,
+            self.retention.run_on,
         )
     }
 

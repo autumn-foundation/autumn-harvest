@@ -33,13 +33,12 @@ pub mod audit_sink;
 /// AWS KMS binding for the core AES-256-GCM payload codec (issue #1825).
 #[cfg(feature = "aws-kms")]
 pub mod aws_kms;
+/// Harvest runtimes as Autumn background tasks.
+mod background;
 /// Startup and shutdown steps that `HarvestPlugin` and `HarvestEmbedding`
 /// share (issue #1613).
 mod boot;
 pub mod canary;
-/// The `chrono` values that the `autumn-web` API still takes.
-#[cfg(any(feature = "webhooks", feature = "sqlite"))]
-mod chrono_boundary;
 pub mod config;
 /// Broker event-source connectors for workflow triggers (issue #944).
 ///

@@ -193,10 +193,9 @@ impl HarvestRetentionRuntime {
 
     /// Retention is on, but this process does not run it (issue #2478).
     ///
-    /// `harvest.retention.run_on = "scheduler"` places the janitor on the
-    /// processes that run the scheduler. `GET /admin/retention` then reports
-    /// `placed_elsewhere: true`. `run-now` returns a 503 that names
-    /// `run_on = "all"`.
+    /// The role or an explicit `scheduler_enabled` places the janitor on other
+    /// processes. `GET /admin/retention` then reports `placed_elsewhere:
+    /// true`. `run-now` returns a 503 that names `run_on = "all"`.
     #[must_use]
     pub const fn placed_elsewhere(config: RetentionConfig) -> Self {
         let mut runtime = Self::new(config, None, None);
@@ -35918,9 +35917,8 @@ async fn retention_status(
 }
 
 /// The 503 of `run-now` on a process with no placed janitor (issue #2478).
-const RETENTION_PLACED_ELSEWHERE_MESSAGE: &str = "retention run-now unavailable: \
-     harvest.retention.run_on = \"scheduler\" runs retention only on processes that run the \
-     scheduler, and this process runs none. Set harvest.retention.run_on = \"all\" to run \
+const RETENTION_PLACED_ELSEWHERE_MESSAGE: &str = "retention run-now unavailable: this \
+     process does not run the retention janitor. Set harvest.retention.run_on = \"all\" to run \
      retention here";
 
 async fn retention_run_now(
@@ -44213,6 +44211,9 @@ impl<Q> diesel::query_builder::QueryId for Explain<Q> {
 impl<Q> diesel::query_builder::Query for Explain<Q> {
     type SqlType = diesel::sql_types::Text;
 }
+
+/// Diesel runs only a marked statement type.
+impl<Q> diesel::query_dsl::RunQueryDslSupport for Explain<Q> {}
 
 /// Builds the default `GET /workflows` query, with no `SELECT` list.
 #[allow(clippy::too_many_lines)]

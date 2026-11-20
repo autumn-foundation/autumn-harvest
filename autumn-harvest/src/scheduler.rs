@@ -24,6 +24,7 @@ use crate::execution::{StartWorkflowParams, StartedWorkflowExecution};
 use crate::info::DagInfo;
 use crate::models::{HarvestSchedule, NewHarvestSchedule};
 use crate::policy::{OverlapPolicy, Schedule, WorkflowSchedule, compute_jitter_offset};
+use crate::prepared_loop::PreparedLoop;
 use crate::schema::{harvest_schedules, harvest_workflow_executions};
 use crate::shard::{ShardRouter, ShardedDbPool};
 use crate::types::{ExecutionId, ShardId, WorkflowIdReusePolicy};
@@ -387,6 +388,43 @@ impl SchedulerMonitor {
 /// (issue #1796).
 const NOTIFY_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// A scheduler loop that is built but not yet running.
+///
+/// [`SchedulerRuntime::prepare_sharded`] builds it.
+#[derive(Debug)]
+#[must_use = "a prepared scheduler does nothing until it runs"]
+pub struct PreparedScheduler {
+    task: PreparedLoop,
+    monitor: SchedulerMonitor,
+}
+
+impl PreparedScheduler {
+    /// The monitor of this scheduler. It reads `running` once the loop ticks.
+    #[must_use]
+    pub fn monitor(&self) -> SchedulerMonitor {
+        self.monitor.clone()
+    }
+
+    /// Run the loop in the current task until `host` is cancelled.
+    ///
+    /// The loop then finishes its tick, flushes its notifications and
+    /// returns. See [`PreparedLoop::run`].
+    pub async fn run(self, host: CancellationToken) {
+        self.task.run(host).await;
+    }
+
+    /// Spawn the loop on a new Tokio task.
+    #[must_use]
+    pub fn spawn(self) -> SchedulerRuntime {
+        let (shutdown, handle) = self.task.spawn();
+        SchedulerRuntime {
+            shutdown,
+            handle,
+            monitor: self.monitor,
+        }
+    }
+}
+
 /// The background runtime that drives DAG and workflow scheduling.
 pub struct SchedulerRuntime {
     shutdown: CancellationToken,
@@ -433,6 +471,25 @@ impl SchedulerRuntime {
         dags: Arc<DagCatalog>,
         workflow_schedules: Arc<Vec<WorkflowSchedule>>,
     ) -> Self {
+        Self::prepare_sharded(pool, router, registry, dags, workflow_schedules).spawn()
+    }
+
+    /// Build the scheduler loop of [`Self::spawn_sharded`], but do not spawn
+    /// it.
+    ///
+    /// The caller runs it with [`PreparedScheduler::run`], or spawns it with
+    /// [`PreparedScheduler::spawn`].
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::spawn_sharded`].
+    pub fn prepare_sharded(
+        pool: ShardedDbPool,
+        router: ShardRouter,
+        registry: Arc<HandlerRegistry>,
+        dags: Arc<DagCatalog>,
+        workflow_schedules: Arc<Vec<WorkflowSchedule>>,
+    ) -> PreparedScheduler {
         #[cfg(not(feature = "unified-dag-execution"))]
         {
             if let Err(error) = reject_classic_dags_without_unified_execution(dags.as_ref()) {
@@ -454,17 +511,19 @@ impl SchedulerRuntime {
         // Issue #1157, defect 2: per-schedule registration backoff state must
         // span ticks, so the loop owns it rather than the (stateless) tick fn.
         let backoff = ScheduleRegistrationBackoff::new();
-        // Issue #797: declare the loop before its first iteration so the
-        // `scanner_liveness` check expects it and grants it boot grace. Unlike
-        // the other loops, the schedule ticker sleeps AFTER its first pass, so
-        // it normally ticks almost immediately.
         let scanner_metrics = Arc::clone(&registry.telemetry().metrics);
-        let owner = crate::scanner_health::register_scanner(
-            scanner_metrics.as_ref(),
-            crate::scanner_health::Scanner::Schedule,
-            DEFAULT_SCHEDULER_TICK_INTERVAL,
-        );
-        let handle = tokio::spawn(async move {
+        let task = async move {
+            // Issue #797: declare the loop before its first iteration so the
+            // `scanner_liveness` check expects it and grants it boot grace.
+            // Unlike the other loops, the schedule ticker sleeps AFTER its
+            // first pass, so it normally ticks almost immediately. The loop
+            // declares itself when it starts. A prepared loop that never runs
+            // then leaves no entry behind.
+            let owner = crate::scanner_health::register_scanner(
+                scanner_metrics.as_ref(),
+                crate::scanner_health::Scanner::Schedule,
+                DEFAULT_SCHEDULER_TICK_INTERVAL,
+            );
             while !shutdown_for_task.is_cancelled() {
                 if let Err(error) = tick_once_sharded_with_backoff(
                     pool.clone(),
@@ -507,11 +566,10 @@ impl SchedulerRuntime {
                     .flush(NOTIFY_FLUSH_TIMEOUT)
                     .await;
             }
-        });
+        };
 
-        Self {
-            shutdown,
-            handle,
+        PreparedScheduler {
+            task: PreparedLoop::new(shutdown, task),
             monitor,
         }
     }
