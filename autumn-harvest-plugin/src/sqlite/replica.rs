@@ -401,8 +401,11 @@ impl Replicas {
                 }
             }
             // The open used the target, or the target does not apply to
-            // this database. It goes in both cases.
-            _ => remove_quietly(&suffixed(path, TARGET_SUFFIX)),
+            // this database. It goes in both cases. A target that stays
+            // applies again at the next open, so a failed removal refuses
+            // this open. The runtime then writes no run that the next open
+            // rolls back (issue #2753).
+            _ => write_entry(path, None)?,
         }
         Ok(())
     }
@@ -2409,13 +2412,45 @@ mod tests {
         assert_eq!(root, "app/test/fleet/slot/00042/harvest");
     }
 
-    /// A destination that refuses each upload while it is down.
+    /// A destination that refuses each upload while it is down. Its next
+    /// read can also block a file, as [`block`] does.
     struct Flaky {
         inner: FileDestination,
         down: AtomicBool,
+        blocked: Mutex<Option<PathBuf>>,
     }
 
     impl Flaky {
+        fn new(dir: &Path, down: bool) -> Arc<Self> {
+            Arc::new(Self {
+                inner: FileDestination::new(dir.join("replicas")).unwrap(),
+                down: AtomicBool::new(down),
+                blocked: Mutex::new(None),
+            })
+        }
+
+        /// The [`Replicas`] that ship to this destination.
+        fn replicas(self: &Arc<Self>, dir: &Path) -> Replicas {
+            Replicas::new(
+                TenantReplica::new(Arc::clone(self) as Arc<dyn ReplicaDestination>, settings()),
+                Arc::new(autumn_web::time::SystemClock),
+                fleet(&dir.join("fleet")),
+            )
+        }
+
+        /// Block `file` at the next read. An open reads the replica after
+        /// it reads the target, and before it records the database.
+        fn block_at_next_read(&self, file: PathBuf) {
+            *self.blocked.lock().unwrap() = Some(file);
+        }
+
+        fn read(&self) {
+            let blocked = self.blocked.lock().unwrap().take();
+            if let Some(file) = blocked {
+                block(&file);
+            }
+        }
+
         fn refused(&self) -> Result<(), autumn_web::replication::DestinationError> {
             if self.down.load(Ordering::SeqCst) {
                 return Err(autumn_web::replication::DestinationError::Io {
@@ -2448,6 +2483,7 @@ mod tests {
             self.inner.put_file(key, path)
         }
         fn get(&self, key: &str) -> Result<Vec<u8>, autumn_web::replication::DestinationError> {
+            self.read();
             self.inner.get(key)
         }
         fn get_to_file(
@@ -2455,12 +2491,14 @@ mod tests {
             key: &str,
             path: &Path,
         ) -> Result<(), autumn_web::replication::DestinationError> {
+            self.read();
             self.inner.get_to_file(key, path)
         }
         fn list(
             &self,
             prefix: &str,
         ) -> Result<Vec<String>, autumn_web::replication::DestinationError> {
+            self.read();
             self.inner.list(prefix)
         }
         fn delete(&self, key: &str) -> Result<(), autumn_web::replication::DestinationError> {
@@ -2473,18 +2511,8 @@ mod tests {
     #[test]
     fn a_failed_close_parks_the_shipper_until_the_backlog_ships() {
         let dir = tempfile::tempdir().unwrap();
-        let flaky = Arc::new(Flaky {
-            inner: FileDestination::new(dir.path().join("replicas")).unwrap(),
-            down: AtomicBool::new(false),
-        });
-        let replicas = Replicas::new(
-            TenantReplica::new(
-                Arc::clone(&flaky) as Arc<dyn ReplicaDestination>,
-                settings(),
-            ),
-            Arc::new(autumn_web::time::SystemClock),
-            fleet(&dir.path().join("fleet")),
-        );
+        let flaky = Flaky::new(dir.path(), false);
+        let replicas = flaky.replicas(dir.path());
         let key = replicas.fleet.key_for("acme").unwrap();
         let path = super::super::fleet::tenant_harvest_file(&replicas.fleet.path_of(&key));
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -2520,18 +2548,8 @@ mod tests {
     #[test]
     fn a_release_drops_a_parked_shipper() {
         let dir = tempfile::tempdir().unwrap();
-        let flaky = Arc::new(Flaky {
-            inner: FileDestination::new(dir.path().join("replicas")).unwrap(),
-            down: AtomicBool::new(true),
-        });
-        let replicas = Replicas::new(
-            TenantReplica::new(
-                Arc::clone(&flaky) as Arc<dyn ReplicaDestination>,
-                settings(),
-            ),
-            Arc::new(autumn_web::time::SystemClock),
-            fleet(&dir.path().join("fleet")),
-        );
+        let flaky = Flaky::new(dir.path(), true);
+        let replicas = flaky.replicas(dir.path());
         let key = replicas.fleet.key_for("acme").unwrap();
         let path = dir.path().join("acme.harvest.db");
         let runtime = autumn_harvest_sqlite::SqliteRuntime::open_replicated(&path).unwrap();
@@ -2542,6 +2560,73 @@ mod tests {
         assert!(replicas.parked_map().contains_key(&key));
         replicas.release(&key);
         assert!(replicas.parked_map().is_empty());
+    }
+
+    /// Put a non-empty directory at `file`. `remove_file` then fails on
+    /// each OS. It keeps the text of `file` as `<file>.kept`.
+    fn block(file: &Path) {
+        std::fs::rename(file, suffixed(file, ".kept")).unwrap();
+        std::fs::create_dir(file).unwrap();
+        std::fs::write(file.join("block"), b"").unwrap();
+    }
+
+    /// Undo [`block`]. The target file is back as the failed removal left
+    /// it.
+    fn unblock(file: &Path) {
+        std::fs::remove_dir_all(file).unwrap();
+        std::fs::rename(suffixed(file, ".kept"), file).unwrap();
+    }
+
+    /// A `HarvestFleet::restore` of `acme` that waits for the next open. The
+    /// open removes its target, and that removal fails.
+    fn a_blocked_target(dir: &Path) -> (Replicas, FleetDbKey, PathBuf, PathBuf) {
+        let flaky = Flaky::new(dir, false);
+        let replicas = flaky.replicas(dir);
+        let (key, path, db) = shipped_acme(dir, &replicas);
+        harvest_restore(&replicas, &key, &db, None);
+        assert!(matches!(entry(&path), Some(Entry::Committed { .. })));
+        flaky.block_at_next_read(suffixed(&path, TARGET_SUFFIX));
+        (replicas, key, path, db)
+    }
+
+    /// A failed removal of the target refuses the open. No runtime then
+    /// writes a run that the next open rolls back (issue #2753).
+    #[test]
+    fn a_failed_target_removal_refuses_the_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let (replicas, key, path, db) = a_blocked_target(dir.path());
+        let refused = replicas.prepare(&key, &path, &db, None);
+        let error = refused.expect_err("the target stays, so the open refuses");
+        assert!(error.contains("cannot remove"), "{error}");
+        assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 6);
+        assert_eq!(
+            std::fs::read_to_string(suffixed(&path, IDENTITY_SUFFIX)).unwrap(),
+            database_identity(&db).unwrap(),
+            "the record is written before the target goes"
+        );
+    }
+
+    /// A retry after a failed removal applies the same target again. The
+    /// Harvest file stays at the target, and the target goes.
+    #[test]
+    fn a_retry_after_a_failed_removal_keeps_the_harvest_file_at_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let (replicas, key, path, db) = a_blocked_target(dir.path());
+        assert!(replicas.prepare(&key, &path, &db, None).is_err());
+        let target = suffixed(&path, TARGET_SUFFIX);
+        unblock(&target);
+        assert!(matches!(entry(&path), Some(Entry::Committed { .. })));
+
+        replicas.prepare(&key, &path, &db, None).unwrap();
+        assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 6);
+        assert_eq!(entry(&path), None, "the retry removes the target");
+
+        // The runtime writes after the open. A later open keeps the write.
+        let runtime = autumn_harvest_sqlite::SqliteRuntime::open_replicated(&path).unwrap();
+        runtime.raise_fleet_epoch(7).unwrap();
+        drop(runtime);
+        replicas.prepare(&key, &path, &db, None).unwrap();
+        assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 7);
     }
 
     /// Without a replica, a missing file stays missing.

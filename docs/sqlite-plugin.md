@@ -353,7 +353,10 @@ sequenceDiagram
 - **A restore covers both files.** `HarvestFleet::restore(key, target)`
   restores the database. It keeps the target on disk, and the next open
   restores the Harvest file to the same point. When the Harvest replica no
-  longer reaches the target, each open refuses until a new restore.
+  longer reaches the target, each open refuses until a new restore. The
+  open then removes the target. When it cannot, the open refuses, and the
+  error names the target file. A retry applies the same target again, so
+  no run is lost.
 - **A later restore supersedes the target.** The target names the
   database file that its restore published. A direct
   `DatabaseFleet::restore` before the next open replaces that file, so the
