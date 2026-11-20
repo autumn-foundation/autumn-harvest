@@ -547,6 +547,8 @@ pub mod scanner_lease;
 pub mod schema_contract;
 /// Worker session fleet-side registry and pure decision functions (issue #606).
 pub mod sessions;
+/// Shape census: the usual and the rare paths over many runs.
+pub mod shape_census;
 pub mod shard;
 /// A task-local fence on the shards one request may reach (issue #1803).
 pub mod shard_fence;
