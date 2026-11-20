@@ -5,6 +5,28 @@
 //! thread, and it holds no lock. So a thread with no dispatcher can store
 //! `never` after a log test made its capture. The span of that test then
 //! goes disabled (issue #2762, `docs/design/DESIGN-2762.md`).
+//!
+//! Two keepers live for the whole process, so a rebuild always holds the
+//! lock. A constructor makes them before `main`, so before any test runs.
+
+use std::sync::OnceLock;
+
+/// The keepers. Each is a `NoSubscriber`, so it adds no interest.
+static KEEPERS: OnceLock<[tracing::Dispatch; 2]> = OnceLock::new();
+
+/// Make the keepers before `main`.
+///
+/// This needs only the allocator and the locks of tracing-core. It does
+/// not panic.
+#[ctor::ctor(unsafe)]
+fn install() {
+    KEEPERS.get_or_init(|| [keeper(), keeper()]);
+}
+
+/// One keeper dispatcher.
+fn keeper() -> tracing::Dispatch {
+    tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new())
+}
 
 #[cfg(test)]
 mod tests {
@@ -79,6 +101,15 @@ mod tests {
         fn enter(&self, _: &span::Id) {}
 
         fn exit(&self, _: &span::Id) {}
+    }
+
+    // Issue #2762.
+    #[test]
+    fn the_keepers_are_live_before_any_test() {
+        assert!(
+            super::KEEPERS.get().is_some(),
+            "the constructor did not run"
+        );
     }
 
     // Issue #2762.
