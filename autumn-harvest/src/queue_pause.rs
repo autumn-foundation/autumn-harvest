@@ -318,16 +318,19 @@ pub async fn release_claim_if_queue_paused(
 /// with their own tail at compile time. Both releases must restore `attempt`
 /// and use the same `state = 'RUNNING' AND worker_id = $2` guard. One copy
 /// makes that structural, not a convention that two sites must remember.
+/// The guard goes through `row_guard_sql!`, so the planner reads the row
+/// through the primary key.
 macro_rules! release_claim_prefix {
     () => {
-        "UPDATE harvest_task_queue \
-         SET state = 'PENDING', \
-             worker_id = NULL, \
-             started_at = NULL, \
-             attempt = GREATEST(attempt - 1, 0) \
-         WHERE id = $1 \
-           AND state = 'RUNNING' \
-           AND worker_id = $2"
+        concat!(
+            "UPDATE harvest_task_queue \
+             SET state = 'PENDING', \
+                 worker_id = NULL, \
+                 started_at = NULL, \
+                 attempt = GREATEST(attempt - 1, 0) \
+             WHERE id = $1 AND ",
+            $crate::row_guard::row_guard_sql!("state = 'RUNNING' AND worker_id = $2")
+        )
     };
 }
 
@@ -2303,8 +2306,11 @@ mod tests {
                 "a released claim must give back the attempt it consumed (AC3); got:\n{sql}"
             );
             assert!(
-                sql.contains("AND state = 'RUNNING'") && sql.contains("AND worker_id = $2"),
-                "a release must only ever undo this worker's own claim; got:\n{sql}"
+                sql.contains(
+                    "WHERE id = $1 AND (CASE WHEN state = 'RUNNING' AND worker_id = $2 THEN true END)"
+                ),
+                "a release must only ever undo this worker's own claim, through the \
+                 primary key; got:\n{sql}"
             );
         }
         assert!(
