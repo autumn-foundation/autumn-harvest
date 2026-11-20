@@ -3163,3 +3163,8 @@ standalone note rather than part of the claim-path attribution table above:
   guard keeps each one on the primary key. On a 1M-row fixture, a recheck
   reads 24 → 6 buffers at 20 rows per worker, and 201 → 6 after an idle
   analyze.
+* [`docs/performance-claim-by-id-guard.md`](performance-claim-by-id-guard.md)
+  — after an idle analyze, the by-id claim and the owner take read a
+  live-row partial index instead of a full index (issue #2751). A `CASE`
+  guard on their state test fixes the plan. On a 1M-row fixture, the by-id
+  claim reads 622 → 26 buffers, and the owner take 3,610 → 33.
