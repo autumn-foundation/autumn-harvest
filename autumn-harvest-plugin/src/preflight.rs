@@ -503,6 +503,14 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
         "harvest_entity_state",
         &["SELECT", "INSERT", "UPDATE", "DELETE"],
     ),
+    // The outbox trigger inserts a row for each external request, and deletes
+    // it for each resolution. It runs as the inserting role, so a missing
+    // grant fails that append. Each outbox claim reads the table. A shard
+    // move deletes the rows of a staged copy.
+    (
+        "harvest_external_outbox_pending",
+        &["SELECT", "INSERT", "DELETE"],
+    ),
     // Every completion that recorded an LLM call inserts here, in the
     // completion transaction (issue #1996). A missing grant rolls back the
     // completion, and the activity runs and pays again. `GET /admin/usage`
@@ -1526,6 +1534,9 @@ async fn check_dlq_read_access(api_state: &HarvestApiState) -> PreflightCheckRes
     )
 }
 
+/// Reads one row of the DLQ, to prove that the role can read the table.
+const DLQ_READ_PROBE_SQL: &str = "SELECT 1 FROM harvest_dead_letters LIMIT 1";
+
 async fn observe_dlq_read_access(shard_id: i32, shard_pool: &DbPool) -> ShardObservation {
     let Ok(mut conn) = shard_pool.get().await else {
         return ShardObservation {
@@ -1538,13 +1549,28 @@ async fn observe_dlq_read_access(shard_id: i32, shard_pool: &DbPool) -> ShardObs
         };
     };
 
-    dlq::dead_letter_count(&mut conn).await.map_or_else(
-        |_| ShardObservation {
+    // The depth reads a counter, not the DLQ. So the probe reads one row of
+    // the DLQ too: the list, the redrive and the API read that table.
+    let table_readable = diesel::sql_query(DLQ_READ_PROBE_SQL)
+        .execute(&mut conn)
+        .await
+        .is_ok();
+    let count = if table_readable {
+        dlq::dead_letter_count(&mut conn).await.ok()
+    } else {
+        None
+    };
+    count.map_or_else(
+        || ShardObservation {
             passed: false,
             details: json!({
                 "shard_id": shard_id,
                 "status": "fail",
-                "error": "dead-letter table is not readable",
+                "error": if table_readable {
+                    "dead-letter depth is not readable"
+                } else {
+                    "dead-letter table is not readable"
+                },
             }),
         },
         |count| ShardObservation {
@@ -2515,6 +2541,17 @@ mod tests {
             .find(|(name, _)| *name == "harvest_partition_exports")
             .map(|(_, privileges)| *privileges);
         assert_eq!(log, Some(&["SELECT", "INSERT"][..]));
+    }
+
+    /// The outbox trigger writes the pending table as the inserting role. A
+    /// missing grant fails each external request.
+    #[test]
+    fn the_external_outbox_pending_table_is_covered_by_the_privilege_probe() {
+        let covered = HARVEST_WRITE_PRIVILEGE_REQUIREMENTS
+            .iter()
+            .find(|(name, _)| *name == autumn_harvest::external_outbox::PENDING_TABLE)
+            .map(|(_, privileges)| *privileges);
+        assert_eq!(covered, Some(&["SELECT", "INSERT", "DELETE"][..]));
     }
 
     /// A reshard carry reads, writes and deletes the override floors. A

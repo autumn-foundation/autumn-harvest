@@ -313,26 +313,28 @@ pub const fn stuck_running_tasks_query() -> &'static str {
 /// observed, or the claiming worker is not dead after all.
 #[must_use]
 pub const fn requeue_orphan_stmt() -> &'static str {
-    "UPDATE harvest_task_queue \
-     SET state = 'PENDING', \
-         worker_id = NULL, \
-         started_at = NULL, \
-         sticky_worker_id = NULL, \
-         sticky_until = NULL, \
-         last_heartbeat_at = NULL, \
-         error = NULL, \
-         crash_strikes = $4, \
-         scheduled_at = clock_timestamp() \
-     WHERE id = $1 \
-       AND state = 'RUNNING' \
-       AND worker_id = $2 \
-       AND crash_strikes = $3 \
-       AND NOT EXISTS ( \
+    concat!(
+        "UPDATE harvest_task_queue \
+         SET state = 'PENDING', \
+             worker_id = NULL, \
+             started_at = NULL, \
+             sticky_worker_id = NULL, \
+             sticky_until = NULL, \
+             last_heartbeat_at = NULL, \
+             error = NULL, \
+             crash_strikes = $4, \
+             scheduled_at = clock_timestamp() \
+         WHERE id = $1 AND ",
+        crate::row_guard::row_guard_sql!(
+            "state = 'RUNNING' AND worker_id = $2 AND crash_strikes = $3"
+        ),
+        " AND NOT EXISTS ( \
            SELECT 1 FROM harvest_workers w \
            WHERE w.worker_id = $2 \
              AND w.last_heartbeat_at > $6 - ($5::bigint * INTERVAL '1 second') \
        ) \
      RETURNING id"
+    )
 }
 
 // ---------------------------------------------------------------------------

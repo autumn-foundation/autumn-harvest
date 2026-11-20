@@ -253,8 +253,8 @@ pub const fn workflow_history_ceiling_query() -> &'static str {
      WHERE event_count >= $1"
 }
 
-/// The one query shape behind all three external-outbox scanners
-/// (issue #1486).
+/// The one query shape behind all three external-outbox scanners (issue
+/// #1486). `docs/performance-external-outbox-scan.md` measures its pins.
 ///
 /// The three scanners differ only in the request type they claim, the two
 /// events that resolve it, and the payload key that correlates them. The
@@ -264,91 +264,123 @@ pub const fn workflow_history_ceiling_query() -> &'static str {
 /// `$1` is the caller's shard assignment list. `$2` is the per-sweep list of
 /// event ids this sweep already gave up on.
 ///
-/// # Why the executions join is a `LATERAL`, and the resolution check is not
+/// # Why the outer scan reads the pending table
 ///
-/// The executions join is pinned to its correlated form on purpose. A `LIMIT
-/// 1` inside a `LATERAL` cannot be pulled up into the outer query, so the
-/// shape is structural. `harvest_workflow_executions.id` is the primary key,
-/// so the subquery returns at most one row with or without that `LIMIT`, and
-/// the pin changes no result. It is also free: the same query with this join
-/// written as an ordinary `INNER JOIN` measures 6,350 buffers against 6,358.
-/// The pin buys a plan that cannot change shape with the statistics, at no
-/// measured cost. That is the whole argument for it.
+/// `harvest_events` is append-only, so a request row stays there after it
+/// resolves. A scan of the request rows walks each request that the
+/// deployment ever made. An idle claim paid that cost on each tick: 942,191
+/// buffers over 200,000 resolved requests.
 ///
-/// The resolution check stays a `NOT EXISTS`, and that is also measured. An
-/// earlier revision of this change pinned it the same way, as a `LEFT JOIN
-/// LATERAL ... WHERE res.resolved IS NULL`. The two forms select the same
-/// rows. The outer join costs twice as much.
+/// A trigger keeps one row in `harvest_external_outbox_pending` for each
+/// unresolved request. See [`crate::external_outbox`]. The claim reads that
+/// table, so its cost follows the backlog and not the history. After a
+/// vacuum, an idle claim reads no buffer.
 ///
-/// The reason is join order, and it only shows once resolved requests
-/// accumulate. `harvest_events` is append-only, so a request row stays in
-/// `idx_harvest_events_external_outbox_pending` after it resolves. Every
-/// claim walks those rows and discards them. As an anti-join the planner
-/// runs the resolution probe first and lifts the executions probe above it,
-/// so the executions probe runs once. An outer join cannot be reordered, so
-/// both probes run for every row about to be discarded. Measured over a
-/// backlog of 8,000 resolved requests: 24,253 buffers against 48,253.
+/// The claim keeps each predicate of the legacy query on the event row. So
+/// it selects a subset of the legacy rows. The table holds each unresolved
+/// request, so the subset is the whole set. The resolution check also guards
+/// against a stale row: such a row cannot cause a second delivery.
+///
+/// # Why both joins are a `LATERAL`, and the resolution check is not
+///
+/// A `LIMIT 1` inside a `LATERAL` cannot be pulled up into the outer query,
+/// so a correlated probe is structural. Each probe matches one row by a
+/// unique id, so the pin changes no result. On the partitioned layout the
+/// event probe reads one index of each partition.
+///
+/// The executions pin was free when measured: 6,350 buffers as an ordinary
+/// `INNER JOIN` against 6,358. It buys a plan that cannot change shape with
+/// the statistics.
+///
+/// The event pin is load-bearing. A plain join that carries the legacy
+/// predicates lets the planner read the request rows through
+/// `idx_harvest_events_external_outbox_pending`. The literal `event_type`
+/// makes that index usable. An equivalence class carries the literal over a
+/// join qual of a plain join too. On a small fixture the planner chose that walk under a
+/// `Materialize`. The walk reads the whole history again.
+///
+/// So the `unresolved` probe holds every legacy predicate, and returns only
+/// the id. It names `running`, so it runs after the executions probe. It
+/// compares the type with `p.request_type`, which is a parameter inside the
+/// probe, not a literal. The planner then cannot prove the predicate of the
+/// history index, so the probe reads by key. A literal there let the planner
+/// scan the whole type prefix of the history index for each probe. The outer
+/// `e` joins by the id alone, so the history index cannot serve it either.
+///
+/// `FOR UPDATE OF e` stays at the top. The lock falls only on the row that
+/// the `LIMIT` returns, after each check, as in the legacy query. A lock
+/// inside a subquery runs for each candidate. Under a scan and a sort, it
+/// locks each pending request of the shard for the whole step.
+///
+/// The resolution check stays a `NOT EXISTS`. A `LEFT JOIN LATERAL ... WHERE
+/// res.resolved IS NULL` selects the same rows and costs more. As an
+/// anti-join the planner can discard a row before a later probe. An outer
+/// join cannot be reordered, so each probe runs for each row about to be
+/// discarded. Measured over a scan of 8,000 resolved requests: 24,253 buffers
+/// against 48,253.
 ///
 /// # Why the `ORDER BY`
 ///
-/// `ORDER BY e.timestamp, e.id` pins the outer scan. Only
-/// `idx_harvest_events_external_outbox_pending` produces that order. Every
-/// competing plan needs a sort, and a sort under `LIMIT 1` must read every
-/// candidate first. The ordered index scan returns after one row. It wins
-/// whatever the row estimate says.
+/// `ORDER BY p.requested_at, p.event_row_id` is the drain order. The trigger
+/// copies the request `timestamp` into `requested_at`, and `event_row_id` is
+/// `e.id`. So the order is the legacy `ORDER BY e.timestamp, e.id`. The
+/// oldest pending request goes first, so newer arrivals cannot starve a
+/// backlog. `timestamp` is caller-settable, so this is request order and not
+/// append order. `id` is append order and decides every tie.
 ///
-/// `ORDER BY e.id` alone does not pin it. `harvest_events_pkey` supplies
-/// that order too. Under an inflated estimate the planner walks the primary
-/// key, and filters every unrelated event out of a full ascending scan.
-/// Prefixing the order with `event_type` does not help either. The planner
-/// drops a column that the `WHERE` clause pins to a constant, because the
-/// remaining order is all it has to satisfy.
-///
-/// The order is also the drain order. `timestamp` is the request instant the
-/// grace-window check already reads, and `id` breaks ties. The oldest
-/// pending request goes first, so newer arrivals cannot starve a backlog.
-/// Note `timestamp` is caller-settable, so this is request order and not
-/// append order; `id` is append order and decides every tie.
+/// `idx_harvest_external_outbox_pending_claim` leads with `request_type` and
+/// supplies that order for a backlog. The ordered scan then stops after one
+/// row. An empty or small table plans a scan and a sort, which cost almost
+/// nothing: 0 buffers idle, and 13 with one request.
 ///
 /// The result names the columns of [`crate::models::HarvestEvent`]. A cached
 /// statement must name its columns, so each scanner keeps its plan prepared.
-/// Each event type in the text is a literal, so the generic plan still proves
-/// the predicate of `idx_harvest_events_external_outbox_pending`.
+/// Each event type in the text is a literal, so a generic plan of the claim
+/// index reads one prefix of it.
 macro_rules! external_outbox_claim_query {
     (requested = $requested:literal, resolved = ($first:literal, $second:literal), key = $key:literal) => {
         concat!(
             "SELECT e.id, e.workflow_exec_id, e.event_id, e.event_type, e.event_data, \
                     e.timestamp \
-             FROM harvest_events e \
+             FROM harvest_external_outbox_pending p \
              JOIN LATERAL ( \
                  SELECT 1 AS running_exec FROM harvest_workflow_executions x \
-                 WHERE x.id = e.workflow_exec_id \
+                 WHERE x.id = p.workflow_exec_id \
                    AND x.state = 'RUNNING' \
                    AND x.shard_id = ANY($1) \
                  LIMIT 1 \
              ) running ON TRUE \
-             WHERE e.event_type = '",
-            $requested,
-            "' \
-               AND (e.event_data->'data'->>'",
+             JOIN LATERAL ( \
+                 SELECT ev.id AS event_row_id \
+                 FROM harvest_events ev \
+                 WHERE ev.id = p.event_row_id \
+                   AND running.running_exec = 1 \
+                   AND ev.event_type = p.request_type \
+                   AND (ev.event_data->'data'->>'",
             $key,
             "') IS NOT NULL \
-               AND NOT (e.id = ANY($2)) \
-               AND NOT EXISTS ( \
-                   SELECT 1 FROM harvest_events res \
-                   WHERE res.workflow_exec_id = e.workflow_exec_id \
-                     AND res.event_type IN ('",
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM harvest_events res \
+                       WHERE res.workflow_exec_id = ev.workflow_exec_id \
+                         AND res.event_type IN ('",
             $first,
             "', '",
             $second,
             "') \
-                     AND res.event_data->'data'->>'",
+                         AND res.event_data->'data'->>'",
             $key,
-            "' = e.event_data->'data'->>'",
+            "' = ev.event_data->'data'->>'",
             $key,
             "' \
-               ) \
-             ORDER BY e.timestamp, e.id \
+                   ) \
+                 LIMIT 1 \
+             ) unresolved ON TRUE \
+             JOIN harvest_events e ON e.id = unresolved.event_row_id \
+             WHERE p.request_type = '",
+            $requested,
+            "' \
+               AND NOT (p.event_row_id = ANY($2)) \
+             ORDER BY p.requested_at, p.event_row_id \
              LIMIT 1 \
              FOR UPDATE OF e SKIP LOCKED"
         )
@@ -6202,6 +6234,13 @@ async fn enforce_timeouts_pass(
         shard_assignments,
     )
     .await?;
+    // Fold the delta rows of the DLQ depth counter on this shard. A writer
+    // never folds, because a fold scans the whole counter. A failure is
+    // logged and skipped: it leaves more rows to read, and the count stays
+    // exact. It is not counted, because `count` is the timeout total.
+    if let Err(error) = crate::dlq::fold_dead_letter_counts(conn).await {
+        tracing::warn!(error = %error, "dlq depth fold failed; continuing the timeout pass");
+    }
     // Lazy payload-codec re-encryption (issue #948): convert a bounded batch of
     // stored rows per shard from a retired key id onto the active one.
     //
@@ -8363,8 +8402,13 @@ mod tests {
 
         let all_keys = ["signal_id", "cancel_id", "await_id"];
         for (sql, requested, first, second, key) in families {
+            assert!(sql.contains("ev.event_type = p.request_type"), "{sql}");
             assert!(
-                sql.contains(&format!("e.event_type = '{requested}'")),
+                !sql.contains(&format!("ev.event_type = '{requested}'")),
+                "a literal on the probe makes the history index usable: {sql}"
+            );
+            assert!(
+                sql.contains(&format!("p.request_type = '{requested}'")),
                 "{sql}"
             );
             assert!(
@@ -8394,12 +8438,31 @@ mod tests {
             external_cancel_outbox_claim_query(),
             external_await_outbox_claim_query(),
         ] {
-            // Pins the outer scan to idx_harvest_events_external_outbox_pending.
-            assert!(sql.contains("ORDER BY e.timestamp, e.id"), "{sql}");
-            // Pins the executions lookup to a correlated probe.
-            assert!(sql.contains("JOIN LATERAL"), "{sql}");
-            // Keeps the resolution check an anti-join, so a discarded
-            // candidate does not also pay the executions probe.
+            // Reads the pending table, not the request history.
+            assert!(
+                sql.contains("FROM harvest_external_outbox_pending p"),
+                "{sql}"
+            );
+            // Pins the outer scan to the claim index, in drain order.
+            assert!(
+                sql.contains("ORDER BY p.requested_at, p.event_row_id"),
+                "{sql}"
+            );
+            // Pins the executions lookup and the event lookup to correlated
+            // probes. A plain join to the events lets the planner walk the
+            // request history again.
+            assert_eq!(sql.matches("JOIN LATERAL").count(), 2, "{sql}");
+            assert!(sql.contains("WHERE ev.id = p.event_row_id"), "{sql}");
+            // The outer event row carries no literal, so the history index
+            // cannot serve it. The lock is on that row, at the top.
+            assert!(
+                sql.contains("JOIN harvest_events e ON e.id = unresolved.event_row_id WHERE"),
+                "{}",
+                sql.split_whitespace().collect::<Vec<_>>().join(" ")
+            );
+            // The event probe follows the executions probe.
+            assert!(sql.contains("AND running.running_exec = 1"), "{sql}");
+            // Keeps the resolution check an anti-join.
             assert!(sql.contains("NOT EXISTS"), "{sql}");
             assert!(!sql.contains("LEFT JOIN LATERAL"), "{sql}");
             // The concurrency contract the drain loop relies on.

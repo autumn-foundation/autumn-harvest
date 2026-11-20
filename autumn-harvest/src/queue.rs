@@ -1992,6 +1992,11 @@ macro_rules! claim_candidate_rows_sql {
 }
 
 /// The running count per concurrency key, for the keys in `$keys`.
+///
+/// The full scan reads this form. Its keys are the due keys of the whole
+/// backlog, so they can be many. One pass over the running rows then can
+/// cost less than one probe per key. The planner picks between the two by
+/// its estimates. The window reads `claim_window_running_counts_sql!`.
 macro_rules! claim_running_counts_sql {
     ($name:literal, $keys:literal) => {
         concat!(
@@ -2005,6 +2010,44 @@ macro_rules! claim_running_counts_sql {
             $keys,
             ") \
              GROUP BY t.concurrency_key, t.task_type \
+         )"
+        )
+    };
+}
+
+/// The running count per concurrency key and task type, for the keys of a
+/// window in `$keys`.
+///
+/// Each distinct key gets one probe of
+/// `harvest_task_queue_concurrency_key_running`. So the count reads the
+/// running rows of the window keys only. A window holds few keys, so a probe
+/// per key always costs little. The form of `claim_running_counts_sql!` let
+/// the planner read every `RUNNING` row instead. On the measured fixture,
+/// that cost about 1,000 buffers per keyed claim.
+///
+/// Postgres does not pull up a subquery with an aggregate or a `DISTINCT`.
+/// So the plan stays one probe per key, whatever the estimates. The probe
+/// groups by task type, so a key with two task types costs one probe. The
+/// `GROUP BY` gives one row per pair, and only for a pair with running rows.
+/// The gate reads a missing pair as 0 with `COALESCE(..., 0)`.
+/// `docs/performance-keyed-claim-running-counts.md` has the measurements.
+macro_rules! claim_window_running_counts_sql {
+    ($name:literal, $keys:literal) => {
+        concat!(
+            $name,
+            " AS MATERIALIZED ( \
+             SELECT k.concurrency_key, c.task_type, c.running_count \
+             FROM (SELECT DISTINCT concurrency_key FROM ",
+            $keys,
+            ") k \
+             CROSS JOIN LATERAL ( \
+                 SELECT t.task_type, COUNT(*) AS running_count \
+                 FROM harvest_task_queue t \
+                 WHERE t.concurrency_key = k.concurrency_key \
+                   AND t.state = 'RUNNING' \
+                   AND t.worker_id IS NOT NULL \
+                 GROUP BY t.task_type \
+             ) c \
          )"
         )
     };
@@ -2245,7 +2288,7 @@ macro_rules! claim_seek_ctes_sql {
              WHERE seek_concurrency_key IS NOT NULL \
                AND seek_concurrency_cap IS NOT NULL \
          ), ",
-            claim_running_counts_sql!("seek_running_counts", "seek_pending_keys"),
+            claim_window_running_counts_sql!("seek_running_counts", "seek_pending_keys"),
             ", "
         )
     };
@@ -2407,7 +2450,7 @@ macro_rules! claim_deep_seek_ctes_sql {
              WHERE seek_concurrency_key IS NOT NULL \
                AND seek_concurrency_cap IS NOT NULL \
          ), ",
-            claim_running_counts_sql!("seek_deep_running_counts", "seek_deep_pending_keys"),
+            claim_window_running_counts_sql!("seek_deep_running_counts", "seek_deep_pending_keys"),
             ", "
         )
     };
@@ -4696,23 +4739,25 @@ pub(crate) async fn release_claim_via(
 /// includes the row that this transaction just claimed.
 #[must_use]
 pub const fn release_claim_if_over_cap_query() -> &'static str {
-    "UPDATE harvest_task_queue \
-     SET state = 'PENDING', \
-         worker_id = NULL, \
-         started_at = NULL, \
-         attempt = GREATEST(attempt - 1, 0) \
-     WHERE id = $1 \
-       AND state = 'RUNNING' \
-       AND worker_id = $2 \
-       AND concurrency_key IS NOT NULL \
-       AND concurrency_cap IS NOT NULL \
-       AND ( \
+    concat!(
+        "UPDATE harvest_task_queue \
+         SET state = 'PENDING', \
+             worker_id = NULL, \
+             started_at = NULL, \
+             attempt = GREATEST(attempt - 1, 0) \
+         WHERE id = $1 AND ",
+        crate::row_guard::row_guard_sql!(
+            "state = 'RUNNING' AND worker_id = $2 \
+             AND concurrency_key IS NOT NULL AND concurrency_cap IS NOT NULL"
+        ),
+        " AND ( \
            SELECT COUNT(*) FROM harvest_task_queue recheck \
            WHERE recheck.concurrency_key = harvest_task_queue.concurrency_key \
              AND recheck.task_type = harvest_task_queue.task_type \
              AND recheck.state = 'RUNNING' \
              AND recheck.worker_id IS NOT NULL \
        ) > harvest_task_queue.concurrency_cap"
+    )
 }
 
 /// Releases a just-claimed task when its concurrency key is over its cap.
@@ -5698,10 +5743,12 @@ impl PendingHintRow {
 /// SQL for [`record_pending_hints`]. Reads the hint columns for named rows.
 #[must_use]
 pub const fn pending_hint_rows_query() -> &'static str {
-    "SELECT id, queue_name, scheduled_at, priority, task_type \
-     FROM harvest_task_queue \
-     WHERE id = ANY($1) \
-       AND state = 'PENDING'"
+    concat!(
+        "SELECT id, queue_name, scheduled_at, priority, task_type \
+         FROM harvest_task_queue \
+         WHERE id = ANY($1) AND ",
+        crate::row_guard::row_guard_sql!("state = 'PENDING'")
+    )
 }
 
 /// Record a dispatch hint for one row a write left `PENDING`.
@@ -6146,8 +6193,10 @@ pub(crate) enum ClaimLock {
 ///
 /// Every write fenced by a [`TaskClaim`] adds this predicate to its own
 /// statement. Only the holder of the current claim can then match the row.
+/// A `WHERE` clause wraps it in `row_guard::row_guard`. A select
+/// list reads it plain.
 #[diesel::dsl::auto_type(no_type_alias)]
-fn claim_held<'a>(worker_id: &'a str, attempt: i32) -> _ {
+pub(crate) fn claim_held<'a>(worker_id: &'a str, attempt: i32) -> _ {
     let running: &'static str = "RUNNING";
     crate::schema::harvest_task_queue::state
         .eq(running)
@@ -6175,12 +6224,15 @@ type TaskUpdate<'a, V, Ret> = diesel::query_builder::BoxedUpdateStatement<
 /// its text at run time. Each caller here builds one fixed text, and the
 /// fence adds one more. So each task row write has two texts at most. Keep
 /// it so: do not pass an update whose text follows a runtime value.
-fn fence<'a, V, Ret>(
+pub(crate) fn fence<'a, V, Ret>(
     update: TaskUpdate<'a, V, Ret>,
     claim: Option<&'a TaskClaim>,
 ) -> TaskUpdate<'a, V, Ret> {
     match claim {
-        Some(claim) => update.filter(claim_held(&claim.worker_id, claim.attempt)),
+        Some(claim) => update.filter(crate::row_guard::row_guard(claim_held(
+            &claim.worker_id,
+            claim.attempt,
+        ))),
         None => update,
     }
 }
@@ -6331,7 +6383,10 @@ pub(crate) async fn claim_held_for_update_skip_locked(
 
     dsl::harvest_task_queue
         .find(claim.task_id)
-        .filter(claim_held(&claim.worker_id, claim.attempt))
+        .filter(crate::row_guard::row_guard(claim_held(
+            &claim.worker_id,
+            claim.attempt,
+        )))
         .select(dsl::id)
         .for_update()
         .skip_locked()
@@ -6360,10 +6415,13 @@ pub(crate) async fn later_claim_shares_strikes(
 
     dsl::harvest_task_queue
         .find(claim.task_id)
-        .filter(dsl::state.eq("RUNNING"))
-        .filter(dsl::worker_id.eq(claim.worker_id.as_str()))
-        .filter(dsl::crash_strikes.eq(crash_strikes))
-        .filter(dsl::attempt.ne(claim.attempt))
+        .filter(crate::row_guard::row_guard(
+            dsl::state
+                .eq("RUNNING")
+                .and(dsl::worker_id.eq(claim.worker_id.as_str()))
+                .and(dsl::crash_strikes.eq(crash_strikes))
+                .and(dsl::attempt.ne(claim.attempt)),
+        ))
         .select(dsl::id)
         .first::<Uuid>(conn)
         .await
@@ -6702,7 +6760,7 @@ async fn defer_claimed_task(
     let update = diesel::update(
         dsl::harvest_task_queue
             .find(claim.task_id)
-            .filter(dsl::state.eq("RUNNING")),
+            .filter(crate::row_guard::row_guard(dsl::state.eq("RUNNING"))),
     )
     .set((
         BudgetDeferralChangeset::new(),
@@ -6786,7 +6844,7 @@ pub async fn release_unstarted_claim(
     let update = diesel::update(
         dsl::harvest_task_queue
             .find(claim.task_id)
-            .filter(dsl::state.eq("RUNNING")),
+            .filter(crate::row_guard::row_guard(dsl::state.eq("RUNNING"))),
     )
     .set((
         dsl::state.eq("PENDING"),
@@ -6902,8 +6960,11 @@ pub async fn release_abandoned_claim(
     let update = diesel::update(
         dsl::harvest_task_queue
             .find(claim.task_id)
-            .filter(dsl::state.eq("RUNNING"))
-            .filter(dsl::started_at.eq(started_at.to_diesel())),
+            .filter(crate::row_guard::row_guard(
+                dsl::state
+                    .eq("RUNNING")
+                    .and(dsl::started_at.eq(started_at.to_diesel())),
+            )),
     )
     .set((
         dsl::state.eq("PENDING"),
@@ -7044,11 +7105,9 @@ async fn fail_task_inner(
 ) -> HarvestResult<bool> {
     use crate::schema::harvest_task_queue::dsl;
 
-    let update = diesel::update(
-        dsl::harvest_task_queue
-            .find(task_id)
-            .filter(dsl::state.eq_any(["PENDING", "RUNNING"])),
-    )
+    let update = diesel::update(dsl::harvest_task_queue.find(task_id).filter(
+        crate::row_guard::row_guard(dsl::state.eq_any(["PENDING", "RUNNING"])),
+    ))
     .set((
         dsl::state.eq("FAILED"),
         dsl::error.eq(Some(error)),
@@ -7851,7 +7910,7 @@ async fn requeue_for_retry_inner(
     let update = diesel::update(
         dsl::harvest_task_queue
             .find(task_id)
-            .filter(dsl::state.eq("RUNNING")),
+            .filter(crate::row_guard::row_guard(dsl::state.eq("RUNNING"))),
     )
     .set((
         changeset,
@@ -8032,12 +8091,9 @@ async fn requeue_workflow_task_with_backoff(
 ) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
 
-    let updated = diesel::update(
-        dsl::harvest_task_queue
-            .find(task_id)
-            .filter(dsl::state.eq("RUNNING"))
-            .filter(dsl::task_type.eq("workflow")),
-    )
+    let updated = diesel::update(dsl::harvest_task_queue.find(task_id).filter(
+        crate::row_guard::row_guard(dsl::state.eq("RUNNING").and(dsl::task_type.eq("workflow"))),
+    ))
     .set((
         PendingRequeueChangeset::new(previous_error.to_string()),
         workflow_backoff_set!(delay, sticky),
@@ -8062,12 +8118,9 @@ fn workflow_backoff_sql(
     use diesel::debug_query;
     use diesel::pg::Pg;
 
-    let query = diesel::update(
-        dsl::harvest_task_queue
-            .find(Uuid::nil())
-            .filter(dsl::state.eq("RUNNING"))
-            .filter(dsl::task_type.eq("workflow")),
-    )
+    let query = diesel::update(dsl::harvest_task_queue.find(Uuid::nil()).filter(
+        crate::row_guard::row_guard(dsl::state.eq("RUNNING").and(dsl::task_type.eq("workflow"))),
+    ))
     .set((changeset, workflow_backoff_set!(delay, sticky)));
     debug_query::<Pg, _>(&query).to_string()
 }
@@ -8262,12 +8315,9 @@ async fn requeue_claimed_workflow_task_with_backoff(
 
     let changeset = PendingRequeueChangeset::new(reason.to_string());
 
-    let update = diesel::update(
-        dsl::harvest_task_queue
-            .find(claim.task_id)
-            .filter(dsl::state.eq("RUNNING"))
-            .filter(dsl::task_type.eq("workflow")),
-    )
+    let update = diesel::update(dsl::harvest_task_queue.find(claim.task_id).filter(
+        crate::row_guard::row_guard(dsl::state.eq("RUNNING").and(dsl::task_type.eq("workflow"))),
+    ))
     .set((
         changeset,
         dsl::scheduled_at.eq(sql::<Timestamptz>(
@@ -8457,8 +8507,11 @@ pub async fn force_retry_activity_now(
     let advanced = diesel::update(
         dsl::harvest_task_queue
             .filter(dsl::id.eq(task_id))
-            .filter(dsl::workflow_exec_id.eq(Some(workflow_exec_id)))
-            .filter(dsl::state.eq("PENDING")),
+            .filter(crate::row_guard::row_guard(
+                dsl::workflow_exec_id
+                    .eq(Some(workflow_exec_id))
+                    .and(dsl::state.eq("PENDING")),
+            )),
     )
     .set(dsl::scheduled_at.eq(db_clock_stamp::<diesel::sql_types::Timestamptz>()))
     .returning((dsl::queue_name, dsl::scheduled_at))
@@ -8608,7 +8661,7 @@ pub async fn reschedule_task(
     let (queue_name, priority, task_type) = diesel::update(
         dsl::harvest_task_queue
             .find(task_id)
-            .filter(dsl::state.eq("RUNNING")),
+            .filter(crate::row_guard::row_guard(dsl::state.eq("RUNNING"))),
     )
     .set((
         CleanContinuationChangeset::new(scheduled_at),
@@ -8678,7 +8731,7 @@ async fn defer_rate_limited_task_inner(
     let update = diesel::update(
         dsl::harvest_task_queue
             .find(task_id)
-            .filter(dsl::state.eq("RUNNING")),
+            .filter(crate::row_guard::row_guard(dsl::state.eq("RUNNING"))),
     )
     .set((
         CleanContinuationChangeset::new(scheduled_at),
@@ -8807,7 +8860,8 @@ pub const fn release_task_for_capability_miss_query(
         // AfterHandler: the body reached a conclusion on this worker, so the
         // #367 crash streak is genuinely broken. The start metric has already
         // fired, so `attempt` stays put.
-        "UPDATE harvest_task_queue \
+        concat!(
+            "UPDATE harvest_task_queue \
          SET state = 'PENDING', \
              worker_id = NULL, \
              started_at = NULL, \
@@ -8829,18 +8883,19 @@ pub const fn release_task_for_capability_miss_query(
              sticky_timeout = NULL, \
              wake_requested = FALSE, \
              activity_name = CASE WHEN task_type = 'workflow' THEN NULL ELSE activity_name END \
-         WHERE id = $1 \
-           AND state = 'RUNNING' \
-           AND worker_id = $2 \
-           AND crash_strikes = $4 \
-           AND attempt = $6 \
-         RETURNING COALESCE(array_length(capability_miss_workers, 1), 0) \
+         WHERE id = $1 AND ",
+            crate::row_guard::row_guard_sql!(
+                "state = 'RUNNING' AND worker_id = $2 AND crash_strikes = $4 AND attempt = $6"
+            ),
+            " RETURNING COALESCE(array_length(capability_miss_workers, 1), 0) \
              AS distinct_miss_workers"
+        )
     } else if phase.restores_dispatch_attempt() {
         // BeforeHandler: nothing ran at all. Restore the claim-time increment
         // so the miss neither drains an activity's retry budget nor blocks a
         // workflow's first-dispatch start metric.
-        "UPDATE harvest_task_queue \
+        concat!(
+            "UPDATE harvest_task_queue \
          SET state = 'PENDING', \
              worker_id = NULL, \
              started_at = NULL, \
@@ -8862,18 +8917,19 @@ pub const fn release_task_for_capability_miss_query(
              sticky_timeout = NULL, \
              wake_requested = FALSE, \
              activity_name = CASE WHEN task_type = 'workflow' THEN NULL ELSE activity_name END \
-         WHERE id = $1 \
-           AND state = 'RUNNING' \
-           AND worker_id = $2 \
-           AND crash_strikes = $4 \
-           AND attempt = $6 \
-         RETURNING COALESCE(array_length(capability_miss_workers, 1), 0) \
+         WHERE id = $1 AND ",
+            crate::row_guard::row_guard_sql!(
+                "state = 'RUNNING' AND worker_id = $2 AND crash_strikes = $4 AND attempt = $6"
+            ),
+            " RETURNING COALESCE(array_length(capability_miss_workers, 1), 0) \
              AS distinct_miss_workers"
+        )
     } else {
         // DuringHandler: the body BEGAN (so the start metric fired and
         // `attempt` must stay put) but did not finish (so the #367 streak is
         // not evidence-broken). The one phase where the two clauses disagree.
-        "UPDATE harvest_task_queue \
+        concat!(
+            "UPDATE harvest_task_queue \
          SET state = 'PENDING', \
              worker_id = NULL, \
              started_at = NULL, \
@@ -8894,13 +8950,13 @@ pub const fn release_task_for_capability_miss_query(
              sticky_timeout = NULL, \
              wake_requested = FALSE, \
              activity_name = CASE WHEN task_type = 'workflow' THEN NULL ELSE activity_name END \
-         WHERE id = $1 \
-           AND state = 'RUNNING' \
-           AND worker_id = $2 \
-           AND crash_strikes = $4 \
-           AND attempt = $6 \
-         RETURNING COALESCE(array_length(capability_miss_workers, 1), 0) \
+         WHERE id = $1 AND ",
+            crate::row_guard::row_guard_sql!(
+                "state = 'RUNNING' AND worker_id = $2 AND crash_strikes = $4 AND attempt = $6"
+            ),
+            " RETURNING COALESCE(array_length(capability_miss_workers, 1), 0) \
              AS distinct_miss_workers"
+        )
     }
 }
 
@@ -9042,12 +9098,13 @@ struct DistinctMissWorkersRow {
 /// under this dispatch is never rewritten.
 #[must_use]
 pub const fn reset_capability_misses_after_inline_progress_query() -> &'static str {
-    "UPDATE harvest_task_queue \
-     SET capability_misses = 0, \
-         capability_miss_workers = '{}' \
-     WHERE id = $1 \
-       AND state = 'RUNNING' \
-       AND worker_id = $2"
+    concat!(
+        "UPDATE harvest_task_queue \
+         SET capability_misses = 0, \
+             capability_miss_workers = '{}' \
+         WHERE id = $1 AND ",
+        crate::row_guard::row_guard_sql!("state = 'RUNNING' AND worker_id = $2")
+    )
 }
 
 /// Start the capability-miss budget clean because this dispatch made durable
@@ -9241,15 +9298,16 @@ pub const fn read_capability_miss_state_query() -> &'static str {
     //
     // `IS DISTINCT FROM` (not `<>`) so a `NULL` handler — no frontier recorded
     // yet — reads as a mismatch and therefore as a full budget.
-    "SELECT \
-         CASE WHEN capability_miss_handler IS DISTINCT FROM $3 \
-             THEN 0 ELSE capability_misses END AS capability_misses, \
-         CASE WHEN capability_miss_handler IS DISTINCT FROM $3 \
-             THEN '{}'::text[] ELSE capability_miss_workers END AS capability_miss_workers \
-     FROM harvest_task_queue \
-     WHERE id = $1 \
-       AND state = 'RUNNING' \
-       AND worker_id = $2"
+    concat!(
+        "SELECT \
+             CASE WHEN capability_miss_handler IS DISTINCT FROM $3 \
+                 THEN 0 ELSE capability_misses END AS capability_misses, \
+             CASE WHEN capability_miss_handler IS DISTINCT FROM $3 \
+                 THEN '{}'::text[] ELSE capability_miss_workers END AS capability_miss_workers \
+         FROM harvest_task_queue \
+         WHERE id = $1 AND ",
+        crate::row_guard::row_guard_sql!("state = 'RUNNING' AND worker_id = $2")
+    )
 }
 
 /// The task's capability-miss counters **as they stand now**, for the
@@ -9417,8 +9475,10 @@ impl HeldClaim<'_> {
 
         let query = dsl::harvest_task_queue
             .find(self.task_id)
-            .filter(claim_held(self.worker_id, self.attempt))
-            .filter(dsl::crash_strikes.eq(self.crash_strikes))
+            .filter(crate::row_guard::row_guard(
+                claim_held(self.worker_id, self.attempt)
+                    .and(dsl::crash_strikes.eq(self.crash_strikes)),
+            ))
             .select(dsl::id)
             .for_update();
         let row = if skip_locked {
@@ -9506,8 +9566,9 @@ async fn set_local_lock_timeout(conn: &mut AsyncPgConnection, value: &str) -> Ha
 /// Also clears `timer_fires_at` (issue #1402). This release hands the
 /// row to a fresh dispatch attempt at the current instant, not to
 /// whatever timer last armed it. A stale marker must not outlive it.
-const fn release_suspended_workflow_claim_query() -> &'static str {
-    "UPDATE harvest_task_queue \
+pub(crate) const fn release_suspended_workflow_claim_query() -> &'static str {
+    concat!(
+        "UPDATE harvest_task_queue \
      SET state = 'PENDING', \
          worker_id = NULL, \
          started_at = NULL, \
@@ -9525,12 +9586,12 @@ const fn release_suspended_workflow_claim_query() -> &'static str {
              THEN NOW() + sticky_timeout \
              ELSE sticky_until \
          END \
-     WHERE id = $1 \
-       AND state = 'RUNNING' \
-       AND worker_id = $2 \
-       AND crash_strikes = $3 \
-       AND attempt = $4 \
-     RETURNING id, queue_name, scheduled_at, priority, task_type"
+     WHERE id = $1 AND ",
+        crate::row_guard::row_guard_sql!(
+            "state = 'RUNNING' AND worker_id = $2 AND crash_strikes = $3 AND attempt = $4"
+        ),
+        " RETURNING id, queue_name, scheduled_at, priority, task_type"
+    )
 }
 
 /// Release a still-claimed, replay-suspended-empty-handed workflow task to `PENDING`.
@@ -9997,12 +10058,14 @@ const fn take_wake_requested_query() -> &'static str {
 /// freshly parked row and record its own miss. A capable peer can also park
 /// and legitimately reset it. No single-statement merge of two whole snapshots
 /// is monotone against both.
-const fn park_workflow_task_sticky_query(reset_capability_misses: bool) -> &'static str {
+pub(crate) const fn park_workflow_task_sticky_query(reset_capability_misses: bool) -> &'static str {
     if reset_capability_misses {
-        "WITH candidate AS ( \
+        concat!(
+            "WITH candidate AS ( \
              SELECT id, wake_requested FROM harvest_task_queue \
-             WHERE id = $1 AND task_type = 'workflow' AND state = 'RUNNING' \
-             FOR UPDATE \
+             WHERE id = $1 AND ",
+            crate::row_guard::row_guard_sql!("task_type = 'workflow' AND state = 'RUNNING'"),
+            " FOR UPDATE \
          ), \
          updated AS ( \
              UPDATE harvest_task_queue t \
@@ -10019,11 +10082,14 @@ const fn park_workflow_task_sticky_query(reset_capability_misses: bool) -> &'sta
              RETURNING candidate.wake_requested AS had_wake_requested \
          ) \
          SELECT had_wake_requested FROM updated"
+        )
     } else {
-        "WITH candidate AS ( \
+        concat!(
+            "WITH candidate AS ( \
              SELECT id, wake_requested FROM harvest_task_queue \
-             WHERE id = $1 AND task_type = 'workflow' AND state = 'RUNNING' \
-             FOR UPDATE \
+             WHERE id = $1 AND ",
+            crate::row_guard::row_guard_sql!("task_type = 'workflow' AND state = 'RUNNING'"),
+            " FOR UPDATE \
          ), \
          updated AS ( \
              UPDATE harvest_task_queue t \
@@ -10038,18 +10104,21 @@ const fn park_workflow_task_sticky_query(reset_capability_misses: bool) -> &'sta
              RETURNING candidate.wake_requested AS had_wake_requested \
          ) \
          SELECT had_wake_requested FROM updated"
+        )
     }
 }
 
 /// SQL for [`park_workflow_task`] when no sticky hint is supplied. See
 /// [`park_workflow_task_sticky_query`] for the `reset_capability_misses`
 /// contract.
-const fn park_workflow_task_query(reset_capability_misses: bool) -> &'static str {
+pub(crate) const fn park_workflow_task_query(reset_capability_misses: bool) -> &'static str {
     if reset_capability_misses {
-        "WITH candidate AS ( \
+        concat!(
+            "WITH candidate AS ( \
              SELECT id, wake_requested FROM harvest_task_queue \
-             WHERE id = $1 AND task_type = 'workflow' AND state = 'RUNNING' \
-             FOR UPDATE \
+             WHERE id = $1 AND ",
+            crate::row_guard::row_guard_sql!("task_type = 'workflow' AND state = 'RUNNING'"),
+            " FOR UPDATE \
          ), \
          updated AS ( \
              UPDATE harvest_task_queue t \
@@ -10066,11 +10135,14 @@ const fn park_workflow_task_query(reset_capability_misses: bool) -> &'static str
              RETURNING candidate.wake_requested AS had_wake_requested \
          ) \
          SELECT had_wake_requested FROM updated"
+        )
     } else {
-        "WITH candidate AS ( \
+        concat!(
+            "WITH candidate AS ( \
              SELECT id, wake_requested FROM harvest_task_queue \
-             WHERE id = $1 AND task_type = 'workflow' AND state = 'RUNNING' \
-             FOR UPDATE \
+             WHERE id = $1 AND ",
+            crate::row_guard::row_guard_sql!("task_type = 'workflow' AND state = 'RUNNING'"),
+            " FOR UPDATE \
          ), \
          updated AS ( \
              UPDATE harvest_task_queue t \
@@ -10085,6 +10157,7 @@ const fn park_workflow_task_query(reset_capability_misses: bool) -> &'static str
              RETURNING candidate.wake_requested AS had_wake_requested \
          ) \
          SELECT had_wake_requested FROM updated"
+        )
     }
 }
 
@@ -10304,11 +10377,9 @@ pub async fn update_task_priority(
 ) -> HarvestResult<bool> {
     use crate::schema::harvest_task_queue::dsl;
 
-    let updated = diesel::update(
-        dsl::harvest_task_queue
-            .find(task_id)
-            .filter(dsl::state.eq_any(["PENDING", "RUNNING"])),
-    )
+    let updated = diesel::update(dsl::harvest_task_queue.find(task_id).filter(
+        crate::row_guard::row_guard(dsl::state.eq_any(["PENDING", "RUNNING"])),
+    ))
     .set(dsl::priority.eq(priority.as_i32()))
     .execute(conn)
     .await
@@ -13801,6 +13872,78 @@ mod tests {
         );
     }
 
+    /// Each window count CTE of each claim form probes the key index once per
+    /// pending key. A scan of every `RUNNING` row is the cost that this form
+    /// removes. `keyed_claim_running_counts_tests` measures it. The full scan
+    /// keeps one pass, so the planner can choose by its estimates.
+    #[test]
+    fn window_running_counts_probe_once_per_pending_key() {
+        let mut variants: Vec<&str> = vec![
+            claim_task_full_scan_query(),
+            claim_task_by_id_query(),
+            claim_task_by_id_query_fenced(),
+        ];
+        for fenced in [false, true] {
+            variants.push(owned_claim_by_id_query(fenced));
+            variants.push(owned_claim_by_execution_query(fenced));
+        }
+        for kind in [None, Some(TaskType::Workflow), Some(TaskType::Activity)] {
+            for fenced in [false, true] {
+                for fairness in [ClaimFairness::Off, ClaimFairness::Keys] {
+                    variants.push(claim_query_for(kind, fenced, fairness));
+                    variants.push(owned_claim_query_for(kind, fenced, fairness));
+                }
+                for owned in [false, true] {
+                    variants.push(window_claim_query_for(kind, fenced, owned));
+                }
+            }
+        }
+        let probe = |counts: &str, keys: &str| {
+            format!(
+                "{counts} AS MATERIALIZED ( \
+                 SELECT k.concurrency_key, c.task_type, c.running_count \
+                 FROM (SELECT DISTINCT concurrency_key FROM {keys}) k \
+                 CROSS JOIN LATERAL ( \
+                 SELECT t.task_type, COUNT(*) AS running_count FROM harvest_task_queue t \
+                 WHERE t.concurrency_key = k.concurrency_key \
+                 AND t.state = 'RUNNING' AND t.worker_id IS NOT NULL \
+                 GROUP BY t.task_type ) c )"
+            )
+        };
+        let single_pass = "concurrency_running_counts AS MATERIALIZED ( \
+             SELECT t.concurrency_key, t.task_type, COUNT(*) AS running_count \
+             FROM harvest_task_queue t WHERE t.state = 'RUNNING' \
+             AND t.worker_id IS NOT NULL \
+             AND t.concurrency_key IN (SELECT concurrency_key FROM concurrency_pending_keys) \
+             GROUP BY t.concurrency_key, t.task_type )";
+        for sql in variants {
+            let sql = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+            let mut found = 0;
+            for (counts, keys) in [
+                ("seek_running_counts", "seek_pending_keys"),
+                ("seek_deep_running_counts", "seek_deep_pending_keys"),
+            ] {
+                if sql.contains(&format!("{counts} AS MATERIALIZED")) {
+                    found += 1;
+                    assert_eq!(
+                        sql.matches(&probe(counts, keys)).count(),
+                        1,
+                        "{counts} must probe once per key of {keys}; got:\n{sql}"
+                    );
+                }
+            }
+            if sql.contains("concurrency_running_counts AS MATERIALIZED") {
+                found += 1;
+                assert_eq!(
+                    sql.matches(single_pass).count(),
+                    1,
+                    "the full scan keeps one pass over the running rows; got:\n{sql}"
+                );
+            }
+            assert!(found > 0, "a claim form has a running count; got:\n{sql}");
+        }
+    }
+
     // ── Batched seek-and-refine claim (issue #1340) ──────────────────────────
 
     /// The batch scan must drop the concurrency-key soft filter entirely.
@@ -14331,7 +14474,8 @@ mod tests {
     fn the_cap_recheck_counts_what_the_claim_counts() {
         let release = release_claim_if_over_cap_query();
         for clause in [
-            "WHERE id = $1 AND state = 'RUNNING' AND worker_id = $2",
+            "WHERE id = $1 AND (CASE WHEN state = 'RUNNING' AND worker_id = $2 \
+             AND concurrency_key IS NOT NULL AND concurrency_cap IS NOT NULL THEN true END)",
             "attempt = GREATEST(attempt - 1, 0)",
             "concurrency_key IS NOT NULL AND concurrency_cap IS NOT NULL",
             "recheck.concurrency_key = harvest_task_queue.concurrency_key",

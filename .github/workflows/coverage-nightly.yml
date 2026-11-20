@@ -80,6 +80,16 @@ jobs:
           save-if: ${{ github.event_name == 'schedule' }}
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --locked --version "$CARGO_LLVM_COV_VERSION"
+      # Issue #2741. AppArmor on Ubuntu can refuse a mount in a user
+      # namespace. The isolation tests then skip, and their code shows as not
+      # covered. This step allows the namespace.
+      - name: Allow user namespaces for the isolation tests
+        run: |
+          knob=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [ -e "${knob}" ]; then
+            echo "apparmor_restrict_unprivileged_userns was $(cat "${knob}")"
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - name: Run the lib tests under coverage
         run: cargo llvm-cov --branch --no-report -p autumn-harvest --all-features --lib
       - name: Export coverage

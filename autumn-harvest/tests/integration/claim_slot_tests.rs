@@ -945,11 +945,26 @@ fn rate(from: (Instant, usize), to: (Instant, usize)) -> f64 {
     claims / secs
 }
 
+/// The median rate of three back-to-back windows, and the sorted windows.
+async fn median_rate(sample: impl Fn() -> (Instant, usize)) -> (f64, Vec<f64>) {
+    let mut windows = Vec::with_capacity(3);
+    let mut last = sample();
+    for _ in 0..3 {
+        tokio::time::sleep(WINDOW).await;
+        let now = sample();
+        windows.push(rate(last, now));
+        last = now;
+    }
+    windows.sort_by(f64::total_cmp);
+    (windows[1], windows)
+}
+
 /// Stall the claims of a 3-worker fleet with an `ACCESS EXCLUSIVE` lock on
 /// `harvest_task_queue`, lift it, and measure the recovery.
 ///
 /// The run owns its database, so the stall blocks no other test. The rate
-/// before the stall is the median of three 1 s windows.
+/// before the stall is the median of three 1 s windows. The run takes them
+/// directly before the lock, after the top-up seed.
 async fn stall_and_recover(cap: Option<NonZeroU16>) -> Recovery {
     let db = TestDb::new().await;
     let queue = format!("cs-stall-{}", Uuid::new_v4());
@@ -965,43 +980,43 @@ async fn stall_and_recover(cap: Option<NonZeroU16>) -> Recovery {
         )
     };
 
-    // Warm up, then take the rate before the stall.
+    // Warm up, then take a first rate. It sizes the backlog only.
     tokio::time::sleep(Duration::from_secs(1)).await;
-    let mut windows = Vec::with_capacity(3);
-    let mut last = sample();
-    for _ in 0..3 {
-        tokio::time::sleep(WINDOW).await;
-        let now = sample();
-        windows.push(rate(last, now));
-        last = now;
-    }
-    windows.sort_by(f64::total_cmp);
-    let before = windows[1];
+    let (sizing, _) = median_rate(sample).await;
 
     // The run tops up the backlog, so that it outlasts the stall and the longest recovery.
     // The fleet keeps claiming while the seed runs, so each round re-reads the claims.
     // A round refills to the headroom target but needs only the bare need to pass.
+    // The horizon also covers the three windows of the rate before the stall.
     assert!(
-        before.is_finite() && before > 0.0,
-        "the rate before the stall is {before}; the fleet claimed nothing"
+        sizing.is_finite() && sizing > 0.0,
+        "the sizing rate is {sizing}; the fleet claimed nothing"
     );
-    let horizon = RECOVERY_LIMIT + Duration::from_secs(2);
+    let horizon = RECOVERY_LIMIT + Duration::from_secs(2) + 3 * WINDOW;
     let mut seeded = STALL_BACKLOG;
     let mut covered = false;
     for _ in 0..TOP_UP_ROUNDS {
         let claimed = AtomicUsize::load(&counter.tasks, Ordering::Relaxed);
         let left = seeded.saturating_sub(claimed);
-        if backlog_covers(left, before, horizon) {
+        if backlog_covers(left, sizing, horizon) {
             covered = true;
             break;
         }
-        let add = backlog_shortfall(left, before, horizon);
+        let add = backlog_shortfall(left, sizing, horizon);
         seed(&db.url, &queue, add, false, ShardId::new(0)).await;
         seeded += add;
     }
     assert!(
         covered,
-        "{TOP_UP_ROUNDS} top-ups did not outlast the recovery at {before:.0}/s"
+        "{TOP_UP_ROUNDS} top-ups did not outlast the recovery at {sizing:.0}/s"
+    );
+
+    // The rate before the stall. A seed slows the claims and a run drifts.
+    // So the run takes this rate after the top-up, directly before the lock.
+    let (before, windows) = median_rate(sample).await;
+    assert!(
+        before.is_finite() && before > 0.0,
+        "the rate before the stall is {before}; the fleet claimed nothing"
     );
 
     // The stall: one transaction holds the table for `STALL`.

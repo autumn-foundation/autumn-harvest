@@ -4036,6 +4036,125 @@ async fn dlq_depth_sampler_emits_dlq_entries_metric() {
     assert!(depth >= 1, "dlq.entries depth must be >= 1, got {depth}");
 }
 
+/// The `depth` values of the `harvest.dlq.entries` emissions of shard 0, in
+/// emission order.
+fn dlq_depths(emissions: &[MetricEmission]) -> Vec<u64> {
+    emissions
+        .iter()
+        .filter(|e| e.name == METRIC_DLQ_ENTRIES && e.labels_debug.contains("shard=0"))
+        .filter_map(|e| {
+            e.labels_debug
+                .split(',')
+                .find_map(|kv| kv.strip_prefix("depth="))
+                .and_then(|v| v.parse().ok())
+        })
+        .collect()
+}
+
+/// The `harvest_dlq_growth` rule over one window: `max_over_time` minus
+/// `min_over_time` is more than 5.
+fn dlq_growth_fires(depths: &[u64]) -> bool {
+    let (Some(max), Some(min)) = (depths.iter().max(), depths.iter().min()) else {
+        return false;
+    };
+    max - min > 5
+}
+
+#[test]
+fn the_growth_rule_needs_more_than_five() {
+    assert!(!dlq_growth_fires(&[]));
+    assert!(!dlq_growth_fires(&[10, 15, 12]));
+    assert!(dlq_growth_fires(&[10, 16]));
+}
+
+/// The real sampler reads the DLQ counter. Six new dead letters must fire
+/// the `harvest_dlq_growth` rule, which reads a growth of more than 5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dlq_gauge_growth_of_six_fires_the_growth_alert() {
+    let (admin_url, _container) = setup_db_env_or_container().await;
+    // Its own database, so no other test adds or removes a dead letter.
+    let db = crate::throwaway_db::ThrowawayDb::create_on(&admin_url, "dlq_growth_alert").await;
+    let database_url = db.url();
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("failed to connect");
+
+    let recording = Arc::new(RecordingMetrics::default());
+    let telemetry = Arc::new(
+        TelemetryConfig::builder()
+            .metrics(Arc::clone(&recording) as Arc<dyn MetricsRecorder>)
+            .build(),
+    );
+    let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
+        vec![],
+        vec![],
+        autumn_harvest::context::empty_shared_state(),
+        telemetry,
+    ));
+    let worker = build_worker("metrics-worker-dlq-growth", registry);
+    let pool = build_test_pool(&database_url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    let wait_for_depth = async |depth: u64| {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let seen = {
+                    let emissions = recording.emissions.lock().unwrap();
+                    dlq_depths(&emissions).contains(&depth)
+                };
+                if seen {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        })
+        .await
+    };
+
+    let empty = wait_for_depth(0).await;
+    for n in 0..6 {
+        dlq::dead_letter(
+            &mut conn,
+            &NewDeadLetterEntry {
+                original_task_id: Uuid::new_v4(),
+                queue_name: "default".to_string(),
+                task_type: "ACTIVITY".to_string(),
+                workflow_exec_id: None,
+                activity_name: Some(format!("burst_{n}")),
+                input: serde_json::json!({}),
+                error: "intentional test failure".to_string(),
+                attempts: 3,
+                owner: None,
+                severity: None,
+            },
+        )
+        .await
+        .expect("failed to insert dead-letter entry");
+    }
+    let grown = wait_for_depth(6).await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join cleanly");
+    drop(pool);
+    drop(conn);
+
+    empty.expect("the sampler must emit depth 0 before the burst");
+    grown.expect("the sampler must emit depth 6 after the burst");
+    let depths = dlq_depths(&recording.drain());
+    assert!(
+        depths.iter().all(|d| *d <= 6),
+        "the gauge must never read more than the 6 dead letters: {depths:?}"
+    );
+    assert!(
+        dlq_growth_fires(&depths),
+        "a burst of 6 must fire harvest_dlq_growth: {depths:?}"
+    );
+}
+
 fn non_deterministic_test_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: serde_json::Value,

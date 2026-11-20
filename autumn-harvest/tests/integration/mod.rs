@@ -180,6 +180,7 @@ mod delayed_start_tests;
 mod det_check_tests;
 mod determinism_static_analysis_docs;
 mod dispatch_tests;
+mod dlq_depth_counter_tests;
 mod docs_guard_support;
 mod drain_release_tests;
 #[cfg(feature = "db")]
@@ -196,6 +197,7 @@ mod event_partitioning_tests;
 mod executor_span_tests;
 #[cfg(feature = "testing")]
 mod external_completion_tests;
+mod external_outbox_pending_tests;
 mod external_outbox_scan_tests;
 mod fairness_key_tests;
 mod fairness_key_worker_tests;
@@ -226,6 +228,8 @@ mod hot_code_swap_tests;
 #[cfg(feature = "testing")]
 mod idempotency_tests;
 mod integration_e2e;
+#[cfg(feature = "db")]
+mod keyed_claim_running_counts_tests;
 #[cfg(feature = "db")]
 mod late_signal_completion_tests;
 #[cfg(feature = "db")]
@@ -368,6 +372,8 @@ mod retry_now_tests;
 #[cfg(feature = "db")]
 mod retry_override_db_tests;
 mod retry_override_guard;
+#[cfg(feature = "db")]
+mod row_guard_plan_db_tests;
 mod run_defaults_chain_guard;
 #[cfg(feature = "db")]
 mod run_defaults_chain_tests;

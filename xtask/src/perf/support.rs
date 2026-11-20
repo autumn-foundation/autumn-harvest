@@ -118,15 +118,37 @@ pub fn exit_code(status: ExitStatus) -> ExitCode {
     ExitCode::from(status_code(status))
 }
 
+/// Exec attempts of [`spawn`] while the program file is busy.
+const EXEC_BUSY_ATTEMPTS: u32 = 50;
+
 /// Starts `command`, and names the command line in the error.
 ///
 /// After an interrupt, it starts nothing. The caller then unwinds, so its
 /// cleanup guards run.
+///
+/// Linux refuses to exec a file that some process holds open for writing.
+/// A thread that forks while another thread writes a script copies that
+/// write handle into the child until the child execs. So an exec of a script
+/// that this process just wrote can fail with `ETXTBSY` for a short time.
+/// The spawn waits and tries again, as Cargo does.
 fn spawn(command: &mut Command) -> Result<Child> {
     stop_on_interrupt()?;
-    command
-        .spawn()
-        .with_context(|| format!("Failed to execute command: {}", describe(command)))
+    let mut attempt = 1;
+    loop {
+        match command.spawn() {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && attempt < EXEC_BUSY_ATTEMPTS =>
+            {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            result => {
+                return result
+                    .with_context(|| format!("Failed to execute command: {}", describe(command)));
+            }
+        }
+    }
 }
 
 /// Renders a command line for an error message.

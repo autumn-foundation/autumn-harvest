@@ -32639,6 +32639,9 @@ fn spawn_rate_limit_sampler(
 /// Periodically sample the dead-letter queue entry count and forward it to
 /// the configured [`MetricsRecorder`](crate::telemetry::MetricsRecorder).
 ///
+/// The count is exact, and its read does not grow with the DLQ. See
+/// [`crate::dlq::DLQ_DEPTH_SQL`].
+///
 /// Runs on the same cadence as the queue-depth sampler. For sharded
 /// deployments the caller should spawn one instance per shard, passing the
 /// shard-specific pool; single-shard deployments pass their single pool and
@@ -32700,6 +32703,13 @@ fn spawn_dlq_depth_sampler(
                 .await;
             match sampled {
                 Ok((count, _role)) => {
+                    if count < 0 {
+                        tracing::warn!(
+                            shard_id,
+                            count,
+                            "dlq depth counter is negative; run harvest_dead_letter_recount()"
+                        );
+                    }
                     let depth = u64::try_from(count).unwrap_or(0);
                     telemetry.metrics.record_dlq_entries(shard_id, depth);
                 }
@@ -45315,15 +45325,19 @@ async fn claim_failed_its_task(
     claim_attempt: i32,
 ) -> bool {
     use crate::schema::harvest_task_queue::dsl;
+    use diesel::BoolExpressionMethods as _;
     let Ok(mut conn) = crate::pool::acquire_within_pool_bound(pool).await else {
         return false;
     };
     dsl::harvest_task_queue
         .find(task_id)
-        .filter(dsl::state.eq("FAILED"))
-        .filter(dsl::worker_id.eq(worker_id))
-        .filter(dsl::crash_strikes.eq(claim_crash_strikes))
-        .filter(dsl::attempt.eq(claim_attempt))
+        .filter(crate::row_guard::row_guard(
+            dsl::state
+                .eq("FAILED")
+                .and(dsl::worker_id.eq(worker_id))
+                .and(dsl::crash_strikes.eq(claim_crash_strikes))
+                .and(dsl::attempt.eq(claim_attempt)),
+        ))
         .select(dsl::id)
         .first::<uuid::Uuid>(&mut conn)
         .await
@@ -45353,6 +45367,7 @@ pub async fn reset_timed_out_workflow_task(
     claim_attempt: i32,
 ) -> ClaimRecovery {
     use crate::schema::harvest_task_queue::dsl;
+    use diesel::BoolExpressionMethods as _;
 
     // Retry both the pool acquire and the release write. Without the retry, a
     // short pool saturation leaves the task stuck in RUNNING on a live worker.
@@ -45381,8 +45396,6 @@ pub async fn reset_timed_out_workflow_task(
         let written = diesel::update(
             dsl::harvest_task_queue
                 .find(task_id)
-                .filter(dsl::state.eq("RUNNING"))
-                .filter(dsl::worker_id.eq(worker_id))
                 // Claim-epoch guard (issue #1459). It is the same race
                 // `queue::release_task_for_capability_miss` already guards.
                 // `poison_pill::requeue_orphan` hands an orphan back as `PENDING`
@@ -45398,8 +45411,13 @@ pub async fn reset_timed_out_workflow_task(
                 // being stuck is not a crash. Its re-claim would then still match
                 // on `crash_strikes` alone. This reset must also check `attempt`,
                 // which `claim_task` bumps on every claim without exception.
-                .filter(dsl::crash_strikes.eq(claim_crash_strikes))
-                .filter(dsl::attempt.eq(claim_attempt)),
+                .filter(crate::row_guard::row_guard(
+                    dsl::state
+                        .eq("RUNNING")
+                        .and(dsl::worker_id.eq(worker_id))
+                        .and(dsl::crash_strikes.eq(claim_crash_strikes))
+                        .and(dsl::attempt.eq(claim_attempt)),
+                )),
         )
         .set((
             dsl::state.eq("PENDING"),
