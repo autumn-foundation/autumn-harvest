@@ -808,8 +808,8 @@ pub async fn dead_letter_with_codecs(
 /// The DLQ depth statement of [`dead_letter_count`].
 ///
 /// Triggers on `harvest_dead_letters` keep `harvest_dead_letter_counts`
-/// exact. `harvest_dead_letter_depth()` sums its rows. The writers and
-/// [`fold_dead_letter_counts`] keep those rows few. So the statement does not
+/// exact. `harvest_dead_letter_depth()` sums its rows.
+/// [`fold_dead_letter_counts`] keeps those rows few. So the statement does not
 /// read the dead letters. The function is `SECURITY DEFINER`, so a role needs
 /// no grant on the counter table.
 pub const DLQ_DEPTH_SQL: &str = "SELECT harvest_dead_letter_depth() AS entries";
@@ -853,10 +853,10 @@ async fn counter_call(conn: &mut AsyncPgConnection, sql: &'static str) -> Harves
 
 /// Fold the free delta rows of the DLQ depth counter into one row.
 ///
-/// Each dead-letter statement adds one delta row. A writer folds with a
-/// chance of 1 in 32. The DLQ sampler also calls this function, so the gauge
-/// read stays a few rows when every writer runs at `SERIALIZABLE`. A row that
-/// another open transaction holds stays as it is.
+/// Each dead-letter statement adds one delta row. The timeout pass calls this
+/// function once per tick, so the gauge reads a few rows. A fold scans the
+/// whole counter, so no writer calls it. A row that another open transaction
+/// holds stays as it is.
 ///
 /// Returns the count of rows that the fold removed.
 ///

@@ -20,10 +20,10 @@
 -- ## The fold
 --
 -- `harvest_dead_letter_fold()` deletes each delta row that no open
--- transaction holds, and inserts their sum as one row. A writer calls it with
--- a chance of 1 in 32. The DLQ sampler calls it each gauge interval. So the
--- gauge reads a few rows. At `SERIALIZABLE` a writer does not fold, because
--- the read of the fold could abort the transaction of the writer at commit.
+-- transaction holds, and inserts their sum as one row. The timeout pass of
+-- each shard calls it once per tick, in its own `READ COMMITTED`
+-- transaction. So the gauge reads the delta rows of about one tick. A fold
+-- scans the whole counter, so no writer runs it.
 --
 -- The fold takes `ROW EXCLUSIVE` on `harvest_dead_letters`, as a writer does.
 -- So it cannot run during a `TRUNCATE` or a recount, which would miss the row
@@ -142,17 +142,9 @@ BEGIN
     IF TG_OP = 'DELETE' THEN
         delta := -delta;
     END IF;
+    -- No fold here. A fold scans the whole counter, and a long snapshot
+    -- elsewhere keeps its dead rows. The timeout pass folds instead.
     INSERT INTO harvest_dead_letter_counts (entries) VALUES (delta);
-    IF random() < 1.0 / 32
-       AND current_setting('transaction_isolation') <> 'serializable' THEN
-        -- At `REPEATABLE READ`, a row that another fold removed after this
-        -- snapshot raises a serialization failure. Skip the fold, not the write.
-        BEGIN
-            PERFORM harvest_dead_letter_fold();
-        EXCEPTION WHEN serialization_failure THEN
-            NULL;
-        END;
-    END IF;
     RETURN NULL;
 END
 $harvest_dead_letter_count_apply_body$

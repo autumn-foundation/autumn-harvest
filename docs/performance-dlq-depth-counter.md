@@ -89,8 +89,9 @@ The design below inserts delta rows instead.
 - Statement triggers run after each `INSERT` and `DELETE` with their
   transition table, and after `TRUNCATE`. One statement inserts one delta
   row, whatever its row count. A writer locks and reads no counter row.
-- A writer folds with a chance of 1 in 32. The DLQ sampler folds each gauge
-  interval. A fold takes only rows that no open transaction holds.
+- The timeout pass of each shard folds the delta rows once per tick. A fold
+  scans the whole counter, so no writer folds. A fold takes only rows that
+  no open transaction holds.
 - `dead_letter_count` reads `dlq::DLQ_DEPTH_SQL`, which calls
   `harvest_dead_letter_depth()`.
 
@@ -117,25 +118,25 @@ Buffers per call. Before is `write-before-write-costs.md`, after is
 
 | statement | small before | small after | large before | large after |
 |:--|--:|--:|--:|--:|
-| insert, one row | 9.3 | 14.7 | 11.5 | 14.9 |
-| discard, one row | 5.0 | 12.1 | 6.0 | 15.1 |
-| discard, 100 rows | 412 | 515 | 594 | 697 |
-| insert, one row, snapshot held | 9.3 | 16.3 | 11.3 | 18.7 |
-| insert, 8 connections at once | 12.0 | 33.4 | 14.2 | 32.4 |
+| insert, one row | 9.3 | 11.3 | 11.5 | 13.6 |
+| discard, one row | 5.0 | 8.6 | 6.0 | 9.6 |
+| discard, 100 rows | 412 | 515 | 594 | 696 |
+| insert, one row, snapshot held | 9.3 | 12.3 | 11.3 | 14.3 |
+| insert, 8 connections at once | 12.0 | 16.9 | 14.2 | 19.1 |
 
 Time per call, same files:
 
 | statement | small before | small after | large before | large after |
 |:--|--:|--:|--:|--:|
-| insert, one row | 0.020 ms | 0.055 ms | 0.026 ms | 0.074 ms |
-| discard, one row | 0.005 ms | 0.038 ms | 0.007 ms | 0.040 ms |
-| discard, 100 rows | 0.115 ms | 0.209 ms | 0.308 ms | 0.414 ms |
+| insert, one row | 0.020 ms | 0.051 ms | 0.026 ms | 0.055 ms |
+| discard, one row | 0.005 ms | 0.032 ms | 0.007 ms | 0.042 ms |
+| discard, 100 rows | 0.115 ms | 0.207 ms | 0.308 ms | 0.416 ms |
 
-- The nested counter work reads about 3 to 9 buffers per statement. It is the
-  delta insert, and now and then a fold.
+- The nested counter work is the delta insert: 2.0 buffers for an insert and
+  2.6 for a one-row discard, at every size.
 - A delete copies each old row into its transition table. That reads the
   heap page once more: about 1 buffer per deleted row.
-- A one-row call costs 0.03 to 0.05 ms more. Most of that is the switch of
+- A one-row call costs 0.03 ms more. Most of that is the switch of
   `search_path` that each `SECURITY DEFINER` call makes.
 - The 8 new connections each load the trigger function from the catalog
   once. That is most of their extra buffers.
@@ -147,13 +148,14 @@ then keeps each dead row version, as during a long `pg_dump`:
 
 | | small before | small after | large before | large after |
 |:--|--:|--:|--:|--:|
-| buffers per insert | 9.3 | 16.3 | 11.3 | 18.7 |
-| buffers per gauge read | 283 | 18 | 743,679 | 18 |
+| buffers per insert | 9.3 | 12.3 | 11.3 | 14.3 |
+| buffers per gauge read | 283 | 33 | 743,679 | 25 |
 | counter table pages | — | 18 | — | 18 |
 
-The writers never read the counter, so their cost stays flat. The gauge read
-scans the dead versions of the folded rows: about 1 page per 110 writes in
-that window. Vacuum removes them when the snapshot ends.
+A writer only inserts. It never reads the counter, so its cost stays flat
+however long the flood runs. The harness runs no timeout pass, so its
+counter held 2,808 unfolded rows here. In a worker, the timeout pass folds
+them each tick, off the write path.
 
 ### Concurrency
 
@@ -163,7 +165,6 @@ that window. Vacuum removes them when the snapshot ends.
   overlapping writers at `REPEATABLE READ` and at `SERIALIZABLE`, after
   other writers committed. Both commit, and the count is exact. The first
   version failed it with 40001.
-- After 400 concurrent inserts, the counter held 3 to 36 rows.
 
 ## ✅ The alert
 

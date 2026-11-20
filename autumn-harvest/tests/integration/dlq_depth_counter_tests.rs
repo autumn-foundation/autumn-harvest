@@ -492,28 +492,49 @@ async fn recount_refuses_a_snapshot_older_than_its_lock() {
     );
 }
 
-/// Each dead-letter statement adds a delta row. The writers and the fold keep
-/// the live row count small, so the gauge read stays a few rows.
+/// Each dead-letter statement adds one delta row and does no other counter
+/// work. A fold would scan the whole counter, so it must stay off the write
+/// path. The timeout pass folds the rows.
 #[tokio::test]
-async fn the_counter_stays_small_under_many_writes() {
-    const WRITES: i64 = 2_000;
+async fn writers_only_insert_and_the_timeout_pass_folds() {
+    const WRITES: i64 = 200;
     let mut f = fixture("dlq_depth_fold").await;
+    let seed_rows = counter_rows(&mut f.conn).await;
     for _ in 0..WRITES {
         insert_rows(&mut f.conn, 1).await;
     }
+    assert_eq!(
+        counter_rows(&mut f.conn).await,
+        seed_rows + WRITES,
+        "a writer must insert one delta row and fold nothing"
+    );
     assert_exact(&mut f.conn, "many single-row writes").await;
-    let rows = counter_rows(&mut f.conn).await;
-    // A writer folds with a chance of 1 in 32. The chance of 600 writes with
-    // no fold is below 1 in 10^8.
-    assert!(rows < 600, "the writers must fold the counter: {rows} rows");
 
+    autumn_harvest::timeout::enforce_timeouts_once(
+        &mut f.conn,
+        &autumn_harvest::telemetry::NoOpMetrics,
+        Duration::from_secs(60),
+        &None,
+        &[autumn_harvest::types::ShardId::new(0)],
+        None,
+        None,
+        60,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
+    )
+    .await
+    .expect("timeout pass");
+    assert_eq!(counter_rows(&mut f.conn).await, 1, "the timeout pass folds");
+    assert_exact(&mut f.conn, "a fold").await;
+    assert_eq!(gauge(&mut f.conn).await, WRITES);
+
+    insert_rows(&mut f.conn, 3).await;
     let folded = dlq::fold_dead_letter_counts(&mut f.conn)
         .await
         .expect("fold");
-    assert!(folded <= rows, "the fold removes free rows only: {folded}");
+    assert_eq!(folded, 2, "the fold removes each free row");
     assert_eq!(counter_rows(&mut f.conn).await, 1);
-    assert_exact(&mut f.conn, "a fold").await;
-    assert_eq!(gauge(&mut f.conn).await, WRITES);
+    assert_eq!(gauge(&mut f.conn).await, WRITES + 3);
 }
 
 /// `TRUNCATE` removes each dead letter, also one that committed after the

@@ -38,7 +38,7 @@ metric. No new grant.**
 |---|------------------------|------------|
 | R1 | The counter row becomes a lock that every failure transaction waits for. A flood of failures then runs one at a time. | A writer locks no counter row (B7 after review). A test holds many open writers at once and needs each insert to end at once. |
 | R2 | The counter wait closes a deadlock with the execution and parent row locks of a failure transaction. | A writer never waits for a counter row, so it cannot close a cycle. |
-| R3 | The rows grow without limit. | The writers fold with a chance of 1 in 32, and the sampler folds each gauge interval. A test writes 2,000 times and checks the row count. The recount leaves one row. |
+| R3 | The rows grow without limit. | The timeout pass folds once per tick (V10). A test writes 200 times, runs the pass and checks for one row. The recount leaves one row. |
 | R4 | A bulk delete or a retention pass writes the counter once per row. | B5. One delta row per statement. |
 | R5 | `TRUNCATE` bypasses row and statement delete triggers. | An `AFTER TRUNCATE` trigger empties the counter. |
 | R6 | A role without a grant on the new table writes a dead letter. The trigger then fails, and so does the failure transaction. | The functions are `SECURITY DEFINER` (V3). No role needs a grant on the counter. |
@@ -94,6 +94,8 @@ documentation, and integration. They found these defects.
 | V7 | The preflight `dlq_read_access` check read the counter, not the DLQ. | It reads one row of `harvest_dead_letters` too. |
 | V8 | The new suite had no row in `.github/ci/integration-suites.txt`, so CI never ran it. | Added. |
 | V9 | The docs cited the wrong baseline file, an uncommitted second run and an unmeasured seed time. | The perf page cites only committed artifacts. |
+| V10 | Codex: a writer that folds scans the whole counter. Under a held snapshot that scan grows with the flood, inside a failure transaction. | The trigger only inserts. The timeout pass folds once per tick, off the write path, whether metrics are on or off. `writers_only_insert_and_the_timeout_pass_folds` proves both. |
+| V11 | Codex: at `REPEATABLE READ`, the truncate trigger deleted only the counter rows of its snapshot. | The trigger truncates the counter. `a_truncate_on_an_old_snapshot_resets_every_counter_row` proves it. |
 
 ### 0.6 Decision
 
@@ -103,9 +105,9 @@ Adopt B1 with B5, B7 and B9.
   sum of `entries` is the count of `harvest_dead_letters`.
 - `harvest_dead_letter_count_apply()` runs after each `INSERT` and `DELETE`
   statement, with its transition table, and after `TRUNCATE`. It inserts one
-  delta row. With a chance of 1 in 32 it folds, except at `SERIALIZABLE`.
-- `harvest_dead_letter_fold()` folds the free rows into one. The DLQ sampler
-  calls it each gauge interval.
+  delta row and does no other counter work.
+- `harvest_dead_letter_fold()` folds the free rows into one. The timeout
+  pass calls it once per tick.
 - `harvest_dead_letter_recount()` locks the table, counts it and leaves one
   row. Only the owner runs it.
 - `dead_letter_count` reads `dlq::DLQ_DEPTH_SQL`, which calls

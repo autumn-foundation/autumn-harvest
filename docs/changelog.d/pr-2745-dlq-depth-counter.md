@@ -12,13 +12,14 @@ stays exact, so the `harvest_dlq_growth` alert keeps its meaning.
 - **Migration `20261119233037_harvest_dead_letter_counts`.** One table, four
   functions and three statement triggers on `harvest_dead_letters`. Each
   `INSERT` and `DELETE` statement inserts one delta row, its row count from
-  its transition table, in the same transaction. `TRUNCATE` empties the
-  counter. A writer locks and reads no counter row. So it never waits, and
+  its transition table, in the same transaction. `TRUNCATE` truncates
+  the counter too. A writer locks and reads no counter row. So it never waits, and
   it raises no serialization failure at `REPEATABLE READ` or
   `SERIALIZABLE`.
 - **Fold.** `harvest_dead_letter_fold()` folds the free delta rows into one.
-  A writer calls it with a chance of 1 in 32, and the DLQ sampler calls it
-  each gauge interval through `dlq::fold_dead_letter_counts`.
+  The timeout pass of each shard calls it once per tick through
+  `dlq::fold_dead_letter_counts`. A fold scans the whole counter, so no
+  writer runs it.
 - **Recount.** `harvest_dead_letter_recount()` and
   `dlq::recount_dead_letters` set the counter from an exact count. The
   function refuses any level above `READ COMMITTED`. `harvest dr promote`
@@ -27,9 +28,9 @@ stays exact, so the `harvest_dlq_growth` alert keeps its meaning.
 - **No new grant.** The trigger, the fold and the depth read are
   `SECURITY DEFINER`, with `pg_temp` last in `search_path`. Only the owner
   runs the recount.
-- **Cost of a write.** About 3 to 9 more buffers and 0.03 to 0.05 ms per
-  one-row statement. A delete reads 1 more buffer per row for its
-  transition table. A long open snapshot does not slow the writers.
+- **Cost of a write.** About 2 to 4 more buffers and 0.03 ms per one-row
+  statement. A delete reads 1 more buffer per row for its transition
+  table. A long open snapshot does not slow the writers.
 - **Preflight.** `dlq_read_access` reads one row of `harvest_dead_letters`
   as well as the depth.
 - **Migration runner.** `migrate::apply_in_transaction` pins
