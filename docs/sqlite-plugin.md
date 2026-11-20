@@ -299,7 +299,11 @@ sequenceDiagram
   `HarvestFleet::restore` there: a finished restore binds its target to
   the restored file, so the next open applies it.
 - An import or a re-create gives the tenant a new database file. A Harvest
-  file with no replica then goes aside, as `<file>.aside-<n>`.
+  file with no replica then goes aside, as `<file>.aside-<n>`. Its sidecars
+  go with it. When a sidecar cannot move, the moved sidecars move back and
+  the open refuses. The error names the sidecar. On Windows another
+  process can hold a sidecar open, so a retry can then succeed (issue
+  #2759).
 - `DatabaseFleet::release_ownership` does not wait for a Harvest backlog.
   The shutdown hook ships it within the fleet's final flush, and logs each
   tenant that stays behind.

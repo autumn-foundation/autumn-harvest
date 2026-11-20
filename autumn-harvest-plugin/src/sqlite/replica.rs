@@ -1360,7 +1360,8 @@ fn write_atomic(file: &Path, text: &str) -> Result<(), String> {
 }
 
 /// Move the Harvest file at `path` and its sidecars aside. The next open
-/// then starts an empty file. An operator can still read the old one.
+/// then starts an empty file. An operator can still read the old one. A
+/// failed move refuses, and the files stay together. See [`move_aside`].
 fn set_aside(key: &FleetDbKey, path: &Path) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
@@ -1369,16 +1370,64 @@ fn set_aside(key: &FleetDbKey, path: &Path) -> Result<(), String> {
     let _writer = autumn_harvest_sqlite::FileWriterLock::acquire(path)
         .map_err(|error| format!("cannot lock {} to set it aside: {error}", path.display()))?;
     let aside = suffixed(path, &format!(".aside-{}", unique()));
-    for suffix in SIDECARS {
-        let sidecar = suffixed(path, suffix);
-        if sidecar.exists() {
-            let _ = std::fs::rename(&sidecar, suffixed(&aside, suffix));
-        }
-    }
-    std::fs::rename(path, &aside)
+    move_aside(path, &aside, |from, to| std::fs::rename(from, to))
         .map_err(|error| format!("cannot set {} aside: {error}", path.display()))?;
     tracing::warn!(tenant = %key, aside = %aside.display(), "the Harvest file does not belong to the tenant database: it is set aside");
     Ok(())
+}
+
+/// Move the file at `path` and its sidecars to `aside`, with `rename`.
+///
+/// Each sidecar moves first, and the main file last. So no sidecar stays at
+/// `path` without its main file, and no open starts a new file beside an
+/// old WAL. A failed move moves back each moved sidecar, last first. The
+/// main file then keeps its WAL, and the move refuses (issue #2759).
+fn move_aside(
+    path: &Path,
+    aside: &Path,
+    rename: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), String> {
+    // The Verus model formal/verus/src/set_aside.rs proves this order.
+    let mut moved = Vec::new();
+    for suffix in SIDECARS {
+        let (from, to) = (suffixed(path, suffix), suffixed(aside, suffix));
+        match rename(&from, &to) {
+            Ok(()) => moved.push((from, to)),
+            // The sidecar is absent. A check before the rename could race.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(move_back(moved, &from, &to, &error, &rename)),
+        }
+    }
+    rename(path, aside).map_err(|error| move_back(moved, path, aside, &error, &rename))
+}
+
+/// Move back each sidecar in `moved`, last first, after the failed move of
+/// `from` to `to`. A failed move back leaves its sidecar aside. The text
+/// names each such sidecar, so an operator can move it back.
+fn move_back(
+    moved: Vec<(PathBuf, PathBuf)>,
+    from: &Path,
+    to: &Path,
+    error: &std::io::Error,
+    rename: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> String {
+    use std::fmt::Write as _;
+    let mut text = format!(
+        "cannot move {} to {}: {error}",
+        from.display(),
+        to.display()
+    );
+    for (home, aside) in moved.into_iter().rev() {
+        if let Err(error) = rename(&aside, &home) {
+            let _ = write!(
+                text,
+                ". {} stays aside: move it back to {}: {error}",
+                aside.display(),
+                home.display()
+            );
+        }
+    }
+    text
 }
 
 /// Publish the restored file `staging` at `path`. See
@@ -2364,6 +2413,224 @@ mod tests {
             .filter_map(Result::ok)
             .any(|entry| entry.file_name().to_string_lossy().contains(".aside-"));
         assert!(aside, "an operator can still read the old file");
+    }
+
+    /// Where a test file is.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum At {
+        Path,
+        Aside,
+        Nowhere,
+    }
+
+    /// The text of the test file of `suffix`. The main file has no suffix.
+    fn tag(suffix: &str) -> &[u8] {
+        if suffix.is_empty() {
+            b"main"
+        } else {
+            suffix.as_bytes()
+        }
+    }
+
+    /// A Harvest file in `dir` with the sidecars of `suffixes`. Each file
+    /// holds its tag.
+    fn file_with(dir: &Path, suffixes: &[&str]) -> PathBuf {
+        let path = dir.join("acme.harvest.db");
+        for suffix in std::iter::once(&"").chain(suffixes) {
+            std::fs::write(suffixed(&path, suffix), tag(suffix)).unwrap();
+        }
+        path
+    }
+
+    /// Where the file of `suffix` is. Its text must be whole, and it must
+    /// not be in two places.
+    fn at(path: &Path, aside: &Path, suffix: &str) -> At {
+        let here = std::fs::read(suffixed(path, suffix)).ok();
+        let there = std::fs::read(suffixed(aside, suffix)).ok();
+        for found in [&here, &there].into_iter().flatten() {
+            assert_eq!(found.as_slice(), tag(suffix), "the text of {suffix:?}");
+        }
+        match (here, there) {
+            (Some(_), None) => At::Path,
+            (None, Some(_)) => At::Aside,
+            (None, None) => At::Nowhere,
+            (Some(_), Some(_)) => panic!("{suffix:?} is in two places"),
+        }
+    }
+
+    /// Assert that the main file and the sidecars of `suffixes` are at
+    /// `want`, and that no other sidecar exists.
+    fn assert_together(path: &Path, aside: &Path, suffixes: &[&str], want: At) {
+        assert_eq!(at(path, aside, ""), want, "the main file");
+        for suffix in SIDECARS {
+            let expected = if suffixes.contains(&suffix) {
+                want
+            } else {
+                At::Nowhere
+            };
+            assert_eq!(at(path, aside, suffix), expected, "{suffix}");
+        }
+    }
+
+    /// Assert that no sidecar stays at `path` without its main file.
+    fn assert_safe(path: &Path) {
+        if !path.exists() {
+            for sidecar in sidecars(path) {
+                assert!(!sidecar.exists(), "{} has no main file", sidecar.display());
+            }
+        }
+    }
+
+    /// A rename that fails for each source in `refused`.
+    fn refusing(refused: Vec<PathBuf>) -> impl Fn(&Path, &Path) -> std::io::Result<()> {
+        move |from, to| {
+            if refused.iter().any(|file| file == from) {
+                return Err(std::io::Error::other("the file is in use"));
+            }
+            std::fs::rename(from, to)
+        }
+    }
+
+    /// A set-aside moves the main file and each sidecar together.
+    #[test]
+    fn a_set_aside_moves_each_sidecar_with_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_with(dir.path(), &["-wal", "-journal"]);
+        set_aside(&FleetDbKey::Slot(1), &path).unwrap();
+        let mut aside: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|file| file.to_string_lossy().contains(".aside-"))
+            .collect();
+        aside.sort();
+        assert_eq!(aside.len(), 3, "{aside:?}");
+        assert_together(&path, &aside[0], &["-wal", "-journal"], At::Aside);
+    }
+
+    /// A sidecar that cannot move refuses the set-aside. The main file
+    /// keeps its WAL, so no old frame replays onto a new file (issue #2759).
+    #[test]
+    fn a_sidecar_that_cannot_move_refuses_the_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_with(dir.path(), &["-wal", "-shm"]);
+        let aside = suffixed(&path, ".aside-test");
+        let shm = suffixed(&path, "-shm");
+        let error = move_aside(&path, &aside, refusing(vec![shm.clone()]))
+            .expect_err("the -shm cannot move");
+        assert!(error.contains(&shm.display().to_string()), "{error}");
+        assert!(error.contains("the file is in use"), "{error}");
+        assert_together(&path, &aside, &["-wal", "-shm"], At::Path);
+    }
+
+    /// A main file that cannot move keeps its sidecars. They move back.
+    #[test]
+    fn a_main_file_that_cannot_move_keeps_its_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_with(dir.path(), &["-wal", "-journal"]);
+        let aside = suffixed(&path, ".aside-test");
+        let error = move_aside(&path, &aside, refusing(vec![path.clone()]))
+            .expect_err("the main file cannot move");
+        assert!(error.contains("the file is in use"), "{error}");
+        assert_together(&path, &aside, &["-wal", "-journal"], At::Path);
+    }
+
+    /// A failed move back leaves a sidecar aside. The main file stays, so
+    /// the set-aside stays safe. The error names the stranded sidecar.
+    #[test]
+    fn a_failed_undo_names_the_stranded_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_with(dir.path(), &["-wal", "-shm"]);
+        let aside = suffixed(&path, ".aside-test");
+        let stranded = suffixed(&aside, "-wal");
+        let refused = vec![suffixed(&path, "-shm"), stranded.clone()];
+        let error = move_aside(&path, &aside, refusing(refused)).expect_err("the -shm cannot move");
+        assert!(error.contains(&stranded.display().to_string()), "{error}");
+        assert_eq!(at(&path, &aside, ""), At::Path);
+        assert_eq!(at(&path, &aside, "-shm"), At::Path);
+        assert_eq!(at(&path, &aside, "-wal"), At::Aside);
+        assert_safe(&path);
+    }
+
+    proptest::proptest! {
+        // The real mover under each fault script. The Verus model
+        // formal/verus/src/set_aside.rs proves the same properties.
+        #[test]
+        fn the_mover_keeps_the_files_together(
+            present in proptest::array::uniform3(proptest::bool::ANY),
+            fails in proptest::collection::vec(proptest::bool::ANY, 0..9),
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let suffixes: Vec<&str> = SIDECARS
+                .iter()
+                .zip(present)
+                .filter_map(|(suffix, present)| present.then_some(*suffix))
+                .collect();
+            let path = file_with(dir.path(), &suffixes);
+            let aside = suffixed(&path, ".aside-test");
+            let calls = std::cell::Cell::new(0_usize);
+            let undo_failed = std::cell::Cell::new(false);
+            let rename = |from: &Path, to: &Path| {
+                assert_safe(&path);
+                let call = calls.replace(calls.get() + 1);
+                if fails.get(call).copied().unwrap_or(false) {
+                    if from.as_os_str().to_string_lossy().starts_with(&*aside.to_string_lossy()) {
+                        undo_failed.set(true);
+                    }
+                    return Err(std::io::Error::other("injected"));
+                }
+                std::fs::rename(from, to)
+            };
+            let moved = move_aside(&path, &aside, &rename);
+            assert_safe(&path);
+            match moved {
+                Ok(()) => assert_together(&path, &aside, &suffixes, At::Aside),
+                Err(_) if !undo_failed.get() => {
+                    assert_together(&path, &aside, &suffixes, At::Path);
+                }
+                Err(_) => {
+                    assert_eq!(at(&path, &aside, ""), At::Path, "the main file");
+                    for suffix in SIDECARS {
+                        let found = at(&path, &aside, suffix);
+                        proptest::prop_assert_eq!(
+                            found == At::Nowhere,
+                            !suffixes.contains(&suffix),
+                            "{}", suffix
+                        );
+                    }
+                }
+            }
+            if fails.iter().all(|fails| !fails) {
+                proptest::prop_assert!(calls.get() > 0);
+                assert_together(&path, &aside, &suffixes, At::Aside);
+            }
+        }
+    }
+
+    /// Another process that holds a sidecar open blocks its move on
+    /// Windows. The set-aside refuses, and the main file keeps its WAL.
+    #[cfg(windows)]
+    #[test]
+    fn a_sidecar_held_open_refuses_the_set_aside() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // The share mode of a reader that refuses a delete or a rename.
+        const FILE_SHARE_READ: u32 = 0x1;
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_with(dir.path(), &["-wal", "-shm"]);
+        let shm = suffixed(&path, "-shm");
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&shm)
+            .unwrap();
+        let error = set_aside(&FleetDbKey::Slot(1), &path).expect_err("the -shm is held open");
+        assert!(error.contains(&shm.display().to_string()), "{error}");
+        drop(held);
+        let nowhere = dir.path().join("nowhere");
+        assert_together(&path, &nowhere, &["-wal", "-shm"], At::Path);
+        set_aside(&FleetDbKey::Slot(1), &path).unwrap();
+        assert!(!path.exists(), "the retry sets the file aside");
+        assert_safe(&path);
     }
 
     /// A new tenant database with a Harvest replica takes its latest file.
