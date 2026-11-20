@@ -6,7 +6,10 @@
 # `sandbox::firecracker::kvm_tests`. See docs/sandbox-activities.md.
 #
 # The tests whose names start with `root_` need root, so a second step runs
-# the test binary with sudo. They include the jailer and snapshot tests.
+# the test binary with sudo. They include the jailer, snapshot, cgroup and
+# mount tests. `sudo` clears the environment, so the step passes
+# `HARVEST_TEST_REQUIRE_ISOLATION=1` through `sudo env`. A missing namespace
+# then fails a root test (issue #2757).
 #
 # The Firecracker release and the base image have pinned digests. The image
 # command pins its default kernel by digest, so this workflow boots that pin.
@@ -112,6 +115,7 @@ jobs:
           sudo install -m 0644 "${HARVEST_GUEST_KERNEL}" "${HARVEST_GUEST_ROOTFS}" /srv/harvest-image/
           sudo install -m 0755 "${HARVEST_FIRECRACKER_BIN}" "${HARVEST_JAILER_BIN}" /srv/harvest-image/
           sudo env \
+            "HARVEST_TEST_REQUIRE_ISOLATION=1" \
             "HARVEST_FIRECRACKER_BIN=/srv/harvest-image/firecracker" \
             "HARVEST_JAILER_BIN=/srv/harvest-image/jailer" \
             "HARVEST_GUEST_KERNEL=/srv/harvest-image/vmlinux" \
