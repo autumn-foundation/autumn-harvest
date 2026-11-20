@@ -176,7 +176,7 @@ schemars = { version = "1.2", optional = true }
 # the only path to `zstd` 0.13, which carries RUSTSEC-2026-0391 and
 # RUSTSEC-2026-0395 to -0410. No wasmtime release depends on the patched
 # `zstd` 0.14, so dropping the feature removes the crate from the graph.
-wasmtime = { version = "50.0.1", optional = true, default-features = false, features = [
+wasmtime = { version = "50.0.2", optional = true, default-features = false, features = [
     "addr2line",
     "anyhow",
     "async",
