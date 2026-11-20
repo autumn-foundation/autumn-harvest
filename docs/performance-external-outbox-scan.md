@@ -356,7 +356,13 @@ Artifacts land in `docs/perf-artifacts/external-outbox-scan/`.
 
 ## 🚧 Known limitations
 
-* **The claim cost grows with lifetime request history, and this change does
+* **Fixed later: the claim cost grew with lifetime request history.**
+  Issue #2724 added a pending table, so the claim now reads one row for
+  each unresolved request. See
+  [`performance-external-outbox-idle.md`](performance-external-outbox-idle.md).
+  The rest of this item records the state before that change.
+
+  **The claim cost grows with lifetime request history, and this change does
   not fix that.** See the measured table above. The shape is O(H x B) for H
   lifetime requests of a family and B pending ones. This change lowers the
   constant; it does not change the shape, and its advantage decays from about

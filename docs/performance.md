@@ -2760,6 +2760,10 @@ standalone note rather than part of the claim-path attribution table above:
 * [`docs/performance-external-outbox-scan.md`](performance-external-outbox-scan.md)
   — indexing both sides of the three external signal/cancel/await outbox claim
   queries, and pinning their plan against a stale row estimate (issue #1486).
+* [`docs/performance-external-outbox-idle.md`](performance-external-outbox-idle.md)
+  — a pending table for the same three claims, so an idle claim no longer
+  reads the request history (issue #2724). 942,191 buffers become 0 at
+  200,000 resolved requests.
 * [`docs/performance-quota-history-bytes.md`](performance-quota-history-bytes.md)
   — measuring the `history_bytes` admission check's cost claim (issue #946
   AC7); partially inaccurate claim, no fix identified.

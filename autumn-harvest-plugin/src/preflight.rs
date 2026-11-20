@@ -496,6 +496,14 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
         "harvest_entity_state",
         &["SELECT", "INSERT", "UPDATE", "DELETE"],
     ),
+    // The outbox trigger inserts a row for each external request, and deletes
+    // it for each resolution. It runs as the inserting role, so a missing
+    // grant fails that append. Each outbox claim reads the table. A shard
+    // move deletes the rows of a staged copy.
+    (
+        "harvest_external_outbox_pending",
+        &["SELECT", "INSERT", "DELETE"],
+    ),
     // Every completion that recorded an LLM call inserts here, in the
     // completion transaction (issue #1996). A missing grant rolls back the
     // completion, and the activity runs and pays again. `GET /admin/usage`
@@ -2508,6 +2516,17 @@ mod tests {
             .find(|(name, _)| *name == "harvest_partition_exports")
             .map(|(_, privileges)| *privileges);
         assert_eq!(log, Some(&["SELECT", "INSERT"][..]));
+    }
+
+    /// The outbox trigger writes the pending table as the inserting role. A
+    /// missing grant fails each external request.
+    #[test]
+    fn the_external_outbox_pending_table_is_covered_by_the_privilege_probe() {
+        let covered = HARVEST_WRITE_PRIVILEGE_REQUIREMENTS
+            .iter()
+            .find(|(name, _)| *name == "harvest_external_outbox_pending")
+            .map(|(_, privileges)| *privileges);
+        assert_eq!(covered, Some(&["SELECT", "INSERT", "DELETE"][..]));
     }
 
     /// A reshard carry reads, writes and deletes the override floors. A

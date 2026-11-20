@@ -57,7 +57,7 @@ measured = "unmeasured"
 driver = "setup"
 backend = ["postgres"]
 kind = ["read", "write"]
-tables = ["harvest_completion_deliveries", "harvest_cross_shard_children", "harvest_dead_letters", "harvest_entity_state", "harvest_events", "harvest_external_tasks", "harvest_mutex_locks", "harvest_mutex_waiters", "harvest_sessions", "harvest_shard_migrations", "harvest_signals", "harvest_task_queue", "harvest_workflow_executions"]
+tables = ["harvest_completion_deliveries", "harvest_cross_shard_children", "harvest_dead_letters", "harvest_entity_state", "harvest_events", "harvest_external_outbox_pending", "harvest_external_tasks", "harvest_mutex_locks", "harvest_mutex_waiters", "harvest_sessions", "harvest_shard_migrations", "harvest_signals", "harvest_task_queue", "harvest_workflow_executions"]
 measured = "unmeasured"
 plan = "docs/ledger/plans/autumn-harvest/shard_rebalance.md"
 
@@ -72,7 +72,7 @@ measured = "unmeasured"
 driver = "setup"
 backend = ["postgres"]
 kind = ["read", "write"]
-tables = ["harvest_events", "harvest_llm_ledger", "harvest_payload_refs", "harvest_signals", "harvest_stream_chunks", "harvest_task_queue", "harvest_timers", "harvest_workflow_executions", "harvest_workflow_logs"]
+tables = ["harvest_events", "harvest_external_outbox_pending", "harvest_llm_ledger", "harvest_payload_refs", "harvest_signals", "harvest_stream_chunks", "harvest_task_queue", "harvest_timers", "harvest_workflow_executions", "harvest_workflow_logs"]
 measured = "unmeasured"
 plan = "docs/ledger/plans/autumn-harvest/shard_rebalance.md"
 
@@ -80,7 +80,7 @@ plan = "docs/ledger/plans/autumn-harvest/shard_rebalance.md"
 driver = "setup"
 backend = ["postgres"]
 kind = ["read", "write"]
-tables = ["harvest_events", "harvest_llm_ledger", "harvest_payload_refs", "harvest_signals", "harvest_stream_chunks", "harvest_task_queue", "harvest_timers", "harvest_workflow_executions", "harvest_workflow_logs"]
+tables = ["harvest_events", "harvest_external_outbox_pending", "harvest_llm_ledger", "harvest_payload_refs", "harvest_signals", "harvest_stream_chunks", "harvest_task_queue", "harvest_timers", "harvest_workflow_executions", "harvest_workflow_logs"]
 measured = "unmeasured"
 
 ["db::existing_seal"]
