@@ -761,9 +761,11 @@ async fn stop_all(workers: Vec<FleetWorker>) {
     let _ = tokio::time::timeout(Duration::from_secs(10), futures::future::join_all(handles)).await;
 }
 
-/// Seeds rows that no harness worker changes on one shard: dead letters,
-/// active runs, a held queue with pending rows, pending rows on a queue
-/// nobody polls, and a full rate-limit bucket.
+/// Seeds one shard with rows that no harness worker changes.
+///
+/// The rows are dead letters, active runs and a held queue with pending
+/// rows. There are also pending rows on a queue that no worker polls, and a
+/// full rate-limit bucket.
 async fn seed(conn: &mut AsyncPgConnection, dead_letters: i64) {
     conn.batch_execute(&format!(
         "INSERT INTO harvest_dead_letters \

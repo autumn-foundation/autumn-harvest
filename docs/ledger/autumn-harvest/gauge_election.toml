@@ -11,5 +11,5 @@ measured = "unmeasured"
 driver = "per_tick"
 backend = ["postgres"]
 kind = ["read", "write"]
-tables = ["harvest_gauge_samples"]
+tables = ["harvest_gauge_samples", "harvest_scanner_leases"]
 measured = "unmeasured"
