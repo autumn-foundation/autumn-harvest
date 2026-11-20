@@ -33,7 +33,7 @@
 //!
 //! Autumn ADR 0040 plans a destination for a lifecycle hook, scoped to
 //! `<key prefix>/<engine name>/`. This module uses that layout now, on the
-//! public parts of autumn-web 0.10.
+//! public parts of autumn-web 0.11.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -420,13 +420,6 @@ impl Replicas {
     /// What the replica of `key` holds at `target`, or at its latest state.
     fn plan(&self, key: &FleetDbKey, target: Option<Timestamp>) -> Result<Planned, String> {
         let root = self.replica.root_for(key);
-        // `restore::plan` takes a `chrono` target.
-        let target = target
-            .map(|at| {
-                crate::chrono_boundary::to_chrono(at)
-                    .ok_or_else(|| format!("the restore target {at} of {key} has no chrono value"))
-            })
-            .transpose()?;
         match restore::plan(self.destination(), &root, target) {
             Ok(plan) => Ok(Planned::Plan(Box::new(plan))),
             Err(RestoreError::NoReplica { .. }) => Ok(Planned::NoReplica),

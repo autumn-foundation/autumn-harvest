@@ -328,7 +328,7 @@ fn harvest_objects(dir: &Path, key: &FleetDbKey) -> Vec<String> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_standby_takes_over_and_finishes_the_run() {
     let dir = tempfile::tempdir().unwrap();
-    let clock = TickingClock::starting_at(chrono::Utc::now());
+    let clock = TickingClock::starting_at(jiff::Timestamp::now());
     let a = host(dir.path(), &clock, &Options::owned("a")).await;
     let key = a.key();
     let harvest = a.harvest();
@@ -376,7 +376,7 @@ async fn a_standby_takes_over_and_finishes_the_run() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_old_owner_ships_nothing_after_the_takeover() {
     let dir = tempfile::tempdir().unwrap();
-    let clock = TickingClock::starting_at(chrono::Utc::now());
+    let clock = TickingClock::starting_at(jiff::Timestamp::now());
     let a = host(dir.path(), &clock, &Options::owned("a")).await;
     let key = a.key();
     let tenant = a.harvest().open(&key).await.expect("open acme on a");
@@ -422,7 +422,7 @@ async fn the_old_owner_ships_nothing_after_the_takeover() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failback_never_opens_the_stale_harvest_file() {
     let dir = tempfile::tempdir().unwrap();
-    let clock = TickingClock::starting_at(chrono::Utc::now());
+    let clock = TickingClock::starting_at(jiff::Timestamp::now());
     let a = host(dir.path(), &clock, &Options::owned("a")).await;
     let key = a.key();
     drop(a.harvest().open(&key).await.expect("open acme on a"));
@@ -481,7 +481,7 @@ async fn a_failback_never_opens_the_stale_harvest_file() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_recreated_tenant_gets_no_deleted_run_back() {
     let dir = tempfile::tempdir().unwrap();
-    let clock = TickingClock::starting_at(chrono::Utc::now());
+    let clock = TickingClock::starting_at(jiff::Timestamp::now());
     let options = Options {
         volume: "a",
         owner: None,
@@ -521,7 +521,7 @@ async fn a_recreated_tenant_gets_no_deleted_run_back() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restore_of_the_tenant_restores_its_harvest_file() {
     let dir = tempfile::tempdir().unwrap();
-    let clock = TickingClock::starting_at(chrono::Utc::now());
+    let clock = TickingClock::starting_at(jiff::Timestamp::now());
     let options = Options {
         volume: "a",
         owner: None,
@@ -549,7 +549,7 @@ async fn a_restore_of_the_tenant_restores_its_harvest_file() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_direct_fleet_restore_restores_the_harvest_file() {
     let dir = tempfile::tempdir().unwrap();
-    let clock = TickingClock::starting_at(chrono::Utc::now());
+    let clock = TickingClock::starting_at(jiff::Timestamp::now());
     let options = Options {
         volume: "a",
         owner: None,
@@ -576,7 +576,7 @@ async fn a_direct_fleet_restore_restores_the_harvest_file() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_zombie_owner_never_wins_a_restore() {
     let dir = tempfile::tempdir().unwrap();
-    let clock = TickingClock::starting_at(chrono::Utc::now());
+    let clock = TickingClock::starting_at(jiff::Timestamp::now());
     let a = host(dir.path(), &clock, &Options::owned("a")).await;
     let key = a.key();
     drop(a.harvest().open(&key).await.expect("open acme on a"));
@@ -610,7 +610,7 @@ async fn a_zombie_owner_never_wins_a_restore() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_point_in_time_restore_takes_both_files_back() {
     let dir = tempfile::tempdir().unwrap();
-    let clock = TickingClock::starting_at(chrono::Utc::now());
+    let clock = TickingClock::starting_at(jiff::Timestamp::now());
     let options = Options {
         volume: "a",
         owner: None,
@@ -663,7 +663,7 @@ fn restore_target(a: &Host) -> String {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_direct_restore_supersedes_a_waiting_target() {
     let dir = tempfile::tempdir().unwrap();
-    let clock = TickingClock::starting_at(chrono::Utc::now());
+    let clock = TickingClock::starting_at(jiff::Timestamp::now());
     let a = host(dir.path(), &clock, &Options::owned("a")).await;
     let key = a.key();
     let (kept, later, target) = runs_around_a_target(&a).await;
@@ -692,7 +692,7 @@ async fn a_direct_restore_supersedes_a_waiting_target() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_direct_restore_keeps_the_waiting_target() {
     let dir = tempfile::tempdir().unwrap();
-    let clock = TickingClock::starting_at(chrono::Utc::now());
+    let clock = TickingClock::starting_at(jiff::Timestamp::now());
     let a = host(dir.path(), &clock, &Options::owned("a")).await;
     let key = a.key();
     let (kept, later, target) = runs_around_a_target(&a).await;
@@ -705,7 +705,7 @@ async fn a_failed_direct_restore_keeps_the_waiting_target() {
     // then refuses the restore.
     let refused = a
         .fleet
-        .restore(&key, Some(chrono::DateTime::UNIX_EPOCH))
+        .restore(&key, Some(jiff::Timestamp::UNIX_EPOCH))
         .await
         .expect_err("no replica reaches the target");
     assert!(
@@ -724,7 +724,7 @@ async fn a_failed_direct_restore_keeps_the_waiting_target() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dropped_restore_call_still_restores_both_files() {
     let dir = tempfile::tempdir().unwrap();
-    let clock = TickingClock::starting_at(chrono::Utc::now());
+    let clock = TickingClock::starting_at(jiff::Timestamp::now());
     let a = host(dir.path(), &clock, &Options::owned("a")).await;
     let key = a.key();
     let (kept, later, target) = runs_around_a_target(&a).await;
@@ -749,7 +749,7 @@ async fn a_dropped_restore_call_still_restores_both_files() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_delete_purges_the_harvest_replica() {
     let dir = tempfile::tempdir().unwrap();
-    let clock = TickingClock::starting_at(chrono::Utc::now());
+    let clock = TickingClock::starting_at(jiff::Timestamp::now());
     let options = Options {
         volume: "a",
         owner: None,

@@ -514,7 +514,8 @@ An agent loop can spend without limit. A budget caps the LLM tokens or the cost 
 
 | File | Purpose |
 |------|---------|
-| `process_role.rs` | Resolves the worker, scheduler and retention switches from the Autumn process role (issues #2477 and #2478). An explicit value wins, a `web` role turns both off, and no role keeps `true`. `formal/verus/src/process_role.rs` proves the table. See [`docs/operations/process-roles.md`](operations/process-roles.md). |
+| `process_role.rs` | Declares the Harvest capabilities `harvest.worker`, `harvest.scheduler` and `harvest.maintenance`, and resolves the placement of each runtime from the Autumn role (issues #2477, #2478 and #2480). An explicit value wins, a `web` role runs none, and no role keeps `true`. `formal/verus/src/process_role.rs` proves the table. See [`docs/operations/process-roles.md`](operations/process-roles.md). |
+| `background.rs` | Registers one Autumn background task per Harvest runtime, and `harvest.queues` for the declared queues (issue #2480). Each task runs the loop that the runner prepared, until the Autumn drain. |
 | `durable_route.rs` | Durable routes: the `DurableRoute` extractor runs an Autumn route as a workflow keyed by the request's `Idempotency-Key`. A retry attaches to the same run through the start-idempotency claim. No migration and no new event. See [`docs/durable-routes.md`](durable-routes.md). |
 | `durable_route/stream.rs` | Durable streaming: `DurableCall::stream()` answers with a resumable SSE stream of the run's `publish_durable_progress` chunks. The SSE id is `<attempt>.<offset>`. No migration and no new event. See [`docs/durable-routes.md`](durable-routes.md#stream-the-run). |
 
