@@ -1,0 +1,33 @@
+                                                                                    QUERY PLAN
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Update on harvest_task_queue t (actual rows=0 loops=1)
+   Buffers: shared hit=569111 read=66564 dirtied=16 written=8
+   CTE batch
+     ->  Limit (actual rows=13 loops=1)
+           Buffers: shared hit=569017 read=66551 dirtied=15 written=8
+           ->  LockRows (actual rows=13 loops=1)
+                 Buffers: shared hit=569017 read=66551 dirtied=15 written=8
+                 ->  Nested Loop (actual rows=13 loops=1)
+                       Buffers: shared hit=568993 read=66549 written=8
+                       ->  Index Scan using harvest_task_queue_pkey on harvest_task_queue t_1 (actual rows=303 loops=1)
+                             Filter: ((concurrency_key IS NOT NULL) AND (state = ANY ('{PENDING,RUNNING}'::text[])) AND (concurrency_cap < $2) AND (task_type = 'workflow'::text))
+                             Rows Removed by Filter: 629697
+                             Buffers: shared hit=568377 read=65953 written=7
+                       ->  Index Scan using harvest_workflow_executions_pkey on harvest_workflow_executions e (actual rows=0 loops=303)
+                             Index Cond: (id = t_1.workflow_exec_id)
+                             Filter: ((workflow_name = $1) AND (state <> ALL ('{COMPLETED,FAILED,CANCELLED,TIMED_OUT,CONTINUED_AS_NEW,TERMINATED}'::text[])))
+                             Rows Removed by Filter: 1
+                             Buffers: shared hit=616 read=596 written=1
+   ->  Nested Loop (actual rows=13 loops=1)
+         Buffers: shared hit=569058 read=66562 dirtied=15 written=8
+         ->  CTE Scan on batch (actual rows=13 loops=1)
+               Buffers: shared hit=569017 read=66551 dirtied=15 written=8
+         ->  Index Scan using harvest_task_queue_pkey on harvest_task_queue t (actual rows=1 loops=13)
+               Index Cond: (id = batch.id)
+               Buffers: shared hit=41 read=11
+ Planning:
+   Buffers: shared hit=1146 read=124
+ Planning Time: 3.234 ms
+ Execution Time: 636.217 ms
+(29 rows)
+

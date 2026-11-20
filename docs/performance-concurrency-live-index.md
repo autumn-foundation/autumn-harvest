@@ -127,11 +127,12 @@ Per call (`docs/perf-artifacts/concurrency-live-index/write-costs.md`):
   one WAL record and 87 bytes.
 - A completion adds none. A finished row is not live.
 - A row with no key pays nothing.
-- An operator cap rewrite (`set_live_activity_caps`) changes only
-  `concurrency_cap`. Before, no index held that column, so the update could be
-  HOT. The predicate of the index names it, so the update is not HOT now. It
-  adds one entry to each index of the row. The rewrite is rare, so the harness
-  does not measure it.
+- Two operator cap rewrites, `set_live_activity_caps` and
+  `raise_waiting_concurrency_caps`, change only `concurrency_cap`. Before, no
+  index held that column, so their updates could be HOT. The predicate of the
+  index names it, so the updates are not HOT now. Each adds one entry to each
+  index of the row. The rewrites are rare, so the harness does not measure
+  them.
 - One keyed task costs 3,749 WAL bytes in all, against 3,556 before. That is
   5.4% more.
 
@@ -146,6 +147,10 @@ Per call (`docs/perf-artifacts/concurrency-live-index/write-costs.md`):
   it reads 3,444 in an index scan, 83% fewer
   (`docs/perf-artifacts/concurrency-live-index/pending-keys-*-large.txt`).
   `large-fixture.sql` in that directory seeds the fixture.
+- `raise_waiting_concurrency_caps` finds the live workflow rows of one type
+  with `concurrency_cap < $2`. That test implies a cap. On the large fixture
+  it read 635,675 buffers through the primary key. With the index it reads
+  3,422 (`raise-caps-*-large.txt`, from `raise-caps.sql`).
 - The claim cap re-check and `release_claim_if_over_cap` count `RUNNING` rows.
   Their count has no `concurrency_cap IS NOT NULL` filter, so the planner
   cannot prove the predicate of the index. They keep

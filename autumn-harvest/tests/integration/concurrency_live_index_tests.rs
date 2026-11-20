@@ -16,6 +16,8 @@
 //! the pending keys of the full claim. On an empty table, other indexes can
 //! serve that step too, so the planner may pick any of them.
 
+use std::fmt::Write as _;
+
 use autumn_harvest::queue::{
     self, CLAIM_PLAN_SETTINGS_SQL, CONCURRENCY_ATTRIBUTION_SQL, CONCURRENCY_STATS_SQL,
 };
@@ -124,14 +126,16 @@ fn fixture_sql() -> String {
          SELECT 'w', 'activity', '{}'::jsonb, 'COMPLETED' FROM generate_series(1, 20000); ",
     );
     for (key, task_type, state, worker, cap, queue_name, count) in rows {
-        sql.push_str(&format!(
+        write!(
+            sql,
             "INSERT INTO harvest_task_queue \
                  (queue_name, task_type, input, state, worker_id, concurrency_key, \
                   concurrency_cap) \
              SELECT '{queue_name}', '{task_type}', '{{}}'::jsonb, '{state}', {worker}, \
                     '{key}', {cap} \
              FROM generate_series(1, {count}); "
-        ));
+        )
+        .expect("write to a String");
     }
     sql
 }

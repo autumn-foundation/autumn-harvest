@@ -89,7 +89,7 @@ impl Cost {
         }
     }
 
-    fn add(&mut self, row: &StatRow) {
+    const fn add(&mut self, row: &StatRow) {
         self.calls += row.calls;
         self.buffers += row.buffers;
         self.dirtied += row.dirtied;

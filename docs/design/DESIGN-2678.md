@@ -31,6 +31,8 @@ reads 1,473 buffers (`docs/performance-concurrency-live-index.md`).
   The engine sets both together. Only an operator can clear a cap.
 - `concurrency_key`, `task_type`, `state`, `worker_id` and `queue_name` are
   in other indexes already. `concurrency_cap` is in no index.
+- `run_defaults::db::raise_waiting_concurrency_caps` also tests
+  `concurrency_cap < $2`, so it can use A. Review found it after the decision.
 - A generic plan of the stats statement can use each of A, B and C.
 - `concurrency_key_workflows` has the same row filter, so it can use the
   same index.

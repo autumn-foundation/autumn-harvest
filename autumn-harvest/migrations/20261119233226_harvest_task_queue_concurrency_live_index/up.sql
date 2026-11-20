@@ -15,6 +15,8 @@
 --    row filter.
 -- 3. The `concurrency_pending_keys` CTE of the full claim statement. Only a
 --    fallback claim runs it.
+-- 4. `run_defaults::db::raise_waiting_concurrency_caps`, an operator cap
+--    raise. Its `concurrency_cap < $2` test implies a cap.
 --
 -- The claim cap re-check counts `RUNNING` rows with no
 -- `concurrency_cap IS NOT NULL` filter. So it cannot use this index, and it
@@ -30,8 +32,9 @@
 -- because a finished row is not live.
 --
 -- Each indexed column is in another index already, except `concurrency_cap`.
--- Each write that changes `state` is not HOT already. An operator cap rewrite
--- changes `concurrency_cap` only. That update is not HOT after this
+-- Each write that changes `state` is not HOT already. Two operator cap
+-- rewrites change `concurrency_cap` only: `set_live_activity_caps` and
+-- `raise_waiting_concurrency_caps`. Their updates are not HOT after this
 -- migration.
 --
 -- ## Build cost and the zero-downtime recipe
