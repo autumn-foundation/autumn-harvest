@@ -649,6 +649,9 @@ pub mod prepared_loop;
 pub mod queue;
 /// Metric-gated automatic abort of a build ramp (issue #1814).
 pub mod ramp_guard;
+/// Keep a by-id task row statement on the primary key.
+#[doc(hidden)]
+pub mod row_guard;
 /// Operator overrides for per-type `sla` and `execution_timeout` (issue #2387).
 pub mod run_defaults;
 #[cfg(feature = "sandbox-activities")]

@@ -210,17 +210,19 @@ pub const fn activity_pause_suppresses_timeout(
 /// One conjunct on a primary-key lookup makes the statement safe in isolation.
 #[must_use]
 pub const fn release_claim_if_activity_paused_query() -> &'static str {
-    "UPDATE harvest_task_queue \
-     SET state = 'PENDING', \
-         worker_id = NULL, \
-         started_at = NULL, \
-         attempt = GREATEST(attempt - 1, 0) \
-     WHERE id = $1 \
-       AND state = 'RUNNING' \
-       AND worker_id = $2 \
-       AND task_type = 'activity' \
-       AND EXISTS (SELECT 1 FROM harvest_activity_pauses ap \
+    concat!(
+        "UPDATE harvest_task_queue \
+         SET state = 'PENDING', \
+             worker_id = NULL, \
+             started_at = NULL, \
+             attempt = GREATEST(attempt - 1, 0) \
+         WHERE id = $1 AND ",
+        crate::row_guard::row_guard_sql!(
+            "state = 'RUNNING' AND worker_id = $2 AND task_type = 'activity'"
+        ),
+        " AND EXISTS (SELECT 1 FROM harvest_activity_pauses ap \
            WHERE ap.activity_name = harvest_task_queue.activity_name)"
+    )
 }
 
 /// Releases a just-claimed task back to `PENDING` when its activity turns out
