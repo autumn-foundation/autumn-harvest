@@ -15,6 +15,7 @@ pub mod external_outbox_scan;
 pub mod external_outbox_scan_matrix;
 pub mod history_bloat;
 pub mod history_ceiling_claim;
+pub mod llm_spend_tenant_window;
 pub mod notify_stage_probe;
 pub mod parent_close_cascade_unfinished_handlers;
 pub mod pause_array_size_claim;
@@ -50,6 +51,8 @@ pub enum Command {
     ExternalOutboxScan(external_outbox_scan::Args),
     /// Port of `autumn-harvest/scripts/history_ceiling_claim_perf_repro.sh`.
     HistoryCeilingClaim(history_ceiling_claim::Args),
+    /// The Ledger harness of the tenant LLM spend read.
+    LlmSpendTenantWindow(llm_spend_tenant_window::Args),
     /// Port of `autumn-harvest/scripts/notify_stage_probe_perf_repro.sh`.
     NotifyStageProbe(notify_stage_probe::Args),
     /// Port of `autumn-harvest/scripts/parent_close_cascade_unfinished_handlers_perf_repro.sh`.
@@ -90,6 +93,7 @@ pub fn run(command: Command) -> Result<ExitCode> {
         Command::ExternalOutboxScanMatrix(args) => external_outbox_scan_matrix::run(args),
         Command::ExternalOutboxScan(args) => external_outbox_scan::run(args),
         Command::HistoryCeilingClaim(args) => history_ceiling_claim::run(args),
+        Command::LlmSpendTenantWindow(args) => llm_spend_tenant_window::run(args),
         Command::NotifyStageProbe(args) => notify_stage_probe::run(args),
         Command::ParentCloseCascadeUnfinishedHandlers(args) => {
             parent_close_cascade_unfinished_handlers::run(args)

@@ -228,8 +228,11 @@ impl LlmBudgetExceeded {
 ///
 /// The sums are `NUMERIC`, clamped to the `BIGINT` range. A huge recorded
 /// value then reads as a spent cap, not as a read error.
+///
+/// It is public so that the Ledger harness can explain the exact statement
+/// (`tests/integration/llm_spend_tenant_window_perf.rs`).
 #[cfg(feature = "db")]
-const LLM_SPEND_SQL: &str = "\
+pub const LLM_SPEND_SQL: &str = "\
     WITH run AS ( \
         SELECT workflow_name, quota_key FROM harvest_workflow_executions WHERE id = $1 \
     ), run_spend AS ( \

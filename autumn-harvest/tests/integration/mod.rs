@@ -244,6 +244,8 @@ mod lineage_store_tests;
 mod llm_budget_tests;
 #[cfg(all(feature = "db", feature = "testing"))]
 mod llm_ledger_tests;
+#[cfg(feature = "db")]
+mod llm_spend_tenant_window_perf;
 mod lock_order_docs;
 mod macros_activity;
 mod macros_collect;
