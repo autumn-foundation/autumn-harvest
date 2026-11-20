@@ -1,4 +1,4 @@
-# By-id task row guards stay on the primary key
+# Task row guards stay on their key index
 
 Issue #2713 refines the result of issue #2689. The claim-release rechecks
 find one `harvest_task_queue` row by `id`, and guard it on `state` and
@@ -38,17 +38,18 @@ A partial index matches each guard form:
 | `concurrency_key IS NOT NULL AND state = 'RUNNING'` | `harvest_task_queue_concurrency_key_running` |
 
 Each path estimates one row. The partial index is small and shallow, so its
-estimated cost is lower than that of the primary key. The partial index
+estimated cost is lower than that of the key index. The partial index
 path reads one heap tuple for each index entry that matches the guard. Then
-it filters on `id`. When the statistics come from an idle table, each live
-partial index looks empty, and every guard form leaves the primary key.
+it filters on the key. When the statistics come from an idle table, each
+live partial index looks empty, and every guard form leaves its key index.
 
 ## 🔧 Fix
 
 `row_guard_sql!` and `row_guard` wrap the guard in
 `CASE WHEN <guard> THEN true END`. The planner cannot use a `CASE` as an
 index condition. It also cannot prove a partial index predicate from it.
-So the only access path left is the primary key.
+So the only access path left is the key index. For a by-id statement,
+that is the primary key.
 
 `WHERE` drops a NULL row as it drops a false row, so each statement keeps
 the same rows. `row_guard_plan_db_tests` proves it three ways:
@@ -85,7 +86,8 @@ measures it.
 The Ledger profiles of `queue::release_claim_via`,
 `queue::park_workflow_task_inner`, `queue::complete_task_inner` and
 `queue::write_heartbeat` point at this page. Each pause recheck runs
-through `release_claim_via`.
+through `release_claim_via`. The by-execution section below names the
+other functions whose profiles point here.
 
 ## 📈 Before and after, 1M-row fixture
 
@@ -132,39 +134,57 @@ noise.
 ## 🧭 By-execution statements
 
 A wake, a drain and a cancel find task rows by `workflow_exec_id`, not by
-`id`. Their guard has the same defect. The key index is
-`idx_harvest_tq_workflow`, which covers every row. The same `CASE` form
-keeps each one on that index.
+`id`. Their guard has the same defect. Each one now hides its `state` and
+`worker_id` tests with the same `CASE` form.
 
-The fixture has 1,000,000 rows and 4 rows for each execution. The idle
-case analyzes terminal rows only. Then 40,000 live rows arrive with no new
-analyze. Each figure is a generic plan, warm, in buffers.
+Each run has one workflow task row. The new index
+`idx_harvest_tq_workflow_task (workflow_exec_id) WHERE task_type =
+'workflow'` holds that row only. The statements that read only that row
+keep `task_type = 'workflow'` as a plain test, so the planner can prove the
+predicate. Each one then reads one row for any run size. The other
+statements read `idx_harvest_tq_workflow`, which holds every row of a run.
 
-| Statement | 5 per worker | Idle statistics |
-|---|--:|--:|
-| `queue::wake_workflow_task`, re-pend | 4 → 4 | 1,411 → 4 |
-| `queue::wake_workflow_task`, fallback | 507 → 9 | 1,235 → 9 |
-| `queue::wake_workflow_task`, due-row read | 4 → 4 | 1,220 → 4 |
-| `queue::owner_keys` | 12 → 4 | 1,221 → 4 |
-| `queue::fail_open_tasks_for_execution` | 64 → 69 | 1,462 → 60 |
-| drain of a failed or timed-out run | 69 → 69 | 1,466 → 60 |
-| `execution::shift_schedule_to_close_on_resume_query` | 1 → 5 | 1,338 → 148 |
-| in-flight count of retention and reset | 4 → 4 | 1,412 → 5 |
-| pending-row delete of a cancel | 4 → 4 | 18 → 4 |
-| parked-row read of a migration | 7 → 7 | 1,414 → 7 |
-| fork loser cancel | 2 → 2 | 2 → 2 |
-| `queue::session_has_other_live_tasks` | 2 → 4 | 2 → 4 |
+The fixture has 1,000,000 rows and 4 rows for each run. "Hot run" is one
+run with 50,000 terminal activity rows and 2 live rows. The idle case
+analyzes terminal rows only. Then 40,000 live rows arrive with no new
+analyze. Each figure is a generic plan, warm, in `shared hit + read`
+buffers. "Before" is the plain form with no new index.
+
+| Statement | 5 per worker | Hot run | Idle statistics |
+|---|--:|--:|--:|
+| `queue::primary_repend_workflow_task` | 21 → 4 | 1,343 → 4 | 1,411 → 4 |
+| `queue::wake_workflow_task`, fallback | 509 → 9 | 509 → 9 | 1,416 → 9 |
+| `queue::wake_workflow_task`, due-row read | 4 → 4 | 1,326 → 4 | 1,231 → 4 |
+| `queue::owner_keys` | 12 → 4 | 51 → 4 | 1,232 → 4 |
+| parked-row read of a migration | 24 → 8 | 1,346 → 8 | 1,414 → 8 |
+| `queue::fail_open_tasks_for_execution` | 64 → 71 | 1,354 → 1,358 | 1,462 → 66 |
+| drain of a failed or timed-out run | 69 → 72 | 1,359 → 1,359 | 1,466 → 66 |
+| in-flight count of retention and reset | 5 → 4 | 1,327 → 1,327 | 1,411 → 5 |
+| pending-row delete of a cancel | 4 → 4 | 1,326 → 1,326 | 18 → 4 |
+| fork loser cancel | 2 → 2 | 2 → 2 | 1,412 → 2 |
+| `execution::shift_schedule_to_close_for_resume` | 3 → 5 | 38 → 1,418 | 1,502 → 154 |
+| `queue::session_has_other_live_tasks` | 2 → 4 | 2 → 1,326 | 1,411 → 4 |
 
 At 5 rows per worker, the plain fallback scans all of
 `running_worker_idx`, so it reads every `RUNNING` row in the table. With
-idle statistics, most plain statements scan a partial index of live rows.
+idle statistics, each plain statement scans a partial index of live rows.
 A write figure includes the rows that it changes.
+`queue::cancel_open_tasks_for_execution` is the same statement as
+`queue::fail_open_tasks_for_execution` with another `SET`.
 
-The fork cancel and the session check also key on `activity_id` and
-`session_id`. Their plain form chose its keyed index on this fixture. On a
-fixture with no activity or session rows, each one chose
-`idx_harvest_tq_live_created`. The `CASE` form costs 2 or 4 buffers on
-every fixture.
+Two statements cost more on a hot run. The session check now reads each
+row of its run. Its plain form read every live row of the table after an
+idle analyze. The deadline shift runs once for each resume. The fail,
+cancel and drain writes and the in-flight counts read each row of the run
+in both forms. They run once at the end of a run.
+
+The pending-row delete of a cancel binds `task_type` as a Diesel
+parameter. A generic plan cannot prove a partial index predicate from a
+parameter, so it keeps `idx_harvest_tq_workflow`.
+
+The workflow task index adds about 40 bytes of WAL to an update of a
+workflow task row that is not HOT, about 3% more. An activity row adds
+none. The index holds about 31 bytes for each run.
 
 The in-scope statements:
 
@@ -178,9 +198,40 @@ The in-scope statements:
 - `shard_rebalance`: the parked-row read, the seal cancel and the signal
   re-pend
 
-The plan test checks each raw statement and a sample of each Diesel shape.
-The source walks check every engine file for a plain by-id or
-by-execution guard.
+The plan test checks each raw statement except the seal cancel, and a
+sample of each Diesel shape. The seal cancel also runs the quiescence
+check, a join that is out of scope, so only the source walk checks it. The
+source walks read every engine file and each top-level term of a keyed
+`WHERE` clause.
+
+The Ledger profiles of `queue::primary_repend_workflow_task`,
+`queue::owner_keys`, `queue::fail_open_tasks_for_execution`,
+`queue::cancel_open_tasks_for_execution`,
+`queue::session_has_other_live_tasks`,
+`execution::shift_schedule_to_close_for_resume`,
+`timeout::find_timed_out_tasks_batch` and `timeout::lapsed_moves` point at
+this page.
+
+## ⏱️ Timeout batch re-read
+
+`timeout::find_timed_out_tasks_batch` and `timeout::lapsed_moves` test a
+scan predicate on a batch of ids. The predicate tests `state` before its
+`id = ANY($1)` key. After an idle analyze, the plain form scanned
+`idx_harvest_tq_live_created`.
+
+The batch now loads its ids through the primary key in a materialized CTE.
+The predicate then tests those rows only. A batch of 100 ids, heartbeat
+predicate, generic plan:
+
+| Fixture | Plain | Fence |
+|---|--:|--:|
+| idle statistics | 1,414 | 395 |
+| 500 `RUNNING` rows | 22 | 378 |
+| 5,000 `RUNNING` rows | 384 | 378 |
+| 20,000 `RUNNING` rows | 387 | 381 |
+
+The fence costs the same on every fixture. It costs more only when very
+few rows run.
 
 ## 🔬 Reproduce
 

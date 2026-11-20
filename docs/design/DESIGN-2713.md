@@ -58,7 +58,7 @@ Decision: option 1, through one helper for raw SQL and one for Diesel.
 |---|---|
 | `CASE` gives NULL, not false, so a result changes. | Use the form only in `WHERE`. `WHERE` drops NULL and false the same way. A truth-table test runs both forms on every input. |
 | A concurrent writer changes the row, and the recheck of the new row version skips the `CASE`. | Postgres rechecks every qual of an `UPDATE`. A concurrency test blocks a recheck behind a completion and a reclaim. |
-| The form goes on a scan that needs the partial index. | Use the form only with `id = $1`. A scan by worker keeps the plain guard. |
+| The form goes on a scan that needs the partial index. | Use the form only with a key: `id = $1`, or a by-execution key (see the addendum). A scan by worker keeps the plain guard. |
 | A select-list use of `claim_held` changes. | The select list keeps the plain predicate. Only the `WHERE` form changes. |
 | A new by-id statement uses the plain guard. | Two unit tests walk the engine source and fail on a plain by-id guard. |
 | A shape test or splice anchor reads the old text. | Update the shape tests. The claim splice anchors are in the claim CTE, which this change does not touch. |
@@ -100,7 +100,8 @@ Out of scope:
 - The by-id claim. It is a variant of the claim statement, which has its
   own plan guards. Issue #2751 measures it.
 
-- Scans by worker, by execution or by key. They need their partial index.
+- Scans by worker. They need their partial index. The addendum adds the
+  by-execution statements.
 - The SQLite backend. Its planner has no generic plan cache.
 - Select-list uses of `claim_held`. They do not filter rows.
 - Statements on `harvest_workflow_executions`. That table is not in the
@@ -145,45 +146,77 @@ defect, through `idx_harvest_tq_workflow`.
 
 ### Facts (white hat)
 
-Fixture: 1,000,000 rows, 4 rows per execution. Generic plan. Buffers are
-`shared hit + read` of the top plan node. The idle case analyzes terminal
-rows only. Then 40,000 live rows arrive with no new analyze.
+Fixture: 1,000,000 rows, 4 rows for each run. Generic plan. Buffers are
+`shared hit + read` of the top plan node. "Hot run" is one run with 50,000
+terminal activity rows and 2 live rows. The idle case analyzes terminal
+rows only. Then 40,000 live rows arrive with no new analyze. "Before" is the
+plain form with no new index. "After" is the final form of this change.
 
-| Statement | Grouped, 5 per worker | Idle statistics |
-|---|--:|--:|
-| wake re-pend | 4 → 4 | 1,411 → 4 |
-| wake fallback | 507 → 9 | 1,235 → 9 |
-| due-row read of a wake | 4 → 4 | 1,220 → 4 |
-| owner key read | 12 → 4 | 1,221 → 4 |
-| fail or cancel of open tasks | 64 → 69 | 1,462 → 60 |
-| drain of a failed or timed-out run | 69 → 69 | 1,466 → 60 |
-| deadline shift of a resume | 1 → 5 | 1,338 → 148 |
-| in-flight count | 4 → 4 | 1,412 → 5 |
-| pending-row delete of a cancel | 4 → 4 | 18 → 4 |
-| parked-row read of a migration | 7 → 7 | 1,414 → 7 |
-| fork loser cancel | 2 → 2 | 2 → 2 |
-| session liveness check | 2 → 4 | 2 → 4 |
+| Statement | 5 per worker | Hot run | Idle statistics |
+|---|--:|--:|--:|
+| wake re-pend | 21 → 4 | 1,343 → 4 | 1,411 → 4 |
+| wake fallback | 509 → 9 | 509 → 9 | 1,416 → 9 |
+| due-row read of a wake | 4 → 4 | 1,326 → 4 | 1,231 → 4 |
+| owner key read | 12 → 4 | 51 → 4 | 1,232 → 4 |
+| parked-row read of a migration | 24 → 8 | 1,346 → 8 | 1,414 → 8 |
+| fail or cancel of open tasks | 64 → 71 | 1,354 → 1,358 | 1,462 → 66 |
+| drain of a failed or timed-out run | 69 → 72 | 1,359 → 1,359 | 1,466 → 66 |
+| in-flight count | 5 → 4 | 1,327 → 1,327 | 1,411 → 5 |
+| pending-row delete of a cancel | 4 → 4 | 1,326 → 1,326 | 18 → 4 |
+| fork loser cancel | 2 → 2 | 2 → 2 | 1,412 → 2 |
+| deadline shift of a resume | 3 → 5 | 38 → 1,418 | 1,502 → 154 |
+| session liveness check | 2 → 4 | 2 → 1,326 | 1,411 → 4 |
 
 The fallback has the issue's own defect. At 5 `RUNNING` rows per worker,
 it scans all of `running_worker_idx` with `worker_id IS NOT NULL`. That
 reads every `RUNNING` row in the table, not only those of one worker.
 
-With idle statistics, most statements scan a partial index of live rows.
-That reads every live row. A wake runs the re-pend on each activity
-completion, signal and child result.
+With idle statistics, each plain statement scans a partial index of live
+rows. That reads every live row in the table. A wake runs the re-pend on
+each activity completion, signal and child result.
 
-A write figure includes the rows that it changes. The deadline shift
-changes four rows with a deadline, so it reads more than a read does.
+A write figure includes the rows that it changes.
 
-In the grouped fixture, the plain deadline shift reads an empty partial
-index. In production, that index holds each live task with a deadline.
+### Review finding: a run with many rows
 
-The fork cancel and the session check also key on `activity_id` and
-`session_id`. Their plain form chose its keyed index here. In an earlier
-fixture with no session rows, the plain session check chose
-`idx_harvest_tq_live_created`, and the plain fork cancel did the same with
-no activity rows. The choice depends on index sizes, so it is not stable.
-The `CASE` form costs 2 or 4 buffers in each fixture.
+A run keeps each terminal activity row until retention deletes the run.
+With only the `CASE` form, each wake statement read every row of a hot run
+through `idx_harvest_tq_workflow`. The plain form could combine that index
+with a small live partial index in a bitmap.
+
+Each run has one workflow task row. A new partial index,
+`idx_harvest_tq_workflow_task (workflow_exec_id) WHERE task_type =
+'workflow'`, holds that row only. The wake statements, the owner key read
+and the migration statements keep `task_type = 'workflow'` as a plain test.
+The planner proves the index predicate from it. They hide only `state` and
+`worker_id`. Each one then reads one row for any run size.
+
+The index adds about 40 bytes of WAL to an update of a workflow task row
+that is not HOT, about 3% more. An activity row adds none. The index holds
+about 31 bytes for each run.
+
+Two statements cost more on a hot run, and the trade is accepted:
+
+- The session check reads each row of its run. Its plain form can read
+  every live row of the table after an idle analyze. A run bounds the new
+  cost. The whole table bounds the old one.
+- The deadline shift runs once for each resume. It reads each row of the
+  run, as the drains do.
+
+The fail, cancel and drain writes and the in-flight counts read each row of
+the run in both forms. They run once at the end of a run.
+
+### Review finding: the timeout batch re-read
+
+`timeout::find_timed_out_tasks_batch` and `timeout::lapsed_moves` test a
+scan predicate on a batch of ids. The predicate tests `state` before the
+`id = ANY($1)` key, so the walk did not see it. After an idle analyze, a
+batch of 100 ids read 1,414 buffers through `idx_harvest_tq_live_created`.
+
+The batch now loads its ids through the primary key in a materialized CTE.
+The predicate then tests those rows only. A batch of 100 ids reads about
+380 buffers on every fixture. The plain form read 22 buffers when only 500
+rows ran, so the fence costs more when the live set is very small.
 
 ### Options (green hat, brainstorming)
 
@@ -194,18 +227,23 @@ The `CASE` form costs 2 or 4 buffers in each fixture.
 3. Make the execution index partial on the live states. A wake also reads
    terminal rows, and the idle case still picks `live_created`.
 4. Accept the cost. The idle case reads every live row on each wake.
+5. Add a partial index on the workflow task row of each run. A wake then
+   reads one row for any run size.
 
-Decision: option 1. It is the same form, the same proof and no migration.
+Decision: option 1 for each statement, and option 5 for the statements that
+read the workflow task row only.
 
 ### Reverse brainstorming: how can this change fail?
 
 | Way to fail | Prevention |
 |---|---|
-| The guard hides a key column, such as `session_id` or `activity_id`. | Wrap only `state`, `task_type` and `worker_id` terms. Keep each key test plain. A `session_id` test then has no index, so the execution index serves it. |
+| The guard hides a key column, such as `session_id` or `activity_id`. | Wrap only `state` and `worker_id` terms. Keep each key test plain. A `session_id` test then has no usable index, so the execution index serves it. |
+| The guard hides `task_type = 'workflow'`, so the workflow task index cannot serve. | Keep that test plain. The plan test names the workflow task index as the key index. |
 | An `OR` guard is split, and part of it stays plain. | Wrap the whole parenthesized `OR` as one top-level `AND` term. |
 | A guard in a CTE wraps the `EXISTS` of the CTE. | Wrap the guard only. The `EXISTS` term stays a separate top-level term. |
 | A wake fallback misses a park, so a wake is lost. | A concurrency test runs the fallback behind a park in both forms. |
-| A new by-execution statement uses a plain guard. | The source walks check every engine file, not six. |
+| A new keyed statement uses a plain guard. | The source walks read every engine file and each top-level term of a keyed `WHERE` clause. They also find a `concat!` that drops `row_guard_sql!`. |
+| A fixture stops provoking the defect, so the plan test proves nothing. | The plan test also plans each plain form. It fails when no plain form leaves its key index. |
 | The plan test expects the primary key for a by-execution statement. | Each statement names the index that it must read. |
 
 ### Feelings (red hat)
@@ -221,19 +259,19 @@ easier to keep than a list of exceptions.
   `workflow_exec_id`, and `idx_harvest_tq_workflow` covers every row.
 - The fork cancel keys on `activity_id` too. It must keep
   `idx_harvest_tq_activity_id`.
-- The session check loses `idx_harvest_tq_session_active`. It reads 4
-  buffers, not 2, when the plain form chooses that index. The plain form
-  can also choose a scan of every live row, so the trade is accepted.
+- The new index adds a build on a hot table. The migration guards the
+  build, and its header gives the `CONCURRENTLY` recipe.
 
 ### Benefits (yellow hat)
 
-- A wake costs a few buffers for any queue size and any statistics.
-- No migration and no index build.
+- A wake costs a few buffers for any queue size, any run size and any
+  statistics.
+- A timeout batch costs a fixed amount for each id.
 
 ### Scope (blue hat)
 
-In scope: each statement that finds task rows by `workflow_exec_id` and
-guards them on `state`, `task_type` or `worker_id`.
+In scope: each statement that finds task rows by a key and guards them on
+`state` or `worker_id`.
 
 - `queue`: the wake re-pend, the wake fallback, the due-row read of a wake,
   the owner key read, the fail and cancel of open tasks, and the session
@@ -244,10 +282,14 @@ guards them on `state`, `task_type` or `worker_id`.
 - The fork loser cancel, the reset count and the retention count.
 - `shard_rebalance`: the parked-row read, the seal cancel and the signal
   re-pend.
+- `timeout`: the batch and probe re-reads of a scan.
 
-Out of scope: a join on `workflow_exec_id`, and a scan that excludes
-executions. Neither one keys on an execution. The deadline shift of
-`harvest_external_tasks` is on another table.
+The plan test checks the seal cancel through the source walk only. Its
+statement also runs the quiescence check, a join that is out of scope.
+
+Out of scope: a join on `workflow_exec_id`, such as the quiescence check,
+and a scan that excludes executions. Neither one keys on a parameter. The
+deadline shift of `harvest_external_tasks` is on another table.
 
 ### Plan
 
@@ -259,8 +301,10 @@ executions. Neither one keys on an execution. The deadline shift of
    and the two inline migration statements to constants.
 3. Proof. Add the by-execution raw statements to the differential run. Add
    a fallback-behind-a-park case and a re-pend case to the concurrency test.
-4. Measure. Record the fixture figures on the performance page.
-5. REFACTOR. Run the gates.
+4. Review. Add the workflow task index and the timeout batch fence. Harden
+   the walks and add a negative control to the plan test.
+5. Measure. Record the fixture figures on the performance page.
+6. REFACTOR. Run the gates.
 
 ### Acceptance criteria
 
@@ -273,3 +317,6 @@ executions. Neither one keys on an execution. The deadline shift of
     by-execution guard.
 11. The performance page records the before and after cost of the
     by-execution statements.
+12. A wake, the owner key read and the migration read cost the same for a
+    run with 50,000 rows as for a run with 4.
+13. A timeout batch re-read reads its ids through the primary key.

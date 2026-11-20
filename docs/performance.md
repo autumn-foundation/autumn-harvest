@@ -3159,4 +3159,5 @@ standalone note rather than part of the claim-path attribution table above:
   #2713). A `CASE` guard keeps each one on its key index. On a 1M-row
   fixture, a recheck reads 24 → 6 buffers at 20 rows per worker, and
   201 → 6 after an idle analyze. A wake re-pend reads 1,411 → 4 after an
-  idle analyze.
+  idle analyze. A workflow task index keeps a wake at 4 buffers for a run
+  with 50,000 rows.

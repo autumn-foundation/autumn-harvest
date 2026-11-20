@@ -1,14 +1,11 @@
-//! Keep a by-id task row statement on the primary key.
+//! Keep a keyed task row statement on its key index.
 //!
-//! Many statements find one `harvest_task_queue` row by `id`, then guard
-//! it on `state` and `worker_id`. A partial index matches each such guard.
-//! Both paths estimate one row, so the planner can pick the small partial
-//! index over the primary key. That path reads each index entry that
-//! matches the guard, then filters on `id`. A cached generic plan keeps that
-//! choice.
-//!
-//! Statements that find task rows by `workflow_exec_id` have the same
-//! defect. Their key index is `idx_harvest_tq_workflow`.
+//! Many statements find `harvest_task_queue` rows by a key, then guard them
+//! on `state` and `worker_id`. The key is `id` or `workflow_exec_id`. A
+//! partial index matches each such guard. Both paths estimate few rows, so
+//! the planner can pick the small partial index over the key index. That
+//! path reads each index entry that matches the guard, then filters on the
+//! key. A cached generic plan keeps that choice.
 //!
 //! `row_guard_sql!` and `row_guard` hide such a guard from the planner.
 //! [`guarded_statements`] lists each raw statement in scope and a sample of
@@ -25,17 +22,18 @@ use diesel::pg::Pg;
 #[cfg(feature = "db")]
 use diesel::sql_types::{Bool, BoolOrNullableBool};
 
-/// Wrap the guard of a by-id statement so that no index can match it.
+/// Wrap the guard of a keyed statement so that no index can match it.
 ///
 /// `CASE WHEN g THEN true END` is true when `g` is true and NULL in all
 /// other cases. `WHERE` drops a NULL row as it drops a false row, so the
 /// statement keeps the same rows. The planner cannot use a `CASE` as an
 /// index condition. It also cannot prove a partial index predicate from
-/// it. So it finds the row through `id = $1` and the primary key.
+/// it. So it finds the rows through the key test and its index.
 ///
-/// Use it only beside a key test: `id = $1`, or `workflow_exec_id = $1` with
-/// the execution index. A scan without a key needs its index. Use it only as
-/// a top-level `AND` term. `NOT` or `OR` on a NULL result changes the rows.
+/// Use it only beside a key test, such as `id = $1` or
+/// `workflow_exec_id = ANY($1)`. [`Key`] names each key index. A scan without
+/// a key needs its partial index. Use it only as a top-level `AND` term.
+/// `NOT` or `OR` on a NULL result changes the rows.
 macro_rules! row_guard_sql {
     ($guard:literal) => {
         concat!("(CASE WHEN ", $guard, " THEN true END)")
@@ -65,6 +63,9 @@ pub enum Key {
     Id,
     /// `workflow_exec_id`, through the execution index.
     Execution,
+    /// `workflow_exec_id` and a plain `task_type = 'workflow'`, through the
+    /// workflow task index. It holds one row for each run.
+    Workflow,
     /// `workflow_exec_id` and `activity_id`, through the activity index.
     Activity,
 }
@@ -77,6 +78,7 @@ impl Key {
         match self {
             Self::Id => "harvest_task_queue_pkey",
             Self::Execution => "idx_harvest_tq_workflow",
+            Self::Workflow => "idx_harvest_tq_workflow_task",
             Self::Activity => "idx_harvest_tq_activity_id",
         }
     }
@@ -93,8 +95,10 @@ pub struct GuardedStatement {
     pub sql: String,
     /// The SQL type of each parameter, in order.
     pub param_types: Vec<&'static str>,
-    /// True when `sql` is the production text. A Diesel entry is false: it
-    /// has the production guard, but its other clauses are a sample.
+    /// True when `sql` is the production text with a `CASE` guard. The
+    /// differential test runs it in both forms. A Diesel entry is false: it
+    /// has the production guard, but its other clauses are a sample. A
+    /// timeout batch entry is false too: it hides its guard with a fence.
     pub raw: bool,
     /// The column that the statement finds its rows by.
     pub key: Key,
@@ -260,20 +264,20 @@ pub fn guarded_statements() -> Vec<GuardedStatement> {
             queue::primary_repend_workflow_task_query(),
             &["uuid", "timestamptz"],
         )
-        .by(Key::Execution),
+        .by(Key::Workflow),
         GuardedStatement::raw(
             "wake_fallback",
             queue::wake_requested_fallback_query(),
             &["uuid"],
         )
-        .by(Key::Execution),
+        .by(Key::Workflow),
         GuardedStatement::raw(
             "wake_already_due",
             queue::already_due_workflow_task_query(),
             &["uuid", "timestamptz"],
         )
-        .by(Key::Execution),
-        GuardedStatement::raw("owner_keys", queue::OWNER_KEYS_SQL, &["uuid[]"]).by(Key::Execution),
+        .by(Key::Workflow),
+        GuardedStatement::raw("owner_keys", queue::OWNER_KEYS_SQL, &["uuid[]"]).by(Key::Workflow),
         GuardedStatement::raw(
             "shift_schedule_to_close_on_resume",
             crate::execution::shift_schedule_to_close_on_resume_query(),
@@ -285,14 +289,40 @@ pub fn guarded_statements() -> Vec<GuardedStatement> {
             crate::shard_rebalance::STAGED_TASK_SQL,
             &["uuid"],
         )
-        .by(Key::Execution),
+        .by(Key::Workflow),
         GuardedStatement::raw(
             "migration_signal_repend",
             crate::shard_rebalance::SIGNAL_REPEND_SQL,
             &["uuid"],
         )
-        .by(Key::Execution),
+        .by(Key::Workflow),
     ]);
+
+    for (reason, batch, probe) in crate::timeout::timeout_batch_statements() {
+        let (batch_name, probe_name) = match reason {
+            crate::timeout::TimeoutReason::Heartbeat => {
+                ("timeout_batch_heartbeat", "timeout_probe_heartbeat")
+            }
+            crate::timeout::TimeoutReason::StartToClose => (
+                "timeout_batch_start_to_close",
+                "timeout_probe_start_to_close",
+            ),
+            crate::timeout::TimeoutReason::ScheduleToStart => (
+                "timeout_batch_schedule_to_start",
+                "timeout_probe_schedule_to_start",
+            ),
+            crate::timeout::TimeoutReason::ScheduleToClose => (
+                "timeout_batch_schedule_to_close",
+                "timeout_probe_schedule_to_close",
+            ),
+        };
+        for (name, sql) in [(batch_name, batch), (probe_name, probe)] {
+            statements.push(GuardedStatement {
+                raw: false,
+                ..GuardedStatement::raw(name, &sql, &["uuid[]"])
+            });
+        }
+    }
 
     let id = uuid::Uuid::nil();
     let claim = queue::TaskClaim::new(id, "worker", 1);
@@ -522,13 +552,16 @@ mod tests {
         out
     }
 
+    // ── Raw SQL ─────────────────────────────────────────────────────────
+
     /// The table alias of `term` and the term without it. Leading
     /// parentheses are removed first.
     fn aliased(term: &str) -> (&str, &str) {
         let term = term.trim_start_matches(['(', ' ']);
         match term.split_once('.') {
             Some((alias, rest))
-                if !alias.is_empty() && alias.chars().all(|c| c.is_ascii_alphanumeric()) =>
+                if !alias.is_empty()
+                    && alias.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
             {
                 (alias, rest)
             }
@@ -536,69 +569,143 @@ mod tests {
         }
     }
 
-    /// `term` with its leading parentheses and table alias removed.
-    fn bare(term: &str) -> &str {
-        aliased(term).1
+    /// The names that refer to the task queue in `sql`: no alias, the table
+    /// name, and each alias that follows the table name.
+    fn queue_aliases(sql: &str) -> Vec<&str> {
+        const NOT_ALIAS: [&str; 12] = [
+            "WHERE", "SET", "JOIN", "ON", "USING", "INNER", "LEFT", "WHEN", "THEN", "AND", "OR",
+            "VALUES",
+        ];
+        let mut aliases = vec!["", "harvest_task_queue"];
+        for (at, _) in sql.match_indices("harvest_task_queue ") {
+            let rest = &sql[at + "harvest_task_queue ".len()..];
+            let rest = rest.strip_prefix("AS ").unwrap_or(rest);
+            let word: &str = rest
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .next()
+                .unwrap_or_default();
+            if !word.is_empty() && !NOT_ALIAS.contains(&word) {
+                aliases.push(word);
+            }
+        }
+        aliases
     }
 
-    /// True when `term` tests a column of the `alias` table that a partial
+    /// Each `WHERE` clause of `sql`, up to its end at the same depth.
+    fn where_clauses(sql: &str) -> Vec<&str> {
+        const ENDS: [&str; 12] = [
+            " RETURNING ",
+            " ORDER BY ",
+            " LIMIT ",
+            " FOR UPDATE",
+            " FOR NO KEY",
+            " FOR SHARE",
+            " FOR KEY",
+            " GROUP BY ",
+            " OFFSET ",
+            " UNION ",
+            " EXCEPT ",
+            " ON CONFLICT",
+        ];
+        let mut out = Vec::new();
+        for (at, _) in sql.match_indices("WHERE ") {
+            let body = &sql[at + "WHERE ".len()..];
+            let mut depth = 0_i64;
+            let mut end = body.len();
+            for (i, c) in body.char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' if depth == 0 => {
+                        end = i;
+                        break;
+                    }
+                    ')' => depth -= 1,
+                    ' ' if depth == 0 && ENDS.iter().any(|e| body[i..].starts_with(e)) => {
+                        end = i;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            out.push(&body[..end]);
+        }
+        out
+    }
+
+    /// The top-level `AND` terms of `clause`.
+    fn and_terms(clause: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut depth = 0_i64;
+        let mut start = 0;
+        for (i, c) in clause.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ' ' if depth == 0 && clause[i..].starts_with(" AND ") => {
+                    out.push(clause[start..i].trim());
+                    start = i + " AND ".len();
+                }
+                _ => {}
+            }
+        }
+        out.push(clause[start..].trim());
+        out
+    }
+
+    /// True when `term` tests a key column of the task queue against a
+    /// parameter.
+    fn is_key(term: &str, aliases: &[&str]) -> bool {
+        let (alias, bare) = aliased(term);
+        aliases.contains(&alias)
+            && ["id = ", "workflow_exec_id = "].iter().any(|column| {
+                bare.strip_prefix(column).is_some_and(|value| {
+                    let value = value.strip_prefix("ANY(").unwrap_or(value);
+                    value.starts_with('$')
+                })
+            })
+    }
+
+    /// True when `term` tests a column of the task queue that a partial
     /// index matches.
-    fn plain_guard(term: &str, alias: &str) -> bool {
-        let (own, term) = aliased(term);
-        own == alias
-            && ["state ", "state=", "worker_id "]
-                .iter()
-                .any(|column| term.starts_with(column))
+    fn is_plain_guard(term: &str, aliases: &[&str]) -> bool {
+        let (alias, bare) = aliased(term);
+        aliases.contains(&alias)
+            && [
+                "state = ",
+                "state IN ",
+                "worker_id = ",
+                "worker_id IS NOT NULL",
+            ]
+            .iter()
+            .any(|column| bare.starts_with(column))
     }
 
     /// Each plain guard beside a row key in `sql`, as a message.
     ///
-    /// A key is `id = $n`, `workflow_exec_id = $n` or the `ANY` form of
-    /// either. A `task_type` test after the key is skipped. The term after
-    /// it must not test `state` or `worker_id` plainly.
+    /// A key is `id` or `workflow_exec_id` against a parameter, or the `ANY`
+    /// form of either. Each top-level `AND` term of a keyed `WHERE` clause is
+    /// read, before and after the key.
     fn plain_keyed_guards(sql: &str) -> Vec<String> {
         let sql = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        let aliases = queue_aliases(&sql);
         let mut found = Vec::new();
-        for (at, _) in sql.match_indices(" = ") {
-            let left = sql[..at].rsplit([' ', '(']).next().unwrap_or_default();
-            let (alias, column) = left.rsplit_once('.').unwrap_or(("", left));
-            if column != "id" && column != "workflow_exec_id" {
+        for clause in where_clauses(&sql) {
+            let terms = and_terms(clause);
+            if !terms.iter().any(|t| is_key(t, &aliases)) {
                 continue;
             }
-            let value = &sql[at + 3..];
-            let Some(param) = value
-                .strip_prefix("ANY(")
-                .or(Some(value))
-                .and_then(|v| v.strip_prefix('$'))
-            else {
-                continue;
-            };
-            let mut rest = param.trim_start_matches(|c: char| {
-                c.is_ascii_digit()
-                    || c == ')'
-                    || c == ':'
-                    || c.is_ascii_alphabetic()
-                    || c == '['
-                    || c == ']'
-            });
-            while let Some(term) = rest.strip_prefix(" AND ") {
-                if bare(term).starts_with("task_type = '") {
-                    let close = term.find("' ").map_or(term.len(), |c| c + 1);
-                    rest = &term[close..];
-                    continue;
+            for term in terms {
+                if is_plain_guard(term, &aliases) {
+                    found.push(format!("{term} in WHERE {clause}"));
                 }
-                if plain_guard(term, alias) {
-                    found.push(sql[at.saturating_sub(40)..(at + 120).min(sql.len())].to_owned());
-                }
-                break;
             }
         }
         found
     }
 
-    /// Each string literal of `source`, with each continuation joined as
-    /// rustc joins it. Comments are skipped.
-    fn string_literals(source: &str) -> Vec<String> {
+    /// Each string literal of `source` and the byte offset after it. Each
+    /// continuation joins as rustc joins it. Comments are skipped.
+    fn string_literals(source: &str) -> Vec<(usize, String)> {
         let mut out = Vec::new();
         let mut chars = source.char_indices().peekable();
         while let Some((at, c)) = chars.next() {
@@ -616,7 +723,8 @@ mod tests {
                 }
                 '"' => {
                     let mut text = String::new();
-                    while let Some((_, c)) = chars.next() {
+                    let mut end = source.len();
+                    while let Some((i, c)) = chars.next() {
                         match c {
                             '\\' => match chars.next() {
                                 Some((_, '\n')) => {
@@ -630,11 +738,14 @@ mod tests {
                                 }
                                 None => {}
                             },
-                            '"' => break,
+                            '"' => {
+                                end = i + 1;
+                                break;
+                            }
                             c => text.push(c),
                         }
                     }
-                    out.push(text);
+                    out.push((end, text));
                 }
                 _ => {}
             }
@@ -642,18 +753,48 @@ mod tests {
         out
     }
 
+    /// Each raw statement in `source` with a plain guard beside its key.
+    ///
+    /// A literal that ends in `AND` after a key must be followed by
+    /// `row_guard_sql!`. Otherwise a `concat!` can join a plain guard to it.
+    fn raw_failures(source: &str) -> Vec<String> {
+        let mut failures = Vec::new();
+        for (end, literal) in string_literals(source) {
+            if !literal.contains("harvest_task_queue") {
+                continue;
+            }
+            failures.extend(plain_keyed_guards(&literal));
+            let sql = literal.split_whitespace().collect::<Vec<_>>().join(" ");
+            let aliases = queue_aliases(&sql);
+            let Some(clause) = where_clauses(&sql).pop() else {
+                continue;
+            };
+            let Some(open) = clause.strip_suffix(" AND") else {
+                continue;
+            };
+            let next = source[end..].trim_start_matches([',', ' ', '\n', '\t']);
+            let next = next
+                .strip_prefix("$crate::row_guard::")
+                .or_else(|| next.strip_prefix("crate::row_guard::"))
+                .unwrap_or(next);
+            if and_terms(open).iter().any(|t| is_key(t, &aliases))
+                && !next.starts_with("row_guard_sql!")
+            {
+                failures.push(format!(
+                    "a key ends a literal with no row_guard_sql!: {clause}"
+                ));
+            }
+        }
+        failures
+    }
+
     /// No raw statement tests `state` or `worker_id` plainly beside its key.
     #[test]
     fn every_keyed_raw_statement_hides_its_guard() {
         let mut failures = Vec::new();
         for (path, source) in engine_sources() {
-            for literal in string_literals(&source) {
-                if !literal.contains("harvest_task_queue") {
-                    continue;
-                }
-                for at in plain_keyed_guards(&literal) {
-                    failures.push(format!("{}: {at}", path.display()));
-                }
+            for failure in raw_failures(&source) {
+                failures.push(format!("{}: {failure}", path.display()));
             }
         }
         assert!(
@@ -662,6 +803,8 @@ mod tests {
             failures.join("\n")
         );
     }
+
+    // ── Diesel ──────────────────────────────────────────────────────────
 
     /// The top-level `.filter(` arguments of a Diesel chain.
     fn filter_arguments(chain: &str) -> Vec<&str> {
@@ -688,58 +831,100 @@ mod tests {
         out
     }
 
-    /// `argument` with its leading `path::` segments removed.
-    fn unpathed(argument: &str) -> &str {
+    /// `argument` with its leading `path::` segments removed. `None` when
+    /// the path names another `harvest_` table.
+    fn unpathed(argument: &str) -> Option<&str> {
         let mut rest = argument;
         while let Some((head, tail)) = rest.split_once("::") {
-            if head.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                rest = tail;
-            } else {
+            if !head.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                 break;
             }
+            if head.starts_with("harvest_") && head != "harvest_task_queue" {
+                return None;
+            }
+            rest = tail;
         }
-        rest
+        Some(rest)
+    }
+
+    /// True when `argument` starts a plain guard.
+    fn plain_diesel_guard(argument: &str) -> bool {
+        unpathed(argument).is_some_and(|a| {
+            ["state.", "worker_id.", "claim_held("]
+                .iter()
+                .any(|plain| a.starts_with(plain))
+        })
+    }
+
+    /// True when `argument` is a key test.
+    fn diesel_key(argument: &str) -> bool {
+        unpathed(argument)
+            .is_some_and(|a| a.starts_with("id.eq(") || a.starts_with("workflow_exec_id.eq("))
     }
 
     /// Each Diesel chain on the task queue in `source`, as one line of text.
     ///
-    /// A chain starts at a line that ends with the table. It runs until its
-    /// parentheses close below the start, or until a `;`. The trimmed lines
-    /// join with no space, so a call split over lines reads as one call.
+    /// A chain starts after the table name, where the next text is a call.
+    /// It runs until its parentheses close below the start, or until a `;`.
+    /// The trimmed lines join with no space, so a call split over lines
+    /// reads as one call. A `//` comment is dropped.
     fn queue_chains(source: &str) -> Vec<(usize, String)> {
-        let lines: Vec<&str> = source.lines().collect();
+        let lines: Vec<&str> = source
+            .lines()
+            .map(|l| l.split_once("//").map_or(l, |(code, _)| code).trim())
+            .collect();
         let mut out = Vec::new();
         for (at, line) in lines.iter().enumerate() {
-            let line = line.trim();
-            if line.starts_with("//")
-                || !(line.ends_with("harvest_task_queue")
-                    || line.ends_with("harvest_task_queue::table"))
-            {
-                continue;
-            }
-            let mut chain = String::new();
-            let mut depth = 0_i64;
-            'lines: for next in &lines[at + 1..] {
-                let next = next.trim();
-                if next.starts_with("//") {
+            for (start, _) in line.match_indices("harvest_task_queue") {
+                let after = &line[start + "harvest_task_queue".len()..];
+                let after = after.strip_prefix("::table").unwrap_or(after);
+                if !(after.is_empty() || after.starts_with('.')) {
                     continue;
                 }
-                for c in next.chars() {
-                    match c {
-                        '(' => depth += 1,
-                        ')' => depth -= 1,
-                        ';' if depth <= 0 => break 'lines,
-                        _ => {}
+                let mut chain = String::new();
+                let mut depth = 0_i64;
+                let rest = std::iter::once(after).chain(lines[at + 1..].iter().copied());
+                'lines: for next in rest {
+                    for c in next.chars() {
+                        match c {
+                            '(' => depth += 1,
+                            ')' => depth -= 1,
+                            ';' if depth <= 0 => break 'lines,
+                            _ => {}
+                        }
+                        if depth < 0 {
+                            break 'lines;
+                        }
+                        chain.push(c);
                     }
-                    if depth < 0 {
-                        break 'lines;
-                    }
-                    chain.push(c);
                 }
+                out.push((at + 1, chain));
             }
-            out.push((at + 1, chain));
         }
         out
+    }
+
+    /// The keyed chains of `source`, and each plain guard in them.
+    fn diesel_failures(source: &str) -> (usize, Vec<String>) {
+        let mut keyed = 0;
+        let mut failures = Vec::new();
+        for (line, chain) in queue_chains(source) {
+            let arguments = filter_arguments(&chain);
+            if !(chain.starts_with(".find(") || arguments.iter().any(|a| diesel_key(a))) {
+                continue;
+            }
+            keyed += 1;
+            for argument in arguments {
+                let joined = diesel_key(argument)
+                    && argument
+                        .match_indices(".and(")
+                        .any(|(at, _)| plain_diesel_guard(&argument[at + ".and(".len()..]));
+                if plain_diesel_guard(argument) || joined {
+                    failures.push(format!("{line}: {argument}"));
+                }
+            }
+        }
+        (keyed, failures)
     }
 
     /// Each Diesel chain that finds task rows by a key hides its guard.
@@ -751,35 +936,21 @@ mod tests {
         let mut chains = 0;
         let mut failures = Vec::new();
         for (path, source) in engine_sources() {
-            for (line, chain) in queue_chains(&source) {
-                let arguments = filter_arguments(&chain);
-                let keyed = chain.trim_start().starts_with(".find(")
-                    || arguments.iter().any(|a| {
-                        let a = unpathed(a);
-                        a.starts_with("id.eq(") || a.starts_with("workflow_exec_id.eq(")
-                    });
-                if !keyed {
-                    continue;
-                }
-                chains += 1;
-                for argument in arguments {
-                    let argument = unpathed(argument);
-                    if ["state.", "worker_id.", "claim_held("]
-                        .iter()
-                        .any(|plain| argument.starts_with(plain))
-                    {
-                        failures.push(format!("{}:{line}: {argument}", path.display()));
-                    }
-                }
+            let (keyed, found) = diesel_failures(&source);
+            chains += keyed;
+            for failure in found {
+                failures.push(format!("{}:{failure}", path.display()));
             }
         }
-        assert!(chains >= 20, "the walk found only {chains} keyed chains");
+        assert!(chains >= 30, "the walk found only {chains} keyed chains");
         assert!(
             failures.is_empty(),
             "these keyed chains have a plain guard:\n{}",
             failures.join("\n")
         );
     }
+
+    // ── The walks find each shape ───────────────────────────────────────
 
     #[test]
     fn the_raw_walk_finds_each_plain_guard_shape() {
@@ -793,62 +964,100 @@ mod tests {
              AND t.task_type = 'workflow' AND ((t.state = 'RUNNING'))",
             "SELECT 1 FROM harvest_task_queue WHERE workflow_exec_id = ANY($1) AND state = 'PENDING'",
             "UPDATE harvest_task_queue SET x = 1 WHERE workflow_exec_id = $2 AND state IN ('PENDING')",
+            "SELECT 1 FROM harvest_task_queue WHERE state = 'RUNNING' AND id = ANY($1)",
+            "UPDATE harvest_task_queue SET x = 1 WHERE id = $1 AND attempt = $3 AND state = 'RUNNING'",
+            "SELECT 1 FROM harvest_task_queue AS inner_q WHERE inner_q.id = $1 \
+             AND inner_q.worker_id IS NOT NULL",
         ] {
             assert_eq!(plain_keyed_guards(sql).len(), 1, "{sql}");
         }
         for sql in [
             "UPDATE harvest_task_queue SET x = 1 WHERE id = $1 AND (CASE WHEN state = 'RUNNING' THEN true END)",
             "UPDATE harvest_task_queue SET x = 1 WHERE workflow_exec_id = $1 \
-             AND (CASE WHEN task_type = 'workflow' AND state = 'RUNNING' THEN true END)",
+             AND task_type = 'workflow' AND (CASE WHEN state = 'RUNNING' THEN true END)",
             "UPDATE harvest_task_queue SET x = 1 WHERE queue_id = $1 AND state = 'RUNNING'",
             "UPDATE harvest_task_queue SET x = 1 WHERE worker_id = $1 AND state = 'RUNNING'",
             "SELECT 1 FROM harvest_task_queue t JOIN e ON e.id = t.workflow_exec_id \
              WHERE t.id = $2 AND e.state = 'RUNNING'",
+            "SELECT 1 FROM harvest_task_queue t, harvest_workflow_executions e \
+             WHERE e.id = $1 AND e.state = 'RUNNING' AND t.workflow_exec_id = e.id",
+            "SELECT 1 FROM harvest_task_queue WHERE state = 'RUNNING' AND id = ANY(SELECT x FROM y)",
         ] {
             assert!(plain_keyed_guards(sql).is_empty(), "{sql}");
         }
     }
 
     #[test]
-    fn the_diesel_walk_finds_each_plain_guard_shape() {
-        let source = "
-            diesel::update(
-                dsl::harvest_task_queue
-                    .filter(dsl::workflow_exec_id.eq(Some(exec)))
-                    .filter(
-                        dsl::state
-                            .eq(\"PENDING\")
-                            .or(dsl::state.eq(\"RUNNING\")),
-                    ),
-            )
-            .set(dsl::state.eq(\"FAILED\"));
-        ";
-        let chains = queue_chains(source);
-        assert_eq!(chains.len(), 1);
-        let arguments = filter_arguments(&chains[0].1);
-        assert_eq!(arguments.len(), 2, "{arguments:?}");
-        assert!(unpathed(arguments[1]).starts_with("state."));
-        assert!(
-            !chains[0].1.contains(".set("),
-            "the chain stops at its close"
+    fn the_raw_walk_reads_each_literal_as_rustc_does() {
+        let source = "let a = \"SELECT 1 FROM harvest_task_queue \\\n    WHERE id = $1\"; // \"not a literal\"\nlet q = '\"';\nlet b = \"x\";";
+        let literals: Vec<String> = string_literals(source)
+            .into_iter()
+            .map(|(_, l)| l)
+            .collect();
+        assert_eq!(
+            literals,
+            ["SELECT 1 FROM harvest_task_queue WHERE id = $1", "x"]
         );
     }
 
-    /// A `SET` clause can hold its own `CASE`, so the test reads the end
-    /// of the guard form. A Diesel guard binds its `true`.
+    #[test]
+    fn the_raw_walk_finds_a_concat_with_no_guard_macro() {
+        let plain = "concat!(\"UPDATE harvest_task_queue SET x = 1 WHERE id = $1 AND \", \"state = 'RUNNING'\")";
+        assert_eq!(raw_failures(plain).len(), 1, "{plain}");
+        let guarded = "concat!(\"UPDATE harvest_task_queue SET x = 1 WHERE id = $1 AND \", \
+                       crate::row_guard::row_guard_sql!(\"state = 'RUNNING'\"))";
+        assert_eq!(raw_failures(guarded), Vec::<String>::new());
+        let in_macro = "concat!(\"UPDATE harvest_task_queue SET x = 1 WHERE id = $1 AND \", \
+                        $crate::row_guard::row_guard_sql!(\"state = 'RUNNING'\"))";
+        assert_eq!(raw_failures(in_macro), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_diesel_walk_finds_each_plain_guard_shape() {
+        let flagged = [
+            "diesel::update(\n    dsl::harvest_task_queue\n        .filter(dsl::workflow_exec_id.eq(Some(exec)))\n        .filter(\n            dsl::state\n                .eq(\"PENDING\")\n                .or(dsl::state.eq(\"RUNNING\")),\n        ),\n)\n.set(dsl::state.eq(\"FAILED\"));",
+            "diesel::update(dsl::harvest_task_queue.find(id).filter(dsl::state.eq(\"RUNNING\")))\n    .set(dsl::state.eq(\"PENDING\"));",
+            "harvest_task_queue::table\n    .filter(harvest_task_queue::id.eq(id).and(harvest_task_queue::state.eq(\"RUNNING\")))\n    .count();",
+            "q::harvest_task_queue // a comment\n    .filter(q::id.eq(id))\n    .filter(q::worker_id.eq(w));",
+        ];
+        for source in flagged {
+            let (keyed, failures) = diesel_failures(source);
+            assert_eq!((keyed, failures.len()), (1, 1), "{source}: {failures:?}");
+        }
+        let clean = [
+            "diesel::update(dsl::harvest_task_queue.find(id).filter(row_guard(dsl::state.eq(\"RUNNING\"))))\n    .set(dsl::state.eq(\"PENDING\"));",
+            "dsl::harvest_task_queue\n    .filter(dsl::worker_id.eq(w))\n    .filter(dsl::state.eq(\"RUNNING\"));",
+            "harvest_task_queue::table\n    .inner_join(harvest_workflow_executions::table)\n    .filter(harvest_task_queue::id.eq(id))\n    .filter(harvest_workflow_executions::state.eq(\"RUNNING\"));",
+        ];
+        for source in clean {
+            assert!(diesel_failures(source).1.is_empty(), "{source}");
+        }
+        assert_eq!(
+            diesel_failures(clean[1]).0,
+            0,
+            "a scan by worker has no key"
+        );
+    }
+
+    /// A `SET` clause can hold its own `CASE`, so the test reads the end of
+    /// the guard form. A Diesel guard binds its `true`. A timeout batch
+    /// loads its ids through the primary key in a fence.
     #[test]
     fn every_guarded_statement_hides_its_guard() {
+        const FENCE: &str =
+            "WITH page AS MATERIALIZED (SELECT * FROM harvest_task_queue WHERE id = ANY($1))";
         for statement in guarded_statements() {
-            let end = if statement.raw {
-                " THEN true END)"
+            let hidden = if statement.name.starts_with("timeout_") {
+                statement.sql.starts_with(FENCE)
+            } else if statement.raw {
+                statement.sql.contains("CASE WHEN") && statement.sql.contains(" THEN true END)")
             } else {
-                " THEN ($"
+                statement.sql.contains("CASE WHEN") && statement.sql.contains(" THEN ($")
             };
             assert!(
-                statement.sql.contains("CASE WHEN") && statement.sql.contains(end),
-                "{} must wrap its row guard in a CASE: {}",
-                statement.name,
-                statement.sql
+                hidden,
+                "{} must hide its row guard: {}",
+                statement.name, statement.sql
             );
         }
     }

@@ -112,7 +112,9 @@ impl Db {
 }
 
 /// The execution of task row `g`, as SQL.
-const EXECUTION_OF_ROW: &str = "md5('execution-' || (g / 4))::uuid";
+fn execution_of_row() -> String {
+    format!("md5('execution-' || (g / {ROWS_PER_EXECUTION}))::uuid")
+}
 
 /// Insert one execution for each `ROWS_PER_EXECUTION` task rows of `rows`.
 async fn seed_executions(conn: &mut AsyncPgConnection, rows: i64) {
@@ -131,6 +133,7 @@ async fn seed_executions(conn: &mut AsyncPgConnection, rows: i64) {
 /// workers. Of the rest, 2% are `PENDING`, and the others are terminal.
 async fn seed(conn: &mut AsyncPgConnection, rows: i64, running: i64) {
     seed_executions(conn, rows).await;
+    let execution = execution_of_row();
     conn.batch_execute(&format!(
         "INSERT INTO harvest_task_queue \
              (queue_name, task_type, input, state, worker_id, started_at, attempt, activity_name, \
@@ -146,7 +149,7 @@ async fn seed(conn: &mut AsyncPgConnection, rows: i64, running: i64) {
                 CASE WHEN g <= {running} THEN now() - g * INTERVAL '1 ms' END, \
                 1, \
                 CASE WHEN g % 3 = 0 THEN NULL ELSE 'activity' END, \
-                {EXECUTION_OF_ROW} \
+                {execution} \
          FROM generate_series(1, {rows}) g"
     ))
     .await
@@ -223,8 +226,19 @@ async fn plan_of(
     serde_json::from_str(&plan.plan).expect("plan is JSON")
 }
 
-/// Each scan of `harvest_task_queue` in `node`: `(alias, node type, index)`.
-fn task_queue_scans(node: &serde_json::Value, out: &mut Vec<(String, String, String)>) {
+/// One scan of `harvest_task_queue` in a plan.
+#[derive(Debug)]
+struct Scan {
+    alias: String,
+    node: String,
+    index: String,
+    /// True when the scan tests an index condition. An index scan with no
+    /// condition reads the whole index.
+    keyed: bool,
+}
+
+/// Each scan of `harvest_task_queue` in `node`.
+fn task_queue_scans(node: &serde_json::Value, out: &mut Vec<Scan>) {
     if node.get("Relation Name").and_then(|v| v.as_str()) == Some("harvest_task_queue")
         && node.get("Node Type").and_then(|v| v.as_str()) != Some("ModifyTable")
     {
@@ -234,12 +248,18 @@ fn task_queue_scans(node: &serde_json::Value, out: &mut Vec<(String, String, Str
                 .unwrap_or_default()
                 .to_owned()
         };
-        let index = if text("Node Type") == "Bitmap Heap Scan" {
+        let bitmap = text("Node Type") == "Bitmap Heap Scan";
+        let index = if bitmap {
             bitmap_indexes(node).join(",")
         } else {
             text("Index Name")
         };
-        out.push((text("Alias"), text("Node Type"), index));
+        out.push(Scan {
+            alias: text("Alias"),
+            node: text("Node Type"),
+            index,
+            keyed: bitmap || node.get("Index Cond").is_some(),
+        });
     }
     if let Some(children) = node.get("Plans").and_then(|v| v.as_array()) {
         for child in children {
@@ -271,31 +291,61 @@ fn exempt(alias: &str) -> bool {
     alias == "recheck"
 }
 
-/// Each statement on `conn` that leaves its key index, as a message.
-async fn key_index_failures(conn: &mut AsyncPgConnection, fixture: &str) -> Vec<String> {
-    let mut failures = Vec::new();
+/// True when each checked scan in `plan` reads `index` with a condition.
+fn reads_key_index(plan: &serde_json::Value, index: &str) -> (bool, Vec<Scan>) {
+    let mut scans = Vec::new();
+    task_queue_scans(&plan[0]["Plan"], &mut scans);
+    scans.retain(|scan| !exempt(&scan.alias));
+    let on_key = !scans.is_empty()
+        && scans.iter().all(|scan| {
+            (scan.node.starts_with("Index") || scan.node == "Bitmap Heap Scan")
+                && scan.index == index
+                && scan.keyed
+        });
+    (on_key, scans)
+}
+
+/// What the plan check found on one fixture.
+#[derive(Default)]
+struct KeyIndexReport {
+    /// Each guarded statement that leaves its key index, as a message.
+    failures: Vec<String>,
+    /// The number of plain forms that leave their key index. A fixture that
+    /// provokes no plain form tests nothing.
+    plain_leaves: usize,
+}
+
+/// Each statement on `conn` that leaves its key index. Each raw statement
+/// is also planned in its plain form, as a negative control.
+async fn key_index_report(conn: &mut AsyncPgConnection, fixture: &str) -> KeyIndexReport {
+    let mut report = KeyIndexReport::default();
     for statement in guarded_statements() {
+        let index = statement.key.index();
         for (settings_name, settings) in SETTINGS {
             for cache_mode in ["force_generic_plan", "force_custom_plan"] {
                 let plan = plan_of(conn, &statement, settings, cache_mode).await;
-                let mut scans = Vec::new();
-                task_queue_scans(&plan[0]["Plan"], &mut scans);
-                let checked: Vec<_> = scans.iter().filter(|(a, _, _)| !exempt(a)).collect();
-                let on_key = !checked.is_empty()
-                    && checked.iter().all(|(_, node, index)| {
-                        (node.starts_with("Index") || node == "Bitmap Heap Scan")
-                            && index == statement.key.index()
-                    });
+                let (on_key, scans) = reads_key_index(&plan, index);
                 if !on_key {
-                    failures.push(format!(
-                        "{fixture}/{settings_name}/{cache_mode}: {} scans {checked:?}",
+                    report.failures.push(format!(
+                        "{fixture}/{settings_name}/{cache_mode}: {} scans {scans:?}",
                         statement.name
                     ));
+                }
+                let unguarded = plain_form(&statement.sql);
+                if statement.raw && unguarded != statement.sql {
+                    let control = GuardedStatement {
+                        sql: unguarded,
+                        ..statement.clone()
+                    };
+                    let control_plan = plan_of(conn, &control, settings, cache_mode).await;
+                    if !reads_key_index(&control_plan, index).0 {
+                        report.plain_leaves += 1;
+                    }
                 }
             }
         }
     }
-    failures
+    report
 }
 
 #[tokio::test]
@@ -303,6 +353,7 @@ async fn guarded_statements_use_their_key_index_for_any_slot_count() {
     let (server, _guard) = setup_server().await;
     let mut db = Db::create(&server).await;
     let mut failures = Vec::new();
+    let mut plain_leaves = 0;
     for per_worker in [5, 20, 50, 200] {
         db.conn
             .batch_execute("TRUNCATE harvest_task_queue CASCADE")
@@ -311,9 +362,12 @@ async fn guarded_statements_use_their_key_index_for_any_slot_count() {
         seed(&mut db.conn, ROWS, per_worker * WORKERS).await;
         analyze(&mut db.conn).await;
         let fixture = format!("{per_worker} per worker");
-        failures.extend(key_index_failures(&mut db.conn, &fixture).await);
+        let report = key_index_report(&mut db.conn, &fixture).await;
+        failures.extend(report.failures);
+        plain_leaves += report.plain_leaves;
     }
     db.drop().await;
+    assert!(plain_leaves > 0, "no plain form leaves its key index");
     assert!(
         failures.is_empty(),
         "these guarded statements leave their key index:\n{}",
@@ -328,19 +382,24 @@ async fn guarded_statements_use_their_key_index_after_an_idle_analyze() {
     let (server, _guard) = setup_server().await;
     let mut db = Db::create(&server).await;
     seed_executions(&mut db.conn, ROWS).await;
+    let execution = execution_of_row();
     db.conn
         .batch_execute(&format!(
             "INSERT INTO harvest_task_queue \
                  (queue_name, task_type, input, state, attempt, workflow_exec_id) \
-             SELECT 'default', 'workflow', '{{}}'::jsonb, 'COMPLETED', 1, {EXECUTION_OF_ROW} \
+             SELECT 'default', 'workflow', '{{}}'::jsonb, 'COMPLETED', 1, {execution} \
              FROM generate_series(1, {ROWS}) g"
         ))
         .await
         .expect("seed terminal rows");
     analyze(&mut db.conn).await;
     seed(&mut db.conn, 2_000, 2_000).await;
-    let failures = key_index_failures(&mut db.conn, "idle statistics").await;
+    let KeyIndexReport {
+        failures,
+        plain_leaves,
+    } = key_index_report(&mut db.conn, "idle statistics").await;
     db.drop().await;
+    assert!(plain_leaves > 0, "no plain form leaves its key index");
     assert!(
         failures.is_empty(),
         "these guarded statements leave their key index:\n{}",
@@ -526,7 +585,7 @@ async fn each_raw_statement_changes_the_same_rows_in_both_forms() {
     for statement in guarded_statements().into_iter().filter(|s| s.raw) {
         let ids = match statement.key {
             Key::Id => &keys[0],
-            Key::Execution | Key::Activity => &keys[1],
+            Key::Execution | Key::Workflow | Key::Activity => &keys[1],
         };
         let plain = plain_form(&statement.sql);
         assert_ne!(plain, statement.sql, "{} has a CASE guard", statement.name);
@@ -592,6 +651,26 @@ struct Case {
     want: usize,
 }
 
+/// `sql` with each `$n` replaced by `value`. A `$n` followed by a digit is a
+/// different parameter, so it stays.
+fn with_parameter(sql: &str, n: usize, value: &str) -> String {
+    let marker = format!("${n}");
+    let mut out = String::with_capacity(sql.len());
+    let mut rest = sql;
+    while let Some(at) = rest.find(&marker) {
+        let after = &rest[at + marker.len()..];
+        out.push_str(&rest[..at]);
+        if after.starts_with(|c: char| c.is_ascii_digit()) {
+            out.push_str(&marker);
+        } else {
+            out.push_str(value);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The raw guarded statement named `name`.
 fn guarded(name: &str) -> GuardedStatement {
     guarded_statements()
@@ -604,7 +683,7 @@ fn guarded(name: &str) -> GuardedStatement {
 /// workflow task row. Return the number of rows that the release changed.
 ///
 /// A by-id release binds the row id and `worker-7`. A by-execution release
-/// binds the execution id, and `now()` for a `timestamptz` parameter.
+/// puts the execution id and `now()` into the SQL text for `$1` and `$2`.
 async fn run_beside_writer(
     setup: &mut AsyncPgConnection,
     db_url: &str,
@@ -652,10 +731,11 @@ async fn run_beside_writer(
                 .execute(&mut release_conn)
                 .await
                 .expect("release"),
-            Key::Execution | Key::Activity => diesel::sql_query(
-                sql.replace("$2", "now()")
-                    .replace("$1", &format!("'{execution}'::uuid")),
-            )
+            Key::Execution | Key::Workflow | Key::Activity => diesel::sql_query(with_parameter(
+                &with_parameter(&sql, 2, "now()"),
+                1,
+                &format!("'{execution}'::uuid"),
+            ))
             .execute(&mut release_conn)
             .await
             .expect("release"),
@@ -774,8 +854,8 @@ async fn a_release_beside_a_completion_reclaim_or_pause_matches_the_plain_form()
     for case in &cases {
         let statement = guarded_statements()
             .into_iter()
-            .find(|s| s.sql == case.release)
-            .unwrap_or_else(|| guarded("release_claim"));
+            .find(|s| s.raw && s.sql == case.release)
+            .unwrap_or_else(|| panic!("{}: no raw guarded statement has this SQL", case.name));
         for sql in [case.release.clone(), plain_form(&case.release)] {
             let changed = run_beside_writer(&mut setup, &db.url, case, &statement, sql).await;
             assert_eq!(

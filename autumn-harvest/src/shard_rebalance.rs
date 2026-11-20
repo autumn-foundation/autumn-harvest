@@ -1880,16 +1880,14 @@ mod db {
 
     /// The parked or timer-pended workflow task of one execution, as JSON.
     ///
-    /// Each guard on the task queue in this module goes through
-    /// `row_guard_sql!`, so the planner reads the rows through the execution
-    /// index.
+    /// The `state` and `worker_id` tests go through `row_guard_sql!`, so the
+    /// planner reads the row through the workflow task index.
     pub const STAGED_TASK_SQL: &str = concat!(
         "SELECT to_jsonb(t) AS payload FROM harvest_task_queue t \
-         WHERE t.workflow_exec_id = $1 AND ",
+         WHERE t.workflow_exec_id = $1 AND t.task_type = 'workflow' AND ",
         crate::row_guard::row_guard_sql!(
-            "t.task_type = 'workflow' \
-             AND ((t.state = 'RUNNING' AND t.worker_id IS NULL) \
-                  OR (t.state = 'PENDING' AND t.scheduled_at > NOW()))"
+            "(t.state = 'RUNNING' AND t.worker_id IS NULL) \
+             OR (t.state = 'PENDING' AND t.scheduled_at > NOW())"
         ),
         " ORDER BY t.scheduled_at LIMIT 1"
     );
@@ -1902,10 +1900,9 @@ mod db {
                 created_at = clock_timestamp(), \
                 timer_fires_at = NULL, \
                 wake_requested = FALSE \
-          WHERE t.workflow_exec_id = $1 AND ",
+          WHERE t.workflow_exec_id = $1 AND t.task_type = 'workflow' AND ",
         crate::row_guard::row_guard_sql!(
-            "t.task_type = 'workflow' AND t.state IN ('PENDING', 'RUNNING') \
-             AND t.worker_id IS NULL AND t.started_at IS NULL"
+            "t.state IN ('PENDING', 'RUNNING') AND t.worker_id IS NULL AND t.started_at IS NULL"
         ),
         " AND EXISTS (SELECT 1 FROM harvest_signals s \
                       WHERE s.workflow_exec_id = $1 AND NOT s.consumed)"
@@ -2912,10 +2909,8 @@ mod db {
                  UPDATE harvest_task_queue t \
                     SET state = 'CANCELLED', worker_id = NULL, completed_at = NOW(), \
                         error = 'execution migrated to shard ' || $2::text \
-                  WHERE t.workflow_exec_id = $1 AND ",
-                crate::row_guard::row_guard_sql!(
-                    "t.task_type = 'workflow' AND t.state IN ('PENDING', 'RUNNING')"
-                ),
+                  WHERE t.workflow_exec_id = $1 AND t.task_type = 'workflow' AND ",
+                crate::row_guard::row_guard_sql!("t.state IN ('PENDING', 'RUNNING')"),
                 " AND EXISTS (SELECT 1 FROM sealed) \
                  RETURNING t.id \
              ), forgotten AS ( \

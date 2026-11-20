@@ -710,15 +710,46 @@ const TIMEOUT_SWEEP_START_SQL: &str = "SELECT NOW() AS as_of";
 /// The batch keeps the reason that the refill gave each row. An earlier
 /// reason that starts to match later does not drop the row. That reason's
 /// sweep has already passed it, so the row would wait for the next sweep.
-fn timeout_batch_query(predicate: &str) -> String {
-    format!("SELECT q.* FROM ({predicate} AND id = ANY($1) OFFSET 0) q ORDER BY q.id")
+///
+/// The ids load through the primary key in a materialized CTE. The predicate
+/// then tests those rows only. So no partial index that matches its `state`
+/// test can replace the key lookup.
+pub(crate) fn timeout_batch_query(predicate: &str) -> String {
+    format!(
+        "{TIMEOUT_BATCH_PAGE} SELECT q.* FROM ({}) q ORDER BY q.id",
+        on_refill_page(predicate)
+    )
 }
 
 /// The ids among `$1` that match `predicate` now (issue #1795).
 ///
-/// It selects ids only. A probe of a large batch then loads no payloads.
-fn timeout_probe_query(predicate: &str) -> String {
-    format!("SELECT q.id FROM ({predicate} AND id = ANY($1) OFFSET 0) q")
+/// It selects ids only. A probe of a large batch then loads no payloads. It
+/// reads the batch as [`timeout_batch_query`] does.
+pub(crate) fn timeout_probe_query(predicate: &str) -> String {
+    format!(
+        "{TIMEOUT_BATCH_PAGE} SELECT q.id FROM ({}) q",
+        on_refill_page(predicate)
+    )
+}
+
+/// The rows of a batch of ids, as the `page` that [`on_refill_page`] names.
+const TIMEOUT_BATCH_PAGE: &str =
+    "WITH page AS MATERIALIZED (SELECT * FROM harvest_task_queue WHERE id = ANY($1))";
+
+/// The batch and probe statements of each task timeout scan, for the plan
+/// test in `row_guard`.
+#[cfg(feature = "db")]
+pub(crate) fn timeout_batch_statements() -> Vec<(TimeoutReason, String, String)> {
+    task_timeout_scans()
+        .into_iter()
+        .map(|(reason, predicate)| {
+            (
+                reason,
+                timeout_batch_query(predicate),
+                timeout_probe_query(predicate),
+            )
+        })
+        .collect()
 }
 
 /// One id from [`timeout_probe_query`].
@@ -7794,9 +7825,14 @@ mod tests {
     fn batch_query_loads_by_id_and_checks_the_predicate_again() {
         let predicate = start_to_close_timeout_query();
         let sql = timeout_batch_query(predicate);
-        assert!(sql.starts_with(&format!(
-            "SELECT q.* FROM ({predicate} AND id = ANY($1) OFFSET 0) q"
-        )));
+        assert_eq!(
+            sql,
+            format!(
+                "WITH page AS MATERIALIZED (SELECT * FROM harvest_task_queue \
+                 WHERE id = ANY($1)) SELECT q.* FROM ({}) q ORDER BY q.id",
+                on_refill_page(predicate)
+            )
+        );
         // The batch keeps the reason of the refill. See the integration test
         // `a_queued_row_keeps_its_reason_when_an_earlier_one_starts_to_match`.
         assert!(!sql.contains("NOT EXISTS"));
@@ -7990,7 +8026,11 @@ mod tests {
     fn the_lapsed_row_probe_selects_ids_only() {
         for (_, predicate) in task_timeout_scans() {
             let sql = timeout_probe_query(predicate);
-            assert!(sql.starts_with("SELECT q.id FROM ("), "{sql}");
+            assert!(
+                sql.starts_with("WITH page AS MATERIALIZED (")
+                    && sql.contains(" SELECT q.id FROM ("),
+                "{sql}"
+            );
         }
     }
 
