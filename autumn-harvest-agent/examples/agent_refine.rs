@@ -295,32 +295,34 @@ fn show(version: Option<OverlayVersion>) -> String {
     version.map_or_else(|| "none (the base profile)".to_owned(), |v| v.to_string())
 }
 
-/// The stack of the thread that runs the example.
+/// The stack of the thread that runs the walk.
 ///
-/// A debug build of the example needs close to 1 MiB of stack. Windows gives
-/// the main thread 1 MiB, so it overflows there. The example runs on a
-/// thread with a set stack instead, as the `harvest` CLI does.
-const STACK_BYTES: usize = 8 * 1024 * 1024;
+/// A debug build polls the walk through deep frames. On Linux the walk needs
+/// almost 1 MiB of stack. The Windows main thread has 1 MiB, so the example
+/// overflowed there with `STATUS_STACK_OVERFLOW`. A spawned thread gets the
+/// stack that the spawn asks for. 8 MiB is the Linux default for a main thread.
+/// `autumn-harvest-cli` does the same for the same reason.
+///
+/// Reproduce the Windows condition on Linux with `ulimit -s 1024`.
+const WALK_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let worker = std::thread::Builder::new()
+    let walk = std::thread::Builder::new()
         .name("agent-refine".to_owned())
-        .stack_size(STACK_BYTES)
+        .stack_size(WALK_STACK_BYTES)
         .spawn(|| {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
-                .map_err(|error| error.to_string())?;
-            runtime
-                .block_on(example())
-                .map_err(|error| error.to_string())
+                .map_err(|e| e.to_string())?;
+            runtime.block_on(walk_main()).map_err(|e| e.to_string())
         })?;
-    worker.join().map_err(|_| "the example thread panicked")??;
-    Ok(())
+    let result = walk.join().map_err(|_| "the walk thread panicked")?;
+    result.map_err(Into::into)
 }
 
-/// The example itself, on the thread with the set stack.
-async fn example() -> Result<(), Box<dyn Error>> {
+/// Run the walk with an approval, print each step and check each claim.
+async fn walk_main() -> Result<(), Box<dyn Error>> {
     let outcome = run(&RefineDecision::Approve).await?;
     println!("op 1 check: {:?}", outcome.op1);
     println!("version before: {}", show(outcome.before));
