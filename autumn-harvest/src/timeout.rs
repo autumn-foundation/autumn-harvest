@@ -296,14 +296,16 @@ pub const fn workflow_history_ceiling_query() -> &'static str {
 /// predicates lets the planner read the request rows through
 /// `idx_harvest_events_external_outbox_pending`. The literal `event_type`
 /// makes that index usable. An equivalence class carries the literal over a
-/// join qual too. A qual such as `ev.event_type = p.request_type` would not
-/// stop it either. On a small fixture the planner chose that walk under a
+/// join qual of a plain join too. On a small fixture the planner chose that walk under a
 /// `Materialize`. The walk reads the whole history again.
 ///
 /// So the `unresolved` probe holds every legacy predicate, and returns only
-/// the id. It names `running`, so it runs after the executions probe. The
-/// outer `e` joins by that id alone. No literal reaches `e`, so the history
-/// index cannot serve it.
+/// the id. It names `running`, so it runs after the executions probe. It
+/// compares the type with `p.request_type`, which is a parameter inside the
+/// probe, not a literal. The planner then cannot prove the predicate of the
+/// history index, so the probe reads by key. A literal there let the planner
+/// scan the whole type prefix of the history index for each probe. The outer
+/// `e` joins by the id alone, so the history index cannot serve it either.
 ///
 /// `FOR UPDATE OF e` stays at the top. The lock falls only on the row that
 /// the `LIMIT` returns, after each check, as in the legacy query. A lock
@@ -353,9 +355,7 @@ macro_rules! external_outbox_claim_query {
                  FROM harvest_events ev \
                  WHERE ev.id = p.event_row_id \
                    AND running.running_exec = 1 \
-                   AND ev.event_type = '",
-            $requested,
-            "' \
+                   AND ev.event_type = p.request_type \
                    AND (ev.event_data->'data'->>'",
             $key,
             "') IS NOT NULL \
@@ -8395,9 +8395,10 @@ mod tests {
 
         let all_keys = ["signal_id", "cancel_id", "await_id"];
         for (sql, requested, first, second, key) in families {
+            assert!(sql.contains("ev.event_type = p.request_type"), "{sql}");
             assert!(
-                sql.contains(&format!("ev.event_type = '{requested}'")),
-                "{sql}"
+                !sql.contains(&format!("ev.event_type = '{requested}'")),
+                "a literal on the probe makes the history index usable: {sql}"
             );
             assert!(
                 sql.contains(&format!("p.request_type = '{requested}'")),
