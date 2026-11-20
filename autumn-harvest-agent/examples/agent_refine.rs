@@ -295,8 +295,32 @@ fn show(version: Option<OverlayVersion>) -> String {
     version.map_or_else(|| "none (the base profile)".to_owned(), |v| v.to_string())
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<(), Box<dyn Error>> {
+/// The stack of the thread that runs the example.
+///
+/// A debug build of the example needs close to 1 MiB of stack. Windows gives
+/// the main thread 1 MiB, so it overflows there. The example runs on a
+/// thread with a set stack instead, as the `harvest` CLI does.
+const STACK_BYTES: usize = 8 * 1024 * 1024;
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let worker = std::thread::Builder::new()
+        .name("agent-refine".to_owned())
+        .stack_size(STACK_BYTES)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?;
+            runtime
+                .block_on(example())
+                .map_err(|error| error.to_string())
+        })?;
+    worker.join().map_err(|_| "the example thread panicked")??;
+    Ok(())
+}
+
+/// The example itself, on the thread with the set stack.
+async fn example() -> Result<(), Box<dyn Error>> {
     let outcome = run(&RefineDecision::Approve).await?;
     println!("op 1 check: {:?}", outcome.op1);
     println!("version before: {}", show(outcome.before));
