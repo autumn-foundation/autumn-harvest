@@ -61,7 +61,7 @@ struct PlanLine {
 ///
 /// A plan gate that skips itself reports success over the defect it exists to
 /// catch. So a database that cannot be provisioned fails the gate.
-async fn plan_gate_db() -> claim_bench_db::BenchDb {
+pub async fn plan_gate_db() -> claim_bench_db::BenchDb {
     claim_bench_db::setup_bench_db().await.unwrap_or_else(|r| {
         panic!(
             "the census plan gates need an isolated database, from \
@@ -77,7 +77,7 @@ async fn plan_gate_db() -> claim_bench_db::BenchDb {
 /// Diesel sends a query with the extended protocol, which needs a value for
 /// each parameter. So the gate prepares the statement with `PREPARE` and
 /// forces its generic plan.
-async fn generic_plan(conn: &mut AsyncPgConnection, sql: &str) -> String {
+pub async fn generic_plan(conn: &mut AsyncPgConnection, sql: &str) -> String {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let name = format!("census_gate_{}", NEXT.fetch_add(1, Ordering::Relaxed));
     // Postgres numbers parameters from `$1` with no gap. A gated statement
@@ -115,7 +115,7 @@ async fn generic_plan(conn: &mut AsyncPgConnection, sql: &str) -> String {
 }
 
 /// Assert that `plan` reads `table` through `index` and never scans it.
-fn assert_served(plan: &str, table: &str, index: &str, what: &str) {
+pub fn assert_served(plan: &str, table: &str, index: &str, what: &str) {
     assert!(
         !plan.contains(&format!("Seq Scan on {table}")),
         "{what} reads the whole of {table}:\n{plan}"

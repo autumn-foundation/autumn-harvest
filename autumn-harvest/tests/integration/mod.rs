@@ -123,6 +123,10 @@ mod completion_callback_tests;
 #[cfg(feature = "db")]
 mod completion_trigger_outbox_queue_perf;
 mod concurrency_key_tests;
+#[cfg(feature = "db")]
+mod concurrency_live_index_perf;
+#[cfg(feature = "db")]
+mod concurrency_live_index_tests;
 mod concurrency_model_ci;
 #[cfg(feature = "db")]
 mod concurrency_override_db_tests;

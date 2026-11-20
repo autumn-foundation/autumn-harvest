@@ -1,0 +1,14 @@
+                                                        QUERY PLAN
+---------------------------------------------------------------------------------------------------------------------------
+ Unique (actual time=2.430..50.798 rows=40 loops=1)
+   Buffers: shared hit=1973 read=1471
+   ->  Index Scan using idx_harvest_tq_concurrency_live on harvest_task_queue (actual time=2.427..50.594 rows=740 loops=1)
+         Filter: ((state = 'PENDING'::text) AND (scheduled_at <= now()) AND (queue_name = ANY ($1)))
+         Rows Removed by Filter: 2709
+         Buffers: shared hit=1973 read=1471
+ Planning:
+   Buffers: shared hit=425 read=85
+ Planning Time: 3.552 ms
+ Execution Time: 50.830 ms
+(10 rows)
+

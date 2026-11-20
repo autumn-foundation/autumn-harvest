@@ -20,7 +20,7 @@ driver = "per_request"
 backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_run_default_overrides", "harvest_task_queue", "harvest_workflow_executions"]
-measured = "unmeasured"
+measured = "docs/performance-concurrency-live-index.md"
 
 ["db::recompute_in_flight_sla"]
 driver = "per_request"

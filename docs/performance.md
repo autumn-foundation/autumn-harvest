@@ -2848,6 +2848,9 @@ standalone note rather than part of the claim-path attribution table above:
   — the DLQ depth gauge read every dead letter: 744,158 buffers per call at
   1M dead letters. A counter of delta rows, kept by triggers, makes it 1
   buffer. A one-row dead-letter write costs about 2 to 4 buffers more.
+* [`docs/performance-concurrency-live-index.md`](performance-concurrency-live-index.md)
+  — the concurrency gauge read the whole task queue (issue #2678). A partial
+  index on the live keyed rows cuts each call by 93% at each size.
 * [`docs/performance-completion-trigger-outbox-queue.md`](performance-completion-trigger-outbox-queue.md)
   — the per-row `harvest_schedules` lookup in
   `completion_trigger::enforce_completion_triggers_outbox`'s cross-shard

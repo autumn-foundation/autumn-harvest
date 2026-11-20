@@ -150,7 +150,7 @@ Statements: 1. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT concurrency_key AS key, task_type, MAX(concurrency_cap)::INT4 AS max_concurrent, COUNT(*) ...` | `harvest_task_queue`: Bitmap Heap Scan on `idx_harvest_tq_live_created` |
+| 1 | `SELECT concurrency_key AS key, task_type, MAX(concurrency_cap)::INT4 AS max_concurrent, COUNT(*) ...` | `harvest_task_queue`: Bitmap Heap Scan on `idx_harvest_tq_concurrency_live` |
 
 ## `concurrency_key_workflows`
 
@@ -158,7 +158,7 @@ Statements: 1. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT t.concurrency_key AS key, t.task_type, e.workflow_name FROM harvest_task_queue t JOIN harv...` | `harvest_task_queue`: Bitmap Heap Scan on `idx_harvest_tq_live_created`<br>`harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
+| 1 | `SELECT t.concurrency_key AS key, t.task_type, e.workflow_name FROM harvest_task_queue t JOIN harv...` | `harvest_task_queue`: Bitmap Heap Scan on `idx_harvest_tq_concurrency_live`<br>`harvest_workflow_executions`: Index Scan on `harvest_workflow_executions_pkey` |
 
 ## `concurrency_probe_passes`
 
