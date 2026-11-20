@@ -297,33 +297,32 @@ fn show(version: Option<OverlayVersion>) -> String {
 
 /// The stack of the thread that runs the walk.
 ///
-/// The SQLite runtime drives each workflow on the calling thread. A debug
-/// build of the walk needs about 760 KiB of stack on Linux, and more on
-/// Windows. The main thread of a Windows process gets 1 MiB only, so the
-/// walk overflowed it in CI. A spawned thread gets the stack that it asks
-/// for, so the walk runs there. `autumn-harvest-cli/src/main.rs` does the
-/// same. Reproduce the overflow on Linux with `ulimit -s 768`.
+/// A debug build polls the walk through deep frames. On Linux the walk needs
+/// almost 1 MiB of stack. The Windows main thread has 1 MiB, so the example
+/// overflowed there with `STATUS_STACK_OVERFLOW`. A spawned thread gets the
+/// stack that the spawn asks for. 8 MiB is the Linux default for a main thread.
+/// `autumn-harvest-cli` does the same for the same reason.
+///
+/// Reproduce the Windows condition on Linux with `ulimit -s 1024`.
 const WALK_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let walk = std::thread::Builder::new()
         .name("agent-refine".to_owned())
         .stack_size(WALK_STACK_BYTES)
-        .spawn(|| -> Result<(), String> {
+        .spawn(|| {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| e.to_string())?;
-            runtime
-                .block_on(walk_and_report())
-                .map_err(|e| e.to_string())
+            runtime.block_on(walk_main()).map_err(|e| e.to_string())
         })?;
-    walk.join().map_err(|_| "the walk thread panicked")??;
-    Ok(())
+    let result = walk.join().map_err(|_| "the walk thread panicked")?;
+    result.map_err(Into::into)
 }
 
-/// Run the walk, print each step, and check the outcome.
-async fn walk_and_report() -> Result<(), Box<dyn Error>> {
+/// Run the walk with an approval, print each step and check each claim.
+async fn walk_main() -> Result<(), Box<dyn Error>> {
     let outcome = run(&RefineDecision::Approve).await?;
     println!("op 1 check: {:?}", outcome.op1);
     println!("version before: {}", show(outcome.before));

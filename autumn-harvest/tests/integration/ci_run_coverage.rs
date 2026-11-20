@@ -83,6 +83,11 @@ const CORE_MOD_RS: &str = include_str!("mod.rs");
 /// above, so the caller was fail-open. The two helper names are tokens as
 /// well, which classifies every caller of the shared fixture.
 ///
+/// The decision owner suites call `OwnDb::new()` from
+/// `decision_owner_claim_tests`. That helper wraps the shared fixture, so its
+/// callers carry no other token. `OwnDb::new(` is a token for that reason
+/// (issue #2723).
+///
 /// Matching uses comment-stripped code only (see [`strip_line_comments`]).
 /// Several no-DB HTTP tests name their sibling `testcontainers` suite in `//!`
 /// prose. The env-gated `status_summary_localpg` names `testcontainers` only in
@@ -99,6 +104,7 @@ const LIVE_DB_TOKENS: &[&str] = &[
     "setup_test_database_url(",
     "setup_test_database_url_or_env(",
     "FixtureServer::start(",
+    "OwnDb::new(",
 ];
 
 /// Drop whole-line comments (`//`, `///`, `//!`) so container tokens that
@@ -704,6 +710,25 @@ fn shared_fixture_callers_are_classified_as_db_gated() {
         assert!(
             needs_live_db(&src),
             "{stem} calls the shared database fixture and must classify as DB-gated"
+        );
+    }
+}
+
+/// Each suite gets its database from `OwnDb::new()`. The two callers carry
+/// no other token, so the guard missed them (issue #2723).
+/// `decision_owner_claim_tests` defines the helper and is a control.
+#[test]
+fn own_db_callers_are_classified_as_db_gated() {
+    let dir = core_integration_dir();
+    for stem in [
+        "decision_owner_claim_tests",
+        "owner_decider_tests",
+        "owner_failover_tests",
+    ] {
+        let src = read_source(&dir.join(format!("{stem}.rs")));
+        assert!(
+            needs_live_db(&src),
+            "{stem} calls `OwnDb::new()` and must classify as DB-gated"
         );
     }
 }
@@ -1751,6 +1776,215 @@ fn every_feature_gated_core_suite_executes_in_some_row() {
         "FEATURE_GATE_EXEMPT has entries that now execute or are no longer gated; remove them:\n  {}",
         stale.join("\n  ")
     );
+}
+
+/// True when the code of `source` names `feature = "<feat>"` as a gate.
+///
+/// A gate on a file, an item or a statement counts. A whole-line `//`
+/// comment does not count. A trailing comment or a block comment still
+/// counts. A negated `not(feature = "<feat>")` does not count, because a row
+/// without `feat` compiles that code in.
+fn names_feature(source: &str, feat: &str) -> bool {
+    let code = strip_line_comments(source);
+    let needle = format!("feature = \"{feat}\"");
+    code.match_indices(&needle)
+        .any(|(idx, _)| !code[..idx].ends_with("not("))
+}
+
+/// True when the `mod.rs` cfg or a `#![cfg]` file gate of a module needs
+/// `feat`. A row without `feat` then compiles the whole module out, and it
+/// runs nothing from that module.
+fn module_gated_on(mod_cfg: &str, source: &str, feat: &str) -> bool {
+    core_required_features(mod_cfg, source).contains(feat)
+}
+
+/// True when a `linux` row runs all of `module` and lists `feat`.
+///
+/// The coverage nightly runs each row with the features of that row only. The
+/// PR job builds one archive with the union of all rows. So only the row
+/// itself proves that the nightly compiles `feat` in.
+fn live_db_row_enables(rows: &[SuiteRow], module: &str, feat: &str) -> bool {
+    rows.iter().any(|r| {
+        r.krate == "autumn-harvest"
+            && r.target == "integration"
+            && r.runs()
+            && r.is_live_db()
+            && filter_runs_whole_module(&r.filter, module)
+            && r.feature_set().contains(feat)
+    })
+}
+
+/// The filters of the `linux` rows that select some test of `module` but do
+/// not list `feat`.
+///
+/// libtest matches a filter as a substring of `module::test_fn`. A row
+/// selects tests of `module` when its filter is `-`, occurs in the module
+/// name, or starts with `module::`. Such a row compiles a gated statement of
+/// `module` out in the nightly, so the test races there.
+fn live_db_rows_without(rows: &[SuiteRow], module: &str, feat: &str) -> Vec<String> {
+    let slice = format!("{module}::");
+    rows.iter()
+        .filter(|r| {
+            r.krate == "autumn-harvest"
+                && r.target == "integration"
+                && r.runs()
+                && r.is_live_db()
+                && (filter_runs_whole_module(&r.filter, module) || r.filter.starts_with(&slice))
+                && !r.feature_set().contains(feat)
+        })
+        .map(|r| r.filter.clone())
+        .collect()
+}
+
+/// A live-DB suite can gate an item or a statement on `testing`. A row
+/// without `testing` compiles it out. A gated test then never runs, and a
+/// gated wait lets its test race. Issue #2723 was such a race:
+/// `owner_decider_tests` skipped its rank wait in the coverage nightly.
+/// `every_feature_gated_core_suite_executes_in_some_row` reads file gates
+/// only, so it did not see the statement gate.
+///
+/// Two rules follow. A `linux` row with `testing` must run the whole suite.
+/// When the gate is not on the whole module, no `linux` row without `testing`
+/// may select the suite.
+///
+/// The guard reads the suite file only. A gate in a helper module that the
+/// suite imports is out of scope, and so is a harness-only file.
+#[test]
+fn every_live_db_suite_that_names_testing_runs_with_testing() {
+    let rows = parse_manifest();
+    let core_dir = core_integration_dir();
+    let mut missing = Vec::new();
+    for m in parse_core_modules() {
+        let path = core_dir.join(format!("{}.rs", m.name));
+        if !path.is_file() || SELF_EXCLUDE.contains(&m.name.as_str()) {
+            continue;
+        }
+        let src = read_source(&path);
+        if !needs_live_db(&src) || is_db_harness_only(&src) || all_tests_ignored(&src) {
+            continue;
+        }
+        if !names_feature(&m.cfg, "testing") && !names_feature(&src, "testing") {
+            continue;
+        }
+        if allowlisted(&format!("core:{}", m.name)) {
+            continue;
+        }
+        if !live_db_row_enables(&rows, &m.name, "testing") {
+            missing.push(format!(
+                "{name} (add `testing` to its `linux` row in .github/ci/integration-suites.txt)",
+                name = m.name
+            ));
+        }
+        if !module_gated_on(&m.cfg, &src, "testing") {
+            for filter in live_db_rows_without(&rows, &m.name, "testing") {
+                missing.push(format!(
+                    "{name} (the `linux` row `{filter}` selects it without `testing`)",
+                    name = m.name
+                ));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "these live-DB suites name the `testing` feature, but a `linux` row runs them \
+         without it. The coverage nightly then compiles the gated code out:\n  {}",
+        missing.join("\n  ")
+    );
+}
+
+#[test]
+fn names_feature_reads_code_and_skips_comment_lines() {
+    let statement_gate = "fn t() {\n    #[cfg(feature = \"testing\")]\n    wait();\n}\n";
+    assert!(names_feature(statement_gate, "testing"));
+    assert!(!names_feature(statement_gate, "chaos"));
+    let negated = "#[cfg(not(feature = \"testing\"))]\nfn t() {}\n";
+    assert!(
+        !names_feature(negated, "testing"),
+        "a negated gate is not a gate"
+    );
+    let both =
+        "#[cfg(not(feature = \"testing\"))]\nfn a() {}\n#[cfg(feature = \"testing\")]\nfn b() {}\n";
+    assert!(names_feature(both, "testing"));
+    let prose = "//! Run with `--features testing` (`feature = \"testing\"`).\nfn t() {}\n";
+    assert!(
+        !names_feature(prose, "testing"),
+        "a comment line is not a gate"
+    );
+}
+
+#[test]
+fn live_db_row_enables_needs_a_linux_row_with_the_feature() {
+    let row = |osclass: &str, features: &str, filter: &str| SuiteRow {
+        osclass: osclass.into(),
+        krate: "autumn-harvest".into(),
+        target: "integration".into(),
+        features: features.into(),
+        filter: filter.into(),
+    };
+    let module = "owner_decider_tests";
+    assert!(live_db_row_enables(
+        &[row("linux", "testing", module)],
+        module,
+        "testing"
+    ));
+    for (rows, why) in [
+        (row("linux", "-", module), "a row without the feature"),
+        (
+            row("allos", "testing", "-"),
+            "an `allos` row has no live DB",
+        ),
+        (
+            row("linuxpart", "testing", module),
+            "`linuxpart` never credits",
+        ),
+        (
+            row("linux", "testing", "owner_decider_tests::one"),
+            "a sub-filter runs a slice",
+        ),
+    ] {
+        assert!(!live_db_row_enables(&[rows], module, "testing"), "{why}");
+    }
+}
+
+#[test]
+fn live_db_rows_without_finds_every_row_that_drops_the_feature() {
+    let row = |osclass: &str, features: &str, filter: &str| SuiteRow {
+        osclass: osclass.into(),
+        krate: "autumn-harvest".into(),
+        target: "integration".into(),
+        features: features.into(),
+        filter: filter.into(),
+    };
+    let module = "replay_canary_tests";
+    let rows = [
+        row("linux", "testing", module),
+        row("linux", "-", "canary_tests"),
+        row("linux", "-", "replay_canary_tests::one"),
+        row("linux", "-", "other_tests"),
+        row("allos", "-", "canary_tests"),
+        row("linuxpart", "-", module),
+    ];
+    assert_eq!(
+        live_db_rows_without(&rows, module, "testing"),
+        vec![
+            "canary_tests".to_string(),
+            "replay_canary_tests::one".to_string()
+        ],
+        "a substring filter and a slice select the module; the others do not"
+    );
+}
+
+#[test]
+fn module_gated_on_reads_the_mod_cfg_and_the_file_gate_only() {
+    let file_gate = "#![cfg(all(feature = \"db\", feature = \"testing\"))]\nfn a() {}";
+    assert!(module_gated_on("", file_gate, "testing"));
+    assert!(module_gated_on(
+        "#[cfg(feature = \"testing\")]",
+        "",
+        "testing"
+    ));
+    let item_gate = "#[cfg(feature = \"testing\")]\nmod replay {}";
+    assert!(!module_gated_on("", item_gate, "testing"));
 }
 
 #[test]

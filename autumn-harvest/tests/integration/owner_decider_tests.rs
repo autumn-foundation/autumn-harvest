@@ -1,9 +1,13 @@
-#![cfg(feature = "db")]
+#![cfg(all(feature = "db", feature = "testing"))]
 //! The owner decider of issue #2255.
 //!
 //! In owner mode, the owner of a partition takes the workflow tasks of that
 //! partition by execution id. The shared claim loop takes activities only. Each test
 //! runs on its own database, because owner mode is a per-database switch.
+//!
+//! The suite needs `testing`. A test waits on `Worker::owner_ranked`, which
+//! only `testing` builds. A gate on the wait alone lets a build without
+//! `testing` skip the wait. The test then races (issue #2723).
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -935,7 +939,6 @@ async fn a_saturated_owner_takes_a_high_priority_run_first() {
     // that pass can go to a ranked normal run. Free the permit only after
     // the owner ranks the high-priority run. The owner must then take it
     // before the older backlog.
-    #[cfg(feature = "testing")]
     eventually("the owner ranks the high-priority run", async || {
         node.worker.owner_ranked(high)
     })
