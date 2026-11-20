@@ -727,6 +727,62 @@ async fn the_llm_ledger_moves_with_the_run() {
     assert_eq!(llm_calls(on_target), 1, "the target reports the call once");
 }
 
+/// An unresolved outbox request moves with the run. The target trigger adds
+/// its pending row, and the cutover removes the row of the sealed source.
+#[tokio::test]
+async fn an_unresolved_outbox_request_moves_with_the_run() {
+    let shards = setup_two_shards().await;
+    let mut source = shards.source().await;
+    let exec_id = insert_execution(&mut source, "entity_flow", "entity-outbox").await;
+    append_history(
+        &mut source,
+        exec_id,
+        &[
+            started(json!({"seed": 1})),
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id: autumn_harvest::types::ExternalSignalId::new(),
+                target: autumn_harvest::types::ExternalTarget::WorkflowId {
+                    workflow_name: "elsewhere".to_string(),
+                    workflow_id: "nobody".to_string(),
+                },
+                signal_name: "ping".to_string(),
+                payload: json!({}),
+                idempotency_key: None,
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: autumn_harvest::types::TimerId::new("wake"),
+                duration_secs: 604_800,
+            },
+        ],
+    )
+    .await;
+    park_on_timer(&mut source, exec_id).await;
+    let pending = "SELECT count(*)::BIGINT AS value FROM harvest_external_outbox_pending \
+                    WHERE workflow_exec_id = $1";
+    assert_eq!(count(&mut source, pending, exec_id).await, 1);
+
+    let outcome = migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migration must not error");
+    assert!(
+        matches!(outcome, MigrationOutcome::Migrated { .. }),
+        "expected a completed migration, got {outcome:?}"
+    );
+
+    let mut target = shards.target().await;
+    assert_eq!(
+        count(&mut target, pending, exec_id).await,
+        1,
+        "the target claims the request"
+    );
+    let mut source = shards.source().await;
+    assert_eq!(
+        count(&mut source, pending, exec_id).await,
+        0,
+        "the sealed source keeps no outbox row"
+    );
+}
+
 /// Issue #1974: a decision between verification and cutover can store
 /// durable stream chunks and park again with no new event. The history guard
 /// then still passes. Activation copies such chunks from the sealed source,

@@ -196,6 +196,7 @@ mod event_partitioning_tests;
 mod executor_span_tests;
 #[cfg(feature = "testing")]
 mod external_completion_tests;
+mod external_outbox_pending_tests;
 mod external_outbox_scan_tests;
 mod fairness_key_tests;
 mod fairness_key_worker_tests;
