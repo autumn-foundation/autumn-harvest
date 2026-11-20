@@ -46,7 +46,14 @@
 -- fires, run the migration again.
 SET LOCAL lock_timeout = '5s';
 
-LOCK TABLE harvest_dead_letters IN SHARE ROW EXCLUSIVE MODE;
+-- A `DO` block, because the test bundle runs this file in autocommit mode,
+-- where a bare `LOCK TABLE` is an error. In the migration transaction, the
+-- lock holds until the commit.
+DO $harvest_dead_letter_counts_lock$
+BEGIN
+    LOCK TABLE harvest_dead_letters IN SHARE ROW EXCLUSIVE MODE;
+END
+$harvest_dead_letter_counts_lock$;
 
 -- `slot` is a random key, so an insert never waits on a unique check, and no
 -- sequence must follow a promotion. The primary key also gives logical
