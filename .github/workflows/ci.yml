@@ -1311,12 +1311,28 @@ jobs:
       - name: Run the agent mesh example
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo run -p autumn-harvest-agent --features sqlite,eval,sandbox,anthropic,openai --example sqlite_mesh
+      # Issue #2741. AppArmor on Ubuntu can refuse a mount in a user
+      # namespace. The gate then fails the isolation tests. This step allows
+      # the namespace. It prints the old value as evidence.
+      - name: Allow user namespaces for the isolation tests (Linux)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 1
+        run: |
+          knob=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [ -e "${knob}" ]; then
+            echo "apparmor_restrict_unprivileged_userns was $(cat "${knob}")"
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       # Sandboxed code activities. The tests need no KVM: a fake VMM, fake
       # `firecracker` and `jailer` scripts and a fake API server stand in. The
       # Linux backends compile on Linux only, so the other OSes run the
       # portable protocol, policy and capture tests.
+      # `HARVEST_TEST_REQUIRE_ISOLATION=1` turns each isolation skip into a
+      # failure (issue #2741). Only the Linux tests read it.
+      # `sandbox::isolation_gate` checks that this step sets it.
       - name: Run sandboxed code activity tests
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
+        env:
+          HARVEST_TEST_REQUIRE_ISOLATION: "1"
         run: cargo sandbox-test
       - name: Run sandbox guest agent tests
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
