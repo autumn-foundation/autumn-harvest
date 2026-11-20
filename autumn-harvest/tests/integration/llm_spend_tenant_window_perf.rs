@@ -9,8 +9,8 @@
 //!
 //! The ledger has two indexes: the primary key `(workflow_exec_id, event_id,
 //! call_index)` and `recorded_at`. Neither serves the per-run window read. The
-//! read takes every row of each run through the primary key, fetches each row
-//! from the heap, and then drops the rows outside the window. A heap page holds
+//! read takes every row of each run through the primary key. It fetches each
+//! row from the heap, and then drops the rows outside the window. A heap page holds
 //! the rows of many runs, because the ledger takes its rows in time order. So
 //! the read touches about one heap page for each ledger row of each run.
 //!
@@ -361,8 +361,8 @@ async fn llm_spend_covering_index_does_not_change_the_spend() {
 ///   tenants, so `tenant-0` takes about 13% of the keyed runs.
 /// - 90% of the runs last 1 to 30 minutes, 9.7% last 1 to 12 hours, and 0.3%
 ///   last 1 to 10 days. A run that has not ended by now is `RUNNING`.
-/// - Calls per run: 70% make 1 to 5, 25% make 6 to 40, 5% make 100 to 600,
-///   and a multi-day run makes 500 to 3,000. They spread evenly over the run.
+/// - Calls per run: 70% make 1 to 5, 25% make 6 to 40, and 5% make 100 to
+///   600. A multi-day run makes 500 to 3,000. They spread evenly over the run.
 ///
 /// One `random()` draw per column, in one row source, so a later `CASE` arm
 /// never draws again. The ledger rows go in in time order, as the engine
@@ -649,8 +649,8 @@ async fn ledger_table_stats(conn: &mut AsyncPgConnection) -> String {
 
 /// Run the workload once, and write the artifacts of one label.
 ///
-/// The workload is the database half of an agent fleet's LLM steps: each step
-/// reads the spend of its run and its tenant, and each completed step writes
+/// The workload is the database half of the LLM steps of an agent fleet. Each
+/// step reads the spend of its run and its tenant. Each completed step writes
 /// one ledger row.
 async fn capture(
     conn: &mut AsyncPgConnection,
