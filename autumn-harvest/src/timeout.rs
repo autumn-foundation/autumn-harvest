@@ -716,27 +716,32 @@ const TIMEOUT_SWEEP_START_SQL: &str = "SELECT NOW() AS as_of";
 /// test can replace the key lookup.
 pub(crate) fn timeout_batch_query(predicate: &str) -> String {
     format!(
-        "{TIMEOUT_BATCH_PAGE} SELECT q.* FROM ({}) q ORDER BY q.id",
-        on_refill_page(predicate)
+        "WITH batch AS MATERIALIZED (SELECT * FROM harvest_task_queue WHERE id = ANY($1)) \
+         SELECT q.* FROM ({}) q ORDER BY q.id",
+        on_batch(predicate)
     )
 }
 
 /// The ids among `$1` that match `predicate` now (issue #1795).
 ///
 /// It selects ids only. A probe of a large batch then loads no payloads. It
-/// reads the batch as [`timeout_batch_query`] does, but its page holds the
+/// reads the batch as [`timeout_batch_query`] does, but its CTE holds the
 /// predicate columns only.
 pub(crate) fn timeout_probe_query(predicate: &str) -> String {
     format!(
-        "WITH page AS MATERIALIZED (SELECT {TIMEOUT_PAGE_COLUMNS} FROM harvest_task_queue \
+        "WITH batch AS MATERIALIZED (SELECT {TIMEOUT_PAGE_COLUMNS} FROM harvest_task_queue \
          WHERE id = ANY($1)) SELECT q.id FROM ({}) q",
-        on_refill_page(predicate)
+        on_batch(predicate)
     )
 }
 
-/// The rows of a batch of ids, as the `page` that [`on_refill_page`] names.
-const TIMEOUT_BATCH_PAGE: &str =
-    "WITH page AS MATERIALIZED (SELECT * FROM harvest_task_queue WHERE id = ANY($1))";
+/// Points a timeout predicate at the `batch` CTE of a re-read.
+///
+/// The CTE is not named `page`, so a re-read is not counted as a refill
+/// page read.
+fn on_batch(predicate: &str) -> String {
+    predicate.replacen("FROM harvest_task_queue", "FROM batch", 1)
+}
 
 /// The batch and probe statements of each task timeout scan, for the plan
 /// test in `row_guard`.
@@ -7837,9 +7842,9 @@ mod tests {
         assert_eq!(
             sql,
             format!(
-                "WITH page AS MATERIALIZED (SELECT * FROM harvest_task_queue \
+                "WITH batch AS MATERIALIZED (SELECT * FROM harvest_task_queue \
                  WHERE id = ANY($1)) SELECT q.* FROM ({}) q ORDER BY q.id",
-                on_refill_page(predicate)
+                on_batch(predicate)
             )
         );
         // The batch keeps the reason of the refill. See the integration test
@@ -8036,7 +8041,7 @@ mod tests {
         for (_, predicate) in task_timeout_scans() {
             let sql = timeout_probe_query(predicate);
             assert!(
-                sql.starts_with("WITH page AS MATERIALIZED (")
+                sql.starts_with("WITH batch AS MATERIALIZED (")
                     && sql.contains(" SELECT q.id FROM ("),
                 "{sql}"
             );

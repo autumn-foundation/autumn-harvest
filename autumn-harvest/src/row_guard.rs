@@ -1189,7 +1189,7 @@ mod tests {
     /// loads its ids through the primary key in a fence.
     #[test]
     fn every_guarded_statement_hides_its_guard() {
-        const FENCE: &str = "WITH page AS MATERIALIZED (SELECT ";
+        const FENCE: &str = "WITH batch AS MATERIALIZED (SELECT ";
         const KEYED: &str = " FROM harvest_task_queue WHERE id = ANY($1))";
         for statement in guarded_statements() {
             let hidden = if statement.name.starts_with("timeout_") {
