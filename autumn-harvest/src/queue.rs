@@ -5697,10 +5697,12 @@ impl PendingHintRow {
 /// SQL for [`record_pending_hints`]. Reads the hint columns for named rows.
 #[must_use]
 pub const fn pending_hint_rows_query() -> &'static str {
-    "SELECT id, queue_name, scheduled_at, priority, task_type \
-     FROM harvest_task_queue \
-     WHERE id = ANY($1) \
-       AND state = 'PENDING'"
+    concat!(
+        "SELECT id, queue_name, scheduled_at, priority, task_type \
+         FROM harvest_task_queue \
+         WHERE id = ANY($1) AND ",
+        crate::row_guard::row_guard_sql!("state = 'PENDING'")
+    )
 }
 
 /// Record a dispatch hint for one row a write left `PENDING`.

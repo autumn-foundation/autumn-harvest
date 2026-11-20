@@ -6,11 +6,16 @@
 //! partial index. Two fixtures make the planner try:
 //!
 //! - Grouped: 100,000 rows, and 5 to 200 `RUNNING` rows for each of 100
-//!   workers. `running_worker_idx` then costs less than the primary key.
+//!   workers. At 5 to 50 rows per worker, `running_worker_idx` can cost less
+//!   than the primary key.
 //! - Idle: the statistics come from a table with no live row. Each live
 //!   partial index then looks empty.
 //!
-//! Each fixture gets its own fresh, migrated database.
+//! Other tests prove that the `CASE` form keeps the same rows. Each test owns
+//! a fresh, migrated database and drops it at the end.
+//!
+//! Execution: set `HARVEST_TEST_DATABASE_URL` to a Postgres server, or let
+//! each test start a container.
 
 use autumn_harvest::row_guard::{GuardedStatement, guarded_statements};
 use diesel::QueryableByName;
@@ -41,30 +46,71 @@ async fn setup_server() -> (String, DbGuard) {
     (url, Some(container))
 }
 
-async fn create_fresh_db(admin_url: &str) -> AsyncPgConnection {
-    let name = format!("row_guard_{}", uuid::Uuid::new_v4().simple());
-    let mut admin = AsyncPgConnection::establish(admin_url)
-        .await
-        .expect("connect to admin database");
-    admin
-        .batch_execute(&format!("CREATE DATABASE \"{name}\""))
-        .await
-        .expect("create database");
-    let (prefix, _) = admin_url.rsplit_once('/').expect("url has a db segment");
-    let mut conn = AsyncPgConnection::establish(&format!("{prefix}/{name}"))
-        .await
-        .expect("connect to fresh database");
-    conn.batch_execute(&autumn_harvest::test_init_sql())
-        .await
-        .expect("apply migration bundle");
-    conn.batch_execute("ALTER TABLE harvest_task_queue SET (autovacuum_enabled = false)")
-        .await
-        .expect("turn off autovacuum");
-    conn
+/// `url` with its database set to `database`. A query string stays.
+fn with_database(url: &str, database: &str) -> String {
+    let (base, query) = url
+        .split_once('?')
+        .map_or((url, None), |(b, q)| (b, Some(q)));
+    let (prefix, _) = base.rsplit_once('/').expect("a database URL has a path");
+    query.map_or_else(
+        || format!("{prefix}/{database}"),
+        |query| format!("{prefix}/{database}?{query}"),
+    )
+}
+
+/// A fresh, migrated database that one test owns.
+struct Db {
+    conn: AsyncPgConnection,
+    url: String,
+    name: String,
+    server: String,
+}
+
+impl Db {
+    /// Create and migrate a database on `server`. Autovacuum is off on the
+    /// task queue, so no background analyze changes the statistics.
+    async fn create(server: &str) -> Self {
+        let name = format!("row_guard_{}", uuid::Uuid::new_v4().simple());
+        AsyncPgConnection::establish(server)
+            .await
+            .expect("connect to the server")
+            .batch_execute(&format!("CREATE DATABASE {name}"))
+            .await
+            .expect("create database");
+        let url = with_database(server, &name);
+        let mut conn = AsyncPgConnection::establish(&url)
+            .await
+            .expect("connect to the fresh database");
+        conn.batch_execute(&autumn_harvest::test_init_sql())
+            .await
+            .expect("apply migration bundle");
+        conn.batch_execute("ALTER TABLE harvest_task_queue SET (autovacuum_enabled = false)")
+            .await
+            .expect("turn off autovacuum");
+        Self {
+            conn,
+            url,
+            name,
+            server: server.to_owned(),
+        }
+    }
+
+    /// Drop the database, best effort.
+    async fn drop(self) {
+        let Self {
+            conn, name, server, ..
+        } = self;
+        drop(conn);
+        if let Ok(mut admin) = AsyncPgConnection::establish(&server).await {
+            let _ = admin
+                .batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+                .await;
+        }
+    }
 }
 
 /// Insert `rows` rows. The first `running` are `RUNNING`, spread over the
-/// workers. The rest are terminal or `PENDING`.
+/// workers. Of the rest, 2% are `PENDING`, and the others are terminal.
 async fn seed(conn: &mut AsyncPgConnection, rows: i64, running: i64) {
     conn.batch_execute(&format!(
         "INSERT INTO harvest_task_queue \
@@ -92,34 +138,12 @@ async fn analyze(conn: &mut AsyncPgConnection) {
         .expect("vacuum analyze");
 }
 
-/// A fixture with `per_worker` `RUNNING` rows for each worker.
-async fn grouped_fixture(admin_url: &str, per_worker: i64) -> AsyncPgConnection {
-    let mut conn = create_fresh_db(admin_url).await;
-    seed(&mut conn, ROWS, per_worker * WORKERS).await;
-    analyze(&mut conn).await;
-    conn
-}
-
-/// A fixture whose statistics come from a table with no live row. The live
-/// rows arrive after the analyze, as a load arrives after an idle period.
-async fn idle_fixture(admin_url: &str) -> AsyncPgConnection {
-    let mut conn = create_fresh_db(admin_url).await;
-    conn.batch_execute(&format!(
-        "INSERT INTO harvest_task_queue (queue_name, task_type, input, state, attempt) \
-         SELECT 'default', 'workflow', '{{}}'::jsonb, 'COMPLETED', 1 \
-         FROM generate_series(1, {ROWS})"
-    ))
-    .await
-    .expect("seed terminal rows");
-    analyze(&mut conn).await;
-    seed(&mut conn, 2_000, 2_000).await;
-    conn
-}
-
-/// A literal for a parameter of `ty`. A generic plan does not read it.
+/// A literal for a parameter of `ty`. A custom plan reads it. A generic plan
+/// does not.
 fn argument(ty: &str) -> &'static str {
     match ty {
         "uuid" => "'00000000-0000-0000-0000-000000000000'",
+        "uuid[]" => "'{00000000-0000-0000-0000-000000000000}'",
         "text" => "'worker-7'",
         "integer" | "bigint" | "double precision" => "1",
         "timestamptz" => "now()",
@@ -189,7 +213,12 @@ fn task_queue_scans(node: &serde_json::Value, out: &mut Vec<(String, String, Str
                 .unwrap_or_default()
                 .to_owned()
         };
-        out.push((text("Alias"), text("Node Type"), text("Index Name")));
+        let index = if text("Node Type") == "Bitmap Heap Scan" {
+            bitmap_indexes(node).join(",")
+        } else {
+            text("Index Name")
+        };
+        out.push((text("Alias"), text("Node Type"), index));
     }
     if let Some(children) = node.get("Plans").and_then(|v| v.as_array()) {
         for child in children {
@@ -198,14 +227,31 @@ fn task_queue_scans(node: &serde_json::Value, out: &mut Vec<(String, String, Str
     }
 }
 
+/// The indexes that the bitmap index scans under `node` read.
+fn bitmap_indexes(node: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for child in node
+        .get("Plans")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        if let Some(index) = child.get("Index Name").and_then(|v| v.as_str()) {
+            out.push(index.to_owned());
+        }
+        out.extend(bitmap_indexes(child));
+    }
+    out
+}
+
 /// A scan that may use another index. The concurrency cap recheck counts the
 /// running rows of a key through the `recheck` alias, by design.
 fn exempt(alias: &str) -> bool {
     alias == "recheck"
 }
 
-/// Every statement on `conn` reads its target row through the primary key.
-async fn assert_primary_key_plans(conn: &mut AsyncPgConnection, fixture: &str) {
+/// Each statement on `conn` that leaves the primary key, as a message.
+async fn primary_key_failures(conn: &mut AsyncPgConnection, fixture: &str) -> Vec<String> {
     let mut failures = Vec::new();
     for statement in guarded_statements() {
         for (settings_name, settings) in SETTINGS {
@@ -216,7 +262,8 @@ async fn assert_primary_key_plans(conn: &mut AsyncPgConnection, fixture: &str) {
                 let checked: Vec<_> = scans.iter().filter(|(a, _, _)| !exempt(a)).collect();
                 let on_pkey = !checked.is_empty()
                     && checked.iter().all(|(_, node, index)| {
-                        node.starts_with("Index") && index == "harvest_task_queue_pkey"
+                        (node.starts_with("Index") || node == "Bitmap Heap Scan")
+                            && index == "harvest_task_queue_pkey"
                     });
                 if !on_pkey {
                     failures.push(format!(
@@ -227,6 +274,25 @@ async fn assert_primary_key_plans(conn: &mut AsyncPgConnection, fixture: &str) {
             }
         }
     }
+    failures
+}
+
+#[tokio::test]
+async fn by_id_guards_use_the_primary_key_for_any_slot_count() {
+    let (server, _guard) = setup_server().await;
+    let mut db = Db::create(&server).await;
+    let mut failures = Vec::new();
+    for per_worker in [5, 20, 50, 200] {
+        db.conn
+            .batch_execute("TRUNCATE harvest_task_queue CASCADE")
+            .await
+            .expect("empty the queue");
+        seed(&mut db.conn, ROWS, per_worker * WORKERS).await;
+        analyze(&mut db.conn).await;
+        let fixture = format!("{per_worker} per worker");
+        failures.extend(primary_key_failures(&mut db.conn, &fixture).await);
+    }
+    db.drop().await;
     assert!(
         failures.is_empty(),
         "these by-id statements leave the primary key:\n{}",
@@ -234,20 +300,29 @@ async fn assert_primary_key_plans(conn: &mut AsyncPgConnection, fixture: &str) {
     );
 }
 
-#[tokio::test]
-async fn by_id_guards_use_the_primary_key_for_any_slot_count() {
-    let (url, _guard) = setup_server().await;
-    for per_worker in [5, 20, 50, 200] {
-        let mut conn = grouped_fixture(&url, per_worker).await;
-        assert_primary_key_plans(&mut conn, &format!("{per_worker} per worker")).await;
-    }
-}
-
+/// The statistics come from a table with no live row. The live rows arrive
+/// after the analyze, as a load arrives after an idle period.
 #[tokio::test]
 async fn by_id_guards_use_the_primary_key_after_an_idle_analyze() {
-    let (url, _guard) = setup_server().await;
-    let mut conn = idle_fixture(&url).await;
-    assert_primary_key_plans(&mut conn, "idle statistics").await;
+    let (server, _guard) = setup_server().await;
+    let mut db = Db::create(&server).await;
+    db.conn
+        .batch_execute(&format!(
+            "INSERT INTO harvest_task_queue (queue_name, task_type, input, state, attempt) \
+             SELECT 'default', 'workflow', '{{}}'::jsonb, 'COMPLETED', 1 \
+             FROM generate_series(1, {ROWS})"
+        ))
+        .await
+        .expect("seed terminal rows");
+    analyze(&mut db.conn).await;
+    seed(&mut db.conn, 2_000, 2_000).await;
+    let failures = primary_key_failures(&mut db.conn, "idle statistics").await;
+    db.drop().await;
+    assert!(
+        failures.is_empty(),
+        "these by-id statements leave the primary key:\n{}",
+        failures.join("\n")
+    );
 }
 
 // ── Equivalence: the CASE form keeps the same rows ─────────────────────────
@@ -280,10 +355,7 @@ struct Verdict {
 
 /// `WHERE a AND CASE WHEN g THEN true END` keeps a row exactly when
 /// `WHERE a AND g` keeps it, for each SQL truth value of `a` and `g`.
-#[tokio::test]
-async fn the_case_form_keeps_a_row_exactly_when_the_guard_is_true() {
-    let (url, _guard) = setup_server().await;
-    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+async fn assert_truth_table(conn: &mut AsyncPgConnection) {
     let verdicts: Vec<Verdict> = diesel::sql_query(
         "SELECT ((a AND (CASE WHEN g THEN true END)) IS TRUE) \
                   = ((a AND g) IS TRUE) AS same, \
@@ -291,7 +363,7 @@ async fn the_case_form_keeps_a_row_exactly_when_the_guard_is_true() {
          FROM (VALUES (true), (false), (NULL::boolean)) AS x(a), \
               (VALUES (true), (false), (NULL::boolean)) AS y(g)",
     )
-    .load(&mut conn)
+    .load(conn)
     .await
     .expect("truth table");
     assert_eq!(verdicts.len(), 9, "every pair of truth values");
@@ -337,7 +409,8 @@ struct Digest {
     digest: String,
 }
 
-/// The rows that `sql` returns or changes for task `id`, rolled back after.
+/// The rows that `sql` returns or changes for task `id`. The transaction then
+/// rolls back.
 ///
 /// A changed row shows its columns that a guard or a release sets. A time
 /// column shows only whether it is NULL, because each run reads a new clock.
@@ -353,6 +426,7 @@ async fn effect_of(
         .iter()
         .map(|ty| match *ty {
             "uuid" => format!("'{id}'"),
+            "uuid[]" => format!("ARRAY['{id}']::uuid[]"),
             other => argument(other).to_owned(),
         })
         .collect();
@@ -389,8 +463,9 @@ async fn effect_of(
     digest.digest
 }
 
-/// Each raw statement returns or changes the same rows in the CASE form and
-/// in the plain form, for every seeded row.
+/// The `CASE` form keeps a row exactly when the plain guard keeps it. Each
+/// raw statement then returns or changes the same rows in both forms, for
+/// every seeded row.
 #[tokio::test]
 async fn each_raw_statement_changes_the_same_rows_in_both_forms() {
     #[derive(QueryableByName)]
@@ -398,22 +473,22 @@ async fn each_raw_statement_changes_the_same_rows_in_both_forms() {
         #[diesel(sql_type = Text)]
         id: String,
     }
-    let (url, _guard) = setup_server().await;
-    let mut conn = create_fresh_db(&url).await;
-    seed_differential(&mut conn).await;
+    let (server, _guard) = setup_server().await;
+    let mut db = Db::create(&server).await;
+    assert_truth_table(&mut db.conn).await;
+    seed_differential(&mut db.conn).await;
     let ids: Vec<Id> = diesel::sql_query("SELECT id::text AS id FROM harvest_task_queue")
-        .load(&mut conn)
+        .load(&mut db.conn)
         .await
         .expect("ids");
-    let mut matched = 0;
     for statement in guarded_statements().into_iter().filter(|s| s.raw) {
         let plain = plain_form(&statement.sql);
         assert_ne!(plain, statement.sql, "{} has a CASE guard", statement.name);
-        assert!(!plain.contains("CASE WHEN state"), "{plain}");
+        assert!(!plain.contains(" THEN true END)"), "{plain}");
         let mut hits = 0;
         for Id { id } in &ids {
-            let guarded = effect_of(&mut conn, &statement, &statement.sql, id).await;
-            let unguarded = effect_of(&mut conn, &statement, &plain, id).await;
+            let guarded = effect_of(&mut db.conn, &statement, &statement.sql, id).await;
+            let unguarded = effect_of(&mut db.conn, &statement, &plain, id).await;
             assert_eq!(
                 guarded, unguarded,
                 "{} differs from its plain form for row {id}",
@@ -429,13 +504,12 @@ async fn each_raw_statement_changes_the_same_rows_in_both_forms() {
             "{}: the fixture matches every row",
             statement.name
         );
-        matched += hits;
     }
-    assert!(matched > 0);
+    db.drop().await;
 }
 
-/// The number of sessions that wait on a lock.
-async fn lock_waiters(conn: &mut AsyncPgConnection) -> i64 {
+/// The number of sessions of this database that wait on another session.
+async fn blocked_sessions(conn: &mut AsyncPgConnection) -> i64 {
     #[derive(QueryableByName)]
     struct Count {
         #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -443,12 +517,97 @@ async fn lock_waiters(conn: &mut AsyncPgConnection) -> i64 {
     }
     let count: Count = diesel::sql_query(
         "SELECT count(*) AS n FROM pg_stat_activity \
-         WHERE wait_event_type = 'Lock' AND datname = current_database()",
+         WHERE datname = current_database() \
+           AND cardinality(pg_blocking_pids(pid)) > 0",
     )
     .get_result(conn)
     .await
-    .expect("lock waiters");
+    .expect("blocked sessions");
     count.n
+}
+
+/// When a concurrent writer commits, against the release.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Order {
+    /// The writer commits before the release starts.
+    CommitsFirst,
+    /// The writer holds the row lock, so the release waits for it.
+    HoldsTheRow,
+    /// The writer commits after the release ends.
+    CommitsLast,
+}
+
+/// One concurrent writer beside one release.
+struct Case {
+    name: &'static str,
+    release: &'static str,
+    writer: &'static str,
+    order: Order,
+    want: usize,
+}
+
+/// Run `sql` as the release of `case` on a new claimed row. Return the
+/// number of rows that the release changed.
+async fn run_beside_writer(
+    setup: &mut AsyncPgConnection,
+    db_url: &str,
+    case: &Case,
+    sql: String,
+) -> usize {
+    let id = uuid::Uuid::new_v4();
+    let queue = format!("q-{id}");
+    setup
+        .batch_execute(&format!(
+            "INSERT INTO harvest_task_queue \
+                 (id, queue_name, task_type, input, state, worker_id, started_at, attempt) \
+             VALUES ('{id}', '{queue}', 'activity', '{{}}'::jsonb, 'RUNNING', \
+                     'worker-7', now(), 1)"
+        ))
+        .await
+        .expect("insert claimed row");
+    let writer = case
+        .writer
+        .replace("$ID", &format!("'{id}'"))
+        .replace("$QUEUE", &format!("'{queue}'"));
+
+    let mut writer_conn = AsyncPgConnection::establish(db_url).await.expect("writer");
+    writer_conn
+        .batch_execute(&format!("BEGIN; {writer}"))
+        .await
+        .expect("writer runs");
+    if case.order == Order::CommitsFirst {
+        writer_conn.batch_execute("COMMIT").await.expect("commit");
+    }
+
+    let mut release_conn = AsyncPgConnection::establish(db_url).await.expect("release");
+    let release = tokio::spawn(async move {
+        diesel::sql_query(sql)
+            .bind::<diesel::sql_types::Uuid, _>(id)
+            .bind::<Text, _>("worker-7")
+            .execute(&mut release_conn)
+            .await
+            .expect("release")
+    });
+    if case.order == Order::HoldsTheRow {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while blocked_sessions(setup).await == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{}: the release never waited on the row",
+                case.name
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        writer_conn.batch_execute("COMMIT").await.expect("commit");
+    }
+    let changed = tokio::time::timeout(std::time::Duration::from_secs(30), release)
+        .await
+        .unwrap_or_else(|_| panic!("{}: the release hangs", case.name))
+        .expect("release task");
+    if case.order == Order::CommitsLast {
+        writer_conn.batch_execute("COMMIT").await.expect("commit");
+    }
+    changed
 }
 
 /// A release that runs beside a concurrent writer gives the same result in
@@ -458,28 +617,12 @@ async fn lock_waiters(conn: &mut AsyncPgConnection) -> i64 {
 /// version, the CASE included. A completion or a reclaim that commits first
 /// makes the release change nothing. A heartbeat keeps the claim, so the
 /// release still applies. A pause is seen only when it commits before the
-/// release starts. The queue lock covers a pause that commits later.
+/// release starts. In production, `try_lock_queue_for_claim` orders a later
+/// pause after the claim.
 #[tokio::test]
 async fn a_release_beside_a_completion_reclaim_or_pause_matches_the_plain_form() {
     use autumn_harvest::queue_pause::{release_claim_if_queue_paused_query, release_claim_query};
 
-    /// When the writer commits, against the release.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Order {
-        /// The writer commits before the release starts.
-        CommitsFirst,
-        /// The writer holds the row lock, so the release waits for it.
-        HoldsTheRow,
-        /// The writer commits after the release ends.
-        CommitsLast,
-    }
-    struct Case {
-        name: &'static str,
-        release: &'static str,
-        writer: &'static str,
-        order: Order,
-        want: usize,
-    }
     let cases = [
         Case {
             name: "completion",
@@ -503,7 +646,7 @@ async fn a_release_beside_a_completion_reclaim_or_pause_matches_the_plain_form()
             want: 1,
         },
         Case {
-            name: "pause after the release starts",
+            name: "pause in flight during the release",
             release: release_claim_if_queue_paused_query(),
             writer: "INSERT INTO harvest_queue_pauses (queue_name, reason) VALUES ($QUEUE, 'test')",
             order: Order::CommitsLast,
@@ -518,90 +661,19 @@ async fn a_release_beside_a_completion_reclaim_or_pause_matches_the_plain_form()
         },
     ];
 
-    let (url, _guard) = setup_server().await;
-    let mut setup = create_fresh_db(&url).await;
-    let db_url = {
-        #[derive(QueryableByName)]
-        struct Name {
-            #[diesel(sql_type = Text)]
-            name: String,
-        }
-        let name: Name = diesel::sql_query("SELECT current_database() AS name")
-            .get_result(&mut setup)
-            .await
-            .expect("database name");
-        let (prefix, _) = url.rsplit_once('/').expect("url has a db segment");
-        format!("{prefix}/{}", name.name)
-    };
-
-    for case in cases {
+    let (server, _guard) = setup_server().await;
+    let db = Db::create(&server).await;
+    let mut setup = AsyncPgConnection::establish(&db.url).await.expect("setup");
+    for case in &cases {
         for sql in [case.release.to_owned(), plain_form(case.release)] {
-            let id = uuid::Uuid::new_v4();
-            let queue = format!("q-{id}");
-            setup
-                .batch_execute(&format!(
-                    "INSERT INTO harvest_task_queue \
-                         (id, queue_name, task_type, input, state, worker_id, started_at, attempt) \
-                     VALUES ('{id}', '{queue}', 'activity', '{{}}'::jsonb, 'RUNNING', \
-                             'worker-7', now(), 1)"
-                ))
-                .await
-                .expect("insert claimed row");
-            let writer = case
-                .writer
-                .replace("$ID", &format!("'{id}'"))
-                .replace("$QUEUE", &format!("'{queue}'"));
-
-            let mut holder = AsyncPgConnection::establish(&db_url).await.expect("holder");
-            holder
-                .batch_execute(&format!("BEGIN; {writer}"))
-                .await
-                .expect("writer runs");
-            if case.order == Order::CommitsFirst {
-                holder
-                    .batch_execute("COMMIT")
-                    .await
-                    .expect("writer commits");
-            }
-
-            let mut releaser = AsyncPgConnection::establish(&db_url)
-                .await
-                .expect("releaser");
-            let waiting = tokio::spawn(async move {
-                diesel::sql_query(sql)
-                    .bind::<diesel::sql_types::Uuid, _>(id)
-                    .bind::<Text, _>("worker-7")
-                    .execute(&mut releaser)
-                    .await
-                    .expect("release")
-            });
-            if case.order == Order::HoldsTheRow {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                while lock_waiters(&mut setup).await == 0 {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "{}: the release never waited on the row",
-                        case.name
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-                holder
-                    .batch_execute("COMMIT")
-                    .await
-                    .expect("writer commits");
-            }
-            let released = waiting.await.expect("release task");
-            if case.order == Order::CommitsLast {
-                holder
-                    .batch_execute("COMMIT")
-                    .await
-                    .expect("writer commits");
-            }
+            let changed = run_beside_writer(&mut setup, &db.url, case, sql).await;
             assert_eq!(
-                released, case.want,
-                "{}: the release changed {released} rows",
+                changed, case.want,
+                "{}: the release changed {changed} rows",
                 case.name
             );
         }
     }
+    drop(setup);
+    db.drop().await;
 }

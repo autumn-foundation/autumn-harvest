@@ -318,8 +318,8 @@ pub async fn release_claim_if_queue_paused(
 /// with their own tail at compile time. Both releases must restore `attempt`
 /// and use the same `state = 'RUNNING' AND worker_id = $2` guard. One copy
 /// makes that structural, not a convention that two sites must remember.
-/// The guard goes through `row_guard_sql!`, so the plan
-/// reads the primary key.
+/// The guard goes through `row_guard_sql!`, so the planner reads the row
+/// through the primary key.
 macro_rules! release_claim_prefix {
     () => {
         concat!(

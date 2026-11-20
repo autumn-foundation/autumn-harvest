@@ -8,11 +8,13 @@ Many statements find one `harvest_task_queue` row by `id` and guard it on
 - `harvest_task_queue_running_worker_idx (worker_id) WHERE state = 'RUNNING'`
 - `idx_harvest_tq_running_started (started_at) WHERE state = 'RUNNING'`
 - `idx_harvest_tq_live_created (...) WHERE state IN ('PENDING', 'RUNNING')`
+- `harvest_task_queue_concurrency_key_running (concurrency_key) WHERE state = 'RUNNING' ...`
+- the `state = 'PENDING'` indexes, such as `idx_harvest_tq_poll`
 
 Each path estimates one row. The planner then picks the smaller index, not
-the primary key. That index path reads one heap tuple for each row that the
-partial index holds, then filters on `id`. A cached generic plan keeps the
-choice for the life of the connection.
+the primary key. That index path reads one heap tuple for each entry of the
+partial index that matches the guard. Then it filters on `id`. A cached
+generic plan keeps the choice for the life of the connection.
 
 ## Facts (white hat)
 
@@ -22,8 +24,11 @@ Fixture: a migrated database, claim settings, `force_generic_plan`.
 |---|---|---|--:|---|--:|
 | 1M rows, 20 RUNNING per worker | `state` + `worker_id` | `running_worker_idx` | 24 | `pkey` | 6 |
 | 100k rows, 20 RUNNING per worker | `state` + `worker_id` | `running_worker_idx` | 24 | `pkey` | 6 |
-| 100k rows, stats from an idle table | `state` only | `live_created` | all live rows | `pkey` | 4 |
-| 100k rows, stats from an idle table | `state IN (...)` | `live_created` | all live rows | `pkey` | 4 |
+| 1M rows, stats from an idle table | `state` + `worker_id` | `live_created` | 201 | `pkey` | 6 |
+| 1M rows, stats from an idle table | `state` only | `live_created` | 200 | `pkey` | 5 |
+| 100k rows, stats from an idle table | `state IN (...)` | `live_created` | — | `pkey` | — |
+
+The 100k rows of the last row show the plan choice only.
 
 The idle-table row is new evidence. Autovacuum often analyzes the queue
 while no task runs. The partial indexes then have `reltuples = 0`, and every
@@ -55,7 +60,7 @@ Decision: option 1, through one helper for raw SQL and one for Diesel.
 | A concurrent writer changes the row, and the recheck of the new row version skips the `CASE`. | Postgres rechecks every qual of an `UPDATE`. A concurrency test blocks a recheck behind a completion and a reclaim. |
 | The form goes on a scan that needs the partial index. | Use the form only with `id = $1`. A scan by worker keeps the plain guard. |
 | A select-list use of `claim_held` changes. | The select list keeps the plain predicate. Only the `WHERE` form changes. |
-| A new by-id statement uses the plain guard. | The plan test reads one list of statements. The helpers carry the rule in their doc comment. |
+| A new by-id statement uses the plain guard. | Two unit tests walk the engine source and fail on a plain by-id guard. |
 | A shape test or splice anchor reads the old text. | Update the shape tests. The claim splice anchors are in the claim CTE, which this change does not touch. |
 
 ## Feelings (red hat)
@@ -66,8 +71,8 @@ short reason makes the intent clear.
 ## Risks (black hat)
 
 - Semantics. The truth-table test and the concurrency test cover it.
-- Coverage. Only statements in the plan test are proven. The helpers make
-  the correct form the easy form.
+- Coverage. The plan test checks each raw statement and each Diesel guard
+  shape. A source walk checks each Diesel call site.
 - Other Postgres versions. A `CASE` is opaque to index matching on every
   supported version.
 
@@ -87,14 +92,19 @@ guards on `state` or `worker_id`.
 - The park statements (the "activity start CTE" of the issue).
 - The claim fence `claim_held` in a `WHERE` clause: completion, heartbeat,
   handler start, fenced fail and requeue writes, and the claim locks.
-- The other by-id releases and requeues in `queue.rs`, `poison_pill.rs` and
-  `worker.rs`.
+- The other by-id releases, requeues, defers and fails in `queue.rs`,
+  `poison_pill.rs` and `worker.rs`, and the pending-hint read.
 
 Out of scope:
+
+- The by-id claim. It is a variant of the claim statement, which has its
+  own plan guards. Issue #2751 measures it.
 
 - Scans by worker, by execution or by key. They need their partial index.
 - The SQLite backend. Its planner has no generic plan cache.
 - Select-list uses of `claim_held`. They do not filter rows.
+- Statements on `harvest_workflow_executions`. That table is not in the
+  measured family.
 
 ## Plan
 
