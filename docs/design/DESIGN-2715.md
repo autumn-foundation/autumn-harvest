@@ -33,19 +33,20 @@ decoy.
 
 **Decisions.**
 
-- **Item 1: A.** The canonical target is the path that the pivot binds, so
-  the link resolves in one step. B must also follow links in the middle of
-  a path, and C turns a link into a file. `readlink` shows the canonical
-  target, not the first hop. That is acceptable.
-- **Item 2: A, for each shown entry.** A shown entry, whether a link or a
-  path under a link, gets its canonical target bound when no entry shows it.
-  The link itself is already visible through the bound directory.
+- **Items 1 and 2: B.** The first plan was A. The review found that A
+  fails when a link of the chain lies in a bound directory, because the
+  host link then shows with its own target. So the pivot walks each entry
+  one name at a time, as the kernel does. It recreates each link on the
+  way with its own target, unless a bound directory shows it. It binds the
+  file or directory at the end. The order of the list does not matter: a
+  bound directory shows the same link that the step recreates. C turns a
+  link into a file.
 - **Item 3: C.** A test showed that a `/proc/self/fd/N` path reaches the
   directory under a mount, not the mount. So option A alone puts each step
   under the new `tmpfs`. Option B leaves the window after the check. Option
   D needs Linux 5.2 and a rewrite of each step. Option C needs one lookup
-  by name, and a check refuses a swapped name. The work directory is
-  opened again and checked, then bound from its descriptor.
+  by name, and a check refuses a swapped name. The child opens the work
+  directory again, checks it, and binds it from its descriptor.
 - **Item 4: C.** A mask over `/proc` breaks most runtimes. A new `/proc`
   needs a PID namespace, and it still shows each process of that namespace.
   `Pivot` is the tool that closes the gap. The docs say that `Mask` does not
@@ -60,13 +61,18 @@ decoy.
 | Swap `root` for a subvolume, which has a device of its own | It is not a `tmpfs`. The check fails the run |
 | Move the scratch parent | The child looks up `..` from the exact `root`, never a path from `/` |
 | Swap `work` for a link or another directory | The reopen checks the device and the inode. The bind source is the checked descriptor |
-| Mount on a descriptor from before the fork | The kernel refuses it with `EINVAL`. So the child enters `root` first, and reopens `work` |
+| Mount on a descriptor from before `unshare` | The kernel refuses it with `EINVAL`. So the child enters `root` first, and reopens `work` |
+| Move `root` next to a host `tmpfs` named `root` | The check passes, and `mkdir` steps write to that `tmpfs`. The worker uid can write there already. A copied host mount is locked, so `pivot_root` refuses it and the run fails. Option D closes this residual risk |
+| No `/proc` in the worker | The work bind and the id maps need it. The run fails closed |
+| A link into `/proc/self` | The walk stops at `/proc`. The link stays a link, and nothing of the worker is bound |
+| A link of a chain in a bound directory | The walk recreates each link that no bound directory shows |
 | Swap `root` before the fork | The `tmpfs` covers the swapped directory in the private namespace only. The lookup then fails, or it finds the new mount |
 | Plant a link in the new `tmpfs` through `/proc/<pid>/root` | The child is not dumpable during the setup, so a process of the same uid cannot open that path. `exec` resets the flag |
 | A link chain that ends in a device | Only a file or a directory is bound, as before |
+| A link loop | The walk stops after 40 links, as the kernel does |
 | A link target that covers `/tmp` or the work directory | Refuse the run, as before |
 | A shown entry whose target is also shown | Bind nothing more |
-| A link chain with a relative middle link | `canonicalize` resolves each link |
+| A link chain with a relative middle link | The walk resolves `..` against the real parent, as the kernel does |
 
 ## 4. Six hats
 
@@ -86,7 +92,8 @@ decoy.
   API.
 - **Blue (process).** Write the red tests for items 1, 2 and 3 first. Then
   fix item 3, which changes the plan format, then items 1 and 2. Item 4 is
-  a doc change.
+  a doc change. Three review agents then check security, the list logic,
+  and the tests and docs.
 
 ## 5. Design
 
@@ -118,8 +125,9 @@ fork. The child setup of a pivot then runs in this order:
 
 | Item | Test |
 |---|---|
-| 1 | `a_pivot_follows_a_link_chain` and `a_link_in_a_chain_points_at_its_target` |
-| 2 | `a_pivot_binds_the_target_of_a_shown_link`, for a link under a bound directory and under a listed link |
+| 1 | `a_pivot_follows_a_link_chain` and `a_link_chain_keeps_each_link` |
+| 2 | `a_pivot_binds_the_target_of_a_shown_link`, for a link under a bound directory and under a listed link, in both orders |
+| 1, 2 | `a_pivot_follows_a_chain_behind_a_bound_directory`, in both orders, and `a_link_into_proc_binds_nothing_of_the_worker` |
 | 3 | `a_swapped_root_leaves_no_trace` and `a_swap_before_the_check_fails_closed`. A test step pauses the child. The test swaps `root` or `work` for a link or a plain directory |
 | 3 | `each_pivot_step_is_relative` |
 | 3 | `the_child_is_not_dumpable_during_the_setup` and `the_code_is_dumpable_again` |

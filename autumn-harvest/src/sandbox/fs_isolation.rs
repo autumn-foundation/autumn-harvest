@@ -109,9 +109,11 @@ pub enum FsIsolation {
     /// A new root. It holds the `read_only` paths, the work directory, a
     /// private `/tmp` and a few device nodes, and nothing else.
     ///
-    /// A listed link points at its final target in the new root, and the
-    /// pivot binds that target. An entry under a bound directory or a
-    /// listed link adds no mount point, but its target is bound.
+    /// The new root holds each link on the way to a listed path, so a chain
+    /// of links resolves as on the host. The pivot binds the file or the
+    /// directory at the end. A link into `/proc` stays a link, and the
+    /// pivot binds nothing in `/proc`. The setup needs `/proc` of the
+    /// worker before the pivot.
     Pivot {
         /// The absolute host paths that the code can read. The code cannot
         /// write them.
@@ -475,9 +477,10 @@ unsafe fn reopen(fd: libc::c_int, path: &CStr) -> bool {
 
 /// Make the `tmpfs` at `path` the working directory.
 ///
-/// Only the new mount is a `tmpfs` with a device other than that of its
-/// parent. A process of the same uid cannot mount in this namespace, so a
-/// swapped name fails the check.
+/// A swapped name fails the check unless it is a `tmpfs` mount on a device
+/// of its own. A process of the same uid cannot add a mount here. Under a
+/// non-root worker, a host `tmpfs` is a locked mount, so the later
+/// `pivot_root` refuses it.
 ///
 /// # Safety
 ///
@@ -665,6 +668,77 @@ fn add_parents(dirs: &mut BTreeSet<PathBuf>, dst: &Path) {
     }
 }
 
+/// The most links that [`resolve`] follows, as for the kernel.
+const MAX_LINKS: usize = 40;
+
+/// The path that an entry reaches, and each link on the way.
+#[derive(Debug, Default)]
+struct Resolved {
+    /// Each link, with its own target, in the order of the walk. Each link
+    /// lies in a directory with no link in its path.
+    links: Vec<(PathBuf, PathBuf)>,
+    /// The path with no link in it, or `None` when the walk stops.
+    real: Option<PathBuf>,
+}
+
+/// Walk the absolute `path` one name at a time, as the kernel does.
+///
+/// The walk stops at a missing name, at a loop, and at `/proc`. A path in
+/// `/proc/self` names the worker, so the new root gets no bind of it.
+fn resolve(path: &Path) -> Resolved {
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
+
+    fn names(path: &Path) -> VecDeque<OsString> {
+        path.components()
+            .filter_map(|c| match c {
+                Component::Normal(name) => Some(name.to_os_string()),
+                Component::ParentDir => Some(OsString::from("..")),
+                Component::RootDir | Component::CurDir | Component::Prefix(_) => None,
+            })
+            .collect()
+    }
+
+    let proc = Path::new("/proc");
+    let mut out = Resolved::default();
+    let mut real = PathBuf::from("/");
+    let mut rest = names(path);
+    while let Some(name) = rest.pop_front() {
+        if real.starts_with(proc) {
+            return out;
+        }
+        if name == ".." {
+            real.pop();
+            continue;
+        }
+        let next = real.join(&name);
+        let Ok(meta) = std::fs::symlink_metadata(&next) else {
+            return out;
+        };
+        if !meta.file_type().is_symlink() {
+            real = next;
+            continue;
+        }
+        let Ok(target) = std::fs::read_link(&next) else {
+            return out;
+        };
+        if out.links.len() == MAX_LINKS {
+            return out;
+        }
+        if target.is_absolute() {
+            real = PathBuf::from("/");
+        }
+        let mut joined = names(&target);
+        joined.extend(rest);
+        rest = joined;
+        out.links.push((next, target));
+    }
+    if !real.starts_with(proc) {
+        out.real = Some(real);
+    }
+    out
+}
+
 /// The steps of a pivot, built one entry at a time. Each path in a step is
 /// relative to the new root.
 struct PivotBuild<'a> {
@@ -679,6 +753,8 @@ struct PivotBuild<'a> {
     /// repeated entry adds nothing, and its mount point would collide.
     bound_dirs: Vec<PathBuf>,
     seen: BTreeSet<PathBuf>,
+    /// The links that a step recreates.
+    links: BTreeSet<PathBuf>,
 }
 
 impl<'a> PivotBuild<'a> {
@@ -690,6 +766,7 @@ impl<'a> PivotBuild<'a> {
             leaves: Vec::new(),
             bound_dirs: Vec::new(),
             seen: BTreeSet::new(),
+            links: BTreeSet::new(),
         }
     }
 
@@ -721,8 +798,8 @@ impl<'a> PivotBuild<'a> {
         Ok(())
     }
 
-    /// Add one entry of the list. `links` holds each entry that is a link.
-    fn add_entry(&mut self, path: &Path, links: &[&Path]) -> Result<(), SandboxError> {
+    /// Add one entry of the list.
+    fn add_entry(&mut self, path: &Path) -> Result<(), SandboxError> {
         check_absolute(path)?;
         if self.covers_scratch(path) {
             return Err(config(format!(
@@ -737,62 +814,21 @@ impl<'a> PivotBuild<'a> {
         {
             return Ok(());
         }
-        // A bound directory or a listed link shows the paths under it, and a
-        // mount point made at the same place would collide with it. So such
-        // an entry adds no mount point, whatever the order of the list. Its
-        // target can still lie outside each bound path.
-        if self.is_shown(path)
-            || links
-                .iter()
-                .any(|link| path != *link && path.starts_with(link))
-        {
-            return self.add_target(path);
+        let resolved = resolve(path);
+        for (link, target) in resolved.links {
+            self.add_link(&link, &target)?;
         }
-        let Ok(meta) = std::fs::symlink_metadata(path) else {
+        let Some(real) = resolved.real else {
             return Ok(());
         };
-        if meta.file_type().is_symlink() {
-            return self.add_link(path);
-        }
-        self.bind_read_only(path, meta.is_dir())
-    }
-
-    /// Recreate the link `path`, and bind its target.
-    ///
-    /// The new link points at the canonical target, not at the next link of
-    /// a chain. So the new root needs no link in the middle of a chain. A
-    /// broken link keeps its target, and stays broken.
-    fn add_link(&mut self, path: &Path) -> Result<(), SandboxError> {
-        let target = match std::fs::canonicalize(path) {
-            Ok(real) => real,
-            Err(_) => std::fs::read_link(path)
-                .map_err(|e| config(format!("cannot read the link {}: {e}", path.display())))?,
-        };
-        let dst = inside(path);
-        add_parents(&mut self.dirs, &dst);
-        self.leaves.push(Step::Symlink {
-            target: cstring(&target)?,
-            dst: cstring(&dst)?,
-        });
-        self.add_target(path)
-    }
-
-    /// Bind the file or the directory that `path` resolves to, unless an
-    /// entry shows it.
-    ///
-    /// A link needs its target. A resolver file in `/run` is one case, a
-    /// runtime directory with a version is another. Only the target is bound,
-    /// never the directory above it.
-    fn add_target(&mut self, path: &Path) -> Result<(), SandboxError> {
-        let Ok(real) = std::fs::canonicalize(path) else {
+        let Ok(meta) = std::fs::symlink_metadata(&real) else {
             return Ok(());
         };
-        let Ok(meta) = std::fs::metadata(&real) else {
-            return Ok(());
-        };
+        // Only a file or a directory is bound. A directory entry shows each
+        // path under it, so a nested or repeated target adds nothing.
         if !(meta.is_file() || meta.is_dir())
             || self.is_shown(&real)
-            || !self.seen.insert(real.clone())
+            || (real != path && !self.seen.insert(real.clone()))
         {
             return Ok(());
         }
@@ -804,6 +840,25 @@ impl<'a> PivotBuild<'a> {
             )));
         }
         self.bind_read_only(&real, meta.is_dir())
+    }
+
+    /// Recreate the host link `link` with its own `target`, unless an
+    /// entry shows it.
+    ///
+    /// Each link of a chain gets its own step, so the chain resolves in the
+    /// new root as on the host. A link that a later directory entry covers
+    /// still resolves, because that entry shows the same link.
+    fn add_link(&mut self, link: &Path, target: &Path) -> Result<(), SandboxError> {
+        if self.is_shown(link) || !self.links.insert(link.to_path_buf()) {
+            return Ok(());
+        }
+        let dst = inside(link);
+        add_parents(&mut self.dirs, &dst);
+        self.leaves.push(Step::Symlink {
+            target: cstring(target)?,
+            dst: cstring(&dst)?,
+        });
+        Ok(())
     }
 
     /// Bind the device nodes that exist on the host.
@@ -844,8 +899,8 @@ impl<'a> PivotBuild<'a> {
     /// the leaves.
     ///
     /// The child starts in the root directory. The `tmpfs` goes on that
-    /// exact directory. The work directory is opened again in the new
-    /// namespace. The child then enters the new `tmpfs`.
+    /// exact directory. The child opens the work directory again in the new
+    /// namespace, then enters the new `tmpfs`.
     fn finish(self, tmp_bytes: u64) -> Result<FsPlan, SandboxError> {
         let tmp = PathBuf::from("tmp");
         let up = Path::new("..");
@@ -893,16 +948,9 @@ fn pivot_plan(
     tmp_bytes: u64,
 ) -> Result<FsPlan, SandboxError> {
     check_absolute(work)?;
-    let links: Vec<&Path> = read_only
-        .iter()
-        .map(PathBuf::as_path)
-        .filter(|path| {
-            std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
-        })
-        .collect();
     let mut build = PivotBuild::new(dirs, work);
     for path in read_only {
-        build.add_entry(path, &links)?;
+        build.add_entry(path)?;
     }
     build.add_devices()?;
     build.add_work()?;
@@ -1711,35 +1759,103 @@ mod tests {
         std::os::unix::fs::symlink(bound.path(), &alias).unwrap();
         let alias_tool = alias.join("tool");
         for (parent, entry) in [(bound.path(), &tool), (alias.as_path(), &alias_tool)] {
-            let out = run(
-                pivot_with(&[parent, entry]),
-                &format!("cat {}", entry.display()),
-            )
-            .await;
-            assert_eq!(out.stdout, "s3cret", "{entry:?}: {}", out.stderr);
+            for paths in [[parent, entry], [entry, parent]] {
+                let out = run(pivot_with(&paths), &format!("cat {}", entry.display())).await;
+                assert_eq!(out.stdout, "s3cret", "{paths:?}: {}", out.stderr);
+            }
         }
     }
 
+    /// The `Symlink` steps of `plan`, as pairs of destination and target.
+    fn links_of(plan: &FsPlan) -> Vec<(PathBuf, PathBuf)> {
+        let path = |c: &CString| PathBuf::from(std::ffi::OsStr::from_bytes(c.to_bytes()));
+        plan.steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::Symlink { target, dst } => Some((path(dst), path(target))),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
-    fn a_link_in_a_chain_points_at_its_target() {
-        let (_dir, file) = secret_dir();
+    fn a_link_chain_keeps_each_link() {
+        let (dir, file) = secret_dir();
         let middle_dir = open_dir();
         let middle = middle_dir.path().join("current");
         std::os::unix::fs::symlink(&file, &middle).unwrap();
         let holder = open_dir();
         let link = holder.path().join("resolv.conf");
         std::os::unix::fs::symlink(&middle, &link).unwrap();
+        let plan = Layout::new().plan(&FsIsolation::Pivot {
+            read_only: vec![link.clone()],
+        });
+        let links = links_of(&plan);
+        assert!(
+            links.contains(&(inside(&link), middle.clone())),
+            "{links:?}"
+        );
+        assert!(links.contains(&(inside(&middle), file)), "{links:?}");
+        let real = std::fs::canonicalize(dir.path()).unwrap().join("secret.db");
+        let bound = plan.steps.iter().any(|step| {
+            matches!(step, Step::Bind { src, .. } if src.as_bytes() == real.as_os_str().as_bytes())
+        });
+        assert!(bound, "{plan:?}");
+    }
+
+    #[test]
+    fn a_link_into_proc_binds_nothing_of_the_worker() {
+        let holder = open_dir();
+        let link = holder.path().join("mtab");
+        std::os::unix::fs::symlink("/proc/self/mounts", &link).unwrap();
         let layout = Layout::new();
         let plan = layout.plan(&FsIsolation::Pivot {
             read_only: vec![link.clone()],
         });
-        let real = std::fs::canonicalize(&file).unwrap();
-        let found = plan.steps.iter().any(|step| {
-            matches!(step, Step::Symlink { target, dst }
-                if target.as_bytes() == real.as_os_str().as_bytes()
-                    && dst.to_bytes().ends_with(b"resolv.conf"))
-        });
-        assert!(found, "{plan:?}");
+        let work = cstring(&inside(&layout.work)).unwrap();
+        for step in &plan.steps {
+            // The work directory is bound from its descriptor.
+            if let Step::Bind { src, dst, .. } = step
+                && *dst != work
+            {
+                assert!(!src.to_bytes().starts_with(b"/proc/"), "{step:?}");
+            }
+        }
+        let links = links_of(&plan);
+        assert_eq!(
+            links,
+            vec![(inside(&link), PathBuf::from("/proc/self/mounts"))],
+            "{plan:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pivot_follows_a_chain_behind_a_bound_directory() {
+        if !needs_isolation().await {
+            return;
+        }
+        // A tool link in a bound directory often points through a
+        // versioned runtime link.
+        let runtime = open_dir();
+        let version = runtime.path().join("v20");
+        std::fs::create_dir_all(version.join("bin")).unwrap();
+        std::fs::set_permissions(&version, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(version.join("bin"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::fs::write(version.join("bin").join("node"), "s3cret").unwrap();
+        std::fs::set_permissions(
+            version.join("bin").join("node"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("v20", runtime.path().join("current")).unwrap();
+        let bound = open_dir();
+        let tool = bound.path().join("node");
+        std::os::unix::fs::symlink(runtime.path().join("current/bin/node"), &tool).unwrap();
+        for paths in [[bound.path(), &tool], [&tool, bound.path()]] {
+            let out = run(pivot_with(&paths), &format!("cat {}", tool.display())).await;
+            assert_eq!(out.stdout, "s3cret", "{paths:?}: {}", out.stderr);
+        }
     }
 
     #[test]
@@ -1753,8 +1869,11 @@ mod tests {
         let mut checked = 0;
         for step in &plan.steps {
             let dst = match step {
-                Step::Mkdir(dst) | Step::Touch(dst) => dst,
-                Step::Symlink { dst, .. } | Step::Bind { dst, .. } | Step::Tmpfs { dst, .. } => dst,
+                Step::Mkdir(dst)
+                | Step::Touch(dst)
+                | Step::Symlink { dst, .. }
+                | Step::Bind { dst, .. }
+                | Step::Tmpfs { dst, .. } => dst,
                 Step::Reopen { .. } | Step::Enter(_) | Step::Pause { .. } => continue,
             };
             let dst = Path::new(std::ffi::OsStr::from_bytes(dst.to_bytes()));
@@ -1825,6 +1944,13 @@ mod tests {
     ) -> (io::Result<std::process::Output>, Option<u8>) {
         use std::io::{Read as _, Write as _};
         use std::os::unix::process::CommandExt as _;
+        // A paused child holds a copy of each pipe that is open at its fork.
+        // Two paused children could then wait for each other, so one runs at
+        // a time.
+        static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _turn = ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (mut ready_r, ready_w) = std::io::pipe().unwrap();
         let (resume_r, mut resume_w) = std::io::pipe().unwrap();
         plan.steps.insert(
@@ -1875,7 +2001,7 @@ mod tests {
             .collect()
     }
 
-    /// The index of the first step after the anchor.
+    /// The index of the first `Mkdir`, the step after `Enter`.
     fn first_mkdir(plan: &FsPlan) -> usize {
         plan.steps
             .iter()
@@ -1921,11 +2047,26 @@ mod tests {
         assert_eq!(std::fs::read_to_string(written).unwrap(), "ok\n");
     }
 
+    /// The index of the `Reopen` step, the first check by name.
+    fn first_check(plan: &FsPlan) -> usize {
+        plan.steps
+            .iter()
+            .position(|step| matches!(step, Step::Reopen { .. }))
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn a_swap_before_the_check_fails_closed() {
         if !needs_isolation().await {
             return;
         }
+        // Without a swap, the same pause lets the run pass.
+        let layout = Layout::new();
+        let plan = layout.plan(&FsIsolation::pivot());
+        let at = first_check(&plan);
+        let (out, paused) = run_paused(plan, at, || {}, "echo ok");
+        assert!(paused.is_some(), "the child must reach the pause");
+        assert_eq!(out.unwrap().stdout, b"ok\n");
         for (name, link) in [
             (ROOT_NAME, true),
             (ROOT_NAME, false),
@@ -1935,6 +2076,7 @@ mod tests {
             let layout = Layout::new();
             let decoy = open_dir();
             let plan = layout.plan(&FsIsolation::pivot());
+            let at = first_check(&plan);
             let (parent, target) = (layout.parent.clone(), decoy.path().to_path_buf());
             let swap = move || {
                 let path = parent.join(name);
@@ -1945,8 +2087,9 @@ mod tests {
                     std::fs::create_dir(&path).unwrap();
                 }
             };
-            let (out, _) = run_paused(plan, 1, swap, "echo ok");
+            let (out, paused) = run_paused(plan, at, swap, "echo ok");
             let case = format!("{name}, link {link}");
+            assert!(paused.is_some(), "{case}: the child must reach the pause");
             assert_eq!(entries(decoy.path()), Vec::<PathBuf>::new(), "{case}");
             if !link {
                 let swapped = layout.parent.join(name);
@@ -1964,9 +2107,11 @@ mod tests {
         }
         let layout = Layout::new();
         let plan = layout.plan(&FsIsolation::pivot());
-        let (out, dumpable) = run_paused(plan, 0, || {}, "true");
-        out.expect("the run must start");
-        assert_eq!(dumpable, Some(0));
+        for at in [0, plan.steps.len()] {
+            let (out, dumpable) = run_paused(plan.clone(), at, || {}, "true");
+            out.expect("the run must start");
+            assert_eq!(dumpable, Some(0), "step {at}");
+        }
     }
 
     #[tokio::test]
@@ -1975,7 +2120,8 @@ mod tests {
             return;
         }
         // A process that is not dumpable has its `/proc` files owned by
-        // root, or by the overflow uid in a user namespace.
+        // root, or by the overflow uid in a user namespace. A pivot mounts
+        // no `/proc`, so the test uses a mask. Both share the setup.
         let (_dir, file) = secret_dir();
         let out = run(
             FsIsolation::Mask(vec![file]),

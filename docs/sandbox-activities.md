@@ -224,10 +224,12 @@ let backend = ProcessBackend::new(ExecOptions {
   `PIVOT_READ_ONLY`: `/usr`, the library directories, and a few files of
   `/etc`. It mounts no `/proc`. The code cannot write a `read_only` path.
   A runtime in another directory, such as `/opt/node`, needs that directory
-  in `read_only`. A path that does not exist is skipped. A listed link
-  points at its final target in the new root, and the pivot binds that
-  target. So a chain of links works. An entry under a bound directory, such
-  as a link in `/usr/local/bin`, gets its target bound too.
+  in `read_only`. A path that does not exist is skipped. The new root holds
+  each link on the way to a listed path, and the pivot binds the file or
+  directory at the end. So a chain of links works, also from a link in a
+  bound directory such as `/usr/local/bin`. A link into `/proc` stays a
+  link, and the pivot binds nothing in `/proc`. The setup needs `/proc` in
+  the worker.
 - **`Mask`** fails open. A directory shows empty. A file, or a socket,
   reads as `/dev/null`. A mask hides a path, not an inode, so a hard link or
   a second path still reaches the data. It does not hide the other runs in
