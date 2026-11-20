@@ -218,6 +218,19 @@ The predicate then tests those rows only. A batch of 100 ids reads about
 380 buffers on every fixture. The plain form read 22 buffers when only 500
 rows ran, so the fence costs more when the live set is very small.
 
+### Known limits of the source walks
+
+The walks read text, not a parsed statement. These shapes pass them. None
+occurs in the engine today:
+
+- a lowercase `and`, `where` or `as`;
+- a key or a guard inside a `format!` placeholder;
+- a boxed Diesel query that adds its guard in a later statement;
+- a correlated key, such as `t.workflow_exec_id = e.id`;
+- a key in another form, such as `id IN ($1)` or `$1 = id`.
+
+The plan test checks each listed statement, whatever its text shape.
+
 ### Options (green hat, brainstorming)
 
 1. Hide the guard with `row_guard_sql!` and `row_guard`, as for the by-id
