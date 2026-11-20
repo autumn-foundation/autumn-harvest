@@ -683,7 +683,8 @@ struct Resolved {
 
 /// Walk the absolute `path` one name at a time, as the kernel does.
 ///
-/// The walk stops at a missing name, at a loop, and at `/proc`. A path in
+/// The walk stops at a missing name, at a file before the last name, at a
+/// loop, and at `/proc`. A path in
 /// `/proc/self` names the worker, so the new root gets no bind of it.
 fn resolve(path: &Path) -> Resolved {
     use std::collections::VecDeque;
@@ -716,6 +717,11 @@ fn resolve(path: &Path) -> Resolved {
             return out;
         };
         if !meta.file_type().is_symlink() {
+            // A name before the last one must be a directory, or the
+            // kernel refuses the path with `ENOTDIR`.
+            if !rest.is_empty() && !meta.is_dir() {
+                return out;
+            }
             real = next;
             continue;
         }
@@ -1801,6 +1807,25 @@ mod tests {
             matches!(step, Step::Bind { src, .. } if src.as_bytes() == real.as_os_str().as_bytes())
         });
         assert!(bound, "{plan:?}");
+    }
+
+    #[test]
+    fn a_file_in_the_middle_of_a_path_binds_nothing() {
+        // The kernel refuses `file/../secret.db` with `ENOTDIR`.
+        let (dir, _file) = secret_dir();
+        let ordinary = dir.path().join("ordinary");
+        std::fs::write(&ordinary, "x").unwrap();
+        let holder = open_dir();
+        let link = holder.path().join("link");
+        std::os::unix::fs::symlink(ordinary.join("..").join("secret.db"), &link).unwrap();
+        let plan = Layout::new().plan(&FsIsolation::Pivot {
+            read_only: vec![link],
+        });
+        let secret = std::fs::canonicalize(dir.path()).unwrap().join("secret.db");
+        let leaked = plan.steps.iter().any(|step| {
+            matches!(step, Step::Bind { src, .. } if src.as_bytes() == secret.as_os_str().as_bytes())
+        });
+        assert!(!leaked, "{plan:?}");
     }
 
     #[test]
