@@ -27,6 +27,7 @@ pending rows.
   and bounds the buffers of the gauge read and of the pending-keys step. Each
   gate failed before the migration and passes after it. A group test pins
   the gauge results.
-- Issue #2744 tracks a cost that the harness found and that this change does
-  not touch: a keyed claim reads every `RUNNING` row.
+- The write harness found that a keyed claim read every `RUNNING` row. This
+  change does not touch that cost. Issue #2744 tracked it, and PR #2761 fixed
+  it.
 - No query text changes. No new `WorkflowEvent` variant. No column changes.

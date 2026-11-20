@@ -167,7 +167,9 @@ Per call (`docs/perf-artifacts/concurrency-live-index/write-costs.md`):
   `harvest_task_queue_running_worker_idx`. It then joins them to the pending
   keys. So each keyed claim reads about one buffer for each running task
   (`keyed-claim-plan.txt`, from `keyed-claim.sql` on
-  `keyed-claim-fixture.sql`). Issue #2744 tracks it.
+  `keyed-claim-fixture.sql`). Issue #2744 tracked it. PR #2761 now probes
+  the running rows of each pending key. See
+  [the keyed claim running counts page](performance-keyed-claim-running-counts.md).
 - An index-only form (`INCLUDE (state, worker_id, concurrency_cap,
   queue_name)`) read 27 buffers on a vacuumed fixture, in a design-time run
   with no committed artifact. A live queue churns, so its rows are seldom
