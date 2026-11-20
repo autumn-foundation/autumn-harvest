@@ -28,6 +28,22 @@ version follow the same rules.
 
 ---
 
+## Support window
+
+Harvest is at 0.x. A minor release can change the API and the schema.
+
+- The newest minor release gets bug fixes and security fixes, as patch
+  releases.
+- An older minor release gets no fixes after the next minor release ships.
+  To get a fix, upgrade to the newest minor release.
+- Upgrade one minor release at a time. Each hop has its own guide above.
+- N-1 gets no fixes. It runs beside N only during a rolling deploy. See
+  [Supported version skew](#supported-version-skew).
+
+[`SECURITY.md`](../../SECURITY.md) applies the same window to security
+fixes. Version 1.0 gets a longer window.
+[`docs/releasing.md`](../releasing.md) gives the release steps.
+
 ## Supported version skew
 
 During a roll, N-1 and N run together on one database. They share the
