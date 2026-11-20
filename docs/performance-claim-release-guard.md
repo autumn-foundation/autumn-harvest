@@ -212,6 +212,27 @@ The Ledger profiles of `queue::primary_repend_workflow_task`,
 `timeout::find_timed_out_tasks_batch` and `timeout::lapsed_moves` point at
 this page.
 
+## 📈 End to end, by-execution change
+
+`e2e_bench`, `throughput` scenario, 1 shard, five alternating pairs of
+runs. "Before" is the merge base with no new index. Each figure is the mean
+of the five runs, from `pg_stat_statements`. The bench was a test-profile
+build, so this page publishes no throughput figure.
+
+| Statement | Buffers per call | WAL bytes |
+|---|--:|--:|
+| due-row read of a wake | 22.21 → 3.76 | 39,844 → 22,661 |
+| `queue::primary_repend_workflow_task` | 27.02 → 26.78 | 4,080,804 → 4,460,541 |
+| park statement | 20.97 → 22.86 | 2,108,600 → 2,443,335 |
+| claim statement | 121.42 → 120.51 | 6,900,803 → 7,335,287 |
+| all statements | 8.82 → 8.58 | 47,298,023 → 48,715,632 |
+
+The due-row read reads 83% fewer buffers. All statements read 2.5% fewer
+buffers, and each run varies by about 3%. WAL grows by 3.0%. Each update of
+a workflow task row adds an entry to the new index: the re-pend, the park
+and the claim. The bench queue is small, so it shows the write cost of the
+index and little of the read gain on a large run.
+
 ## ⏱️ Timeout batch re-read
 
 `timeout::find_timed_out_tasks_batch` and `timeout::lapsed_moves` test a

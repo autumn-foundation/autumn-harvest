@@ -320,3 +320,4 @@ deadline shift of `harvest_external_tasks` is on another table.
 12. A wake, the owner key read and the migration read cost the same for a
     run with 50,000 rows as for a run with 4.
 13. A timeout batch re-read reads its ids through the primary key.
+14. An `e2e_bench` run records the before and after cost of the change.

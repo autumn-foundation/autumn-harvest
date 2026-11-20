@@ -31,5 +31,7 @@ row.
 - No new event variant and no change to `harvest_events`.
 - On a 1M-row fixture, the wake fallback reads 509 → 9 buffers at 5 rows
   per worker. After an idle analyze, the wake re-pend reads 1,411 → 4. For a
-  run with 50,000 rows, it reads 1,343 → 4. See
+  run with 50,000 rows, it reads 1,343 → 4. In `e2e_bench`, the due-row
+  read of a wake reads 22.21 → 3.76 buffers per call, all statements read
+  2.5% fewer buffers, and WAL grows by 3.0%. See
   `docs/performance-claim-release-guard.md`.
