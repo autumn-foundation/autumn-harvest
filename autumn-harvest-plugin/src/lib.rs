@@ -104,6 +104,9 @@ pub mod status_summary;
 pub mod strict_query;
 /// Tenant binding for the management API (issue #1977).
 pub mod tenant;
+/// Keepers for the tracing callsite cache of the tests (issue #2762).
+#[cfg(test)]
+mod trace_keepers;
 pub mod ui;
 pub mod usage;
 #[cfg(feature = "vault-transit")]
