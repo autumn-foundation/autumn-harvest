@@ -249,6 +249,12 @@ mod db {
     /// lease, and a later leader can write first. The outdated read then
     /// writes nothing.
     ///
+    /// The check locks the lease row `FOR SHARE` until the write commits. A
+    /// handover in flight holds that row, so the write waits for it. Postgres
+    /// then checks the new row version, and a superseded holder writes
+    /// nothing. Without the lock, the check reads an old version and the
+    /// outdated read can overwrite the new one.
+    ///
     /// The delete skips the row of `$2`. One statement must not delete and
     /// then update the same row. `clock_timestamp()` is the database clock,
     /// which every worker shares.
@@ -260,7 +266,8 @@ mod db {
          SELECT $1, $2, $3, clock_timestamp() \
          WHERE EXISTS (SELECT 1 FROM harvest_scanner_leases l \
                        WHERE l.shard_id = $1 AND l.scanner = $2 AND l.holder = $4 \
-                         AND l.lease_until > clock_timestamp()) \
+                         AND l.lease_until > clock_timestamp() \
+                       FOR SHARE) \
          ON CONFLICT (shard_id, sampler) DO UPDATE SET \
              sample = EXCLUDED.sample, sampled_at = EXCLUDED.sampled_at";
 
@@ -678,6 +685,7 @@ mod db {
             assert_eq!(super::super::GAUGE_SAMPLE_RETENTION.as_secs(), 86_400);
             assert!(PUBLISH_SQL.contains("sampler <> $2"));
             assert!(PUBLISH_SQL.contains("l.holder = $4 AND l.lease_until > clock_timestamp()"));
+            assert!(PUBLISH_SQL.contains("FOR SHARE"));
             assert!(!PUBLISH_SQL.contains("NOW()"));
             assert!(FRESH_SQL.contains("clock_timestamp() - make_interval(secs => $3)"));
             assert_eq!(WRITE_LOCK_TIMEOUT_SQL, "SET LOCAL lock_timeout = '1s'");

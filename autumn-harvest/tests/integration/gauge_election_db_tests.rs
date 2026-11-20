@@ -265,6 +265,54 @@ async fn a_worker_without_the_lease_writes_no_row() {
     assert_eq!(row, Some(serde_json::json!(2)));
 }
 
+/// A handover in flight decides the write. The old holder waits for it, and
+/// then writes nothing over the new holder's lease.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_waits_for_a_handover_and_then_yields() {
+    let db = database("gauge_elect_t").await;
+    let mut conn = connect(&db.url).await;
+    let key = test_key("handover");
+    publish_as(&mut conn, "old", 0, &key, &serde_json::json!(1)).await;
+
+    // A new holder takes the lease in a transaction that is still open.
+    let mut taker = connect(&db.url).await;
+    taker.batch_execute("BEGIN").await.expect("begin");
+    diesel::sql_query(
+        "UPDATE harvest_scanner_leases SET holder = 'new', epoch = epoch + 1 \
+         WHERE shard_id = 0 AND scanner = $1",
+    )
+    .bind::<Text, _>(&key)
+    .execute(&mut taker)
+    .await
+    .expect("take the lease");
+
+    let url = db.url.clone();
+    let write_key = key.clone();
+    let write = tokio::spawn(async move {
+        let mut conn = connect(&url).await;
+        publish_gauge_sample(
+            &mut conn,
+            ShardId::new(0),
+            &write_key,
+            "old",
+            &serde_json::json!(9),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    taker.batch_execute("COMMIT").await.expect("commit");
+
+    let written = write
+        .await
+        .expect("join")
+        .expect("the write ends without error");
+    assert!(!written, "the old holder must not write after the handover");
+    let row = fresh_gauge_sample(&mut conn, ShardId::new(0), &key, LONG)
+        .await
+        .expect("read");
+    assert_eq!(row, Some(serde_json::json!(1)));
+}
+
 /// A transaction that holds the row lock cannot stall the leader. The write
 /// gives up within its bound, and the leader still emits its own read.
 #[tokio::test(flavor = "multi_thread")]
