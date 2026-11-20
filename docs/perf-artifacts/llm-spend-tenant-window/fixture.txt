@@ -2,8 +2,8 @@ item|value
 runs|200004
 runs RUNNING|342
 runs with a quota key|179984
-ledger rows|6259781
-ledger rows in the window|295417
+ledger rows|6259787
+ledger rows in the window|295423
 ledger heap pages|94480
 ledger all-visible pages|90023
 scope large: runs in the window|571

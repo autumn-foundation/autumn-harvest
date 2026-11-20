@@ -1,0 +1,1 @@
+plain CREATE INDEX on the fixture: 4404 ms

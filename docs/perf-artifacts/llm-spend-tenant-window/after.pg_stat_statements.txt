@@ -1,0 +1,18 @@
+-- after: 3 targets x 10 spend reads + 200 ledger inserts --
+-- workload total: 218177 buffers, 320 calls --
+calls|shared_blks_hit|shared_blks_read|total_buffers|pct_buffers|pct_calls|temp_blks_written|wal_bytes|rows|query
+30|213836|2104|215940|99.0|9.4|0|0|30|WITH run AS ( SELECT workflow_name, quota_key FROM harvest_workflow_executions WHERE id = $1 ), run_spend AS ( SELECT LEAST(COALESCE(SUM(input_tokens::NUMERIC +
+200|2228|9|2237|1.0|62.5|0|121328|200|INSERT INTO harvest_llm_ledger (workflow_exec_id, event_id, call_index, activity_name, model, input_tokens, output_tokens, cost_usd_micros, latency_ms) VALUES (
+30|0|0|0|0.0|9.4|0|0|0|BEGIN
+30|0|0|0|0.0|9.4|0|0|0|SET LOCAL jit = off
+30|0|0|0|0.0|9.4|0|0|0|COMMIT
+
+-- pg_stat_user_indexes, harvest_llm_ledger --
+indexrelname|idx_scan|size_bytes
+harvest_llm_ledger_pkey|0|401596416
+harvest_llm_ledger_recorded_at|0|140632064
+harvest_llm_ledger_run_recorded|8070|423043072
+
+-- pg_stat_user_tables + pg_statio_user_tables, harvest_llm_ledger --
+seq_scan|idx_scan|heap_blks_read|heap_blks_hit|idx_blks_read|idx_blks_hit
+0|8070|25473|178227|1300|33673

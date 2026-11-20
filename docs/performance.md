@@ -3168,3 +3168,9 @@ standalone note rather than part of the claim-path attribution table above:
   live-row partial index instead of a full index (issue #2751). A `CASE`
   guard on their state test fixes the plan. On a 1M-row fixture, the by-id
   claim reads 622 → 26 buffers, and the owner take 3,610 → 33.
+* [`docs/performance-llm-spend-tenant-window.md`](performance-llm-spend-tenant-window.md)
+  — the tenant LLM spend read took every ledger row of each in-window run
+  from the heap, then dropped the rows outside the window (issue #1997). A
+  covering index on `(workflow_exec_id, recorded_at)` makes the window a key
+  range. On a 6.26M-row ledger, a read of a large tenant takes 34,833 →
+  16,915 buffers with a cold visibility map, and 3,024 after a vacuum.
