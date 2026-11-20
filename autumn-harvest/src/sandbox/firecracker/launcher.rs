@@ -4653,19 +4653,27 @@ while True:
         let config = jailed(&dir);
         std::fs::set_permissions(&config.image.rootfs, std::fs::Permissions::from_mode(0o600))
             .unwrap();
-        let err = new_launcher(config.clone()).expect_err("unreadable image");
+        let err = new_launcher(config).expect_err("unreadable image");
         assert!(
             matches!(err, SandboxError::Config(ref m) if m.contains("read")),
             "{err:?}"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The jail group may read a 0640 image file of its group. Only root
+    /// can give the file to that group.
+    #[test]
+    #[ignore = "needs root; the Sandbox (KVM) workflow runs it with sudo"]
+    fn root_a_shared_image_that_the_jail_group_can_read_is_accepted() {
         // SAFETY: geteuid has no preconditions.
-        if unsafe { libc::geteuid() } == 0 {
-            // The jail group may read a 0640 file of its group.
-            std::os::unix::fs::chown(&config.image.rootfs, None, Some(12_345)).unwrap();
-            std::fs::set_permissions(&config.image.rootfs, std::fs::Permissions::from_mode(0o640))
-                .unwrap();
-            new_launcher(config).unwrap();
-        }
+        assert_eq!(unsafe { libc::geteuid() }, 0, "run this test as root");
+        let dir = temp_dir();
+        let config = jailed(&dir);
+        std::os::unix::fs::chown(&config.image.rootfs, None, Some(12_345)).unwrap();
+        std::fs::set_permissions(&config.image.rootfs, std::fs::Permissions::from_mode(0o640))
+            .unwrap();
+        new_launcher(config).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 

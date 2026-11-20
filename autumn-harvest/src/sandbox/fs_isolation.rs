@@ -1020,6 +1020,7 @@ mod tests {
     use super::*;
     use crate::sandbox::error::SandboxError;
     use crate::sandbox::exec::{ExecOptions, execute_plan};
+    use crate::sandbox::isolation_gate::host_has;
     use crate::sandbox::outcome::{RunStatus, SandboxOutcome};
     use crate::sandbox::policy::{NetworkPolicy, SandboxPolicy};
     use crate::sandbox::request::SandboxRequest;
@@ -1083,11 +1084,14 @@ mod tests {
         (dir, file)
     }
 
+    /// Names the executor mount namespace in each skip line and gate panic.
+    const MOUNT_NS: &str = "mount namespace for the executor";
+
     async fn needs_isolation() -> bool {
-        if fs_isolation_available().await {
+        if host_has(fs_isolation_available().await, MOUNT_NS) {
             return true;
         }
-        eprintln!("skipped: this host has no mount namespace for the executor");
+        eprintln!("skipped: this host has no {MOUNT_NS}");
         false
     }
 
@@ -1526,12 +1530,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pivot_runs_a_dedicated_uid_with_no_network() {
+    #[ignore = "needs root; the Sandbox (KVM) workflow runs it with sudo"]
+    async fn root_a_pivot_runs_a_dedicated_uid_with_no_network() {
+        assert!(is_root(), "run this test as root");
         if !needs_isolation().await {
-            return;
-        }
-        if !is_root() {
-            eprintln!("skipped: run_as needs a root worker");
             return;
         }
         let options = ExecOptions {
@@ -1585,11 +1587,9 @@ mod tests {
     /// The child must make the tree private before it mounts. A thread in
     /// its own mount namespace with a shared root shows a leak.
     #[test]
-    fn a_mask_does_not_leak_into_a_shared_root() {
-        if !is_root() {
-            eprintln!("skipped: a shared root needs a root worker");
-            return;
-        }
+    #[ignore = "needs root; the Sandbox (KVM) workflow runs it with sudo"]
+    fn root_a_mask_does_not_leak_into_a_shared_root() {
+        assert!(is_root(), "run this test as root");
         let (_dir, file) = secret_dir();
         let masked = file.display().to_string();
         let leaked = std::thread::spawn(move || {
@@ -1599,18 +1599,22 @@ mod tests {
             if unsafe { libc::unshare(libc::CLONE_FS | libc::CLONE_NEWNS) } != 0 {
                 return None;
             }
-            // SAFETY: mount reads valid C strings.
-            let shared = unsafe {
-                libc::mount(
-                    std::ptr::null(),
-                    c"/".as_ptr(),
-                    std::ptr::null(),
-                    libc::MS_REC | libc::MS_SHARED,
-                    std::ptr::null(),
-                )
-            };
-            if shared != 0 {
-                return None;
+            // Private first, then shared, gives this thread a new peer
+            // group. A leak then stays out of the host namespace.
+            for flags in [libc::MS_PRIVATE, libc::MS_SHARED] {
+                // SAFETY: mount reads valid C strings.
+                let changed = unsafe {
+                    libc::mount(
+                        std::ptr::null(),
+                        c"/".as_ptr(),
+                        std::ptr::null(),
+                        libc::MS_REC | flags,
+                        std::ptr::null(),
+                    )
+                };
+                if changed != 0 {
+                    return None;
+                }
             }
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1622,20 +1626,20 @@ mod tests {
         })
         .join()
         .unwrap();
-        match leaked {
-            Some(leaked) => assert!(!leaked, "the mask leaked into the shared root"),
-            None => eprintln!("skipped: this host refuses a private mount namespace"),
-        }
+        let Some(leaked) = leaked else {
+            host_has(false, "private mount namespace for a root worker");
+            eprintln!("skipped: this host refuses a private mount namespace");
+            return;
+        };
+        assert!(!leaked, "the mask leaked into the shared root");
     }
 
     /// A strict umask of the worker must not close the directories of the
     /// new root to the code uid.
     #[test]
-    fn a_pivot_ignores_a_strict_worker_umask() {
-        if !is_root() {
-            eprintln!("skipped: the code uid differs from the worker only for root");
-            return;
-        }
+    #[ignore = "needs root; the Sandbox (KVM) workflow runs it with sudo"]
+    fn root_a_pivot_ignores_a_strict_worker_umask() {
+        assert!(is_root(), "run this test as root");
         let out = std::thread::spawn(|| {
             // SAFETY: CLONE_FS gives this thread its own umask, so no other
             // test sees the change.
@@ -1647,7 +1651,7 @@ mod tests {
                 .build()
                 .unwrap();
             runtime.block_on(async {
-                if !fs_isolation_available().await {
+                if !host_has(fs_isolation_available().await, MOUNT_NS) {
                     return None;
                 }
                 let code = "cat /etc/passwd > /dev/null && echo ok; umask";
@@ -1657,7 +1661,7 @@ mod tests {
         .join()
         .unwrap();
         let Some(out) = out else {
-            eprintln!("skipped: this host has no mount namespace for the executor");
+            eprintln!("skipped: this host has no {MOUNT_NS}");
             return;
         };
         assert_eq!(out.stdout, "ok\n0077\n", "{}", out.stderr);
@@ -1743,7 +1747,7 @@ mod tests {
             &SandboxRequest::new("sh", "true"),
         )
         .await;
-        if fs_isolation_available().await {
+        if host_has(fs_isolation_available().await, MOUNT_NS) {
             result.expect("the probe says the host can isolate");
         } else {
             let err = result.expect_err("no isolation, so the run must fail closed");

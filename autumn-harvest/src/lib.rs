@@ -382,6 +382,8 @@ pub mod fan_out;
 /// Non-destructive fork of a workflow run (issue #2000).
 #[cfg(feature = "db")]
 pub mod fork;
+/// Keep a large child future off the stack of a debug build (issue #2752).
+pub mod frame;
 /// Replay fuzz harness (issue #1835). Not a stable API.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
@@ -547,6 +549,8 @@ pub mod scanner_lease;
 pub mod schema_contract;
 /// Worker session fleet-side registry and pure decision functions (issue #606).
 pub mod sessions;
+/// Shape census: the usual and the rare paths over many runs.
+pub mod shape_census;
 pub mod shard;
 /// A task-local fence on the shards one request may reach (issue #1803).
 pub mod shard_fence;

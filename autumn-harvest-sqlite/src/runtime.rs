@@ -17,6 +17,7 @@ use autumn_harvest::executor::{
     QueryReplayOutcome, WorkflowExecuteSpanMeta, drive_query_replay_async,
     run_workflow_with_state_history_policy_and_caps,
 };
+use autumn_harvest::frame::boxed;
 use autumn_harvest::llm_ledger::LlmCall;
 use autumn_harvest::payload_depth::{
     MAX_PAYLOAD_DEPTH, PAYLOAD_TOO_DEEP_ERROR_TYPE, nests_past_cap,
@@ -414,6 +415,13 @@ const WORKFLOW_PANIC_MAX_ATTEMPTS: u32 = 3;
 /// [`open`](Self::open) reclaims any task stranded `RUNNING` by the previous
 /// process (see the crash model in [`worker`](crate::worker)). The workflow
 /// then resumes purely by deterministic replay of the recorded history.
+///
+/// # Stack
+///
+/// A drive polls the workflow on the thread that awaits it. A debug build
+/// makes large poll frames there (issue #2752). Box a large child future of
+/// your own workflow with [`autumn_harvest::frame::boxed`]. The guide
+/// `docs/sqlite-backend.md` gives the stack need.
 pub struct SqliteRuntime {
     conn: Connection,
     workflows: HashMap<String, WorkflowHandlerFn>,
@@ -3429,7 +3437,9 @@ impl SqliteRuntime {
         now: i64,
         failure_now: &(dyn Fn() -> i64 + Send + Sync),
     ) -> SqliteResult<RunState> {
-        let result = self.drive_one_cycle_inner(exec, now, failure_now).await;
+        // The cycle future holds the workflow drive. On the heap, it adds only
+        // a pointer to each caller frame in a debug build (issue #2752).
+        let result = boxed(|| self.drive_one_cycle_inner(exec, now, failure_now)).await;
         let result = self.seal_after_error(exec, result, now, failure_now);
         // The cycle, or a seal after it, can seal other runs too, such as a
         // cancel target or a detached child (issue #2026). No drive reaches a
@@ -3967,7 +3977,9 @@ impl SqliteRuntime {
             .cloned()
             .unwrap_or_default();
         let queries: Vec<&QueryHandlerInfo> = queries.iter().collect();
-        let (outcome, pending, _span, _resolved_router) =
+        // The workflow drive and the suspension below go on the heap, so this
+        // frame holds no copy of them in a debug build (issue #2752).
+        let (outcome, pending, _span, _resolved_router) = boxed(|| {
             run_workflow_with_state_history_policy_and_caps(
                 exec,
                 history.clone(),
@@ -3997,7 +4009,8 @@ impl SqliteRuntime {
                 None,
                 None,
             )
-            .await;
+        })
+        .await;
         // Read the clock again once the body returns (issue #2026). The body
         // can take time. Each write that another run reads by time uses this
         // instant. A close checks the parent's child deadlines at it. A signal
@@ -4259,17 +4272,19 @@ impl SqliteRuntime {
                     workflow_type: &workflow_name,
                     state: &shared_state,
                 };
-                self.drive_suspension(
-                    exec,
-                    &owner,
-                    &ingest,
-                    &history,
-                    &commands,
-                    &caps,
-                    CycleClock { now, decided_at },
-                    failure_now,
-                    cancel_reason.as_deref(),
-                )
+                boxed(|| {
+                    self.drive_suspension(
+                        exec,
+                        &owner,
+                        &ingest,
+                        &history,
+                        &commands,
+                        &caps,
+                        CycleClock { now, decided_at },
+                        failure_now,
+                        cancel_reason.as_deref(),
+                    )
+                })
                 .await
             }
         }
@@ -4330,15 +4345,17 @@ impl SqliteRuntime {
         }
         let settle_after_first_terminal = worker::activity_race_in_flight(history, commands);
         let deadline = store::run_config(&self.conn, exec)?.deadline_at;
-        let drain = worker::drain_ready(
-            &mut self.conn,
-            exec,
-            owner,
-            now,
-            failure_now,
-            &self.activities,
-            settle_after_first_terminal,
-        );
+        let drain = boxed(|| {
+            worker::drain_ready(
+                &mut self.conn,
+                exec,
+                owner,
+                now,
+                failure_now,
+                &self.activities,
+                settle_after_first_terminal,
+            )
+        });
         // Issue #2029: the workflow deadline bounds the drain. A body past it
         // is dropped, as a dropped drive drops it (issue #2024). The seal then
         // removes its `RUNNING` task.

@@ -1425,9 +1425,12 @@ four largest queues. "64 queues" polls all of them.
   reads 80 times the buffers, and it spills its sort from 100K.
 - **The new claim does not.** From 10K to 1M its buffers grow 5 times on
   4 queues and 2 times on 64 queues, for 100 times the backlog.
-- **The rest follows the `RUNNING` population.** `seek_running_counts`
-  walks every `RUNNING` row: 9 rows at 1K, 897 at 100K and the fleet cap of
-  1,024 at 1M. The dead tuples at the head cost a heap visit once, until
+- **The rest followed the `RUNNING` population.** Before issue #2744,
+  `seek_running_counts` walked every `RUNNING` row: 9 rows at 1K, 897 at
+  100K and the fleet cap of 1,024 at 1M. It now reads only the running rows
+  of the window keys. See
+  [the keyed claim page](performance-keyed-claim-running-counts.md). The
+  dead tuples at the head cost a heap visit once, until
   Postgres marks their index entries dead.
 - **A small backlog costs more, in milliseconds.** At 1K the window reads
   almost every row by index. The old full scan reads the small table at
@@ -1823,9 +1826,12 @@ The median of about 195 sampled claim plans in each half of run 2:
   grows with the number of polled queues. At 64 queues on the issue #1956
   fixture it read 7,920 buffers in 46 ms at 100K, and 8,700 buffers in
   185 ms at 1M. The full scan took 1.4 s and 18 s.
-- **The `RUNNING` population.** `seek_running_counts` walks every `RUNNING`
-  row, so its cost follows the size of the fleet: about 900 buffers with
-  1,024 tasks in flight.
+- **The running rows of the window keys.** `seek_running_counts` probes
+  each pending key once, so its cost follows the running rows of those keys.
+  A key with many tasks in flight costs about one page per task. Before
+  issue #2744 it walked every `RUNNING` row: about 900 buffers with 1,024
+  tasks in flight. See
+  [the keyed claim page](performance-keyed-claim-running-counts.md).
 - **Future-dated rows in a higher band.** A head scan steps over the index
   entries of rows that are not yet due, inside a higher priority band.
   Those steps read index pages only.
@@ -2051,7 +2057,9 @@ fleet reaches 10.
 workers of 4 claim loops each on one table, with a backlog of 6,000
 workflows. It runs the cap off, then 4 slots, each on its own database. Each
 arm takes the claim rate before the stall as the median of three 1 s
-windows. One transaction then holds `ACCESS EXCLUSIVE` on
+windows. It takes them after the backlog top-up, directly before the lock.
+A top-up seed slows the claims, so an earlier rate is not a fair base. One
+transaction then holds `ACCESS EXCLUSIVE` on
 `harvest_task_queue` for 3 s. After the lift, a 1 s window slides in 100 ms
 steps until it reaches 90% of the rate before the stall. The test fails if
 that takes more than 10 s.
@@ -2693,6 +2701,9 @@ from the benchmark are directly comparable.
   evidence for that measurement.
 * `cargo xtask perf claim-batched-seek-and-refine` —
   regenerates that evidence from a clean checkout.
+* [`docs/performance-keyed-claim-running-counts.md`](performance-keyed-claim-running-counts.md)
+  — a keyed claim counted every running task (issue #2744). A window count
+  per pending key cuts the keyed claim from 1,094 to 112 buffers per call.
 * [`docs/performance-task-queue-hygiene.md`](performance-task-queue-hygiene.md) —
   claim latency after 1M terminal task rows, before and after the
   terminal-task janitor and table tuning (issue #1811).
@@ -2833,6 +2844,10 @@ standalone note rather than part of the claim-path attribution table above:
   query had a quadratic plan. A `NOT EXISTS` probe fixes the plan. One 15 s
   gauge interval cuts the sampler buffers per worker-hour by 98.3% at the
   small size.
+* [`docs/performance-dlq-depth-counter.md`](performance-dlq-depth-counter.md)
+  — the DLQ depth gauge read every dead letter: 744,158 buffers per call at
+  1M dead letters. A counter of delta rows, kept by triggers, makes it 1
+  buffer. A one-row dead-letter write costs about 2 to 4 buffers more.
 * [`docs/performance-concurrency-live-index.md`](performance-concurrency-live-index.md)
   — the concurrency gauge read the whole task queue (issue #2678). A partial
   index on the live keyed rows cuts each call by 93% at each size.
@@ -3151,3 +3166,8 @@ standalone note rather than part of the claim-path attribution table above:
   guard keeps each one on the primary key. On a 1M-row fixture, a recheck
   reads 24 → 6 buffers at 20 rows per worker, and 201 → 6 after an idle
   analyze.
+* [`docs/performance-claim-by-id-guard.md`](performance-claim-by-id-guard.md)
+  — after an idle analyze, the by-id claim and the owner take read a
+  live-row partial index instead of a full index (issue #2751). A `CASE`
+  guard on their state test fixes the plan. On a 1M-row fixture, the by-id
+  claim reads 622 → 26 buffers, and the owner take 3,610 → 33.

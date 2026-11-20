@@ -619,6 +619,19 @@ cargo test -p autumn-harvest-sandbox-guest
 cargo test -p autumn-harvest-agent --features sqlite,eval,sandbox
 ```
 
+On a host without a mount or a network namespace, a test that needs one
+skips. A few check only the fail-closed path. Both pass, and libtest hides
+the `skipped` line. Set `HARVEST_TEST_REQUIRE_ISOLATION=1` to make each such
+test fail, as CI does. On Ubuntu, AppArmor can refuse the namespace to a
+non-root user. To allow it, run
+`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`. The change
+lasts until the next reboot.
+
+A test that needs root has a name that starts with `root_` and has
+`#[ignore]`. No test that is not ignored skips for lack of root (issue
+#2757). As root, run the mount tests with the filter
+`sandbox::fs_isolation::tests::root_` and `--ignored`.
+
 The `Sandbox (KVM)` workflow boots real microVMs on a GitHub runner with
 `/dev/kvm`. It runs on each pull request that changes the sandbox code, and
 weekly. It builds the guest image and runs the ignored KVM tests. Run them on
@@ -633,8 +646,11 @@ HARVEST_FIRECRACKER_BIN=/usr/local/bin/firecracker \
 ```
 
 The tests whose names start with `root_` need root. They include the jailer
-and snapshot tests. Set `HARVEST_JAILER_BIN`, and run the test binary as root
-with the filter `root_` and `--ignored`. The workflow does both.
+and snapshot tests, the cgroup tests and the mount tests. Set
+`HARVEST_JAILER_BIN`, and run the test binary as root with the filter
+`root_` and `--ignored`. The workflow does both. It also passes
+`HARVEST_TEST_REQUIRE_ISOLATION=1` through `sudo env`, so a missing
+namespace fails a root test.
 
 ## Research sources
 

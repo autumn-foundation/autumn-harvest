@@ -24,6 +24,13 @@ tables = ["harvest_activity_default_overrides", "harvest_activity_pauses", "harv
 measured = "unmeasured"
 plan = "docs/ledger/plans/autumn-harvest-plugin/preflight.md"
 
+["observe_dlq_read_access"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_dead_letter_counts", "harvest_dead_letters"]
+measured = "unmeasured"
+
 ["observe_migration_shard"]
 driver = "setup"
 backend = ["postgres"]

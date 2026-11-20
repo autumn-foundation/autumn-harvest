@@ -184,6 +184,7 @@ mod delayed_start_tests;
 mod det_check_tests;
 mod determinism_static_analysis_docs;
 mod dispatch_tests;
+mod dlq_depth_counter_tests;
 mod docs_guard_support;
 mod drain_release_tests;
 #[cfg(feature = "db")]
@@ -231,6 +232,8 @@ mod hot_code_swap_tests;
 #[cfg(feature = "testing")]
 mod idempotency_tests;
 mod integration_e2e;
+#[cfg(feature = "db")]
+mod keyed_claim_running_counts_tests;
 #[cfg(feature = "db")]
 mod late_signal_completion_tests;
 #[cfg(feature = "db")]

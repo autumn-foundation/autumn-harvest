@@ -761,12 +761,22 @@ mod tests {
         let findings = inspect_jail_base(&base);
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert_eq!(findings[0].severity, Severity::Critical);
-        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // SAFETY: geteuid has no preconditions.
-        if unsafe { libc::geteuid() } == 0 {
-            assert_eq!(inspect_jail_base(&base), []);
-        }
         assert_eq!(inspect_jail_base(&root.join("missing")), []);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Only root can own a jail base, so only root sees no finding.
+    #[test]
+    #[ignore = "needs root; the Sandbox (KVM) workflow runs it with sudo"]
+    fn root_a_jail_base_that_only_root_can_write_has_no_findings() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // SAFETY: geteuid has no preconditions.
+        assert_eq!(unsafe { libc::geteuid() }, 0, "run this test as root");
+        let root = fake_sys();
+        let base = root.join("jail");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(inspect_jail_base(&base), []);
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -1534,6 +1534,9 @@ async fn check_dlq_read_access(api_state: &HarvestApiState) -> PreflightCheckRes
     )
 }
 
+/// Reads one row of the DLQ, to prove that the role can read the table.
+const DLQ_READ_PROBE_SQL: &str = "SELECT 1 FROM harvest_dead_letters LIMIT 1";
+
 async fn observe_dlq_read_access(shard_id: i32, shard_pool: &DbPool) -> ShardObservation {
     let Ok(mut conn) = shard_pool.get().await else {
         return ShardObservation {
@@ -1546,13 +1549,28 @@ async fn observe_dlq_read_access(shard_id: i32, shard_pool: &DbPool) -> ShardObs
         };
     };
 
-    dlq::dead_letter_count(&mut conn).await.map_or_else(
-        |_| ShardObservation {
+    // The depth reads a counter, not the DLQ. So the probe reads one row of
+    // the DLQ too: the list, the redrive and the API read that table.
+    let table_readable = diesel::sql_query(DLQ_READ_PROBE_SQL)
+        .execute(&mut conn)
+        .await
+        .is_ok();
+    let count = if table_readable {
+        dlq::dead_letter_count(&mut conn).await.ok()
+    } else {
+        None
+    };
+    count.map_or_else(
+        || ShardObservation {
             passed: false,
             details: json!({
                 "shard_id": shard_id,
                 "status": "fail",
-                "error": "dead-letter table is not readable",
+                "error": if table_readable {
+                    "dead-letter depth is not readable"
+                } else {
+                    "dead-letter table is not readable"
+                },
             }),
         },
         |count| ShardObservation {

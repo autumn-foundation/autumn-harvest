@@ -1785,6 +1785,7 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+    use crate::sandbox::isolation_gate::host_has;
     use crate::sandbox::outcome::RunStatus;
     use crate::sandbox::policy::{NetworkPolicy, SandboxPolicy};
     use crate::sandbox::request::{SandboxFile, SandboxRequest};
@@ -1828,7 +1829,10 @@ mod tests {
                     }
                     stderr = out.stderr;
                 }
-                Err(SandboxError::Unavailable(m)) if m.contains("user namespace") => return,
+                Err(SandboxError::Unavailable(m)) if m.contains("user namespace") => {
+                    host_has(false, "user namespace");
+                    return;
+                }
                 // EAGAIN: the worker uid is at its process limit.
                 Err(SandboxError::Unavailable(m)) if m.contains("(os error 11)") => stderr = m,
                 Err(e) => panic!("{e:?}"),
@@ -2881,7 +2885,7 @@ mod tests {
             .plan(&sh("cat /proc/net/dev"))
             .unwrap();
         let result = execute_plan(&denied, &options(), &CancellationToken::new()).await;
-        if network_isolation_available().await {
+        if host_has(network_isolation_available().await, "network namespace") {
             let out = result.expect("isolation is available");
             let interfaces: Vec<&str> = out
                 .stdout
