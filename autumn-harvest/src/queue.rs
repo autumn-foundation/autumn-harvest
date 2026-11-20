@@ -3883,11 +3883,32 @@ const BY_ID_ANCHOR: &str = "AND NOT (harvest_task_queue.queue_name = ANY(paused_
 /// full-scan form.
 const BY_ID_KEYS_ANCHOR: &str = "AND concurrency_cap IS NOT NULL ";
 
+/// The queue and state test of `candidate` and of `concurrency_pending_keys`.
+///
+/// It appears once in each of the two scans of the full-scan form.
+const BY_ID_STATE_ANCHOR: &str = "queue_name = ANY($2) AND state = 'PENDING' ";
+
+/// [`BY_ID_STATE_ANCHOR`] with the state test hidden from the planner.
+///
+/// Each partial index on `PENDING` rows matches the plain state test. After
+/// an idle analyze each such index looks empty. The plan then reads each
+/// live entry of that index, not one entry of a full index. A one-row claim
+/// finds its row through a full index: the primary key for a task id, and
+/// `idx_harvest_tq_workflow` for an execution id. So `row_guard_sql!`
+/// applies. See `docs/performance-claim-by-id-guard.md`.
+const BY_ID_STATE_GUARD: &str = concat!(
+    "queue_name = ANY($2) AND ",
+    crate::row_guard::row_guard_sql!("state = 'PENDING'"),
+    " "
+);
+
 /// Splice the by-id predicates into `base`.
 ///
 /// Two predicates go in, both binding the same task id. The first restricts
 /// `candidate` to the named row, which is what makes the claim a by-id claim.
-/// The second restricts `concurrency_pending_keys` to the named row.
+/// The second restricts `concurrency_pending_keys` to the named row. The
+/// state test of both scans also goes into a row guard.
+/// [`splice_one_row_predicates`] does the splice.
 ///
 /// # Why the CTE needs its own predicate
 ///
@@ -3901,11 +3922,24 @@ const BY_ID_KEYS_ANCHOR: &str = "AND concurrency_cap IS NOT NULL ";
 /// still
 /// aggregates the `RUNNING` population for the named row's key, and the
 /// authoritative advisory-locked recheck inside `claimed` is untouched.
-///
-/// The assertion on each anchor count guards a future edit. An edit that
-/// duplicates or renames an anchor panics at first use. Without it, a by-id
-/// claim could silently claim some other row.
 fn splice_by_id_predicate(base: &str, bind: &str) -> String {
+    splice_one_row_predicates(
+        base,
+        &format!("AND harvest_task_queue.id = {bind} "),
+        &format!("AND id = {bind} "),
+    )
+}
+
+/// Splice the predicates of a one-row claim into `base`.
+///
+/// `candidate` goes into the `candidate` CTE and `keys` into
+/// `concurrency_pending_keys`. Each must find few rows through a full index.
+/// The state test of both scans then goes into a row guard, as
+/// [`BY_ID_STATE_GUARD`] explains.
+///
+/// The assertions make an edit that breaks an anchor panic at first use.
+/// Without them, a one-row claim could silently claim some other row.
+fn splice_one_row_predicates(base: &str, candidate: &str, keys: &str) -> String {
     assert_eq!(
         base.matches(BY_ID_ANCHOR).count(),
         1,
@@ -3916,22 +3950,23 @@ fn splice_by_id_predicate(base: &str, bind: &str) -> String {
         1,
         "claim query concurrency-keys anchor must appear exactly once"
     );
-    base.replace(
-        BY_ID_ANCHOR,
-        &format!("{BY_ID_ANCHOR}AND harvest_task_queue.id = {bind} "),
-    )
-    .replace(
-        BY_ID_KEYS_ANCHOR,
-        &format!("{BY_ID_KEYS_ANCHOR}AND id = {bind} "),
-    )
+    assert_eq!(
+        base.matches(BY_ID_STATE_ANCHOR).count(),
+        2,
+        "claim query state anchor must appear once in each one-row scan"
+    );
+    base.replace(BY_ID_ANCHOR, &format!("{BY_ID_ANCHOR}{candidate}"))
+        .replace(BY_ID_KEYS_ANCHOR, &format!("{BY_ID_KEYS_ANCHOR}{keys}"))
+        .replace(BY_ID_STATE_ANCHOR, BY_ID_STATE_GUARD)
 }
 
 /// [`claim_task_query`] restricted to one named row (issue #1312).
 ///
-/// Identical to the full-scan form of the claim query plus two predicates on
-/// the row id: one in the `candidate` CTE and one in
-/// `concurrency_pending_keys`. The full-scan form has no seek window (issue
-/// #1971), because a window cannot help a claim of one row. Every one of the
+/// The full-scan form of the claim query with two predicates on the row id:
+/// one in the `candidate` CTE and one in `concurrency_pending_keys`. A row
+/// guard hides the state test of both scans, so each scan reads the primary
+/// key. The full-scan form has no seek window (issue #1971), because a window
+/// cannot help a claim of one row. Every one of the
 /// thirteen claim gates still applies. A dispatch reference names a row; it
 /// never authorizes a claim. Binds `$7` task id on top of the base query's
 /// `$1..$6`.
@@ -4429,28 +4464,15 @@ pub fn owned_claim_by_id_query(fenced: bool) -> &'static str {
 ///
 /// It is [`splice_by_id_predicate`] keyed by the execution id of a
 /// workflow row. Each run has one workflow-task row, so the claim names one
-/// row. `idx_harvest_tq_workflow` finds it.
+/// row. `idx_harvest_tq_workflow_task` finds it.
 fn splice_by_execution_predicate(base: &str, bind: &str) -> String {
-    assert_eq!(
-        base.matches(BY_ID_ANCHOR).count(),
-        1,
-        "claim query by-id anchor must appear exactly once"
-    );
-    assert_eq!(
-        base.matches(BY_ID_KEYS_ANCHOR).count(),
-        1,
-        "claim query concurrency-keys anchor must appear exactly once"
-    );
-    base.replace(
-        BY_ID_ANCHOR,
+    splice_one_row_predicates(
+        base,
         &format!(
-            "{BY_ID_ANCHOR}AND harvest_task_queue.workflow_exec_id = {bind} \
+            "AND harvest_task_queue.workflow_exec_id = {bind} \
              AND harvest_task_queue.task_type = 'workflow' "
         ),
-    )
-    .replace(
-        BY_ID_KEYS_ANCHOR,
-        &format!("{BY_ID_KEYS_ANCHOR}AND workflow_exec_id = {bind} AND task_type = 'workflow' "),
+        &format!("AND workflow_exec_id = {bind} AND task_type = 'workflow' "),
     )
 }
 
@@ -18039,9 +18061,10 @@ mod tests {
         assert_eq!(
             by_id
                 .replace(candidate_predicate, "")
-                .replace(keys_predicate, ""),
+                .replace(keys_predicate, "")
+                .replace(BY_ID_STATE_GUARD, BY_ID_STATE_ANCHOR),
             base,
-            "the by-id query must differ from the full-scan form by two predicates only"
+            "the by-id query must differ from the full-scan form by two predicates and the guard only"
         );
         assert!(
             !by_id.contains("seek_heads"),
@@ -18049,9 +18072,10 @@ mod tests {
         );
     }
 
+    /// The state gate stays in its row guard. The test reads it plain.
     #[test]
     fn by_id_claim_query_keeps_every_gate() {
-        let by_id = claim_task_by_id_query();
+        let by_id = claim_task_by_id_query().replace(BY_ID_STATE_GUARD, BY_ID_STATE_ANCHOR);
         for gate in CLAIM_GATES {
             assert!(by_id.contains(gate), "by-id claim query dropped: {gate}");
         }
@@ -18059,7 +18083,7 @@ mod tests {
 
     #[test]
     fn fenced_by_id_claim_query_keeps_every_gate_and_the_fence() {
-        let fenced = claim_task_by_id_query_fenced();
+        let fenced = claim_task_by_id_query_fenced().replace(BY_ID_STATE_GUARD, BY_ID_STATE_ANCHOR);
         for gate in CLAIM_GATES {
             assert!(
                 fenced.contains(gate),
@@ -18082,9 +18106,63 @@ mod tests {
         assert_eq!(
             fenced
                 .replace(candidate_predicate, "")
-                .replace(keys_predicate, ""),
+                .replace(keys_predicate, "")
+                .replace(BY_ID_STATE_GUARD, BY_ID_STATE_ANCHOR),
             splice_dr_fence(claim_task_full_scan_query(), "$7", "$8", 1)
         );
+    }
+
+    /// Each scan of a one-row claim hides its state test. The plan then
+    /// reads a full index after an idle analyze. `row_guard_plan_db_tests`
+    /// checks the plan.
+    #[test]
+    fn every_one_row_claim_hides_the_state_test_of_both_scans() {
+        let guard = "AND (CASE WHEN state = 'PENDING' THEN true END) ";
+        for (sql, id) in [
+            (claim_task_by_id_query(), "id = $7 "),
+            (claim_task_by_id_query_fenced(), "id = $9 "),
+            (owned_claim_by_id_query(false), "id = $7 "),
+            (owned_claim_by_id_query(true), "id = $9 "),
+            (
+                owned_claim_by_execution_query(false),
+                "workflow_exec_id = $7 ",
+            ),
+            (
+                owned_claim_by_execution_query(true),
+                "workflow_exec_id = $9 ",
+            ),
+        ] {
+            assert_eq!(sql.matches(guard).count(), 2, "{sql}");
+            assert!(!sql.contains(BY_ID_STATE_ANCHOR), "{sql}");
+            for (start, end) in [
+                (
+                    "concurrency_pending_keys AS",
+                    "concurrency_running_counts AS",
+                ),
+                ("candidate AS (", "rate_limit_debit AS"),
+            ] {
+                let from = sql.find(start).expect("scan start");
+                let to = sql.find(end).expect("scan end");
+                let scan = &sql[from..to];
+                assert!(scan.contains(guard), "{start} has no guard");
+                assert!(scan.contains(id), "{start} has no {id}");
+            }
+        }
+    }
+
+    /// The window claim reads its partial indexes, so it keeps the plain
+    /// state test. Only a one-row claim names its row.
+    #[test]
+    fn the_window_claim_keeps_the_plain_state_test() {
+        for sql in [
+            claim_task_query(),
+            claim_task_query_fenced(),
+            claim_query_for(Some(TaskType::Workflow), false, ClaimFairness::Keys),
+            owned_claim_query_for(None, false, ClaimFairness::Off),
+        ] {
+            assert!(sql.contains(BY_ID_STATE_ANCHOR), "{sql}");
+            assert!(!sql.contains("CASE WHEN state = 'PENDING'"), "{sql}");
+        }
     }
 
     #[test]

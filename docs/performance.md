@@ -2844,6 +2844,10 @@ standalone note rather than part of the claim-path attribution table above:
   query had a quadratic plan. A `NOT EXISTS` probe fixes the plan. One 15 s
   gauge interval cuts the sampler buffers per worker-hour by 98.3% at the
   small size.
+* [`docs/performance-dlq-depth-counter.md`](performance-dlq-depth-counter.md)
+  — the DLQ depth gauge read every dead letter: 744,158 buffers per call at
+  1M dead letters. A counter of delta rows, kept by triggers, makes it 1
+  buffer. A one-row dead-letter write costs about 2 to 4 buffers more.
 * [`docs/performance-completion-trigger-outbox-queue.md`](performance-completion-trigger-outbox-queue.md)
   — the per-row `harvest_schedules` lookup in
   `completion_trigger::enforce_completion_triggers_outbox`'s cross-shard
@@ -3161,3 +3165,8 @@ standalone note rather than part of the claim-path attribution table above:
   201 → 6 after an idle analyze. A wake re-pend reads 1,411 → 4 after an
   idle analyze. A workflow task index keeps a wake at 4 buffers for a run
   with 50,000 rows.
+* [`docs/performance-claim-by-id-guard.md`](performance-claim-by-id-guard.md)
+  — after an idle analyze, the by-id claim and the owner take read a
+  live-row partial index instead of a full index (issue #2751). A `CASE`
+  guard on their state test fixes the plan. On a 1M-row fixture, the by-id
+  claim reads 622 → 26 buffers, and the owner take 3,610 → 33.

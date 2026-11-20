@@ -724,10 +724,12 @@ pub(crate) fn timeout_batch_query(predicate: &str) -> String {
 /// The ids among `$1` that match `predicate` now (issue #1795).
 ///
 /// It selects ids only. A probe of a large batch then loads no payloads. It
-/// reads the batch as [`timeout_batch_query`] does.
+/// reads the batch as [`timeout_batch_query`] does, but its page holds the
+/// predicate columns only.
 pub(crate) fn timeout_probe_query(predicate: &str) -> String {
     format!(
-        "{TIMEOUT_BATCH_PAGE} SELECT q.id FROM ({}) q",
+        "WITH page AS MATERIALIZED (SELECT {TIMEOUT_PAGE_COLUMNS} FROM harvest_task_queue \
+         WHERE id = ANY($1)) SELECT q.id FROM ({}) q",
         on_refill_page(predicate)
     )
 }
@@ -6265,6 +6267,13 @@ async fn enforce_timeouts_pass(
         shard_assignments,
     )
     .await?;
+    // Fold the delta rows of the DLQ depth counter on this shard. A writer
+    // never folds, because a fold scans the whole counter. A failure is
+    // logged and skipped: it leaves more rows to read, and the count stays
+    // exact. It is not counted, because `count` is the timeout total.
+    if let Err(error) = crate::dlq::fold_dead_letter_counts(conn).await {
+        tracing::warn!(error = %error, "dlq depth fold failed; continuing the timeout pass");
+    }
     // Lazy payload-codec re-encryption (issue #948): convert a bounded batch of
     // stored rows per shard from a retired key id onto the active one.
     //

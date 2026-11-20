@@ -70,7 +70,7 @@ use crate::sampling::{OpSample, SampleFailure, sample_task};
 use crate::skill::SkillText;
 use crate::types::{AgentStop, AgentTask, DEFAULT_APPROVAL_TIMEOUT_SECS, DEFAULT_MAX_STEPS};
 use crate::workflow::{
-    Member, Outbox, Progress, Run, SteerBook, Tree, deliver, discover, harness, run_segment,
+    Member, Outbox, Progress, Run, SteerBook, Tree, boxed_run_segment, deliver, discover, harness,
 };
 use crate::workspace::{WorkspaceMount, WorkspaceRef};
 use autumn_harvest::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES;
@@ -1384,15 +1384,17 @@ impl Agent {
     }
 }
 
+/// The state after one segment, with the stop and the answer of a segment
+/// that completed. `Err` is a refusal of a peer message.
+type SegmentEnd = (AgentState, Result<Option<(AgentStop, String)>, Refusal>);
+
 /// Handle one op of `run`.
 ///
 /// The handler closure returns this future, not the future of
 /// [`AgentRun::handle`]. harvest-verify reads a future type that names a
 /// lifetime, as `AgentRun<'_>` does, as one that can write through its
-/// fields. The future also stays unboxed, so harvest-verify can follow it.
-// The engine keeps the workflow future on the heap, so the size of this
-// inline future costs no stack.
-#[allow(clippy::large_futures)]
+/// fields. The handler closure returns this future unboxed, so harvest-verify
+/// can follow it. The entity loop puts it on the heap (issue #2752).
 async fn handle_op(
     run: &AgentRun<'_>,
     state: AgentState,
@@ -1450,6 +1452,19 @@ async fn load_run(ctx: &WorkflowContext, id: Result<AgentId, String>) -> AgentRu
     }
 }
 
+/// [`load_run`] on the heap.
+///
+/// It makes its future in its own frame, as [`autumn_harvest::frame`]
+/// explains (issue #2752). The future names a lifetime, so a closure future
+/// would be a harvest-verify boundary. A named function is not.
+#[inline(never)]
+fn boxed_load_run(
+    ctx: &WorkflowContext,
+    id: Result<AgentId, String>,
+) -> Pin<Box<impl Future<Output = AgentRun<'_>>>> {
+    Box::pin(load_run(ctx, id))
+}
+
 /// The durable agent workflow. The workflow id is the [`AgentId`].
 ///
 /// Each op runs one segment of the agent loop. See the [module
@@ -1459,14 +1474,11 @@ async fn load_run(ctx: &WorkflowContext, id: Result<AgentId, String>) -> AgentRu
 ///
 /// Returns an engine error of the entity loop, for example a cancel.
 #[workflow]
-// The entity future holds the op future inline. The engine keeps the
-// workflow future on the heap, so a box here adds only an allocation.
-#[allow(clippy::large_futures)]
 pub async fn agent(ctx: &WorkflowContext, input: serde_json::Value) -> Result<AgentState, String> {
     // `format!` and not `to_string`: harvest-verify trusts `format`, but not
     // the blanket `ToString` impl on a type of this crate.
     let id = AgentId::parse(ctx.workflow_id()).map_err(|err| format!("{err}"));
-    let run = load_run(ctx, id).await;
+    let run = boxed_load_run(ctx, id).await;
     let max_ops = run
         .profile
         .as_ref()
@@ -1551,8 +1563,8 @@ impl AgentRun<'_> {
                 AgentOp::Control(Control::ReloadProfile) => {
                     reload = Some(self.boxed_reload_read().await);
                 }
-                AgentOp::Control(control) => state = self.control(state, control).await,
-                AgentOp::Unpark => state = self.unpark(state).await,
+                AgentOp::Control(control) => state = self.boxed_control(state, control).await,
+                AgentOp::Unpark => state = self.boxed_unpark(state).await,
                 _ => {}
             },
             Admit::Hold => {
@@ -1562,7 +1574,7 @@ impl AgentRun<'_> {
             }
             Admit::Run => {
                 ticked = matches!(op, AgentOp::HeartbeatTick);
-                state = self.work(state, op).await;
+                state = self.boxed_work(state, op).await;
             }
             Admit::Skip => {}
         }
@@ -1614,15 +1626,81 @@ impl AgentRun<'_> {
 
     /// [`reload_read`](Self::reload_read) on the heap.
     ///
-    /// A debug build makes a future in the frame of its caller before it
-    /// boxes it. This function owns that frame, and it returns before the
-    /// poll. So the frame of `handle` holds a pointer only. With the future
-    /// inline, each op needs more stack, and a 1 MiB main thread overflows.
+    /// Each `boxed_` function makes its future in its own frame, as
+    /// [`autumn_harvest::frame`] explains (issue #2752). Each future names a
+    /// lifetime, so a closure future would be a harvest-verify boundary.
     #[inline(never)]
     fn boxed_reload_read(
         &self,
     ) -> Pin<Box<impl Future<Output = Result<Box<AgentProfile>, String>> + '_>> {
         Box::pin(self.reload_read())
+    }
+
+    /// [`work`](Self::work) on the heap.
+    #[inline(never)]
+    fn boxed_work(
+        &self,
+        state: AgentState,
+        op: AgentOp,
+    ) -> Pin<Box<impl Future<Output = AgentState> + '_>> {
+        Box::pin(self.work(state, op))
+    }
+
+    /// [`control`](Self::control) on the heap.
+    #[inline(never)]
+    fn boxed_control(
+        &self,
+        state: AgentState,
+        control: Control,
+    ) -> Pin<Box<impl Future<Output = AgentState> + '_>> {
+        Box::pin(self.control(state, control))
+    }
+
+    /// [`unpark`](Self::unpark) on the heap.
+    #[inline(never)]
+    fn boxed_unpark(&self, state: AgentState) -> Pin<Box<impl Future<Output = AgentState> + '_>> {
+        Box::pin(self.unpark(state))
+    }
+
+    /// [`sampled`](Self::sampled) on the heap.
+    #[inline(never)]
+    fn boxed_sampled<'s>(
+        &'s self,
+        state: AgentState,
+        input: &'s str,
+        sample: &'s OpSample,
+        mode: Mode<'s>,
+        peer: Option<PeerSegment<'s>>,
+    ) -> Pin<Box<impl Future<Output = SegmentEnd> + 's>> {
+        Box::pin(self.sampled(state, input, sample, mode, peer))
+    }
+
+    /// [`run_segment_as`](Self::run_segment_as) on the heap.
+    #[inline(never)]
+    fn boxed_run_segment_as<'s>(
+        &'s self,
+        state: AgentState,
+        input: &'s str,
+        mode: Mode<'s>,
+        peer: Option<PeerSegment<'s>>,
+    ) -> Pin<Box<impl Future<Output = SegmentEnd> + 's>> {
+        Box::pin(self.run_segment_as(state, input, mode, peer))
+    }
+
+    /// [`peer_message`](Self::peer_message) on the heap.
+    #[inline(never)]
+    fn boxed_peer_message(
+        &self,
+        state: AgentState,
+        envelope: PeerEnvelope,
+    ) -> Pin<Box<impl Future<Output = AgentState> + '_>> {
+        Box::pin(self.peer_message(state, envelope))
+    }
+
+    /// [`tick`](Self::tick) on the heap.
+    #[inline(never)]
+    fn boxed_tick(&self, state: AgentState) -> Pin<Box<impl Future<Output = AgentState> + '_>> {
+        Box::pin(self.tick(state))
     }
 
     /// The profile of one op and its overlay version (issue #2372).
@@ -2127,7 +2205,7 @@ impl AgentRun<'_> {
                     // A person is present, so a new follow-up chain starts.
                     state.chain = 0;
                     let (mut state, outcome) = self
-                        .sampled(state, &message.text, sample, Mode::Attended, None)
+                        .boxed_sampled(state, &message.text, sample, Mode::Attended, None)
                         .await;
                     // A mesh budget refused each draw before it spent a
                     // token. The message waits for the next period, first in
@@ -2159,8 +2237,8 @@ impl AgentRun<'_> {
                 }
                 state
             }
-            AgentOp::PeerMessage(envelope) => self.peer_message(state, envelope).await,
-            AgentOp::HeartbeatTick => self.tick(state).await,
+            AgentOp::PeerMessage(envelope) => self.boxed_peer_message(state, envelope).await,
+            AgentOp::HeartbeatTick => self.boxed_tick(state).await,
             AgentOp::FollowupDue => {
                 if state.followup_due_ms.take().is_none() {
                     return state;
@@ -2220,11 +2298,11 @@ impl AgentRun<'_> {
                 };
                 let (next, outcome) = match &envelope.sample {
                     Some(sample) => {
-                        self.sampled(state, &input, sample, Mode::Peer, Some(peer))
+                        self.boxed_sampled(state, &input, sample, Mode::Peer, Some(peer))
                             .await
                     }
                     None => {
-                        self.run_segment_as(state, &input, Mode::Peer, Some(peer))
+                        self.boxed_run_segment_as(state, &input, Mode::Peer, Some(peer))
                             .await
                     }
                 };
@@ -2322,7 +2400,7 @@ impl AgentRun<'_> {
 
     /// Run one segment with `input` and fold it into `state`.
     async fn segment(&self, state: AgentState, input: &str, mode: Mode<'_>) -> AgentState {
-        self.run_segment_as(state, input, mode, None).await.0
+        self.boxed_run_segment_as(state, input, mode, None).await.0
     }
 
     /// Start one op: check the run, drain the stale interrupts, read the op
@@ -2396,7 +2474,7 @@ impl AgentRun<'_> {
         input: &str,
         mode: Mode<'_>,
         peer: Option<PeerSegment<'_>>,
-    ) -> (AgentState, Result<Option<(AgentStop, String)>, Refusal>) {
+    ) -> SegmentEnd {
         let mut task = match self.open_op(&mut state, input, mode, peer.as_ref()).await {
             Ok(task) => task,
             Err(Some(refusal)) => return (state, Err(refusal)),
@@ -2453,7 +2531,7 @@ impl AgentRun<'_> {
                 .map_or(self.member.as_ref(), |peer| Some(peer.member)),
             live: true,
         };
-        let result = run_segment(self.ctx, run, &mut progress, &mut tree, input).await;
+        let result = boxed_run_segment(self.ctx, run, &mut progress, &mut tree, input).await;
         fold_segment(&mut state, &mut progress, tree);
         let refused = refused_untouched(&state, rounds);
         if state.workspace != head {
@@ -2529,7 +2607,7 @@ impl AgentRun<'_> {
         sample: &OpSample,
         mode: Mode<'_>,
         peer: Option<PeerSegment<'_>>,
-    ) -> (AgentState, Result<Option<(AgentStop, String)>, Refusal>) {
+    ) -> SegmentEnd {
         let mut task = match self.open_op(&mut state, input, mode, peer.as_ref()).await {
             Ok(task) => task,
             Err(Some(refusal)) => return (state, Err(refusal)),

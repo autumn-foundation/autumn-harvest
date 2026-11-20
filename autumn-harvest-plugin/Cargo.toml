@@ -223,6 +223,8 @@ tokio = { workspace = true, features = ["test-util"] }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 tracing-subscriber = "0.3"
+# Issue #2762: the test binary makes two tracing keepers before `main`.
+ctor = "1"
 # Issue #798: the export -> bundle -> drift-gate end-to-end test writes a real
 # bundle directory and feeds it to `WorkflowReplayer::replay_bundle`.
 tempfile = "3"

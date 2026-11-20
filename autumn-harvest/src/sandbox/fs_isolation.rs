@@ -1530,12 +1530,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pivot_runs_a_dedicated_uid_with_no_network() {
+    #[ignore = "needs root; the Sandbox (KVM) workflow runs it with sudo"]
+    async fn root_a_pivot_runs_a_dedicated_uid_with_no_network() {
+        assert!(is_root(), "run this test as root");
         if !needs_isolation().await {
-            return;
-        }
-        if !is_root() {
-            eprintln!("skipped: run_as needs a root worker");
             return;
         }
         let options = ExecOptions {
@@ -1589,11 +1587,9 @@ mod tests {
     /// The child must make the tree private before it mounts. A thread in
     /// its own mount namespace with a shared root shows a leak.
     #[test]
-    fn a_mask_does_not_leak_into_a_shared_root() {
-        if !is_root() {
-            eprintln!("skipped: a shared root needs a root worker");
-            return;
-        }
+    #[ignore = "needs root; the Sandbox (KVM) workflow runs it with sudo"]
+    fn root_a_mask_does_not_leak_into_a_shared_root() {
+        assert!(is_root(), "run this test as root");
         let (_dir, file) = secret_dir();
         let masked = file.display().to_string();
         let leaked = std::thread::spawn(move || {
@@ -1603,18 +1599,22 @@ mod tests {
             if unsafe { libc::unshare(libc::CLONE_FS | libc::CLONE_NEWNS) } != 0 {
                 return None;
             }
-            // SAFETY: mount reads valid C strings.
-            let shared = unsafe {
-                libc::mount(
-                    std::ptr::null(),
-                    c"/".as_ptr(),
-                    std::ptr::null(),
-                    libc::MS_REC | libc::MS_SHARED,
-                    std::ptr::null(),
-                )
-            };
-            if shared != 0 {
-                return None;
+            // Private first, then shared, gives this thread a new peer
+            // group. A leak then stays out of the host namespace.
+            for flags in [libc::MS_PRIVATE, libc::MS_SHARED] {
+                // SAFETY: mount reads valid C strings.
+                let changed = unsafe {
+                    libc::mount(
+                        std::ptr::null(),
+                        c"/".as_ptr(),
+                        std::ptr::null(),
+                        libc::MS_REC | flags,
+                        std::ptr::null(),
+                    )
+                };
+                if changed != 0 {
+                    return None;
+                }
             }
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1637,11 +1637,9 @@ mod tests {
     /// A strict umask of the worker must not close the directories of the
     /// new root to the code uid.
     #[test]
-    fn a_pivot_ignores_a_strict_worker_umask() {
-        if !is_root() {
-            eprintln!("skipped: the code uid differs from the worker only for root");
-            return;
-        }
+    #[ignore = "needs root; the Sandbox (KVM) workflow runs it with sudo"]
+    fn root_a_pivot_ignores_a_strict_worker_umask() {
+        assert!(is_root(), "run this test as root");
         let out = std::thread::spawn(|| {
             // SAFETY: CLONE_FS gives this thread its own umask, so no other
             // test sees the change.

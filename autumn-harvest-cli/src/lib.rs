@@ -7757,12 +7757,23 @@ async fn run_dr_promote(shards: &[String], format: DrFormat) -> Result<(), CliEr
         let advanced = advance_sequences_after_promotion(&mut conn)
             .await
             .map_err(|e| CliError::InvalidInput(e.to_string()))?;
+        // A logical standby applies rows with the triggers off, and its own
+        // migration seeded a row. So its DLQ depth counter can be wrong. The
+        // recount sets it from the table. A failure does not stop the
+        // promotion: the counter only feeds a gauge.
+        let dlq_recount = autumn_harvest::dlq::recount_dead_letters(&mut conn)
+            .await
+            .map_or_else(
+                |e| serde_json::json!({ "error": e.to_string() }),
+                |entries| serde_json::json!({ "entries": entries }),
+            );
         results.push(serde_json::json!({
             "shard_id": target.shard_id,
             "sequences_advanced": advanced
                 .iter()
                 .map(|(name, value)| serde_json::json!({ "sequence": name, "set_to": value }))
                 .collect::<Vec<_>>(),
+            "dlq_recount": dlq_recount,
         }));
     }
 
@@ -7776,6 +7787,16 @@ async fn run_dr_promote(shards: &[String], format: DrFormat) -> Result<(), CliEr
             for r in &results {
                 let seqs = r["sequences_advanced"].as_array().map_or(0, Vec::len);
                 println!("shard {}: {seqs} sequence(s) advanced", r["shard_id"]);
+                let recount = &r["dlq_recount"];
+                if let Some(entries) = recount["entries"].as_i64() {
+                    println!("shard {}: DLQ depth recounted: {entries}", r["shard_id"]);
+                } else {
+                    println!(
+                        "shard {}: DLQ depth recount failed: {}; run \
+                         SELECT harvest_dead_letter_recount(); as the table owner",
+                        r["shard_id"], recount["error"]
+                    );
+                }
             }
         }
     }

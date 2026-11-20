@@ -295,30 +295,14 @@ fn show(version: Option<OverlayVersion>) -> String {
     version.map_or_else(|| "none (the base profile)".to_owned(), |v| v.to_string())
 }
 
-/// The stack of the thread that runs the walk.
+/// Run the walk on the main thread.
 ///
-/// A debug build polls the walk through deep frames. On Linux the walk needs
-/// almost 1 MiB of stack. The Windows main thread has 1 MiB, so the example
-/// overflowed there with `STATUS_STACK_OVERFLOW`. A spawned thread gets the
-/// stack that the spawn asks for. 8 MiB is the Linux default for a main thread.
-/// `autumn-harvest-cli` does the same for the same reason.
-///
-/// Reproduce the Windows condition on Linux with `ulimit -s 1024`.
-const WALK_STACK_BYTES: usize = 8 * 1024 * 1024;
-
-fn main() -> Result<(), Box<dyn Error>> {
-    let walk = std::thread::Builder::new()
-        .name("agent-refine".to_owned())
-        .stack_size(WALK_STACK_BYTES)
-        .spawn(|| {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| e.to_string())?;
-            runtime.block_on(walk_main()).map_err(|e| e.to_string())
-        })?;
-    let result = walk.join().map_err(|_| "the walk thread panicked")?;
-    result.map_err(Into::into)
+/// A debug build of the walk needed almost 1 MiB of stack before issue #2752,
+/// so it overflowed the Windows main thread. The engine keeps large futures
+/// on the heap. The `stack_budget` test guards that.
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<(), Box<dyn Error>> {
+    walk_main().await
 }
 
 /// Run the walk with an approval, print each step and check each claim.

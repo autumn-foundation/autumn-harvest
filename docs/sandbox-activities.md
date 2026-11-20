@@ -627,6 +627,11 @@ non-root user. To allow it, run
 `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`. The change
 lasts until the next reboot.
 
+A test that needs root has a name that starts with `root_` and has
+`#[ignore]`. No test that is not ignored skips for lack of root (issue
+#2757). As root, run the mount tests with the filter
+`sandbox::fs_isolation::tests::root_` and `--ignored`.
+
 The `Sandbox (KVM)` workflow boots real microVMs on a GitHub runner with
 `/dev/kvm`. It runs on each pull request that changes the sandbox code, and
 weekly. It builds the guest image and runs the ignored KVM tests. Run them on
@@ -641,8 +646,11 @@ HARVEST_FIRECRACKER_BIN=/usr/local/bin/firecracker \
 ```
 
 The tests whose names start with `root_` need root. They include the jailer
-and snapshot tests. Set `HARVEST_JAILER_BIN`, and run the test binary as root
-with the filter `root_` and `--ignored`. The workflow does both.
+and snapshot tests, the cgroup tests and the mount tests. Set
+`HARVEST_JAILER_BIN`, and run the test binary as root with the filter
+`root_` and `--ignored`. The workflow does both. It also passes
+`HARVEST_TEST_REQUIRE_ISOLATION=1` through `sudo env`, so a missing
+namespace fails a root test.
 
 ## Research sources
 

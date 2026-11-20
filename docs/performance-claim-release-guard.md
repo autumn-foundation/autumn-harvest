@@ -80,8 +80,9 @@ Two unit tests walk the engine source. A by-id statement with a plain guard
 fails them.
 
 The by-id claim (`queue::claim_task_by_id_query`) is not in scope. It is a
-variant of the claim statement, which has its own plan guards. Issue #2751
-measures it.
+variant of the claim statement, which has its own plan guards.
+[`performance-claim-by-id-guard.md`](performance-claim-by-id-guard.md)
+measures and fixes it.
 
 The Ledger profiles of `queue::release_claim_via`,
 `queue::park_workflow_task_inner`, `queue::complete_task_inner` and
