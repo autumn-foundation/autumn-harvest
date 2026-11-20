@@ -382,6 +382,8 @@ pub mod fan_out;
 /// Non-destructive fork of a workflow run (issue #2000).
 #[cfg(feature = "db")]
 pub mod fork;
+/// Keep a large child future off the stack of a debug build (issue #2752).
+pub mod frame;
 /// Replay fuzz harness (issue #1835). Not a stable API.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
