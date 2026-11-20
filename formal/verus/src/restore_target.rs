@@ -4,24 +4,31 @@
 //! The next open restores the Harvest file to it. A later restore of the
 //! database must supersede it, and a failed one must keep it.
 //!
-//! The copy below proves `resolve_target` in
+//! The copies below prove `resolve_target` and `replaced` in
 //! `autumn-harvest-plugin/src/sqlite/replica.rs` for every input. The spec
 //! below models the target file under any sequence of restores, deletes and
 //! opens. An identity is a `nat`. A new database file gets any identity
 //! other than the current one, so an old identity can come back. Each open
 //! applies the target of the last finished `HarvestFleet::restore`, and no
-//! target after a direct restore, a delete or an earlier open.
+//! target after a direct restore, a delete or an earlier open. After a
+//! direct restore supersedes a target, the open sees a new database file.
+//! This holds even when the new file reuses the recorded identity (issue
+//! #2721).
 //!
 //! Each release before the fleet restore returns writes the pending target
 //! again. The last one comes from the drain of the restore. So an earlier
 //! release does no harm, such as the release of a stale-epoch open. An
 //! open during the drain keeps the pending target.
 //!
+//! An open can fail at any point, such as the removal of the target. It
+//! then refuses, so the runtime writes no run, and the entry stays. The
+//! next open applies the same target again (issue #2753).
+//!
 //! The model takes these engine facts as preconditions. A publish follows
 //! the release of its own drain, with no other step between. No other
 //! restore publishes between that drain and the return of the fleet
-//! restore. Each file write succeeds, except the write of an end. One
-//! process owns the tenant files.
+//! restore. Each file write of a release succeeds, and so does the removal
+//! of a delete. One process owns the tenant files.
 
 use vstd::prelude::*;
 
@@ -94,6 +101,25 @@ pub fn resolve_target<T>(held: Held<T>) -> (r: Resolution<T>)
             (false, Some(previous)) => Resolution::Apply(previous),
             (false, None) => Resolution::Nothing,
         },
+    }
+}
+
+/// `replaced` as a spec. A target that applies or that a later restore
+/// superseded shows a new database file. Otherwise only the record shows
+/// it.
+pub open spec fn spec_replaced<T>(resolution: Resolution<T>, moved: bool) -> bool {
+    !(resolution is Nothing) || moved
+}
+
+// mirror: autumn-harvest-plugin/src/sqlite/replica.rs replaced
+pub fn replaced<T>(resolution: &Resolution<T>, moved: bool) -> (r: bool)
+    ensures
+        r == spec_replaced(*resolution, moved),
+        *resolution is Superseded ==> r,
+{
+    match resolution {
+        Resolution::Nothing => moved,
+        _ => true,
     }
 }
 
@@ -200,6 +226,9 @@ pub enum Step<T> {
     Direct { ok: bool, to: nat },
     /// An open. It applies the result.
     Open,
+    /// An open that fails at any point. It refuses and changes no entry.
+    /// A refused open is also this step.
+    OpenFails,
     /// A delete, then a new file `to` of the re-created tenant.
     Delete { to: nat },
 }
@@ -210,6 +239,15 @@ pub open spec fn opens<T>(w: World<T>) -> Option<T> {
         Run::Asked { written, .. } => applies(seen(w.file, written), w.db),
         Run::Published { pending, .. } => applies(seen(w.file, Some(pending)), w.db),
         _ => applies(w.file, w.db),
+    }
+}
+
+/// The resolution of an open in `w`. [`opens`] gives its target.
+pub open spec fn resolves<T>(w: World<T>) -> Resolution<T> {
+    match w.run {
+        Run::Asked { written, .. } => spec_resolve(held(seen(w.file, written), w.db)),
+        Run::Published { pending, .. } => spec_resolve(held(seen(w.file, Some(pending)), w.db)),
+        _ => spec_resolve(held(w.file, w.db)),
     }
 }
 
@@ -275,6 +313,7 @@ pub open spec fn valid<T>(w: World<T>, step: Step<T>) -> bool {
         Step::EndFails => w.run is Returned,
         Step::Direct { ok, to } => !(w.run is Published) && (ok ==> to != w.db),
         Step::Open => !refused(w),
+        Step::OpenFails => true,
         Step::Delete { .. } => !(w.run is Published),
     }
 }
@@ -371,6 +410,7 @@ pub open spec fn step<T>(w: World<T>, step: Step<T>) -> World<T> {
             },
             _ => World { file: None, want: None, ..w },
         },
+        Step::OpenFails => w,
         Step::Delete { to } => World { db: to, file: None, want: None, ..w },
     }
 }
@@ -541,6 +581,28 @@ pub proof fn theorem_a_direct_restore_supersedes_the_target<T>(
     lemma_restore_then_direct(w, target, to, true, again);
 }
 
+/// A direct restore after a `HarvestFleet::restore` supersedes its target.
+/// The open then sees a new database file, even when the record shows no
+/// move. A new file can reuse the identity of the recorded one, so `again`
+/// can equal any identity but `to` (issue #2721).
+pub proof fn theorem_a_superseded_target_shows_a_new_file<T>(
+    w: World<T>,
+    target: T,
+    to: nat,
+    again: nat,
+)
+    requires
+        inv(w),
+        w.run is Idle,
+        to != w.db,
+        again != to,
+    ensures
+        resolves(restore_then_direct(w, target, to, true, again)) is Superseded,
+        spec_replaced(resolves(restore_then_direct(w, target, to, true, again)), false),
+{
+    lemma_restore_then_direct(w, target, to, true, again);
+}
+
 /// A failed direct restore after a `HarvestFleet::restore` keeps its
 /// target. The open applies it.
 pub proof fn theorem_a_failed_direct_restore_keeps_the_target<T>(
@@ -613,6 +675,39 @@ pub proof fn theorem_an_open_before_the_return_refuses<T>(w: World<T>, target: T
                 step(drained, Step::Publish { ok: true, to }),
             )
         }),
+{
+}
+
+/// A failed open changes no part of the world, so the next open applies
+/// the same target. The model has no runs. The engine writes no run after
+/// a failed open, and the unit tests in `replica.rs` check the Harvest file.
+pub proof fn theorem_a_failed_open_applies_the_same_target<T>(w: World<T>)
+    requires
+        inv(w),
+    ensures
+        inv(step(w, Step::OpenFails)),
+        opens(step(w, Step::OpenFails)) == opens(w),
+{
+}
+
+/// `w` after an open that kept the target but did not refuse. The
+/// runtime wrote runs, so the next open must apply no target.
+pub open spec fn kept_quietly<T>(w: World<T>) -> World<T> {
+    World { want: None, ..w }
+}
+
+/// An open must refuse when the target stays (issue #2753). A target that
+/// applies then applies again over the runs written since, and the
+/// invariant breaks. A superseded target makes the next open replace the
+/// Harvest file again. The replica can lack the runs that did not ship.
+pub proof fn theorem_a_kept_target_must_refuse_the_open<T>(w: World<T>)
+    requires
+        inv(w),
+        w.run is Idle,
+        !(resolves(w) is Nothing),
+    ensures
+        spec_replaced(resolves(kept_quietly(w)), false),
+        resolves(w) is Apply ==> !inv(kept_quietly(w)) && opens(kept_quietly(w)) == opens(w),
 {
 }
 

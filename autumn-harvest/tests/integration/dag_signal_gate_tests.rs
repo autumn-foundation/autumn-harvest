@@ -264,7 +264,7 @@ mod unified {
     use autumn_harvest::prelude::*;
     use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer, WorkflowTestEnv};
     use autumn_harvest::types::{ExecutionId, TimerId};
-    use chrono::Utc;
+    use jiff::Timestamp;
     use serde_json::{Value, json};
     use std::time::Duration;
 
@@ -369,7 +369,7 @@ mod unified {
     fn started(input: Value) -> WorkflowEvent {
         WorkflowEvent::WorkflowStarted {
             input,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,

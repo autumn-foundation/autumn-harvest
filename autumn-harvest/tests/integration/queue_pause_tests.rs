@@ -27,6 +27,8 @@ use autumn_harvest::queue_pause::{self, MAX_QUEUE_NAME_LEN};
 use autumn_harvest::timeout::{self, TimeoutReason};
 use diesel_async::AsyncPgConnection;
 use diesel_async::SimpleAsyncConnection;
+use jiff_diesel::ToDiesel;
+
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -109,7 +111,7 @@ async fn insert_execution(conn: &mut AsyncPgConnection) -> Uuid {
 async fn enqueue_activity(
     conn: &mut AsyncPgConnection,
     queue: &str,
-    schedule_to_start: Option<chrono::Duration>,
+    schedule_to_start: Option<jiff::SignedDuration>,
 ) -> Uuid {
     let exec_id = insert_execution(conn).await;
     let mut params = EnqueueParams::new(queue, TaskType::Activity, serde_json::json!({}));
@@ -135,15 +137,13 @@ async fn task_state(conn: &mut AsyncPgConnection, id: Uuid) -> String {
         .state
 }
 
-async fn scheduled_at(
-    conn: &mut AsyncPgConnection,
-    id: Uuid,
-) -> chrono::DateTime<chrono::offset::Utc> {
+async fn scheduled_at(conn: &mut AsyncPgConnection, id: Uuid) -> jiff::Timestamp {
     use diesel_async::RunQueryDsl;
     #[derive(diesel::QueryableByName)]
     struct S {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        scheduled_at: chrono::DateTime<chrono::offset::Utc>,
+        #[diesel(deserialize_as = autumn_harvest::time::sql::SqlTimestamp)]
+        scheduled_at: jiff::Timestamp,
     }
     diesel::sql_query("SELECT scheduled_at FROM harvest_task_queue WHERE id=$1")
         .bind::<diesel::sql_types::Uuid, _>(id)
@@ -186,15 +186,13 @@ async fn backdate_scheduled_at(conn: &mut AsyncPgConnection, id: Uuid, secs: i64
 
 /// Read a pause's `paused_at`, so a hand-driven resume binds exactly what
 /// `resume_queue` binds.
-async fn paused_at_of(
-    conn: &mut AsyncPgConnection,
-    queue: &str,
-) -> chrono::DateTime<chrono::offset::Utc> {
+async fn paused_at_of(conn: &mut AsyncPgConnection, queue: &str) -> jiff::Timestamp {
     use diesel_async::RunQueryDsl;
     #[derive(diesel::QueryableByName)]
     struct P {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        paused_at: chrono::DateTime<chrono::offset::Utc>,
+        #[diesel(deserialize_as = autumn_harvest::time::sql::SqlTimestamp)]
+        paused_at: jiff::Timestamp,
     }
     diesel::sql_query("SELECT paused_at FROM harvest_queue_pauses WHERE queue_name = $1")
         .bind::<diesel::sql_types::Text, _>(queue)
@@ -386,7 +384,7 @@ async fn pause_holds_dispatch_and_resume_releases_it() {
     // Claimable before the pause.
     assert_eq!(claim_one(&mut conn, &q).await, Some(task));
     // Put it back so the pause has something to hold.
-    queue::requeue_for_retry(&mut conn, task, chrono::Duration::zero(), "reset")
+    queue::requeue_for_retry(&mut conn, task, jiff::SignedDuration::ZERO, "reset")
         .await
         .expect("requeue");
     assert_eq!(task_state(&mut conn, task).await, "PENDING");
@@ -529,7 +527,7 @@ async fn pause_does_not_abort_in_flight_tasks() {
 async fn schedule_to_start_is_suspended_while_paused_and_after_resume() {
     let (mut conn, _c) = setup_db().await;
     let q = unique_queue("sts");
-    let task = enqueue_activity(&mut conn, &q, Some(chrono::Duration::seconds(30))).await;
+    let task = enqueue_activity(&mut conn, &q, Some(jiff::SignedDuration::from_secs(30))).await;
 
     queue_pause::pause_queue(&mut conn, &q, "warehouse down", "alice", None)
         .await
@@ -593,18 +591,18 @@ async fn resume_shifts_scheduled_at_by_held_time_only() {
         .expect("resume");
     let after = scheduled_at(&mut conn, task).await;
 
-    let shift = (after - before).num_seconds();
+    let shift = (after - before).as_secs();
     assert!(
         (595..=605).contains(&shift),
         "expected ~600s of held time credited back, got {shift}s"
     );
-    let age_now = (chrono::Utc::now() - after).num_seconds();
+    let age_now = (jiff::Timestamp::now() - after).as_secs();
     assert!(
         (95..=115).contains(&age_now),
         "pre-pause waiting must be preserved (~100s), got {age_now}s"
     );
     assert!(
-        after <= chrono::Utc::now(),
+        after <= jiff::Timestamp::now(),
         "AC5: the shift must never push a held task into the future"
     );
 }
@@ -668,7 +666,7 @@ async fn resume_credits_the_time_the_resume_itself_spends_waiting() {
     holder.await.expect("holder task");
 
     let after = scheduled_at(&mut conn, task).await;
-    let apparent_wait = (chrono::Utc::now() - after).num_seconds();
+    let apparent_wait = (jiff::Timestamp::now() - after).as_secs();
 
     // The task genuinely waited ~100s pre-pause. The frozen-clock bug adds the
     // resume's own runtime to that. So the tolerance must be strictly SMALLER
@@ -692,7 +690,7 @@ async fn resume_credits_the_time_the_resume_itself_spends_waiting() {
         100.0 + charged
     );
     assert!(
-        after <= chrono::Utc::now(),
+        after <= jiff::Timestamp::now(),
         "AC5: the shift must never push a held task into the future"
     );
 }
@@ -744,7 +742,7 @@ async fn resume_credits_a_task_enqueued_between_the_two_shift_passes() {
     let primary_ids: Vec<ShiftedTaskIdRow> =
         diesel::sql_query(queue_pause::resume_shift_scheduled_at_query())
             .bind::<diesel::sql_types::Text, _>(&q)
-            .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+            .bind::<diesel::sql_types::Timestamptz, _>(paused_at.to_diesel())
             .load(&mut resumer)
             .await
             .expect("primary shift");
@@ -762,7 +760,7 @@ async fn resume_credits_a_task_enqueued_between_the_two_shift_passes() {
     );
     // Prove the primary pass genuinely missed it, so the pass-2 assertion below
     // cannot be vacuous.
-    let before_pass2 = (chrono::Utc::now() - scheduled_at(&mut conn, late).await).num_seconds();
+    let before_pass2 = (jiff::Timestamp::now() - scheduled_at(&mut conn, late).await).as_secs();
     assert!(
         (99..=101).contains(&before_pass2),
         "the primary shift cannot see a row enqueued after its snapshot; if this \
@@ -774,7 +772,7 @@ async fn resume_credits_a_task_enqueued_between_the_two_shift_passes() {
     // pass did *not* shift, excluded by id rather than by predicate.
     let late_shifted = diesel::sql_query(queue_pause::resume_shift_late_arrivals_query())
         .bind::<diesel::sql_types::Text, _>(&q)
-        .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+        .bind::<diesel::sql_types::Timestamptz, _>(paused_at.to_diesel())
         .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
         .execute(&mut resumer)
         .await
@@ -794,7 +792,7 @@ async fn resume_credits_a_task_enqueued_between_the_two_shift_passes() {
         "the task enqueued mid-resume must be credited by the second pass"
     );
 
-    let late_wait = (chrono::Utc::now() - scheduled_at(&mut conn, late).await).num_seconds();
+    let late_wait = (jiff::Timestamp::now() - scheduled_at(&mut conn, late).await).as_secs();
     assert!(
         (0..=1).contains(&late_wait),
         "a task enqueued during the thaw was held from the moment it became due, \
@@ -803,7 +801,7 @@ async fn resume_credits_a_task_enqueued_between_the_two_shift_passes() {
     );
 
     // ...and the pre-pause wait the primary pass preserved is untouched by it.
-    let early_wait = (chrono::Utc::now() - scheduled_at(&mut conn, early).await).num_seconds();
+    let early_wait = (jiff::Timestamp::now() - scheduled_at(&mut conn, early).await).as_secs();
     assert!(
         (99..=101).contains(&early_wait),
         "the second pass must not re-shift the pre-existing backlog (its relative \
@@ -882,7 +880,7 @@ async fn resume_credits_a_task_committed_late_but_inserted_before_the_resume() {
     let primary_ids: Vec<ShiftedTaskIdRow> =
         diesel::sql_query(queue_pause::resume_shift_scheduled_at_query())
             .bind::<diesel::sql_types::Text, _>(&q)
-            .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+            .bind::<diesel::sql_types::Timestamptz, _>(paused_at.to_diesel())
             .load(&mut resumer)
             .await
             .expect("primary shift");
@@ -902,7 +900,7 @@ async fn resume_credits_a_task_committed_late_but_inserted_before_the_resume() {
 
     let late_shifted = diesel::sql_query(queue_pause::resume_shift_late_arrivals_query())
         .bind::<diesel::sql_types::Text, _>(&q)
-        .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+        .bind::<diesel::sql_types::Timestamptz, _>(paused_at.to_diesel())
         .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
         .execute(&mut resumer)
         .await
@@ -919,7 +917,7 @@ async fn resume_credits_a_task_committed_late_but_inserted_before_the_resume() {
          transaction_timestamp() drops it from both passes"
     );
 
-    let wait = (chrono::Utc::now() - scheduled_at(&mut conn, straddler).await).num_seconds();
+    let wait = (jiff::Timestamp::now() - scheduled_at(&mut conn, straddler).await).as_secs();
     assert!(
         (0..=2).contains(&wait),
         "the straddling row must be credited for the time it spent held; \
@@ -927,7 +925,7 @@ async fn resume_credits_a_task_committed_late_but_inserted_before_the_resume() {
     );
 
     // The committed backlog keeps the wait it genuinely accrued before the hold.
-    let early_wait = (chrono::Utc::now() - scheduled_at(&mut conn, early).await).num_seconds();
+    let early_wait = (jiff::Timestamp::now() - scheduled_at(&mut conn, early).await).as_secs();
     assert!(
         (99..=101).contains(&early_wait),
         "the pre-pause wait must survive both passes: apparent wait {early_wait}s"
@@ -972,7 +970,7 @@ async fn resume_credits_a_legacy_task_with_no_created_at() {
          both passes"
     );
 
-    let wait = (chrono::Utc::now() - scheduled_at(&mut conn, task).await).num_seconds();
+    let wait = (jiff::Timestamp::now() - scheduled_at(&mut conn, task).await).as_secs();
     assert!(
         (99..=101).contains(&wait),
         "the legacy row must be credited the 600s it was held and keep its genuine \
@@ -1082,7 +1080,7 @@ async fn resume_shift_collapses_mid_pause_arrivals_to_now() {
         .await
         .expect("resume");
 
-    let age = (chrono::Utc::now() - scheduled_at(&mut conn, task).await).num_seconds();
+    let age = (jiff::Timestamp::now() - scheduled_at(&mut conn, task).await).as_secs();
     assert!(
         (0..=5).contains(&age),
         "a mid-pause arrival accrues no wait; got {age}s"
@@ -1181,7 +1179,7 @@ async fn list_paused_queues_reports_reason_and_held_count() {
     assert_eq!(entry.reason, "sendgrid down");
     assert_eq!(entry.paused_by, "alice");
     assert_eq!(entry.held_task_count, 2);
-    assert!(entry.paused_at <= chrono::Utc::now());
+    assert!(entry.paused_at <= jiff::Timestamp::now());
     assert!(
         !listed.iter().any(|e| e.queue_name == other),
         "a pause is scoped to exactly the named queue"
@@ -1500,7 +1498,7 @@ async fn a_pause_committed_after_the_scan_still_suppresses_the_timeout() {
     params.workflow_exec_id = Some(exec_id);
     params.activity_name = Some("noop".to_string());
     params.activity_id = Some(Uuid::new_v4());
-    params.schedule_to_start = Some(chrono::Duration::seconds(1));
+    params.schedule_to_start = Some(jiff::SignedDuration::from_secs(1));
     let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
     diesel::sql_query(
         "UPDATE harvest_task_queue SET scheduled_at = NOW() - INTERVAL '1 hour' WHERE id = $1",
@@ -1603,7 +1601,7 @@ async fn enforcer_takes_the_queue_lock_before_the_row_locks_no_abba() {
     params.workflow_exec_id = Some(exec_id);
     params.activity_name = Some("noop".to_string());
     params.activity_id = Some(Uuid::new_v4());
-    params.schedule_to_start = Some(chrono::Duration::seconds(1));
+    params.schedule_to_start = Some(jiff::SignedDuration::from_secs(1));
     let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
     diesel::sql_query(
         "UPDATE harvest_task_queue SET scheduled_at = NOW() - INTERVAL '1 hour' WHERE id = $1",
@@ -1734,7 +1732,8 @@ async fn a_claim_that_beat_the_pause_is_released_with_its_attempt_restored() {
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
         worker_id: Option<String>,
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-        started_at: Option<chrono::DateTime<chrono::Utc>>,
+        #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+        started_at: Option<jiff::Timestamp>,
     }
     let row: Row = diesel::sql_query(
         "SELECT state, attempt, worker_id, started_at FROM harvest_task_queue WHERE id = $1",
@@ -2089,7 +2088,7 @@ async fn pause_stamps_paused_at_after_the_lock_wait_not_at_transaction_start() {
 
     // Anchor BEFORE the pause transaction opens: this is the instant a frozen
     // `NOW()` would (approximately) record.
-    let before_pause = chrono::Utc::now();
+    let before_pause = jiff::Timestamp::now();
 
     let mut pauser = connect(&url).await;
     let started = std::time::Instant::now();
@@ -2108,7 +2107,7 @@ async fn pause_stamps_paused_at_after_the_lock_wait_not_at_transaction_start() {
     );
 
     let stored = paused_at_of(&mut conn, &q).await;
-    let lag = (stored - before_pause).num_milliseconds();
+    let lag = autumn_harvest::time::num_milliseconds(stored - before_pause);
 
     // Tolerance is strictly SMALLER than the injected delay so it can actually
     // falsify: the frozen clock records ~0ms of lag, the live clock ~3000ms.
@@ -2120,7 +2119,7 @@ async fn pause_stamps_paused_at_after_the_lock_wait_not_at_transaction_start() {
     );
     // And it must not be in the future.
     assert!(
-        stored <= chrono::Utc::now(),
+        stored <= jiff::Timestamp::now(),
         "paused_at must not be stamped in the future; got {stored}"
     );
 }
@@ -2748,7 +2747,8 @@ async fn a_pre_pause_enqueue_committing_after_the_first_pass_is_still_credited()
     #[derive(diesel::QueryableByName)]
     struct PausedAtRow {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        paused_at: chrono::DateTime<chrono::offset::Utc>,
+        #[diesel(deserialize_as = autumn_harvest::time::sql::SqlTimestamp)]
+        paused_at: jiff::Timestamp,
     }
 
     let (url, _c) = setup_db_url().await;
@@ -2801,7 +2801,7 @@ async fn a_pre_pause_enqueue_committing_after_the_first_pass_is_still_credited()
     let shifted: Vec<ShiftedTaskIdRow> =
         diesel::sql_query(queue_pause::resume_shift_scheduled_at_query())
             .bind::<diesel::sql_types::Text, _>(&q)
-            .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+            .bind::<diesel::sql_types::Timestamptz, _>(paused_at.to_diesel())
             .load(&mut driver)
             .await
             .expect("primary shift");
@@ -2821,7 +2821,7 @@ async fn a_pre_pause_enqueue_committing_after_the_first_pass_is_still_credited()
     // Pass 2, excluding exactly what pass 1 reported.
     diesel::sql_query(queue_pause::resume_shift_late_arrivals_query())
         .bind::<diesel::sql_types::Text, _>(&q)
-        .bind::<diesel::sql_types::Timestamptz, _>(paused_at)
+        .bind::<diesel::sql_types::Timestamptz, _>(paused_at.to_diesel())
         .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
         .execute(&mut driver)
         .await
@@ -2832,14 +2832,14 @@ async fn a_pre_pause_enqueue_committing_after_the_first_pass_is_still_credited()
     // Both rows were due 2h ago and held for 1h. So both keep the 1h of wait
     // accrued *before* the hold, and none of the hold itself.
     let late_age =
-        (chrono::Utc::now() - scheduled_at(&mut driver, late_commit).await).num_seconds();
+        (jiff::Timestamp::now() - scheduled_at(&mut driver, late_commit).await).as_secs();
     assert!(
         (3540..=3660).contains(&late_age),
         "a pre-pause enqueue that committed after the primary pass must still be \
          credited the held hour; got {late_age}s (uncredited would be ~7200s)"
     );
 
-    let visible_age = (chrono::Utc::now() - scheduled_at(&mut driver, visible).await).num_seconds();
+    let visible_age = (jiff::Timestamp::now() - scheduled_at(&mut driver, visible).await).as_secs();
     assert!(
         (3540..=3660).contains(&visible_age),
         "the row pass 1 already shifted must be excluded from pass 2, not shifted \
@@ -2905,7 +2905,8 @@ async fn pause_credits_the_backlog_scan_interval() {
     #[derive(diesel::QueryableByName)]
     struct NowRow {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        now: chrono::DateTime<chrono::Utc>,
+        #[diesel(deserialize_as = autumn_harvest::time::sql::SqlTimestamp)]
+        now: jiff::Timestamp,
     }
     let unblock_at: NowRow = diesel::sql_query("SELECT clock_timestamp() AS now")
         .get_result(&mut conn)
@@ -2915,7 +2916,7 @@ async fn pause_credits_the_backlog_scan_interval() {
     blocker.batch_execute("COMMIT").await.expect("release");
     let outcome = pausing.await.expect("the pause task must not panic");
 
-    let lead = (unblock_at.now - outcome.paused_at).num_milliseconds();
+    let lead = autumn_harvest::time::num_milliseconds(unblock_at.now - outcome.paused_at);
     assert!(
         lead >= (BLOCK_SECS as i64 - 1) * 1000,
         "paused_at must be stamped when the queue actually became held (at lock \
@@ -2930,7 +2931,7 @@ async fn pause_credits_the_backlog_scan_interval() {
     queue_pause::resume_queue(&mut conn, &q, "alice")
         .await
         .expect("resume");
-    let wait = (chrono::Utc::now() - scheduled_at(&mut conn, task).await).num_seconds();
+    let wait = (jiff::Timestamp::now() - scheduled_at(&mut conn, task).await).as_secs();
     assert!(
         (99..=103).contains(&wait),
         "the task's 100s pre-pause wait must survive the thaw, with the held scan \
@@ -2987,7 +2988,7 @@ async fn timeout_enforcement_does_not_block_claims_on_an_unpaused_queue() {
     params.workflow_exec_id = Some(exec_id);
     params.activity_name = Some("noop".to_string());
     params.activity_id = Some(Uuid::new_v4());
-    params.schedule_to_start = Some(chrono::Duration::seconds(1));
+    params.schedule_to_start = Some(jiff::SignedDuration::from_secs(1));
     let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
     backdate_scheduled_at(&mut conn, task_id, 3600).await;
 
@@ -3115,7 +3116,7 @@ async fn schedule_to_start_sweep_does_not_hold_a_task_row_while_awaiting_the_exe
     params.workflow_exec_id = Some(exec_id);
     params.activity_name = Some("noop".to_string());
     params.activity_id = Some(Uuid::new_v4());
-    params.schedule_to_start = Some(chrono::Duration::seconds(1));
+    params.schedule_to_start = Some(jiff::SignedDuration::from_secs(1));
     let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
     backdate_scheduled_at(&mut conn, task_id, 3600).await;
 

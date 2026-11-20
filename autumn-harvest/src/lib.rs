@@ -366,6 +366,8 @@ pub mod event_batch;
 #[doc(hidden)]
 pub mod execution;
 pub mod executor;
+/// The pending table of the external outbox and its trigger.
+pub mod external_outbox;
 /// Shard-placement-aware resolution for `workflow_id`-addressed external
 /// signal/cancel targets (issue #1146).
 #[cfg(feature = "db")]
@@ -380,6 +382,8 @@ pub mod fan_out;
 /// Non-destructive fork of a workflow run (issue #2000).
 #[cfg(feature = "db")]
 pub mod fork;
+/// Keep a large child future off the stack of a debug build (issue #2752).
+pub mod frame;
 /// Replay fuzz harness (issue #1835). Not a stable API.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
@@ -388,6 +392,8 @@ pub mod fork;
     reason = "fuzz harness code: a failed `expect` is a finding"
 )]
 pub mod fuzzing;
+/// One elected gauge sampler per shard and sampler kind.
+pub mod gauge_election;
 /// Group commit of one decision partition (issue #2256).
 pub mod group_commit;
 /// Deterministic workflow guardrail rule catalog (issue #173).
@@ -543,6 +549,8 @@ pub mod scanner_lease;
 pub mod schema_contract;
 /// Worker session fleet-side registry and pure decision functions (issue #606).
 pub mod sessions;
+/// Shape census: the usual and the rare paths over many runs.
+pub mod shape_census;
 pub mod shard;
 /// A task-local fence on the shards one request may reach (issue #1803).
 pub mod shard_fence;
@@ -599,6 +607,8 @@ pub mod testing;
 pub mod throttle;
 /// Forecast when each throttled start runs, from bursts or real schedules.
 pub mod throttle_forecast;
+/// Date and time helpers over jiff (ADR 0018).
+pub mod time;
 /// Per-execution timeline read model (issue #739).
 pub mod timeline;
 #[cfg(any(test, feature = "testing"))]
@@ -635,11 +645,17 @@ pub mod models;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod notify;
+/// A background loop that its caller spawns or runs.
+#[cfg(feature = "db")]
+pub mod prepared_loop;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod queue;
 /// Metric-gated automatic abort of a build ramp (issue #1814).
 pub mod ramp_guard;
+/// Keep a by-id task row statement on the primary key.
+#[doc(hidden)]
+pub mod row_guard;
 /// Operator overrides for per-type `sla` and `execution_timeout` (issue #2387).
 pub mod run_defaults;
 #[cfg(feature = "sandbox-activities")]
@@ -994,8 +1010,11 @@ pub use queue::{ConcurrencyKeyStats, QueueScalingSignal, QueueTaskCounts, queue_
 pub use serde_json;
 // Allow macro-generated code to use ::autumn_harvest::serde
 pub use serde;
-// Allow macro-generated code to use ::autumn_harvest::chrono
-pub use chrono;
+// Allow macro-generated code to use ::autumn_harvest::jiff
+pub use jiff;
+// Diesel wrapper types for jiff, for crates that query Harvest tables.
+#[cfg(feature = "db")]
+pub use jiff_diesel;
 // Allow macro-generated code to use ::autumn_harvest::uuid (e.g. update_with_start UUIDv5 derivation)
 pub use uuid;
 // Allow macro-generated code to use ::autumn_harvest::futures.

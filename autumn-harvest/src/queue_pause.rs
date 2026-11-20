@@ -60,9 +60,11 @@
 use crate::error::HarvestError;
 use crate::error::HarvestResult;
 #[cfg(feature = "db")]
-use chrono::{DateTime, Utc};
-#[cfg(feature = "db")]
 use diesel_async::AsyncPgConnection;
+#[cfg(feature = "db")]
+use jiff::Timestamp;
+#[cfg(feature = "db")]
+use jiff_diesel::ToDiesel;
 
 /// Build the late-pass statement. `$tail` is the optional `RETURNING` clause.
 ///
@@ -316,16 +318,19 @@ pub async fn release_claim_if_queue_paused(
 /// with their own tail at compile time. Both releases must restore `attempt`
 /// and use the same `state = 'RUNNING' AND worker_id = $2` guard. One copy
 /// makes that structural, not a convention that two sites must remember.
+/// The guard goes through `row_guard_sql!`, so the planner reads the row
+/// through the primary key.
 macro_rules! release_claim_prefix {
     () => {
-        "UPDATE harvest_task_queue \
-         SET state = 'PENDING', \
-             worker_id = NULL, \
-             started_at = NULL, \
-             attempt = GREATEST(attempt - 1, 0) \
-         WHERE id = $1 \
-           AND state = 'RUNNING' \
-           AND worker_id = $2"
+        concat!(
+            "UPDATE harvest_task_queue \
+             SET state = 'PENDING', \
+                 worker_id = NULL, \
+                 started_at = NULL, \
+                 attempt = GREATEST(attempt - 1, 0) \
+             WHERE id = $1 AND ",
+            $crate::row_guard::row_guard_sql!("state = 'RUNNING' AND worker_id = $2")
+        )
     };
 }
 
@@ -1066,7 +1071,7 @@ pub struct PausedQueue {
     /// Operator identity that applied the pause.
     pub paused_by: String,
     /// When the pause was applied.
-    pub paused_at: chrono::DateTime<chrono::Utc>,
+    pub paused_at: jiff::Timestamp,
     /// `None` = fleet-wide (the default); otherwise the shard the operator
     /// scoped the pause to.
     pub scope_shard_id: Option<i32>,
@@ -1090,7 +1095,7 @@ pub struct PauseOutcome {
     /// The effective operator identity (the original one on a re-pause).
     pub paused_by: String,
     /// The effective pause instant (the original one on a re-pause).
-    pub paused_at: chrono::DateTime<chrono::Utc>,
+    pub paused_at: jiff::Timestamp,
     /// `None` = fleet-wide (the default); otherwise the shard the operator
     /// scoped the pause to. The effective value (the original on a re-pause).
     pub scope_shard_id: Option<i32>,
@@ -1138,7 +1143,8 @@ struct CountRow {
 #[derive(diesel::QueryableByName)]
 struct ClockRow {
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    now: DateTime<Utc>,
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+    now: Timestamp,
 }
 
 #[cfg(feature = "db")]
@@ -1149,7 +1155,8 @@ struct PauseRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     paused_by: String,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    paused_at: DateTime<Utc>,
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+    paused_at: Timestamp,
 }
 
 /// The pause row as returned by the upsert, plus its own "did I insert this?"
@@ -1165,7 +1172,8 @@ struct UpsertedPauseRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     paused_by: String,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    paused_at: DateTime<Utc>,
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+    paused_at: Timestamp,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
     scope_shard_id: Option<i32>,
     /// `xmax = 0` on a freshly inserted tuple; non-zero when `DO UPDATE` fired
@@ -1347,7 +1355,7 @@ pub async fn pause_queue(
             .bind::<diesel::sql_types::Text, _>(&reason_owned)
             .bind::<diesel::sql_types::Text, _>(&actor_owned)
             .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(scope_shard_id)
-            .bind::<diesel::sql_types::Timestamptz, _>(clock.now)
+            .bind::<diesel::sql_types::Timestamptz, _>(clock.now.to_diesel())
             .get_result(conn)
             .await?;
         let newly_paused = row.newly_paused;
@@ -1462,7 +1470,7 @@ pub async fn resume_queue(
         let publish_hints = crate::dispatch::hints_deliverable();
         let shifted: Vec<ShiftedTaskId> = diesel::sql_query(resume_shift_scheduled_at_query())
             .bind::<diesel::sql_types::Text, _>(&queue_owned)
-            .bind::<diesel::sql_types::Timestamptz, _>(row.paused_at)
+            .bind::<diesel::sql_types::Timestamptz, _>(row.paused_at.to_diesel())
             .load(conn)
             .await?;
         let released = shifted.len();
@@ -1492,7 +1500,7 @@ pub async fn resume_queue(
             let late_shifted: Vec<ShiftedTaskId> =
                 diesel::sql_query(resume_shift_late_arrivals_query())
                     .bind::<diesel::sql_types::Text, _>(&queue_owned)
-                    .bind::<diesel::sql_types::Timestamptz, _>(row.paused_at)
+                    .bind::<diesel::sql_types::Timestamptz, _>(row.paused_at.to_diesel())
                     .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
                     .load(conn)
                     .await?;
@@ -1507,7 +1515,7 @@ pub async fn resume_queue(
         } else {
             diesel::sql_query(resume_shift_late_arrivals_count_query())
                 .bind::<diesel::sql_types::Text, _>(&queue_owned)
-                .bind::<diesel::sql_types::Timestamptz, _>(row.paused_at)
+                .bind::<diesel::sql_types::Timestamptz, _>(row.paused_at.to_diesel())
                 .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
                 .execute(conn)
                 .await?
@@ -1542,7 +1550,7 @@ pub async fn resume_queue(
             queue_name: queue_owned,
             newly_resumed: true,
             released_task_count: i64::try_from(released.saturating_add(late)).unwrap_or(i64::MAX),
-            paused_duration_secs: (Utc::now() - row.paused_at).num_seconds().max(0),
+            paused_duration_secs: (Timestamp::now() - row.paused_at).as_secs().max(0),
             released_reason: Some(row.reason),
             released_paused_by: Some(row.paused_by),
         })
@@ -1579,7 +1587,8 @@ pub async fn list_paused_queues(conn: &mut AsyncPgConnection) -> HarvestResult<V
         #[diesel(sql_type = diesel::sql_types::Text)]
         paused_by: String,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        paused_at: DateTime<Utc>,
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+        paused_at: Timestamp,
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
         scope_shard_id: Option<i32>,
         #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -2297,8 +2306,11 @@ mod tests {
                 "a released claim must give back the attempt it consumed (AC3); got:\n{sql}"
             );
             assert!(
-                sql.contains("AND state = 'RUNNING'") && sql.contains("AND worker_id = $2"),
-                "a release must only ever undo this worker's own claim; got:\n{sql}"
+                sql.contains(
+                    "WHERE id = $1 AND (CASE WHEN state = 'RUNNING' AND worker_id = $2 THEN true END)"
+                ),
+                "a release must only ever undo this worker's own claim, through the \
+                 primary key; got:\n{sql}"
             );
         }
         assert!(

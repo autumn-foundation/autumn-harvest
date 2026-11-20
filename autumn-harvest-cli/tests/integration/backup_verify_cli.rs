@@ -37,7 +37,7 @@ fn shard(findings: Vec<Finding>) -> ShardVerifyReport {
 }
 
 fn report(findings: Vec<Finding>) -> RestoreVerifyReport {
-    RestoreVerifyReport::assemble(chrono::Utc::now(), vec![shard(findings)], Vec::new())
+    RestoreVerifyReport::assemble(jiff::Timestamp::now(), vec![shard(findings)], Vec::new())
 }
 
 // ── AC4: the scratch guard ─────────────────────────────────────────────────
@@ -269,7 +269,7 @@ fn an_unavailable_report_exits_two_so_ci_can_tell_it_apart() {
         "connect failed".to_string(),
     );
     let r = RestoreVerifyReport::assemble(
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
         vec![shard(Vec::new()), unreachable],
         Vec::new(),
     );
@@ -305,7 +305,7 @@ fn json_output_says_whether_replay_actually_ran() {
         skipped_no_handler: 4,
         unreadable: 0,
     };
-    let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
+    let r = RestoreVerifyReport::assemble(jiff::Timestamp::now(), vec![s], Vec::new());
     let v: serde_json::Value =
         serde_json::from_str(&backup_verify_json(&r).expect("serialise")).expect("valid json");
     assert_eq!(
@@ -372,7 +372,7 @@ fn text_output_reports_replay_coverage_honestly() {
         skipped_no_handler: 5,
         unreadable: 0,
     };
-    let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
+    let r = RestoreVerifyReport::assemble(jiff::Timestamp::now(), vec![s], Vec::new());
     let text = format_backup_verify_text(&r);
     // `contains("skipped")` alone is not falsifiable -- the verified branch
     // prints that word too. Pin the verdict token that only the unverified
@@ -401,7 +401,7 @@ fn text_output_does_not_claim_partial_coverage_when_nothing_replayed_at_all() {
         skipped_no_handler: 0,
         unreadable: 2,
     };
-    let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
+    let r = RestoreVerifyReport::assemble(jiff::Timestamp::now(), vec![s], Vec::new());
     let text = format_backup_verify_text(&r);
     assert!(
         text.contains("NOT VERIFIED") && !text.contains("PARTIALLY VERIFIED"),
@@ -424,7 +424,7 @@ fn text_output_does_not_blame_handlers_when_every_history_is_unreadable() {
         skipped_no_handler: 0,
         unreadable: 2,
     };
-    let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
+    let r = RestoreVerifyReport::assemble(jiff::Timestamp::now(), vec![s], Vec::new());
     let text = format_backup_verify_text(&r);
     assert!(
         !text.contains("Register the workflow handlers"),
@@ -450,7 +450,7 @@ fn text_output_names_both_causes_when_unreadable_and_skipped_combine() {
         skipped_no_handler: 3,
         unreadable: 2,
     };
-    let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
+    let r = RestoreVerifyReport::assemble(jiff::Timestamp::now(), vec![s], Vec::new());
     let text = format_backup_verify_text(&r);
     assert!(
         text.contains("NOT VERIFIED") && !text.contains("PARTIALLY VERIFIED"),
@@ -484,7 +484,7 @@ fn text_output_reports_partial_coverage_even_when_skipped_is_also_present() {
         skipped_no_handler: 3,
         unreadable: 1,
     };
-    let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
+    let r = RestoreVerifyReport::assemble(jiff::Timestamp::now(), vec![s], Vec::new());
     let text = format_backup_verify_text(&r);
     assert!(
         text.contains("PARTIALLY VERIFIED") && !text.contains("NOT VERIFIED"),
@@ -503,7 +503,7 @@ fn text_output_reports_partial_coverage_when_some_unreadable_but_others_replayed
         skipped_no_handler: 0,
         unreadable: 1,
     };
-    let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
+    let r = RestoreVerifyReport::assemble(jiff::Timestamp::now(), vec![s], Vec::new());
     let text = format_backup_verify_text(&r);
     assert!(
         text.contains("PARTIALLY VERIFIED"),
@@ -522,7 +522,7 @@ fn text_output_does_not_claim_not_verified_when_replay_really_ran() {
         skipped_no_handler: 0,
         unreadable: 0,
     };
-    let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
+    let r = RestoreVerifyReport::assemble(jiff::Timestamp::now(), vec![s], Vec::new());
     let text = format_backup_verify_text(&r);
     assert!(
         !text.contains("NOT VERIFIED"),

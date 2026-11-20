@@ -9,7 +9,7 @@ use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::testing::{HistorySnapshot, ReplayStatus, WorkflowReplayer};
 use autumn_harvest::types::ExecutionId;
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::Value;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -17,7 +17,7 @@ use serde_json::Value;
 fn make_started_history(input: Value) -> Vec<WorkflowEvent> {
     vec![WorkflowEvent::WorkflowStarted {
         input,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,

@@ -15,8 +15,8 @@ use autumn_harvest_agent::recall::{
 };
 use autumn_harvest_agent::{AgentModel, sqlite};
 use autumn_harvest_sqlite::SqliteRuntime;
-use chrono::{DateTime, Utc};
 use clap::Parser;
+use jiff::Timestamp;
 
 /// The command line.
 #[derive(Debug, Parser)]
@@ -81,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let temp = tempfile::tempdir()?;
     let db = args.db.unwrap_or_else(|| temp.path().join("recall.db"));
-    let section = run(model, &name, args.window, &db, Utc::now()).await?;
+    let section = run(model, &name, args.window, &db, Timestamp::now()).await?;
     println!("{section}");
     Ok(())
 }
@@ -92,7 +92,7 @@ async fn run(
     name: &str,
     window: u32,
     db: &std::path::Path,
-    at: DateTime<Utc>,
+    at: Timestamp,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let fixture = RecallFixture::builtin()?;
     let harness = Arc::new(recall::harness(model, window));
@@ -105,7 +105,7 @@ async fn run(
 
 /// The Markdown section of one run: the model, the date, the config and
 /// the table.
-fn render(name: &str, window: u32, at: DateTime<Utc>, report: &recall::RecallReport) -> String {
+fn render(name: &str, window: u32, at: Timestamp, report: &recall::RecallReport) -> String {
     format!(
         "### {name}, {date}\n\n\
          - Model: `{name}`\n\
@@ -115,7 +115,7 @@ fn render(name: &str, window: u32, at: DateTime<Utc>, report: &recall::RecallRep
          and `EpisodeSettings::default().every(1)`.\n\
          - Fixture: the built-in fixture, {items} items. Scorer: `ExactMatch`.\n\n\
          {table}",
-        date = at.format("%Y-%m-%d"),
+        date = at.strftime("%Y-%m-%d"),
         items = report.items.len(),
         table = report.to_markdown(),
     )
@@ -128,9 +128,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_scripted_run_renders_the_model_the_date_the_config_and_the_table() {
         let dir = tempfile::tempdir().expect("a temporary directory");
-        let at = DateTime::parse_from_rfc3339("2026-11-04T00:00:00Z")
-            .expect("a date")
-            .with_timezone(&Utc);
+        let at: Timestamp = "2026-11-04T00:00:00Z".parse().expect("a date");
         let section = run(
             ReaderModel::new(),
             "reader",

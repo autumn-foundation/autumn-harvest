@@ -18,6 +18,7 @@ use autumn_harvest::WorkflowIdReusePolicy;
 use autumn_harvest::entity::{ENTITY_OP_SIGNAL, ENTITY_STATE_QUERY};
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 use autumn_harvest::llm_ledger::LlmCall;
+use autumn_harvest::time::Timestamp;
 use autumn_harvest_sqlite::{
     ExecutionFilter, ExecutionId, RunState, SignalWithStart, SignalWithStartOutcome, SqliteReader,
     SqliteResult, SqliteRuntime,
@@ -63,7 +64,6 @@ use crate::workflow::{
     agent_loop_info, agent_memory_snapshot_info, agent_model_turn_info, agent_precheck_info,
     agent_tool_call_info,
 };
-use autumn_harvest::chrono::{DateTime, Utc};
 
 /// Register the agent workflows and their activities against `harness`.
 ///
@@ -713,7 +713,7 @@ impl LedgerSpend {
         }
     }
 
-    fn read(&self, mesh: &str, since: DateTime<Utc>) -> SqliteResult<Spend> {
+    fn read(&self, mesh: &str, since: Timestamp) -> SqliteResult<Spend> {
         let reader = SqliteReader::open(&self.path)?;
         let filter = ExecutionFilter::new().search_attribute(MESH_ATTR, serde_json::json!(mesh));
         let mut runs = std::collections::HashSet::new();
@@ -735,7 +735,7 @@ impl LedgerSpend {
         }
         // A row of a simulated drive can be later than the wall clock, so the
         // read has no upper bound (issue #2272).
-        let rows = reader.llm_ledger_between(since, DateTime::<Utc>::MAX_UTC)?;
+        let rows = reader.llm_ledger_between(since, Timestamp::MAX)?;
         let spend = rows.iter().filter(|row| runs.contains(&row.exec_id)).fold(
             Spend::default(),
             |spend, row| Spend {
@@ -756,7 +756,7 @@ impl MeshSpend for LedgerSpend {
     fn spent<'a>(
         &'a self,
         mesh: &'a str,
-        since: DateTime<Utc>,
+        since: Timestamp,
     ) -> BoxFuture<'a, Result<Spend, AgentError>> {
         let read = self
             .read(mesh, since)
@@ -823,7 +823,8 @@ impl Directory {
                 .executions
                 .first()
                 .and_then(|summary| summary.started_at.value())
-                .map(DateTime::timestamp_millis))
+                .copied()
+                .map(Timestamp::as_millisecond))
         };
         if let Some(started_ms) = newest(&filter.clone().state("RUNNING"))? {
             return Ok(Some(LastPass {
@@ -878,7 +879,7 @@ impl AgentDirectory for Directory {
 /// Returns a list or a send error. Agents that got the pause before it stay
 /// paused.
 pub fn pause_mesh(rt: &mut SqliteRuntime, mesh: &str, reason: &str) -> SqliteResult<MeshPause> {
-    let at_ms = Utc::now().timestamp_millis();
+    let at_ms = Timestamp::now().as_millisecond();
     let filter = ExecutionFilter::new()
         .workflow_name(AGENT_WORKFLOW_NAME)
         .state("RUNNING")
@@ -966,7 +967,10 @@ pub fn reload_profiles(rt: &mut SqliteRuntime, kind: &str) -> SqliteResult<Vec<A
         }
     }
     targets.sort_by(|(_, a), (_, b)| a.as_str().cmp(b.as_str()));
-    let key = format!("reload-profiles:{kind}:{}", Utc::now().timestamp_millis());
+    let key = format!(
+        "reload-profiles:{kind}:{}",
+        Timestamp::now().as_millisecond()
+    );
     let payload = Agent::payload(&AgentOp::Control(Control::ReloadProfile));
     let mut agents = Vec::with_capacity(targets.len());
     for (exec, id) in targets {

@@ -32,7 +32,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{HarvestError, HarvestResult};
@@ -94,9 +94,9 @@ pub async fn sweep_orphaned_blobs(
         next_cursor: options.cursor.clone(),
         ..OrphanSweepReport::default()
     };
-    let Some(cutoff) = chrono::Duration::from_std(options.grace)
+    let Some(cutoff) = jiff::SignedDuration::try_from(options.grace)
         .ok()
-        .and_then(|grace| Utc::now().checked_sub_signed(grace))
+        .and_then(|grace| Timestamp::now().checked_sub(grace).ok())
     else {
         report.error = Some("the grace period is out of range".to_owned());
         return OrphanSweep::Swept(report);
@@ -150,7 +150,7 @@ pub async fn sweep_orphaned_blobs(
 async fn sweep_page(
     store: &dyn PayloadStore,
     pools: &ShardedDbPool,
-    cutoff: DateTime<Utc>,
+    cutoff: Timestamp,
     blobs: &[StoredBlob],
     (options, shutdown): (&OrphanSweepOptions, &CancellationToken),
     report: &mut OrphanSweepReport,

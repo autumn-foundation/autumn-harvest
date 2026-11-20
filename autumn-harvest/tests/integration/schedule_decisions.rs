@@ -5,11 +5,11 @@ use autumn_harvest::schedule_decision::record_decision_graceful;
 use autumn_harvest::schema::harvest_schedule_decisions;
 use autumn_harvest::telemetry::MetricsRecorder;
 
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
+use jiff::Timestamp;
 use std::sync::{Arc, Mutex};
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -53,8 +53,8 @@ async fn test_record_decision_graceful_success() {
     let metrics = TestMetrics::default();
 
     let schedule_id = None;
-    let next_fire_at = Utc::now() + chrono::Duration::hours(1);
-    let occurred_at = Utc::now();
+    let next_fire_at = Timestamp::now() + jiff::SignedDuration::from_hours(1);
+    let occurred_at = Timestamp::now();
 
     record_decision_graceful(
         &mut conn,
@@ -100,8 +100,8 @@ async fn test_record_decision_graceful_failure() {
     drop(container);
 
     let metrics = TestMetrics::default();
-    let next_fire_at = Utc::now() + chrono::Duration::hours(1);
-    let occurred_at = Utc::now();
+    let next_fire_at = Timestamp::now() + jiff::SignedDuration::from_hours(1);
+    let occurred_at = Timestamp::now();
 
     // The call absorbs the DB error, logs it and records the metric. It
     // returns no error.
@@ -128,7 +128,7 @@ async fn test_purge_old_schedule_decisions() {
     let (mut conn, _c) = make_conn().await;
     let metrics = TestMetrics::default();
 
-    let ten_days_ago = Utc::now() - chrono::Duration::days(10);
+    let ten_days_ago = Timestamp::now() - autumn_harvest::time::days(10);
     record_decision_graceful(
         &mut conn,
         Some(&metrics),
@@ -144,7 +144,7 @@ async fn test_purge_old_schedule_decisions() {
     )
     .await;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     record_decision_graceful(
         &mut conn,
         Some(&metrics),

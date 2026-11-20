@@ -362,7 +362,7 @@ async fn a_retry_of_a_task_in_flight_waits_under_the_new_cap() {
     let write = queue::requeue_claimed_task_for_retry(
         &mut conn,
         &claim_of(&failing),
-        chrono::Duration::zero(),
+        jiff::SignedDuration::ZERO,
         "transient",
     )
     .await

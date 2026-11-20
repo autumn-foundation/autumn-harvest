@@ -12,6 +12,7 @@
 
 use autumn_harvest::schema::harvest_schedules_ext;
 use autumn_harvest::table_split::SetExt;
+use jiff_diesel::ToDiesel;
 use std::sync::Arc;
 
 use autumn_harvest::models::HarvestSchedule;
@@ -25,12 +26,12 @@ use autumn_harvest::schema::{harvest_schedules, harvest_workflow_executions};
 use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics};
 use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::HandlerRegistry;
-use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -131,7 +132,7 @@ async fn cadence_change_recomputes_next_run_at_anchored_at_now() {
     let ws = WorkflowSchedule::new("upd_cadence_wf", Schedule::Cron("0 3 * * *".to_string()));
     let before = register_and_load(&mut conn, &ws).await;
 
-    let patch_started = Utc::now();
+    let patch_started = Timestamp::now();
     let patch = WorkflowSchedulePatch {
         schedule: Some(Schedule::Interval(std::time::Duration::from_secs(60))),
         ..Default::default()
@@ -149,7 +150,7 @@ async fn cadence_change_recomputes_next_run_at_anchored_at_now() {
         "next_run_at must be in the future (anchored at now), got {next}"
     );
     assert!(
-        next <= Utc::now() + chrono::Duration::seconds(120),
+        next <= Timestamp::now() + jiff::SignedDuration::from_secs(120),
         "next_run_at must be ~now + 60s, got {next}"
     );
     assert_ne!(
@@ -197,16 +198,16 @@ async fn paused_schedule_stays_paused_and_bookkeeping_preserved() {
     );
     let before = register_and_load(&mut conn, &ws).await;
 
-    let paused_at = Utc::now() - chrono::Duration::minutes(10);
-    let last_run = Utc::now() - chrono::Duration::minutes(30);
+    let paused_at = Timestamp::now() - jiff::SignedDuration::from_mins(10);
+    let last_run = Timestamp::now() - jiff::SignedDuration::from_mins(30);
     diesel::update(harvest_schedules::table.find(before.id))
         .set((
             dsl::is_paused.eq(true),
-            dsl::paused_at.eq(Some(paused_at)),
+            dsl::paused_at.eq(Some(paused_at).to_diesel()),
             dsl::paused_by.eq(Some("ops")),
             dsl::pause_reason.eq(Some("incident")),
             dsl::runs_started.eq(5),
-            SetExt(harvest_schedules_ext::last_run_at.eq(Some(last_run))),
+            SetExt(harvest_schedules_ext::last_run_at.eq(Some(last_run).to_diesel())),
             dsl::consecutive_failure_count.eq(2),
         ))
         .execute(&mut conn)
@@ -229,8 +230,8 @@ async fn paused_schedule_stays_paused_and_bookkeeping_preserved() {
     assert_eq!(row.runs_started, 5, "runs_started must be preserved");
     assert_eq!(row.consecutive_failure_count, 2);
     assert_eq!(
-        row.last_run_at.map(|t| t.timestamp()),
-        Some(last_run.timestamp()),
+        row.last_run_at.map(jiff::Timestamp::as_second),
+        Some(last_run.as_second()),
         "last_run_at must be preserved"
     );
 }
@@ -253,9 +254,9 @@ async fn raising_max_runs_clears_exhaustion_and_repopulates_next_run_at() {
     diesel::update(harvest_schedules::table.find(before.id))
         .set((
             dsl::runs_started.eq(1),
-            dsl::exhausted_at.eq(Some(Utc::now())),
+            dsl::exhausted_at.eq(Some(Timestamp::now()).to_diesel()),
             dsl::exhausted_reason.eq(Some("max_runs_exhausted")),
-            dsl::next_run_at.eq(None::<DateTime<Utc>>),
+            dsl::next_run_at.eq(None::<jiff_diesel::Timestamp>),
         ))
         .execute(&mut conn)
         .await
@@ -339,7 +340,8 @@ async fn live_fire_claim_blocks_update_with_claim_live_outcome() {
     diesel::update(harvest_schedules::table.find(before.id))
         .set((
             dsl::fire_claim_token.eq(Some(Uuid::new_v4())),
-            dsl::fire_claimed_until.eq(Some(Utc::now() + chrono::Duration::seconds(25))),
+            dsl::fire_claimed_until
+                .eq(Some(Timestamp::now() + jiff::SignedDuration::from_secs(25)).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -381,7 +383,8 @@ async fn expired_fire_claim_does_not_block_update() {
     diesel::update(harvest_schedules::table.find(before.id))
         .set((
             dsl::fire_claim_token.eq(Some(Uuid::new_v4())),
-            dsl::fire_claimed_until.eq(Some(Utc::now() - chrono::Duration::seconds(5))),
+            dsl::fire_claimed_until
+                .eq(Some(Timestamp::now() - jiff::SignedDuration::from_secs(5)).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -573,11 +576,11 @@ async fn tristate_clear_and_absence_semantics() {
     autumn_harvest::calendar::create_calendar(&mut conn, "us-holidays", None)
         .await
         .expect("create calendar");
-    let end_at = Utc::now() + chrono::Duration::days(30);
+    let end_at = Timestamp::now() + autumn_harvest::time::days(30);
     diesel::update(harvest_schedules::table.find(before.id))
         .set((
             dsl::calendar_name.eq(Some("us-holidays")),
-            dsl::end_at.eq(Some(end_at)),
+            dsl::end_at.eq(Some(end_at).to_diesel()),
             dsl::max_runs.eq(Some(9)),
         ))
         .execute(&mut conn)
@@ -598,7 +601,10 @@ async fn tristate_clear_and_absence_semantics() {
         .expect("update must succeed"),
     );
     assert_eq!(row.calendar_name.as_deref(), Some("us-holidays"));
-    assert_eq!(row.end_at.map(|t| t.timestamp()), Some(end_at.timestamp()));
+    assert_eq!(
+        row.end_at.map(jiff::Timestamp::as_second),
+        Some(end_at.as_second())
+    );
     assert_eq!(row.max_runs, Some(9));
 
     // Explicit Some(None) clears the stored values.
@@ -668,7 +674,7 @@ async fn manual_to_cron_populates_next_run_at() {
     );
     assert_eq!(row.schedule_expr.as_deref(), Some("cron:*/5 * * * *"));
     let next = row.next_run_at.expect("next_run_at must be populated");
-    assert!(next > Utc::now(), "next slot must be in the future");
+    assert!(next > Timestamp::now(), "next slot must be in the future");
 }
 
 /// An auto-paused schedule (issue #360): an unrelated patch preserves
@@ -683,12 +689,12 @@ async fn autopaused_schedule_patch_preserves_then_clears_auto_paused_at() {
         Schedule::Interval(std::time::Duration::from_secs(600)),
     );
     let before = register_and_load(&mut conn, &ws).await;
-    let auto_paused = Utc::now() - chrono::Duration::minutes(3);
+    let auto_paused = Timestamp::now() - jiff::SignedDuration::from_mins(3);
     diesel::update(harvest_schedules::table.find(before.id))
         .set((
             dsl::consecutive_failure_limit.eq(Some(3)),
             dsl::consecutive_failure_count.eq(3),
-            dsl::auto_paused_at.eq(Some(auto_paused)),
+            dsl::auto_paused_at.eq(Some(auto_paused).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -708,8 +714,8 @@ async fn autopaused_schedule_patch_preserves_then_clears_auto_paused_at() {
         .expect("update must succeed"),
     );
     assert_eq!(
-        row.auto_paused_at.map(|t| t.timestamp()),
-        Some(auto_paused.timestamp()),
+        row.auto_paused_at.map(jiff::Timestamp::as_second),
+        Some(auto_paused.as_second()),
         "an unrelated patch must not clear auto_paused_at"
     );
     assert_eq!(row.consecutive_failure_count, 3);
@@ -756,9 +762,9 @@ async fn tick_fires_fresh_row_not_pre_claim_snapshot() {
     let before = register_and_load(&mut conn, &ws).await;
 
     // Arm the slot in the past so it is due.
-    let slot = Utc::now() - chrono::Duration::seconds(60);
+    let slot = Timestamp::now() - jiff::SignedDuration::from_secs(60);
     diesel::update(harvest_schedules::table.find(before.id))
-        .set(dsl::next_run_at.eq(Some(slot)))
+        .set(dsl::next_run_at.eq(Some(slot).to_diesel()))
         .execute(&mut conn)
         .await
         .expect("arm slot");
@@ -786,8 +792,8 @@ async fn tick_fires_fresh_row_not_pre_claim_snapshot() {
         .expect("concurrent edit must succeed"),
     );
     assert_eq!(
-        patched.next_run_at.map(|t| t.timestamp_micros()),
-        Some(slot.timestamp_micros()),
+        patched.next_run_at.map(jiff::Timestamp::as_microsecond),
+        Some(slot.as_microsecond()),
         "a non-cadence edit must leave the armed slot in place"
     );
 
@@ -797,7 +803,7 @@ async fn tick_fires_fresh_row_not_pre_claim_snapshot() {
     claim_and_fire_workflow_schedule(
         &mut conn,
         &stale_snapshot,
-        Utc::now(),
+        Timestamp::now(),
         ShardId::new(0),
         &DagCatalog::default(),
         &registry,
@@ -862,9 +868,9 @@ async fn patch_blocks_on_row_lock_and_applies_against_post_commit_row() {
     // hold_execution_row_lock precedent).
     let mut conn2 = AsyncPgConnection::establish(&url).await.expect("conn2");
     conn2.batch_execute("BEGIN").await.expect("begin");
-    let advanced_slot = Utc::now() + chrono::Duration::seconds(999);
+    let advanced_slot = Timestamp::now() + jiff::SignedDuration::from_secs(999);
     diesel::update(harvest_schedules::table.find(before.id))
-        .set(dsl::next_run_at.eq(Some(advanced_slot)))
+        .set(dsl::next_run_at.eq(Some(advanced_slot).to_diesel()))
         .execute(&mut conn2)
         .await
         .expect("advance under lock");
@@ -901,8 +907,8 @@ async fn patch_blocks_on_row_lock_and_applies_against_post_commit_row() {
             .expect("patch must succeed after the lock is released"),
     );
     assert_eq!(
-        row.next_run_at.map(|t| t.timestamp_micros()),
-        Some(advanced_slot.timestamp_micros()),
+        row.next_run_at.map(jiff::Timestamp::as_microsecond),
+        Some(advanced_slot.as_microsecond()),
         "the PATCH must merge against the post-commit row: the concurrently \
          advanced next_run_at must survive the edit"
     );
@@ -932,7 +938,8 @@ async fn patch_on_expired_claim_fences_straggler_finalize() {
     diesel::update(harvest_schedules::table.find(before.id))
         .set((
             dsl::fire_claim_token.eq(Some(stale_token)),
-            dsl::fire_claimed_until.eq(Some(Utc::now() - chrono::Duration::seconds(5))),
+            dsl::fire_claimed_until
+                .eq(Some(Timestamp::now() - jiff::SignedDuration::from_secs(5)).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -958,16 +965,16 @@ async fn patch_on_expired_claim_fences_straggler_finalize() {
 
     // A straggler fire's finalize UPDATE is guarded on its own token — it
     // must now match zero rows instead of clobbering the edited next_run_at.
-    let old_spec_next = Utc::now() - chrono::Duration::seconds(30);
+    let old_spec_next = Timestamp::now() - jiff::SignedDuration::from_secs(30);
     let straggler_rows = diesel::update(
         harvest_schedules::table
             .find(before.id)
             .filter(dsl::fire_claim_token.eq(Some(stale_token))),
     )
     .set((
-        dsl::next_run_at.eq(Some(old_spec_next)),
+        dsl::next_run_at.eq(Some(old_spec_next).to_diesel()),
         dsl::fire_claim_token.eq(None::<Uuid>),
-        dsl::fire_claimed_until.eq(None::<DateTime<Utc>>),
+        dsl::fire_claimed_until.eq(None::<jiff_diesel::Timestamp>),
     ))
     .execute(&mut conn)
     .await
@@ -978,8 +985,8 @@ async fn patch_on_expired_claim_fences_straggler_finalize() {
     );
     let after = load_by_id(&mut conn, before.id).await;
     assert_ne!(
-        after.next_run_at.map(|t| t.timestamp_micros()),
-        Some(old_spec_next.timestamp_micros()),
+        after.next_run_at.map(jiff::Timestamp::as_microsecond),
+        Some(old_spec_next.as_microsecond()),
         "the straggler must not have clobbered next_run_at"
     );
 }

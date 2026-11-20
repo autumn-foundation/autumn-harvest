@@ -41,7 +41,9 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
+#[cfg(feature = "db")]
+use jiff_diesel::ToDiesel;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -100,8 +102,8 @@ pub(crate) const SEGMENT_MAX_BYTES: usize = 8 * 1024 * 1024;
 pub fn archive_prefix(
     shard_id: i32,
     partition: &str,
-    lower: Option<DateTime<Utc>>,
-    upper: DateTime<Utc>,
+    lower: Option<Timestamp>,
+    upper: Timestamp,
 ) -> String {
     format!(
         "{KEY_ROOT}/shard-{shard_id}/{partition}/{}_{}",
@@ -114,15 +116,14 @@ pub fn archive_prefix(
 ///
 /// A cohort bound is whole seconds. The legacy upper bound is the conversion
 /// instant, so it keeps its microseconds.
-fn key_bound(bound: Option<DateTime<Utc>>) -> String {
-    use chrono::Timelike as _;
+fn key_bound(bound: Option<Timestamp>) -> String {
     bound.map_or_else(
         || "min".to_string(),
         |ts| {
-            if ts.nanosecond() == 0 {
-                ts.format("%Y%m%dT%H%M%SZ").to_string()
+            if ts.subsec_nanosecond() == 0 {
+                ts.strftime("%Y%m%dT%H%M%SZ").to_string()
             } else {
-                ts.format("%Y%m%dT%H%M%S%.6fZ").to_string()
+                ts.strftime("%Y%m%dT%H%M%S%.6fZ").to_string()
             }
         },
     )
@@ -195,11 +196,11 @@ pub struct PartitionManifest {
     /// The partition table name.
     pub partition: String,
     /// The inclusive lower cohort bound. `None` for `MINVALUE`.
-    pub lower: Option<DateTime<Utc>>,
+    pub lower: Option<Timestamp>,
     /// The exclusive upper cohort bound.
-    pub upper: DateTime<Utc>,
+    pub upper: Timestamp,
     /// When the export finished.
-    pub exported_at: DateTime<Utc>,
+    pub exported_at: Timestamp,
     /// Rows in the partition.
     pub row_count: u64,
     /// Lowercase hex SHA-256 of all segment bytes, in segment order.
@@ -340,7 +341,7 @@ pub struct ArchivedEventRow {
     /// The stored event. Codec envelopes stay ciphertext.
     pub event_data: serde_json::Value,
     /// The event timestamp.
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     /// Every other column, such as `cohort`. A new column lands here.
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
@@ -1215,7 +1216,7 @@ async fn upload_segment(
 pub(crate) async fn reusable_export(
     export: &PartitionExport,
     part: &crate::partition::PartitionInfo,
-    upper: DateTime<Utc>,
+    upper: Timestamp,
     progress: Option<&mut (dyn FnMut() + Send)>,
 ) -> Option<PartitionManifest> {
     let prefix = archive_prefix(export.shard_id, &part.name, part.lower, upper);
@@ -1260,8 +1261,8 @@ pub(crate) async fn record_drop(
     )
     .bind::<Text, _>(manifest.key())
     .bind::<Text, _>(&manifest.partition)
-    .bind::<Nullable<Timestamptz>, _>(manifest.lower)
-    .bind::<Timestamptz, _>(manifest.upper)
+    .bind::<Nullable<Timestamptz>, _>(manifest.lower.to_diesel())
+    .bind::<Timestamptz, _>(manifest.upper.to_diesel())
     .bind::<BigInt, _>(i64::try_from(manifest.row_count).unwrap_or(i64::MAX))
     .execute(conn)
     .await
@@ -1290,7 +1291,7 @@ struct KeyRow {
 pub async fn dropped_manifest_key(
     conn: &mut diesel_async::AsyncPgConnection,
     partition: &str,
-    upper: DateTime<Utc>,
+    upper: Timestamp,
 ) -> crate::error::HarvestResult<Option<String>> {
     use diesel::sql_types::{Text, Timestamptz};
     use diesel_async::RunQueryDsl as _;
@@ -1301,7 +1302,7 @@ pub async fn dropped_manifest_key(
           LIMIT 1",
     )
     .bind::<Text, _>(partition)
-    .bind::<Timestamptz, _>(upper)
+    .bind::<Timestamptz, _>(upper.to_diesel())
     .load::<KeyRow>(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -1321,7 +1322,7 @@ pub(crate) async fn export_partition(
     conn: &mut diesel_async::AsyncPgConnection,
     export: &PartitionExport,
     part: &crate::partition::PartitionInfo,
-    upper: DateTime<Utc>,
+    upper: Timestamp,
     mut progress: Option<&mut (dyn FnMut() + Send)>,
 ) -> Result<PartitionManifest, String> {
     use diesel_async::AsyncConnection as _;
@@ -1368,7 +1369,7 @@ pub(crate) async fn export_partition(
         partition: part.name.clone(),
         lower: part.lower,
         upper,
-        exported_at: Utc::now(),
+        exported_at: Timestamp::now(),
         row_count,
         sha256,
         row_checksum,
@@ -1406,12 +1407,12 @@ pub(crate) async fn export_partition(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use jiff::Timestamp;
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    fn ts(y: i32, m: u32, d: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap()
+    fn ts(y: i32, m: u32, d: u32) -> Timestamp {
+        crate::time::utc_ymd_hms(y, m, d, 0, 0, 0).unwrap()
     }
 
     #[derive(Default)]
@@ -1553,7 +1554,7 @@ mod tests {
 
     #[test]
     fn a_sub_second_bound_keeps_its_microseconds() {
-        let cutover = ts(2026, 1, 1) + chrono::Duration::microseconds(1_500_250);
+        let cutover = ts(2026, 1, 1) + jiff::SignedDuration::from_micros(1_500_250);
         let prefix = archive_prefix(0, "harvest_events_p_legacy", None, cutover);
         assert!(prefix.ends_with("/min_20260101T000001.500250Z"), "{prefix}");
     }

@@ -44,7 +44,7 @@ use autumn_harvest::{
     ActivityContext, DEFAULT_HISTORY_BYTE_HARD_CAP, DEFAULT_HISTORY_EVENT_HARD_CAP,
     WorkflowContext, WorkflowHistoryPolicy,
 };
-use chrono::Utc;
+use jiff::Timestamp;
 
 const GROWER: &str = "history_default_caps_grower";
 const LOCAL_RUNNER: &str = "history_default_caps_local_runner";
@@ -377,7 +377,7 @@ async fn seed_execution(conn: &mut AsyncPgConnection, workflow_name: &str) -> Ex
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -433,7 +433,7 @@ async fn pad_bytes(
 async fn enqueue_workflow_task(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
     let mut params = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({}));
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
     queue_mod::enqueue(conn, &params).await.expect("enqueue");
 }
 

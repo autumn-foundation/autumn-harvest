@@ -540,7 +540,7 @@ async fn a_second_dead_letter_for_one_key_is_reported_as_already_recorded() {
         detail: detail.to_string(),
         attempts: 1,
         payload: b"{".to_vec(),
-        failed_at: chrono::Utc::now(),
+        failed_at: jiff::Timestamp::now(),
     };
 
     assert_eq!(

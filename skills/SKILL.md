@@ -67,7 +67,7 @@ non-web or other-framework contexts.
 autumn-harvest = { version = "0.10", features = ["db"] }
 autumn-harvest-plugin = "0.10"
 autumn-web = { version = "0.10", features = ["ws"] }
-# ... plus standard deps (serde_json, chrono, uuid, tokio, tracing, etc.)
+# ... plus standard deps (serde_json, jiff, uuid, tokio, tracing, etc.)
 ```
 
 The `db` feature (default) pulls Diesel + diesel-async. Requirements: Postgres 12+. CI runs Harvest's own DB suites on Postgres 16 and does not test 12 to 15.
@@ -121,7 +121,7 @@ Because workflows replay from history, they must be deterministic:
 - **Do**: Use `ctx.timer()` instead of `tokio::time::sleep`
 - **Do**: Use `ctx.wait_for_signal()` for external events
 - **Do**: Use `ctx.spawn_child_workflow_raw()` or the typed `ctx.spawn_child_workflow()` for sub-orchestrations
-- **Don't**: Call `Utc::now()`, `rand::random()`, or do I/O directly in workflows
+- **Don't**: Call `jiff::Timestamp::now()`, `chrono::Utc::now()`, `rand::random()`, or do I/O directly in workflows (read time with `ctx.now()` or `ctx.system_now()`)
 - **Don't**: Use `tokio::spawn` or other non-deterministic operations
 
 ## Defining Activities

@@ -287,14 +287,26 @@ sequenceDiagram
 - Do not run a direct restore of a tenant while a `HarvestFleet::restore`
   of it runs. A direct restore that publishes just before the
   `HarvestFleet::restore` returns can take its target.
-- On Unix the database identity is the device and inode. Elsewhere it is
+- On Unix the database identity is the device, the inode and the birth
+  time. A new file can reuse the inode of a removed file, and the birth
+  time tells them apart (issue #2721). A file system with no birth time
+  gives the device and inode only. Two direct restores before the next
+  open can then keep the old Harvest file, when the new file reuses the
+  inode of the recorded file. Elsewhere the identity is
   the creation time, which Windows can keep across a rename. A direct
   `DatabaseFleet::restore` on Windows can then keep the old Harvest file,
   or the target of an earlier `HarvestFleet::restore`. Use
   `HarvestFleet::restore` there: a finished restore binds its target to
   the restored file, so the next open applies it.
 - An import or a re-create gives the tenant a new database file. A Harvest
-  file with no replica then goes aside, as `<file>.aside-<n>`.
+  file with no replica then goes aside, as `<file>.aside-<n>`. Its sidecars
+  go with it. When a file cannot move, each moved sidecar moves back and
+  the open refuses. The error names the file. On Windows another process
+  can hold a sidecar open. The next open tries again. When a move back
+  also fails, the error names the sidecar that stays aside. Move it back
+  before the next open (issue #2759).
+- Sidecars of a missing Harvest file go aside, as `<file>.aside-<n>-wal`.
+  So no open starts a new file beside an old WAL.
 - `DatabaseFleet::release_ownership` does not wait for a Harvest backlog.
   The shutdown hook ships it within the fleet's final flush, and logs each
   tenant that stays behind.
@@ -348,7 +360,10 @@ sequenceDiagram
 - **A restore covers both files.** `HarvestFleet::restore(key, target)`
   restores the database. It keeps the target on disk, and the next open
   restores the Harvest file to the same point. When the Harvest replica no
-  longer reaches the target, each open refuses until a new restore.
+  longer reaches the target, each open refuses until a new restore. An
+  open that does not refuse then removes the target. When it cannot, the
+  open refuses, and the error names the target file. A retry applies the
+  same target again, so the retry loses no run.
 - **A later restore supersedes the target.** The target names the
   database file that its restore published. A direct
   `DatabaseFleet::restore` before the next open replaces that file, so the
@@ -883,7 +898,7 @@ SqliteAuthStore::open("app.harvest.db")?.insert_token(&NewToken {
     name: "bootstrap",
     token_hash: &autumn_harvest::api_token::hash_secret(&secret),
     scope: "admin",
-    created_at: chrono::Utc::now(),
+    created_at: jiff::Timestamp::now(),
     expires_at: None,
     created_by: "bootstrap",
     tenant: None,
@@ -919,7 +934,7 @@ no-op would let an app believe a protection or a feature is on.
 | A webhook or connector `queue`, and a `Starts` connector binding in `BrokerCoordinates` mode | the epic: see [MCP, webhooks and connectors](#mcp-webhooks-and-connectors) |
 | `harvest.sqlite.path` or `sqlite_per_tenant()` with `harvest.mode = "split"` / `"external"` | [#2472](https://github.com/autumn-foundation/autumn-harvest/issues/2472): no effect in that mode |
 | `sqlite_per_tenant()` in an app with no `[database.fleet]` | [#2472](https://github.com/autumn-foundation/autumn-harvest/issues/2472) |
-| `harvest.worker_enabled = false` | not planned: the app process is the only writer. The `web` role does not stop the driver either ([#2477](https://github.com/autumn-foundation/autumn-harvest/issues/2477)) |
+| `harvest.worker_enabled = false` | not planned: the app process is the only writer. A role that turns off `harvest.worker`, `web` included, does not stop the driver either ([#2477](https://github.com/autumn-foundation/autumn-harvest/issues/2477)) |
 | DAGs | an engine non-goal of the SQLite backend (#2019) |
 | `with_metrics_scrape` | the epic |
 

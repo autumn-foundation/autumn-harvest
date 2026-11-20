@@ -61,7 +61,7 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use crate::info::ActivityInfo;
 use crate::policy::RetryPolicy;
@@ -70,7 +70,7 @@ use crate::workflow_retry::{RetryLimits, RetryLimitsPatch};
 /// The longest timeout that an override can set: 100 years.
 ///
 /// A schedule adds `schedule_to_close` to its time. A sum past the range of
-/// `chrono` panics, so the write refuses a value above this bound.
+/// `jiff` panics, so the write refuses a value above this bound.
 pub const MAX_ACTIVITY_TIMEOUT: Duration = crate::run_defaults::MAX_RUN_DEFAULT;
 
 /// The largest cap that an override can set.
@@ -281,9 +281,9 @@ pub struct ActivityDefaultOverride {
     /// The actor that last changed the override.
     pub updated_by: String,
     /// The time of the first write.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// When the override last changed.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 #[cfg(feature = "db")]
@@ -297,9 +297,10 @@ mod db {
     };
     use std::time::Duration;
 
-    use chrono::{DateTime, Utc};
     use diesel::prelude::*;
     use diesel_async::{AsyncPgConnection, RunQueryDsl};
+    use jiff::Timestamp;
+    use jiff_diesel::ToDiesel;
 
     use crate::error::{HarvestError, HarvestResult};
     use crate::run_defaults::{MAX_RETRY_INTERVAL, check_retry_limits, check_retry_patch};
@@ -320,8 +321,10 @@ mod db {
         max_concurrent: Option<i32>,
         reason: Option<String>,
         updated_by: String,
-        created_at: DateTime<Utc>,
-        updated_at: DateTime<Utc>,
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+        created_at: Timestamp,
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+        updated_at: Timestamp,
     }
 
     impl OverrideRow {
@@ -531,7 +534,7 @@ mod db {
                 return Ok(None);
             }
             check_retry_limits(merged.retry)?;
-            let now = Utc::now();
+            let now = Timestamp::now();
             let retry_max_attempts = merged
                 .retry
                 .max_attempts
@@ -558,8 +561,8 @@ mod db {
                     dsl::max_concurrent.eq(max_concurrent),
                     dsl::reason.eq(change.reason),
                     dsl::updated_by.eq(change.actor),
-                    dsl::created_at.eq(now),
-                    dsl::updated_at.eq(now),
+                    dsl::created_at.eq(now.to_diesel()),
+                    dsl::updated_at.eq(now.to_diesel()),
                 ))
                 .on_conflict(dsl::activity_name)
                 .do_update()
@@ -574,7 +577,7 @@ mod db {
                     dsl::max_concurrent.eq(max_concurrent),
                     dsl::reason.eq(change.reason),
                     dsl::updated_by.eq(change.actor),
-                    dsl::updated_at.eq(now),
+                    dsl::updated_at.eq(now.to_diesel()),
                 ))
                 .execute(conn)
                 .await
@@ -589,7 +592,7 @@ mod db {
     /// The columns hold whole milliseconds. So the write refuses a timeout
     /// under 1 ms and one with a part of a millisecond. A zero timeout ends
     /// each attempt at once. A timeout over [`MAX_ACTIVITY_TIMEOUT`] can pass
-    /// the range of `chrono` when a schedule adds it to its time. The retry
+    /// the range of `jiff` when a schedule adds it to its time. The retry
     /// fields follow the rules of the workflow retry override.
     ///
     /// # Errors

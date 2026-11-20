@@ -42,14 +42,11 @@ use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest_sqlite::{ActivitySpec, RunState, SqliteRuntime};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::json;
 
-const fn t0() -> DateTime<Utc> {
-    match DateTime::from_timestamp(4_000_000, 0) {
-        Some(t) => t,
-        None => unreachable!(),
-    }
+const fn t0() -> Timestamp {
+    Timestamp::constant(4_000_000, 0)
 }
 
 /// The maximum attempts of the always-failing, zero-delay-retry branch. Large

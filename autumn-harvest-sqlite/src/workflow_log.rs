@@ -15,7 +15,7 @@
 
 use autumn_harvest::context::WorkflowLogPolicy;
 use autumn_harvest::{ExecutionId, WorkflowCommand};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{SqliteError, SqliteResult};
@@ -37,7 +37,7 @@ pub struct LogLine {
     /// The message, cut to the policy's byte cap.
     pub message: String,
     /// When the line was stored.
-    pub occurred_at: DateTime<Utc>,
+    pub occurred_at: Timestamp,
 }
 
 /// Which lines one page reads. All set filters combine with AND.
@@ -46,7 +46,7 @@ pub struct LogFilter {
     /// Only lines after this `seq`.
     pub after_seq: Option<i64>,
     /// Only lines stored after this time.
-    pub since: Option<DateTime<Utc>>,
+    pub since: Option<Timestamp>,
     /// Only lines of these levels. An empty list matches every level.
     pub levels: Vec<String>,
     /// The page size.
@@ -150,7 +150,7 @@ fn append(
     let admit = usize::try_from(remaining)
         .unwrap_or(usize::MAX)
         .min(lines.len());
-    let now = Utc::now().timestamp_micros();
+    let now = Timestamp::now().as_microsecond();
     let mut insert = conn.prepare_cached(
         "INSERT OR IGNORE INTO harvest_workflow_logs \
          (exec_id, seq, level, message, occurred_at) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -225,7 +225,9 @@ pub fn load(
         params![
             exec.to_string(),
             filter.after_seq.unwrap_or(i64::MIN),
-            filter.since.map_or(i64::MIN, |at| at.timestamp_micros()),
+            filter
+                .since
+                .map_or(i64::MIN, jiff::Timestamp::as_microsecond),
             levels,
             i64::from(filter.limit)
         ],
@@ -240,9 +242,7 @@ pub fn load(
     )?;
     rows.map(|row| {
         let (seq, level, message, at) = row?;
-        let occurred_at = DateTime::from_timestamp_micros(at).ok_or_else(|| {
-            SqliteError::Corrupt(format!("log line {seq} of {exec} has the time {at}"))
-        })?;
+        let occurred_at = autumn_harvest::time::from_microsecond_clamped(at);
         Ok(LogLine {
             seq,
             level,

@@ -16,15 +16,15 @@ use autumn_harvest::WorkflowHandlerFn;
 use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{NonDeterminismKind, ReplayStatus, WorkflowReplayer};
 use autumn_harvest_sqlite::{ActivitySpec, RunState, SqliteError, SqliteRuntime};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
-const fn t0() -> DateTime<Utc> {
-    DateTime::from_timestamp(4_000_000, 0).unwrap()
+const fn t0() -> Timestamp {
+    Timestamp::constant(4_000_000, 0)
 }
 
-fn at(secs: i64) -> DateTime<Utc> {
-    t0() + chrono::Duration::seconds(secs)
+fn at(secs: i64) -> Timestamp {
+    t0() + jiff::SignedDuration::from_secs(secs)
 }
 
 fn completed(state: &RunState) -> Value {

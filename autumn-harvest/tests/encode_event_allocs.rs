@@ -62,8 +62,8 @@ fn completed(output: Value) -> WorkflowEvent {
 }
 
 /// A fixed time, so each encode writes a timestamp of the same length.
-const fn fixed_time() -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::from_timestamp(1_800_000_000, 0).expect("valid time")
+const fn fixed_time() -> jiff::Timestamp {
+    jiff::Timestamp::constant(1_800_000_000, 0)
 }
 
 const fn started(input: Value, carryover: Value) -> WorkflowEvent {

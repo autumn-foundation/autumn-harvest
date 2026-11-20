@@ -4,6 +4,7 @@
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
 use autumn_harvest::table_split::SetExt;
+use jiff_diesel::ToDiesel;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,10 +34,10 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -581,7 +582,7 @@ async fn reset_on_terminal_source_returns_conflict() {
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -623,7 +624,7 @@ async fn reset_strips_stale_nd_diagnostic_search_attrs_from_fork() {
     // business attribute the fork must keep.
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
-            harvest_workflow_executions::nd_blocked_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::nd_blocked_at.eq(Some(Timestamp::now()).to_diesel()),
             SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(Some(
                 "non-deterministic replay: activity mismatch".to_string(),
             ))),
@@ -707,7 +708,7 @@ async fn seed_terminal_execution(
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq(state),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
         ))
         .execute(conn)
         .await

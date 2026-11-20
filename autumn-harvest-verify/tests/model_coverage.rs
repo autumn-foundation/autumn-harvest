@@ -523,8 +523,9 @@ fn every_pub_async_method_on_durable_promise_is_a_sink() {
 
 /// A `[[trusted]]` crate is modelled as a pure taint-propagator. That makes
 /// `format!` tractable. It is also how a source could be silently swallowed.
-/// `chrono` is trusted, so if `Utc::now` were not *also* a source row it would
-/// propagate cleanly. Then every clock read through chrono would vanish.
+/// `jiff` is trusted, so if `Timestamp::now` were not *also* a source row it
+/// would propagate cleanly. Then every clock read through jiff would vanish.
+/// The same holds for `chrono` and `Utc::now` in user code.
 ///
 /// The precedence rule ("sources match before the trusted default") lives in
 /// `Model::classify`, and its unit tests prove it. This guard checks the other
@@ -534,6 +535,10 @@ fn every_pub_async_method_on_durable_promise_is_a_sink() {
 fn sources_never_shadowed_by_trusted_crates() {
     // (trusted crate, a source/forbidden row that must exist for it)
     const CARVE_OUTS: &[(&str, &[&str])] = &[
+        (
+            "jiff",
+            &["Timestamp::now", "ZonedDateTime::now", "TimeZone::system"],
+        ),
         ("chrono", &["Utc::now", "Local::now"]),
         ("uuid", &["Uuid::new_v4", "Uuid::now_v7"]),
         ("rand", &["thread_rng", "random", "Rng::gen_range"]),

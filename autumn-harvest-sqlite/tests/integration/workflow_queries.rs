@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use autumn_harvest::prelude::*;
 use autumn_harvest_sqlite::{ActivitySpec, RunState, SqliteError, SqliteRuntime};
-use chrono::{DateTime, TimeDelta, Utc};
+use jiff::{SignedDuration, Timestamp};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
 
@@ -611,12 +611,12 @@ async fn query_does_not_fire_a_due_timer() {
     let (_dir, path) = temp_db();
     let mut rt = SqliteRuntime::open(&path).unwrap();
     rt.register_workflow(&timed_info());
-    let t0 = DateTime::<Utc>::from_timestamp(1_000_000, 0).unwrap();
+    let t0 = Timestamp::from_second(1_000_000).unwrap();
     let exec = rt.start_workflow("timed", json!(0)).unwrap();
     let state = rt.run_until_blocked_as_of(exec, t0).await.unwrap();
     assert!(matches!(state, RunState::WaitingTimer), "got {state:?}");
     // The timer is now due. Only a drive may fire it.
-    rt.set_clock(move || t0 + TimeDelta::hours(2));
+    rt.set_clock(move || t0 + SignedDuration::from_hours(2));
 
     let reader = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
     let rows_before = snapshot(&reader);

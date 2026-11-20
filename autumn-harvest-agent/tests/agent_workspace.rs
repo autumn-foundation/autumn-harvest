@@ -14,7 +14,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use autumn_harvest::aead_codec::{AeadCodec, DataKey};
-use autumn_harvest::chrono::{DateTime, Utc};
 use autumn_harvest::payload_codec::PayloadCodecs;
 use autumn_harvest_agent::flow::labels;
 use autumn_harvest_agent::mesh::DELEGATE_TOOL;
@@ -26,6 +25,7 @@ use autumn_harvest_agent::{
 };
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
 use common::{ScriptedModel, TryFnModel, answer, calls, runtime};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::json;
 
 fn fresh_db() -> (tempfile::TempDir, PathBuf) {
@@ -40,7 +40,7 @@ fn state(rt: &SqliteRuntime, agent: &AgentId) -> impl Future<Output = AgentState
 }
 
 /// Drive the agent at the drive clock `at`, through each checkpoint.
-async fn drive_at(rt: &mut SqliteRuntime, agent: &AgentId, at: DateTime<Utc>) -> RunState {
+async fn drive_at(rt: &mut SqliteRuntime, agent: &AgentId, at: Timestamp) -> RunState {
     let mut exec = sqlite::current_run(rt, agent).unwrap().unwrap();
     loop {
         match rt.run_until_blocked_as_of(exec, at).await.unwrap() {
@@ -54,10 +54,10 @@ async fn drive_at(rt: &mut SqliteRuntime, agent: &AgentId, at: DateTime<Utc>) ->
 /// each retry backoff end.
 async fn say(rt: &mut SqliteRuntime, agent: &AgentId, text: &str) -> AgentState {
     sqlite::send(rt, agent, &AgentOp::message(text), None).unwrap();
-    let mut at = Utc::now();
+    let mut at = Timestamp::now();
     for _ in 0..5 {
         drive_at(rt, agent, at).await;
-        at += chrono::Duration::minutes(5);
+        at += SignedDuration::from_mins(5);
     }
     state(rt, agent).await
 }
@@ -411,7 +411,7 @@ async fn a_read_only_tick_runs_a_workspace_tool_but_keeps_the_head() {
         .workspace(memory_store())
         .agent(profile);
     let mut rt = runtime(&db, harness);
-    let start = Utc::now();
+    let start = Timestamp::now();
     sqlite::send(&mut rt, &agent, &AgentOp::message("write it"), None).unwrap();
     drive_at(&mut rt, &agent, start).await;
     let head = state(&rt, &agent)
@@ -419,14 +419,14 @@ async fn a_read_only_tick_runs_a_workspace_tool_but_keeps_the_head() {
         .workspace
         .expect("the op saved a snapshot");
 
-    drive_at(&mut rt, &agent, start + chrono::Duration::seconds(90)).await;
+    drive_at(&mut rt, &agent, start + SignedDuration::from_secs(90)).await;
     let ticked = state(&rt, &agent).await;
     assert_eq!(ticked.ticks, 1);
     assert_eq!(runs.load(Ordering::SeqCst), 2, "the tick ran the tool");
     assert_eq!(ticked.workspace, Some(head), "the tick keeps the head");
 
     sqlite::send(&mut rt, &agent, &AgentOp::message("read it"), None).unwrap();
-    drive_at(&mut rt, &agent, start + chrono::Duration::seconds(100)).await;
+    drive_at(&mut rt, &agent, start + SignedDuration::from_secs(100)).await;
     let results = tool_results(&state(&rt, &agent).await);
     assert!(
         results
@@ -531,9 +531,9 @@ async fn a_reset_in_a_new_life_deletes_the_keys_of_an_old_life_on_a_fast_clock()
     let runs = Arc::new(AtomicUsize::new(0));
     let model = ScriptedModel::new(vec![write("w1", "a.txt", "old"), answer("written", 1)]);
     let mut rt = runtime(&db, harness(model, store, &runs));
-    let now = Utc::now();
+    let now = Timestamp::now();
     // The first life runs on a clock that is an hour fast.
-    let fast = now + chrono::Duration::hours(1);
+    let fast = now + SignedDuration::from_hours(1);
     sqlite::send(&mut rt, &agent, &AgentOp::message("write it"), None).unwrap();
     drive_at(&mut rt, &agent, fast).await;
     let scope = WorkspaceMount::agent_scope(agent.as_str());

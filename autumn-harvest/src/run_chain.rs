@@ -22,7 +22,7 @@
 //! rows written before the feature also carry `None`; [`assemble_run_chain`]
 //! still orders them via a `started_at` fallback and flags the head as unknown.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -40,9 +40,9 @@ pub struct RunChainRecord {
     /// Raw DB state string (e.g. `"COMPLETED"`, `"CONTINUED_AS_NEW"`).
     pub state: String,
     /// When this run started.
-    pub started_at: DateTime<Utc>,
+    pub started_at: Timestamp,
     /// When this run reached a terminal state, if it has.
-    pub completed_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<Timestamp>,
     /// Collapsed terminal outcome (see [`outcome_for_state`]).
     pub outcome: String,
     /// Forward link to the next run in the chain (the successor's `exec_id`).
@@ -79,9 +79,9 @@ pub struct RunChainRow {
     /// Raw DB state string.
     pub state: String,
     /// When this run started.
-    pub started_at: DateTime<Utc>,
+    pub started_at: Timestamp,
     /// Terminal timestamp, if reached.
-    pub completed_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<Timestamp>,
     /// Immediate predecessor in the chain (issue #701). `None` for the origin
     /// and for non-continued / legacy rows.
     pub continued_from_exec_id: Option<Uuid>,
@@ -417,10 +417,10 @@ pub fn reconstruct_legacy_chain_order(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{TimeZone, Utc};
+    use jiff::Timestamp;
 
-    fn ts(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(1_700_000_000 + secs, 0).unwrap()
+    fn ts(secs: i64) -> Timestamp {
+        Timestamp::new(1_700_000_000 + secs, 0).unwrap()
     }
 
     /// Builder for a chain row keeping the tests terse.

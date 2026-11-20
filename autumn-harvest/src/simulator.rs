@@ -222,7 +222,7 @@ impl WorkflowSimulator {
         let exec_id = ExecutionId::new();
         let mut history = vec![WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: chrono::Utc::now(),
+            timestamp: jiff::Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -625,7 +625,7 @@ impl WorkflowSimulator {
                             WorkflowEvent::WorkflowStarted { timestamp, .. } => Some(*timestamp),
                             _ => None,
                         })
-                        .unwrap_or_else(chrono::Utc::now);
+                        .unwrap_or_else(jiff::Timestamp::now);
                     history.push(WorkflowEvent::MutexGranted {
                         key,
                         lock_seq,

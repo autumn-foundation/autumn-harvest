@@ -63,7 +63,7 @@ pub enum SystemTest {
     Eq(String),
     Ne(String),
     In(Vec<String>),
-    Cmp(CmpOp, chrono::DateTime<chrono::Utc>),
+    Cmp(CmpOp, jiff::Timestamp),
 }
 
 /// Parses `raw` into a filter and checks the index rule.
@@ -559,9 +559,9 @@ impl Parser {
             };
             let value_at = self.at();
             let text = self.string_literal(name)?;
-            let ts = chrono::DateTime::parse_from_rfc3339(&text)
+            let ts = autumn_harvest::time::parse::rfc3339(&text)
                 .map_err(|_| format!("started_at at byte {value_at} needs an RFC 3339 time"))?;
-            return Ok(SystemTest::Cmp(cmp, ts.with_timezone(&chrono::Utc)));
+            return Ok(SystemTest::Cmp(cmp, ts));
         }
         // `selects` is true for `=` and `IN`. The default list hides `MIGRATED`
         // rows, so such a test could never match. The `state` parameter shows
@@ -764,7 +764,7 @@ enum Part {
     TextArray(Vec<String>),
     Jsonb(JsonText),
     JsonbArray(Vec<JsonText>),
-    Timestamptz(chrono::DateTime<chrono::Utc>),
+    Timestamptz(jiff_diesel::Timestamp),
 }
 
 /// A compiled filter: SQL text with bound values.
@@ -894,7 +894,8 @@ impl SqlFilter {
                     CmpOp::Lt => " < ",
                     CmpOp::Lte => " <= ",
                 });
-                self.parts.push(Part::Timestamptz(*at));
+                self.parts
+                    .push(Part::Timestamptz(jiff_diesel::Timestamp::from(*at)));
             }
         }
     }

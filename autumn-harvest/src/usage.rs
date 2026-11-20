@@ -89,13 +89,15 @@
 //! choosing a `search_attr:<key>` should avoid keys whose legitimate values
 //! could collide with the sentinel string.
 
-use chrono::{DateTime, Utc};
 #[cfg(feature = "db")]
 use diesel::sql_types::{BigInt, Double, Integer, Nullable, Text, Timestamptz};
 #[cfg(feature = "db")]
 use diesel_async::AsyncPgConnection;
 #[cfg(feature = "db")]
 use diesel_async::RunQueryDsl;
+use jiff::Timestamp;
+#[cfg(feature = "db")]
+use jiff_diesel::ToDiesel;
 
 #[cfg(feature = "db")]
 use crate::error::{HarvestResult, database_error};
@@ -193,8 +195,8 @@ impl UsageGroupBy {
 #[derive(Debug, Clone)]
 pub struct UsageQuery {
     pub group_by: UsageGroupBy,
-    pub from: DateTime<Utc>,
-    pub to: DateTime<Utc>,
+    pub from: Timestamp,
+    pub to: Timestamp,
 }
 
 /// One grouped usage row read from a single database shard (issue #596).
@@ -454,8 +456,8 @@ pub async fn load_usage_grouped(
     let rows = diesel::sql_query(usage_sql())
         .bind::<Integer, _>(shard_id)
         .bind::<Nullable<Text>, _>(attr_key)
-        .bind::<Timestamptz, _>(query.from)
-        .bind::<Timestamptz, _>(query.to)
+        .bind::<Timestamptz, _>(query.from.to_diesel())
+        .bind::<Timestamptz, _>(query.to.to_diesel())
         .bind::<BigInt, _>(row_limit)
         .load::<UsageSqlRow>(conn)
         .await

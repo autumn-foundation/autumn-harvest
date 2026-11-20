@@ -2640,16 +2640,14 @@ fn secret_schedule(name: &str) -> autumn_harvest::WorkflowSchedule {
     ws
 }
 
-async fn schedule_cell(
-    conn: &mut AsyncPgConnection,
-    name: &str,
-) -> (Value, chrono::DateTime<chrono::Utc>) {
+async fn schedule_cell(conn: &mut AsyncPgConnection, name: &str) -> (Value, jiff::Timestamp) {
     #[derive(diesel::QueryableByName)]
     struct Row {
         #[diesel(sql_type = diesel::sql_types::Jsonb)]
         value: Value,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        updated_at: chrono::DateTime<chrono::Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        updated_at: jiff::Timestamp,
     }
     let row: Row = diesel::sql_query(
         "SELECT workflow_input AS value, updated_at FROM harvest_schedules \
@@ -3707,7 +3705,7 @@ async fn a_flush_that_cannot_decode_gets_a_short_deadline_and_keeps_its_elements
         .expect("an admission never fails on a flush it cannot decode")
         .expect("admitted");
     assert!(
-        outcome.fire_at < chrono::Utc::now() + chrono::Duration::seconds(120),
+        outcome.fire_at < jiff::Timestamp::now() + jiff::SignedDuration::from_secs(120),
         "the outcome reports the deadline the scanner uses"
     );
 
@@ -4068,7 +4066,7 @@ async fn an_overlap_policy_disturbs_no_run_when_the_schedule_input_cannot_decode
         &mut conn,
         StartWorkflowParams {
             schedule_id: Some(schedule.id),
-            scheduled_for: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+            scheduled_for: Some(jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1)),
             ..StartWorkflowParams::new(
                 static_name,
                 "cc-sched-in-flight",

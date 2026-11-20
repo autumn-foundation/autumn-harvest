@@ -33,6 +33,7 @@ use autumn_harvest::llm_budget::LlmBudgetExceeded;
 use autumn_harvest::llm_ledger::LlmCall;
 use autumn_harvest::policy::{RetryPolicy, Schedule, WorkflowSchedule};
 use autumn_harvest::prelude::*;
+use autumn_harvest::time::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentId, AgentMemory, AgentProfile};
@@ -41,7 +42,7 @@ use crate::episode::{Appended, Episode, EpisodeReset, EpisodeSettings, PassMark,
 use crate::error::ErrorKind;
 use crate::harness::{AgentHarness, model_failure};
 use crate::memory::{EditKey, MemoryOp, MemoryScope, escape};
-use crate::message::{ChatMessage, ChatRole, ContentPart, TokenUsage};
+use crate::message::{ChatMessage, ChatRole, ContentPart, StopReason, TokenUsage};
 use crate::model::{BoxFuture, ChatRequest};
 use crate::workflow::harness;
 
@@ -108,8 +109,12 @@ pub enum ConsolidationStop {
     NothingToDo,
     /// The LLM budget refused the model call. Nothing changed.
     BudgetExceeded,
-    /// The reply did not parse. The episodes wait for the next pass.
+    /// The reply ended normally and did not parse. The episodes wait for
+    /// the next pass. A retry may pass.
     InvalidReply,
+    /// The reply hit the output cap and did not parse. The episodes wait,
+    /// but a retry fails the same way. Read fewer episodes or raise the cap.
+    OutputCapped,
     /// The kind keeps no episodes or no store memory, or its mandate
     /// forbids the pass model. No model call ran.
     Disabled,
@@ -273,6 +278,9 @@ pub struct ConsolidateFacts {
     /// The proposed facts. `None` when the reply did not parse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub facts: Option<Vec<ProposedFact>>,
+    /// The reply hit the output cap and did not parse.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub capped: bool,
     /// The tokens of the call.
     #[serde(default)]
     pub usage: TokenUsage,
@@ -435,7 +443,11 @@ pub async fn agent_consolidate(
     };
     report.usage = reply.usage;
     let Some(proposed) = reply.facts else {
-        report.stop = ConsolidationStop::InvalidReply;
+        report.stop = if reply.capped {
+            ConsolidationStop::OutputCapped
+        } else {
+            ConsolidationStop::InvalidReply
+        };
         return Ok(report);
     };
     let (facts, rejected) = fact_entries(&proposed, &read.episodes);
@@ -669,7 +681,7 @@ pub(crate) async fn run_turn<'a>(
     harness: &'a AgentHarness,
     turn: ConsolidateTurn,
     check: crate::score::BudgetCheck<'a>,
-    now: autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>,
+    now: Timestamp,
 ) -> (Result<ConsolidateFacts, String>, Vec<LlmCall>) {
     let client = match harness.model(turn.model.as_deref()) {
         Ok(client) => client,
@@ -696,8 +708,10 @@ pub(crate) async fn run_turn<'a>(
         }
     };
     let call = harness.ledger_call(turn.model.as_deref(), &response.usage, started.elapsed());
+    let parsed = parse_reply(&response.content);
     let facts = ConsolidateFacts {
-        facts: parse_reply(&response.content),
+        capped: parsed.is_none() && response.stop_reason == StopReason::MaxTokens,
+        facts: parsed,
         usage: response.usage,
     };
     (Ok(facts), vec![call])
@@ -938,7 +952,7 @@ pub async fn agent_consolidate_turn(
 ) -> Result<ConsolidateFacts, String> {
     let harness = harness(ctx)?;
     let check = Box::new(|| Box::pin(ctx.check_llm_budget()) as BoxFuture<'_, _>);
-    let (facts, calls) = run_turn(harness, turn, check, autumn_harvest::chrono::Utc::now()).await;
+    let (facts, calls) = run_turn(harness, turn, check, Timestamp::now()).await;
     for call in calls {
         if let Err(err) = ctx.record_llm_call(call) {
             tracing::warn!(error = %err, "the agent cost ledger refused a pass turn");
@@ -1007,7 +1021,6 @@ mod tests {
 
     use super::*;
     use crate::error::AgentError;
-    use crate::message::StopReason;
     use crate::model::{AgentModel, ChatResponse};
     use crate::types::AgentStop;
 
@@ -1274,8 +1287,7 @@ mod tests {
             let pass: crate::score::BudgetCheck<'_> = Box::new(|| Box::pin(async { Ok(()) }));
             let mut capped = turn();
             capped.max_output_tokens = cap;
-            let (facts, _) =
-                run_turn(&harness, capped, pass, autumn_harvest::chrono::Utc::now()).await;
+            let (facts, _) = run_turn(&harness, capped, pass, Timestamp::now()).await;
             assert!(facts.is_ok());
             assert_eq!(*spy.0.lock().unwrap(), vec![cap]);
         }
@@ -1295,8 +1307,7 @@ mod tests {
                 })
             })
         });
-        let (facts, calls) =
-            run_turn(&harness, turn(), zero, autumn_harvest::chrono::Utc::now()).await;
+        let (facts, calls) = run_turn(&harness, turn(), zero, Timestamp::now()).await;
         let payload = facts.unwrap_err();
         let failure = autumn_harvest::failure::parse_typed_payload(&payload).unwrap();
         assert_eq!(
@@ -1312,13 +1323,90 @@ mod tests {
         let model = Arc::new(Counting::default());
         let harness = AgentHarness::new(model.clone());
         let pass: crate::score::BudgetCheck<'_> = Box::new(|| Box::pin(async { Ok(()) }));
-        let (facts, calls) =
-            run_turn(&harness, turn(), pass, autumn_harvest::chrono::Utc::now()).await;
+        let (facts, calls) = run_turn(&harness, turn(), pass, Timestamp::now()).await;
         let facts = facts.unwrap();
         assert_eq!(facts.facts, Some(Vec::new()));
         assert_eq!(facts.usage, TokenUsage::new(5, 2));
         assert_eq!(calls.len(), 1);
         assert_eq!(model.0.load(Ordering::SeqCst), 1);
+    }
+
+    /// A model that answers each call with `text` and `stop`.
+    #[derive(Debug)]
+    struct Fixed(&'static str, StopReason);
+
+    impl AgentModel for Fixed {
+        fn chat<'a>(
+            &'a self,
+            _request: &'a ChatRequest,
+        ) -> BoxFuture<'a, Result<ChatResponse, AgentError>> {
+            let reply = ChatResponse {
+                content: vec![ContentPart::Text(self.0.to_owned())],
+                stop_reason: self.1,
+                usage: TokenUsage::new(5, 2),
+            };
+            Box::pin(async move { Ok(reply) })
+        }
+    }
+
+    async fn turn_of(text: &'static str, stop: StopReason) -> ConsolidateFacts {
+        let harness = AgentHarness::new(Arc::new(Fixed(text, stop)));
+        let pass: crate::score::BudgetCheck<'_> = Box::new(|| Box::pin(async { Ok(()) }));
+        let (facts, _) = run_turn(&harness, turn(), pass, Timestamp::now()).await;
+        facts.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_cut_off_reply_that_does_not_parse_is_capped() {
+        let facts = turn_of("{\"facts\":[{\"subject\":\"a", StopReason::MaxTokens).await;
+        assert_eq!(facts.facts, None);
+        assert!(facts.capped);
+    }
+
+    #[tokio::test]
+    async fn a_cut_off_reply_that_parses_is_not_capped() {
+        let facts = turn_of("{\"facts\":[]}", StopReason::MaxTokens).await;
+        assert_eq!(facts.facts, Some(Vec::new()));
+        assert!(!facts.capped);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_reply_that_ended_is_not_capped() {
+        let facts = turn_of("no facts here", StopReason::EndTurn).await;
+        assert_eq!(facts.facts, None);
+        assert!(!facts.capped);
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_stops_for_a_tool_call_is_not_capped() {
+        let facts = turn_of("no facts here", StopReason::ToolUse).await;
+        assert!(!facts.capped);
+    }
+
+    #[test]
+    fn the_capped_forms_round_trip() {
+        let stop = serde_json::to_string(&ConsolidationStop::OutputCapped).unwrap();
+        assert_eq!(stop, "\"output_capped\"");
+        let back: ConsolidationStop = serde_json::from_str(&stop).unwrap();
+        assert_eq!(back, ConsolidationStop::OutputCapped);
+        let facts = ConsolidateFacts {
+            capped: true,
+            ..ConsolidateFacts::default()
+        };
+        let json = serde_json::to_string(&facts).unwrap();
+        assert!(json.contains("\"capped\":true"), "{json}");
+        assert_eq!(
+            serde_json::from_str::<ConsolidateFacts>(&json).unwrap(),
+            facts
+        );
+    }
+
+    #[test]
+    fn a_recorded_turn_without_the_flag_reads_as_not_capped() {
+        let old: ConsolidateFacts = serde_json::from_str("{}").unwrap();
+        assert!(!old.capped);
+        let json = serde_json::to_string(&ConsolidateFacts::default()).unwrap();
+        assert!(!json.contains("capped"), "{json}");
     }
 
     #[tokio::test]
@@ -1328,8 +1416,7 @@ mod tests {
             Box::new(|| Box::pin(async { panic!("no check for an unknown model") }));
         let mut unknown = turn();
         unknown.model = Some("nope".to_owned());
-        let (facts, calls) =
-            run_turn(&harness, unknown, never, autumn_harvest::chrono::Utc::now()).await;
+        let (facts, calls) = run_turn(&harness, unknown, never, Timestamp::now()).await;
         assert!(facts.unwrap_err().contains("UnknownModel"));
         assert_eq!(calls.len(), 0);
     }

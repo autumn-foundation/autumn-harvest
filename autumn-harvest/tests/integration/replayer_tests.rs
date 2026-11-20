@@ -22,7 +22,7 @@ use autumn_harvest::testing::{
 use autumn_harvest::types::{
     ActivityExecId, ExecutionId, ExternalTarget, ParentClosePolicy, TimerId, UpdateId, WorkerId,
 };
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
@@ -365,8 +365,8 @@ fn sleep_until_workflow<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
         let deadline_millis = input["deadline_millis"].as_i64().unwrap_or(0);
-        let deadline = chrono::DateTime::from_timestamp_millis(deadline_millis)
-            .ok_or_else(|| "bad deadline".to_string())?;
+        let deadline = jiff::Timestamp::from_millisecond(deadline_millis)
+            .map_err(|_| "bad deadline".to_string())?;
         ctx.sleep_until("wake", deadline)
             .await
             .map_err(|e| e.to_string())?;
@@ -1085,7 +1085,7 @@ fn parent_typed_child_failure_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1125,7 +1125,7 @@ fn self_typed_failure_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1147,7 +1147,7 @@ fn canonical_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1191,7 +1191,7 @@ fn current_details_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1428,7 +1428,7 @@ fn force_failed_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1476,7 +1476,7 @@ fn session_pipeline_history(host_worker_id: &str) -> (ExecutionId, Vec<WorkflowE
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1605,7 +1605,7 @@ fn handler_panic_activity_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1678,7 +1678,7 @@ fn drain_interleaved_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1740,7 +1740,7 @@ async fn replay_drain_n_signals_in_one_task_consumes_all() {
     let n = 1000usize;
     let mut events = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -1775,7 +1775,7 @@ fn await_resolved_history(target: ExecutionId, output: Value) -> (ExecutionId, V
     let events = vec![
         WorkflowEvent::workflow_started(
             serde_json::json!({ "target": target.to_string() }),
-            Utc::now(),
+            Timestamp::now(),
         ),
         WorkflowEvent::ExternalAwaitRequested { await_id, target },
         WorkflowEvent::ExternalAwaitResolved { await_id, output },
@@ -1855,7 +1855,7 @@ fn await_concurrent_history(
 
     let mut events = vec![WorkflowEvent::workflow_started(
         serde_json::json!({ "target": target.to_string() }),
-        Utc::now(),
+        Timestamp::now(),
     )];
     // Schedule block (bit 0).
     if ordering & 1 == 0 {
@@ -1925,7 +1925,7 @@ async fn replayer_await_external_failed_target_branches_deterministically() {
     let events = vec![
         WorkflowEvent::workflow_started(
             serde_json::json!({ "target": target.to_string() }),
-            Utc::now(),
+            Timestamp::now(),
         ),
         WorkflowEvent::ExternalAwaitRequested { await_id, target },
         WorkflowEvent::ExternalAwaitFailed {
@@ -1975,7 +1975,7 @@ async fn replayer_await_external_concurrent_with_activity_deterministic() {
     let events_a = vec![
         WorkflowEvent::workflow_started(
             serde_json::json!({ "target": target.to_string() }),
-            Utc::now(),
+            Timestamp::now(),
         ),
         WorkflowEvent::ActivityScheduled {
             activity_id: act_id,
@@ -1997,7 +1997,7 @@ async fn replayer_await_external_concurrent_with_activity_deterministic() {
     let events_b = vec![
         WorkflowEvent::workflow_started(
             serde_json::json!({ "target": target.to_string() }),
-            Utc::now(),
+            Timestamp::now(),
         ),
         WorkflowEvent::ActivityScheduled {
             activity_id: act_id,
@@ -2045,7 +2045,7 @@ async fn replayer_await_external_concurrent_with_timer_deterministic() {
     let started = || {
         WorkflowEvent::workflow_started(
             serde_json::json!({ "target": target.to_string() }),
-            Utc::now(),
+            Timestamp::now(),
         )
     };
     let timer_started = || WorkflowEvent::TimerStarted {
@@ -2311,7 +2311,7 @@ fn mutex_grant_history(key: &str, lock_seq: i64) -> (ExecutionId, Vec<WorkflowEv
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -2319,7 +2319,7 @@ fn mutex_grant_history(key: &str, lock_seq: i64) -> (ExecutionId, Vec<WorkflowEv
         WorkflowEvent::MutexGranted {
             key: key.to_string(),
             lock_seq,
-            acquired_at: Utc::now(),
+            acquired_at: Timestamp::now(),
         },
     ];
     (exec_id, events)
@@ -2384,7 +2384,7 @@ async fn replay_workflow_mutex_release_before_subsequent_event_succeeds() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -2392,7 +2392,7 @@ async fn replay_workflow_mutex_release_before_subsequent_event_succeeds() {
         WorkflowEvent::MutexGranted {
             key: "k".to_string(),
             lock_seq: 1,
-            acquired_at: Utc::now(),
+            acquired_at: Timestamp::now(),
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: step_id,
@@ -2494,7 +2494,7 @@ async fn replay_race_with_in_flight_loser_and_follow_on_activity_succeeds() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -2586,7 +2586,7 @@ async fn replay_race_ending_at_race_no_follow_on_succeeds() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -2688,7 +2688,7 @@ async fn replay_jitter_timer_is_exact_and_deterministic() {
     let ok_history = vec![
         WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -2707,7 +2707,7 @@ async fn replay_jitter_timer_is_exact_and_deterministic() {
     let bad_history = vec![
         WorkflowEvent::WorkflowStarted {
             input,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -2765,7 +2765,7 @@ fn sleep_until_history(
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -2939,8 +2939,8 @@ fn deadline_can_history(t0_millis: i64, consumed_secs: i64) -> Vec<WorkflowEvent
 /// capture that `should_continue_as_new()` records when a deadline exists (the
 /// recorded wall clock is `t0 + consumed_secs`).
 fn deadline_probe_history(t0_millis: i64, consumed_secs: i64) -> Vec<WorkflowEvent> {
-    let t0 = chrono::DateTime::from_timestamp_millis(t0_millis).unwrap();
-    let recorded_now = t0 + chrono::Duration::seconds(consumed_secs);
+    let t0 = jiff::Timestamp::from_millisecond(t0_millis).unwrap();
+    let recorded_now = t0 + jiff::SignedDuration::from_secs(consumed_secs);
     vec![
         WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({ "cycle": 0 }),
@@ -2952,7 +2952,7 @@ fn deadline_probe_history(t0_millis: i64, consumed_secs: i64) -> Vec<WorkflowEve
         WorkflowEvent::SideEffectRecorded {
             kind: autumn_harvest::SideEffectKind::Now,
             name: Some(autumn_harvest::DEADLINE_PROBE_SIDE_EFFECT_NAME.to_string()),
-            value: serde_json::json!(recorded_now.timestamp_millis()),
+            value: serde_json::json!(recorded_now.as_millisecond()),
         },
     ]
 }
@@ -2992,7 +2992,7 @@ fn deadline_branch_history(
 /// a durable timer, but the old binary recorded NO `SideEffectRecorded{Now}`
 /// at the `should_continue_as_new()` call site.
 fn pre_772_timer_history(t0_millis: i64) -> Vec<WorkflowEvent> {
-    let t0 = chrono::DateTime::from_timestamp_millis(t0_millis).unwrap();
+    let t0 = jiff::Timestamp::from_millisecond(t0_millis).unwrap();
     vec![
         WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({ "cycle": 0 }),
@@ -3017,11 +3017,11 @@ fn pre_772_timer_history(t0_millis: i64) -> Vec<WorkflowEvent> {
 /// `should_continue_as_new()` call site, then the durable timer. The probe
 /// must leave the user's `Now` for `ctx.system_now()`.
 fn pre_772_user_now_timer_history(t0_millis: i64) -> Vec<WorkflowEvent> {
-    let t0 = chrono::DateTime::from_timestamp_millis(t0_millis).unwrap();
+    let t0 = jiff::Timestamp::from_millisecond(t0_millis).unwrap();
     // The user's recorded wall clock, well within the 30s budget. Even a buggy
     // probe that consumes it does not trip the deadline branch. That isolates
     // the failure to the stolen-`Now` divergence.
-    let user_now = t0 + chrono::Duration::seconds(1);
+    let user_now = t0 + jiff::SignedDuration::from_secs(1);
     vec![
         WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({ "cycle": 0 }),
@@ -3033,7 +3033,7 @@ fn pre_772_user_now_timer_history(t0_millis: i64) -> Vec<WorkflowEvent> {
         WorkflowEvent::SideEffectRecorded {
             kind: autumn_harvest::SideEffectKind::Now,
             name: None,
-            value: serde_json::json!(user_now.timestamp_millis()),
+            value: serde_json::json!(user_now.as_millisecond()),
         },
         WorkflowEvent::TimerStarted {
             timer_id: TimerId::new("renewal"),
@@ -3054,7 +3054,7 @@ async fn replay_deadline_crossed_history_yields_continue_as_new() {
     // 27s of a 30s budget consumed (0.9 ≥ 0.8) ⇒ deadline branch trips.
     let events = deadline_can_history(1_700_000_000_000, 27);
     let report = build_replayer()
-        .with_execution_timeout(chrono::Duration::seconds(30))
+        .with_execution_timeout(jiff::SignedDuration::from_secs(30))
         .replay_from_snapshot(make_snapshot(
             "deadline_can_workflow",
             ExecutionId::new(),
@@ -3086,7 +3086,7 @@ async fn json_replay_threads_snapshot_execution_timeout_for_deadline_history() {
         execution_id: ExecutionId::new(),
         events,
         context_headers: None,
-        execution_timeout: Some(chrono::Duration::seconds(30)),
+        execution_timeout: Some(jiff::SignedDuration::from_secs(30)),
         deadline_at: None,
         start_provenance: None,
         parent_execution_id: None,
@@ -3147,7 +3147,7 @@ async fn json_replay_legacy_snapshot_without_fields_falls_back_to_global_timeout
     // the deadline branch so the deadline-aware history replays cleanly.
     let report = WorkflowReplayer::new()
         .register_fn("deadline_can_workflow", deadline_can_workflow)
-        .with_execution_timeout(chrono::Duration::seconds(30))
+        .with_execution_timeout(jiff::SignedDuration::from_secs(30))
         .replay_from_json(&json)
         .await
         .expect("legacy snapshot JSON (no deadline fields) parses");
@@ -3185,7 +3185,7 @@ async fn deadline_triggered_can_replays_deterministically_1000x() {
         let t0_millis = base + i * 41_000;
         let events = deadline_branch_history(t0_millis, consumed_secs, expected_trip);
         let report = build_replayer()
-            .with_execution_timeout(chrono::Duration::seconds(budget_secs))
+            .with_execution_timeout(jiff::SignedDuration::from_secs(budget_secs))
             .replay_from_snapshot(make_snapshot(
                 "deadline_branch_probe_workflow",
                 ExecutionId::new(),
@@ -3213,7 +3213,7 @@ async fn deadline_triggered_can_replays_deterministically_1000x() {
 async fn should_continue_as_new_tolerates_pre_772_history_without_nd_block() {
     let events = pre_772_timer_history(1_700_000_000_000);
     let report = build_replayer()
-        .with_execution_timeout(chrono::Duration::seconds(30))
+        .with_execution_timeout(jiff::SignedDuration::from_secs(30))
         .replay_from_snapshot(make_snapshot(
             "should_can_then_timer_workflow",
             ExecutionId::new(),
@@ -3240,7 +3240,7 @@ async fn should_continue_as_new_tolerates_pre_772_history_without_nd_block() {
 async fn deadline_probe_does_not_consume_a_user_system_now() {
     let events = pre_772_user_now_timer_history(1_700_000_000_000);
     let report = build_replayer()
-        .with_execution_timeout(chrono::Duration::seconds(30))
+        .with_execution_timeout(jiff::SignedDuration::from_secs(30))
         .replay_from_snapshot(make_snapshot(
             "should_can_then_user_now_then_timer_workflow",
             ExecutionId::new(),
@@ -3281,7 +3281,7 @@ fn wf_started() -> WorkflowEvent {
 fn wf_started_with_input(input: Value) -> WorkflowEvent {
     WorkflowEvent::WorkflowStarted {
         input,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -4062,7 +4062,7 @@ fn pre_patch_history() -> Vec<WorkflowEvent> {
     vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -4086,7 +4086,7 @@ fn post_patch_history() -> Vec<WorkflowEvent> {
     vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -4177,7 +4177,7 @@ async fn replay_version_recorded_history_against_patched_handler_succeeds() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -4275,7 +4275,7 @@ fn phase2_marker_less_history() -> Vec<WorkflowEvent> {
     vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -4335,7 +4335,7 @@ async fn replay_trailing_stale_patch_marker_classifies_as_early_completion() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -4538,7 +4538,7 @@ async fn replay_activity_history_for_timer_workflow_detects_timer_mismatch() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -4624,7 +4624,7 @@ async fn replay_activity_with_changed_input_detects_non_determinism() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -4767,7 +4767,7 @@ async fn replay_new_command_beyond_history_detects_non_determinism() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -4844,7 +4844,7 @@ fn two_gate_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -4898,7 +4898,7 @@ fn interleaved_gate_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -4972,7 +4972,7 @@ fn history_with_old_gate() -> (ExecutionId, Vec<WorkflowEvent>) {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -5024,7 +5024,7 @@ async fn replay_history_with_workflow_completed_tail_succeeds() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -5108,7 +5108,7 @@ fn child_spawning_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -5243,7 +5243,7 @@ fn child_fan_out_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -5380,7 +5380,7 @@ async fn replayer_replays_a_payload_cap_fan_out_failure_cleanly() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -5429,7 +5429,7 @@ async fn early_config_dependent_failure_replays_cleanly() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -5506,7 +5506,7 @@ fn dispatch_children_then_fail<'a>(
 fn abandoned_children_history(n: usize) -> Vec<WorkflowEvent> {
     let mut events = vec![WorkflowEvent::WorkflowStarted {
         input: serde_json::json!({ "children": n }),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -5645,7 +5645,7 @@ async fn failure_after_a_marker_replays_cleanly() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -5691,7 +5691,7 @@ async fn failure_after_a_side_effect_replays_cleanly() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -5731,7 +5731,7 @@ async fn a_pre_fix_history_with_dropped_dispatches_replays_without_reinterpretat
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({ "children": 3 }),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -5793,7 +5793,7 @@ async fn a_new_patch_gate_on_a_sealed_failed_history_replays_cleanly() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -5827,7 +5827,7 @@ async fn a_redriven_history_re_dispatches_the_work_its_failing_cycle_abandoned()
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({ "children": 1 }),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -5846,7 +5846,7 @@ async fn a_redriven_history_re_dispatches_the_work_its_failing_cycle_abandoned()
         },
         WorkflowEvent::workflow_failed("budget exceeded"),
         WorkflowEvent::WorkflowRedriven {
-            redriven_at: Utc::now(),
+            redriven_at: Timestamp::now(),
             dead_letter_id: uuid::Uuid::new_v4(),
             reason: Some("config fixed".to_string()),
         },
@@ -5885,7 +5885,7 @@ async fn a_redriven_history_re_dispatches_past_a_trailing_marker() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({ "children": 1 }),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -5908,7 +5908,7 @@ async fn a_redriven_history_re_dispatches_past_a_trailing_marker() {
         },
         WorkflowEvent::workflow_failed("budget exceeded"),
         WorkflowEvent::WorkflowRedriven {
-            redriven_at: Utc::now(),
+            redriven_at: Timestamp::now(),
             dead_letter_id: uuid::Uuid::new_v4(),
             reason: Some("config fixed".to_string()),
         },
@@ -5964,7 +5964,7 @@ async fn a_redriven_run_re_derives_a_version_gate_past_the_swallowed_marker() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -5987,7 +5987,7 @@ async fn a_redriven_run_re_derives_a_version_gate_past_the_swallowed_marker() {
         },
         WorkflowEvent::workflow_failed("budget exceeded"),
         WorkflowEvent::WorkflowRedriven {
-            redriven_at: Utc::now(),
+            redriven_at: Timestamp::now(),
             dead_letter_id: uuid::Uuid::new_v4(),
             reason: Some("config fixed".to_string()),
         },
@@ -6018,7 +6018,7 @@ async fn drift_before_the_failure_point_still_reports_non_determinism() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -6056,7 +6056,7 @@ async fn completed_history_with_extra_command_still_reports_non_determinism() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -6094,7 +6094,7 @@ fn external_signal_delivered_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -6122,7 +6122,7 @@ fn external_signal_failed_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -6345,7 +6345,7 @@ fn external_signal_by_id_delivered_history() -> (ExecutionId, Vec<WorkflowEvent>
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -6461,7 +6461,7 @@ fn external_cancel_by_id_delivered_history() -> (ExecutionId, Vec<WorkflowEvent>
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -6576,7 +6576,7 @@ fn detached_spawn_history(
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -6599,7 +6599,7 @@ fn detached_spawn_then_activity_history() -> (ExecutionId, ExecutionId, Vec<Work
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -6822,7 +6822,7 @@ fn awaited_child_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -6897,7 +6897,7 @@ fn now_then_activity_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -6957,7 +6957,7 @@ async fn replay_detects_side_effect_drift() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -7029,7 +7029,7 @@ fn signal_branch_fixture() -> Vec<WorkflowEvent> {
     vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -7053,7 +7053,7 @@ fn timeout_branch_fixture() -> Vec<WorkflowEvent> {
     vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -7130,7 +7130,7 @@ async fn signal_timeout_timeout_branch_with_ignored_late_signal_replays_succeede
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -7167,7 +7167,7 @@ fn signal_in_flight_fixture() -> Vec<WorkflowEvent> {
     vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -7219,7 +7219,7 @@ fn signal_in_flight_woken_by_update_fixture() -> Vec<WorkflowEvent> {
     vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -7232,7 +7232,7 @@ fn signal_in_flight_woken_by_update_fixture() -> Vec<WorkflowEvent> {
             update_id,
             name: "poke".to_string(),
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
         },
         WorkflowEvent::UpdateCompleted {
             update_id,
@@ -7289,7 +7289,7 @@ async fn signal_timeout_genuine_divergence_still_detected_in_canary() {
     let divergent = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -7356,7 +7356,7 @@ fn signal_in_flight_with_bookkeeping_sibling_fixture() -> Vec<WorkflowEvent> {
     vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -7416,7 +7416,7 @@ async fn signal_timeout_in_flight_genuine_leftover_event_still_detected_in_canar
     let orphan = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -7477,7 +7477,7 @@ fn child_or_deadline_workflow<'a>(
 fn child_timeout_started() -> WorkflowEvent {
     WorkflowEvent::WorkflowStarted {
         input: Value::Null,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -7718,7 +7718,7 @@ fn child_in_flight_woken_by_update_fixture() -> Vec<WorkflowEvent> {
             update_id,
             name: "poke".to_string(),
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
         },
         WorkflowEvent::UpdateCompleted {
             update_id,
@@ -8212,7 +8212,7 @@ async fn replayer_replays_signal_handler_workflow_successfully() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -8253,7 +8253,7 @@ async fn replayer_replays_signal_handler_workflow_with_reordered_signals() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -8293,7 +8293,7 @@ async fn replayer_replays_signal_handler_workflow_with_only_one_signal() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -8361,7 +8361,7 @@ fn saga_marker_history() -> Vec<WorkflowEvent> {
     vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -8530,7 +8530,7 @@ async fn replayer_succeeds_for_failed_unwind_history_with_trailing_signal() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -8620,7 +8620,7 @@ async fn replayer_succeeds_for_cancel_and_compensate_history_with_marker() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -8671,7 +8671,7 @@ async fn replayer_pre_marker_cancelled_history_stays_uncounted() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -8794,7 +8794,7 @@ async fn replay_of_terminal_history_never_emits_signal_unhandled() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -8875,7 +8875,7 @@ fn business_counter_history() -> Vec<WorkflowEvent> {
     vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -9014,7 +9014,7 @@ fn parent_taken_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -9103,7 +9103,7 @@ async fn parent_aware_child_replays_clean_through_export_document_round_trip() {
         shard_id: 0,
         state: "COMPLETED".to_string(),
         events,
-        exported_at: Utc::now(),
+        exported_at: Timestamp::now(),
         payload_policy: HistoryPayloadPolicy::Full,
         max_bytes: Some(64 * 1024),
         context_headers: None,
@@ -9150,7 +9150,7 @@ async fn parent_aware_child_diverges_through_export_document_without_parent() {
         shard_id: 0,
         state: "COMPLETED".to_string(),
         events,
-        exported_at: Utc::now(),
+        exported_at: Timestamp::now(),
         payload_policy: HistoryPayloadPolicy::Full,
         max_bytes: Some(64 * 1024),
         context_headers: None,
@@ -9235,7 +9235,7 @@ fn identity_taken_history(wf_type: &str, wf_id: &str) -> (ExecutionId, Vec<Workf
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -9285,7 +9285,7 @@ async fn workflow_type_and_id_replay_clean_through_export_document_round_trip() 
         shard_id: 0,
         state: "COMPLETED".to_string(),
         events,
-        exported_at: Utc::now(),
+        exported_at: Timestamp::now(),
         payload_policy: HistoryPayloadPolicy::Full,
         max_bytes: Some(64 * 1024),
         context_headers: None,
@@ -9335,7 +9335,7 @@ async fn workflow_id_diverges_through_export_document_when_id_is_dropped() {
         shard_id: 0,
         state: "COMPLETED".to_string(),
         events,
-        exported_at: Utc::now(),
+        exported_at: Timestamp::now(),
         payload_policy: HistoryPayloadPolicy::Full,
         max_bytes: Some(64 * 1024),
         context_headers: None,
@@ -9446,7 +9446,7 @@ fn exec_id_taken_history(exec_id: ExecutionId) -> Vec<WorkflowEvent> {
     vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -9597,7 +9597,7 @@ fn interleaved_two_timers_workflow<'a>(
 fn interleaved_started() -> WorkflowEvent {
     WorkflowEvent::WorkflowStarted {
         input: Value::Null,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -10194,7 +10194,7 @@ fn history_policy_checkpoint_fixture() -> Vec<WorkflowEvent> {
     vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -10321,7 +10321,7 @@ fn windowed_fan_out_history(completion_order: &[usize]) -> (ExecutionId, Vec<Wor
     let mut events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -10507,7 +10507,7 @@ fn windowed_shaped_fan_out_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     let mut events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -10612,7 +10612,7 @@ async fn replayer_windowed_fail_fast_history_reproduces_failure_deterministicall
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -10737,7 +10737,7 @@ fn cross_type_can_history_targeting(target: &str) -> Vec<WorkflowEvent> {
     vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -10975,7 +10975,7 @@ async fn pre_803_same_type_history_json_still_replays() -> Result<(), serde_json
 fn mixed_started() -> WorkflowEvent {
     WorkflowEvent::WorkflowStarted {
         input: Value::Null,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,

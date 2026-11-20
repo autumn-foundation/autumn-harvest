@@ -35,7 +35,6 @@ use std::sync::{Arc, Mutex};
 use agent_mesh::desk::Desk;
 use agent_mesh::mesh::{self, DeskDelivery, MeshConfig};
 use agent_mesh::scripted::{ScriptedDesk, TOKENS_PER_CALL, last_user};
-use autumn_harvest::chrono::{DateTime, Duration, Utc};
 use autumn_harvest::dst::{SeedPlan, SeedVars, SplitMix64};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest_agent::approval::SIGNAL_TOOL_APPROVAL;
@@ -44,6 +43,7 @@ use autumn_harvest_agent::{
     ChatRole, ContentPart, PeerEnvelope, sqlite,
 };
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
+use jiff::{SignedDuration, Timestamp};
 
 const VARS: SeedVars = SeedVars {
     seed: "AGENT_MESH_SEED",
@@ -244,7 +244,7 @@ async fn run_seed(seed: u64) -> Seen {
         awaiting_approval: false,
     };
     let mut reached = Seen::default();
-    let mut clock: DateTime<Utc> = "2026-10-23T08:00:00Z".parse().unwrap();
+    let mut clock: Timestamp = "2026-10-23T08:00:00Z".parse().unwrap();
     let mut asked: BTreeSet<String> = BTreeSet::new();
     let mut approved = 0_usize;
     world.in_exchange = mesh::start(world.rt(), clock).await.unwrap().in_exchange;
@@ -263,9 +263,10 @@ async fn run_seed(seed: u64) -> Seen {
                 // comes more often while a reply waits.
                 let long = rng.chance(if world.awaiting_approval { 75 } else { 5 });
                 clock += if long {
-                    Duration::from_std(world.config.approval_timeout).unwrap() + Duration::hours(1)
+                    SignedDuration::try_from(world.config.approval_timeout).unwrap()
+                        + SignedDuration::from_hours(1)
                 } else {
-                    Duration::minutes(i64::try_from(1 + rng.below(40)).unwrap())
+                    SignedDuration::from_mins(i64::try_from(1 + rng.below(40)).unwrap())
                 };
                 let before = ticks(world.rt()).await;
                 let order = shuffled(&mut rng);
@@ -340,7 +341,7 @@ async fn run_seed(seed: u64) -> Seen {
         if !has_work(world.rt()).await {
             break;
         }
-        clock += Duration::days(1);
+        clock += autumn_harvest::time::days(1);
     }
     let rt = world.rt();
     assert!(
@@ -401,10 +402,10 @@ async fn run_seed(seed: u64) -> Seen {
     // Invariant 3: the check runs before each turn, so a day passes the cap
     // by one turn at most. Each row carries the drive clock of its turn.
     // Every run of the file is an agent of the desk mesh.
-    let mut day: DateTime<Utc> = "2026-10-23T00:00:00Z".parse().unwrap();
+    let mut day: Timestamp = "2026-10-23T00:00:00Z".parse().unwrap();
     while day <= clock {
         let tokens: u64 = rt
-            .llm_ledger_between(day, day + Duration::days(1))
+            .llm_ledger_between(day, day + autumn_harvest::time::days(1))
             .unwrap()
             .iter()
             .map(|row| row.input_tokens + row.output_tokens)
@@ -413,7 +414,7 @@ async fn run_seed(seed: u64) -> Seen {
             tokens <= cap + u64::from(TOKENS_PER_CALL),
             "seed {seed}: {tokens} tokens on {day}, cap {cap}"
         );
-        day += Duration::days(1);
+        day += autumn_harvest::time::days(1);
     }
     // Invariant 4: no tick filed a reply. Each run of the tool follows an
     // approval.

@@ -42,9 +42,9 @@ use autumn_harvest::telemetry::{
 use autumn_harvest::types::{ActivityExecId, ExecutionId, ParentClosePolicy, ShardId, UpdateId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{ActivityContext, RetryPolicy, WorkflowContext, WorkflowHistoryPolicy};
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
+use jiff::Timestamp;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -1033,7 +1033,7 @@ async fn workflow_and_activity_metrics_are_recorded() {
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1046,7 +1046,7 @@ async fn workflow_and_activity_metrics_are_recorded() {
     let mut enqueue_params =
         EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
-    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    enqueue_params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
     queue_mod::enqueue(&mut conn, &enqueue_params)
         .await
         .expect("enqueue failed");
@@ -1277,7 +1277,7 @@ async fn continue_as_new_records_history_size_and_rotation_metrics() {
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1290,7 +1290,7 @@ async fn continue_as_new_records_history_size_and_rotation_metrics() {
     let mut enqueue_params =
         EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
-    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    enqueue_params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
     queue_mod::enqueue(&mut conn, &enqueue_params)
         .await
         .expect("enqueue failed");
@@ -1430,7 +1430,7 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
         &[
             WorkflowEvent::WorkflowStarted {
                 input: workflow_input.clone(),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -1451,7 +1451,7 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
     let mut enqueue_params =
         EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
-    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    enqueue_params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
     queue_mod::enqueue(&mut conn, &enqueue_params)
         .await
         .expect("enqueue failed");
@@ -1598,7 +1598,7 @@ async fn workflow_hard_cap_dlq_preserves_terminal_attempt_count() {
         &[
             WorkflowEvent::WorkflowStarted {
                 input: workflow_input.clone(),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -1619,7 +1619,7 @@ async fn workflow_hard_cap_dlq_preserves_terminal_attempt_count() {
     let mut enqueue_params =
         EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
-    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    enqueue_params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
     let task_id = queue_mod::enqueue(&mut conn, &enqueue_params)
         .await
         .expect("enqueue failed");
@@ -1764,7 +1764,7 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
             &[
                 WorkflowEvent::WorkflowStarted {
                     input: workflow_input.clone(),
-                    timestamp: Utc::now(),
+                    timestamp: Timestamp::now(),
                     last_completion_result: None,
                     last_error: None,
                     scheduled_time: None,
@@ -1782,7 +1782,7 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
         let mut enqueue_params =
             EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
         enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
-        enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+        enqueue_params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
         queue_mod::enqueue(&mut conn, &enqueue_params)
             .await
             .expect("enqueue failed");
@@ -2034,7 +2034,7 @@ async fn history_bloat_counter_fires_once_when_a_still_suspended_execution_cross
         &[
             WorkflowEvent::WorkflowStarted {
                 input: workflow_input.clone(),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -2056,7 +2056,7 @@ async fn history_bloat_counter_fires_once_when_a_still_suspended_execution_cross
     let mut enqueue_params =
         EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
-    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    enqueue_params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
     queue_mod::enqueue(&mut conn, &enqueue_params)
         .await
         .expect("enqueue failed");
@@ -2265,7 +2265,7 @@ async fn history_bloat_soft_threshold_not_crossed_by_a_contended_mutex_acquires_
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -2282,7 +2282,7 @@ async fn history_bloat_soft_threshold_not_crossed_by_a_contended_mutex_acquires_
             lock_key: mutex_key.clone(),
             holder_exec_id: Uuid::new_v4(),
             lock_seq: 1,
-            lease_expires_at: Utc::now() + chrono::Duration::minutes(5),
+            lease_expires_at: Timestamp::now() + jiff::SignedDuration::from_mins(5),
         })
         .execute(&mut conn)
         .await
@@ -2291,7 +2291,7 @@ async fn history_bloat_soft_threshold_not_crossed_by_a_contended_mutex_acquires_
     let mut enqueue_params =
         EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
-    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    enqueue_params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
     queue_mod::enqueue(&mut conn, &enqueue_params)
         .await
         .expect("enqueue failed");
@@ -2496,7 +2496,7 @@ async fn history_bloat_counter_fires_even_when_the_same_decision_reaches_the_har
         &[
             WorkflowEvent::WorkflowStarted {
                 input: workflow_input.clone(),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -2518,7 +2518,7 @@ async fn history_bloat_counter_fires_even_when_the_same_decision_reaches_the_har
     let mut enqueue_params =
         EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
-    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    enqueue_params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
     queue_mod::enqueue(&mut conn, &enqueue_params)
         .await
         .expect("enqueue failed");
@@ -2738,7 +2738,7 @@ async fn history_bloat_counter_does_not_fire_off_a_prospective_pending_command_c
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -2751,7 +2751,7 @@ async fn history_bloat_counter_does_not_fire_off_a_prospective_pending_command_c
     let mut enqueue_params =
         EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
-    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    enqueue_params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
     queue_mod::enqueue(&mut conn, &enqueue_params)
         .await
         .expect("enqueue failed");
@@ -2947,7 +2947,7 @@ async fn history_bloat_counter_fires_exactly_once_across_two_real_live_suspensio
         &[
             WorkflowEvent::WorkflowStarted {
                 input: workflow_input.clone(),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -2969,7 +2969,7 @@ async fn history_bloat_counter_fires_exactly_once_across_two_real_live_suspensio
     let mut enqueue_params =
         EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
-    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    enqueue_params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
     queue_mod::enqueue(&mut conn, &enqueue_params)
         .await
         .expect("enqueue failed");
@@ -3161,7 +3161,7 @@ async fn history_bloat_counter_never_fires_when_the_soft_threshold_is_disabled()
         &[
             WorkflowEvent::WorkflowStarted {
                 input: workflow_input.clone(),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -3183,7 +3183,7 @@ async fn history_bloat_counter_never_fires_when_the_soft_threshold_is_disabled()
     let mut enqueue_params =
         EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
-    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    enqueue_params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
     queue_mod::enqueue(&mut conn, &enqueue_params)
         .await
         .expect("enqueue failed");
@@ -3347,7 +3347,7 @@ async fn local_activity_retries_stop_when_hard_cap_is_reached() {
         &[
             WorkflowEvent::WorkflowStarted {
                 input: workflow_input.clone(),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -3365,7 +3365,7 @@ async fn local_activity_retries_stop_when_hard_cap_is_reached() {
     let mut enqueue_params =
         EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
-    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    enqueue_params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
     queue_mod::enqueue(&mut conn, &enqueue_params)
         .await
         .expect("enqueue failed");
@@ -3548,7 +3548,7 @@ async fn detached_parent_close_cascade_counts_against_history_cap() {
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -3561,7 +3561,7 @@ async fn detached_parent_close_cascade_counts_against_history_cap() {
     let mut enqueue_params =
         EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
-    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    enqueue_params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
     queue_mod::enqueue(&mut conn, &enqueue_params)
         .await
         .expect("enqueue failed");
@@ -3761,7 +3761,7 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
         parent_exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -3774,7 +3774,7 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
     let mut enqueue_params =
         EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     enqueue_params.workflow_exec_id = Some(parent_exec_id.as_uuid());
-    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    enqueue_params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
     queue_mod::enqueue(&mut conn, &enqueue_params)
         .await
         .expect("enqueue parent failed");
@@ -4036,6 +4036,125 @@ async fn dlq_depth_sampler_emits_dlq_entries_metric() {
     assert!(depth >= 1, "dlq.entries depth must be >= 1, got {depth}");
 }
 
+/// The `depth` values of the `harvest.dlq.entries` emissions of shard 0, in
+/// emission order.
+fn dlq_depths(emissions: &[MetricEmission]) -> Vec<u64> {
+    emissions
+        .iter()
+        .filter(|e| e.name == METRIC_DLQ_ENTRIES && e.labels_debug.contains("shard=0"))
+        .filter_map(|e| {
+            e.labels_debug
+                .split(',')
+                .find_map(|kv| kv.strip_prefix("depth="))
+                .and_then(|v| v.parse().ok())
+        })
+        .collect()
+}
+
+/// The `harvest_dlq_growth` rule over one window: `max_over_time` minus
+/// `min_over_time` is more than 5.
+fn dlq_growth_fires(depths: &[u64]) -> bool {
+    let (Some(max), Some(min)) = (depths.iter().max(), depths.iter().min()) else {
+        return false;
+    };
+    max - min > 5
+}
+
+#[test]
+fn the_growth_rule_needs_more_than_five() {
+    assert!(!dlq_growth_fires(&[]));
+    assert!(!dlq_growth_fires(&[10, 15, 12]));
+    assert!(dlq_growth_fires(&[10, 16]));
+}
+
+/// The real sampler reads the DLQ counter. Six new dead letters must fire
+/// the `harvest_dlq_growth` rule, which reads a growth of more than 5.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dlq_gauge_growth_of_six_fires_the_growth_alert() {
+    let (admin_url, _container) = setup_db_env_or_container().await;
+    // Its own database, so no other test adds or removes a dead letter.
+    let db = crate::throwaway_db::ThrowawayDb::create_on(&admin_url, "dlq_growth_alert").await;
+    let database_url = db.url();
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("failed to connect");
+
+    let recording = Arc::new(RecordingMetrics::default());
+    let telemetry = Arc::new(
+        TelemetryConfig::builder()
+            .metrics(Arc::clone(&recording) as Arc<dyn MetricsRecorder>)
+            .build(),
+    );
+    let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
+        vec![],
+        vec![],
+        autumn_harvest::context::empty_shared_state(),
+        telemetry,
+    ));
+    let worker = build_worker("metrics-worker-dlq-growth", registry);
+    let pool = build_test_pool(&database_url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    let wait_for_depth = async |depth: u64| {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let seen = {
+                    let emissions = recording.emissions.lock().unwrap();
+                    dlq_depths(&emissions).contains(&depth)
+                };
+                if seen {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        })
+        .await
+    };
+
+    let empty = wait_for_depth(0).await;
+    for n in 0..6 {
+        dlq::dead_letter(
+            &mut conn,
+            &NewDeadLetterEntry {
+                original_task_id: Uuid::new_v4(),
+                queue_name: "default".to_string(),
+                task_type: "ACTIVITY".to_string(),
+                workflow_exec_id: None,
+                activity_name: Some(format!("burst_{n}")),
+                input: serde_json::json!({}),
+                error: "intentional test failure".to_string(),
+                attempts: 3,
+                owner: None,
+                severity: None,
+            },
+        )
+        .await
+        .expect("failed to insert dead-letter entry");
+    }
+    let grown = wait_for_depth(6).await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join cleanly");
+    drop(pool);
+    drop(conn);
+
+    empty.expect("the sampler must emit depth 0 before the burst");
+    grown.expect("the sampler must emit depth 6 after the burst");
+    let depths = dlq_depths(&recording.drain());
+    assert!(
+        depths.iter().all(|d| *d <= 6),
+        "the gauge must never read more than the 6 dead letters: {depths:?}"
+    );
+    assert!(
+        dlq_growth_fires(&depths),
+        "a burst of 6 must fire harvest_dlq_growth: {depths:?}"
+    );
+}
+
 fn non_deterministic_test_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: serde_json::Value,
@@ -4112,7 +4231,7 @@ async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
         &[
             WorkflowEvent::WorkflowStarted {
                 input: workflow_input.clone(),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -4132,7 +4251,7 @@ async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
     let mut enqueue_params =
         EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
-    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    enqueue_params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
     queue_mod::enqueue(&mut conn, &enqueue_params)
         .await
         .expect("enqueue failed");
@@ -4359,7 +4478,7 @@ async fn schedule_to_start_histogram_emitted_at_dispatch() {
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -4376,7 +4495,7 @@ async fn schedule_to_start_histogram_emitted_at_dispatch() {
     let mut enqueue_params =
         EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
-    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(13);
+    enqueue_params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(13);
     queue_mod::enqueue(&mut conn, &enqueue_params)
         .await
         .expect("enqueue failed");
@@ -4532,7 +4651,7 @@ async fn oldest_pending_age_query_positive_then_zero_after_drain() {
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -4548,7 +4667,7 @@ async fn oldest_pending_age_query_positive_then_zero_after_drain() {
     let mut enqueue_params =
         EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
-    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(13);
+    enqueue_params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(13);
     queue_mod::enqueue(&mut conn, &enqueue_params)
         .await
         .expect("enqueue failed");
@@ -4657,7 +4776,7 @@ async fn oldest_pending_age_excludes_paused_executions() {
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -4671,7 +4790,7 @@ async fn oldest_pending_age_excludes_paused_executions() {
     let mut enqueue_params =
         EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
-    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(13);
+    enqueue_params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(13);
     queue_mod::enqueue(&mut conn, &enqueue_params)
         .await
         .expect("enqueue failed");
@@ -4771,7 +4890,7 @@ async fn oldest_pending_age_excludes_rate_limited_tasks() {
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -4800,7 +4919,7 @@ async fn oldest_pending_age_excludes_rate_limited_tasks() {
     enqueue_params.activity_name = Some("rl_activity".to_string());
     enqueue_params.activity_id = Some(Uuid::new_v4());
     enqueue_params.rate_limit_key = Some(rate_limit_key.clone());
-    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(13);
+    enqueue_params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(13);
     queue_mod::enqueue(&mut conn, &enqueue_params)
         .await
         .expect("enqueue failed");
@@ -4919,7 +5038,7 @@ async fn oldest_pending_age_excludes_saturated_concurrency_cap() {
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -4938,7 +5057,7 @@ async fn oldest_pending_age_excludes_saturated_concurrency_cap() {
     enqueue_params.activity_id = Some(Uuid::new_v4());
     enqueue_params.concurrency_key = Some(concurrency_key.clone());
     enqueue_params.max_concurrent = Some(1);
-    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(13);
+    enqueue_params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(13);
     queue_mod::enqueue(&mut conn, &enqueue_params)
         .await
         .expect("enqueue failed");
@@ -5054,7 +5173,7 @@ async fn workflow_completed_with_unfinished_updates_emits_metric() {
         &[
             WorkflowEvent::WorkflowStarted {
                 input: workflow_input.clone(),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -5063,13 +5182,13 @@ async fn workflow_completed_with_unfinished_updates_emits_metric() {
                 update_id: first_update,
                 name: "unfinished_probe".to_string(),
                 input: serde_json::json!({}),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
             },
             WorkflowEvent::UpdateAdmitted {
                 update_id: second_update,
                 name: "unfinished_probe".to_string(),
                 input: serde_json::json!({}),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
             },
         ],
         0,
@@ -5080,7 +5199,7 @@ async fn workflow_completed_with_unfinished_updates_emits_metric() {
     let mut enqueue_params =
         EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
-    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    enqueue_params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
     queue_mod::enqueue(&mut conn, &enqueue_params)
         .await
         .expect("enqueue failed");
@@ -5245,7 +5364,7 @@ async fn update_completed_metric_fires_on_the_suspend_path() {
         &[
             WorkflowEvent::WorkflowStarted {
                 input: workflow_input.clone(),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -5254,7 +5373,7 @@ async fn update_completed_metric_fires_on_the_suspend_path() {
                 update_id: UpdateId::from_uuid(FIX1_UPDATE_UUID),
                 name: "set_val".to_string(),
                 input: serde_json::json!({"v": 7}),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
             },
         ],
         0,
@@ -5265,7 +5384,7 @@ async fn update_completed_metric_fires_on_the_suspend_path() {
     let mut enqueue_params =
         EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
-    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    enqueue_params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
     queue_mod::enqueue(&mut conn, &enqueue_params)
         .await
         .expect("enqueue workflow task");

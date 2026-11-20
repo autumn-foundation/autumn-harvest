@@ -13,7 +13,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use autumn_harvest::chrono::{DateTime, Utc};
 use autumn_harvest_agent::{
     AgentError, AgentHarness, AgentHeartbeat, AgentId, AgentModel, AgentOp, AgentProfile,
     AgentState, BoxFuture, ChatRequest, ChatResponse, ChatRole, ContentPart, Control, StopReason,
@@ -21,6 +20,7 @@ use autumn_harvest_agent::{
 };
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
 use common::runtime;
+use jiff::{SignedDuration, Timestamp};
 
 fn fresh_db() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("a temporary directory");
@@ -34,7 +34,7 @@ fn state(rt: &SqliteRuntime, agent: &AgentId) -> impl Future<Output = AgentState
 }
 
 /// Drive the agent at the drive clock `at`, through each checkpoint.
-async fn drive_at(rt: &mut SqliteRuntime, agent: &AgentId, at: DateTime<Utc>) -> RunState {
+async fn drive_at(rt: &mut SqliteRuntime, agent: &AgentId, at: Timestamp) -> RunState {
     let mut exec = sqlite::current_run(rt, agent).unwrap().unwrap();
     loop {
         match rt.run_until_blocked_as_of(exec, at).await.unwrap() {
@@ -137,7 +137,7 @@ async fn an_idle_agent_wakes_on_its_timer_in_a_fresh_runtime() {
             AgentProfile::new("watch").heartbeat(AgentHeartbeat::every(Duration::from_secs(60))),
         )
     };
-    let start = Utc::now();
+    let start = Timestamp::now();
     let first = FixedModel::new("HEARTBEAT_OK");
     let booked = {
         let mut rt = runtime(&db, harness(first.clone()));
@@ -147,11 +147,11 @@ async fn an_idle_agent_wakes_on_its_timer_in_a_fresh_runtime() {
         assert_eq!(idle.ticks, 0);
         idle.next_heartbeat_ms.expect("a tick is booked")
     };
-    assert!(booked > start.timestamp_millis());
+    assert!(booked > start.as_millisecond());
 
     let second = FixedModel::new("HEARTBEAT_OK");
     let mut rt = runtime(&db, harness(second.clone()));
-    drive_at(&mut rt, &agent, start + chrono::Duration::seconds(90)).await;
+    drive_at(&mut rt, &agent, start + SignedDuration::from_secs(90)).await;
     let woke = state(&rt, &agent).await;
     assert_eq!(woke.ticks, 1, "the booked tick ran in the fresh runtime");
     assert_eq!((first.calls(), second.calls()), (0, 1));

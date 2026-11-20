@@ -27,7 +27,7 @@ use autumn_harvest::TimerId;
 use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest_sqlite::{ActivitySpec, RunState, SqliteRuntime};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::json;
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -52,13 +52,13 @@ async fn equal_deadline_timers_fire_in_arm_order_and_replay_on_core() {
     rt.register_workflow(&two_timers_info());
     let exec = rt.start_workflow("two_timers", json!(0)).unwrap();
 
-    let t0: DateTime<Utc> = DateTime::from_timestamp(4_000_000, 0).unwrap();
+    let t0: Timestamp = Timestamp::from_second(4_000_000).unwrap();
     // First pass arms both timers (deadline t0+1) and blocks.
     let state = rt.run_until_blocked_as_of(exec, t0).await.unwrap();
     assert!(matches!(state, RunState::WaitingTimer), "got {state:?}");
     // Second pass fires both past their deadline and completes.
     let state = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(5))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(5))
         .await
         .unwrap();
     assert!(matches!(state, RunState::Completed(_)), "got {state:?}");
@@ -117,7 +117,7 @@ async fn equal_deadline_timers_fire_in_arm_order_and_replay_on_core() {
 #[tokio::test]
 async fn reversed_timer_fire_order_replays_on_core_after_1071() {
     let reversed = vec![
-        WorkflowEvent::workflow_started(json!(0), Utc::now()),
+        WorkflowEvent::workflow_started(json!(0), Timestamp::now()),
         WorkflowEvent::TimerStarted {
             timer_id: TimerId::new("a"),
             duration_secs: 1,

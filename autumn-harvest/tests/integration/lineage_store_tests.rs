@@ -23,9 +23,10 @@
 use autumn_harvest::models::NewWorkflowExecution;
 use autumn_harvest::store::{AwaitMode, load_parents_with_children, load_workflow_children_batch};
 use autumn_harvest::types::{ExecutionId, ShardId};
-use chrono::{Duration, Utc};
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::{SignedDuration, Timestamp};
+use jiff_diesel::ToDiesel;
 use serde_json::json;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -109,17 +110,17 @@ async fn insert(conn: &mut AsyncPgConnection, spec: InsertSpec<'_>) -> Execution
         .await
         .expect("insert execution");
 
-    let started_at = Utc::now() + Duration::seconds(spec.started_at_offset_secs);
+    let started_at = Timestamp::now() + SignedDuration::from_secs(spec.started_at_offset_secs);
     let completed_at = if spec.state == "RUNNING" {
         None
     } else {
-        Some(started_at + Duration::seconds(1))
+        Some(started_at + SignedDuration::from_secs(1))
     };
     diesel::update(t::table.find(exec_id.as_uuid()))
         .set((
             t::state.eq(spec.state),
-            t::started_at.eq(started_at),
-            t::completed_at.eq(completed_at),
+            t::started_at.eq(started_at.to_diesel()),
+            t::completed_at.eq(completed_at.to_diesel()),
         ))
         .execute(conn)
         .await

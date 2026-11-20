@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::Value;
 
 use super::{
@@ -82,7 +82,7 @@ pub(crate) type SeededMockFn =
 /// both runs of a seed.
 pub struct MockContext {
     rng: SplitMix64,
-    now: DateTime<Utc>,
+    now: Timestamp,
     call: u32,
     attempt: u32,
 }
@@ -95,7 +95,7 @@ impl MockContext {
 
     /// The virtual time of the call. It is the start time plus the fired timers.
     #[must_use]
-    pub const fn now(&self) -> DateTime<Utc> {
+    pub const fn now(&self) -> Timestamp {
         self.now
     }
 
@@ -127,7 +127,7 @@ pub(crate) struct MockCall<'a> {
     pub(crate) name: &'a str,
     pub(crate) call: u32,
     attempt: u32,
-    now: DateTime<Utc>,
+    now: Timestamp,
     seed: u64,
 }
 
@@ -136,7 +136,7 @@ impl<'a> MockCall<'a> {
         name: &'a str,
         call: u32,
         attempt: u32,
-        now: DateTime<Utc>,
+        now: Timestamp,
         seed: u64,
     ) -> Self {
         Self {
@@ -632,7 +632,7 @@ impl SimOutcome {
 
     /// The virtual time that the run took.
     #[must_use]
-    pub fn elapsed(&self) -> chrono::Duration {
+    pub fn elapsed(&self) -> jiff::SignedDuration {
         self.outcome.elapsed()
     }
 
@@ -1318,11 +1318,13 @@ fn parks_without_deadline(commands: &[WorkflowCommand]) -> bool {
 ///
 /// A fixed start makes `ctx.now()` the same on every machine and day. It is
 /// Monday 2024-01-01 00:00 UTC.
-fn sim_start(env: &WorkflowTestEnv) -> DateTime<Utc> {
+fn sim_start(env: &WorkflowTestEnv) -> Timestamp {
     if env.anchor_frozen {
         return env.simulated_now;
     }
-    DateTime::from_timestamp(1_704_067_200, 0).unwrap_or(env.simulated_now)
+    Timestamp::from_second(1_704_067_200)
+        .ok()
+        .unwrap_or(env.simulated_now)
 }
 
 /// The state of one simulation run.
@@ -1330,7 +1332,7 @@ struct SimRun<'a, 'env> {
     sim: &'a Simulation<'env>,
     env: &'env WorkflowTestEnv,
     seed: u64,
-    start: DateTime<Utc>,
+    start: Timestamp,
     /// The delivery choices.
     rng: SplitMix64,
     /// The fault lane.
@@ -2210,7 +2212,7 @@ mod tests {
     fn started() -> WorkflowEvent {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -2352,7 +2354,7 @@ mod tests {
 
     #[test]
     fn a_seeded_mock_context_depends_on_seed_name_call_and_attempt() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let draw = |name, call, attempt, seed| {
             MockCall::new(name, call, attempt, now, seed)
                 .context()

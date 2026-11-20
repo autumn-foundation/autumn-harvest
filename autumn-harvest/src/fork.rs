@@ -22,6 +22,7 @@
 //! sends no completion callback and fires no completion trigger (issue #2378).
 
 use crate::schema::harvest_workflow_executions_ext;
+use jiff_diesel::ToDiesel;
 use std::collections::{HashMap, HashSet};
 
 use diesel::prelude::*;
@@ -2315,7 +2316,7 @@ pub(crate) async fn serve_recorded_activities(
             } else {
                 FORK_HOLD_ERROR
             })),
-            harvest_task_queue::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_task_queue::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(conn)
         .await
@@ -2375,7 +2376,7 @@ mod tests {
     fn started(input: Value) -> WorkflowEvent {
         WorkflowEvent::WorkflowStarted {
             input,
-            timestamp: chrono::Utc::now(),
+            timestamp: jiff::Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -3128,7 +3129,7 @@ mod tests {
             WorkflowEvent::MutexGranted {
                 key: "acct-1".to_string(),
                 lock_seq: 1,
-                acquired_at: chrono::Utc::now(),
+                acquired_at: jiff::Timestamp::now(),
             },
         ];
         let error = validate_fork(&events, 1, &WorkflowForkRequest::default()).unwrap_err();

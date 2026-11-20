@@ -82,10 +82,10 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::Utc;
 use diesel::sql_types;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use reqwest::Url;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
@@ -333,7 +333,7 @@ async fn seed_execution(conn: &mut AsyncPgConnection, history_activities: u64) -
 
     let mut events = vec![WorkflowEvent::WorkflowStarted {
         input: input.clone(),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,

@@ -46,11 +46,11 @@ use autumn_harvest::wasm_store::{
 };
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{WorkflowContext, store};
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel::sql_types::BigInt;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1023,14 +1023,17 @@ async fn seed_workflow(
     store::append_events(
         conn,
         exec_id,
-        &[WorkflowEvent::workflow_started(input.clone(), Utc::now())],
+        &[WorkflowEvent::workflow_started(
+            input.clone(),
+            Timestamp::now(),
+        )],
         0,
     )
     .await
     .expect("append WorkflowStarted");
     let mut params = EnqueueParams::new(queue, TaskType::Workflow, input);
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     queue::enqueue(conn, &params)
         .await
         .expect("enqueue workflow");

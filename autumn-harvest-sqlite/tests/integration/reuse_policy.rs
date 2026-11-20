@@ -146,7 +146,7 @@ fn seed_legacy_running_row(path: &std::path::Path, name: &str, id: &str) -> Exec
     )
     .unwrap();
     // A WorkflowStarted event so drive_one_cycle can replay/run the handler.
-    let started = WorkflowEvent::workflow_started(json!({}), chrono::Utc::now());
+    let started = WorkflowEvent::workflow_started(json!({}), jiff::Timestamp::now());
     raw.execute(
         "INSERT INTO harvest_events (exec_id, seq, event_json) VALUES (?1, 0, ?2)",
         rusqlite::params![exec.to_string(), serde_json::to_string(&started).unwrap()],

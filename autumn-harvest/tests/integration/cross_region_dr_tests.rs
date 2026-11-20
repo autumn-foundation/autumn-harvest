@@ -1305,7 +1305,7 @@ async fn a_fenced_worker_cannot_persist_events() {
 
     let event = autumn_harvest::event::WorkflowEvent::WorkflowStarted {
         input: serde_json::json!({}),
-        timestamp: chrono::Utc::now(),
+        timestamp: jiff::Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -1649,7 +1649,8 @@ async fn a_fenced_sweep_that_converts_nothing_still_fails_closed() {
         #[diesel(sql_type = diesel::sql_types::BigInt)]
         last_event_id: i64,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        updated_at: chrono::DateTime<chrono::Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        updated_at: jiff::Timestamp,
     }
     let rows: Vec<Row> = diesel::sql_query(
         "SELECT last_event_id, updated_at FROM harvest_codec_rotation_cursor \
@@ -1674,7 +1675,7 @@ async fn a_fenced_sweep_that_converts_nothing_still_fails_closed() {
         "a fenced worker must not advance a cursor it examined nothing under"
     );
     assert!(
-        rows[0].updated_at < chrono::Utc::now() - chrono::Duration::minutes(30),
+        rows[0].updated_at < jiff::Timestamp::now() - jiff::SignedDuration::from_mins(30),
         "a fenced worker must not win the revalidation claim and bump updated_at"
     );
     FenceRegistry::clear();
@@ -2120,7 +2121,7 @@ async fn a_batched_append_does_not_hold_the_fence_across_its_offload_upload() {
         exec_id,
         autumn_harvest::event::WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
-            timestamp: chrono::Utc::now(),
+            timestamp: jiff::Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -6764,7 +6765,7 @@ async fn promotion_body(regions: &Regions) -> Result<(), String> {
 
     let started = autumn_harvest::event::WorkflowEvent::WorkflowStarted {
         input: serde_json::json!({}),
-        timestamp: chrono::Utc::now(),
+        timestamp: jiff::Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,

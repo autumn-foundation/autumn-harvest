@@ -116,7 +116,7 @@ autumn-harvest-macros ──► autumn-harvest ──► autumn-web
         │                       │                │
         └── syn, quote,         └── diesel-async  └── axum 0.8
             proc-macro2             deadpool           tokio 1
-                                    chrono
+                                    jiff
                                     serde
                                     uuid
 ```
@@ -452,7 +452,7 @@ If the worker crashes and the workflow must resume on a different worker, the en
 ```rust
 pub enum WorkflowEvent {
     // Lifecycle
-    WorkflowStarted { input: serde_json::Value, timestamp: DateTime<Utc> },
+    WorkflowStarted { input: serde_json::Value, timestamp: Timestamp },
     WorkflowCompleted { output: serde_json::Value },
     WorkflowFailed { error: String },
     WorkflowCancelled { reason: String },
@@ -608,12 +608,12 @@ pub enum Schedule {
 
 pub trait Timetable: Send + Sync {
     /// Given the last run's data interval, compute the next one.
-    fn next_run(&self, last_interval: Option<DataInterval>, now: DateTime<Utc>) -> Option<DataInterval>;
+    fn next_run(&self, last_interval: Option<DataInterval>, now: Timestamp) -> Option<DataInterval>;
 }
 
 pub struct DataInterval {
-    pub start: DateTime<Utc>,
-    pub end: DateTime<Utc>,
+    pub start: Timestamp,
+    pub end: Timestamp,
 }
 ```
 
@@ -1010,7 +1010,7 @@ The terminal-task janitor deletes `harvest_task_queue` rows in `COMPLETED`, `FAI
 
 The management API exposes retention introspection and control via `GET /admin/retention` and `POST /admin/retention/run-now`.
 
-The janitor runs where the scheduler runs, unless `[harvest.retention] run_on = "all"` (issue #2478). Both routes read the janitor of the process that serves them. On a process with no janitor, `GET` adds `placed_elsewhere: true` and `run-now` returns 503.
+The janitor follows an explicit `scheduler_enabled`, else the `harvest.maintenance` capability of the role, unless `[harvest.retention] run_on = "all"` (issue #2478). Both routes read the janitor of the process that serves them. On a process with no janitor, `GET` adds `placed_elsewhere: true` and `run-now` returns 503.
 
 ---
 
@@ -1464,7 +1464,7 @@ An unset `worker_enabled` or `scheduler_enabled` follows the Autumn process role
 
 `harvest.worker.queues` narrows the queues that the worker of this process polls. Code declares the full set with `WorkerConfig::with_queues`. An undeclared name stops the boot. With no list, the `pin` of a named Autumn role narrows it, if the pin names a declared queue. `AUTUMN_HARVEST__WORKER__QUEUES` follows the Autumn form `AUTUMN_<section>__<key>`, not the form of neighbours such as `AUTUMN_HARVEST_RETENTION__RUN_ON`. See [`docs/operations/process-roles.md`](operations/process-roles.md#worker-queues).
 
-`harvest.retention.run_on` places the retention janitor. `scheduler` runs it where the resolved scheduler runs, so a `web` role runs none by default. `all` runs it on each process. The retention policy itself stays Rust-only. See [`docs/operations/process-roles.md`](operations/process-roles.md#background-runtimes).
+`harvest.retention.run_on` places the retention janitor. `scheduler` follows an explicit `scheduler_enabled`, else `harvest.maintenance`, so a `web` role runs none by default. A named role follows its Harvest capabilities. See [Harvest capabilities](operations/process-roles.md#harvest-capabilities). `all` runs it on each process. The retention policy itself stays Rust-only. See [`docs/operations/process-roles.md`](operations/process-roles.md#background-runtimes).
 
 Setting `harvest.redis.url` needs the `redis` cargo feature of `autumn-harvest-plugin`. A build without that feature carries no channel implementation, so it rejects the URL at load rather than ignoring it. Validation also rejects an empty `key_prefix` or `consumer_group`, a `poll_interval_ms` outside 1 to 5000, and a `visibility_timeout_ms` below 1000. See [`docs/operations/redis-dispatch.md`](operations/redis-dispatch.md).
 

@@ -12,6 +12,8 @@
 //!
 //! `docs/operations/build-ramp-guard.md` is the specification.
 
+#[cfg(feature = "db")]
+use jiff_diesel::ToDiesel;
 use std::time::Duration;
 
 /// The default time between two guard passes.
@@ -684,7 +686,7 @@ pub async fn abort_ramp(
     queue: &str,
     base: &str,
     target: &str,
-    step: chrono::DateTime<chrono::Utc>,
+    step: jiff::Timestamp,
     bound: Duration,
 ) -> crate::error::HarvestResult<Option<uuid::Uuid>> {
     clear_ramp(conn, queue, base, target, step, bound, uuid::Uuid::new_v4()).await
@@ -698,7 +700,7 @@ async fn clear_ramp(
     queue: &str,
     base: &str,
     target: &str,
-    step: chrono::DateTime<chrono::Utc>,
+    step: jiff::Timestamp,
     bound: Duration,
     report_id: uuid::Uuid,
 ) -> crate::error::HarvestResult<Option<uuid::Uuid>> {
@@ -720,7 +722,7 @@ async fn clear_ramp(
                 .bind::<Text, _>(queue)
                 .bind::<Text, _>(base)
                 .bind::<Text, _>(target)
-                .bind::<Timestamptz, _>(step)
+                .bind::<Timestamptz, _>(step.to_diesel())
                 .bind::<diesel::sql_types::Uuid, _>(report_id)
                 .get_result(conn)
                 .await
@@ -749,7 +751,7 @@ type GenerationKey = (RampKey, Option<uuid::Uuid>);
 #[derive(Debug)]
 struct PoolRamp {
     key: RampKey,
-    step: chrono::DateTime<chrono::Utc>,
+    step: jiff::Timestamp,
     /// The ramp's identity, or `None` for a ramp set before the column
     /// existed.
     ramp_id: Option<uuid::Uuid>,
@@ -770,7 +772,7 @@ struct ObservedRamp {
     target: BuildOutcomeStats,
     /// The pool index and the step of each pool that holds the ramp, in
     /// pool order.
-    steps: Vec<(usize, chrono::DateTime<chrono::Utc>)>,
+    steps: Vec<(usize, jiff::Timestamp)>,
     /// `true` when a guard abort marker holds the `ramp_id` of this
     /// generation. That is the trace of a partial clear.
     abort_marked: bool,
@@ -889,7 +891,7 @@ async fn read_step_stats(
         .bind::<Text, _>(&policy.queue_name)
         .bind::<Text, _>(&policy.build_id)
         .bind::<Text, _>(target)
-        .bind::<Timestamptz, _>(policy.updated_at)
+        .bind::<Timestamptz, _>(policy.updated_at.to_diesel())
         .bind::<Text, _>(crate::canary::CANARY_WORKFLOW_NAME_PREFIX)
         .load(conn)
         .await
@@ -923,7 +925,8 @@ struct PolicyRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     build_id: String,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    updated_at: chrono::DateTime<chrono::Utc>,
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+    updated_at: jiff::Timestamp,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     target_build_id: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
@@ -1435,7 +1438,7 @@ async fn record_abort_tombstones(
 #[cfg(feature = "db")]
 fn id_less_report_id(
     (queue, base, target): &RampKey,
-    steps: &[(usize, chrono::DateTime<chrono::Utc>)],
+    steps: &[(usize, jiff::Timestamp)],
 ) -> uuid::Uuid {
     use std::fmt::Write as _;
 
@@ -1446,7 +1449,7 @@ fn id_less_report_id(
         target.len()
     );
     for (index, step) in steps {
-        let _ = write!(name, "/{index}@{}", step.timestamp_micros());
+        let _ = write!(name, "/{index}@{}", step.as_microsecond());
     }
     uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, name.as_bytes())
 }
@@ -1470,7 +1473,7 @@ async fn stamp_report_id(
     pool: &crate::worker::DbPool,
     index: usize,
     (queue, base, target): &RampKey,
-    step: chrono::DateTime<chrono::Utc>,
+    step: jiff::Timestamp,
     report_id: uuid::Uuid,
     bound: Duration,
 ) -> Result<Option<uuid::Uuid>, ()> {
@@ -1501,7 +1504,7 @@ async fn stamp_report_id(
                 .bind::<Text, _>(queue)
                 .bind::<Text, _>(base)
                 .bind::<Text, _>(target)
-                .bind::<Timestamptz, _>(step)
+                .bind::<Timestamptz, _>(step.to_diesel())
                 .bind::<diesel::sql_types::Uuid, _>(report_id)
                 .get_result(conn)
                 .await
@@ -1520,7 +1523,7 @@ async fn stamp_report_id(
                 .bind::<Text, _>(queue)
                 .bind::<Text, _>(base)
                 .bind::<Text, _>(target)
-                .bind::<Timestamptz, _>(step)
+                .bind::<Timestamptz, _>(step.to_diesel())
                 .get_result(conn)
                 .await
                 .optional()
@@ -1665,7 +1668,7 @@ async fn clear_on_pool(
     index: usize,
     (key, ramp_id): (&RampKey, Option<uuid::Uuid>),
     report_id: uuid::Uuid,
-    step: chrono::DateTime<chrono::Utc>,
+    step: jiff::Timestamp,
     bound: Duration,
 ) -> ClearOutcome {
     let (queue, base, target) = key;
@@ -2017,7 +2020,7 @@ async fn report_abort(
 /// One pool clear to retry: the pool index, the step, and `true` when an
 /// earlier attempt was ambiguous.
 #[cfg(feature = "db")]
-type PendingStep = (usize, chrono::DateTime<chrono::Utc>, bool);
+type PendingStep = (usize, jiff::Timestamp, bool);
 
 /// The outcome of a retry, given whether an earlier attempt was ambiguous.
 ///
@@ -2330,7 +2333,7 @@ impl RampGuard {
         audit_pool: &crate::worker::DbPool,
         metrics: Option<&dyn crate::telemetry::MetricsRecorder>,
         (key, ramp_id): GenerationKey,
-        (steps, callers): (&[(usize, chrono::DateTime<chrono::Utc>)], &[uuid::Uuid]),
+        (steps, callers): (&[(usize, jiff::Timestamp)], &[uuid::Uuid]),
         mut abort: RampAbort,
         bound: Duration,
         cancel: &tokio_util::sync::CancellationToken,
@@ -2465,7 +2468,7 @@ impl RampGuard {
         &mut self,
         pools: &[crate::worker::DbPool],
         (key, ramp_id): &GenerationKey,
-        steps: &[(usize, chrono::DateTime<chrono::Utc>)],
+        steps: &[(usize, jiff::Timestamp)],
         bound: Duration,
         cancel: &tokio_util::sync::CancellationToken,
     ) {

@@ -360,8 +360,17 @@ impl Outcome {
     }
 }
 
+/// Run the mesh on the main thread.
+///
+/// The engine keeps large futures on the heap (issue #2752). CI runs this
+/// example on the 1 MiB Windows main thread.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    mesh_main().await
+}
+
+/// Run the mesh, print each line and check each claim.
+async fn mesh_main() -> Result<(), Box<dyn Error>> {
     // The directory and the database files go away when `dir` drops.
     let dir = tempfile::tempdir()?;
     let mut lines = Vec::new();

@@ -11,7 +11,7 @@ use std::time::Duration;
 use autumn_harvest::WorkflowIdReusePolicy;
 use autumn_harvest::prelude::*;
 use autumn_harvest_sqlite::{ActivitySpec, RunState, SqliteError, SqliteRuntime};
-use chrono::Utc;
+use jiff::Timestamp;
 use rusqlite::Connection;
 use serde_json::json;
 
@@ -72,7 +72,7 @@ fn rows_of(path: &std::path::Path, exec: &str) -> Vec<(&'static str, i64)> {
 /// Purge with the window counted from two hours on, so each run closed now
 /// is past a one-hour window.
 fn purge_two_hours_on(rt: &mut SqliteRuntime) -> u64 {
-    rt.purge_terminal_as_of(Utc::now() + chrono::Duration::hours(2), HOUR)
+    rt.purge_terminal_as_of(Timestamp::now() + jiff::SignedDuration::from_hours(2), HOUR)
         .unwrap()
 }
 
@@ -133,7 +133,7 @@ async fn purge_keeps_terminal_runs_inside_the_window() {
     rt.run_until_blocked(exec).await.unwrap();
 
     assert_eq!(rt.purge_terminal(HOUR).unwrap(), 0);
-    rt.set_clock(|| Utc::now() + chrono::Duration::days(30));
+    rt.set_clock(|| Timestamp::now() + autumn_harvest::time::days(30));
     assert_eq!(
         rt.purge_terminal(HOUR).unwrap(),
         0,

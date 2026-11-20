@@ -473,7 +473,7 @@ async fn append_new_execution_started_events_batch_handles_a_batch_past_the_para
     use autumn_harvest::payload_codec::PayloadCodecs;
     use autumn_harvest::schema::harvest_events;
     use autumn_harvest::store;
-    use chrono::Utc;
+    use jiff::Timestamp;
 
     const N: i64 = 16_400; // > 65_535 / 4 = 16_383
 
@@ -509,7 +509,7 @@ async fn append_new_execution_started_events_batch_handles_a_batch_past_the_para
                 ExecutionId::from_uuid(r.id),
                 WorkflowEvent::WorkflowStarted {
                     input: json!({}),
-                    timestamp: Utc::now(),
+                    timestamp: Timestamp::now(),
                     last_completion_result: None,
                     last_error: None,
                     scheduled_time: None,

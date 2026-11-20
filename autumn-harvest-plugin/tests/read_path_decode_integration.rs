@@ -19,6 +19,7 @@
 #![allow(clippy::too_many_lines)]
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
+use jiff_diesel::ToDiesel;
 use std::sync::Arc;
 
 use autumn_harvest::models::NewHarvestEvent;
@@ -44,10 +45,10 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -383,7 +384,7 @@ async fn mark_completed(conn: &mut AsyncPgConnection, exec_id: ExecutionId, outp
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             harvest_workflow_executions::output.eq(Some(output)),
         ))
         .execute(conn)
@@ -395,7 +396,7 @@ async fn mark_failed(conn: &mut AsyncPgConnection, exec_id: ExecutionId, error: 
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("FAILED"),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             harvest_workflow_executions::error.eq(Some(error.to_string())),
         ))
         .execute(conn)
@@ -468,7 +469,7 @@ async fn seed_pending_activity(
         )
         .set((
             harvest_task_queue::heartbeat_details.eq(Some(checkpoint)),
-            harvest_task_queue::last_heartbeat_at.eq(Some(Utc::now())),
+            harvest_task_queue::last_heartbeat_at.eq(Some(Timestamp::now()).to_diesel()),
         ))
         .execute(conn)
         .await
@@ -501,7 +502,8 @@ async fn seed_backing_off_activity(
         harvest_task_queue::state.eq("PENDING"),
         harvest_task_queue::error.eq(Some(error.to_string())),
         harvest_task_queue::attempt.eq(attempt),
-        harvest_task_queue::scheduled_at.eq(Utc::now() + chrono::Duration::seconds(30)),
+        harvest_task_queue::scheduled_at
+            .eq((Timestamp::now() + jiff::SignedDuration::from_secs(30)).to_diesel()),
     ))
     .execute(conn)
     .await

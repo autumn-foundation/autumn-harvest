@@ -65,11 +65,11 @@
 use autumn_harvest::PayloadCodecs;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::types::{ActivityExecId, WorkerId};
-use chrono::{DateTime, TimeZone, Utc};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
-fn now() -> DateTime<Utc> {
-    Utc.timestamp_opt(1_800_000_000, 0).unwrap()
+fn now() -> Timestamp {
+    Timestamp::new(1_800_000_000, 0).unwrap()
 }
 
 /// A representative per-event payload -- a nested order-processing

@@ -2,9 +2,9 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
 use croner::Cron;
 use croner::parser::{CronParser, Seconds};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -1241,7 +1241,7 @@ pub struct WorkflowSchedule {
     /// a calendar `skip_policy`, or `paused` does **not** consume the `max_runs` budget
     /// and does **not** trigger `end_at` exhaustion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub end_at: Option<DateTime<Utc>>,
+    pub end_at: Option<Timestamp>,
     /// Total run budget for this schedule (issue #478).
     ///
     /// Decremented atomically at the moment a run is actually started (not merely
@@ -1549,7 +1549,7 @@ impl WorkflowSchedule {
     /// Composes cleanly with `max_runs`, `OverlapPolicy`, calendar filtering, and
     /// `paused`.  A skipped firing does not trigger exhaustion.
     #[must_use]
-    pub const fn with_end_at(mut self, end_at: DateTime<Utc>) -> Self {
+    pub const fn with_end_at(mut self, end_at: Timestamp) -> Self {
         self.end_at = Some(end_at);
         self
     }
@@ -1595,9 +1595,9 @@ impl WorkflowSchedule {
 
 /// Longest accepted [`Schedule::Interval`] period: 100 years of 365 days.
 ///
-/// A period of about 8.2e12 seconds or more pushes the next fire time past
-/// the last date that `chrono` holds (issue #2048). The cap sits far below
-/// that limit and far above any real cadence. [`validate_schedule`] rejects a
+/// A period of about 2.5e11 seconds or more pushes the next fire time past
+/// the last date that jiff holds, in year 9999 (issue #2048). The cap sits
+/// far below that limit and far above any real cadence. [`validate_schedule`] rejects a
 /// longer period.
 pub const MAX_INTERVAL_PERIOD: Duration = Duration::from_hours(876_000);
 
@@ -1633,7 +1633,7 @@ pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
             .map_err(|e| format!("invalid cron expression '{expr}': {e}")),
         Schedule::CronInTimezone { expr, tz } => {
             // Validate the IANA timezone name first so callers get a clear error.
-            if tz.parse::<chrono_tz::Tz>().is_err() {
+            if crate::time::zone(tz).is_none() {
                 return Err(format!(
                     "unknown timezone '{tz}'; use an IANA timezone name (e.g. \"America/Los_Angeles\", \"UTC\")"
                 ));
@@ -1654,8 +1654,8 @@ pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
         Schedule::Interval(period) if period.subsec_nanos() != 0 => Err(format!(
             "interval schedule period must be a whole number of seconds, got {period:?}"
         )),
-        // The scheduler adds the period to a timestamp. chrono cannot hold a
-        // date past year 262143. The cap keeps the sum in range (issue #2048).
+        // The scheduler adds the period to a timestamp. jiff cannot hold a
+        // date past year 9999. The cap keeps the sum in range (issue #2048).
         Schedule::Interval(period) if *period > MAX_INTERVAL_PERIOD => Err(format!(
             "interval schedule period must not exceed {} seconds, got {} seconds. \
              Use a manual schedule to stop automatic runs.",
@@ -1741,15 +1741,14 @@ pub fn validate_jitter(schedule: &Schedule, jitter: Duration) -> Result<(), Stri
 #[must_use]
 pub fn compute_jitter_offset(
     schedule_id: Uuid,
-    fire_time: DateTime<Utc>,
+    fire_time: Timestamp,
     jitter: Duration,
 ) -> Duration {
     if jitter.is_zero() {
         return Duration::ZERO;
     }
     let jitter_nanos = u64::try_from(jitter.as_nanos()).unwrap_or(u64::MAX);
-    let fire_nanos = fire_time
-        .timestamp_nanos_opt()
+    let fire_nanos = i64::try_from(fire_time.as_nanosecond())
         .unwrap_or_default()
         .cast_unsigned();
     let mut bytes = [0u8; 24];
@@ -2128,10 +2127,10 @@ mod tests {
 
     #[test]
     fn compute_jitter_offset_deterministic() {
-        use chrono::{DateTime, Utc};
+        use jiff::Timestamp;
         use uuid::Uuid;
         let id = Uuid::from_u128(42);
-        let fire_time = "2026-04-01T10:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let fire_time = "2026-04-01T10:00:00Z".parse::<Timestamp>().unwrap();
         let jitter = Duration::from_secs(300);
         let first = compute_jitter_offset(id, fire_time, jitter);
         for _ in 0..999 {
@@ -2141,10 +2140,10 @@ mod tests {
 
     #[test]
     fn compute_jitter_offset_zero_jitter_returns_zero() {
-        use chrono::{DateTime, Utc};
+        use jiff::Timestamp;
         use uuid::Uuid;
         let id = Uuid::from_u128(1);
-        let fire_time = "2026-04-01T10:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let fire_time = "2026-04-01T10:00:00Z".parse::<Timestamp>().unwrap();
         assert_eq!(
             compute_jitter_offset(id, fire_time, Duration::ZERO),
             Duration::ZERO
@@ -2153,10 +2152,10 @@ mod tests {
 
     #[test]
     fn compute_jitter_offset_within_bounds() {
-        use chrono::{DateTime, Utc};
+        use jiff::Timestamp;
         use uuid::Uuid;
         let id = Uuid::from_u128(12345);
-        let fire_time = "2026-04-01T10:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let fire_time = "2026-04-01T10:00:00Z".parse::<Timestamp>().unwrap();
         let jitter = Duration::from_secs(300);
         let offset = compute_jitter_offset(id, fire_time, jitter);
         assert!(
@@ -2167,9 +2166,9 @@ mod tests {
 
     #[test]
     fn compute_jitter_offset_uniform_distribution() {
-        use chrono::{DateTime, Utc};
+        use jiff::Timestamp;
         use uuid::Uuid;
-        let fire_time = "2026-04-01T10:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let fire_time = "2026-04-01T10:00:00Z".parse::<Timestamp>().unwrap();
         let jitter = Duration::from_secs(300);
         let num_ids: u128 = 10_000;
         let num_buckets = 10usize;
@@ -2696,7 +2695,7 @@ mod tests {
 
     #[test]
     fn interval_schedule_over_the_cap_is_rejected() {
-        // Adding this period to a timestamp overflows chrono (issue #2048).
+        // Each period is over the cap. The larger ones overflow a jiff timestamp (issue #2048).
         for secs in [
             MAX_INTERVAL_PERIOD.as_secs() + 1,
             8_000_000_000_000,

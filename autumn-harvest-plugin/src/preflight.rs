@@ -12,12 +12,12 @@ use autumn_harvest::schema::harvest_schedules;
 use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::DbPool;
 use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, WorkerStatus, list_workers};
-use chrono::{DateTime, Utc};
 use diesel::QueryDsl;
 use diesel::SelectableHelper;
 use diesel::migration::MigrationSource;
 use diesel::pg::Pg;
 use diesel_async::RunQueryDsl;
+use jiff::Timestamp;
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -65,7 +65,7 @@ pub struct PreflightCheckResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct PreflightReport {
     pub overall_status: PreflightStatus,
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: Timestamp,
     pub version: PreflightVersion,
     pub checks: Vec<PreflightCheckResult>,
 }
@@ -154,7 +154,7 @@ pub async fn build_preflight_report(api_state: &HarvestApiState) -> PreflightRep
 
     PreflightReport {
         overall_status,
-        observed_at: Utc::now(),
+        observed_at: Timestamp::now(),
         version: PreflightVersion {
             package: env!("CARGO_PKG_NAME"),
             version: env!("CARGO_PKG_VERSION"),
@@ -471,6 +471,13 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
     // (issue #1795). A missing grant does not stop enforcement: the worker
     // fails open and every replica runs every pass, as before the lease.
     ("harvest_scanner_leases", &["SELECT", "INSERT", "UPDATE"]),
+    // The elected gauge sampler of a shard writes its read here, and prunes
+    // old rows. A missing grant does not stop a gauge: each worker then
+    // reads the shard itself, as before the election.
+    (
+        "harvest_gauge_samples",
+        &["SELECT", "INSERT", "UPDATE", "DELETE"],
+    ),
     // The DR bump ends every owner lease in its transaction (issue #2251). A
     // missing grant fails the bump. In owner mode (issue #2252), each
     // decision locks a row FOR KEY SHARE, which needs UPDATE, and each
@@ -495,6 +502,14 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
     (
         "harvest_entity_state",
         &["SELECT", "INSERT", "UPDATE", "DELETE"],
+    ),
+    // The outbox trigger inserts a row for each external request, and deletes
+    // it for each resolution. It runs as the inserting role, so a missing
+    // grant fails that append. Each outbox claim reads the table. A shard
+    // move deletes the rows of a staged copy.
+    (
+        "harvest_external_outbox_pending",
+        &["SELECT", "INSERT", "DELETE"],
     ),
     // Every completion that recorded an LLM call inserts here, in the
     // completion transaction (issue #1996). A missing grant rolls back the
@@ -1519,6 +1534,9 @@ async fn check_dlq_read_access(api_state: &HarvestApiState) -> PreflightCheckRes
     )
 }
 
+/// Reads one row of the DLQ, to prove that the role can read the table.
+const DLQ_READ_PROBE_SQL: &str = "SELECT 1 FROM harvest_dead_letters LIMIT 1";
+
 async fn observe_dlq_read_access(shard_id: i32, shard_pool: &DbPool) -> ShardObservation {
     let Ok(mut conn) = shard_pool.get().await else {
         return ShardObservation {
@@ -1531,13 +1549,28 @@ async fn observe_dlq_read_access(shard_id: i32, shard_pool: &DbPool) -> ShardObs
         };
     };
 
-    dlq::dead_letter_count(&mut conn).await.map_or_else(
-        |_| ShardObservation {
+    // The depth reads a counter, not the DLQ. So the probe reads one row of
+    // the DLQ too: the list, the redrive and the API read that table.
+    let table_readable = diesel::sql_query(DLQ_READ_PROBE_SQL)
+        .execute(&mut conn)
+        .await
+        .is_ok();
+    let count = if table_readable {
+        dlq::dead_letter_count(&mut conn).await.ok()
+    } else {
+        None
+    };
+    count.map_or_else(
+        || ShardObservation {
             passed: false,
             details: json!({
                 "shard_id": shard_id,
                 "status": "fail",
-                "error": "dead-letter table is not readable",
+                "error": if table_readable {
+                    "dead-letter depth is not readable"
+                } else {
+                    "dead-letter table is not readable"
+                },
             }),
         },
         |count| ShardObservation {
@@ -1962,7 +1995,7 @@ mod tests {
 
     fn worker_row_with_shard_assignments(shard_assignments: &[i64], queues: &[&str]) -> WorkerRow {
         use autumn_harvest::models::HarvestWorker;
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         WorkerRow {
             worker: HarvestWorker {
                 worker_id: "legacy-worker".to_string(),
@@ -2093,7 +2126,7 @@ mod tests {
             scanner,
             poll_interval: Duration::from_secs(poll_interval_secs),
             tick_count,
-            last_tick_at: (tick_count > 0).then(Utc::now),
+            last_tick_at: (tick_count > 0).then(jiff::Timestamp::now),
             age: Duration::from_secs(age_secs),
             has_ticked: tick_count > 0,
             shard,
@@ -2510,6 +2543,17 @@ mod tests {
         assert_eq!(log, Some(&["SELECT", "INSERT"][..]));
     }
 
+    /// The outbox trigger writes the pending table as the inserting role. A
+    /// missing grant fails each external request.
+    #[test]
+    fn the_external_outbox_pending_table_is_covered_by_the_privilege_probe() {
+        let covered = HARVEST_WRITE_PRIVILEGE_REQUIREMENTS
+            .iter()
+            .find(|(name, _)| *name == autumn_harvest::external_outbox::PENDING_TABLE)
+            .map(|(_, privileges)| *privileges);
+        assert_eq!(covered, Some(&["SELECT", "INSERT", "DELETE"][..]));
+    }
+
     /// A reshard carry reads, writes and deletes the override floors. A
     /// missing grant fails each carry.
     #[test]
@@ -2517,6 +2561,17 @@ mod tests {
         let covered = HARVEST_WRITE_PRIVILEGE_REQUIREMENTS
             .iter()
             .find(|(name, _)| *name == "harvest_schedule_override_receipts")
+            .map(|(_, privileges)| *privileges);
+        assert_eq!(covered, Some(&["SELECT", "INSERT", "UPDATE", "DELETE"][..]));
+    }
+
+    /// The elected gauge sampler writes its read and prunes old rows. A
+    /// missing grant makes every worker read each shard itself.
+    #[test]
+    fn the_shared_gauge_samples_are_covered_by_the_privilege_probe() {
+        let covered = HARVEST_WRITE_PRIVILEGE_REQUIREMENTS
+            .iter()
+            .find(|(name, _)| *name == "harvest_gauge_samples")
             .map(|(_, privileges)| *privileges);
         assert_eq!(covered, Some(&["SELECT", "INSERT", "UPDATE", "DELETE"][..]));
     }

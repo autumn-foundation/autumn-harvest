@@ -13,6 +13,7 @@
 //!   gate alone (AC4).
 //! - The route is admin-gated.
 
+use jiff_diesel::ToDiesel;
 use std::collections::{BTreeSet, HashMap};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -37,10 +38,10 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{Duration as ChronoDuration, Utc};
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -253,7 +254,7 @@ async fn insert_execution(
 
     let events = vec![WorkflowEvent::WorkflowStarted {
         input: json!({}),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -339,7 +340,7 @@ async fn backdate_worker_heartbeat(database_url: &str, worker_id: &str, seconds_
     diesel::update(harvest_workers::table.find(worker_id))
         .set(
             harvest_workers::last_heartbeat_at
-                .eq(Utc::now() - ChronoDuration::seconds(seconds_ago)),
+                .eq((Timestamp::now() - SignedDuration::from_secs(seconds_ago)).to_diesel()),
         )
         .execute(&mut conn)
         .await
@@ -754,7 +755,10 @@ async fn stale_workers_exceeding_the_cap_do_not_crowd_out_a_healthy_poller() {
     diesel::update(
         harvest_workers::table.filter(harvest_workers::worker_id.eq_any(&stale_worker_ids)),
     )
-    .set(harvest_workers::last_heartbeat_at.eq(Utc::now() - ChronoDuration::seconds(60)))
+    .set(
+        harvest_workers::last_heartbeat_at
+            .eq((Timestamp::now() - SignedDuration::from_secs(60)).to_diesel()),
+    )
     .execute(&mut conn)
     .await
     .expect("failed to bulk-backdate stale workers");

@@ -4,7 +4,6 @@
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use autumn_harvest::chrono::{DateTime, Utc};
 use autumn_harvest::durable_promise::PROMISE_SIGNAL_PREFIX;
 use autumn_harvest_agent::delivery::{Delivery, Report};
 use autumn_harvest_agent::mesh_control::{BudgetPeriod, MeshBudget, MeshSpend, Spend};
@@ -15,6 +14,7 @@ use autumn_harvest_agent::{
     ToolRules,
 };
 use autumn_harvest_sqlite::{ExecutionId, RunState, SqliteResult, SqliteRuntime};
+use jiff::Timestamp;
 
 use crate::desk::Desk;
 
@@ -280,7 +280,7 @@ fn mark(rt: &SqliteRuntime, agent: &AgentId) -> SqliteResult<Option<(ExecutionId
 pub async fn drive_at(
     rt: &mut SqliteRuntime,
     agent: &AgentId,
-    at: DateTime<Utc>,
+    at: Timestamp,
 ) -> SqliteResult<Option<RunState>> {
     let Some(mut exec) = sqlite::current_run(rt, agent)? else {
         return Ok(None);
@@ -303,7 +303,7 @@ pub async fn drive_at(
 /// Returns an error when the runtime fails.
 pub async fn settle_in(
     rt: &mut SqliteRuntime,
-    at: DateTime<Utc>,
+    at: Timestamp,
     order: &[AgentId],
 ) -> SqliteResult<Settled> {
     let mut settled = Settled::default();
@@ -339,7 +339,7 @@ pub async fn settle_in(
 /// # Errors
 ///
 /// As [`settle_in`].
-pub async fn settle(rt: &mut SqliteRuntime, at: DateTime<Utc>) -> SqliteResult<Settled> {
+pub async fn settle(rt: &mut SqliteRuntime, at: Timestamp) -> SqliteResult<Settled> {
     settle_in(rt, at, &agents()).await
 }
 
@@ -349,7 +349,7 @@ pub async fn settle(rt: &mut SqliteRuntime, at: DateTime<Utc>) -> SqliteResult<S
 /// # Errors
 ///
 /// Returns an error when the runtime fails.
-pub async fn start(rt: &mut SqliteRuntime, at: DateTime<Utc>) -> SqliteResult<Settled> {
+pub async fn start(rt: &mut SqliteRuntime, at: Timestamp) -> SqliteResult<Settled> {
     for agent in agents() {
         if sqlite::current_run(rt, &agent)?.is_none() {
             let key = format!("start:{agent}");
@@ -428,7 +428,7 @@ pub fn states(
 /// # Errors
 ///
 /// Returns an error when the ledger cannot be read.
-pub async fn spent_today(desk: &Desk, now: DateTime<Utc>) -> Result<Spend, AgentError> {
+pub async fn spent_today(desk: &Desk, now: Timestamp) -> Result<Spend, AgentError> {
     let (since, _) = BudgetPeriod::Day.window(now);
     LedgerSpend::open(desk.db()).spent(MESH, since).await
 }

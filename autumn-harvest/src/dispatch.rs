@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use uuid::Uuid;
 
 use crate::error::HarvestResult;
@@ -86,7 +86,7 @@ pub struct DispatchHint {
     /// Logical queue the row belongs to.
     pub queue_name: String,
     /// Time the row becomes claimable.
-    pub scheduled_at: DateTime<Utc>,
+    pub scheduled_at: Timestamp,
     /// Row priority. Implementations may use it for ordering.
     pub priority: i32,
     /// Shard the row lives on. `None` for a single-shard runtime.
@@ -1599,10 +1599,10 @@ struct MemoryEntry {
     /// The `scheduled_at` of the row, as the publish that placed this entry
     /// gave it. Contract C1 keys the dedupe on this value, so a release must
     /// keep it while it changes `due`.
-    scheduled_at: DateTime<Utc>,
+    scheduled_at: Timestamp,
     /// When the entry becomes claimable. Equal to `scheduled_at` on publish, and
     /// later than it while a release backs the entry off.
-    due: DateTime<Utc>,
+    due: Timestamp,
     redeliveries: u32,
     shard: Option<crate::types::ShardId>,
     /// Pool the row needs, as the publish gave it.
@@ -1624,7 +1624,7 @@ struct MemoryState {
     /// Claimable references per queue, in publish order.
     ready: std::collections::HashMap<String, std::collections::VecDeque<Uuid>>,
     /// References parked until their due time.
-    delayed: std::collections::BTreeSet<(DateTime<Utc>, Uuid)>,
+    delayed: std::collections::BTreeSet<(Timestamp, Uuid)>,
     /// Every reference the channel holds and has not delivered.
     entries: std::collections::HashMap<Uuid, MemoryEntry>,
     /// Delivered references, keyed by lease handle.
@@ -1755,7 +1755,7 @@ impl MemoryDispatch {
     }
 
     /// Put `entry` in the ready queue or the delayed set, by its due time.
-    fn place(state: &mut MemoryState, entry: MemoryEntry, now: DateTime<Utc>) {
+    fn place(state: &mut MemoryState, entry: MemoryEntry, now: Timestamp) {
         let task_id = entry.task_id;
         if entry.due <= now {
             state
@@ -1780,8 +1780,8 @@ impl MemoryDispatch {
     }
 
     /// Move every due delayed reference into its ready queue.
-    fn promote_due(state: &mut MemoryState, now: DateTime<Utc>) -> usize {
-        let due: Vec<(DateTime<Utc>, Uuid)> = state
+    fn promote_due(state: &mut MemoryState, now: Timestamp) -> usize {
+        let due: Vec<(Timestamp, Uuid)> = state
             .delayed
             .iter()
             .take_while(|(due, _)| *due <= now)
@@ -1808,7 +1808,7 @@ impl TaskDispatch for MemoryDispatch {
                 "injected publish failure".to_string(),
             ));
         }
-        let now = Utc::now();
+        let now = Timestamp::now();
         for hint in hints {
             state.published.push(hint.task_id);
             // Contract C1. A held reference with the same `scheduled_at` names
@@ -1927,9 +1927,9 @@ impl TaskDispatch for MemoryDispatch {
             return Ok(());
         };
         state.released.push(lease.task_id);
-        let now = Utc::now();
-        let due = chrono::Duration::from_std(delay)
-            .map_or(now, |delay| now.checked_add_signed(delay).unwrap_or(now));
+        let now = Timestamp::now();
+        let due = jiff::SignedDuration::try_from(delay)
+            .map_or(now, |delay| now.checked_add(delay).unwrap_or(now));
         let entry = MemoryEntry {
             due,
             redeliveries: held.entry.redeliveries.saturating_add(1),
@@ -1942,7 +1942,7 @@ impl TaskDispatch for MemoryDispatch {
 
     async fn maintain(&self, _queues: &[String]) -> HarvestResult<DispatchMaintenance> {
         let mut state = lock(&self.state);
-        let promoted = Self::promote_due(&mut state, Utc::now());
+        let promoted = Self::promote_due(&mut state, Timestamp::now());
 
         let visibility_timeout = self.visibility_timeout;
         let expired: Vec<String> = state
@@ -1952,7 +1952,7 @@ impl TaskDispatch for MemoryDispatch {
             .map(|(handle, _)| handle.clone())
             .collect();
         let recovered = expired.len();
-        let now = Utc::now();
+        let now = Timestamp::now();
         for handle in expired {
             let Some(held) = state.inflight.remove(&handle) else {
                 continue;
@@ -1982,7 +1982,7 @@ mod tests {
     /// Serializes the cases that install the process-global channel.
     use super::TEST_SLOT_LOCK as INSTALL_LOCK;
 
-    fn hint(queue: &str, at: DateTime<Utc>) -> DispatchHint {
+    fn hint(queue: &str, at: Timestamp) -> DispatchHint {
         DispatchHint {
             task_id: Uuid::new_v4(),
             queue_name: queue.to_string(),
@@ -2030,7 +2030,7 @@ mod tests {
     #[tokio::test]
     async fn a_lease_carries_the_kind_of_its_hint() {
         let channel = MemoryDispatch::new();
-        let mut activity = hint("q", Utc::now());
+        let mut activity = hint("q", Timestamp::now());
         activity.kind = Some(DispatchKind::Activity);
         channel.publish(&[activity.clone()]).await.expect("publish");
 
@@ -2386,7 +2386,7 @@ mod tests {
             DispatchSettings::default(),
         );
 
-        let one = hint("q", Utc::now());
+        let one = hint("q", Timestamp::now());
         record_hint(one.clone());
         for _ in 0..100 {
             if channel.published_ids().contains(&one.task_id) {
@@ -2407,7 +2407,7 @@ mod tests {
             DispatchSettings::default(),
         );
 
-        let one = hint("q", Utc::now());
+        let one = hint("q", Timestamp::now());
         let inner = one.clone();
         let observed = Arc::clone(&channel);
         let ((), leftover) = buffered(async move {
@@ -2437,7 +2437,7 @@ mod tests {
             DispatchSettings::default(),
         );
 
-        let one = hint("q", Utc::now());
+        let one = hint("q", Timestamp::now());
         let inner = one.clone();
         let ((), outer) = buffered(async move {
             let ((), nested) = buffered(async move {
@@ -2460,7 +2460,7 @@ mod tests {
             DispatchSettings::default(),
         );
 
-        let one = hint("q", Utc::now());
+        let one = hint("q", Timestamp::now());
         let inner = one.clone();
         let ((), leftover) = buffered(async move {
             record_hint(inner);
@@ -2512,7 +2512,7 @@ mod tests {
             DispatchSettings::default(),
         );
 
-        let one = hint("q", Utc::now());
+        let one = hint("q", Timestamp::now());
         let inner = one.clone();
         let (outcome, leftover) = buffered(async move {
             record_hint(inner);
@@ -2538,7 +2538,7 @@ mod tests {
             DispatchSettings::default(),
         );
 
-        let committed = hint("q", Utc::now());
+        let committed = hint("q", Timestamp::now());
         let inner = committed.clone();
         let outcome = buffered_settled(async move {
             record_hint(inner);
@@ -2548,7 +2548,7 @@ mod tests {
         assert!(outcome.is_ok());
         assert_eq!(channel.published_ids(), vec![committed.task_id]);
 
-        let rolled_back = hint("q", Utc::now());
+        let rolled_back = hint("q", Timestamp::now());
         let inner = rolled_back.clone();
         let outcome = buffered_settled(async move {
             record_hint(inner);
@@ -2573,7 +2573,7 @@ mod tests {
             DispatchSettings::default(),
         );
 
-        let one = hint("q", Utc::now());
+        let one = hint("q", Timestamp::now());
         let inner = one.clone();
         let observed = Arc::clone(&channel);
         let ((), outer) = buffered(async move {
@@ -2607,8 +2607,8 @@ mod tests {
             DispatchSettings::default(),
         );
 
-        let sibling = hint("q", Utc::now());
-        let failed = hint("q", Utc::now());
+        let sibling = hint("q", Timestamp::now());
+        let failed = hint("q", Timestamp::now());
         let sibling_inner = sibling.clone();
         let failed_inner = failed.clone();
         let ((), outer) = buffered(async move {
@@ -2641,7 +2641,7 @@ mod tests {
             DispatchSettings::default(),
         );
 
-        let one = hint("q", Utc::now());
+        let one = hint("q", Timestamp::now());
         let inner = one.clone();
         let observed = Arc::clone(&channel);
         let ((), outer) = buffered(async move {
@@ -2671,7 +2671,7 @@ mod tests {
             DispatchSettings::default(),
         );
 
-        let committed = hint("q", Utc::now());
+        let committed = hint("q", Timestamp::now());
         let inner = committed.clone();
         let outcome = buffered_checkpoint(async move {
             record_hint(inner);
@@ -2701,9 +2701,9 @@ mod tests {
             DispatchSettings::default(),
         );
 
-        let committed = hint("q", Utc::now());
+        let committed = hint("q", Timestamp::now());
         let committed_inner = committed.clone();
-        let rolled_back = hint("q", Utc::now());
+        let rolled_back = hint("q", Timestamp::now());
 
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
         let (committed_tx, committed_rx) = tokio::sync::oneshot::channel::<()>();
@@ -2758,7 +2758,7 @@ mod tests {
     #[tokio::test]
     async fn uninstall_all_shards_stops_the_background_publisher() {
         let _guard = INSTALL_LOCK.lock().await;
-        publish_in_background(hint("q", Utc::now()));
+        publish_in_background(hint("q", Timestamp::now()));
         assert!(
             lock(&PUBLISHER)
                 .as_ref()
@@ -2860,14 +2860,14 @@ mod tests {
         let _guard = INSTALL_LOCK.lock().await;
         uninstall();
         assert!(!is_installed());
-        record_hint(hint("q", Utc::now()));
-        publish_now(vec![hint("q", Utc::now())]).await;
+        record_hint(hint("q", Timestamp::now()));
+        publish_now(vec![hint("q", Timestamp::now())]).await;
     }
 
     #[tokio::test]
     async fn memory_dispatch_delivers_a_published_reference_once() {
         let channel = MemoryDispatch::new();
-        let one = hint("q", Utc::now());
+        let one = hint("q", Timestamp::now());
         channel
             .publish(std::slice::from_ref(&one))
             .await
@@ -2889,8 +2889,8 @@ mod tests {
         // Issue #1429. `MemoryDispatch` does not override `ack_many`, so this
         // exercises the trait's default sequential implementation.
         let channel = MemoryDispatch::new();
-        let a = hint("q", Utc::now());
-        let b = hint("q", Utc::now());
+        let a = hint("q", Timestamp::now());
+        let b = hint("q", Timestamp::now());
         channel
             .publish(&[a.clone(), b.clone()])
             .await
@@ -2965,8 +2965,8 @@ mod tests {
 
     #[tokio::test]
     async fn ack_many_default_attempts_every_lease_despite_one_failure() {
-        let a = hint("q", Utc::now());
-        let b = hint("q", Utc::now());
+        let a = hint("q", Timestamp::now());
+        let b = hint("q", Timestamp::now());
         let inner = MemoryDispatch::new();
         inner
             .publish(&[a.clone(), b.clone()])
@@ -2992,8 +2992,8 @@ mod tests {
 
     #[tokio::test]
     async fn release_many_default_attempts_every_lease_despite_one_failure() {
-        let a = hint("q", Utc::now());
-        let b = hint("q", Utc::now());
+        let a = hint("q", Timestamp::now());
+        let b = hint("q", Timestamp::now());
         let inner = MemoryDispatch::new();
         inner
             .publish(&[a.clone(), b.clone()])
@@ -3027,8 +3027,8 @@ mod tests {
         // two leases here get different delays. Only the short one is ready
         // right away; the long one is still not ready by then.
         let channel = MemoryDispatch::new();
-        let a = hint("q", Utc::now());
-        let b = hint("q", Utc::now());
+        let a = hint("q", Timestamp::now());
+        let b = hint("q", Timestamp::now());
         channel
             .publish(&[a.clone(), b.clone()])
             .await
@@ -3087,7 +3087,7 @@ mod tests {
     #[tokio::test]
     async fn memory_dispatch_dedupes_a_repeated_publish() {
         let channel = MemoryDispatch::new();
-        let one = hint("q", Utc::now());
+        let one = hint("q", Timestamp::now());
         channel
             .publish(std::slice::from_ref(&one))
             .await
@@ -3105,7 +3105,7 @@ mod tests {
     #[tokio::test]
     async fn memory_dispatch_moves_a_parked_reference_to_an_earlier_due_time() {
         let channel = MemoryDispatch::new();
-        let later = hint("q", Utc::now() + chrono::Duration::seconds(60));
+        let later = hint("q", Timestamp::now() + jiff::SignedDuration::from_secs(60));
         channel
             .publish(std::slice::from_ref(&later))
             .await
@@ -3113,7 +3113,7 @@ mod tests {
         assert!(read_one(&channel).await.is_none());
 
         let sooner = DispatchHint {
-            scheduled_at: Utc::now() - chrono::Duration::seconds(1),
+            scheduled_at: Timestamp::now() - jiff::SignedDuration::from_secs(1),
             ..later.clone()
         };
         channel.publish(&[sooner]).await.expect("republish");
@@ -3127,7 +3127,7 @@ mod tests {
     #[tokio::test]
     async fn a_republish_at_the_same_due_time_leaves_a_backed_off_reference_alone() {
         let channel = MemoryDispatch::new();
-        let one = hint("q", Utc::now());
+        let one = hint("q", Timestamp::now());
         channel
             .publish(std::slice::from_ref(&one))
             .await
@@ -3155,7 +3155,7 @@ mod tests {
         let channel = MemoryDispatch::new();
         // Both due times are in the past, so the case tests the dedupe rule and
         // never the clock.
-        let one = hint("q", Utc::now() - chrono::Duration::seconds(2));
+        let one = hint("q", Timestamp::now() - jiff::SignedDuration::from_secs(2));
         channel
             .publish(std::slice::from_ref(&one))
             .await
@@ -3170,7 +3170,7 @@ mod tests {
         // A signal moved the row. Its `scheduled_at` differs, so the reference
         // moves to the new due time and its redelivery count starts again.
         let woken = DispatchHint {
-            scheduled_at: one.scheduled_at + chrono::Duration::seconds(1),
+            scheduled_at: one.scheduled_at + jiff::SignedDuration::from_secs(1),
             ..one.clone()
         };
         channel.publish(&[woken]).await.expect("wake");
@@ -3184,7 +3184,7 @@ mod tests {
     #[tokio::test]
     async fn a_publish_at_a_later_due_time_parks_a_ready_reference() {
         let channel = MemoryDispatch::new();
-        let one = hint("q", Utc::now());
+        let one = hint("q", Timestamp::now());
         channel
             .publish(std::slice::from_ref(&one))
             .await
@@ -3192,7 +3192,7 @@ mod tests {
 
         // A retry moved the row into the future. The reference moves with it.
         let retried = DispatchHint {
-            scheduled_at: Utc::now() + chrono::Duration::seconds(60),
+            scheduled_at: Timestamp::now() + jiff::SignedDuration::from_secs(60),
             ..one.clone()
         };
         channel.publish(&[retried]).await.expect("retry");
@@ -3205,7 +3205,10 @@ mod tests {
     #[tokio::test]
     async fn memory_dispatch_promotes_a_delayed_reference_when_it_is_due() {
         let channel = MemoryDispatch::new();
-        let soon = hint("q", Utc::now() + chrono::Duration::milliseconds(60));
+        let soon = hint(
+            "q",
+            Timestamp::now() + jiff::SignedDuration::from_millis(60),
+        );
         channel
             .publish(std::slice::from_ref(&soon))
             .await
@@ -3237,7 +3240,7 @@ mod tests {
     #[tokio::test]
     async fn memory_dispatch_counts_a_redelivery_after_a_release() {
         let channel = MemoryDispatch::new();
-        let one = hint("q", Utc::now());
+        let one = hint("q", Timestamp::now());
         channel
             .publish(std::slice::from_ref(&one))
             .await
@@ -3258,7 +3261,7 @@ mod tests {
     #[tokio::test]
     async fn memory_dispatch_recovers_a_lease_a_dead_consumer_left_behind() {
         let channel = MemoryDispatch::with_visibility_timeout(Duration::from_millis(40));
-        let one = hint("q", Utc::now());
+        let one = hint("q", Timestamp::now());
         channel
             .publish(std::slice::from_ref(&one))
             .await
@@ -3286,8 +3289,8 @@ mod tests {
     #[tokio::test]
     async fn memory_dispatch_drop_all_wipes_every_reference() {
         let channel = MemoryDispatch::new();
-        let ready = hint("q", Utc::now());
-        let parked = hint("q", Utc::now() + chrono::Duration::seconds(60));
+        let ready = hint("q", Timestamp::now());
+        let parked = hint("q", Timestamp::now() + jiff::SignedDuration::from_secs(60));
         channel
             .publish(&[ready.clone(), parked])
             .await
@@ -3307,7 +3310,7 @@ mod tests {
         let channel = MemoryDispatch::new();
         channel.fail_next(2);
 
-        let one = hint("q", Utc::now());
+        let one = hint("q", Timestamp::now());
         assert!(matches!(
             channel.publish(std::slice::from_ref(&one)).await,
             Err(crate::error::HarvestError::Dispatch(_))
@@ -3330,9 +3333,9 @@ mod tests {
     #[tokio::test]
     async fn memory_dispatch_keeps_queue_order_and_honours_max() {
         let channel = MemoryDispatch::new();
-        let first = hint("q", Utc::now());
-        let second = hint("q", Utc::now());
-        let other = hint("other", Utc::now());
+        let first = hint("q", Timestamp::now());
+        let second = hint("q", Timestamp::now());
+        let other = hint("other", Timestamp::now());
         channel
             .publish(&[first.clone(), second.clone(), other])
             .await
@@ -3370,7 +3373,7 @@ mod tests {
         );
         let bound = Arc::new(MemoryDispatch::new());
 
-        let one = hint("q", Utc::now());
+        let one = hint("q", Timestamp::now());
         let inner = one.clone();
         with_bound_channel(
             Some(Arc::clone(&bound) as Arc<dyn TaskDispatch>),
@@ -3434,10 +3437,13 @@ mod tests {
         );
 
         let wanted = with_bound_channel(None, async { hints_wanted() }).await;
-        with_bound_channel(None, publish_now(vec![hint("q", Utc::now())])).await;
-        with_bound_channel(None, async { publish_in_background(hint("q", Utc::now())) }).await;
+        with_bound_channel(None, publish_now(vec![hint("q", Timestamp::now())])).await;
+        with_bound_channel(None, async {
+            publish_in_background(hint("q", Timestamp::now()));
+        })
+        .await;
         // The publisher queue is FIFO. A leaked hint lands before this one.
-        let sentinel = hint("q", Utc::now());
+        let sentinel = hint("q", Timestamp::now());
         publish_in_background(sentinel.clone());
         for _ in 0..100 {
             if !live.published_ids().is_empty() {
@@ -3465,7 +3471,7 @@ mod tests {
         let first = Arc::new(MemoryDispatch::new());
         let second = Arc::new(MemoryDispatch::new());
         let queued = |channel: &Arc<MemoryDispatch>| QueuedHint {
-            hint: hint("q", Utc::now()),
+            hint: hint("q", Timestamp::now()),
             channel: Some(Arc::clone(channel) as Arc<dyn TaskDispatch>),
         };
         let batch = vec![
@@ -3495,8 +3501,8 @@ mod tests {
         );
         let bound = Arc::new(MemoryDispatch::new());
 
-        let one = hint("q", Utc::now());
-        let unbound = hint("q", Utc::now());
+        let one = hint("q", Timestamp::now());
+        let unbound = hint("q", Timestamp::now());
         let inner = one.clone();
         with_bound_channel(
             Some(Arc::clone(&bound) as Arc<dyn TaskDispatch>),
@@ -3528,7 +3534,7 @@ mod tests {
         uninstall_all();
         let bound = Arc::new(MemoryDispatch::new());
 
-        let one = hint("q", Utc::now());
+        let one = hint("q", Timestamp::now());
         let inner = one.clone();
         let wanted = with_bound_channel(
             Some(Arc::clone(&bound) as Arc<dyn TaskDispatch>),
@@ -3564,7 +3570,7 @@ mod tests {
         );
         let bound = Arc::new(MemoryDispatch::new());
 
-        let one = hint("q", Utc::now());
+        let one = hint("q", Timestamp::now());
         let inner = one.clone();
         with_bound_channel(
             Some(Arc::clone(&bound) as Arc<dyn TaskDispatch>),

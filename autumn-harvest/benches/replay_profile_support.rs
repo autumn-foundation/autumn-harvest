@@ -21,7 +21,7 @@ use std::pin::Pin;
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 /// A representative per-activity input record: an order line item.
@@ -75,7 +75,7 @@ pub fn build_history(n: usize) -> (ExecutionId, Vec<WorkflowEvent>) {
 
     events.push(WorkflowEvent::WorkflowStarted {
         input: Value::from(n as u64),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,

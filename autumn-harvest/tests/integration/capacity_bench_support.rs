@@ -1474,9 +1474,9 @@ pub mod db {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use chrono::{DateTime, Utc};
     use diesel::QueryableByName;
     use diesel_async::{AsyncPgConnection, RunQueryDsl};
+    use jiff::Timestamp;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
     use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
@@ -1884,7 +1884,8 @@ pub mod db {
         #[diesel(sql_type = diesel::sql_types::Text)]
         state: String,
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-        completed_at: Option<DateTime<Utc>>,
+        #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+        completed_at: Option<Timestamp>,
     }
 
     /// Whether a stored state is terminal. An unknown state is not.
@@ -1942,7 +1943,7 @@ pub mod db {
         rate: f64,
         deadline: Instant,
         census: &TaskCensus,
-    ) -> (DateTime<Utc>, Vec<ShardOffer>) {
+    ) -> (Timestamp, Vec<ShardOffer>) {
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
@@ -1970,8 +1971,8 @@ pub mod db {
         // One instant on both clocks. Arrivals are scheduled on the
         // monotonic clock and stamped on the host wall clock.
         let t0 = Instant::now() + STEP_LEAD;
-        let t0_utc = Utc::now()
-            + chrono::Duration::from_std(STEP_LEAD).unwrap_or_else(|_| chrono::Duration::zero());
+        let t0_utc = Timestamp::now()
+            + jiff::SignedDuration::try_from(STEP_LEAD).unwrap_or(jiff::SignedDuration::ZERO);
 
         // A `JoinSet` aborts every arrival if one panics. Each arrival holds
         // a census guard, so a forced abort can wait for its connection.
@@ -2121,8 +2122,9 @@ pub mod db {
                             clippy::cast_precision_loss,
                             reason = "a step lasts seconds; microsecond counts stay far below 2^53"
                         )]
-                        let secs =
-                            (at - t0_utc).num_microseconds().unwrap_or(i64::MAX) as f64 / 1e6;
+                        let secs = autumn_harvest::time::num_microseconds(at - t0_utc)
+                            .unwrap_or(i64::MAX) as f64
+                            / 1e6;
                         Some(secs)
                     });
                     Arrival {

@@ -84,7 +84,7 @@ fn history_for(i: usize, events_per_child: usize, unfinished: bool) -> Vec<Workf
     let mut events = Vec::with_capacity(events_per_child);
     events.push(WorkflowEvent::WorkflowStarted {
         input: serde_json::json!({ "seed": i }),
-        timestamp: chrono::Utc::now(),
+        timestamp: jiff::Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -101,7 +101,7 @@ fn history_for(i: usize, events_per_child: usize, unfinished: bool) -> Vec<Workf
             update_id: UpdateId::new(),
             name: "pending_update".to_string(),
             input: serde_json::json!({ "child": i }),
-            timestamp: chrono::Utc::now(),
+            timestamp: jiff::Timestamp::now(),
         });
     } else {
         events.push(WorkflowEvent::WorkflowCompleted {

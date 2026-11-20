@@ -337,6 +337,30 @@ async fn one_firing_starts_at_most_max_passes_and_the_rest_wait() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_capped_agent_reports_output_capped() {
+    let (_dir, db) = fresh_db();
+    let episodes = Arc::new(InMemoryEpisodeStore::default());
+    let memory = Arc::new(InMemoryMemoryStore::new());
+    let model = TryFnModel::new(|request| -> Reply {
+        if is_pass(request) && user_text(request).contains("stuck") {
+            let mut cut = text_reply("{\"facts\":[{\"subject\":\"ada");
+            cut.stop_reason = StopReason::MaxTokens;
+            return Ok(cut);
+        }
+        Ok(answer(request))
+    });
+    let mut rt = runtime(&db, harness(&db, model, &episodes, &memory));
+    say(&mut rt, &desk("d1"), "stuck").await;
+    say(&mut rt, &desk("d2"), "fine").await;
+    let one = ConsolidateAll::new().max_passes(1);
+
+    let first = fire(&mut rt, &one).await;
+    assert_eq!(first.passes[0].stop, Some(ConsolidationStop::OutputCapped));
+    let second = fire(&mut rt, &one).await;
+    assert_eq!(started(&second), ["desk/d2"], "the capped agent waits");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_stuck_agent_does_not_starve_the_others() {
     let (_dir, db) = fresh_db();
     let episodes = Arc::new(InMemoryEpisodeStore::default());

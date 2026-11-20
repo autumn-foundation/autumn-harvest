@@ -18,13 +18,14 @@
 //! heartbeats, read-only UI page loads, worker fleet reads, and the audit
 //! list endpoint itself. See [`crate::audit::EXCLUDED_ROUTES`] for the full list.
 
-use chrono::{DateTime, Utc};
 use diesel::BoolExpressionMethods;
 use diesel::ExpressionMethods;
 use diesel::QueryDsl;
 use diesel::SelectableHelper;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 use uuid::Uuid;
 
 use crate::error::{HarvestResult, database_error};
@@ -1713,8 +1714,8 @@ pub struct AuditFilters {
     pub target_type: Option<String>,
     pub target_id: Option<String>,
     pub status: Option<String>,
-    pub since: Option<DateTime<Utc>>,
-    pub before: Option<DateTime<Utc>>,
+    pub since: Option<Timestamp>,
+    pub before: Option<Timestamp>,
     /// Row id tiebreaker for `before` (issue #1408).
     ///
     /// `list_audit` orders by `(occurred_at, id)` DESC. Pass the last row's
@@ -1907,20 +1908,20 @@ pub async fn list_audit(
         query = query.filter(harvest_audit_log::status.eq(status.clone()));
     }
     if let Some(since) = filters.since {
-        query = query.filter(harvest_audit_log::occurred_at.ge(since));
+        query = query.filter(harvest_audit_log::occurred_at.ge(since.to_diesel()));
     }
     match (filters.before, filters.before_id) {
         (Some(before), Some(before_id)) => {
             query = query.filter(
-                harvest_audit_log::occurred_at
-                    .lt(before)
-                    .or(harvest_audit_log::occurred_at
-                        .eq(before)
-                        .and(harvest_audit_log::id.lt(before_id))),
+                harvest_audit_log::occurred_at.lt(before.to_diesel()).or(
+                    harvest_audit_log::occurred_at
+                        .eq(before.to_diesel())
+                        .and(harvest_audit_log::id.lt(before_id)),
+                ),
             );
         }
         (Some(before), None) => {
-            query = query.filter(harvest_audit_log::occurred_at.lt(before));
+            query = query.filter(harvest_audit_log::occurred_at.lt(before.to_diesel()));
         }
         (None, _) => {}
     }
@@ -1930,6 +1931,15 @@ pub async fn list_audit(
         .load(conn)
         .await
         .map_err(database_error)
+}
+
+/// Returns the audit purge cutoff, `retention_days` before `now`.
+///
+/// A cutoff before the jiff range gives `Timestamp::MIN`. It predates every
+/// row, as the old `chrono` cutoff did, so the purge cannot panic.
+fn audit_purge_cutoff(now: jiff::Timestamp, retention_days: i64) -> jiff::Timestamp {
+    now.checked_sub(crate::time::days(retention_days))
+        .unwrap_or(jiff::Timestamp::MIN)
 }
 
 /// Delete audit records older than `retention_days` days.
@@ -2107,7 +2117,7 @@ pub async fn purge_old_audit_records(
 ) -> HarvestResult<usize> {
     use diesel_async::RunQueryDsl as _;
 
-    let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days);
+    let cutoff = audit_purge_cutoff(jiff::Timestamp::now(), retention_days);
 
     // Delete an aged row UNLESS export is live AND that row is still pending.
     //
@@ -2263,7 +2273,7 @@ pub async fn purge_old_audit_records(
          ) \
          SELECT COUNT(*) AS deleted FROM deleted",
     )
-    .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
+    .bind::<diesel::sql_types::Timestamptz, _>(cutoff.to_diesel())
     .bind::<diesel::sql_types::Bool, _>(protect_unexported_audit)
     .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(colocated_shard_ids.to_vec())
     .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(exempted_shard_ids.to_vec())
@@ -2288,6 +2298,17 @@ struct PurgeCount {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_purge_cutoff_saturates_before_the_jiff_range() {
+        let now = jiff::Timestamp::constant(1_700_000_000, 0);
+        assert_eq!(
+            audit_purge_cutoff(now, 1),
+            jiff::Timestamp::constant(1_699_913_600, 0)
+        );
+        assert_eq!(audit_purge_cutoff(now, 10_000_000), jiff::Timestamp::MIN);
+        assert_eq!(audit_purge_cutoff(now, i64::MAX), jiff::Timestamp::MIN);
+    }
 
     #[test]
     fn operation_constants_are_distinct() {

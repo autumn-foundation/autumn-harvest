@@ -49,7 +49,7 @@ pub struct PendingRemoteTask {
     /// The remote task handle.
     pub handle: RemoteTaskHandle,
     /// When the token was recorded.
-    pub recorded_at: chrono::DateTime<chrono::Utc>,
+    pub recorded_at: jiff::Timestamp,
 }
 
 /// What one poll did.
@@ -71,8 +71,8 @@ pub struct PollReport {
 type PageRow = (
     uuid::Uuid,
     uuid::Uuid,
-    chrono::DateTime<chrono::Utc>,
-    chrono::DateTime<chrono::Utc>,
+    crate::time::sql::SqlTimestamp,
+    crate::time::sql::SqlTimestamp,
 );
 
 /// One page of the scan.
@@ -84,7 +84,7 @@ struct Page {
     full: bool,
     /// The database time of the query. The first-read wait uses it, so
     /// both sides of the compare use one clock.
-    db_now: chrono::DateTime<chrono::Utc>,
+    db_now: jiff::Timestamp,
 }
 
 /// `first` with "no row" as `None`.
@@ -126,7 +126,7 @@ async fn pending_page(
     let db_now = rows
         .as_slice()
         .first()
-        .map_or_else(chrono::Utc::now, |row| row.3);
+        .map_or_else(jiff::Timestamp::now, |row| row.3.to_jiff());
     let full = i64::try_from(rows.len()).is_ok_and(|n| n >= limit);
     let last = rows
         .last()
@@ -140,7 +140,7 @@ async fn pending_page(
                 token,
                 execution_id,
                 handle,
-                recorded_at,
+                recorded_at: recorded_at.to_jiff(),
             }),
             Ok(None) => {
                 tracing::warn!(
@@ -678,13 +678,13 @@ impl RemoteTaskPoller {
     /// `false` while the start poll interval of `pending` runs at the
     /// database time `db_now`. The token time is in the database, so a
     /// restart keeps the wait.
-    fn first_read_due(pending: &PendingRemoteTask, db_now: chrono::DateTime<chrono::Utc>) -> bool {
+    fn first_read_due(pending: &PendingRemoteTask, db_now: jiff::Timestamp) -> bool {
         let Some(wait) = pending.handle.poll_interval_ms.map(Duration::from_millis) else {
             return true;
         };
-        chrono::Duration::from_std(wait.min(MAX_SERVER_POLL_INTERVAL))
+        jiff::SignedDuration::try_from(wait.min(MAX_SERVER_POLL_INTERVAL))
             .ok()
-            .and_then(|wait| pending.recorded_at.checked_add_signed(wait))
+            .and_then(|wait| pending.recorded_at.checked_add(wait).ok())
             .is_none_or(|due| db_now >= due)
     }
 
@@ -791,7 +791,7 @@ mod tests {
                 task_id: task_id.into(),
                 poll_interval_ms: None,
             },
-            recorded_at: chrono::Utc::now(),
+            recorded_at: jiff::Timestamp::now(),
         }
     }
 
@@ -815,7 +815,7 @@ mod tests {
     #[test]
     fn the_first_read_uses_the_database_clock() {
         // A database clock one day ahead of this host.
-        let recorded_at = chrono::Utc::now() + chrono::Duration::days(1);
+        let recorded_at = jiff::Timestamp::now() + crate::time::days(1);
         let pending = PendingRemoteTask {
             token: ExternalActivityToken::new(),
             execution_id: ExecutionId::new(),
@@ -827,8 +827,8 @@ mod tests {
             },
             recorded_at,
         };
-        let early = recorded_at + chrono::Duration::seconds(4);
-        let late = recorded_at + chrono::Duration::seconds(6);
+        let early = recorded_at + jiff::SignedDuration::from_secs(4);
+        let late = recorded_at + jiff::SignedDuration::from_secs(6);
         assert!(!RemoteTaskPoller::first_read_due(&pending, early));
         assert!(RemoteTaskPoller::first_read_due(&pending, late));
     }

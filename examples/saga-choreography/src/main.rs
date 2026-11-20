@@ -127,7 +127,7 @@ mod tests {
     use autumn_harvest::event::WorkflowEvent;
     use autumn_harvest::testing::{HistorySnapshot, ReplayStatus, WorkflowReplayer};
     use autumn_harvest::types::{ActivityExecId, ExecutionId, ExternalSignalId, ExternalTarget};
-    use chrono::Utc;
+    use jiff::Timestamp;
     use serde_json::{Value, json};
 
     fn tenant_cancel_handler<'a>(
@@ -160,7 +160,7 @@ mod tests {
                     "tenant_id": "acme",
                     "onboarding_exec_ids": [target_id.to_string()],
                 }),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -187,7 +187,7 @@ mod tests {
                     "tenant_id": "acme",
                     "onboarding_exec_ids": [target_id.to_string()],
                 }),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -215,7 +215,7 @@ mod tests {
         vec![
             WorkflowEvent::WorkflowStarted {
                 input: json!({ "tenant_id": tenant_id }),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,

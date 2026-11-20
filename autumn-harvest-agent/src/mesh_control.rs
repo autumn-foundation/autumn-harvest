@@ -15,7 +15,8 @@
 //!
 //! [`AgentProfile::mesh`]: crate::AgentProfile::mesh
 
-use autumn_harvest::chrono::{DateTime, Datelike, TimeZone, Utc};
+use autumn_harvest::overlay_log::utc_day;
+use autumn_harvest::time::{self, Timestamp, civil};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentId;
@@ -46,44 +47,36 @@ pub enum BudgetPeriod {
 impl BudgetPeriod {
     /// The start and the end of the period that holds `now`.
     #[must_use]
-    pub fn window(self, now: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
+    pub fn window(self, now: Timestamp) -> (Timestamp, Timestamp) {
         match self {
-            Self::Day => {
-                let start = Utc
-                    .with_ymd_and_hms(now.year(), now.month(), now.day(), 0, 0, 0)
-                    .single()
-                    .unwrap_or(now);
-                (start, start + autumn_harvest::chrono::Duration::days(1))
-            }
+            Self::Day => utc_day(now),
             Self::Month => {
-                let start = Utc
-                    .with_ymd_and_hms(now.year(), now.month(), 1, 0, 0, 0)
-                    .single()
-                    .unwrap_or(now);
-                let (year, month) = if now.month() == 12 {
-                    (now.year() + 1, 1)
-                } else {
-                    (now.year(), now.month() + 1)
-                };
-                let end = Utc
-                    .with_ymd_and_hms(year, month, 1, 0, 0, 0)
-                    .single()
+                let first = time::utc_date(now).first_of_month();
+                let start = utc_midnight(first).unwrap_or(now);
+                let end = first
+                    .last_of_month()
+                    .tomorrow()
+                    .ok()
+                    .and_then(utc_midnight)
                     .unwrap_or(now);
                 (start, end)
             }
             Self::Every { secs } => {
                 let len = i64::try_from(secs.max(1)).unwrap_or(i64::MAX);
-                let at = now.timestamp();
+                // The floored second keeps `now` inside the window before 1970.
+                let at = time::chrono_split(now).0;
                 let start = at - at.rem_euclid(len);
-                let from = Utc.timestamp_opt(start, 0).single().unwrap_or(now);
-                let until = Utc
-                    .timestamp_opt(start.saturating_add(len), 0)
-                    .single()
-                    .unwrap_or(now);
+                let from = Timestamp::from_second(start).unwrap_or(now);
+                let until = Timestamp::from_second(start.saturating_add(len)).unwrap_or(now);
                 (from, until)
             }
         }
     }
+}
+
+/// The UTC midnight at the start of `date`, or `None` past the jiff range.
+fn utc_midnight(date: civil::Date) -> Option<Timestamp> {
+    time::from_utc_datetime(date.to_datetime(civil::Time::midnight()))
 }
 
 /// A cap on the spend of one mesh in each period.
@@ -181,7 +174,7 @@ pub trait MeshSpend: Send + Sync + std::fmt::Debug {
     fn spent<'a>(
         &'a self,
         mesh: &'a str,
-        since: DateTime<Utc>,
+        since: Timestamp,
     ) -> BoxFuture<'a, Result<Spend, AgentError>>;
 }
 
@@ -212,7 +205,7 @@ pub struct MeshPause {
 mod tests {
     use super::*;
 
-    fn at(text: &str) -> DateTime<Utc> {
+    fn at(text: &str) -> Timestamp {
         text.parse().unwrap()
     }
 
@@ -235,6 +228,15 @@ mod tests {
         let (start, end) = BudgetPeriod::Every { secs: 60 }.window(at("2026-10-23T17:05:30Z"));
         assert_eq!(start, at("2026-10-23T17:05:00Z"));
         assert_eq!(end, at("2026-10-23T17:06:00Z"));
+    }
+
+    #[test]
+    fn a_fixed_window_holds_a_fractional_instant_before_the_epoch() {
+        let now = at("1969-12-31T23:59:59.5Z");
+        let (start, end) = BudgetPeriod::Every { secs: 60 }.window(now);
+        assert_eq!(start, at("1969-12-31T23:59:00Z"));
+        assert_eq!(end, at("1970-01-01T00:00:00Z"));
+        assert!(start <= now && now < end);
     }
 
     #[test]

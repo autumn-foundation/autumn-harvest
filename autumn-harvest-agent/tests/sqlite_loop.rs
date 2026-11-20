@@ -24,8 +24,8 @@ use common::{
 use serde_json::json;
 
 /// A wall-clock instant `seconds` from now, to fire a durable timer early.
-fn later(seconds: i64) -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc::now() + chrono::Duration::seconds(seconds)
+fn later(seconds: i64) -> jiff::Timestamp {
+    jiff::Timestamp::now() + jiff::SignedDuration::from_secs(seconds)
 }
 
 fn fresh_db() -> (tempfile::TempDir, std::path::PathBuf) {

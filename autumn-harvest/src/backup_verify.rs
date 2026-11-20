@@ -45,7 +45,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 #[cfg(all(feature = "db", feature = "testing"))]
 use uuid::Uuid;
@@ -736,7 +736,7 @@ pub struct ShardVerifyReport {
     pub unreachable_reason: Option<String>,
     /// Newest `harvest_events.timestamp` observed — the restore-point proxy.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub latest_event_at: Option<DateTime<Utc>>,
+    pub latest_event_at: Option<Timestamp>,
     /// Count of non-terminal (`RUNNING`/`PAUSED`) executions.
     ///
     /// `None` when the count probe itself failed — never `0`, which would read
@@ -770,7 +770,7 @@ impl ShardVerifyReport {
 #[derive(Debug, Clone, Serialize)]
 pub struct RestoreVerifyReport {
     /// When the drill ran.
-    pub generated_at: DateTime<Utc>,
+    pub generated_at: Timestamp,
     /// The overall verdict.
     pub status: VerifyStatus,
     /// Per-shard detail.
@@ -799,7 +799,7 @@ impl RestoreVerifyReport {
     /// Assembles a report from per-shard results, deriving status and totals.
     #[must_use]
     pub fn assemble(
-        generated_at: DateTime<Utc>,
+        generated_at: Timestamp,
         shards: Vec<ShardVerifyReport>,
         cross_shard: Vec<Finding>,
     ) -> Self {
@@ -873,15 +873,15 @@ impl RestoreVerifyReport {
 /// Largest pairwise gap, in seconds, between the supplied restore-point
 /// proxies. `None` when fewer than two shards reported a timestamp.
 #[must_use]
-pub fn compute_skew(latest: impl IntoIterator<Item = Option<DateTime<Utc>>>) -> Option<i64> {
-    let mut seen: Vec<DateTime<Utc>> = latest.into_iter().flatten().collect();
+pub fn compute_skew(latest: impl IntoIterator<Item = Option<Timestamp>>) -> Option<i64> {
+    let mut seen: Vec<Timestamp> = latest.into_iter().flatten().collect();
     if seen.len() < 2 {
         return None;
     }
     seen.sort_unstable();
     let first = *seen.first()?;
     let last = *seen.last()?;
-    Some((last - first).num_seconds().abs())
+    Some((last - first).as_secs().abs())
 }
 
 // ── Completion-trigger fire routing and adjudication (pure) ────────────────
@@ -906,7 +906,7 @@ pub fn compute_skew(latest: impl IntoIterator<Item = Option<DateTime<Utc>>>) -> 
 struct ResolvedFire {
     source_exec_id: Uuid,
     trigger_id: Uuid,
-    fired_at: DateTime<Utc>,
+    fired_at: Timestamp,
     target_workflow_name: String,
     target_shard: Option<i32>,
 }
@@ -929,7 +929,7 @@ struct PendingTriggerFire {
     target_workflow_name: String,
     target_workflow_id: String,
     target_shard: i32,
-    fired_at: DateTime<Utc>,
+    fired_at: Timestamp,
 }
 
 /// Route each fire to its target shard and drop the same-shard ones.
@@ -1096,8 +1096,8 @@ fn route_trigger_fires(
 #[cfg(all(feature = "db", feature = "testing"))]
 #[must_use]
 fn absence_is_decisive_loss(
-    fired_at: DateTime<Utc>,
-    target_latest_event_at: Option<DateTime<Utc>>,
+    fired_at: Timestamp,
+    target_latest_event_at: Option<Timestamp>,
     max_skew_secs: i64,
 ) -> bool {
     // `VerifyOptions::max_skew_secs` is a public, unvalidated field (issue
@@ -1106,13 +1106,13 @@ fn absence_is_decisive_loss(
     // decisive loss instead of proof of life. Floor it at zero: a
     // negative tolerance means "no tolerance", not "invert the check".
     let max_skew_secs = max_skew_secs.max(0);
-    // A very large positive value can still overflow `Duration::seconds`'s
-    // representable range and panic (issue #1401). That would abort
-    // the whole verify run instead of returning an undetermined report.
-    // Fall back to the largest representable tolerance instead. An
-    // out-of-range request means "tolerate anything." That is the safe
-    // reading of an unbounded skew allowance, not a crash.
-    let max_skew = chrono::Duration::try_seconds(max_skew_secs).unwrap_or(chrono::Duration::MAX);
+    // A very large positive value overflowed `chrono::Duration::seconds`
+    // and panicked (issue #1401). That aborted the whole verify run instead
+    // of returning an undetermined report. `SignedDuration::from_secs` holds
+    // every `i64`, so it cannot panic. A value past the span of two
+    // timestamps means "tolerate anything", the safe reading of an
+    // unbounded skew allowance.
+    let max_skew = jiff::SignedDuration::from_secs(max_skew_secs);
     matches!(
         target_latest_event_at,
         Some(latest) if fired_at - latest > max_skew
@@ -1449,10 +1449,10 @@ impl VerifyOptions {
 mod probes {
     use std::collections::{BTreeMap, BTreeSet};
 
-    use chrono::{DateTime, Utc};
     use diesel::OptionalExtension as _;
     use diesel::sql_types::{BigInt, Integer, Nullable, Text, Timestamptz};
     use diesel_async::{AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+    use jiff::Timestamp;
     use uuid::Uuid;
 
     use super::{
@@ -1479,7 +1479,8 @@ mod probes {
     #[derive(diesel::QueryableByName)]
     struct LatestEventRow {
         #[diesel(sql_type = Nullable<Timestamptz>)]
-        latest: Option<DateTime<Utc>>,
+        #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+        latest: Option<Timestamp>,
     }
 
     #[derive(diesel::QueryableByName)]
@@ -2077,7 +2078,8 @@ mod probes {
         #[diesel(sql_type = diesel::sql_types::Uuid)]
         trigger_id: Uuid,
         #[diesel(sql_type = Timestamptz)]
-        fired_at: DateTime<Utc>,
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+        fired_at: Timestamp,
         #[diesel(sql_type = Nullable<Integer>)]
         target_shard: Option<i32>,
         #[diesel(sql_type = Nullable<Text>)]
@@ -3732,7 +3734,7 @@ mod probes {
         conn: &mut AsyncPgConnection,
         owned: &[&super::PendingTriggerFire],
         targets: &[ShardTarget],
-        latest_by_shard: &std::collections::BTreeMap<i32, Option<DateTime<Utc>>>,
+        latest_by_shard: &std::collections::BTreeMap<i32, Option<Timestamp>>,
         max_skew_secs: i64,
     ) -> TriggerFireBuckets {
         let mut out = TriggerFireBuckets::default();
@@ -3949,7 +3951,7 @@ mod probes {
         conn: &mut AsyncPgConnection,
         chunk: &[&super::PendingTriggerFire],
         targets: &[ShardTarget],
-        latest_by_shard: &std::collections::BTreeMap<i32, Option<DateTime<Utc>>>,
+        latest_by_shard: &std::collections::BTreeMap<i32, Option<Timestamp>>,
         max_skew_secs: i64,
         out: &mut TriggerFireBuckets,
     ) {
@@ -4055,7 +4057,7 @@ mod probes {
                 fire.target_workflow_id,
                 fire.source_exec_id,
                 fire.source_shard,
-                fire.fired_at,
+                crate::time::utc_display(fire.fired_at),
                 fire.target_shard
             );
             if super::absence_is_decisive_loss(fire.fired_at, target_latest, max_skew_secs) {
@@ -4107,7 +4109,7 @@ mod probes {
             ));
         }
 
-        let latest_by_shard: std::collections::BTreeMap<i32, Option<DateTime<Utc>>> = shards
+        let latest_by_shard: std::collections::BTreeMap<i32, Option<Timestamp>> = shards
             .iter()
             .map(|s| (s.shard_id, s.latest_event_at))
             .collect();
@@ -4274,7 +4276,7 @@ mod probes {
             );
         }
 
-        RestoreVerifyReport::assemble(chrono::Utc::now(), shards, cross_shard)
+        RestoreVerifyReport::assemble(jiff::Timestamp::now(), shards, cross_shard)
     }
 }
 
@@ -4355,7 +4357,7 @@ mod tests {
         ResolvedFire {
             source_exec_id: Uuid::new_v4(),
             trigger_id: Uuid::new_v4(),
-            fired_at: Utc::now(),
+            fired_at: Timestamp::now(),
             target_workflow_name: target_workflow_name.to_string(),
             target_shard: None,
         }
@@ -4522,14 +4524,18 @@ mod tests {
     #[test]
     #[cfg(all(feature = "db", feature = "testing"))]
     fn absence_is_decisive_loss_requires_a_restore_point_strictly_before_the_fire() {
-        let fired_at = Utc::now();
+        let fired_at = Timestamp::now();
 
         assert!(
             !absence_is_decisive_loss(fired_at, None, 0),
             "no timestamp signal at all must not be treated as proof of loss"
         );
         assert!(
-            absence_is_decisive_loss(fired_at, Some(fired_at - chrono::Duration::seconds(1)), 0),
+            absence_is_decisive_loss(
+                fired_at,
+                Some(fired_at - jiff::SignedDuration::from_secs(1)),
+                0
+            ),
             "a target restore point strictly before the fire proves the loss"
         );
         assert!(
@@ -4537,7 +4543,11 @@ mod tests {
             "a restore point exactly at the fire is not proof of loss"
         );
         assert!(
-            !absence_is_decisive_loss(fired_at, Some(fired_at + chrono::Duration::seconds(1)), 0),
+            !absence_is_decisive_loss(
+                fired_at,
+                Some(fired_at + jiff::SignedDuration::from_secs(1)),
+                0
+            ),
             "a target shard that progressed past the fire may simply have \
              retained and collected the run"
         );
@@ -4546,13 +4556,13 @@ mod tests {
     #[test]
     #[cfg(all(feature = "db", feature = "testing"))]
     fn absence_is_decisive_loss_requires_the_gap_to_exceed_the_skew_tolerance() {
-        let fired_at = Utc::now();
+        let fired_at = Timestamp::now();
         let max_skew_secs = 60;
 
         assert!(
             !absence_is_decisive_loss(
                 fired_at,
-                Some(fired_at - chrono::Duration::seconds(max_skew_secs)),
+                Some(fired_at - jiff::SignedDuration::from_secs(max_skew_secs)),
                 max_skew_secs,
             ),
             "a gap no larger than the configured cross-shard clock-skew \
@@ -4561,7 +4571,7 @@ mod tests {
         assert!(
             absence_is_decisive_loss(
                 fired_at,
-                Some(fired_at - chrono::Duration::seconds(max_skew_secs + 1)),
+                Some(fired_at - jiff::SignedDuration::from_secs(max_skew_secs + 1)),
                 max_skew_secs,
             ),
             "a gap exceeding the skew tolerance is still proof of loss"
@@ -4575,19 +4585,23 @@ mod tests {
         // (issue #1401). A negative value must not flip the
         // comparison and report a target shard AHEAD of `fired_at` as
         // decisive loss.
-        let fired_at = Utc::now();
+        let fired_at = Timestamp::now();
 
         assert!(
             !absence_is_decisive_loss(
                 fired_at,
-                Some(fired_at + chrono::Duration::seconds(30)),
+                Some(fired_at + jiff::SignedDuration::from_secs(30)),
                 -60
             ),
             "a target shard ahead of fired_at is proof of life, not loss, \
              regardless of a negative configured tolerance"
         );
         assert!(
-            absence_is_decisive_loss(fired_at, Some(fired_at - chrono::Duration::seconds(1)), -60),
+            absence_is_decisive_loss(
+                fired_at,
+                Some(fired_at - jiff::SignedDuration::from_secs(1)),
+                -60
+            ),
             "a negative tolerance floors to zero, so any positive gap is still \
              decisive loss"
         );
@@ -4600,12 +4614,12 @@ mod tests {
         // (issue #1401). `chrono::Duration::seconds` panics when its
         // argument overflows the representable range. This must return a
         // finding instead of aborting the whole verify run.
-        let fired_at = Utc::now();
+        let fired_at = Timestamp::now();
 
         assert!(
             !absence_is_decisive_loss(
                 fired_at,
-                Some(fired_at - chrono::Duration::seconds(30)),
+                Some(fired_at - jiff::SignedDuration::from_secs(30)),
                 i64::MAX
             ),
             "an out-of-range tolerance means \"treat as unbounded,\" so a \
@@ -4925,7 +4939,7 @@ mod tests {
             classify_status(expected.iter(), false),
             VerifyStatus::ResumableWithReclaim
         );
-        let report = RestoreVerifyReport::assemble(Utc::now(), vec![], expected);
+        let report = RestoreVerifyReport::assemble(Timestamp::now(), vec![], expected);
         assert_eq!(report.exit_code(), 0);
     }
 
@@ -4937,12 +4951,12 @@ mod tests {
     #[test]
     fn exit_codes_distinguish_incoherent_from_undetermined() {
         let shard = ShardVerifyReport::unreachable(1, "postgres://h/db", "connection refused");
-        let unavailable = RestoreVerifyReport::assemble(Utc::now(), vec![shard], vec![]);
+        let unavailable = RestoreVerifyReport::assemble(Timestamp::now(), vec![shard], vec![]);
         assert_eq!(unavailable.status, VerifyStatus::Unavailable);
         assert_eq!(unavailable.exit_code(), 2);
 
         let incoherent = RestoreVerifyReport::assemble(
-            Utc::now(),
+            Timestamp::now(),
             vec![],
             vec![finding(FindingClass::ChildExecutionMissing)],
         );
@@ -4967,7 +4981,7 @@ mod tests {
             findings: vec![finding(FindingClass::DeadWorkerRunningTask)],
         };
         let report = RestoreVerifyReport::assemble(
-            Utc::now(),
+            Timestamp::now(),
             vec![shard],
             vec![finding(FindingClass::ReplayDivergence)],
         );
@@ -5038,20 +5052,20 @@ mod tests {
 
     #[test]
     fn compute_skew_needs_two_timestamps() {
-        let t0 = Utc::now();
+        let t0 = Timestamp::now();
         assert_eq!(compute_skew([]), None);
         assert_eq!(compute_skew([Some(t0)]), None);
         assert_eq!(compute_skew([Some(t0), None]), None);
         assert_eq!(
-            compute_skew([Some(t0), Some(t0 + chrono::Duration::seconds(90))]),
+            compute_skew([Some(t0), Some(t0 + jiff::SignedDuration::from_secs(90))]),
             Some(90)
         );
         // Order-independent, and uses the widest pair, not adjacent pairs.
         assert_eq!(
             compute_skew([
-                Some(t0 + chrono::Duration::seconds(120)),
+                Some(t0 + jiff::SignedDuration::from_secs(120)),
                 Some(t0),
-                Some(t0 + chrono::Duration::seconds(30)),
+                Some(t0 + jiff::SignedDuration::from_secs(30)),
             ]),
             Some(120)
         );

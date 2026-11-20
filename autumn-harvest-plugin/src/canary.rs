@@ -28,10 +28,10 @@ use std::time::Duration;
 use autumn_harvest::policy::MAX_INTERVAL_PERIOD;
 use autumn_harvest::prelude::*;
 use autumn_harvest::worker::DbPool;
-use chrono::{DateTime, Utc};
 use diesel::sql_types::{Nullable, Text, Timestamptz};
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use futures::future::join_all;
+use jiff::Timestamp;
 use serde::Serialize;
 
 use crate::api::HarvestApiState;
@@ -546,9 +546,9 @@ pub struct CanaryRow {
     /// Terminal or in-flight state string.
     pub state: String,
     /// When the probe run started.
-    pub started_at: DateTime<Utc>,
+    pub started_at: Timestamp,
     /// When the probe run reached a terminal state (`NULL` while in flight).
-    pub completed_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<Timestamp>,
 }
 
 /// Freshness of one `(queue, shard)` synthetic-liveness probe (issue #796).
@@ -563,7 +563,7 @@ pub struct CanaryProbeStatus {
     /// It is `None` if no probe on this `(queue, shard)` ever completed. An
     /// empty or write-blocked shard reports `None` here and `stale: true`
     /// (AC4/AC7).
-    pub last_success_at: Option<DateTime<Utc>>,
+    pub last_success_at: Option<Timestamp>,
     /// Seconds since [`Self::last_success_at`] as of the snapshot, or `None`
     /// when there has been no success.
     pub age_of_last_success_secs: Option<i64>,
@@ -586,7 +586,7 @@ pub struct CanaryReport {
     /// Cross-shard completeness of this snapshot.
     pub status: CanaryReportStatus,
     /// When the snapshot was assembled.
-    pub as_of: DateTime<Utc>,
+    pub as_of: Timestamp,
     /// The staleness window (seconds) each probe's freshness was judged against.
     pub staleness_window_secs: i64,
     /// Per-`(queue, shard)` probe freshness, sorted by `(queue, shard)`.
@@ -600,7 +600,7 @@ impl CanaryReport {
     /// An empty, complete report — used when the canary is disabled (no config
     /// mirrored onto the runtime). The endpoint still answers `200`, it just
     /// reports nothing (AC1: disabled ⇒ no probes).
-    const fn empty(as_of: DateTime<Utc>) -> Self {
+    const fn empty(as_of: Timestamp) -> Self {
         Self {
             status: FanoutStatus::Complete,
             as_of,
@@ -636,7 +636,7 @@ pub fn build_canary_report(
     expected: &[(String, i32)],
     observations: &[ShardObservation<CanaryRow>],
     staleness_window: Duration,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> CanaryReport {
     let (inspected, unavailable_shards) = shard_fanout::summarize_shard_errors(observations);
 
@@ -696,10 +696,9 @@ pub fn build_canary_report(
             {
                 Some((completed, started)) => {
                     let age = shard_fanout::age_secs(now, completed);
-                    let latency = completed
-                        .signed_duration_since(started)
-                        .num_milliseconds()
-                        .max(0);
+                    let latency =
+                        autumn_harvest::time::num_milliseconds(completed.duration_since(started))
+                            .max(0);
                     (Some(completed), Some(age), Some(latency))
                 }
                 None => (None, None, None),
@@ -753,9 +752,11 @@ struct CanaryRowDb {
     #[diesel(sql_type = Text)]
     state: String,
     #[diesel(sql_type = Timestamptz)]
-    started_at: DateTime<Utc>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::SqlTimestamp)]
+    started_at: Timestamp,
     #[diesel(sql_type = Nullable<Timestamptz>)]
-    completed_at: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+    completed_at: Option<Timestamp>,
 }
 
 /// Bounded upper limit on canary rows read per shard.
@@ -832,7 +833,7 @@ async fn observe_canary_shard(shard_id: i32, pool: Option<DbPool>) -> ShardObser
 /// canary (no config mirrored onto the runtime) returns an empty `complete`
 /// report. The endpoint still works; it just reports nothing (AC1).
 pub async fn build_canary_report_from_shards(api_state: &HarvestApiState) -> CanaryReport {
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     let Some(cfg) = api_state.canary_config() else {
         return CanaryReport::empty(now);
@@ -1185,10 +1186,10 @@ mod tests {
 
     // ── build_canary_report (pure read-model, no DB) ─────────────────────────
 
-    use chrono::TimeZone as _;
+    use jiff::Timestamp;
 
-    fn at(seconds: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(seconds, 0).unwrap()
+    fn at(seconds: i64) -> Timestamp {
+        Timestamp::new(seconds, 0).unwrap()
     }
 
     fn row(queue: &str, state: &str, started: i64, completed: Option<i64>) -> CanaryRow {

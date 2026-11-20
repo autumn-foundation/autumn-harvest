@@ -29,7 +29,7 @@
 //! `docs/design/DESIGN-2374.md` and `docs/design/DESIGN-2394.md`.
 //! `formal/verus/src/overlay_log.rs` proves the kernel.
 
-use chrono::{DateTime, TimeDelta, Utc};
+use jiff::Timestamp;
 
 /// The `author_kind` of a version that an operator wrote.
 pub const AUTHOR_OPERATOR: &str = "operator";
@@ -284,7 +284,7 @@ pub struct ActivationRow {
     /// The operator id, or the execution id of the refine run.
     pub actor: String,
     /// The time of the move.
-    pub activated_at: DateTime<Utc>,
+    pub activated_at: Timestamp,
 }
 
 /// One stored overlay version.
@@ -299,19 +299,17 @@ pub struct OverlayRow {
     /// The operator id, or the execution id of the refine run.
     pub author: String,
     /// The time of the write.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 /// The start and the end of the UTC day of `at`.
 #[must_use]
-pub fn utc_day(at: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
-    let start = at
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .map_or(at, |midnight| midnight.and_utc());
+pub fn utc_day(at: Timestamp) -> (Timestamp, Timestamp) {
+    let midnight = crate::time::utc_date(at).to_datetime(jiff::civil::Time::midnight());
+    let start = crate::time::from_utc_datetime(midnight).unwrap_or(at);
     let end = start
-        .checked_add_signed(TimeDelta::days(1))
-        .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        .checked_add(crate::time::days(1))
+        .unwrap_or(Timestamp::MAX);
     (start, end)
 }
 
@@ -392,7 +390,7 @@ pub struct PolicyRow {
     /// The operator id.
     pub actor: String,
     /// The time of the change.
-    pub changed_at: DateTime<Utc>,
+    pub changed_at: Timestamp,
 }
 
 /// One write of the refine policy log. The caller checks the actor and the
@@ -433,7 +431,7 @@ pub struct AutoAdoptRequest<'a> {
     /// The daily cap, or `None` for no cap.
     pub cap: Option<u32>,
     /// The time of the move. Its UTC day is the day of the cap.
-    pub at: DateTime<Utc>,
+    pub at: Timestamp,
     /// The policy revision that the gate read. The transaction compares
     /// it, so a policy change after the gate refuses the move.
     pub policy_revision: Option<u64>,
@@ -475,10 +473,11 @@ pub use pg::{
 /// `ProfileOverlayStore`, which does.
 #[cfg(feature = "db")]
 mod pg {
-    use chrono::{DateTime, Utc};
     use diesel::QueryableByName;
     use diesel::sql_types::{BigInt, Binary, Bool, Nullable, Text, Timestamptz};
     use diesel_async::{AsyncPgConnection, RunQueryDsl};
+    use jiff::Timestamp;
+    use jiff_diesel::ToDiesel;
 
     use super::{
         AUTHOR_AUTO, ActivateDecision, ActivateOutcome, ActivationRow, AutoAdoptRaw,
@@ -501,7 +500,8 @@ mod pg {
         #[diesel(sql_type = Text)]
         author: String,
         #[diesel(sql_type = Timestamptz)]
-        created_at: DateTime<Utc>,
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+        created_at: Timestamp,
     }
 
     impl Row {
@@ -737,7 +737,8 @@ mod pg {
         #[diesel(sql_type = Text)]
         actor: String,
         #[diesel(sql_type = Timestamptz)]
-        activated_at: DateTime<Utc>,
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+        activated_at: Timestamp,
     }
 
     /// The last move of the pointer of `kind`, or `None`.
@@ -856,7 +857,8 @@ mod pg {
         #[diesel(sql_type = Text)]
         actor: String,
         #[diesel(sql_type = Timestamptz)]
-        changed_at: DateTime<Utc>,
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+        changed_at: Timestamp,
     }
 
     impl Policy {
@@ -1125,7 +1127,7 @@ mod pg {
             .bind::<BigInt, _>(version)
             .bind::<Text, _>(AUTHOR_AUTO)
             .bind::<Text, _>(request.actor)
-            .bind::<Timestamptz, _>(request.at)
+            .bind::<Timestamptz, _>(request.at.to_diesel())
             .execute(conn)
             .await?;
             Ok(AutoAdoptRaw::Adopted(row))
@@ -1152,8 +1154,8 @@ mod pg {
         )
         .bind::<Text, _>(kind)
         .bind::<Text, _>(AUTHOR_AUTO)
-        .bind::<Timestamptz, _>(start)
-        .bind::<Timestamptz, _>(end)
+        .bind::<Timestamptz, _>(start.to_diesel())
+        .bind::<Timestamptz, _>(end.to_diesel())
         .get_result(conn)
         .await
         .map_err(database_error)?;
@@ -1190,12 +1192,10 @@ mod tests {
 
     #[test]
     fn a_utc_day_runs_from_midnight_to_midnight() {
-        let at = DateTime::parse_from_rfc3339("2026-11-03T23:59:59Z")
-            .expect("time")
-            .with_timezone(&Utc);
+        let at = ("2026-11-03T23:59:59Z").parse::<Timestamp>().expect("time");
         let (start, end) = utc_day(at);
-        assert_eq!(start.to_rfc3339(), "2026-11-03T00:00:00+00:00");
-        assert_eq!(end.to_rfc3339(), "2026-11-04T00:00:00+00:00");
+        assert_eq!(crate::time::rfc3339(start), "2026-11-03T00:00:00+00:00");
+        assert_eq!(crate::time::rfc3339(end), "2026-11-04T00:00:00+00:00");
         assert_eq!(utc_day(start), (start, end));
         assert_eq!(utc_day(end).0, end);
     }

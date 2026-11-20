@@ -405,8 +405,8 @@ async fn schedule_backfill_paces_admissions_and_defers_the_excess() {
     let schedule_id =
         insert_workflow_schedule(&mut conn, "sync_tenant", json!({ "tenant_id": "acme" })).await;
 
-    let now = chrono::Utc::now();
-    let from = now - chrono::Duration::hours(4);
+    let now = jiff::Timestamp::now();
+    let from = now - jiff::SignedDuration::from_hours(4);
     let (status, body) = post_json(
         &app,
         &format!("/admin/schedules/{schedule_id}/backfill"),
@@ -458,7 +458,7 @@ async fn schedule_backfill_skips_oversized_input_before_deferring() {
     });
     let schedule_id = insert_workflow_schedule(&mut conn, "sync_tenant", oversized_input).await;
 
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let (status, body) = post_json(
         &app,
         &format!("/admin/schedules/{schedule_id}/backfill"),
@@ -527,7 +527,7 @@ async fn schedule_backfill_counts_pending_throttled_slots_against_max_active_run
     )
     .await;
 
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let (status1, body1) = post_json(
         &app,
         &format!("/admin/schedules/{schedule_id}/backfill"),
@@ -559,7 +559,7 @@ async fn schedule_backfill_counts_pending_throttled_slots_against_max_active_run
     // max_active_runs=1. It must skip, not defer a second row. The slot uses a
     // different hour. So it plans to a distinct workflow_id and is not
     // rejected as an already-existing run.
-    let next_hour = now + chrono::Duration::hours(1);
+    let next_hour = now + jiff::SignedDuration::from_hours(1);
     let (status2, body2) = post_json(
         &app,
         &format!("/admin/schedules/{schedule_id}/backfill"),
@@ -623,7 +623,7 @@ async fn repeated_backfill_call_does_not_double_count_an_already_pending_throttl
     let schedule_id =
         insert_workflow_schedule(&mut conn, "sync_tenant", json!({ "tenant_id": "acme" })).await;
 
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let window = json!({ "from": now, "to": now });
 
     let (status1, body1) = post_json(
@@ -950,7 +950,7 @@ async fn retry_with_a_pending_throttle_row_bypasses_the_admission_gate() {
         reason: "incident".to_string(),
         message: None,
         created_by: "test".to_string(),
-        created_at: chrono::Utc::now(),
+        created_at: jiff::Timestamp::now(),
         expires_at: None,
     }]);
 
@@ -1019,7 +1019,7 @@ async fn armed_gate_blocks_fresh_creating_start_under_reuse_policy_on_empty_buck
         reason: "incident".to_string(),
         message: None,
         created_by: "test".to_string(),
-        created_at: chrono::Utc::now(),
+        created_at: jiff::Timestamp::now(),
         expires_at: None,
     }]);
 
@@ -1225,7 +1225,7 @@ async fn batch_retry_with_a_pending_throttle_row_bypasses_the_admission_gate() {
         reason: "incident".to_string(),
         message: None,
         created_by: "test".to_string(),
-        created_at: chrono::Utc::now(),
+        created_at: jiff::Timestamp::now(),
         expires_at: None,
     }]);
 
@@ -1379,7 +1379,7 @@ async fn batch_gate_bypasses_an_attaching_item_but_blocks_a_would_be_fresh_creat
         reason: "incident".to_string(),
         message: None,
         created_by: "test".to_string(),
-        created_at: chrono::Utc::now(),
+        created_at: jiff::Timestamp::now(),
         expires_at: None,
     }]);
 

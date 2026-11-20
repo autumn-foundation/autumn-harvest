@@ -19,7 +19,7 @@ use autumn_harvest::remote_task::{
     RemoteTaskState, RemoteTaskTransport, RemoteTasks, START_ACTIVITY, a2a, mcp,
 };
 use autumn_harvest::types::{ActivityExecId, ExecutionId, ExternalActivityToken};
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 fn request(protocol: RemoteProtocol) -> RemoteTaskRequest {
@@ -407,7 +407,7 @@ fn call() -> RemoteTaskCall {
 fn started() -> WorkflowEvent {
     WorkflowEvent::WorkflowStarted {
         input: Value::Null,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,

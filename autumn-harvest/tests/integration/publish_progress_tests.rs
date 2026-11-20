@@ -19,7 +19,7 @@ use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer, WorkflowTestEnv};
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
@@ -86,7 +86,7 @@ fn two_activity_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,

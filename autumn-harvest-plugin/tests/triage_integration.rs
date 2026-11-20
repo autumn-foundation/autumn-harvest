@@ -11,6 +11,7 @@
 #![allow(clippy::similar_names)]
 #![allow(clippy::too_many_lines)]
 
+use jiff_diesel::ToDiesel;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -26,11 +27,11 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel::sql_types::{Nullable, Text, Timestamptz};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -217,7 +218,7 @@ async fn seed_execution(
 ) -> String {
     let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
     let id = exec_id.as_uuid();
-    let now = Utc::now();
+    let now = Timestamp::now();
     diesel::sql_query(
         "INSERT INTO harvest_workflow_executions
             (id, workflow_name, workflow_id, shard_id, state, input, started_at, completed_at,
@@ -229,7 +230,7 @@ async fn seed_execution(
     .bind::<Text, _>(workflow_name)
     .bind::<Text, _>(workflow_id)
     .bind::<Text, _>(state)
-    .bind::<Timestamptz, _>(now)
+    .bind::<Timestamptz, _>(now.to_diesel())
     .bind::<Nullable<Text>, _>(owner)
     .bind::<Nullable<Text>, _>(severity)
     .execute(conn)

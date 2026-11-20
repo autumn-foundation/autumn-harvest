@@ -5,7 +5,7 @@
 //! code, so both backends share them. The SQLite backend applies an override
 //! with the same rules as Postgres (issue #2390).
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use std::time::Duration;
 
 use crate::error::{HarvestError, HarvestResult};
@@ -46,7 +46,7 @@ pub struct WorkflowSchedulePatch {
     /// New auto-pause threshold (issue #360). `Some(None)` disables.
     pub consecutive_failure_limit: Option<Option<u32>>,
     /// New absolute cutoff (issue #478). `Some(None)` removes the cutoff.
-    pub end_at: Option<Option<DateTime<Utc>>>,
+    pub end_at: Option<Option<Timestamp>>,
     /// New total run budget (issue #478). `Some(None)` (or `Some(Some(0))`)
     /// removes the budget.
     pub max_runs: Option<Option<u32>>,

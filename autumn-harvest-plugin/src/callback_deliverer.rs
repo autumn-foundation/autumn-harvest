@@ -89,7 +89,7 @@ impl CompletionCallbackDeliverer for ReqwestCallbackDeliverer {
                         .headers()
                         .get(reqwest::header::RETRY_AFTER)
                         .and_then(|value| value.to_str().ok())
-                        .and_then(|value| parse_retry_after(value, chrono::Utc::now()));
+                        .and_then(|value| parse_retry_after(value, jiff::Timestamp::now()));
                     match retry_after {
                         Some(delay) => attempt.with_retry_after(delay),
                         None => attempt,

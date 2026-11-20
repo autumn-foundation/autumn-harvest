@@ -35,7 +35,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use uuid::Uuid;
 
 use crate::error::{HarvestError, HarvestResult, database_error};
@@ -153,8 +153,8 @@ pub struct BuildPolicy {
     pub queue_name: String,
     pub build_id: String,
     pub deployment_name: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
     /// Ramp target build. `None` = no ramp configured (100% `build_id`).
     #[serde(default)]
     pub target_build_id: Option<String>,
@@ -240,7 +240,7 @@ pub struct BuildCompatEntry {
     pub build_id: String,
     /// Execution build whose tasks the worker may process.
     pub compatible_with: String,
-    pub declared_at: DateTime<Utc>,
+    pub declared_at: Timestamp,
 }
 
 /// Per-build reachability snapshot.
@@ -290,9 +290,11 @@ struct BuildPolicyRow {
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     deployment_name: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    created_at: DateTime<Utc>,
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+    created_at: Timestamp,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    updated_at: DateTime<Utc>,
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+    updated_at: Timestamp,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     target_build_id: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
@@ -1016,7 +1018,8 @@ pub async fn declare_compat(
         #[diesel(sql_type = diesel::sql_types::Text)]
         compatible_with: String,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        declared_at: DateTime<Utc>,
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+        declared_at: Timestamp,
     }
 
     let rows: Vec<Row> = diesel::sql_query(
@@ -1199,7 +1202,8 @@ pub async fn list_build_compat(
         #[diesel(sql_type = diesel::sql_types::Text)]
         compatible_with: String,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        declared_at: DateTime<Utc>,
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+        declared_at: Timestamp,
     }
 
     let rows: Vec<Row> = diesel::sql_query(

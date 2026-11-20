@@ -713,11 +713,12 @@ pub use db::{
 
 #[cfg(feature = "db")]
 mod db {
-    use chrono::{DateTime, Utc};
     use diesel::sql_types::{
         BigInt, Bool, Integer, Jsonb, Nullable, Text, Timestamptz, Uuid as SqlUuid,
     };
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+    use jiff::Timestamp;
+    use jiff_diesel::ToDiesel;
     use serde::Serialize;
     use serde_json::Value;
     use uuid::Uuid;
@@ -1115,9 +1116,9 @@ mod db {
         /// The last failure this row saw, verbatim.
         pub last_error: Option<String>,
         /// When the row was opened.
-        pub created_at: DateTime<Utc>,
+        pub created_at: Timestamp,
         /// When the row last advanced.
-        pub updated_at: DateTime<Utc>,
+        pub updated_at: Timestamp,
     }
 
     #[derive(diesel::QueryableByName)]
@@ -1139,9 +1140,11 @@ mod db {
         #[diesel(sql_type = Nullable<Text>)]
         last_error: Option<String>,
         #[diesel(sql_type = Timestamptz)]
-        created_at: DateTime<Utc>,
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+        created_at: Timestamp,
         #[diesel(sql_type = Timestamptz)]
-        updated_at: DateTime<Utc>,
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+        updated_at: Timestamp,
     }
 
     impl MigrationRow {
@@ -1684,7 +1687,7 @@ mod db {
             .bind::<Jsonb, _>(&execution)
             .bind::<Integer, _>(target_shard.as_i32())
             .bind::<Nullable<Integer>, _>(prior_seal.map(|(shard, _)| shard))
-            .bind::<Nullable<Timestamptz>, _>(prior_seal.map(|(_, at)| at))
+            .bind::<Nullable<Timestamptz>, _>(prior_seal.map(|(_, at)| at).to_diesel())
             .execute(&mut *conn)
             .await
             .map_err(database_error)?;
@@ -1883,6 +1886,8 @@ mod db {
     /// Everything a staged copy writes apart from the execution row itself.
     pub const STAGED_CHILD_DELETES: &[&str] = &[
         "DELETE FROM harvest_events WHERE workflow_exec_id = $1",
+        // The outbox trigger writes these rows when the staged events go in.
+        "DELETE FROM harvest_external_outbox_pending WHERE workflow_exec_id = $1",
         "DELETE FROM harvest_timers WHERE workflow_exec_id = $1",
         "DELETE FROM harvest_signals WHERE workflow_exec_id = $1",
         "DELETE FROM harvest_payload_refs WHERE workflow_exec_id = $1",
@@ -1967,7 +1972,7 @@ mod db {
     async fn existing_seal(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
-    ) -> HarvestResult<Option<(i32, DateTime<Utc>)>> {
+    ) -> HarvestResult<Option<(i32, Timestamp)>> {
         let row: Option<SealRow> = diesel::sql_query(
             "SELECT migrated_to_shard AS forward, migrated_at FROM harvest_workflow_executions \
               WHERE id = $1 AND migrated_to_shard IS NOT NULL",
@@ -1987,7 +1992,8 @@ mod db {
         #[diesel(sql_type = Nullable<Integer>)]
         forward: Option<i32>,
         #[diesel(sql_type = Nullable<Timestamptz>)]
-        migrated_at: Option<DateTime<Utc>>,
+        #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+        migrated_at: Option<Timestamp>,
     }
 
     // ── Seal reconciliation ──────────────────────────────────────────────────
@@ -2446,7 +2452,8 @@ mod db {
         #[diesel(sql_type = SqlUuid)]
         id: Uuid,
         #[diesel(sql_type = Timestamptz)]
-        migrated_at: DateTime<Utc>,
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+        migrated_at: Timestamp,
     }
 
     /// A seal a reconciliation sweep could not resolve (issue #1317 review).
@@ -2517,7 +2524,7 @@ mod db {
         Option<MigrationScanCursor>,
     )> {
         let mut source = checkout(pool, shard).await?;
-        let (cursor_at, cursor_id): (Option<DateTime<Utc>>, Option<Uuid>) = match after {
+        let (cursor_at, cursor_id): (Option<Timestamp>, Option<Uuid>) = match after {
             Some((at, id)) => (Some(at), Some(id.as_uuid())),
             None => (None, None),
         };
@@ -2530,7 +2537,7 @@ mod db {
               LIMIT $1",
         )
         .bind::<BigInt, _>(limit)
-        .bind::<Nullable<Timestamptz>, _>(cursor_at)
+        .bind::<Nullable<Timestamptz>, _>(cursor_at.to_diesel())
         .bind::<Nullable<SqlUuid>, _>(cursor_id)
         .load(&mut *source)
         .await
@@ -2755,7 +2762,7 @@ mod db {
         .bind::<Text, _>(&fingerprint)
         .bind::<BigInt, _>(verified_count)
         .bind::<Integer, _>(verified_max)
-        .bind::<Nullable<Timestamptz>, _>(legal_hold_set_at)
+        .bind::<Nullable<Timestamptz>, _>(legal_hold_set_at.to_diesel())
         .execute(source)
         .await
         .map_err(database_error)?;
@@ -2768,7 +2775,7 @@ mod db {
     async fn read_legal_hold_set_at(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
-    ) -> HarvestResult<Option<DateTime<Utc>>> {
+    ) -> HarvestResult<Option<Timestamp>> {
         let row: LegalHoldRow = diesel::sql_query(
             "SELECT legal_hold_set_at AS value FROM harvest_workflow_executions WHERE id = $1",
         )
@@ -2782,7 +2789,8 @@ mod db {
     #[derive(diesel::QueryableByName)]
     struct LegalHoldRow {
         #[diesel(sql_type = Nullable<Timestamptz>)]
-        value: Option<DateTime<Utc>>,
+        #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+        value: Option<Timestamp>,
     }
 
     /// `(event count, highest event_id)` of the verified history, read out of
@@ -2859,6 +2867,10 @@ mod db {
         // `forgotten` removes the entity state row of the sealed run (issue
         // #2259). The target now holds the live row. A stale copy here would
         // answer a read on this shard.
+        //
+        // `unclaimed` removes the outbox rows of the sealed run. The target
+        // copy holds the same requests and claims them. A stale row here
+        // would cost each later claim on this shard one probe.
         let sql = format!(
             "WITH sealed AS ( \
                  UPDATE harvest_workflow_executions e \
@@ -2879,6 +2891,10 @@ mod db {
                  DELETE FROM harvest_entity_state s \
                   WHERE s.execution_id = $1 AND EXISTS (SELECT 1 FROM sealed) \
                  RETURNING s.id \
+             ), unclaimed AS ( \
+                 DELETE FROM harvest_external_outbox_pending p \
+                  WHERE p.workflow_exec_id = $1 AND EXISTS (SELECT 1 FROM sealed) \
+                 RETURNING p.event_row_id \
              ) \
              SELECT (SELECT count(*) FROM sealed)::BIGINT AS sealed_rows"
         );
@@ -2973,11 +2989,13 @@ mod db {
         #[derive(diesel::QueryableByName)]
         struct DeclineRow {
             #[diesel(sql_type = Nullable<Timestamptz>)]
-            verified_legal_hold_set_at: Option<DateTime<Utc>>,
+            #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+            verified_legal_hold_set_at: Option<Timestamp>,
             #[diesel(sql_type = Bool)]
             legal_hold_verified: bool,
             #[diesel(sql_type = Nullable<Timestamptz>)]
-            legal_hold_set_at: Option<DateTime<Utc>>,
+            #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+            legal_hold_set_at: Option<Timestamp>,
         }
         let row: Option<DeclineRow> = diesel::sql_query(
             "SELECT m.verified_legal_hold_set_at, m.legal_hold_verified, \
@@ -3469,7 +3487,7 @@ mod db {
         /// `harvest_workflow_executions.created_at`, the scan's sort key.
         /// Carried so a caller can resume the scan past this row (issue
         /// #1317) without re-deriving it with a second query.
-        pub created_at: DateTime<Utc>,
+        pub created_at: Timestamp,
     }
 
     impl ShardMigrationCandidate {
@@ -3486,7 +3504,7 @@ mod db {
     /// Two columns, not one, because `created_at` alone is not unique.
     /// A keyset scan ordered by a non-unique column can re-see or skip
     /// rows straddling a tie. `id` breaks every tie deterministically.
-    pub type MigrationScanCursor = (DateTime<Utc>, ExecutionId);
+    pub type MigrationScanCursor = (Timestamp, ExecutionId);
 
     #[derive(diesel::QueryableByName)]
     struct CandidateRow {
@@ -3497,7 +3515,8 @@ mod db {
         #[diesel(sql_type = Text)]
         workflow_id: String,
         #[diesel(sql_type = Timestamptz)]
-        created_at: DateTime<Utc>,
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+        created_at: Timestamp,
     }
 
     /// Find quiescent executions on a shard, oldest first.
@@ -3532,7 +3551,7 @@ mod db {
         // `$2::timestamptz IS NULL OR ...` short-circuits the keyset compare
         // in that case. One query shape either way, rather than two `sql_query`
         // bind chains of different arities (which cannot share a match arm).
-        let (cursor_at, cursor_id): (Option<DateTime<Utc>>, Option<Uuid>) = match after {
+        let (cursor_at, cursor_id): (Option<Timestamp>, Option<Uuid>) = match after {
             Some((at, id)) => (Some(at), Some(id.as_uuid())),
             None => (None, None),
         };
@@ -3548,7 +3567,7 @@ mod db {
              LIMIT $1",
         )
         .bind::<BigInt, _>(scan_limit)
-        .bind::<Nullable<Timestamptz>, _>(cursor_at)
+        .bind::<Nullable<Timestamptz>, _>(cursor_at.to_diesel())
         .bind::<Nullable<SqlUuid>, _>(cursor_id)
         .load(conn)
         .await
@@ -5150,9 +5169,9 @@ mod db {
         pool: &ShardedDbPool,
         exec_id: ExecutionId,
         reason: &str,
-        hold_until: Option<DateTime<Utc>>,
+        hold_until: Option<Timestamp>,
         actor: &str,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> HarvestResult<(LegalHoldOutcome, ShardId)> {
         let mut last_shard = exec_id.shard();
         for _ in 0..MAX_FORWARD_HOPS {
@@ -5189,7 +5208,7 @@ mod db {
     pub async fn release_legal_hold_forwarded(
         pool: &ShardedDbPool,
         exec_id: ExecutionId,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> HarvestResult<(LegalHoldOutcome, ShardId)> {
         let mut last_shard = exec_id.shard();
         for _ in 0..MAX_FORWARD_HOPS {

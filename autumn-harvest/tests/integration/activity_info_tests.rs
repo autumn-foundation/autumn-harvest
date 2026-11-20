@@ -71,10 +71,12 @@ use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{ActivityExecutionInfo, WorkflowContext, store};
 
-use chrono::{DateTime, Utc};
+use autumn_harvest::time::sql::{NullablePgDuration, NullableTimestamp};
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -359,7 +361,7 @@ async fn seed_workflow(
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -371,7 +373,7 @@ async fn seed_workflow(
 
     let mut params = EnqueueParams::new("default", TaskType::Workflow, input);
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     queue::enqueue(conn, &params)
         .await
         .expect("enqueue workflow task");
@@ -385,8 +387,8 @@ async fn seed_workflow(
 async fn seed_running_activity_probe(
     conn: &mut AsyncPgConnection,
     workflow_name: &'static str,
-    start_to_close: chrono::Duration,
-    started_at: DateTime<Utc>,
+    start_to_close: jiff::SignedDuration,
+    started_at: Timestamp,
 ) -> Uuid {
     let (exec_id, _) = seed_workflow(conn, workflow_name, serde_json::json!({})).await;
     let mut params = EnqueueParams::new("default", TaskType::Activity, serde_json::json!({}));
@@ -400,7 +402,7 @@ async fn seed_running_activity_probe(
         .set((
             harvest_task_queue::state.eq("RUNNING"),
             harvest_task_queue::worker_id.eq("probe"),
-            harvest_task_queue::started_at.eq(started_at),
+            harvest_task_queue::started_at.eq(started_at.to_diesel()),
         ))
         .execute(conn)
         .await
@@ -467,7 +469,7 @@ async fn wait_for_state(
 #[derive(Default)]
 struct Observations {
     infos: Mutex<Vec<ActivityExecutionInfo>>,
-    deadlines: Mutex<Vec<Option<DateTime<Utc>>>>,
+    deadlines: Mutex<Vec<Option<Timestamp>>>,
     /// Items an attempt actually processed (the 0%-rework ledger).
     processed: Mutex<Vec<u32>>,
 }
@@ -482,7 +484,7 @@ impl Observations {
         self.infos.lock().unwrap().clone()
     }
 
-    fn deadlines(&self) -> Vec<Option<DateTime<Utc>>> {
+    fn deadlines(&self) -> Vec<Option<Timestamp>> {
         self.deadlines.lock().unwrap().clone()
     }
 
@@ -871,7 +873,7 @@ async fn assert_execution_id_is_the_api_path_segment(
 fn assert_unbounded_sibling(
     unbounded: &ActivityExecutionInfo,
     bounded: &ActivityExecutionInfo,
-    unbounded_deadline: Option<DateTime<Utc>>,
+    unbounded_deadline: Option<Timestamp>,
 ) {
     // AC2 — "None when unbounded", proven through the real worker rather than
     // only through the pure helper. A mutant that fabricated a budget here
@@ -940,19 +942,20 @@ async fn reported_deadline_agrees_with_the_start_to_close_scanner() {
     // `started_at + start_to_close`, read off the row the scanner compares
     // against. A "plausible-looking" deadline from any other anchor (e.g.
     // `scheduled_at`, or a local `Instant`) fails here.
-    let (row_started_at, row_stc): (Option<DateTime<Utc>>, Option<chrono::Duration>) =
-        harvest_task_queue::table
-            .filter(harvest_task_queue::workflow_exec_id.eq(exec_id.as_uuid()))
-            .filter(harvest_task_queue::task_type.eq("activity"))
-            .select((
-                harvest_task_queue::started_at,
-                harvest_task_queue_ext::start_to_close,
-            ))
-            .first(&mut conn)
-            .await
-            .expect("load the activity task row");
-    let row_started_at = row_started_at.expect("a dispatched activity has started_at");
-    let row_stc = row_stc.expect("start_to_close was configured");
+    let (row_started_at, row_stc) = harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(exec_id.as_uuid()))
+        .filter(harvest_task_queue::task_type.eq("activity"))
+        .select((
+            harvest_task_queue::started_at,
+            harvest_task_queue_ext::start_to_close,
+        ))
+        .first::<(NullableTimestamp, NullablePgDuration)>(&mut conn)
+        .await
+        .expect("load the activity task row");
+    let row_started_at = row_started_at
+        .0
+        .expect("a dispatched activity has started_at");
+    let row_stc = row_stc.0.expect("start_to_close was configured");
     assert_eq!(
         deadline,
         row_started_at + row_stc,
@@ -970,7 +973,7 @@ async fn reported_deadline_agrees_with_the_start_to_close_scanner() {
         "stc_probe_future",
         row_stc,
         // started_at such that started_at + stc == now + 5s
-        Utc::now() - row_stc + chrono::Duration::seconds(5),
+        Timestamp::now() - row_stc + jiff::SignedDuration::from_secs(5),
     )
     .await;
     let overdue = seed_running_activity_probe(
@@ -978,7 +981,7 @@ async fn reported_deadline_agrees_with_the_start_to_close_scanner() {
         "stc_probe_past",
         row_stc,
         // started_at such that started_at + stc == now - 5s
-        Utc::now() - row_stc - chrono::Duration::seconds(5),
+        Timestamp::now() - row_stc - jiff::SignedDuration::from_secs(5),
     )
     .await;
 
@@ -1041,14 +1044,14 @@ async fn schedule_to_close_shortens_the_reported_deadline() {
     let _ = handle.await;
 
     let deadline = observed.deadlines()[0].expect("a bounded activity has a deadline");
-    let stc_at: Option<DateTime<Utc>> = harvest_task_queue::table
+    let stc_at = harvest_task_queue::table
         .filter(harvest_task_queue::workflow_exec_id.eq(exec_id.as_uuid()))
         .filter(harvest_task_queue::task_type.eq("activity"))
         .select(harvest_task_queue::schedule_to_close_at)
-        .first(&mut conn)
+        .first::<NullableTimestamp>(&mut conn)
         .await
         .expect("load schedule_to_close_at");
-    let stc_at = stc_at.expect("schedule_to_close_at must be persisted");
+    let stc_at = stc_at.0.expect("schedule_to_close_at must be persisted");
 
     assert_eq!(
         deadline, stc_at,
@@ -1058,17 +1061,17 @@ async fn schedule_to_close_shortens_the_reported_deadline() {
     // The min really did bite: the per-attempt `start_to_close` clock was the
     // later of the two, so an un-shortened deadline would have been
     // `started_at + 600s`. Compare against that exact value, not against a
-    // `Utc::now()`-relative bound — `now > started_at` makes the latter true
+    // `Timestamp::now()`-relative bound — `now > started_at` makes the latter true
     // even when the shortening never happened.
-    let row_started_at: Option<DateTime<Utc>> = harvest_task_queue::table
+    let row_started_at = harvest_task_queue::table
         .filter(harvest_task_queue::workflow_exec_id.eq(exec_id.as_uuid()))
         .filter(harvest_task_queue::task_type.eq("activity"))
         .select(harvest_task_queue::started_at)
-        .first(&mut conn)
+        .first::<NullableTimestamp>(&mut conn)
         .await
         .expect("load started_at");
-    let unshortened =
-        row_started_at.expect("a claimed row has started_at") + chrono::Duration::seconds(600);
+    let unshortened = row_started_at.0.expect("a claimed row has started_at")
+        + jiff::SignedDuration::from_secs(600);
     assert!(
         deadline < unshortened,
         "min-of-two-clocks did not shorten the deadline: reported {deadline}, \
@@ -1183,7 +1186,7 @@ async fn local_dispatch_reports_is_local_and_the_configured_cap() {
         )],
     );
     let worker = build_worker_with_local_cap("w-info-e1", registry, local_cap);
-    let before = Utc::now();
+    let before = Timestamp::now();
     let handle = tokio::spawn({
         let worker = Arc::clone(&worker);
         let pool = pool.clone();
@@ -1208,9 +1211,9 @@ async fn local_dispatch_reports_is_local_and_the_configured_cap() {
         "a local activity reports the owning workflow's queue"
     );
 
-    let after = Utc::now();
+    let after = Timestamp::now();
     let deadline = observed.deadlines()[0].expect("a local activity is always capped");
-    let cap_budget = chrono::Duration::from_std(local_cap).unwrap();
+    let cap_budget = jiff::SignedDuration::try_from(local_cap).unwrap();
     // A two-sided sandwich, not `>= before`: the deadline is `dispatch + cap`
     // and `before <= dispatch <= after`, so it must be at least a FULL cap past
     // `before`. A one-sided `>= before` would pass for any budget at all —
@@ -1240,7 +1243,7 @@ async fn local_dispatch_reports_is_local_and_the_configured_cap() {
         )],
     );
     let worker2 = build_worker_with_local_cap("w-info-e2", registry2, local_cap);
-    let before2 = Utc::now();
+    let before2 = Timestamp::now();
     let handle2 = tokio::spawn({
         let worker = Arc::clone(&worker2);
         let pool = pool.clone();
@@ -1250,7 +1253,7 @@ async fn local_dispatch_reports_is_local_and_the_configured_cap() {
     worker2.shutdown();
     let _ = handle2.await;
 
-    let after2 = Utc::now();
+    let after2 = Timestamp::now();
     let capped = observed2.deadlines()[0].expect("a local activity is always capped");
     // Same two-sided sandwich. The upper bound proves the clamp, because the
     // declared 600s budget would blow past it. The lower bound proves the

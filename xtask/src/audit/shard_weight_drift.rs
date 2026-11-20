@@ -383,11 +383,10 @@ impl Patterns {
     ///    evidence generators. The file itself says they are "not a repeatable
     ///    CI assertion". They raised its weight from 29, what runs, to 36. That
     ///    made up a heavy collision that direct log evidence does not support.
-    /// 2. `cfg(feature = ...)`: the `replay_tests` module of
-    ///    `retry_after_tests.rs` is `#[cfg(feature = "testing")]`. Its manifest
-    ///    row requests no extra features, and the defaults of `autumn-harvest`
-    ///    do not include `testing`. So its one test never compiles for that row.
-    ///    The real weight of the file is 6, not the 7 of a plain count.
+    /// 2. `cfg(feature = ...)`: a module that is `#[cfg(feature = "testing")]`
+    ///    never compiles for a row that does not request `testing`. The
+    ///    defaults of `autumn-harvest` do not include it. So the tests of that
+    ///    module do not count toward the weight of that row.
     /// 3. `#![cfg(...)]`: an inner attribute gates the enclosing item. Here that
     ///    is always the whole file, because each one in the corpus is the first
     ///    line of a file. `claim_budget_tests.rs` and

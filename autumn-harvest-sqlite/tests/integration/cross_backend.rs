@@ -148,7 +148,7 @@ async fn stored_event_matches_golden_encoding() {
 async fn pg_shaped_history_with_activity_started_is_replay_equivalent() {
     let activity_id = ActivityExecId::new();
     let pg_history = vec![
-        WorkflowEvent::workflow_started(json!(4), chrono::Utc::now()),
+        WorkflowEvent::workflow_started(json!(4), jiff::Timestamp::now()),
         WorkflowEvent::ActivityScheduled {
             activity_id,
             name: "work".to_string(),

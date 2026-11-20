@@ -50,10 +50,10 @@ use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{JitterPolicy, RetryPolicy, WorkflowContext, store};
 
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -274,7 +274,7 @@ async fn seed_workflow(
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -286,7 +286,7 @@ async fn seed_workflow(
 
     let mut params = EnqueueParams::new("default", TaskType::Workflow, input);
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     queue::enqueue(conn, &params)
         .await
         .expect("enqueue workflow task");
@@ -773,7 +773,7 @@ async fn workflow_handler_panic_is_re_dispatched_then_terminal_within_budget() {
             for t in load_tasks(&observer_url, exec_id).await {
                 if t.task_type == "workflow"
                     && t.state == "PENDING"
-                    && t.scheduled_at > Utc::now()
+                    && t.scheduled_at > Timestamp::now()
                     && t.crash_strikes == 0
                 {
                     saw_repended_pending = true;
@@ -1191,7 +1191,7 @@ async fn backing_off_activity_task_error_column_carries_the_panic_message() {
         let backing_off = load_tasks(&url, exec_id).await.into_iter().find(|t| {
             t.activity_name.as_deref() == Some("panic_activity")
                 && t.state == "PENDING"
-                && t.scheduled_at > Utc::now()
+                && t.scheduled_at > Timestamp::now()
                 && t.error.is_some()
         });
         if let Some(t) = backing_off {
@@ -1376,7 +1376,7 @@ async fn deadlocked_workflow_task_is_re_pended_and_the_retry_completes_the_run()
             for t in load_tasks(&observer_url, exec_id).await {
                 if t.task_type == "workflow"
                     && t.state == "PENDING"
-                    && t.scheduled_at > Utc::now()
+                    && t.scheduled_at > Timestamp::now()
                     && t.error
                         .as_deref()
                         .is_some_and(|e| e.contains("potential deadlock detected"))

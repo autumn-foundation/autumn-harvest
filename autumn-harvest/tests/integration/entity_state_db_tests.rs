@@ -28,9 +28,9 @@ use autumn_harvest::reset::{ResetSignalReapplyPolicy, WorkflowResetRequest};
 use autumn_harvest::store;
 use autumn_harvest::worker::{DbPool, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{StickyRoutingConfig, TypedSignalWithStartOptions};
-use chrono::Utc;
 use diesel::sql_types::{Text, Uuid as SqlUuid};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -76,7 +76,7 @@ async fn insert_run(
 fn started() -> WorkflowEvent {
     WorkflowEvent::WorkflowStarted {
         input: json!({}),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,

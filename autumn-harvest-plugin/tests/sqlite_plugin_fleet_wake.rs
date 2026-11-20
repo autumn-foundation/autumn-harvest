@@ -232,7 +232,7 @@ async fn a_closed_tenant_wakes_for_its_timer() {
     let run = || runs(&file, "napper").into_iter().next().expect("the run");
     assert_eq!(state(&run()), "RUNNING", "nothing ran while closed");
     let started = run().started_at.into_value().expect("started_at");
-    let due = started + chrono::Duration::seconds(5);
+    let due = started + jiff::SignedDuration::from_secs(5);
 
     eventually(
         Duration::from_secs(5) + TICK + SLACK * 4,
@@ -242,7 +242,7 @@ async fn a_closed_tenant_wakes_for_its_timer() {
     .await;
     let closed = run().closed_at.into_value().expect("closed_at");
     assert!(closed >= due, "the timer fired early: {closed} < {due}");
-    let late = (closed - due).to_std().unwrap_or_default();
+    let late = std::time::Duration::try_from(closed - due).unwrap_or_default();
     assert!(late <= TICK + SLACK, "the timer fired {late:?} late");
 
     // The sweep lets the fleet close the tenant again.
@@ -444,7 +444,7 @@ async fn a_host_wakes_only_the_tenants_it_owns() {
         .map(|n| key(&probe, &format!("zed{n}")))
         .find(|zed| ![slot, other].contains(&zed.routing_slot()))
         .expect("a tenant of another slot");
-    let due = chrono::Utc::now().timestamp_millis() - 1_000;
+    let due = jiff::Timestamp::now().as_millisecond() - 1_000;
     put_row(dir.path(), &zed, due).await;
     tokio::time::sleep(TICK * 8).await;
     assert_eq!(wake_row(dir.path(), &zed).await, Some(Some(due)));

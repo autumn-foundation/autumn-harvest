@@ -18,6 +18,7 @@
 //!   shard (the plugin's single-shard gate could not).
 //! - a caller that already ran the gate (the plugin path) is not gated twice.
 
+use jiff_diesel::ToDiesel;
 use std::pin::Pin;
 
 use autumn_harvest::WorkflowContext;
@@ -33,10 +34,10 @@ use autumn_harvest_plugin::config::{
     HarvestRuntimeConfig, HarvestStartupConfig, OrphanStartupAction,
 };
 use autumn_harvest_plugin::runner::{HarvestRunner, HarvestRunnerResources};
-use chrono::Utc;
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -289,7 +290,7 @@ async fn insert_execution(
 
     let events = vec![WorkflowEvent::WorkflowStarted {
         input: json!({}),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -316,7 +317,8 @@ async fn insert_claimable_task(database_url: &str, exec_id: ExecutionId) -> uuid
             harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())),
             harvest_task_queue::input.eq(json!({})),
             harvest_task_queue::max_attempts.eq(1),
-            harvest_task_queue::scheduled_at.eq(Utc::now() - chrono::Duration::seconds(5)),
+            harvest_task_queue::scheduled_at
+                .eq((Timestamp::now() - jiff::SignedDuration::from_secs(5)).to_diesel()),
         ))
         .execute(&mut conn)
         .await

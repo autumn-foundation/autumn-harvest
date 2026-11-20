@@ -38,6 +38,7 @@ use autumn_harvest::signal::{
     ByIdSignalOutcome, resolve_and_signal_by_workflow_id_with_codecs,
     send_signal_idempotent_with_codecs,
 };
+use autumn_harvest::time::Timestamp;
 use autumn_harvest::types::StartProvenance;
 use autumn_harvest::worker::DbPool;
 use autumn_harvest::{ExecutionId, ShardId, WorkflowIdReusePolicy, WorkflowResultState};
@@ -57,7 +58,6 @@ use crate::mesh_control::{MESH_ATTR, MeshPause, MeshSpend, Spend};
 use crate::model::BoxFuture;
 use crate::types::AgentTask;
 use crate::workflow::WORKFLOW_NAME;
-use autumn_harvest::chrono::{DateTime, Utc};
 
 /// The queue of a new run when the caller names none.
 pub const DEFAULT_QUEUE: &str = "default";
@@ -463,7 +463,7 @@ async fn live_run(
     pg: &PostgresAgents,
     id: &AgentId,
 ) -> HarvestResult<Option<(ShardId, ExecutionId)>> {
-    let mut best: Option<(DateTime<Utc>, ShardId, ExecutionId)> = None;
+    let mut best: Option<(Timestamp, ShardId, ExecutionId)> = None;
     for shard in pg.group_shards() {
         let mut conn = pg.conn(shard).await?;
         let found =
@@ -775,7 +775,7 @@ impl LedgerSpend {
         Self { pg }
     }
 
-    async fn read(&self, mesh: &str, since: DateTime<Utc>) -> HarvestResult<Spend> {
+    async fn read(&self, mesh: &str, since: Timestamp) -> HarvestResult<Spend> {
         let attrs = serde_json::json!({ MESH_ATTR: mesh });
         let mut spend = Spend::default();
         for shard in self.pg.group_shards() {
@@ -796,7 +796,7 @@ impl MeshSpend for LedgerSpend {
     fn spent<'a>(
         &'a self,
         mesh: &'a str,
-        since: DateTime<Utc>,
+        since: Timestamp,
     ) -> BoxFuture<'a, Result<Spend, AgentError>> {
         Box::pin(async move {
             self.read(mesh, since)
@@ -868,7 +868,7 @@ impl Directory {
             };
             let found = LastPass {
                 running: state == "RUNNING",
-                started_ms: started_at.timestamp_millis(),
+                started_ms: started_at.as_millisecond(),
             };
             last = Some(match last {
                 Some(seen)
@@ -927,7 +927,7 @@ impl AgentDirectory for Directory {
 /// Returns a list or a send error. Agents that got the pause before it stay
 /// paused.
 pub async fn pause_mesh(pg: &PostgresAgents, mesh: &str, reason: &str) -> HarvestResult<MeshPause> {
-    let at_ms = Utc::now().timestamp_millis();
+    let at_ms = Timestamp::now().as_millisecond();
     let targets = running_agents(pg, &serde_json::json!({ MESH_ATTR: mesh })).await?;
     let key = format!("pause-mesh:{mesh}:{at_ms}");
     let pause = AgentOp::Control(Control::Pause {
@@ -1003,7 +1003,7 @@ async fn running_agents(pg: &PostgresAgents, attrs: &Value) -> HarvestResult<Vec
 /// Returns a list or a send error. Agents that got the op before it keep
 /// it.
 pub async fn reload_profiles(pg: &PostgresAgents, kind: &str) -> HarvestResult<Vec<AgentId>> {
-    let at_ms = Utc::now().timestamp_millis();
+    let at_ms = Timestamp::now().as_millisecond();
     let targets = running_agents(pg, &serde_json::json!({ "agent_kind": kind })).await?;
     let key = format!("{ENTITY_OP_SIGNAL}:reload-profiles:{kind}:{at_ms}");
     let payload = Agent::payload(&AgentOp::Control(Control::ReloadProfile));

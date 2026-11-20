@@ -295,8 +295,18 @@ fn show(version: Option<OverlayVersion>) -> String {
     version.map_or_else(|| "none (the base profile)".to_owned(), |v| v.to_string())
 }
 
+/// Run the walk on the main thread.
+///
+/// A debug build of the walk needed almost 1 MiB of stack before issue #2752,
+/// so it overflowed the Windows main thread. The engine keeps large futures
+/// on the heap. The `stack_budget` test guards that.
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
+    walk_main().await
+}
+
+/// Run the walk with an approval, print each step and check each claim.
+async fn walk_main() -> Result<(), Box<dyn Error>> {
     let outcome = run(&RefineDecision::Approve).await?;
     println!("op 1 check: {:?}", outcome.op1);
     println!("version before: {}", show(outcome.before));

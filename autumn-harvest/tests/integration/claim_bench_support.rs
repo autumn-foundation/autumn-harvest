@@ -4351,7 +4351,7 @@ pub mod db {
             input: serde_json::json!({}).into(),
             priority: 0,
             max_attempts: 3,
-            scheduled_at: chrono::Utc::now(),
+            scheduled_at: jiff::Timestamp::now(),
             heartbeat_timeout: None,
             start_to_close: None,
             schedule_to_start: None,

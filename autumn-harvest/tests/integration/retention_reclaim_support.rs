@@ -35,9 +35,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
 use diesel::sql_types::{BigInt, Double};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 
 // ── Scale ──────────────────────────────────────────────────────────────────
 
@@ -241,7 +241,7 @@ pub async fn seed(conn: &mut AsyncPgConnection, scale: Scale, partitioned: bool)
         // Materialize every cohort the corpus will occupy. In production the
         // engine's lookahead maintenance did this when the rows were written.
         for bucket in 0..cohorts {
-            let at = Utc::now() - chrono::Duration::days(cohorts - bucket);
+            let at = Timestamp::now() - autumn_harvest::time::days(cohorts - bucket);
             autumn_harvest::partition::ensure_cohort(conn, at)
                 .await
                 .expect("materialize cohort");
@@ -603,7 +603,7 @@ pub async fn measure_pass(
         let t = Instant::now();
         autumn_harvest::partition::maintain(
             &mut conn,
-            Utc::now(),
+            Timestamp::now(),
             autumn_harvest::partition::DEFAULT_LOOKAHEAD_COHORTS,
             &autumn_harvest::partition::SweepOptions::default(),
             None,

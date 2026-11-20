@@ -69,7 +69,7 @@ fn history(rt: &SqliteRuntime, agent: &AgentId) -> Vec<WorkflowEvent> {
 /// Drive the agent with its clock `secs` ahead, so a retry backoff ends.
 async fn drive_later(rt: &mut SqliteRuntime, agent: &AgentId, secs: i64) -> RunState {
     let exec = sqlite::current_run(rt, agent).unwrap().unwrap();
-    let later = chrono::Utc::now() + chrono::Duration::seconds(secs);
+    let later = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(secs);
     rt.run_until_blocked_as_of(exec, later).await.unwrap()
 }
 

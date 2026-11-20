@@ -160,7 +160,7 @@ async fn s3_archiver_uploads_ciphertext_and_fetches_it_back() {
         events: vec![WorkflowEvent::WorkflowCompleted {
             output: serde_json::json!({ "secret": MARKER }),
         }],
-        exported_at: chrono::Utc::now(),
+        exported_at: jiff::Timestamp::now(),
         payload_policy: HistoryPayloadPolicy::Full,
         max_bytes: Some(usize::MAX),
         context_headers: None,

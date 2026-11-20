@@ -41,6 +41,7 @@ use crate::skill::{LOAD_SKILL_TOOL, SkillTool};
 use crate::tool::{Tool, ToolContext, ToolEffect};
 use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
+use autumn_harvest::time::Timestamp;
 
 use crate::transcript::{
     InMemoryTranscriptStore, PREFIX_MISSING, TranscriptStore, WindowOwner, chain,
@@ -758,7 +759,7 @@ impl AgentHarness {
     pub(crate) async fn check_mesh_budget(
         &self,
         mesh: Option<&str>,
-        now: autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>,
+        now: Timestamp,
     ) -> Result<(), String> {
         let Some(mesh) = mesh else {
             return Ok(());
@@ -786,7 +787,7 @@ impl AgentHarness {
             if budget.is_spent(&spend) {
                 let details = MeshBudgetExceeded {
                     mesh: mesh.to_owned(),
-                    until_ms: until.timestamp_millis(),
+                    until_ms: until.as_millisecond(),
                 };
                 return Err(ActivityFailure::non_retryable(
                     MESH_BUDGET_EXCEEDED,
@@ -1054,15 +1055,9 @@ impl AgentHarness {
         tenant: CacheTenant,
         prepare: impl FnMut(&mut Vec<ContentPart>),
     ) -> Result<ModelTurn, String> {
-        self.model_turn_timed_in(
-            request,
-            tenant,
-            prepare,
-            None,
-            autumn_harvest::chrono::Utc::now(),
-        )
-        .await
-        .map(|(turn, _latency)| turn)
+        self.model_turn_timed_in(request, tenant, prepare, None, Timestamp::now())
+            .await
+            .map(|(turn, _latency)| turn)
     }
 
     /// [`model_turn_in`](Self::model_turn_in), with the latency of the model
@@ -1083,7 +1078,7 @@ impl AgentHarness {
         tenant: CacheTenant,
         prepare: impl FnMut(&mut Vec<ContentPart>),
         publish: Option<&(dyn Fn(&LiveEvent) + Send + Sync)>,
-        now: autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>,
+        now: Timestamp,
     ) -> Result<(ModelTurn, Option<Duration>), String> {
         let span = tracing::info_span!(
             "agent_model_turn",
@@ -1131,7 +1126,7 @@ impl AgentHarness {
         tenant: CacheTenant,
         mut prepare: impl FnMut(&mut Vec<ContentPart>),
         publish: Option<&(dyn Fn(&LiveEvent) + Send + Sync)>,
-        now: autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>,
+        now: Timestamp,
     ) -> Result<(ModelTurn, Option<Duration>), String> {
         let live = Live {
             run_id: request.run_id.clone(),
@@ -1884,7 +1879,7 @@ impl AgentHarness {
     /// Returns the delivery error. A retryable kind retries, and so does a
     /// send over its time budget.
     pub async fn notify_approval(&self, call: ParkedCall) -> Result<(), String> {
-        let notice = call.notice(autumn_harvest::chrono::Utc::now());
+        let notice = call.notice(Timestamp::now());
         tokio::time::timeout(self.hook_timeout, self.delivery.notify_approval(&notice))
             .await
             .map_err(|_| self.hook_timed_out("ApprovalNoticeTimeout", "the approval notice"))?

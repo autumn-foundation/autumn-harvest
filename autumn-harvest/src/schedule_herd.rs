@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use crate::policy::Schedule;
 use crate::schedule_plan::SlotWalker;
@@ -31,7 +31,7 @@ pub const MAX_FIRES_PER_SCHEDULE: usize = 100_000;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HerdSpot {
     /// The start of the bucket.
-    pub at: DateTime<Utc>,
+    pub at: Timestamp,
     /// The names of the schedules that fire in the bucket, sorted and unique.
     pub schedules: Vec<String>,
 }
@@ -48,7 +48,7 @@ impl HerdSpot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fire {
     /// The run of the slot starts at this time.
-    Start(DateTime<Utc>),
+    Start(Timestamp),
     /// The slot never runs. The walk goes on to the next slot.
     Skip,
     /// The schedule runs no more. The walk of this schedule ends.
@@ -110,8 +110,8 @@ impl HerdForecast {
 #[must_use]
 pub fn forecast(
     schedules: &[(&str, &Schedule)],
-    from: DateTime<Utc>,
-    until: DateTime<Utc>,
+    from: Timestamp,
+    until: Timestamp,
     bucket: Duration,
     min_herd: usize,
 ) -> HerdForecast {
@@ -144,12 +144,12 @@ pub fn forecast(
 #[must_use]
 pub fn forecast_shifted(
     schedules: &[(&str, &Schedule)],
-    from: DateTime<Utc>,
-    until: DateTime<Utc>,
+    from: Timestamp,
+    until: Timestamp,
     bucket: Duration,
     min_herd: usize,
     lookback: Duration,
-    mut shift: impl FnMut(usize, DateTime<Utc>) -> Fire,
+    mut shift: impl FnMut(usize, Timestamp) -> Fire,
 ) -> HerdForecast {
     // The width counts in milliseconds, so a fractional bucket keeps its size.
     let width = i64::try_from(bucket.as_millis())
@@ -161,9 +161,9 @@ pub fn forecast_shifted(
     // distinct members and not the fires.
     let mut buckets: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
     let mut fires = 0;
-    let walk_from = chrono::Duration::from_std(lookback)
+    let walk_from = jiff::SignedDuration::try_from(lookback)
         .ok()
-        .and_then(|back| from.checked_sub_signed(back))
+        .and_then(|back| from.checked_sub(back).ok())
         .unwrap_or(from);
     let mut unanchored = Vec::new();
     let mut truncated = Vec::new();
@@ -179,7 +179,10 @@ pub fn forecast_shifted(
         let walker = SlotWalker::new(schedule);
         // The walk looks for fires strictly after its reference. So it starts
         // one second before `walk_from` to include a fire at `walk_from` itself.
-        let mut cursor = walk_from - chrono::Duration::seconds(1);
+        // At the start of the jiff range the walk starts at `walk_from`.
+        let mut cursor = walk_from
+            .checked_sub(jiff::SignedDuration::from_secs(1))
+            .unwrap_or(walk_from);
         let mut read = 0;
         while let Some(next) = walker.next_after(cursor).filter(|&t| t < until) {
             cursor = next;
@@ -200,7 +203,11 @@ pub fn forecast_shifted(
                 continue;
             }
             fires += 1;
-            let key = start.timestamp_millis().div_euclid(width);
+            // The bucket key floors the millisecond, as `chrono` did. A
+            // truncated key puts a fire before 1970 in the next bucket.
+            let (seconds, nanos) = crate::time::chrono_split(start);
+            let millis = seconds * 1_000 + i64::from(nanos / 1_000_000);
+            let key = millis.div_euclid(width);
             let members = buckets.entry(key).or_default();
             if members.last() != Some(&index) {
                 members.push(index);
@@ -225,7 +232,7 @@ pub fn forecast_shifted(
                 .collect();
             names.sort();
             names.dedup();
-            let at = DateTime::from_timestamp_millis(key.saturating_mul(width))?;
+            let at = Timestamp::from_millisecond(key.saturating_mul(width)).ok()?;
             (names.len() >= min_herd).then_some(HerdSpot {
                 at,
                 schedules: names,
@@ -246,13 +253,13 @@ pub fn forecast_shifted(
 mod tests {
     use std::time::Duration;
 
-    use chrono::{DateTime, Utc};
+    use jiff::Timestamp;
 
     use super::{Fire, MAX_FIRES_PER_SCHEDULE, forecast, forecast_shifted};
     use crate::policy::Schedule;
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        DateTime::from_timestamp(secs, 0).unwrap()
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::from_second(secs).unwrap()
     }
 
     fn cron(expr: &str) -> Schedule {
@@ -261,6 +268,15 @@ mod tests {
 
     const HOUR: i64 = 3_600;
     const MINUTE: Duration = Duration::from_secs(60);
+
+    /// A `from` at the start of the jiff range does not panic the walk.
+    #[test]
+    fn a_walk_from_the_start_of_the_range_does_not_panic() {
+        let a = cron("0 * * * *");
+        let until = Timestamp::MIN + jiff::SignedDuration::from_hours(3);
+        let report = forecast(&[("a", &a)], Timestamp::MIN, until, MINUTE, 2);
+        assert!(report.fires <= 3);
+    }
 
     #[test]
     fn hourly_schedules_herd_at_the_top_of_each_hour() {
@@ -279,6 +295,26 @@ mod tests {
         assert_eq!(times, vec![at(0), at(HOUR), at(2 * HOUR)]);
         assert!(report.spots.iter().all(|s| s.schedules == ["a", "b"]));
         assert_eq!(report.peak().map(super::HerdSpot::size), Some(2));
+    }
+
+    /// A start before 1970 with a sub-millisecond fraction goes into the
+    /// bucket that holds it, as `chrono` did.
+    #[test]
+    fn a_fractional_start_before_the_epoch_keeps_its_bucket() {
+        let a = cron("* * * * *");
+        let b = cron("* * * * *");
+        let report = forecast_shifted(
+            &[("a", &a), ("b", &b)],
+            at(-120),
+            at(0),
+            Duration::from_secs(1),
+            2,
+            Duration::ZERO,
+            |_, slot| Fire::Start(slot - jiff::SignedDuration::from_micros(500)),
+        );
+        assert_eq!(report.fires, 2);
+        let times: Vec<_> = report.spots.iter().map(|s| s.at).collect();
+        assert_eq!(times, vec![at(-61)]);
     }
 
     #[test]
@@ -349,7 +385,7 @@ mod tests {
         assert_eq!(report.fires, 2);
         assert_eq!(report.spots.len(), 1);
         assert_eq!(report.spots[0].at, at(HOUR));
-        let late = DateTime::from_timestamp(HOUR, 500_000_000).unwrap();
+        let late = Timestamp::new(HOUR, 500_000_000).unwrap();
         let none = forecast(&[("a", &a), ("b", &b)], late, at(2 * HOUR), MINUTE, 2);
         assert_eq!(none.fires, 0);
     }
@@ -408,7 +444,7 @@ mod tests {
         let five = cron("5 * * * * *");
         let six = cron("6 * * * * *");
         let join = forecast(&[("five", &five), ("six", &six)], at(0), at(10), width, 2);
-        let start = DateTime::from_timestamp_millis(5_000).unwrap();
+        let start = Timestamp::from_millisecond(5_000).unwrap();
         assert_eq!(join.spots[0].at, start);
     }
 
@@ -417,9 +453,9 @@ mod tests {
         let a = cron("0 * * * *");
         let b = cron("0 * * * *");
         let schedules = [("a", &a), ("b", &b)];
-        let jitter = |index: usize, t: DateTime<Utc>| {
+        let jitter = |index: usize, t: Timestamp| {
             Fire::Start(if index == 1 {
-                t + chrono::Duration::seconds(90)
+                t + jiff::SignedDuration::from_secs(90)
             } else {
                 t
             })
@@ -452,7 +488,7 @@ mod tests {
         let a = cron("0 * * * *");
         let b = cron("0 * * * *");
         let schedules = [("a", &a), ("b", &b)];
-        let cap = |index: usize, t: DateTime<Utc>| {
+        let cap = |index: usize, t: Timestamp| {
             if index == 0 || t < at(HOUR) {
                 Fire::Start(t)
             } else {
@@ -490,7 +526,7 @@ mod tests {
         let a = cron("0 * * * *");
         let b = cron("0 * * * *");
         let schedules = [("a", &a), ("b", &b)];
-        let late = |_: usize, t: DateTime<Utc>| Fire::Start(t + chrono::Duration::minutes(5));
+        let late = |_: usize, t: Timestamp| Fire::Start(t + jiff::SignedDuration::from_mins(5));
         let back = Duration::from_secs(600);
         // The 00:00 slots are before the window but start at 00:05, inside it.
         let early = forecast_shifted(&schedules, at(60), at(HOUR), MINUTE, 2, back, late);
@@ -520,7 +556,7 @@ mod tests {
         let a = cron("0 * * * *");
         let b = cron("0 * * * *");
         let schedules = [("a", &a), ("b", &b)];
-        let skip_first = |index: usize, t: DateTime<Utc>| {
+        let skip_first = |index: usize, t: Timestamp| {
             if index == 1 && t == at(0) {
                 Fire::Skip
             } else {

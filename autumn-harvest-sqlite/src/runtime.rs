@@ -17,6 +17,7 @@ use autumn_harvest::executor::{
     QueryReplayOutcome, WorkflowExecuteSpanMeta, drive_query_replay_async,
     run_workflow_with_state_history_policy_and_caps,
 };
+use autumn_harvest::frame::boxed;
 use autumn_harvest::llm_ledger::LlmCall;
 use autumn_harvest::payload_depth::{
     MAX_PAYLOAD_DEPTH, PAYLOAD_TOO_DEEP_ERROR_TYPE, nests_past_cap,
@@ -28,7 +29,7 @@ use autumn_harvest::{
     WorkflowCommand, WorkflowEvent, WorkflowHandlerFn, WorkflowHistoryPolicy,
     WorkflowIdReusePolicy, WorkflowInfo, WorkflowOutcome,
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use rusqlite::Connection;
 use serde_json::Value;
 
@@ -59,7 +60,7 @@ pub type ActivityBody = Box<dyn Fn(Value) -> Result<Value, String> + Send + Sync
 /// (issue #2275). See
 /// [`register_activity_with_ledger`](SqliteRuntime::register_activity_with_ledger).
 pub type LedgerActivityBody =
-    Box<dyn Fn(Value, DateTime<Utc>) -> Result<(Value, Vec<LlmCall>), String> + Send + Sync>;
+    Box<dyn Fn(Value, Timestamp) -> Result<(Value, Vec<LlmCall>), String> + Send + Sync>;
 
 /// What runs for one registered activity (issue #2024).
 // Crate-internal like the `ActivitySpec` fields that hold it.
@@ -414,6 +415,13 @@ const WORKFLOW_PANIC_MAX_ATTEMPTS: u32 = 3;
 /// [`open`](Self::open) reclaims any task stranded `RUNNING` by the previous
 /// process (see the crash model in [`worker`](crate::worker)). The workflow
 /// then resumes purely by deterministic replay of the recorded history.
+///
+/// # Stack
+///
+/// A drive polls the workflow on the thread that awaits it. A debug build
+/// makes large poll frames there (issue #2752). Box a large child future of
+/// your own workflow with [`autumn_harvest::frame::boxed`]. The guide
+/// `docs/sqlite-backend.md` gives the stack need.
 pub struct SqliteRuntime {
     conn: Connection,
     workflows: HashMap<String, WorkflowHandlerFn>,
@@ -441,7 +449,7 @@ pub struct SqliteRuntime {
     /// timer can arm in a later cycle, e.g. after a real-time activity. It then
     /// anchors its deadline to its true arm time, not to the start of the outer
     /// call.
-    /// Defaults to [`Utc::now`]; tests install a controllable clock via
+    /// Defaults to [`Timestamp::now`]; tests install a controllable clock via
     /// [`set_clock`](Self::set_clock). The `_as_of`
     /// drivers bypass it: they take a caller-fixed timestamp, the
     /// deterministic-simulation seam.
@@ -495,7 +503,7 @@ enum Checkpointer {
 /// it. `Arc` + `Send`/`Sync` keeps [`SqliteRuntime`] cheaply cloneable in bound
 /// and usable across the async drivers. The closure runs synchronously and is
 /// never held across an `.await`.
-type NowFn = std::sync::Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
+type NowFn = std::sync::Arc<dyn Fn() -> Timestamp + Send + Sync>;
 
 impl SqliteRuntime {
     /// Open (creating if absent) the `SQLite` database at `path`.
@@ -631,7 +639,7 @@ impl SqliteRuntime {
             log_policy: None,
             update_timeout: UPDATE_TIMEOUT,
             workflow_panic_strikes: HashMap::new(),
-            now_fn: std::sync::Arc::new(Utc::now),
+            now_fn: std::sync::Arc::new(Timestamp::now),
             writer_lock,
             history_policy: WorkflowHistoryPolicy::default(),
             drive_blocked: HashSet::new(),
@@ -647,12 +655,12 @@ impl SqliteRuntime {
     /// ([`run_until_blocked`](Self::run_until_blocked) /
     /// [`poll_once`](Self::poll_once) / [`run_until_idle`](Self::run_until_idle)),
     /// which read it **once per decision cycle**. A deterministic-test seam only;
-    /// production uses the [`Utc::now`] default. Prefer the `_as_of` drivers for
+    /// production uses the [`Timestamp::now`] default. Prefer the `_as_of` drivers for
     /// a caller-fixed single timestamp. Use this to assert that the *public* path
     /// re-reads the clock per cycle. For example, an advancing clock proves that a
     /// post-activity timer arms at its true, later instant.
     #[doc(hidden)]
-    pub fn set_clock(&mut self, now_fn: impl Fn() -> DateTime<Utc> + Send + Sync + 'static) {
+    pub fn set_clock(&mut self, now_fn: impl Fn() -> Timestamp + Send + Sync + 'static) {
         self.now_fn = std::sync::Arc::new(now_fn);
     }
 
@@ -693,7 +701,7 @@ impl SqliteRuntime {
     ///
     /// Returns [`SqliteError::Sqlite`] when the read fails.
     pub fn next_wake_at(&self) -> SqliteResult<Option<i64>> {
-        self.next_wake_since((self.now_fn)().timestamp_millis())
+        self.next_wake_since((self.now_fn)().as_millisecond())
     }
 
     /// As [`next_wake_at`](Self::next_wake_at), for a caller that knows
@@ -997,10 +1005,7 @@ impl SqliteRuntime {
     pub fn register_activity_with_ledger(
         &mut self,
         info: &ActivityInfo,
-        body: impl Fn(Value, DateTime<Utc>) -> Result<(Value, Vec<LlmCall>), String>
-        + Send
-        + Sync
-        + 'static,
+        body: impl Fn(Value, Timestamp) -> Result<(Value, Vec<LlmCall>), String> + Send + Sync + 'static,
     ) {
         self.register_audited_activity(info, ActivityRunner::Ledger(Box::new(body)));
     }
@@ -1389,7 +1394,7 @@ impl SqliteRuntime {
         if let Some(id) = workflow_id.filter(|id| !id.trim().is_empty()) {
             self.seal_key_if_overdue(workflow_name, id)?;
         }
-        let now = (self.now_fn)().timestamp_millis();
+        let now = (self.now_fn)().as_millisecond();
         let config = self.start_config(workflow_name, now)?;
         let tx = self.conn.transaction()?;
         let outcome = start_in_tx(
@@ -1458,8 +1463,8 @@ impl SqliteRuntime {
         name: &str,
         payload: Value,
     ) -> SqliteResult<()> {
-        let now = (self.now_fn)().timestamp_millis();
-        self.signal_execution(exec, name, &payload, None, Utc::now(), now)
+        let now = (self.now_fn)().as_millisecond();
+        self.signal_execution(exec, name, &payload, None, Timestamp::now(), now)
             .map(|_staged| ())
     }
 
@@ -1488,9 +1493,9 @@ impl SqliteRuntime {
         exec: ExecutionId,
         name: &str,
         payload: Value,
-        received_at: DateTime<Utc>,
+        received_at: Timestamp,
     ) -> SqliteResult<()> {
-        let at = received_at.timestamp_millis();
+        let at = received_at.as_millisecond();
         self.signal_execution(exec, name, &payload, None, received_at, at)
             .map(|_staged| ())
     }
@@ -1526,8 +1531,8 @@ impl SqliteRuntime {
         payload: Value,
         idempotency_key: Option<&str>,
     ) -> SqliteResult<bool> {
-        let now = (self.now_fn)().timestamp_millis();
-        self.signal_execution(exec, name, &payload, idempotency_key, Utc::now(), now)
+        let now = (self.now_fn)().as_millisecond();
+        self.signal_execution(exec, name, &payload, idempotency_key, Timestamp::now(), now)
     }
 
     /// Signal the run that a `(workflow_name, workflow_id)` key names (issue
@@ -1576,7 +1581,15 @@ impl SqliteRuntime {
                 workflow_name: workflow_name.to_string(),
                 workflow_id: workflow_id.to_string(),
             })?;
-        let delivered = stage_keyed(&tx, exec, name, &payload, key, Utc::now(), check.as_ref())?;
+        let delivered = stage_keyed(
+            &tx,
+            exec,
+            name,
+            &payload,
+            key,
+            Timestamp::now(),
+            check.as_ref(),
+        )?;
         tx.commit()?;
         Ok(SignalDelivery {
             exec_id: exec,
@@ -1645,7 +1658,7 @@ impl SqliteRuntime {
         let key = signal_key(signal_name, &signal_payload, idempotency_key)?;
         // An overdue prior ends first, so the call replaces it.
         self.seal_key_if_overdue(workflow_name, workflow_id)?;
-        let now = (self.now_fn)().timestamp_millis();
+        let now = (self.now_fn)().as_millisecond();
         let config = self.start_config(workflow_name, now)?;
         // Checked only where they apply: the input when a run is created, the
         // signal after the key probe (issue #2467).
@@ -1679,7 +1692,7 @@ impl SqliteRuntime {
             signal_name,
             &signal_payload,
             key,
-            Utc::now(),
+            Timestamp::now(),
             signal_check.as_ref(),
         )?;
         tx.commit()?;
@@ -1697,7 +1710,7 @@ impl SqliteRuntime {
         name: &str,
         payload: &Value,
         idempotency_key: Option<&str>,
-        received_at: DateTime<Utc>,
+        received_at: Timestamp,
         deadline_clock: i64,
     ) -> SqliteResult<bool> {
         // A missing run reports `NotFound` before the key rules. The deadline
@@ -1804,7 +1817,7 @@ impl SqliteRuntime {
         refuse_unless_running(&self.conn, exec)?;
         let reason = reason_or(reason, DEFAULT_TERMINATE_REASON);
         let tx = self.conn.transaction()?;
-        let now = (self.now_fn)().timestamp_millis();
+        let now = (self.now_fn)().as_millisecond();
         seal_with_cancel_event(&tx, exec, TERMINATED_STATE, &reason, now)?;
         tx.commit()?;
         // The cascade can seal detached descendants too (issue #2026).
@@ -1823,7 +1836,7 @@ impl SqliteRuntime {
     /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id, or a
     /// persistence error if the seal cannot be written.
     pub fn seal_if_overdue(&mut self, exec: ExecutionId) -> SqliteResult<()> {
-        let now = (self.now_fn)().timestamp_millis();
+        let now = (self.now_fn)().as_millisecond();
         self.seal_if_overdue_at(exec, now)
     }
 
@@ -2085,7 +2098,7 @@ impl SqliteRuntime {
         let now = (self.now_fn)();
         // Issue #2029: the handler can end past the deadline. The update then
         // does not commit, and the run ends `TIMED_OUT`.
-        self.refuse_past_deadline(exec, now.timestamp_millis())?;
+        self.refuse_past_deadline(exec, now.as_millisecond())?;
         let admitted = WorkflowEvent::UpdateAdmitted {
             update_id,
             name: name.to_string(),
@@ -2114,7 +2127,7 @@ impl SqliteRuntime {
         if let Some(reason) = caps.reached(&tx, exec)? {
             // Roll the update back, then end the run as a drive does.
             drop(tx);
-            self.end_run_at_cap(exec, &reason, now.timestamp_millis())?;
+            self.end_run_at_cap(exec, &reason, now.as_millisecond())?;
             return Err(SqliteError::UpdateHistoryCapReached {
                 execution_id: exec,
                 name: name.to_string(),
@@ -2252,7 +2265,7 @@ impl SqliteRuntime {
         if task.state != ExternalTaskState::Pending {
             return Ok(false);
         }
-        let now = (self.now_fn)().timestamp_millis();
+        let now = (self.now_fn)().as_millisecond();
         // An overdue run ends first. Its terminal setter cancels the token.
         self.seal_if_overdue_at(task.exec, now)?;
         if store::execution_state(&self.conn, task.exec)? != "RUNNING" {
@@ -2343,7 +2356,7 @@ impl SqliteRuntime {
                 state: task.state,
             });
         }
-        let now = (self.now_fn)().timestamp_millis();
+        let now = (self.now_fn)().as_millisecond();
         self.refuse_past_deadline(task.exec, now)?;
         let deadline_at = now.saturating_add(duration_to_millis_saturating(extend_by));
         let (policy, start_bytes, workflow_type) =
@@ -2468,8 +2481,8 @@ impl SqliteRuntime {
     /// [`SqliteError::Corrupt`] for a row that does not parse.
     pub fn llm_ledger_between(
         &self,
-        from: DateTime<Utc>,
-        until: DateTime<Utc>,
+        from: Timestamp,
+        until: Timestamp,
     ) -> SqliteResult<Vec<LlmLedgerRow>> {
         llm_ledger::rows_between(&self.conn, from, until)
     }
@@ -2616,7 +2629,7 @@ impl SqliteRuntime {
     /// - [`SqliteError::Sqlite`]: the write fails.
     pub fn upsert_schedule(&mut self, schedule: &WorkflowSchedule) -> SqliteResult<()> {
         self.check_start(&schedule.workflow_name, &schedule.input)?;
-        let now = (self.now_fn)().timestamp_millis();
+        let now = (self.now_fn)().as_millisecond();
         schedule::upsert(&self.conn, schedule, now)
     }
 
@@ -2653,7 +2666,7 @@ impl SqliteRuntime {
         workflow_name: &str,
         reason: Option<&str>,
     ) -> SqliteResult<()> {
-        let now = (self.now_fn)().timestamp_millis();
+        let now = (self.now_fn)().as_millisecond();
         schedule::set_paused(&self.conn, workflow_name, true, reason, now)
     }
 
@@ -2666,7 +2679,7 @@ impl SqliteRuntime {
     /// Returns [`SqliteError::Corrupt`] for a stored spec that does not parse,
     /// and [`SqliteError::Sqlite`] if the write fails.
     pub fn resume_schedule(&mut self, workflow_name: &str) -> SqliteResult<()> {
-        let now = (self.now_fn)().timestamp_millis();
+        let now = (self.now_fn)().as_millisecond();
         schedule::set_paused(&self.conn, workflow_name, false, None, now)
     }
 
@@ -2703,7 +2716,7 @@ impl SqliteRuntime {
         actor: &str,
         reason: Option<&str>,
     ) -> SqliteResult<WorkflowSchedule> {
-        let now = (self.now_fn)().timestamp_millis();
+        let now = (self.now_fn)().as_millisecond();
         schedule::set_override(&self.conn, workflow_name, patch, actor, reason, now)
     }
 
@@ -2717,7 +2730,7 @@ impl SqliteRuntime {
     /// [`SqliteError::Corrupt`] or [`SqliteError::Sqlite`] when a stored value
     /// does not parse or the write fails.
     pub fn clear_schedule_override(&mut self, workflow_name: &str) -> SqliteResult<bool> {
-        let now = (self.now_fn)().timestamp_millis();
+        let now = (self.now_fn)().as_millisecond();
         schedule::clear_override(&self.conn, workflow_name, now)
     }
 
@@ -2769,7 +2782,7 @@ impl SqliteRuntime {
         if let Some(policy) = overlap {
             schedule::check_trigger_policy(policy)?;
         }
-        let now = (self.now_fn)().timestamp_millis();
+        let now = (self.now_fn)().as_millisecond();
         let config = self.start_config(workflow_name, now)?;
         let tx = self.conn.transaction()?;
         let Some(manual) = schedule::load_manual(&tx, workflow_name)? else {
@@ -2825,7 +2838,7 @@ impl SqliteRuntime {
     ///
     /// Returns [`SqliteError::Sqlite`] if a read or a delete fails.
     pub fn purge_with(&mut self, policy: &PurgePolicy) -> SqliteResult<PurgeReport> {
-        self.purge_with_as_of(Utc::now(), policy)
+        self.purge_with_as_of(Timestamp::now(), policy)
     }
 
     /// Like [`purge_with`](Self::purge_with), with each window counted back
@@ -2837,10 +2850,10 @@ impl SqliteRuntime {
     #[doc(hidden)]
     pub fn purge_with_as_of(
         &mut self,
-        now: DateTime<Utc>,
+        now: Timestamp,
         policy: &PurgePolicy,
     ) -> SqliteResult<PurgeReport> {
-        retention::purge_with(&mut self.conn, now.timestamp_micros(), policy)
+        retention::purge_with(&mut self.conn, now.as_microsecond(), policy)
     }
 
     /// Remove each terminal run closed more than `older_than` ago (issue
@@ -2867,7 +2880,7 @@ impl SqliteRuntime {
     ///
     /// Returns [`SqliteError::Sqlite`] if a delete fails.
     pub fn purge_terminal(&mut self, older_than: std::time::Duration) -> SqliteResult<u64> {
-        self.purge_terminal_as_of(Utc::now(), older_than)
+        self.purge_terminal_as_of(Timestamp::now(), older_than)
     }
 
     /// Like [`purge_terminal`](Self::purge_terminal), with the window counted
@@ -2879,11 +2892,11 @@ impl SqliteRuntime {
     #[doc(hidden)]
     pub fn purge_terminal_as_of(
         &mut self,
-        now: DateTime<Utc>,
+        now: Timestamp,
         older_than: std::time::Duration,
     ) -> SqliteResult<u64> {
         let window = i64::try_from(older_than.as_micros()).unwrap_or(i64::MAX);
-        let cutoff = now.timestamp_micros().saturating_sub(window);
+        let cutoff = now.as_microsecond().saturating_sub(window);
         retention::purge_terminal(&mut self.conn, cutoff)
     }
 
@@ -3003,9 +3016,9 @@ impl SqliteRuntime {
         // re-reads `now_fn`. It is a cheap `Arc` clone captured once, so it does
         // not borrow `self` across the `&mut self` cycle call.
         let now_fn = self.now_fn.clone();
-        let failure_now = move || now_fn().timestamp_millis();
+        let failure_now = move || now_fn().as_millisecond();
         let now_fn = self.now_fn.clone();
-        let cycle_now = move || now_fn().timestamp_millis();
+        let cycle_now = move || now_fn().as_millisecond();
         self.drive_until_blocked(exec, &cycle_now, &failure_now)
             .await
     }
@@ -3031,7 +3044,7 @@ impl SqliteRuntime {
     pub async fn run_until_blocked_as_of(
         &mut self,
         exec: ExecutionId,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> SqliteResult<RunState> {
         // Millisecond precision (issue #1069). A whole-second floor would arm a
         // timer up to ~1s early. It could flip an on-time signal-vs-deadline race
@@ -3039,7 +3052,7 @@ impl SqliteRuntime {
         // `received_at`, `run_at`) is a relative epoch-MILLISECOND. So the whole
         // comparison stays self-consistent, with no DDL change (the columns are
         // `INTEGER`).
-        let now = now.timestamp_millis();
+        let now = now.as_millisecond();
         // `_as_of` simulation keeps `failure_now() == now` (the caller-fixed epoch).
         // So a policy retry's backoff anchor is byte-identical to a wall-clock
         // cycle with an instant body: deterministic and sleep-free (issue #1069).
@@ -3225,16 +3238,16 @@ impl SqliteRuntime {
         // Activity-finalize clock seam (issue #1069): re-reads `now_fn` per
         // finalize. It is cloned once so it does not borrow `self`.
         let now_fn = self.now_fn.clone();
-        let failure_now = move || now_fn().timestamp_millis();
+        let failure_now = move || now_fn().as_millisecond();
         let mut first_error = None;
-        let now = (self.now_fn)().timestamp_millis();
+        let now = (self.now_fn)().as_millisecond();
         let fire = fire && self.schedules_enabled;
         let mut progress = fire && self.fire_due_schedules(now, &mut first_error)?;
         for exec in store::running_executions(&self.conn)? {
             if skip.contains(&exec) {
                 continue;
             }
-            let now = (self.now_fn)().timestamp_millis();
+            let now = (self.now_fn)().as_millisecond();
             match self.drive_one_cycle(exec, now, &failure_now).await {
                 Ok(
                     RunState::WaitingSignal(_)
@@ -3269,9 +3282,9 @@ impl SqliteRuntime {
     /// See [`poll_once`](Self::poll_once) — one execution's error does not stop
     /// this pass from driving the rest of the fleet (issue #1530).
     #[doc(hidden)]
-    pub async fn poll_once_as_of(&mut self, now: DateTime<Utc>) -> SqliteResult<bool> {
+    pub async fn poll_once_as_of(&mut self, now: Timestamp) -> SqliteResult<bool> {
         // Millisecond precision — see `run_until_blocked_as_of` (issue #1069).
-        let now = now.timestamp_millis();
+        let now = now.as_millisecond();
         // `_as_of` simulation: `failure_now() == now` (deterministic, sleep-free).
         let failure_now = move || now;
         let mut first_error = None;
@@ -3424,7 +3437,9 @@ impl SqliteRuntime {
         now: i64,
         failure_now: &(dyn Fn() -> i64 + Send + Sync),
     ) -> SqliteResult<RunState> {
-        let result = self.drive_one_cycle_inner(exec, now, failure_now).await;
+        // The cycle future holds the workflow drive. On the heap, it adds only
+        // a pointer to each caller frame in a debug build (issue #2752).
+        let result = boxed(|| self.drive_one_cycle_inner(exec, now, failure_now)).await;
         let result = self.seal_after_error(exec, result, now, failure_now);
         // The cycle, or a seal after it, can seal other runs too, such as a
         // cancel target or a detached child (issue #2026). No drive reaches a
@@ -3620,7 +3635,7 @@ impl SqliteRuntime {
             task_name: workflow_name,
         }
         .to_string();
-        let at = |ms: i64| DateTime::from_timestamp_millis(ms).unwrap_or_default();
+        let at = autumn_harvest::time::from_millisecond_clamped;
         let tx = self.conn.transaction()?;
         let event = WorkflowEvent::WorkflowExecutionTimedOut {
             deadline: at(deadline),
@@ -3962,7 +3977,9 @@ impl SqliteRuntime {
             .cloned()
             .unwrap_or_default();
         let queries: Vec<&QueryHandlerInfo> = queries.iter().collect();
-        let (outcome, pending, _span, _resolved_router) =
+        // The workflow drive and the suspension below go on the heap, so this
+        // frame holds no copy of them in a debug build (issue #2752).
+        let (outcome, pending, _span, _resolved_router) = boxed(|| {
             run_workflow_with_state_history_policy_and_caps(
                 exec,
                 history.clone(),
@@ -3992,7 +4009,8 @@ impl SqliteRuntime {
                 None,
                 None,
             )
-            .await;
+        })
+        .await;
         // Read the clock again once the body returns (issue #2026). The body
         // can take time. Each write that another run reads by time uses this
         // instant. A close checks the parent's child deadlines at it. A signal
@@ -4254,17 +4272,19 @@ impl SqliteRuntime {
                     workflow_type: &workflow_name,
                     state: &shared_state,
                 };
-                self.drive_suspension(
-                    exec,
-                    &owner,
-                    &ingest,
-                    &history,
-                    &commands,
-                    &caps,
-                    CycleClock { now, decided_at },
-                    failure_now,
-                    cancel_reason.as_deref(),
-                )
+                boxed(|| {
+                    self.drive_suspension(
+                        exec,
+                        &owner,
+                        &ingest,
+                        &history,
+                        &commands,
+                        &caps,
+                        CycleClock { now, decided_at },
+                        failure_now,
+                        cancel_reason.as_deref(),
+                    )
+                })
                 .await
             }
         }
@@ -4325,15 +4345,17 @@ impl SqliteRuntime {
         }
         let settle_after_first_terminal = worker::activity_race_in_flight(history, commands);
         let deadline = store::run_config(&self.conn, exec)?.deadline_at;
-        let drain = worker::drain_ready(
-            &mut self.conn,
-            exec,
-            owner,
-            now,
-            failure_now,
-            &self.activities,
-            settle_after_first_terminal,
-        );
+        let drain = boxed(|| {
+            worker::drain_ready(
+                &mut self.conn,
+                exec,
+                owner,
+                now,
+                failure_now,
+                &self.activities,
+                settle_after_first_terminal,
+            )
+        });
         // Issue #2029: the workflow deadline bounds the drain. A body past it
         // is dropped, as a dropped drive drops it (issue #2024). The seal then
         // removes its `RUNNING` task.
@@ -5104,7 +5126,7 @@ fn cancel_and_seal_prior(
     // A RUNNING prior closes here, so settle its parent and its detached
     // children (issue #2026). A terminal prior settled them when it ended.
     if let Some(event) = &cancelled {
-        composition::close_execution(conn, prior_exec, event, Utc::now().timestamp_millis())?;
+        composition::close_execution(conn, prior_exec, event, Timestamp::now().as_millisecond())?;
     }
     Ok(())
 }
@@ -5398,7 +5420,7 @@ fn stage_keyed(
     name: &str,
     payload: &Value,
     key: Option<&str>,
-    received_at: DateTime<Utc>,
+    received_at: Timestamp,
     check: Option<&SignalHandlerInfo>,
 ) -> SqliteResult<bool> {
     if let Some(key) = key
@@ -5449,14 +5471,7 @@ fn stage_keyed(
     // `received_at` with a deadline timer's `fire_at`. Both are epoch
     // milliseconds. A whole-second floor can move an on-time signal past its
     // deadline.
-    store::stage_signal(
-        conn,
-        exec,
-        name,
-        payload,
-        received_at.timestamp_millis(),
-        key,
-    )?;
+    store::stage_signal(conn, exec, name, payload, received_at.as_millisecond(), key)?;
     Ok(true)
 }
 
@@ -5639,11 +5654,11 @@ fn insert_run(
         &input,
         fresh.config,
     )?;
-    let started_at = DateTime::from_timestamp_millis(fresh.started_at).unwrap_or_else(Utc::now);
+    let started_at = autumn_harvest::time::from_millisecond_clamped(fresh.started_at);
     store::set_start_fields(
         conn,
         exec,
-        started_at.timestamp_micros(),
+        started_at.as_microsecond(),
         fresh.fields.memo,
         fresh.fields.search_attrs,
     )?;
@@ -5779,7 +5794,7 @@ fn start_retry(
         &WorkflowEvent::WorkflowRetryScheduled {
             retry_exec_id: successor,
             attempt: plan.attempt,
-            fire_at: DateTime::from_timestamp_millis(plan.start_at).unwrap_or_default(),
+            fire_at: autumn_harvest::time::from_millisecond_clamped(plan.start_at),
         },
     )
 }
@@ -5965,7 +5980,7 @@ fn apply_mutex_command(
             let Some(lock_seq) = mutex::acquire(conn, exec, key)? else {
                 return Ok(false);
             };
-            let acquired_at = DateTime::from_timestamp_millis(now).unwrap_or_default();
+            let acquired_at = autumn_harvest::time::from_millisecond_clamped(now);
             store::append_event(
                 conn,
                 exec,
@@ -6629,7 +6644,7 @@ fn drive_span_meta(
         workflow_id: workflow_id.to_string(),
         shard_id: 0,
         queue_name: String::new(),
-        drive_clock: DateTime::<Utc>::from_timestamp_millis(now),
+        drive_clock: Some(autumn_harvest::time::from_millisecond_clamped(now)),
         is_replay: false,
         link_traceparent: None,
         build_id: None,

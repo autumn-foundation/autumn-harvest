@@ -79,7 +79,7 @@ type IdMap<K, V> = HashMap<K, V, foldhash::fast::RandomState>;
 /// Hash set for the history index's UUID-newtype keys. See [`IdMap`].
 type IdSet<K> = HashSet<K, foldhash::fast::RandomState>;
 
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use jiff::SignedDuration;
 use serde::Serialize;
 
 use crate::context::WorkflowCommand;
@@ -169,13 +169,13 @@ pub struct Awaitable {
     /// it is the time of the last recorded event: the suspension point, when
     /// the run last made progress.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub since: Option<DateTime<Utc>>,
+    pub since: Option<jiff::Timestamp>,
     /// A deadline where one applies: timer fire time (armed-at + duration),
     /// external-activity schedule-to-close, or the deadline of a
     /// signal-or-deadline / child-or-deadline race. Callers may enrich activity
     /// awaitables with the task row's cross-retry `schedule_to_close_at`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub deadline: Option<DateTime<Utc>>,
+    pub deadline: Option<jiff::Timestamp>,
     /// `true` for a local activity (runs inline on the workflow worker).
     #[serde(skip_serializing_if = "is_false")]
     pub local: bool,
@@ -258,11 +258,11 @@ pub struct AwaitablesProjection {
 }
 
 /// External-handoff activity metadata: (name, awaiting-since, deadline).
-type ExternalActivityMeta = (String, DateTime<Utc>, Option<DateTime<Utc>>);
+type ExternalActivityMeta = (String, jiff::Timestamp, Option<jiff::Timestamp>);
 
 /// Metadata about one open (unpaired) durable-timer arm.
 struct OpenTimerArm {
-    since: DateTime<Utc>,
+    since: jiff::Timestamp,
     duration_secs: u64,
 }
 
@@ -277,12 +277,12 @@ struct HistoryIndex {
     /// allocation and format on every touch. It also avoids a variable-length
     /// `SipHash` pass over a 36-byte hyphenated string. A wide fan-out's
     /// history scan is the whole cost of this index, so both add up.
-    activities: IdMap<ActivityExecId, (String, DateTime<Utc>)>,
+    activities: IdMap<ActivityExecId, (String, jiff::Timestamp)>,
     /// activity ids with a recorded terminal (completed/failed/timed out/
     /// externally resolved).
     closed_activities: IdSet<ActivityExecId>,
     /// `activity_id` → (name, scheduled-at) for local activities.
-    local_activities: IdMap<ActivityExecId, (String, DateTime<Utc>)>,
+    local_activities: IdMap<ActivityExecId, (String, jiff::Timestamp)>,
     /// local activity ids with a recorded terminal (completed/exhausted).
     closed_local_activities: IdSet<ActivityExecId>,
     /// `activity_id` → (name, awaiting-since, deadline) for external handoffs.
@@ -296,15 +296,15 @@ struct HistoryIndex {
     ///
     /// Keyed by the native `ExecutionId` (`Copy`, same rationale as
     /// `activities` above).
-    children: IdMap<ExecutionId, (String, DateTime<Utc>)>,
+    children: IdMap<ExecutionId, (String, jiff::Timestamp)>,
     /// Insertion order of open children.
     child_order: Vec<ExecutionId>,
     /// Update id → (handler name, admitted-at) for unresolved updates,
     /// in admission order.
-    pending_updates: Vec<(String, String, DateTime<Utc>)>,
+    pending_updates: Vec<(String, String, jiff::Timestamp)>,
     /// `await_id` → (target exec id, requested-at) for unresolved external
     /// workflow awaits, in request order.
-    open_external_awaits: Vec<(String, String, DateTime<Utc>)>,
+    open_external_awaits: Vec<(String, String, jiff::Timestamp)>,
     /// Unresolved external signal (issue #244) / cancel (issue #492) requests,
     /// each `(target exec id, optional signal name, requested-at)`, in request
     /// order. A signal request carries the signal name; a cancel request does
@@ -314,9 +314,9 @@ struct HistoryIndex {
     /// history-only fallback still reports them in crash-recovery or degraded
     /// scans. This matches the replayed mode's `SignalExternalWorkflow` /
     /// `RequestCancelExternalWorkflow` command projection.
-    open_external_ops: Vec<(String, Option<String>, DateTime<Utc>)>,
+    open_external_ops: Vec<(String, Option<String>, jiff::Timestamp)>,
     /// Timestamp of the last recorded event (the suspension point).
-    last_event_at: Option<DateTime<Utc>>,
+    last_event_at: Option<jiff::Timestamp>,
 }
 
 /// Per-category row counts used to pre-size [`HistoryIndex`]'s collections.
@@ -341,7 +341,7 @@ struct HistoryCounts {
 /// indexing pass it precedes. There is no `timers` or `external_activities`
 /// field: see [`HistoryIndex::with_capacity`] for why those rows are not
 /// counted here.
-fn count_history_categories(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryCounts {
+fn count_history_categories(rows: &[(jiff::Timestamp, WorkflowEvent)]) -> HistoryCounts {
     let mut counts = HistoryCounts::default();
     for (_, event) in rows {
         match event {
@@ -453,16 +453,16 @@ impl HistoryIndex {
 }
 
 #[allow(clippy::too_many_lines)]
-fn build_history_index(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryIndex {
+fn build_history_index(rows: &[(jiff::Timestamp, WorkflowEvent)]) -> HistoryIndex {
     let mut index = HistoryIndex::with_capacity(&count_history_categories(rows));
     let mut resolved_updates: HashSet<String> = HashSet::new();
-    let mut admitted_updates: Vec<(String, String, DateTime<Utc>)> = Vec::new();
-    let mut external_awaits: Vec<(String, String, DateTime<Utc>)> = Vec::new();
+    let mut admitted_updates: Vec<(String, String, jiff::Timestamp)> = Vec::new();
+    let mut external_awaits: Vec<(String, String, jiff::Timestamp)> = Vec::new();
     let mut resolved_awaits: HashSet<String> = HashSet::new();
     // External signal/cancel requests keyed by their correlation id. Signal and
     // cancel ids are distinct UUIDs, so one resolved set cannot collide across
     // the two. Tuple: (correlation id, target, optional signal name, at).
-    let mut external_ops: Vec<(String, String, Option<String>, DateTime<Utc>)> = Vec::new();
+    let mut external_ops: Vec<(String, String, Option<String>, jiff::Timestamp)> = Vec::new();
     let mut resolved_external_ops: HashSet<String> = HashSet::new();
 
     for (at, event) in rows {
@@ -488,7 +488,7 @@ fn build_history_index(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> HistoryIndex 
             } => {
                 let deadline = i64::try_from(*schedule_to_close_secs)
                     .ok()
-                    .and_then(|secs| at.checked_add_signed(ChronoDuration::seconds(secs)));
+                    .and_then(|secs| at.checked_add(SignedDuration::from_secs(secs)).ok());
                 index
                     .external_activities
                     .insert(*activity_id, (name.clone(), *at, deadline));
@@ -693,15 +693,15 @@ pub(crate) fn reserved_child_race_name(timer_id: &str) -> Option<&str> {
 /// A race deadline parsed from a reserved race timer, to be folded into the
 /// matching signal/child awaitable rather than reported as an internal timer.
 struct RaceDeadline {
-    since: Option<DateTime<Utc>>,
-    deadline: Option<DateTime<Utc>>,
+    since: Option<jiff::Timestamp>,
+    deadline: Option<jiff::Timestamp>,
 }
 
 fn timer_arm_metadata(
     index: &HistoryIndex,
     timer_id: &str,
     duration_secs: u64,
-) -> (Option<DateTime<Utc>>, Option<DateTime<Utc>>) {
+) -> (Option<jiff::Timestamp>, Option<jiff::Timestamp>) {
     let since = index
         .open_timer_arms
         .get(timer_id)
@@ -710,7 +710,7 @@ fn timer_arm_metadata(
     let deadline = since.and_then(|at| {
         i64::try_from(duration_secs)
             .ok()
-            .and_then(|secs| at.checked_add_signed(ChronoDuration::seconds(secs)))
+            .and_then(|secs| at.checked_add(SignedDuration::from_secs(secs)).ok())
     });
     (since, deadline)
 }
@@ -787,7 +787,7 @@ fn project_replayed(index: &HistoryIndex, commands: &[WorkflowCommand]) -> Vec<A
                     awaitable.deadline = awaitable.since.and_then(|at| {
                         i64::try_from(*schedule_to_close_secs)
                             .ok()
-                            .and_then(|secs| at.checked_add_signed(ChronoDuration::seconds(secs)))
+                            .and_then(|secs| at.checked_add(SignedDuration::from_secs(secs)).ok())
                     });
                 }
                 awaitables.push(awaitable);
@@ -992,7 +992,7 @@ fn orphan_race_timer(prefix: &str, name: &str, race: &RaceDeadline) -> Awaitable
     awaitable
 }
 
-fn update_awaitable(update_id: &str, name: &str, since: DateTime<Utc>) -> Awaitable {
+fn update_awaitable(update_id: &str, name: &str, since: jiff::Timestamp) -> Awaitable {
     let mut awaitable = Awaitable::new(AwaitableKind::Update);
     awaitable.id = Some(update_id.to_string());
     awaitable.name = Some(name.to_string());
@@ -1017,7 +1017,7 @@ fn project_history_only(
     let mut awaitables: Vec<Awaitable> = Vec::new();
 
     // Open regular activities, in scheduling order.
-    let mut open_activities: Vec<(&ActivityExecId, &(String, DateTime<Utc>))> = index
+    let mut open_activities: Vec<(&ActivityExecId, &(String, jiff::Timestamp))> = index
         .activities
         .iter()
         .filter(|(id, _)| !index.closed_activities.contains(*id))
@@ -1049,7 +1049,7 @@ fn project_history_only(
     }
 
     // Open local activities (scheduled, possibly mid-retry, no terminal).
-    let mut open_local: Vec<(&ActivityExecId, &(String, DateTime<Utc>))> = index
+    let mut open_local: Vec<(&ActivityExecId, &(String, jiff::Timestamp))> = index
         .local_activities
         .iter()
         .filter(|(id, _)| !index.closed_local_activities.contains(*id))
@@ -1076,7 +1076,7 @@ fn project_history_only(
     // recorded order and derive from the same command order. So popping the
     // front of a name's queue per child pairs them correctly. This mirrors the
     // replayed path's per-name `VecDeque` (issue #615).
-    let mut child_race_deadlines: HashMap<String, VecDeque<DateTime<Utc>>> = HashMap::new();
+    let mut child_race_deadlines: HashMap<String, VecDeque<jiff::Timestamp>> = HashMap::new();
     for timer_id in &index.timer_order {
         let Some(arms) = index.open_timer_arms.get(timer_id) else {
             continue;
@@ -1084,7 +1084,7 @@ fn project_history_only(
         for arm in arms {
             let deadline = i64::try_from(arm.duration_secs)
                 .ok()
-                .and_then(|secs| arm.since.checked_add_signed(ChronoDuration::seconds(secs)));
+                .and_then(|secs| arm.since.checked_add(SignedDuration::from_secs(secs)).ok());
             if let Some(signal_name) = reserved_signal_race_name(timer_id) {
                 let mut awaitable = Awaitable::new(AwaitableKind::Signal);
                 awaitable.name = Some(signal_name.to_string());
@@ -1172,7 +1172,7 @@ fn project_history_only(
 /// Pure and read-only: no side effects, no mutation, no new event variants.
 #[must_use]
 pub fn project_awaitables(
-    rows: &[(DateTime<Utc>, WorkflowEvent)],
+    rows: &[(jiff::Timestamp, WorkflowEvent)],
     wait_set: WaitSetInput<'_>,
     cap: usize,
 ) -> AwaitablesProjection {

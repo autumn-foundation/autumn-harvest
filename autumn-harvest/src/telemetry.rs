@@ -1822,7 +1822,7 @@ pub const METRIC_UPDATE_FAILED: &str = "harvest.update.failed";
 /// [`UNREGISTERED_UPDATE_NAME`]. `outcome` is `"completed"`/`"failed"`.
 /// Rejected updates never enter the histogram, as no handler runs. The admit
 /// timestamp comes from the `UpdateAdmitted` event already in the loaded
-/// history. The terminal time is `Utc::now()` at emit. It is clamped, so a
+/// history. The terminal time is `Timestamp::now()` at emit. It is clamped, so a
 /// clock-skew negative delta records `0`, never a garbage value.
 /// `execution.id`/`update_id` are span-only per ADR-0001 §7.
 pub const METRIC_UPDATE_DURATION: &str = "harvest.update.duration";

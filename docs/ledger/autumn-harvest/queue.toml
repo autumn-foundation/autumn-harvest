@@ -99,7 +99,7 @@ driver = "per_task"
 backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_activity_pauses", "harvest_build_compat", "harvest_queue_pauses", "harvest_rate_limit_buckets", "harvest_task_queue", "harvest_workers", "harvest_workflow_executions"]
-measured = "docs/performance-claim-window-split.md"
+measured = "docs/performance-keyed-claim-running-counts.md"
 plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["claim_workflow_task_of_execution"]
@@ -123,7 +123,7 @@ driver = "per_task"
 backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_task_queue"]
-measured = "unmeasured"
+measured = "docs/performance-claim-release-guard.md"
 plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["concurrency_key_stats"]
@@ -329,7 +329,7 @@ driver = "per_task"
 backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_task_queue"]
-measured = "unmeasured"
+measured = "docs/performance-claim-release-guard.md"
 plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["pending_queue_demand_by_queue_name"]
@@ -408,7 +408,7 @@ driver = "per_task"
 backend = ["postgres"]
 kind = []
 tables = []
-measured = "unmeasured"
+measured = "docs/performance-claim-release-guard.md"
 plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["release_task_for_capability_miss"]
@@ -620,5 +620,5 @@ driver = "per_task"
 backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_task_queue"]
-measured = "unmeasured"
+measured = "docs/performance-claim-release-guard.md"
 plan = "docs/ledger/plans/autumn-harvest/queue.md"

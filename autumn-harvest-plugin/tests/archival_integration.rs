@@ -634,7 +634,7 @@ async fn retention_preserves_a_failed_callback_delivery_and_its_dead_letter() {
                 "non_retryable_errors": [],
                 "jitter": "None"
             }),
-            next_attempt_at: chrono::Utc::now(),
+            next_attempt_at: jiff::Timestamp::now(),
         })
         .execute(&mut conn)
         .await
@@ -747,7 +747,7 @@ fn orphan_reclaim_delivery_fixture(
             "non_retryable_errors": [],
             "jitter": "None"
         }),
-        next_attempt_at: chrono::Utc::now(),
+        next_attempt_at: jiff::Timestamp::now(),
     }
 }
 

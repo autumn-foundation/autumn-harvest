@@ -16,7 +16,7 @@
 
 use autumn_harvest::policy::Schedule;
 use autumn_harvest::schedule_plan::SlotWalker;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -29,7 +29,7 @@ fn main() {
     let schedules = env_usize("SLOT_WALK_SCHEDULES", 20);
     let slots = env_usize("SLOT_WALK_SLOTS", 1440);
     let exprs = ["* * * * *", "*/5 * * * *", "0/10 * * * *", "*/15 * * * * *"];
-    let start: DateTime<Utc> = "2026-03-01T00:00:00Z".parse().expect("timestamp");
+    let start: Timestamp = "2026-03-01T00:00:00Z".parse().expect("timestamp");
     let mut checksum = 0_i64;
     for i in 0..schedules {
         let schedule = Schedule::Cron(exprs[i % exprs.len()].to_string());
@@ -38,7 +38,7 @@ fn main() {
         for _ in 0..slots {
             cursor = walker.next_after(cursor).expect("next slot");
         }
-        checksum ^= cursor.timestamp();
+        checksum ^= cursor.as_second();
     }
     println!("checksum {checksum}");
 }

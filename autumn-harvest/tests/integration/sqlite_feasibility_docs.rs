@@ -238,7 +238,13 @@ const AUDIT_EXCLUDED_MODULES: &[&str] = &["chaos"];
 /// sandbox run is an ordinary activity, so a port to `SQLite` carries it with
 /// no change. The same check keeps it free of Postgres coupling, nested
 /// directories included.
-const SKIPPED_SUBDIRS: &[&str] = &["dst", "sandbox", "testing"];
+///
+/// `time` holds the date and time helpers of ADR 0018. They are
+/// backend-neutral: formats, parsing, zones and serde adapters. The
+/// Postgres wrappers are not in it. They are in the flat `time_sql.rs`, so
+/// the inventory records their coupling. The same check keeps `time` free of
+/// Postgres coupling.
+const SKIPPED_SUBDIRS: &[&str] = &["dst", "sandbox", "testing", "time"];
 
 /// R&D spike subdirectories of `autumn-harvest/src` that the flat scan
 /// skips, each with the Cargo feature that turns it on.

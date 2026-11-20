@@ -17,6 +17,7 @@
 #![allow(clippy::similar_names)]
 #![allow(clippy::too_many_lines)]
 
+use jiff_diesel::ToDiesel;
 use std::sync::Arc;
 
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
@@ -34,10 +35,10 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -215,7 +216,7 @@ async fn seed_terminal(
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq(state),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             harvest_workflow_executions::error.eq(error),
         ))
         .execute(conn)
@@ -323,7 +324,7 @@ async fn terminate_idempotent_on_terminal() {
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -664,7 +665,7 @@ async fn terminate_awaited_child_skips_wake_when_parent_terminal() {
     diesel::update(harvest_workflow_executions::table.find(parent.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("TIMED_OUT"),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await

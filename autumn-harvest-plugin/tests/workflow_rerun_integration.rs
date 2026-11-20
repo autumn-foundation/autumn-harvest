@@ -20,6 +20,7 @@
 // suites (`start_idempotency_integration.rs`, `admission_gate_authoritative_localpg.rs`).
 #![allow(clippy::await_holding_lock)]
 
+use jiff_diesel::ToDiesel;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
@@ -34,10 +35,10 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{DateTime, Utc};
 use diesel::sql_types::{Jsonb, Nullable, Text, Timestamptz};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -332,11 +333,11 @@ struct Seed {
     context_headers: Option<Value>,
     workflow_retry_policy: Option<Value>,
     chain_execution_timeout_secs: Option<i64>,
-    chain_deadline_at: Option<DateTime<Utc>>,
+    chain_deadline_at: Option<Timestamp>,
     schedule_id: Option<uuid::Uuid>,
-    scheduled_for: Option<DateTime<Utc>>,
+    scheduled_for: Option<Timestamp>,
     origin: Option<&'static str>,
-    completed_at: Option<DateTime<Utc>>,
+    completed_at: Option<Timestamp>,
 }
 
 #[derive(diesel::QueryableByName)]
@@ -354,7 +355,7 @@ async fn seed_execution(
     state: &str,
     seed: Seed,
 ) -> String {
-    let now = Utc::now();
+    let now = Timestamp::now();
     let completed_at = if matches!(state, "RUNNING" | "PAUSED") {
         None
     } else {
@@ -382,8 +383,8 @@ async fn seed_execution(
     .bind::<Text, _>(workflow_id)
     .bind::<Text, _>(state)
     .bind::<Jsonb, _>(seed.input.unwrap_or_else(|| json!({})))
-    .bind::<Timestamptz, _>(now)
-    .bind::<Nullable<Timestamptz>, _>(completed_at)
+    .bind::<Timestamptz, _>(now.to_diesel())
+    .bind::<Nullable<Timestamptz>, _>(completed_at.to_diesel())
     .bind::<Nullable<Jsonb>, _>(seed.output)
     .bind::<Nullable<Text>, _>(seed.error)
     .bind::<Nullable<Text>, _>(seed.queue_name)
@@ -398,10 +399,10 @@ async fn seed_execution(
     .bind::<Nullable<Jsonb>, _>(seed.context_headers)
     .bind::<Nullable<Jsonb>, _>(seed.workflow_retry_policy)
     .bind::<Nullable<diesel::sql_types::Uuid>, _>(seed.schedule_id)
-    .bind::<Nullable<Timestamptz>, _>(seed.scheduled_for)
+    .bind::<Nullable<Timestamptz>, _>(seed.scheduled_for.to_diesel())
     .bind::<Nullable<Text>, _>(seed.origin)
     .bind::<Nullable<diesel::sql_types::BigInt>, _>(seed.chain_execution_timeout_secs)
-    .bind::<Nullable<Timestamptz>, _>(seed.chain_deadline_at)
+    .bind::<Nullable<Timestamptz>, _>(seed.chain_deadline_at.to_diesel())
     .get_result::<IdRow>(conn)
     .await
     .expect("insert execution")
@@ -442,7 +443,7 @@ async fn seed_retry_successor(
     predecessor: &str,
     state: &str,
 ) -> String {
-    let now = Utc::now();
+    let now = Timestamp::now();
     let completed_at = if matches!(state, "RUNNING" | "PAUSED") {
         None
     } else {
@@ -458,8 +459,8 @@ async fn seed_retry_successor(
     .bind::<Text, _>(workflow_name)
     .bind::<Text, _>(workflow_id)
     .bind::<Text, _>(state)
-    .bind::<Timestamptz, _>(now)
-    .bind::<Nullable<Timestamptz>, _>(completed_at)
+    .bind::<Timestamptz, _>(now.to_diesel())
+    .bind::<Nullable<Timestamptz>, _>(completed_at.to_diesel())
     .bind::<Text, _>(predecessor)
     .get_result::<IdRow>(conn)
     .await
@@ -496,7 +497,8 @@ struct ExecRow {
     #[diesel(sql_type = Nullable<Text>)]
     error: Option<String>,
     #[diesel(sql_type = Nullable<Timestamptz>)]
-    completed_at: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+    completed_at: Option<Timestamp>,
     #[diesel(sql_type = Nullable<Jsonb>)]
     memo: Option<Value>,
     #[diesel(sql_type = Nullable<Jsonb>)]
@@ -522,7 +524,8 @@ struct ExecRow {
     #[diesel(sql_type = Nullable<diesel::sql_types::Uuid>)]
     schedule_id: Option<uuid::Uuid>,
     #[diesel(sql_type = Nullable<Timestamptz>)]
-    scheduled_for: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+    scheduled_for: Option<Timestamp>,
     #[diesel(sql_type = Nullable<Text>)]
     origin: Option<String>,
     #[diesel(sql_type = Nullable<diesel::sql_types::Uuid>)]
@@ -538,7 +541,8 @@ struct ExecRow {
     #[diesel(sql_type = Nullable<diesel::sql_types::BigInt>)]
     chain_execution_timeout_secs: Option<i64>,
     #[diesel(sql_type = Nullable<Timestamptz>)]
-    chain_deadline_at: Option<DateTime<Utc>>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+    chain_deadline_at: Option<Timestamp>,
 }
 
 const EXEC_SELECT: &str = "SELECT state, workflow_id, queue_name, input, output, error,
@@ -806,7 +810,7 @@ async fn seed_terminal_on_shard0(
 ) -> String {
     let exec_id =
         autumn_harvest::types::ExecutionId::new_for_shard(autumn_harvest::types::ShardId::new(0));
-    let now = Utc::now();
+    let now = Timestamp::now();
     diesel::sql_query(
         "INSERT INTO harvest_workflow_executions
             (id, workflow_name, workflow_id, shard_id, state, input, started_at, completed_at,
@@ -817,7 +821,7 @@ async fn seed_terminal_on_shard0(
     .bind::<Text, _>(workflow_name)
     .bind::<Text, _>(workflow_id)
     .bind::<Jsonb, _>(json!({}))
-    .bind::<Timestamptz, _>(now)
+    .bind::<Timestamptz, _>(now.to_diesel())
     .execute(conn)
     .await
     .expect("insert execution");
@@ -846,7 +850,7 @@ async fn seed_execution_on_shard(
     state: &str,
 ) -> String {
     let exec_id = autumn_harvest::types::ExecutionId::new_for_shard(shard);
-    let now = Utc::now();
+    let now = Timestamp::now();
     diesel::sql_query(
         "INSERT INTO harvest_workflow_executions
             (id, workflow_name, workflow_id, shard_id, state, input, started_at, completed_at,
@@ -860,7 +864,7 @@ async fn seed_execution_on_shard(
     .bind::<diesel::sql_types::Integer, _>(shard.as_i32())
     .bind::<Text, _>(state)
     .bind::<Jsonb, _>(json!({}))
-    .bind::<Timestamptz, _>(now)
+    .bind::<Timestamptz, _>(now.to_diesel())
     .execute(conn)
     .await
     .expect("insert execution");
@@ -1871,9 +1875,7 @@ async fn rerun_seals_source_and_preserves_completed_at() {
     let mut conn = pool.get().await.unwrap();
 
     let wf_id = unique("rr-seal");
-    let fixed = DateTime::parse_from_rfc3339("2026-02-03T04:05:06Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let fixed = "2026-02-03T04:05:06Z".parse::<Timestamp>().unwrap();
     let source = seed_execution(
         &mut conn,
         wf,
@@ -2255,7 +2257,7 @@ async fn rerun_respects_admission_gate() {
         reason: "incident".to_string(),
         message: None,
         created_by: "op".to_string(),
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         expires_at: None,
     }]);
     set_global_admission_gate_cache(Some(api_state.gate_cache()));
@@ -2578,7 +2580,7 @@ async fn rerun_does_not_carry_schedule_provenance() {
         "COMPLETED",
         Seed {
             schedule_id: Some(uuid::Uuid::new_v4()),
-            scheduled_for: Some(Utc::now()),
+            scheduled_for: Some(Timestamp::now()),
             origin: Some("scheduled"),
             ..Seed::default()
         },
@@ -2877,8 +2879,8 @@ async fn rerun_of_schedule_attributed_source_is_rejected() {
 
     let wf_id = unique("rr-sched-seal");
     let schedule_id = uuid::Uuid::new_v4();
-    let slot = Utc::now();
-    let completed = Utc::now();
+    let slot = Timestamp::now();
+    let completed = Timestamp::now();
     let source = seed_execution(
         &mut conn,
         wf,
@@ -2941,7 +2943,7 @@ async fn rerun_of_schedule_attributed_source_with_override_is_allowed() {
         "FAILED",
         Seed {
             schedule_id: Some(schedule_id),
-            scheduled_for: Some(Utc::now()),
+            scheduled_for: Some(Timestamp::now()),
             origin: Some("scheduled"),
             ..Seed::default()
         },
@@ -3048,7 +3050,7 @@ async fn rerun_clones_chain_timeout_and_reanchors_its_deadline() {
     let wf_id = unique("rr-chain");
     // A deadline far in the PAST: if it were inherited, the new run would be
     // born already over its chain cap.
-    let stale_deadline = Utc::now() - chrono::Duration::hours(24);
+    let stale_deadline = Timestamp::now() - jiff::SignedDuration::from_hours(24);
     let source = seed_execution(
         &mut conn,
         wf,
@@ -3062,11 +3064,11 @@ async fn rerun_clones_chain_timeout_and_reanchors_its_deadline() {
     )
     .await;
 
-    let before = Utc::now();
+    let before = Timestamp::now();
     let (status, body) = post_json(&app, &rerun_uri(&source), json!({})).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let new_id = body["execution_id"].as_str().unwrap().to_string();
-    let after = Utc::now();
+    let after = Timestamp::now();
 
     let row = load_exec(&mut conn, &new_id).await;
     assert_eq!(
@@ -3083,8 +3085,8 @@ async fn rerun_clones_chain_timeout_and_reanchors_its_deadline() {
     );
     // Fresh anchor = (start instant) + 7200s, bracketed by the request window.
     assert!(
-        deadline >= before + chrono::Duration::seconds(7200)
-            && deadline <= after + chrono::Duration::seconds(7200),
+        deadline >= before + jiff::SignedDuration::from_secs(7200)
+            && deadline <= after + jiff::SignedDuration::from_secs(7200),
         "the deadline is re-anchored at now + chain cap: {deadline} not in \
          [{before} + 2h, {after} + 2h]"
     );

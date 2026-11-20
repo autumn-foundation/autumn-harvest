@@ -363,7 +363,7 @@ mod tests {
 
     use std::sync::{Arc, Mutex};
 
-    use autumn_harvest::chrono::Utc;
+    use autumn_harvest::time::Timestamp;
     use serde_json::json;
 
     use super::*;
@@ -401,7 +401,7 @@ mod tests {
                 name: WORKFLOW_NAME.to_owned(),
                 events: vec![WorkflowEvent::WorkflowStarted {
                     input,
-                    timestamp: Utc::now(),
+                    timestamp: Timestamp::now(),
                     last_completion_result: None,
                     last_error: None,
                     scheduled_time: None,

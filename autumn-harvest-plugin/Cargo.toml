@@ -106,17 +106,17 @@ autumn-harvest = { version = "0.10.0", path = "../autumn-harvest", features = ["
 # policy store. The agent crate never depends on this crate.
 # `cargo xtask check agent-adapter-deps` checks that direction.
 autumn-harvest-agent = { version = "0.10.0", path = "../autumn-harvest-agent", features = ["postgres"] }
-autumn-web = "0.10"
+autumn-web = "0.11"
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 uuid = { workspace = true }
-chrono = { workspace = true }
-chrono-tz = { workspace = true }
+jiff = { workspace = true }
 tracing = { workspace = true }
 diesel = { workspace = true }
+jiff-diesel = { workspace = true }
 diesel-async = { workspace = true }
 diesel_migrations = { workspace = true }
 deadpool = { workspace = true }
@@ -210,7 +210,7 @@ path = "src/bin/harvest_dev.rs"
 required-features = ["dev-runtime"]
 
 [dev-dependencies]
-autumn-web = { version = "0.10", features = ["test-support", "mcp"] }
+autumn-web = { version = "0.11", features = ["test-support", "mcp"] }
 # The dev-runtime lifecycle test drives the running dev runtime over real HTTP
 # (start a workflow, poll its status, fetch the Vantage page). The crate already
 # depends on reqwest for the callback deliverer; the test needs `json` on top.

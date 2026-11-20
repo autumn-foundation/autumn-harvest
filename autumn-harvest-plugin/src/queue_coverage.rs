@@ -58,6 +58,7 @@
 //! poller. A paused queue with live pollers is not listed there: it would
 //! not have been uncovered anyway.
 
+use jiff_diesel::ToDiesel;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Duration;
 
@@ -66,9 +67,9 @@ use autumn_harvest::queue::{self, PendingQueueDemand};
 use autumn_harvest::queue_pause;
 use autumn_harvest::worker::DbPool;
 use autumn_harvest::workers::{WorkerHealth, WorkerRow, WorkerStatus};
-use chrono::{DateTime, Utc};
 use diesel_async::AsyncPgConnection;
 use futures::future::join_all;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -172,7 +173,7 @@ pub struct QueueCoverageReport {
     /// could host an uncovered queue this report never saw.
     pub status: QueueCoverageReportStatus,
     /// When the report was assembled.
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: Timestamp,
     /// Echo of the `queue_name` filter, if any.
     pub filter: Option<String>,
     /// Top-level summary (AC4): `true` when at least one queue has pending
@@ -318,7 +319,7 @@ pub async fn build_queue_coverage_report(
     api_state: &HarvestApiState,
     query: QueueCoverageQuery,
 ) -> QueueCoverageReport {
-    let observed_at = Utc::now();
+    let observed_at = Timestamp::now();
     let worker_stale_threshold = api_state.worker_stale_threshold();
 
     let pools = shard_fanout::pools_by_shard(api_state);
@@ -535,7 +536,7 @@ pub(crate) fn worker_covers_queue(worker: &WorkerRow, queue_name: &str, shard_id
 /// its workers (issue #774).
 ///
 /// So this bypasses `list_workers` and issues a purpose-built query. Rust
-/// computes the heartbeat cutoff (`Utc::now() - worker_stale_threshold`)
+/// computes the heartbeat cutoff (`Timestamp::now() - worker_stale_threshold`)
 /// once. The query binds it as a timestamp comparison beside the
 /// `status IN (...)` filter. Postgres then excludes every crashed or stale
 /// row before a byte crosses the wire. No row-count limit is needed, so none
@@ -557,7 +558,10 @@ pub(crate) async fn fetch_potentially_live_workers(
     use diesel_async::RunQueryDsl;
 
     let stale_secs = i64::try_from(worker_stale_threshold.as_secs()).unwrap_or(i64::MAX);
-    let cutoff = Utc::now() - chrono::Duration::seconds(stale_secs);
+    // A threshold past the jiff range gives the earliest cutoff, not a panic.
+    let cutoff = Timestamp::now()
+        .checked_sub(jiff::SignedDuration::from_secs(stale_secs))
+        .unwrap_or(Timestamp::MIN);
 
     let rows: Vec<HarvestWorker> = harvest_workers::table
         .select(HarvestWorker::as_select())
@@ -565,7 +569,7 @@ pub(crate) async fn fetch_potentially_live_workers(
             WorkerStatus::Active.as_str(),
             WorkerStatus::Draining.as_str(),
         ]))
-        .filter(harvest_workers::last_heartbeat_at.ge(cutoff))
+        .filter(harvest_workers::last_heartbeat_at.ge(cutoff.to_diesel()))
         .load(conn)
         .await
         .map_err(autumn_harvest::error::database_error)?;
@@ -754,7 +758,7 @@ fn classify_pending_demand(
 }
 
 fn build_report_from_observations(
-    observed_at: DateTime<Utc>,
+    observed_at: Timestamp,
     filter: Option<String>,
     observations: Vec<ShardObservation<UncoveredQueueDemand>>,
 ) -> QueueCoverageReport {
@@ -832,10 +836,10 @@ fn build_report_from_observations(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone as _;
+    use jiff::Timestamp;
 
-    fn at(seconds: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(seconds, 0).unwrap()
+    fn at(seconds: i64) -> Timestamp {
+        Timestamp::new(seconds, 0).unwrap()
     }
 
     fn demand(queue_name: &str, pending_count: i64) -> UncoveredQueueDemand {

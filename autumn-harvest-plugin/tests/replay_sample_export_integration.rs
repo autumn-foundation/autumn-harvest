@@ -18,6 +18,7 @@
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
 use autumn_harvest::table_split::SetExt;
+use jiff_diesel::ToDiesel;
 use std::collections::BTreeMap;
 
 use autumn_harvest::event::WorkflowEvent;
@@ -207,7 +208,7 @@ async fn seed_execution(
     workflow_name: &str,
     workflow_id: &str,
     state: &str,
-    started_at: chrono::DateTime<chrono::Utc>,
+    started_at: jiff::Timestamp,
 ) -> ExecutionId {
     let exec_id = ExecutionId::new_for_shard(shard);
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
@@ -267,9 +268,10 @@ async fn seed_execution(
     )
     .set((
         autumn_harvest::schema::harvest_workflow_executions::state.eq(state),
-        autumn_harvest::schema::harvest_workflow_executions::started_at.eq(started_at),
-        autumn_harvest::schema::harvest_workflow_executions::created_at.eq(started_at),
-        autumn_harvest::schema::harvest_workflow_executions::completed_at.eq(completed_at),
+        autumn_harvest::schema::harvest_workflow_executions::started_at.eq(started_at.to_diesel()),
+        autumn_harvest::schema::harvest_workflow_executions::created_at.eq(started_at.to_diesel()),
+        autumn_harvest::schema::harvest_workflow_executions::completed_at
+            .eq(completed_at.to_diesel()),
     ))
     .execute(&mut conn)
     .await
@@ -321,10 +323,10 @@ fn exported_workflow_names(body: &Value) -> Vec<String> {
         .collect()
 }
 
-fn base_time() -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+fn base_time() -> jiff::Timestamp {
+    "2026-01-01T00:00:00Z"
+        .parse::<jiff::Timestamp>()
         .expect("parse base time")
-        .with_timezone(&chrono::Utc)
 }
 
 // ---------------------------------------------------------------------------
@@ -350,7 +352,7 @@ async fn sample_is_stratified_per_workflow_type_and_reports_coverage() {
             "noisy",
             &format!("noisy-{index}"),
             "RUNNING",
-            t0 + chrono::Duration::seconds(index),
+            t0 + jiff::SignedDuration::from_secs(index),
         )
         .await;
     }
@@ -361,7 +363,7 @@ async fn sample_is_stratified_per_workflow_type_and_reports_coverage() {
             "quiet",
             &format!("quiet-{index}"),
             "RUNNING",
-            t0 + chrono::Duration::seconds(100 + index),
+            t0 + jiff::SignedDuration::from_secs(100 + index),
         )
         .await;
     }
@@ -417,7 +419,7 @@ async fn terminal_executions_are_never_sampled() {
         "wf",
         "done",
         "COMPLETED",
-        t0 + chrono::Duration::seconds(1),
+        t0 + jiff::SignedDuration::from_secs(1),
     )
     .await;
     seed_execution(
@@ -426,7 +428,7 @@ async fn terminal_executions_are_never_sampled() {
         "wf",
         "dead",
         "FAILED",
-        t0 + chrono::Duration::seconds(2),
+        t0 + jiff::SignedDuration::from_secs(2),
     )
     .await;
 
@@ -456,7 +458,7 @@ async fn paused_executions_are_sampled_by_default() {
         "wf",
         "paused",
         "PAUSED",
-        t0 + chrono::Duration::seconds(1),
+        t0 + jiff::SignedDuration::from_secs(1),
     )
     .await;
 
@@ -486,7 +488,7 @@ async fn caller_specified_states_narrow_the_sample() {
         "wf",
         "paused",
         "PAUSED",
-        t0 + chrono::Duration::seconds(1),
+        t0 + jiff::SignedDuration::from_secs(1),
     )
     .await;
 
@@ -535,7 +537,7 @@ async fn per_workflow_cap_is_global_across_shards() {
             "wf",
             &format!("s0-{index}"),
             "RUNNING",
-            t0 + chrono::Duration::seconds(index),
+            t0 + jiff::SignedDuration::from_secs(index),
         )
         .await;
         seed_execution(
@@ -544,7 +546,7 @@ async fn per_workflow_cap_is_global_across_shards() {
             "wf",
             &format!("s1-{index}"),
             "RUNNING",
-            t0 + chrono::Duration::seconds(10 + index),
+            t0 + jiff::SignedDuration::from_secs(10 + index),
         )
         .await;
     }
@@ -597,7 +599,7 @@ async fn two_logical_shards_sharing_one_database_do_not_double_count() {
             "wf",
             &format!("shared-{index}"),
             "RUNNING",
-            t0 + chrono::Duration::seconds(index),
+            t0 + jiff::SignedDuration::from_secs(index),
         )
         .await;
     }
@@ -733,7 +735,7 @@ async fn liveness_canary_probes_are_never_sampled() {
         "wf",
         "real-1",
         "RUNNING",
-        t0 + chrono::Duration::seconds(1),
+        t0 + jiff::SignedDuration::from_secs(1),
     )
     .await;
 
@@ -1441,7 +1443,7 @@ async fn workflow_name_filter_narrows_the_sample() {
         "beta",
         "b",
         "RUNNING",
-        t0 + chrono::Duration::seconds(1),
+        t0 + jiff::SignedDuration::from_secs(1),
     )
     .await;
 
@@ -1484,7 +1486,7 @@ async fn many_types_keep_their_population_census_under_the_discovery_bound() {
                 &format!("wf_{type_index:03}"),
                 &format!("wf-{type_index:03}-{exec_index}"),
                 "RUNNING",
-                t0 + chrono::Duration::seconds(exec_index),
+                t0 + jiff::SignedDuration::from_secs(exec_index),
             )
             .await;
         }
@@ -1549,7 +1551,7 @@ async fn the_manifest_records_the_exported_execution_identities() {
             "wf",
             &format!("wf-{index}"),
             "RUNNING",
-            t0 + chrono::Duration::seconds(index),
+            t0 + jiff::SignedDuration::from_secs(index),
         )
         .await;
     }

@@ -37,7 +37,7 @@ use autumn_harvest::HarvestError;
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
 use autumn_harvest_sqlite::{ActivitySpec, RunState, SqliteError, SqliteRuntime};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::json;
 
 // ── Shared helpers ─────────────────────────────────────────────────────────────
@@ -48,7 +48,7 @@ fn temp_db() -> (tempfile::TempDir, std::path::PathBuf) {
     (dir, path)
 }
 
-fn fixed_now() -> DateTime<Utc> {
+fn fixed_now() -> Timestamp {
     "2026-07-15T00:00:00Z".parse().unwrap()
 }
 
@@ -156,7 +156,7 @@ async fn frozen_retry_policy_survives_re_registration() {
     // Advance past each backoff. Under the frozen contract the run STILL gets its
     // original 3 attempts.
     let state = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(61))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(61))
         .await
         .unwrap();
     assert!(
@@ -166,7 +166,7 @@ async fn frozen_retry_policy_survives_re_registration() {
     );
 
     let done = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(122))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(122))
         .await
         .unwrap();
     assert!(
@@ -261,7 +261,7 @@ async fn frozen_schedule_to_close_deadline_survives_re_registration() {
     // FROZEN 5m deadline. So it seals ActivityTimedOut { ScheduleToClose }. The bug
     // would requeue it under the re-registered 1h deadline.
     let done = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(240))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(240))
         .await
         .unwrap();
     assert!(
@@ -356,7 +356,7 @@ async fn frozen_start_to_close_survives_re_registration() {
     // Drive past the backoff: attempt 2 sleeps 40ms — over the FROZEN 1ms budget →
     // ActivityTimedOut { StartToClose }. Under the bug (1h budget) it completes.
     let done = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(61))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(61))
         .await
         .unwrap();
     assert!(
@@ -531,13 +531,13 @@ async fn stable_registration_unchanged() {
     assert_eq!(frozen, 1, "the stable path freezes the task row");
     assert_eq!(
         deadline,
-        Some(t0.timestamp_millis() + 600_000),
+        Some(t0.as_millisecond() + 600_000),
         "the total deadline is frozen as scheduled_at + schedule_to_close"
     );
 
     // Past the back-off the retry runs and the run completes normally.
     let done = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(61))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(61))
         .await
         .unwrap();
     assert!(
@@ -643,7 +643,7 @@ async fn frozen_cap_survives_re_registration_via_claim_time_freeze() {
     // 3, attempt 2 backs off AGAIN (not terminal at the re-registered cap of 1) and
     // attempt 3 fails terminally.
     let state = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(61))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(61))
         .await
         .unwrap();
     assert!(
@@ -653,7 +653,7 @@ async fn frozen_cap_survives_re_registration_via_claim_time_freeze() {
          terminal here at attempt 2)"
     );
     let done = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(122))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(122))
         .await
         .unwrap();
     assert!(

@@ -408,7 +408,7 @@ fn reap_one_session(
         owner_is_the_recorded_one(&record),
         postmaster,
         self_pid,
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     );
     match decision {
         ReapDecision::Skip(SkipReason::PostmasterIdentityUnknown) => {
@@ -1008,7 +1008,7 @@ mod tests {
             postmaster_start_token,
             bin_dir: None,
             data_dir: std::path::PathBuf::from("/tmp/harvest-dev-0/session-1-aa/data"),
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
         }
     }
 

@@ -20,10 +20,10 @@ use autumn_harvest::store;
 use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics, TelemetryConfig};
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -165,7 +165,7 @@ async fn seed_portable_run(
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,

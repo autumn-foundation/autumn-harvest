@@ -69,7 +69,7 @@ fn child_wf_info() -> WorkflowInfo {
 fn started() -> WorkflowEvent {
     WorkflowEvent::WorkflowStarted {
         input: Value::Null,
-        timestamp: chrono::Utc::now(),
+        timestamp: jiff::Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,

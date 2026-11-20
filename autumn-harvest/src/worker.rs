@@ -11,6 +11,7 @@
 
 use crate::schema::harvest_workflow_executions_ext;
 use crate::table_split::SetExt;
+use jiff_diesel::ToDiesel;
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -1882,11 +1883,12 @@ impl HandlerRegistry {
             info.and_then(|info| info.execution_timeout),
             info.and_then(|info| info.sla),
         );
-        let execution_timeout = execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
-        let sla = sla.and_then(|d| chrono::Duration::from_std(d).ok());
+        let execution_timeout =
+            execution_timeout.and_then(|d| jiff::SignedDuration::try_from(d).ok());
+        let sla = sla.and_then(|d| jiff::SignedDuration::try_from(d).ok());
         let max_execution_timeout_ceiling = self
             .max_workflow_execution_timeout
-            .and_then(|d| chrono::Duration::from_std(d).ok());
+            .and_then(|d| jiff::SignedDuration::try_from(d).ok());
         DispatchDeadline {
             execution_timeout,
             sla,
@@ -1902,9 +1904,9 @@ impl HandlerRegistry {
 /// mismatched field name fails to compile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DispatchDeadline {
-    pub execution_timeout: Option<chrono::Duration>,
-    pub sla: Option<chrono::Duration>,
-    pub max_execution_timeout_ceiling: Option<chrono::Duration>,
+    pub execution_timeout: Option<jiff::SignedDuration>,
+    pub sla: Option<jiff::SignedDuration>,
+    pub max_execution_timeout_ceiling: Option<jiff::SignedDuration>,
 }
 
 #[cfg(test)]
@@ -1970,8 +1972,8 @@ mod resolve_dispatch_deadline_tests {
         assert_eq!(
             registry.resolve_dispatch_deadline("wf"),
             DispatchDeadline {
-                execution_timeout: Some(chrono::Duration::seconds(60)),
-                sla: Some(chrono::Duration::seconds(30)),
+                execution_timeout: Some(jiff::SignedDuration::from_secs(60)),
+                sla: Some(jiff::SignedDuration::from_secs(30)),
                 max_execution_timeout_ceiling: None,
             }
         );
@@ -1999,7 +2001,7 @@ mod resolve_dispatch_deadline_tests {
             DispatchDeadline {
                 execution_timeout: None,
                 sla: None,
-                max_execution_timeout_ceiling: Some(chrono::Duration::seconds(3600)),
+                max_execution_timeout_ceiling: Some(jiff::SignedDuration::from_secs(3600)),
             }
         );
     }
@@ -2021,9 +2023,9 @@ mod resolve_dispatch_deadline_tests {
         assert_eq!(
             registry.resolve_dispatch_deadline("wf"),
             DispatchDeadline {
-                execution_timeout: Some(chrono::Duration::seconds(7200)),
+                execution_timeout: Some(jiff::SignedDuration::from_secs(7200)),
                 sla: None,
-                max_execution_timeout_ceiling: Some(chrono::Duration::seconds(3600)),
+                max_execution_timeout_ceiling: Some(jiff::SignedDuration::from_secs(3600)),
             }
         );
     }
@@ -2053,7 +2055,7 @@ mod resolve_dispatch_deadline_tests {
         let child = resolve_child_workflow_defaults(&registry, "wf");
         assert_eq!(
             child.chain_execution_timeout,
-            chrono::Duration::from_std(2 * hour).ok()
+            jiff::SignedDuration::try_from(2 * hour).ok()
         );
 
         registry
@@ -2135,10 +2137,10 @@ mod resolve_dispatch_deadline_tests {
         let child = resolve_child_workflow_defaults(&registry, "wf");
         assert_eq!(
             child.chain_execution_timeout,
-            Some(chrono::Duration::hours(2))
+            Some(jiff::SignedDuration::from_hours(2))
         );
         let deadline = child.chain_deadline_at.expect("a chain deadline");
-        assert!(deadline <= chrono::Utc::now() + chrono::Duration::hours(2));
+        assert!(deadline <= jiff::Timestamp::now() + jiff::SignedDuration::from_hours(2));
         let uncapped = resolve_child_workflow_defaults(&registry, "uncapped");
         assert_eq!(uncapped.chain_execution_timeout, None);
     }
@@ -2176,8 +2178,8 @@ mod resolve_dispatch_deadline_tests {
         assert_eq!(
             registry.resolve_dispatch_deadline("my_dag"),
             DispatchDeadline {
-                execution_timeout: Some(chrono::Duration::seconds(120)),
-                sla: Some(chrono::Duration::seconds(90)),
+                execution_timeout: Some(jiff::SignedDuration::from_secs(120)),
+                sla: Some(jiff::SignedDuration::from_secs(90)),
                 max_execution_timeout_ceiling: None,
             }
         );
@@ -2545,7 +2547,7 @@ pub struct WorkflowTaskPersistence<'a> {
     /// Nominal scheduled fire-time frozen in this execution's `WorkflowStarted` event
     /// (issue #508). Propagated verbatim to a `continue_as_new` continuation so
     /// `ctx.scheduled_time()` survives the fork. `None` for non-scheduled runs.
-    carryover_scheduled_time: Option<chrono::DateTime<chrono::Utc>>,
+    carryover_scheduled_time: Option<jiff::Timestamp>,
 }
 
 impl<'a> WorkflowTaskPersistence<'a> {
@@ -2565,7 +2567,7 @@ impl<'a> WorkflowTaskPersistence<'a> {
         sticky_timeout: Duration,
         carryover_result: Option<serde_json::Value>,
         carryover_error: Option<String>,
-        carryover_scheduled_time: Option<chrono::DateTime<chrono::Utc>>,
+        carryover_scheduled_time: Option<jiff::Timestamp>,
     ) -> Self {
         Self {
             task,
@@ -5229,13 +5231,13 @@ fn stuck_running_threshold_secs(effective_workflow_task_timeout: Duration) -> Op
 /// `None` for the enclosing budget means the workflow-task timeout is disabled
 /// (`Duration::ZERO`), leaving the per-attempt budget as the only clock.
 fn local_attempt_deadline(
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
     per_attempt_timeout: Duration,
-    workflow_task_deadline: Option<chrono::DateTime<chrono::Utc>>,
-) -> Option<chrono::DateTime<chrono::Utc>> {
-    let own = chrono::Duration::from_std(per_attempt_timeout)
+    workflow_task_deadline: Option<jiff::Timestamp>,
+) -> Option<jiff::Timestamp> {
+    let own = jiff::SignedDuration::try_from(per_attempt_timeout)
         .ok()
-        .and_then(|budget| now.checked_add_signed(budget));
+        .and_then(|budget| now.checked_add(budget).ok());
     match (own, workflow_task_deadline) {
         (Some(own), Some(enclosing)) => Some(own.min(enclosing)),
         (Some(only), None) | (None, Some(only)) => Some(only),
@@ -5385,7 +5387,7 @@ async fn run_local_activity_inline(
     // Issue #783: absolute instant the enclosing workflow-task dispatch is cut
     // off at (issue #494), or `None` when that timeout is disabled. Clamps the
     // reported per-attempt deadline so it can never out-live the cycle.
-    workflow_task_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    workflow_task_deadline: Option<jiff::Timestamp>,
     // Issue #804: the claimed row whose capability-miss
     // accounting is retired atomically with this activity's frontier-resolving
     // append. See `append_frontier_resolution`.
@@ -5399,7 +5401,7 @@ async fn run_local_activity_inline(
     // `Err` this function returns afterward. Empty when the batch carries no
     // `RecordUpdateResult`, or when one was already persisted and emitted by
     // the caller's external-command branch.
-    update_result_metrics: &[(String, bool, Option<chrono::DateTime<chrono::Utc>>)],
+    update_result_metrics: &[(String, bool, Option<jiff::Timestamp>)],
     // Issue #1804: the byte-cap breach measured at the decision start, if
     // any. The first cap gate below returns it before the handler runs.
     byte_cap_breach: Option<HistoryCapBreach>,
@@ -5643,7 +5645,7 @@ async fn run_local_activity_inline(
         // says why the activity must see the minimum, not the per-attempt
         // budget alone.
         let attempt_deadline = local_attempt_deadline(
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
             per_attempt_timeout,
             workflow_task_deadline,
         );
@@ -5902,14 +5904,38 @@ async fn run_local_activity_inline(
     Ok(LocalActivityInlineOutcome::Complete(all_new_events))
 }
 
-fn chrono_duration_from_std(
+/// The longest duration that `chrono` held: `i64::MAX` milliseconds.
+///
+/// jiff holds a longer one. The activity duration checks keep the old bound,
+/// so a value that `chrono` refused still fails.
+const MAX_ACTIVITY_DURATION: jiff::SignedDuration = jiff::SignedDuration::from_millis(i64::MAX);
+
+fn bounded_duration_from_std(
     duration: Duration,
     field_name: &str,
-) -> HarvestResult<chrono::Duration> {
-    chrono::Duration::from_std(duration).map_err(|_| {
-        HarvestError::Config(format!(
-            "activity {field_name} duration exceeds chrono range"
-        ))
+) -> HarvestResult<jiff::SignedDuration> {
+    jiff::SignedDuration::try_from(duration)
+        .ok()
+        .filter(|duration| *duration <= MAX_ACTIVITY_DURATION)
+        .ok_or_else(|| {
+            HarvestError::Config(format!(
+                "activity {field_name} duration exceeds the duration range"
+            ))
+        })
+}
+
+/// Returns `at + delay`, or the nearest instant that jiff holds.
+///
+/// `chrono` held dates to year 262143, so a long delay still got a fire
+/// time. jiff stops at year 9999. A sum past that year saturates, so a
+/// timer that never fires does not panic the worker.
+fn saturating_fire_at(at: jiff::Timestamp, delay: jiff::SignedDuration) -> jiff::Timestamp {
+    at.checked_add(delay).unwrap_or_else(|_| {
+        if delay.is_negative() {
+            jiff::Timestamp::MIN
+        } else {
+            jiff::Timestamp::MAX
+        }
     })
 }
 
@@ -5925,11 +5951,11 @@ fn chrono_duration_from_std(
 /// `max_wall_clock` ceiling (M2) of the runtime still bounds the guest.
 #[cfg(feature = "wasm-activities")]
 fn wasm_effective_deadline(
-    task_start_to_close: Option<chrono::Duration>,
+    task_start_to_close: Option<jiff::SignedDuration>,
     default_start_to_close: Option<Duration>,
 ) -> Option<Duration> {
     task_start_to_close
-        .and_then(|d| d.to_std().ok())
+        .and_then(|d| std::time::Duration::try_from(d).ok())
         .or(default_start_to_close)
 }
 
@@ -6050,27 +6076,26 @@ async fn load_unfired_timers_by_id(
 /// Timer due-ness checks and the signal `received_at` column default both use
 /// Postgres `NOW()`. Deadlines from this clock stay comparable to them, even
 /// with worker clock skew.
-async fn db_clock_now(
-    conn: &mut AsyncPgConnection,
-) -> HarvestResult<chrono::DateTime<chrono::Utc>> {
+async fn db_clock_now(conn: &mut AsyncPgConnection) -> HarvestResult<jiff::Timestamp> {
     diesel::select(crate::cached_stmt::pg_now())
-        .get_result(conn)
+        .get_result::<crate::time::sql::SqlTimestamp>(conn)
         .await
+        .map(crate::time::sql::SqlTimestamp::to_jiff)
         .map_err(crate::error::database_error)
 }
 
-pub(crate) fn chrono_duration_from_secs(
+pub(crate) fn signed_duration_from_secs(
     seconds: u64,
     field_name: &str,
-) -> HarvestResult<chrono::Duration> {
+) -> HarvestResult<jiff::SignedDuration> {
     let seconds = i64::try_from(seconds).map_err(|_| {
         HarvestError::Config(format!("activity {field_name} exceeds i64 seconds range"))
     })?;
-    chrono::Duration::try_seconds(seconds).ok_or_else(|| {
-        HarvestError::Config(format!(
-            "activity {field_name} exceeds chrono::Duration bounds"
-        ))
-    })
+    Some(jiff::SignedDuration::from_secs(seconds))
+        .filter(|duration| *duration <= MAX_ACTIVITY_DURATION)
+        .ok_or_else(|| {
+            HarvestError::Config(format!("activity {field_name} exceeds the duration bounds"))
+        })
 }
 
 fn next_retry_delay(
@@ -6078,7 +6103,7 @@ fn next_retry_delay(
     error: &str,
     retry_policy: Option<&RetryPolicy>,
     retry_after_ceiling: Duration,
-) -> HarvestResult<Option<chrono::Duration>> {
+) -> HarvestResult<Option<jiff::SignedDuration>> {
     // Issue #744: parse the error ONCE with `classify_activity_error`. The
     // non-retryable decision AND the activity-supplied `retry_after` hint then
     // come from one parse. `failure_is_non_retryable` alone would discard the
@@ -6115,7 +6140,7 @@ fn next_retry_delay(
     let delay = crate::policy::resolve_retry_after_hint(failure.retry_after, retry_after_ceiling)
         .unwrap_or(policy_delay);
 
-    chrono_duration_from_std(delay, "retry delay").map(Some)
+    bounded_duration_from_std(delay, "retry delay").map(Some)
 }
 
 /// The delay before the retry of a timed-out attempt (issue #1809).
@@ -6128,7 +6153,10 @@ fn next_retry_delay(
 /// `None` means the timeout is terminal. A retry policy that does not parse
 /// is terminal too. The worker fails the execution in that case, but the
 /// enforcer only fails the activity, which the workflow can handle.
-pub(crate) fn timeout_retry_delay(task: &TaskQueueItem, error: &str) -> Option<chrono::Duration> {
+pub(crate) fn timeout_retry_delay(
+    task: &TaskQueueItem,
+    error: &str,
+) -> Option<jiff::SignedDuration> {
     let policy = configured_retry_policy(task)
         .inspect_err(|e| {
             tracing::warn!(
@@ -7036,11 +7064,11 @@ async fn update_workflow_execution_completed(
         dsl::output.eq(Some(output.clone())),
         dsl::error.eq(None::<String>),
         dsl::sticky_worker_id.eq(Some(worker_id.to_string())),
-        dsl::completed_at.eq(Some(chrono::Utc::now())),
+        dsl::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         // Belt-and-braces ND-block reset (issue #603). Some terminal paths
         // bypass the pause-guarded persist transaction and its clear hook.
         // They must not leave a stale block marker on a closed run.
-        dsl::nd_blocked_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+        dsl::nd_blocked_at.eq(None::<crate::time::sql::SqlTimestamp>),
         SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(None::<String>)),
         dsl::nd_block_count.eq(0),
     ))
@@ -7213,7 +7241,7 @@ pub const CAPABILITY_MISS_TOTAL_BUDGET_MULTIPLIER: i32 = 10;
 ///
 /// `2 × heartbeat_interval`, with a 1 s floor for sub-second intervals and a
 /// one-year cap so an absurd configured interval cannot overflow the
-/// `chrono::Duration` arithmetic downstream. The doubling happens *before*
+/// `jiff::SignedDuration` arithmetic downstream. The doubling happens *before*
 /// rounding to whole seconds so a fractional interval (e.g. 1500 ms → 3 s, not
 /// 2 s) keeps the documented window.
 ///
@@ -9672,11 +9700,11 @@ async fn update_workflow_execution_failed(
         dsl::output.eq(None::<serde_json::Value>),
         dsl::error.eq(Some(error.to_string())),
         dsl::sticky_worker_id.eq(Some(worker_id.to_string())),
-        dsl::completed_at.eq(Some(chrono::Utc::now())),
+        dsl::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         // Belt-and-braces ND-block reset (issue #603). An author failure (or
         // history-cap/dispatch-error terminal) closes the run. A stale block
         // marker must not survive on a terminal row.
-        dsl::nd_blocked_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+        dsl::nd_blocked_at.eq(None::<crate::time::sql::SqlTimestamp>),
         SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(None::<String>)),
         dsl::nd_block_count.eq(0),
     ))
@@ -9860,7 +9888,7 @@ async fn block_workflow_for_non_determinism(
     details: &crate::error::NonDeterministicDetails,
 ) -> HarvestResult<()> {
     let backoff = nd_block_backoff_jittered(execution.nd_block_count, task);
-    let backoff_chrono = chrono::Duration::from_std(backoff).unwrap_or_default();
+    let backoff_duration = jiff::SignedDuration::try_from(backoff).unwrap_or_default();
     let error_owned = error.to_string();
     let patch = nd_search_attrs_patch(details);
     let task_id = task.id;
@@ -9892,7 +9920,7 @@ async fn block_workflow_for_non_determinism(
                 .filter(exec_dsl::state.eq("RUNNING")),
         )
         .set((
-            exec_dsl::nd_blocked_at.eq(Some(chrono::Utc::now())),
+            exec_dsl::nd_blocked_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
             SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(Some(error_owned.clone()))),
             exec_dsl::nd_block_count.eq(exec_dsl::nd_block_count + 1),
         ))
@@ -9905,7 +9933,7 @@ async fn block_workflow_for_non_determinism(
         }
 
         crate::store::update_search_attrs(conn, exec_id, &patch).await?;
-        queue::requeue_workflow_task_nd_blocked(conn, task_id, backoff_chrono, &error_owned)
+        queue::requeue_workflow_task_nd_blocked(conn, task_id, backoff_duration, &error_owned)
             .await?;
         Ok(false)
     }))
@@ -9972,7 +10000,7 @@ async fn clear_nd_block(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> H
 
     diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
         .set((
-            dsl::nd_blocked_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+            dsl::nd_blocked_at.eq(None::<crate::time::sql::SqlTimestamp>),
             SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(None::<String>)),
             dsl::nd_block_count.eq(0),
         ))
@@ -10310,12 +10338,16 @@ pub async fn persist_workflow_failure(
         ExecutionId,
         RetryPolicy,
         u32,
-        chrono::DateTime<chrono::Utc>,
-        Option<chrono::Duration>,
+        jiff::Timestamp,
+        Option<jiff::SignedDuration>,
     )> = retry_plan.as_ref().map(|(rid, policy, attempt, delay)| {
-        let delay_chrono = chrono::Duration::from_std(*delay).unwrap_or_default();
-        let fire_at = chrono::Utc::now() + delay_chrono;
-        let start_delay = (!delay.is_zero()).then_some(delay_chrono);
+        // `chrono` read a delay past `i64::MAX` milliseconds as zero.
+        let delay_duration = jiff::SignedDuration::try_from(*delay)
+            .ok()
+            .filter(|delay| *delay <= MAX_ACTIVITY_DURATION)
+            .unwrap_or_default();
+        let fire_at = saturating_fire_at(jiff::Timestamp::now(), delay_duration);
+        let start_delay = (!delay.is_zero()).then_some(delay_duration);
         (*rid, policy.clone(), *attempt, fire_at, start_delay)
     });
 
@@ -10641,7 +10673,7 @@ async fn persist_update_result_commands(
 fn collect_update_result_metrics(
     history_events: &[WorkflowEvent],
     pending_cmds: &[WorkflowCommand],
-) -> Vec<(String, bool, Option<chrono::DateTime<chrono::Utc>>)> {
+) -> Vec<(String, bool, Option<jiff::Timestamp>)> {
     // Fast path: nothing to resolve or emit.
     if !pending_cmds
         .iter()
@@ -10656,10 +10688,8 @@ fn collect_update_result_metrics(
     // is not in the loaded history yields name "unknown" AND a `None` timestamp
     // together. So its histogram sample is skipped rather than fabricated. That
     // should not happen, because admission always precedes the result.
-    let mut admitted: std::collections::HashMap<
-        crate::types::UpdateId,
-        (&str, chrono::DateTime<chrono::Utc>),
-    > = std::collections::HashMap::new();
+    let mut admitted: std::collections::HashMap<crate::types::UpdateId, (&str, jiff::Timestamp)> =
+        std::collections::HashMap::new();
     for event in history_events {
         if let WorkflowEvent::UpdateAdmitted {
             update_id,
@@ -10697,16 +10727,16 @@ fn collect_update_result_metrics(
 /// Pure and unit-tested. `admit_ts` is the recorded `UpdateAdmitted.timestamp`.
 /// It is `None` when the admit could not be resolved from history. Then the
 /// histogram sample is **skipped**: `None` is returned, so the caller emits
-/// nothing. `now` is the terminal time (`Utc::now()` at the post-commit emit).
+/// nothing. `now` is the terminal time (`Timestamp::now()` at the post-commit emit).
 /// A negative delta (clock skew across event appends) clamps to `0.0`, never a
 /// garbage/negative sample.
 #[allow(clippy::cast_precision_loss)] // realistic admit→terminal latencies (ms) are far within f64's exact range
 fn update_admit_duration_secs(
-    admit_ts: Option<chrono::DateTime<chrono::Utc>>,
-    now: chrono::DateTime<chrono::Utc>,
+    admit_ts: Option<jiff::Timestamp>,
+    now: jiff::Timestamp,
 ) -> Option<f64> {
     let admit = admit_ts?;
-    let millis = (now - admit).num_milliseconds().max(0);
+    let millis = crate::time::num_milliseconds(now - admit).max(0);
     Some(millis as f64 / 1000.0)
 }
 
@@ -10771,9 +10801,9 @@ fn emit_update_result_metrics(
     metrics: &dyn crate::telemetry::MetricsRecorder,
     workflow_name: &str,
     queue: &str,
-    results: &[(String, bool, Option<chrono::DateTime<chrono::Utc>>)],
+    results: &[(String, bool, Option<jiff::Timestamp>)],
 ) {
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     for (update_name, completed, admit_ts) in results {
         let outcome = if *completed {
             metrics.record_update_completed(workflow_name, update_name, queue);
@@ -11484,8 +11514,9 @@ async fn process_mutex_releases_from_commands(
                     && metrics_enabled
                 {
                     #[allow(clippy::cast_precision_loss)]
-                    let secs =
-                        ((chrono::Utc::now() - acquired_at).num_milliseconds() as f64) / 1000.0;
+                    let secs = (crate::time::num_milliseconds(jiff::Timestamp::now() - acquired_at)
+                        as f64)
+                        / 1000.0;
                     held.push(secs.max(0.0));
                 }
             }
@@ -11602,8 +11633,9 @@ async fn persist_mutex_acquire_park(
                         match crate::mutex::waiter_wait_metrics(conn, &key, exec_id).await? {
                             Some((requested_at, count)) => {
                                 #[allow(clippy::cast_precision_loss)]
-                                let secs = ((chrono::Utc::now() - requested_at).num_milliseconds()
-                                    as f64)
+                                let secs = (crate::time::num_milliseconds(
+                                    jiff::Timestamp::now() - requested_at,
+                                ) as f64)
                                     / 1000.0;
                                 (Some(secs.max(0.0)), u64::try_from(count).ok())
                             }
@@ -11617,7 +11649,7 @@ async fn persist_mutex_acquire_park(
                     let granted_event = WorkflowEvent::MutexGranted {
                         key: key.clone(),
                         lock_seq,
-                        acquired_at: chrono::Utc::now(),
+                        acquired_at: jiff::Timestamp::now(),
                     };
                     store::append_single_event(conn, exec_id, granted_event).await?;
                     // Park so the next cycle replays and drives the grant
@@ -12092,7 +12124,7 @@ fn build_activity_enqueue_plan(
 
         if let Some(timeout) = defaults.heartbeat_timeout {
             params.heartbeat_timeout =
-                Some(chrono_duration_from_std(timeout, "heartbeat timeout")?);
+                Some(bounded_duration_from_std(timeout, "heartbeat timeout")?);
         }
         // Issue #620: call-site override → activity default → builder default.
         // Reserved session-internal activities skip the builder floor (see the
@@ -12111,8 +12143,10 @@ fn build_activity_enqueue_plan(
             builder_stc_default,
         );
         if let Some(timeout) = effective_stc {
-            params.start_to_close =
-                Some(chrono_duration_from_std(timeout, "start_to_close timeout")?);
+            params.start_to_close = Some(bounded_duration_from_std(
+                timeout,
+                "start_to_close timeout",
+            )?);
         }
         // Issue #606: a per-call schedule_to_start override takes priority over
         // the activity's registered default, like retry_policy_override /
@@ -12124,14 +12158,16 @@ fn build_activity_enqueue_plan(
             .schedule_to_start_override
             .or(defaults.schedule_to_start);
         if let Some(timeout) = effective_schedule_to_start {
-            params.schedule_to_start = Some(chrono_duration_from_std(
+            params.schedule_to_start = Some(bounded_duration_from_std(
                 timeout,
                 "schedule_to_start timeout",
             )?);
         }
         if let Some(timeout) = defaults.schedule_to_close {
-            let deadline = chrono::Utc::now()
-                + chrono_duration_from_std(timeout, "schedule_to_close timeout")?;
+            let deadline = saturating_fire_at(
+                jiff::Timestamp::now(),
+                bounded_duration_from_std(timeout, "schedule_to_close timeout")?,
+            );
             params.schedule_to_close_at = Some(deadline);
         }
 
@@ -12576,9 +12612,9 @@ async fn persist_started_timer(
             ext.fires_at
         } else {
             let fire_delay =
-                chrono_duration_from_secs(timer.duration_secs, "timer duration")?;
+                signed_duration_from_secs(timer.duration_secs, "timer duration")?;
             let db_now = db_clock_now(conn).await?;
-            db_now + fire_delay
+            saturating_fire_at(db_now, fire_delay)
         };
         let is_new = existing.is_none();
         // The suspending StartTimer's own TimerStarted (for a new timer) is
@@ -12620,7 +12656,7 @@ async fn persist_started_timer(
                 fires_at,
             };
             diesel::insert_into(harvest_timers::table)
-                .values(&new_timer)
+                .values(new_timer)
                 .execute(conn)
                 .await
                 .map_err(crate::error::database_error)?;
@@ -13214,7 +13250,7 @@ async fn persist_all_started_child_workflows(
             )?;
             let child_started_event = WorkflowEvent::WorkflowStarted {
                 input: child.input.clone(),
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None, // child workflows are not scheduler-fired
@@ -13340,7 +13376,7 @@ async fn persist_all_started_child_workflows(
                         plan.child.child_id,
                         WorkflowEvent::WorkflowStarted {
                             input: plan.child.input.clone(),
-                            timestamp: chrono::Utc::now(),
+                            timestamp: jiff::Timestamp::now(),
                             last_completion_result: None,
                             last_error: None,
                             scheduled_time: None, // child workflows are not scheduler-fired
@@ -13510,12 +13546,12 @@ struct ChildWorkflowDefaults {
     owner: Option<&'static str>,
     runbook_url: Option<&'static str>,
     severity: Option<&'static str>,
-    sla: Option<chrono::Duration>,
-    sla_deadline_at: Option<chrono::DateTime<chrono::Utc>>,
-    execution_timeout: Option<chrono::Duration>,
-    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
-    chain_execution_timeout: Option<chrono::Duration>,
-    chain_deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    sla: Option<jiff::SignedDuration>,
+    sla_deadline_at: Option<jiff::Timestamp>,
+    execution_timeout: Option<jiff::SignedDuration>,
+    deadline_at: Option<jiff::Timestamp>,
+    chain_execution_timeout: Option<jiff::SignedDuration>,
+    chain_deadline_at: Option<jiff::Timestamp>,
     /// Shared, not owned per child (issue #1589).
     /// `RetryPolicy::non_retryable_errors` is an unbounded `Vec<String>`.
     /// A same-type fan-out with a large policy would otherwise hold one
@@ -13699,16 +13735,24 @@ fn build_child_row<'p>(
     // "now", not the row's real `started_at`. A short-timeout child could
     // then be born already overdue. `execution_timeout`/`sla`/
     // `chain_execution_timeout` are plain durations. Recomputing the
-    // absolute deadline from `Utc::now()` at build time is exactly what
+    // absolute deadline from `Timestamp::now()` at build time is exactly what
     // `resolve_child_workflow_defaults` itself does for every other,
     // immediate-use caller.
-    let now = chrono::Utc::now();
-    let deadline_at = plan.defaults.execution_timeout.map(|d| now + d);
-    let sla_deadline_at = plan.defaults.sla.map(|d| now + d);
+    let now = jiff::Timestamp::now();
+    // A deadline past the jiff range saturates inside the `chrono` range, as at
+    // the start path.
+    let deadline_at = plan
+        .defaults
+        .execution_timeout
+        .and_then(|d| crate::time::checked_add_chrono_range(now, d));
+    let sla_deadline_at = plan
+        .defaults
+        .sla
+        .and_then(|d| crate::time::checked_add_chrono_range(now, d));
     let chain_deadline_at = plan
         .defaults
         .chain_execution_timeout
-        .and_then(|d| now.checked_add_signed(d));
+        .and_then(|d| crate::time::checked_add_chrono_range(now, d));
     Ok(NewWorkflowExecution {
         continued_from_exec_id: None,
         first_exec_id: None,
@@ -13864,17 +13908,17 @@ fn cross_shard_child_spec(
         // Issue #1263 item 7 extended this to the chain deadline too. A
         // child is its own fresh chain origin (issue #617), never an
         // inherited one, so there is no absolute value to preserve.
-        sla_secs: defaults.sla.map(|d| d.num_seconds()),
+        sla_secs: defaults.sla.map(|d| d.as_secs()),
         // A detached child resolves NO execution timeout at spawn on the local
         // path, and so no chain cap either. A remotely placed one must not
         // acquire one. Copying the awaited-child defaults here would let a mere
         // placement change start timing out a formerly unbounded detached
         // child. The placed API's location-only contract forbids that.
         execution_timeout_secs: (!detached)
-            .then(|| defaults.execution_timeout.map(|d| d.num_seconds()))
+            .then(|| defaults.execution_timeout.map(|d| d.as_secs()))
             .flatten(),
         chain_execution_timeout_secs: (!detached)
-            .then(|| defaults.chain_execution_timeout.map(|d| d.num_seconds()))
+            .then(|| defaults.chain_execution_timeout.map(|d| d.as_secs()))
             .flatten(),
         // Clamp a detached child's declared retry policy by the server-side
         // ceiling, exactly as the local detached path does. Detached children
@@ -13962,23 +14006,26 @@ fn resolve_child_workflow_defaults(
     let (execution_timeout, sla) =
         registry.apply_run_defaults(workflow_name, execution_timeout, sla);
     let chain_execution_timeout = registry.chain_execution_timeout(workflow_name);
-    let execution_timeout = execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
-    let sla = sla.and_then(|d| chrono::Duration::from_std(d).ok());
-    let deadline_at = execution_timeout.map(|d| chrono::Utc::now() + d);
-    let sla_deadline_at = sla.map(|d| chrono::Utc::now() + d);
+    let execution_timeout = execution_timeout.and_then(crate::time::from_std_bounded);
+    let sla = sla.and_then(crate::time::from_std_bounded);
+    // A deadline past the jiff range saturates inside the `chrono` range, as at
+    // the start path.
+    let now = jiff::Timestamp::now();
+    let deadline_at = execution_timeout.and_then(|d| crate::time::checked_add_chrono_range(now, d));
+    let sla_deadline_at = sla.and_then(|d| crate::time::checked_add_chrono_range(now, d));
     // A child is its own logical workflow → fresh chain origin (issue #617).
     // Issue #2406: the fleet chain ceiling caps the chain cap of a child, so
     // an override cannot exceed it. A child type with no cap stays uncapped.
     let chain_ceiling = registry
         .max_workflow_chain_timeout
-        .and_then(|d| chrono::Duration::from_std(d).ok());
+        .and_then(crate::time::from_std_bounded);
     let chain_execution_timeout = chain_execution_timeout
-        .and_then(|d| chrono::Duration::from_std(d).ok())
+        .and_then(crate::time::from_std_bounded)
         .map(|d| chain_ceiling.map_or(d, |ceiling| d.min(ceiling)));
     // `checked_add_signed` guards against `Duration::MAX` overflow (issue
     // #617): `DateTime + Duration` panics; yield `None` instead.
     let chain_deadline_at =
-        chain_execution_timeout.and_then(|d| chrono::Utc::now().checked_add_signed(d));
+        chain_execution_timeout.and_then(|d| crate::time::checked_add_chrono_range(now, d));
     ChildWorkflowDefaults {
         owner,
         runbook_url,
@@ -14131,7 +14178,7 @@ async fn insert_awaited_child_execution(
     };
     let child_started_event = WorkflowEvent::WorkflowStarted {
         input: child.input.clone(),
-        timestamp: chrono::Utc::now(),
+        timestamp: jiff::Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None, // child workflows are not scheduler-fired
@@ -14304,9 +14351,9 @@ async fn persist_child_timeout_race(
                 ext.fires_at
             } else {
                 let fire_delay =
-                    chrono_duration_from_secs(timer.duration_secs, "child timeout duration")?;
+                    signed_duration_from_secs(timer.duration_secs, "child timeout duration")?;
                 let db_now = db_clock_now(conn).await?;
-                db_now + fire_delay
+                saturating_fire_at(db_now, fire_delay)
             };
 
             // ── append parent events in command emission order ──
@@ -14400,7 +14447,7 @@ async fn persist_child_timeout_race(
                     fires_at,
                 };
                 diesel::insert_into(harvest_timers::table)
-                    .values(&new_timer)
+                    .values(new_timer)
                     .execute(conn)
                     .await
                     .map_err(crate::error::database_error)?;
@@ -14684,9 +14731,8 @@ async fn persist_mixed_suspension_batch(
         // Postgres `NOW()`. So the chronological wake ingest
         // (`merge_wake_events`) compares instants from one clock, whatever the
         // worker skew.
-        let mut timer_fire_instants: Vec<chrono::DateTime<chrono::Utc>> =
-            Vec::with_capacity(batch.timers.len());
-        let mut new_timer_rows: Vec<(TimerId, chrono::DateTime<chrono::Utc>)> = Vec::new();
+        let mut timer_fire_instants: Vec<jiff::Timestamp> = Vec::with_capacity(batch.timers.len());
+        let mut new_timer_rows: Vec<(TimerId, jiff::Timestamp)> = Vec::new();
         let mut timer_started_events: std::collections::VecDeque<Option<WorkflowEvent>> =
             std::collections::VecDeque::with_capacity(batch.timers.len());
         let timer_ids: Vec<&str> = batch.timers.iter().map(|t| t.timer_id.as_str()).collect();
@@ -14694,13 +14740,13 @@ async fn persist_mixed_suspension_batch(
             load_unfired_timers_by_id(conn, exec_id.as_uuid(), &timer_ids).await?;
         // `NOW()` is the transaction start time, so one read serves every new
         // timer in this batch.
-        let mut db_now: Option<chrono::DateTime<chrono::Utc>> = None;
+        let mut db_now: Option<jiff::Timestamp> = None;
         for timer in &batch.timers {
             let existing = existing_timers.get(timer.timer_id.as_str());
             let fires_at = if let Some(ext) = existing {
                 ext.fires_at
             } else {
-                let fire_delay = chrono_duration_from_secs(timer.duration_secs, "timer duration")?;
+                let fire_delay = signed_duration_from_secs(timer.duration_secs, "timer duration")?;
                 let now = if let Some(now) = db_now {
                     now
                 } else {
@@ -14708,7 +14754,7 @@ async fn persist_mixed_suspension_batch(
                     db_now = Some(now);
                     now
                 };
-                let fires_at = now + fire_delay;
+                let fires_at = saturating_fire_at(now, fire_delay);
                 new_timer_rows.push((timer.timer_id.clone(), fires_at));
                 fires_at
             };
@@ -14874,17 +14920,19 @@ async fn persist_mixed_suspension_batch(
 
         // Insert the durable rows for genuinely new timers.
         if !new_timer_rows.is_empty() {
-            let new_timers: Vec<NewHarvestTimer<'_>> = new_timer_rows
-                .iter()
-                .map(|(timer_id, fires_at)| NewHarvestTimer {
-                    workflow_exec_id: exec_id.as_uuid(),
-                    timer_id: timer_id.as_str(),
-                    fires_at: *fires_at,
-                })
-                .collect();
-            for chunk in new_timers.chunks(TIMER_ROWS_PER_INSERT_CHUNK) {
+            // A `serialize_as` field makes only an owned row insertable, so
+            // each chunk builds its own rows.
+            for chunk in new_timer_rows.chunks(TIMER_ROWS_PER_INSERT_CHUNK) {
+                let new_timers: Vec<NewHarvestTimer<'_>> = chunk
+                    .iter()
+                    .map(|(timer_id, fires_at)| NewHarvestTimer {
+                        workflow_exec_id: exec_id.as_uuid(),
+                        timer_id: timer_id.as_str(),
+                        fires_at: *fires_at,
+                    })
+                    .collect();
                 diesel::insert_into(harvest_timers::table)
-                    .values(chunk)
+                    .values(new_timers)
                     .execute(conn)
                     .await
                     .map_err(crate::error::database_error)?;
@@ -15124,8 +15172,8 @@ async fn persist_mixed_suspension_batch(
 /// within each kind is preserved (`fires_at` for timers, `received_at` for
 /// signals — the orders their loaders return).
 fn merge_wake_events(
-    due_timers: Vec<(TimerId, chrono::DateTime<chrono::Utc>)>,
-    pending_signals: Vec<(String, serde_json::Value, chrono::DateTime<chrono::Utc>)>,
+    due_timers: Vec<(TimerId, jiff::Timestamp)>,
+    pending_signals: Vec<(String, serde_json::Value, jiff::Timestamp)>,
 ) -> Vec<WorkflowEvent> {
     let mut events = Vec::with_capacity(due_timers.len() + pending_signals.len());
     let mut timers = due_timers.into_iter().peekable();
@@ -16648,8 +16696,9 @@ async fn create_detached_child_executions(
         // Issue #2387: an operator SLA override wins over the declared one. A
         // detached child resolves no `execution_timeout`, so only the SLA applies.
         let (_, child_sla) = registry.apply_run_defaults(workflow_name, None, child_sla);
-        let child_sla = child_sla.and_then(|d| chrono::Duration::from_std(d).ok());
-        let child_sla_deadline_at = child_sla.map(|d| chrono::Utc::now() + d);
+        let child_sla = child_sla.and_then(crate::time::from_std_bounded);
+        let child_sla_deadline_at = child_sla
+            .and_then(|d| crate::time::checked_add_chrono_range(jiff::Timestamp::now(), d));
         // A detached child accumulates its own history/DLQ/active-execution
         // footprint exactly like any other registry-aware start. So it is
         // resolved against and enforced under its OWN declared quota (issue
@@ -16756,7 +16805,7 @@ async fn create_detached_child_executions(
             *child_id,
             &[WorkflowEvent::WorkflowStarted {
                 input: input.clone(),
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None, // child workflows are not scheduler-fired
@@ -16832,11 +16881,12 @@ pub async fn observe_task_cancellation(pool: &DbPool, claim: &queue::TaskClaim) 
 /// re-check (issue #609 post-review hardening) share one decision rule. The
 /// timeout enforcer uses it too (issue #1809).
 pub(crate) fn deadline_would_be_exceeded(
-    deadline: Option<chrono::DateTime<chrono::Utc>>,
-    now: chrono::DateTime<chrono::Utc>,
-    retry_delay: chrono::Duration,
+    deadline: Option<jiff::Timestamp>,
+    now: jiff::Timestamp,
+    retry_delay: jiff::SignedDuration,
 ) -> bool {
-    deadline.is_some_and(|d| now + retry_delay >= d)
+    // A retry past the jiff range is past every deadline that jiff can hold.
+    deadline.is_some_and(|d| now.checked_add(retry_delay).map_or(true, |next| next >= d))
 }
 
 /// Returns `true` when the cross-retry wall-clock deadline would be exceeded
@@ -16864,7 +16914,7 @@ pub(crate) fn deadline_would_be_exceeded(
 async fn schedule_to_close_deadline_exceeded(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
-    retry_delay: chrono::Duration,
+    retry_delay: jiff::SignedDuration,
 ) -> HarvestResult<bool> {
     let Some(deadline) = task.schedule_to_close_at else {
         return Ok(false);
@@ -16942,9 +16992,9 @@ enum ScheduleToCloseTimeoutOutcome {
 /// after a completed pause/resume cycle.
 fn schedule_to_close_recheck_outcome(
     execution_state: &str,
-    task_row: Option<&(String, Option<chrono::DateTime<chrono::Utc>>)>,
-    now: chrono::DateTime<chrono::Utc>,
-    retry_delay: chrono::Duration,
+    task_row: Option<&(String, Option<jiff::Timestamp>)>,
+    now: jiff::Timestamp,
+    retry_delay: jiff::SignedDuration,
 ) -> Option<ScheduleToCloseTimeoutOutcome> {
     let Some((task_state, fresh_deadline)) = task_row else {
         return Some(ScheduleToCloseTimeoutOutcome::Handled);
@@ -16969,16 +17019,21 @@ fn schedule_to_close_recheck_outcome(
 async fn task_state_and_deadline_for_update(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
-) -> HarvestResult<Option<(String, Option<chrono::DateTime<chrono::Utc>>)>> {
+) -> HarvestResult<Option<(String, Option<jiff::Timestamp>)>> {
     use crate::schema::harvest_task_queue::dsl;
 
     dsl::harvest_task_queue
         .find(task_id)
         .for_update()
         .select((dsl::state, dsl::schedule_to_close_at))
-        .first(conn)
+        .first::<(String, Option<crate::time::sql::SqlTimestamp>)>(conn)
         .await
         .optional()
+        .map(|row| {
+            row.map(|(state, deadline)| {
+                (state, deadline.map(crate::time::sql::SqlTimestamp::to_jiff))
+            })
+        })
         .map_err(crate::error::database_error)
 }
 
@@ -17017,7 +17072,7 @@ async fn record_schedule_to_close_activity_timeout(
     task: &TaskQueueItem,
     exec_id: ExecutionId,
     activity_id: ActivityExecId,
-    retry_delay: chrono::Duration,
+    retry_delay: jiff::SignedDuration,
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
@@ -17444,15 +17499,15 @@ fn limit_sample_outcome(
 /// answer. The timeout scanner also judges the deadline by the database
 /// clock.
 fn past_attempt_deadline(
-    deadline: Option<chrono::DateTime<chrono::Utc>>,
-    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    deadline: Option<jiff::Timestamp>,
+    started_at: Option<jiff::Timestamp>,
     elapsed: Duration,
 ) -> bool {
     let (Some(deadline), Some(started_at)) = (deadline, started_at) else {
         return false;
     };
     // A deadline before the claim leaves no budget.
-    let budget = (deadline - started_at).to_std().unwrap_or(Duration::ZERO);
+    let budget = std::time::Duration::try_from(deadline - started_at).unwrap_or(Duration::ZERO);
     elapsed >= budget
 }
 
@@ -17544,7 +17599,7 @@ async fn attempt_timed_out(
     claim: &queue::TaskClaim,
     activity_name: &str,
     check: TimeoutCheck,
-    past_deadline: impl FnOnce(Option<chrono::DateTime<chrono::Utc>>) -> bool,
+    past_deadline: impl FnOnce(Option<jiff::Timestamp>) -> bool,
 ) -> Option<bool> {
     if let TimeoutCheck::NotTimedOut | TimeoutCheck::TimedOut = check {
         return Some(check == TimeoutCheck::TimedOut);
@@ -17576,7 +17631,7 @@ async fn attempt_timed_out(
 fn timed_out_from_deadline(
     read: HarvestResult<Option<queue::TaskDeadline>>,
     activity_name: &str,
-    past_deadline: impl FnOnce(Option<chrono::DateTime<chrono::Utc>>) -> bool,
+    past_deadline: impl FnOnce(Option<jiff::Timestamp>) -> bool,
 ) -> Option<bool> {
     match read {
         Err(_) => None,
@@ -17872,7 +17927,7 @@ mod adaptive_limit_gate_tests {
         use super::timed_out_from_deadline;
         use crate::error::HarvestError;
         use crate::queue::TaskDeadline;
-        let moved = chrono::Utc::now();
+        let moved = jiff::Timestamp::now();
         let row = |error: Option<&str>, claim_held, schedule_to_close_at| {
             Ok(Some(TaskDeadline {
                 error: error.map(str::to_owned),
@@ -17980,10 +18035,9 @@ mod adaptive_limit_gate_tests {
     #[test]
     fn the_deadline_check_ignores_the_host_clock() {
         use super::past_attempt_deadline;
-        use chrono::TimeZone as _;
         // Database timestamps far from the host clock, as under a skew.
-        let started = chrono::Utc.with_ymd_and_hms(2001, 1, 1, 0, 0, 0).single();
-        let deadline = started.map(|s| s + chrono::Duration::milliseconds(300));
+        let started = crate::time::utc_ymd_hms(2001, 1, 1, 0, 0, 0);
+        let deadline = started.map(|s| s + jiff::SignedDuration::from_millis(300));
         let ms = Duration::from_millis;
         assert!(!past_attempt_deadline(deadline, started, ms(280)));
         assert!(past_attempt_deadline(deadline, started, ms(300)));
@@ -18283,7 +18337,7 @@ async fn defer_adaptive_limited_task(
 async fn defer_open_circuit_task(
     pool: &DbPool,
     task: &TaskQueueItem,
-    delay: chrono::Duration,
+    delay: jiff::SignedDuration,
 ) -> HarvestResult<queue::ClaimWrite> {
     let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
     queue::defer_claimed_task_for_open_circuit(&mut conn, &claim_of_task(task)?, delay).await
@@ -18299,7 +18353,8 @@ async fn defer_unstarted_claim(
     delay: Duration,
     write_name: &str,
 ) -> HarvestResult<bool> {
-    let delay = chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::seconds(1));
+    let delay = jiff::SignedDuration::try_from(delay)
+        .unwrap_or_else(|_| jiff::SignedDuration::from_secs(1));
     let write = queue::defer_claimed_retry_for_budget(conn, &claim_of_task(task)?, delay).await?;
     if write == queue::ClaimWrite::LeaseLost {
         log_lease_lost(task, write_name);
@@ -18363,7 +18418,7 @@ async fn release_drained_activity(
     let message = crate::failure::parse_error_payload_full(payload).message;
     let error = format!("{WORKER_SHUTDOWN_ERROR}: {message}");
     let write =
-        queue::requeue_claimed_task_for_retry(conn, &claim, chrono::Duration::zero(), &error)
+        queue::requeue_claimed_task_for_retry(conn, &claim, jiff::SignedDuration::ZERO, &error)
             .await?;
     let applied = write == queue::ClaimWrite::Applied;
     if applied {
@@ -18766,7 +18821,7 @@ async fn claim_lost_to_timeout(pool: &DbPool, task: &TaskQueueItem) -> bool {
 async fn take_timed_out_claim_once(
     pool: &DbPool,
     task: &TaskQueueItem,
-    started_at: chrono::DateTime<chrono::Utc>,
+    started_at: jiff::Timestamp,
 ) -> HarvestResult<bool> {
     let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
     queue::take_timed_out_claim(&mut conn, task.id, task.attempt, started_at).await
@@ -18797,12 +18852,12 @@ fn circuit_defer_delay(
     retry_after: Option<Duration>,
     cooldown: Duration,
     task: &TaskQueueItem,
-) -> chrono::Duration {
+) -> jiff::SignedDuration {
     let base = retry_after
         .unwrap_or_else(|| cooldown.max(CIRCUIT_DEFER_UNSCHEDULED))
         .clamp(CIRCUIT_DEFER_MIN, CIRCUIT_DEFER_MAX);
     let jitter = crate::policy::full_jitter(base / 4, retry_stream_seed(task), task_attempt(task));
-    chrono::Duration::from_std(base + jitter).unwrap_or(chrono::Duration::seconds(1))
+    jiff::SignedDuration::try_from(base + jitter).unwrap_or(jiff::SignedDuration::from_secs(1))
 }
 
 /// Fallback defer delay when a rate-limited circuit-breaker activity has no
@@ -19007,9 +19062,12 @@ async fn handle_session_acquire(
     // capacity for longer than one backoff interval. The same holds for
     // workers with the default `max_concurrent_sessions = 0`.
     let eligible_since = task.created_at.unwrap_or(task.scheduled_at);
-    let acquisition_timeout_exceeded = task
-        .schedule_to_start
-        .is_some_and(|budget| chrono::Utc::now() >= eligible_since + budget);
+    let acquisition_timeout_exceeded = task.schedule_to_start.is_some_and(|budget| {
+        // A due time past the jiff range is never reached, as under chrono.
+        eligible_since
+            .checked_add(budget)
+            .is_ok_and(|due| jiff::Timestamp::now() >= due)
+    });
     if acquisition_timeout_exceeded {
         return record_session_acquire_schedule_to_start_timeout(
             &mut conn,
@@ -19046,9 +19104,9 @@ async fn handle_session_acquire(
             crate::sessions::ACQUIRE_RETRY_BACKOFF_MAX,
         );
         // host-clock-ok: the deferral API takes an absolute time. See issue #1807 follow-ups.
-        let scheduled_at = chrono::Utc::now()
-            + chrono::Duration::from_std(backoff)
-                .unwrap_or_else(|_| chrono::Duration::milliseconds(200));
+        let scheduled_at = jiff::Timestamp::now()
+            + jiff::SignedDuration::try_from(backoff)
+                .unwrap_or_else(|_| jiff::SignedDuration::from_millis(200));
         // A lost lease is a no-op (issue #1789).
         if queue::defer_claimed_rate_limited_task(&mut conn, &claim_of_task(task)?, scheduled_at)
             .await?
@@ -19059,9 +19117,9 @@ async fn handle_session_acquire(
         return Ok(None);
     }
 
-    let expires_at = chrono::Utc::now()
-        + chrono::Duration::from_std(crate::sessions::SESSION_MEMBER_STICKY_TIMEOUT)
-            .unwrap_or_else(|_| chrono::Duration::hours(24));
+    let expires_at = jiff::Timestamp::now()
+        + jiff::SignedDuration::try_from(crate::sessions::SESSION_MEMBER_STICKY_TIMEOUT)
+            .unwrap_or_else(|_| jiff::SignedDuration::from_hours(24));
     let actual_host = match crate::sessions::record_session_acquired(
         &mut conn,
         session_id,
@@ -19542,17 +19600,18 @@ async fn read_session_after_inserts(
     use diesel::result::{DatabaseErrorKind, Error as DieselError};
     use diesel_async::AsyncConnection as _;
 
-    let probe = crate::models::NewHarvestSession {
-        id: row.session_id.as_uuid(),
-        workflow_exec_id: row.exec_id.as_uuid(),
-        host_worker_id: &row.host_worker_id,
-        queue_name: &row.queue_name,
-        expires_at: chrono::Utc::now(),
-    };
+    let expires_at = jiff::Timestamp::now();
     let waited = conn
         .transaction::<(), DieselError, _>(async |conn| {
+            let probe = crate::models::NewHarvestSession {
+                id: row.session_id.as_uuid(),
+                workflow_exec_id: row.exec_id.as_uuid(),
+                host_worker_id: &row.host_worker_id,
+                queue_name: &row.queue_name,
+                expires_at,
+            };
             diesel::insert_into(dsl::harvest_sessions)
-                .values(&probe)
+                .values(probe)
                 .on_conflict(dsl::id)
                 .do_nothing()
                 .execute(conn)
@@ -20078,9 +20137,9 @@ async fn process_activity_task(
                     .metrics
                     .record_rate_limit_throttled(activity_name);
                 // host-clock-ok: the deferral API takes an absolute time. See issue #1807 follow-ups.
-                let scheduled_at = chrono::Utc::now()
-                    + chrono::Duration::from_std(refill_delay)
-                        .unwrap_or_else(|_| chrono::Duration::seconds(5));
+                let scheduled_at = jiff::Timestamp::now()
+                    + jiff::SignedDuration::try_from(refill_delay)
+                        .unwrap_or_else(|_| jiff::SignedDuration::from_secs(5));
                 // A lost lease is a no-op (issue #1789). A failed write is a
                 // failed setup write (issue #1815).
                 let deferred = count_setup_failure(
@@ -20386,7 +20445,10 @@ async fn process_activity_task(
     .with_context_headers(activity_context_headers)
     // Issue #682: surface the activity's heartbeat timeout so a handler can
     // opt into `ctx.start_auto_heartbeat_default()`.
-    .with_heartbeat_timeout_opt(task.heartbeat_timeout.and_then(|d| d.to_std().ok()))
+    .with_heartbeat_timeout_opt(
+        task.heartbeat_timeout
+            .and_then(|d| std::time::Duration::try_from(d).ok()),
+    )
     .with_metrics(registry.telemetry().metrics.clone())
     .with_idempotency_key(IdempotencyKey::from_activity_exec_id(activity_id))
     .with_attempt(task_attempt(task))
@@ -22274,10 +22336,7 @@ async fn plan_timer_lifecycle(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     commands: &[WorkflowCommand],
-) -> HarvestResult<(
-    Vec<Option<WorkflowEvent>>,
-    Option<chrono::DateTime<chrono::Utc>>,
-)> {
+) -> HarvestResult<(Vec<Option<WorkflowEvent>>, Option<jiff::Timestamp>)> {
     use crate::schema::harvest_timers;
 
     if !commands.iter().any(|c| {
@@ -22332,7 +22391,7 @@ async fn plan_timer_lifecycle(
         }
     }
 
-    let mut min_fires_at: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut min_fires_at: Option<jiff::Timestamp> = None;
     for &i in &armed_indices {
         let WorkflowCommand::ArmTimer {
             timer_id,
@@ -22354,16 +22413,16 @@ async fn plan_timer_lifecycle(
         let fires_at = if let Some(ref ext) = existing {
             ext.fires_at
         } else {
-            let fire_delay = chrono_duration_from_secs(*duration_secs, "timer duration")?;
+            let fire_delay = signed_duration_from_secs(*duration_secs, "timer duration")?;
             let db_now = db_clock_now(conn).await?;
-            let fires_at = db_now + fire_delay;
+            let fires_at = saturating_fire_at(db_now, fire_delay);
             let new_timer = NewHarvestTimer {
                 workflow_exec_id: exec_id.as_uuid(),
                 timer_id: timer_id.as_str(),
                 fires_at,
             };
             diesel::insert_into(harvest_timers::table)
-                .values(&new_timer)
+                .values(new_timer)
                 .execute(conn)
                 .await
                 .map_err(crate::error::database_error)?;
@@ -22924,10 +22983,15 @@ async fn requeue_child_spawn_admission_error(
         "child spawn could not be admitted; deferring the retry with a bounded \
          jittered backoff rather than failing the execution or hot-spinning",
     );
-    let backoff_chrono =
-        chrono::Duration::from_std(backoff).unwrap_or_else(|_| chrono::Duration::seconds(5));
-    queue::requeue_workflow_task_for_quota_retry(conn, task_id, backoff_chrono, &error.to_string())
-        .await?;
+    let backoff_duration = jiff::SignedDuration::try_from(backoff)
+        .unwrap_or_else(|_| jiff::SignedDuration::from_secs(5));
+    queue::requeue_workflow_task_for_quota_retry(
+        conn,
+        task_id,
+        backoff_duration,
+        &error.to_string(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -23020,10 +23084,15 @@ async fn recover_from_child_quota_exceeded(
          a bounded jittered backoff rather than immediately re-driving it or \
          failing the execution over an unrelated tenant's quota",
     );
-    let backoff_chrono =
-        chrono::Duration::from_std(backoff).unwrap_or_else(|_| chrono::Duration::seconds(5));
-    queue::requeue_workflow_task_for_quota_retry(conn, task_id, backoff_chrono, &error.to_string())
-        .await?;
+    let backoff_duration = jiff::SignedDuration::try_from(backoff)
+        .unwrap_or_else(|_| jiff::SignedDuration::from_secs(5));
+    queue::requeue_workflow_task_for_quota_retry(
+        conn,
+        task_id,
+        backoff_duration,
+        &error.to_string(),
+    )
+    .await?;
     Ok(true)
 }
 
@@ -23202,11 +23271,11 @@ const fn load_failure_fails_task(owner_mode: bool, error: &HarvestError) -> bool
 /// tenure at all (epoch 0), this worker would claim the task again at once,
 /// so it waits a second. The owned claim of issue #2252 then skips such
 /// tasks.
-fn fence_repend_delay(pinned: crate::decision_owner::OwnerEpoch) -> chrono::Duration {
+fn fence_repend_delay(pinned: crate::decision_owner::OwnerEpoch) -> jiff::SignedDuration {
     if pinned == crate::decision_owner::OwnerEpoch::new(0) {
-        chrono::Duration::seconds(1)
+        jiff::SignedDuration::from_secs(1)
     } else {
-        chrono::Duration::zero()
+        jiff::SignedDuration::ZERO
     }
 }
 
@@ -23247,11 +23316,11 @@ mod owner_load_failure_tests {
     fn only_an_ownerless_fence_waits_before_the_repend() {
         assert_eq!(
             fence_repend_delay(OwnerEpoch::new(0)),
-            chrono::Duration::seconds(1)
+            jiff::SignedDuration::from_secs(1)
         );
         assert_eq!(
             fence_repend_delay(OwnerEpoch::new(7)),
-            chrono::Duration::zero()
+            jiff::SignedDuration::ZERO
         );
     }
 }
@@ -23934,14 +24003,14 @@ async fn check_continue_as_new_type<'a>(
                 registry
                     .apply_run_defaults(info.name, info.execution_timeout, None)
                     .0
-                    .and_then(|d| chrono::Duration::from_std(d).ok())
+                    .and_then(|d| jiff::SignedDuration::try_from(d).ok())
                     .map(|t| {
                         registry
                             .max_workflow_execution_timeout
-                            .and_then(|d| chrono::Duration::from_std(d).ok())
+                            .and_then(|d| jiff::SignedDuration::try_from(d).ok())
                             .map_or(t, |ceiling| t.min(ceiling))
                     }),
-                chrono::Utc::now(),
+                jiff::Timestamp::now(),
             ) {
                 error
             } else {
@@ -24154,17 +24223,17 @@ fn continue_as_new_certainly_redirects(
     let effective_timeout = registry
         .apply_run_defaults(target_info.name, target_info.execution_timeout, None)
         .0
-        .and_then(|d| chrono::Duration::from_std(d).ok())
+        .and_then(|d| jiff::SignedDuration::try_from(d).ok())
         .map(|t| {
             registry
                 .max_workflow_execution_timeout
-                .and_then(|d| chrono::Duration::from_std(d).ok())
+                .and_then(|d| jiff::SignedDuration::try_from(d).ok())
                 .map_or(t, |ceiling| t.min(ceiling))
         });
     if classify_successor_deadline_representable(
         target_info.name,
         effective_timeout,
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .is_err()
     {
@@ -24509,11 +24578,11 @@ fn render_cross_shard_continue_as_new_result(
 /// exists to prevent.
 ///
 /// This is the FIRST path that resolves the declaration of the target type
-/// itself. The normal start path computes `target_start_time + d` with a
-/// plain `+` (`execution.rs`). That panics on overflow rather than persisting
-/// such a run. So a type whose declaration overflows could never have been
-/// started directly anyway. Refusing here reaches the same "no run is created with a
-/// lying field" outcome as a diagnosable terminal failure instead of a panic.
+/// itself. A deadline past the jiff range, but inside the `chrono` range,
+/// saturates to `Timestamp::MAX`, as at the start path (`execution.rs`). So
+/// this check refuses only a deadline past the `chrono` range, as
+/// `checked_add_signed` did. Refusing here gives a diagnosable terminal
+/// failure. No run is created with a lying field.
 ///
 /// Takes the **effective** timeout (already clamped by the operator's
 /// fleet-wide ceiling), so a configured ceiling rescues an otherwise
@@ -24525,15 +24594,15 @@ fn render_cross_shard_continue_as_new_result(
 /// benign; silently dropping a runaway cap is not.
 fn classify_successor_deadline_representable(
     target: &str,
-    effective_timeout: Option<chrono::Duration>,
-    now: chrono::DateTime<chrono::Utc>,
+    effective_timeout: Option<jiff::SignedDuration>,
+    now: jiff::Timestamp,
 ) -> Result<(), String> {
     let Some(timeout) = effective_timeout else {
         // No declared timeout: `deadline_at = NULL` is then correct and agrees
         // with `execution_timeout = NULL`.
         return Ok(());
     };
-    if now.checked_add_signed(timeout).is_some() {
+    if crate::time::checked_add_chrono_range(now, timeout).is_some() {
         return Ok(());
     }
     Err(format!(
@@ -24544,7 +24613,7 @@ fn classify_successor_deadline_representable(
          claim a runaway cap it does not have. Declare a smaller execution_timeout on '{target}', \
          omit it to mean 'no timeout', or configure a fleet-wide \
          max_workflow_execution_timeout ceiling",
-        timeout.num_seconds()
+        timeout.as_secs()
     ))
 }
 
@@ -24718,10 +24787,10 @@ fn classify_continue_as_new_target<'a>(
 /// Borrows string metadata from whichever source won, so the caller can hand
 /// these straight to `NewWorkflowExecution`'s `&str` fields.
 struct ContinueAsNewSuccessorDefaults<'a> {
-    execution_timeout: Option<chrono::Duration>,
-    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
-    sla: Option<chrono::Duration>,
-    sla_deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    execution_timeout: Option<jiff::SignedDuration>,
+    deadline_at: Option<jiff::Timestamp>,
+    sla: Option<jiff::SignedDuration>,
+    sla_deadline_at: Option<jiff::Timestamp>,
     owner: Option<&'a str>,
     runbook_url: Option<&'a str>,
     severity: Option<&'a str>,
@@ -24731,8 +24800,8 @@ struct ContinueAsNewSuccessorDefaults<'a> {
     /// escape hatch from the runaway-loop budget. It is threaded through this
     /// struct, not read straight off the row at the insert site. So the pure
     /// `can803_*` tests cover the invariant, not only a Docker-gated one.
-    chain_execution_timeout: Option<chrono::Duration>,
-    chain_deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    chain_execution_timeout: Option<jiff::SignedDuration>,
+    chain_deadline_at: Option<jiff::Timestamp>,
 }
 
 /// Decide the successor's lifecycle defaults for a continue-as-new (issue #803).
@@ -24759,19 +24828,23 @@ struct ContinueAsNewSuccessorDefaults<'a> {
 fn resolve_continue_as_new_successor_defaults<'a>(
     execution: &'a WorkflowExecution,
     target_info: Option<&'a crate::info::WorkflowInfo>,
-    max_execution_timeout_ceiling: Option<chrono::Duration>,
+    max_execution_timeout_ceiling: Option<jiff::SignedDuration>,
     max_workflow_attempts_ceiling: Option<u32>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> ContinueAsNewSuccessorDefaults<'a> {
     let Some(info) = target_info else {
         return ContinueAsNewSuccessorDefaults {
             execution_timeout: execution.execution_timeout,
-            // Plain `+` (not `checked_add_signed`) preserves the pre-#803 path
-            // exactly. Safe because the value is a stored duration that was
-            // already validated when the chain's first run started.
-            deadline_at: execution.execution_timeout.map(|d| now + d),
+            // The start path saturates a deadline past the jiff range to
+            // `Timestamp::MAX`, inside the `chrono` range. The successor follows
+            // the same rule.
+            deadline_at: execution
+                .execution_timeout
+                .and_then(|d| crate::time::checked_add_chrono_range(now, d)),
             sla: execution.sla,
-            sla_deadline_at: execution.sla.map(|d| now + d),
+            sla_deadline_at: execution
+                .sla
+                .and_then(|d| crate::time::checked_add_chrono_range(now, d)),
             owner: execution.owner.as_deref(),
             runbook_url: execution.runbook_url.as_deref(),
             severity: execution.severity.as_deref(),
@@ -24787,7 +24860,7 @@ fn resolve_continue_as_new_successor_defaults<'a>(
     // by that cap when started over HTTP or fired by the scheduler.
     let execution_timeout = info
         .execution_timeout
-        .and_then(|d| chrono::Duration::from_std(d).ok())
+        .and_then(|d| jiff::SignedDuration::try_from(d).ok())
         .map(|t| max_execution_timeout_ceiling.map_or(t, |ceiling| t.min(ceiling)));
     // Clamp the soft SLA to at most the hard timeout, mirroring the start
     // path's resolution — never a soft deadline the hard one would preempt.
@@ -24796,8 +24869,8 @@ fn resolve_continue_as_new_successor_defaults<'a>(
     // reported breached by the very next scan (issue #487).
     let sla = info
         .sla
-        .and_then(|d| chrono::Duration::from_std(d).ok())
-        .filter(|sla| *sla > chrono::Duration::zero())
+        .and_then(|d| jiff::SignedDuration::try_from(d).ok())
+        .filter(|sla| *sla > jiff::SignedDuration::ZERO)
         .map(|sla| execution_timeout.map_or(sla, |hard| sla.min(hard)))
         // An SLA whose absolute deadline is unrepresentable maps to "no SLA", with
         // BOTH fields NULL (PR #1159). The alternative stores a budget with a NULL
@@ -24811,15 +24884,15 @@ fn resolve_continue_as_new_successor_defaults<'a>(
         // cap is not. Narrow in practice: the clamp above already bounds the SLA
         // by a representable `execution_timeout`. So this can only fire when the
         // target declares no hard timeout at all.
-        .filter(|sla| now.checked_add_signed(*sla).is_some());
+        .filter(|sla| crate::time::checked_add_chrono_range(now, *sla).is_some());
     ContinueAsNewSuccessorDefaults {
         execution_timeout,
         // `checked_add_signed` here (unlike the verbatim arm above): these are
         // freshly converted `WorkflowInfo` durations that no start path has
         // range-checked, and `DateTime + Duration` panics on overflow.
-        deadline_at: execution_timeout.and_then(|d| now.checked_add_signed(d)),
+        deadline_at: execution_timeout.and_then(|d| crate::time::checked_add_chrono_range(now, d)),
         sla,
-        sla_deadline_at: sla.and_then(|d| now.checked_add_signed(d)),
+        sla_deadline_at: sla.and_then(|d| crate::time::checked_add_chrono_range(now, d)),
         owner: info.owner,
         runbook_url: info.runbook_url,
         severity: info.severity,
@@ -24986,7 +25059,7 @@ async fn persist_workflow_continue_as_new_with_verdict(
     let worker_id = persistence.worker_id;
     let started_event = WorkflowEvent::WorkflowStarted {
         input: input.clone(),
-        timestamp: chrono::Utc::now(),
+        timestamp: jiff::Timestamp::now(),
         // Preserve scheduled carryover across the fork (issue #488). The
         // continuation is the same logical scheduled run, so it must see the same
         // frozen values. Re-resolving could pick up the output of a newer sibling
@@ -25030,9 +25103,9 @@ async fn persist_workflow_continue_as_new_with_verdict(
         target_info.as_ref(),
         registry
             .max_workflow_execution_timeout
-            .and_then(|d| chrono::Duration::from_std(d).ok()),
+            .and_then(|d| jiff::SignedDuration::try_from(d).ok()),
         registry.max_workflow_attempts_ceiling,
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     );
     // Chain-scoped lifetime cap (issue #617): CARRY BOTH COLUMNS VERBATIM, for a
     // cross-type continuation too. The per-run `deadline_at`/`sla_deadline_at`
@@ -25199,7 +25272,8 @@ async fn persist_workflow_continue_as_new_with_verdict(
                 harvest_workflow_executions::output.eq(None::<serde_json::Value>),
                 harvest_workflow_executions::error.eq(None::<String>),
                 harvest_workflow_executions::sticky_worker_id.eq(Some(worker_id.to_string())),
-                harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+                harvest_workflow_executions::completed_at
+                    .eq(Some(jiff::Timestamp::now()).to_diesel()),
             ))
             .cache_prepared()
             .execute(conn)
@@ -27148,7 +27222,7 @@ async fn process_workflow_task(
     // Issue #783: absolute cut-off of the enclosing workflow-task dispatch
     // (issue #494), forwarded to inline local activities so their reported
     // deadline cannot out-live the cycle. `None` when that timeout is disabled.
-    workflow_task_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    workflow_task_deadline: Option<jiff::Timestamp>,
     // Issue #804: set by this dispatch when a frontier reset commits. A later
     // capability miss can then decide on the counters the row actually holds
     // without re-reading them. See `frontier_miss_state`.
@@ -28839,14 +28913,14 @@ async fn process_workflow_task(
         let strikes = workflow_deadlock_strikes.record(prepared.exec_id.as_uuid());
         // `deadlock_retry_backoff` is capped at 300 s, so the fallback never
         // runs. It is still non-zero, so it cannot hot-loop.
-        let backoff = chrono::Duration::from_std(deadlock_retry_backoff(strikes))
-            .unwrap_or_else(|_| chrono::Duration::seconds(300));
+        let backoff = jiff::SignedDuration::try_from(deadlock_retry_backoff(strikes))
+            .unwrap_or_else(|_| jiff::SignedDuration::from_secs(300));
         tracing::warn!(
             execution_id = %prepared.exec_id,
             workflow = %prepared.execution.workflow_name,
             queue = %task.queue_name,
             strikes,
-            backoff_secs = backoff.num_seconds(),
+            backoff_secs = backoff.as_secs(),
             error = %error,
             "harvest: workflow task failed (issue #1797); the task is retried and the \
              run stays RUNNING"
@@ -28898,19 +28972,19 @@ async fn process_workflow_task(
         match panic_retry_decision(strikes, workflow_panic_max_attempts) {
             PanicRetryDecision::Requeue => {
                 // `panic_retry_backoff` is bounded by PANIC_RETRY_BACKOFF_CAP_SECS
-                // (30s), always representable as a chrono::Duration; the fallback
+                // (30s), always representable as a jiff::SignedDuration; the fallback
                 // is defensive and still non-zero so it can never hot-loop.
                 let backoff = panic_retry_backoff_jittered(strikes, task);
-                let backoff = chrono::Duration::from_std(backoff)
-                    .unwrap_or_else(|_| chrono::Duration::seconds(30));
+                let backoff = jiff::SignedDuration::try_from(backoff)
+                    .unwrap_or_else(|_| jiff::SignedDuration::from_secs(30));
                 tracing::warn!(
                     execution_id = %prepared.exec_id,
                     workflow = %prepared.execution.workflow_name,
                     queue = %task.queue_name,
                     strikes,
                     max_attempts = workflow_panic_max_attempts,
-                    backoff_secs = backoff.num_seconds(),
-                    backoff_ms = backoff.num_milliseconds(),
+                    backoff_secs = backoff.as_secs(),
+                    backoff_ms = crate::time::num_milliseconds(backoff),
                     "harvest: workflow handler panicked; containing as a non-terminal \
                      re-dispatch (issue #782) — roll back or fix the panicking build"
                 );
@@ -29288,20 +29362,20 @@ async fn process_workflow_task(
     // absorbing that unrelated later latency would inflate them and distort
     // executor-latency SLOs.
     let duration_secs = started_at.elapsed().as_secs_f64();
-    let canary_roundtrip_secs =
-        if is_canary && matches!(&outcome, WorkflowOutcome::Completed { .. }) {
-            // Round-trip = start-requested → completed wall-clock (AC5). Clamp a
-            // clock-skew negative delta to 0 (`.to_std()` errs on a negative
-            // chrono duration), mirroring the update-duration clamping
-            // precedent.
-            Some(
-                (chrono::Utc::now() - prepared.execution.started_at)
-                    .to_std()
-                    .map_or(0.0, |delta| delta.as_secs_f64()),
-            )
-        } else {
-            None
-        };
+    let canary_roundtrip_secs = if is_canary
+        && matches!(&outcome, WorkflowOutcome::Completed { .. })
+    {
+        // Round-trip = start-requested → completed wall-clock (AC5). Clamp a
+        // clock-skew negative delta to 0 (the std conversion errs on a negative
+        // signed duration), mirroring the update-duration clamping
+        // precedent.
+        Some(
+            std::time::Duration::try_from(jiff::Timestamp::now() - prepared.execution.started_at)
+                .map_or(0.0, |delta| delta.as_secs_f64()),
+        )
+    } else {
+        None
+    };
     let mut pending_workflow_metrics = PendingWorkflowMetrics {
         status,
         is_canary,
@@ -30410,7 +30484,7 @@ async fn process_task(
     // Issue #783: absolute cut-off of the enclosing workflow-task dispatch
     // (issue #494); `None` when that timeout is disabled. Workflow path only —
     // an activity task is not wrapped in it.
-    workflow_task_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    workflow_task_deadline: Option<jiff::Timestamp>,
     // Issue #804: the redelivery budget and the fleet-liveness window that
     // gates it.
     capability_miss_policy: CapabilityMissPolicy,
@@ -32154,12 +32228,13 @@ fn spawn_queue_depth_sampler(
     // default shard only (issue #522 review). Every worker aggregates the
     // same full set, so all workers emit a consistent
     // `harvest.queue.depth{queue}` value.
-    pools: Vec<DbPool>,
+    pools: Vec<GaugeShard>,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     queues: Vec<String>,
     interval: Duration,
     circuit_breaker_activities: Vec<String>,
+    election: crate::gauge_election::GaugeElection,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // No recorder configured: never issue the sampler SQL. The per-event
@@ -32167,6 +32242,17 @@ fn spawn_queue_depth_sampler(
         if !telemetry.metrics.is_enabled() {
             return;
         }
+        let inputs = serde_json::json!({
+            "queues": sorted_set(&queues),
+            "circuit_breakers": sorted_set(&circuit_breaker_activities),
+            "cap": crate::telemetry::QUEUE_DEPTH_CAP.get(),
+        });
+        let mut slots = gauge_slots(
+            &election,
+            crate::gauge_election::GaugeSampler::QueueDepth,
+            &inputs,
+            &pools,
+        );
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -32189,7 +32275,7 @@ fn spawn_queue_depth_sampler(
             // pre-aggregation single-pool path, which skipped the sample on read
             // failure (#522).
             let mut read_failed = false;
-            for pool in &pools {
+            for (shard, slot) in pools.iter().zip(slots.iter_mut()) {
                 // Selected against `cancel` (issue #1426), mirroring
                 // `spawn_schedule_overdue_sampler`. A cancelled acquisition
                 // abandons the rest of this tick's shards, same as any
@@ -32197,7 +32283,7 @@ fn spawn_queue_depth_sampler(
                 // loop.
                 let get_result = tokio::select! {
                     () = cancel.cancelled() => None,
-                    result = pool.get() => Some(result),
+                    result = shard.pool.get() => Some(result),
                 };
                 let Some(get_result) = get_result else {
                     read_failed = true;
@@ -32214,15 +32300,24 @@ fn spawn_queue_depth_sampler(
                         continue;
                     }
                 };
-                match queue::bounded_queue_depths(
-                    &mut conn,
-                    &queues,
-                    crate::telemetry::QUEUE_DEPTH_CAP,
-                )
-                .await
-                {
-                    Ok(depths) => {
-                        for (queue_name, depth) in depths {
+                // The elected worker reads the shard. The others use its row.
+                let sampled = slot
+                    .sample(&mut conn, &*telemetry.metrics, async |conn| {
+                        let depths = queue::bounded_queue_depths(
+                            conn,
+                            &queues,
+                            crate::telemetry::QUEUE_DEPTH_CAP,
+                        )
+                        .await?;
+                        let ages =
+                            queue::oldest_pending_ages(conn, &queues, &circuit_breaker_activities)
+                                .await?;
+                        Ok(QueueDepthRead { depths, ages })
+                    })
+                    .await;
+                match sampled {
+                    Ok((read, _role)) => {
+                        for (queue_name, depth) in read.depths {
                             let total = depth_by_queue.entry(queue_name).or_insert(0);
                             *total = queue::add_bounded_depth(
                                 *total,
@@ -32230,23 +32325,13 @@ fn spawn_queue_depth_sampler(
                                 crate::telemetry::QUEUE_DEPTH_CAP.get(),
                             );
                         }
-                    }
-                    Err(error) => {
-                        tracing::debug!(error = %error, "queue depth sample failed");
-                        read_failed = true;
-                    }
-                }
-                match queue::oldest_pending_ages(&mut conn, &queues, &circuit_breaker_activities)
-                    .await
-                {
-                    Ok(ages) => {
-                        for (queue_name, age_secs) in ages {
-                            let slot = age_by_queue.entry(queue_name).or_insert(0.0);
-                            *slot = slot.max(age_secs);
+                        for (queue_name, age_secs) in read.ages {
+                            let age = age_by_queue.entry(queue_name).or_insert(0.0);
+                            *age = age.max(age_secs);
                         }
                     }
                     Err(error) => {
-                        tracing::debug!(error = %error, "oldest pending age sample failed");
+                        tracing::debug!(error = %error, "queue depth sample failed");
                         read_failed = true;
                     }
                 }
@@ -32276,6 +32361,7 @@ fn spawn_queue_depth_sampler(
                 break;
             }
         }
+        release_gauge_slots(&mut slots, &pools).await;
     })
 }
 
@@ -32287,11 +32373,12 @@ fn spawn_queue_depth_sampler(
 ///  - A `DEBUG` trace if any tasks are pending while the cap is saturated
 fn spawn_concurrency_sampler(
     // One pool per shard to aggregate over (see `spawn_queue_depth_sampler`).
-    pools: Vec<DbPool>,
+    pools: Vec<GaugeShard>,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     queues: Vec<String>,
     interval: Duration,
+    election: crate::gauge_election::GaugeElection,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // No recorder configured, and no DEBUG subscriber would observe the
@@ -32308,6 +32395,12 @@ fn spawn_concurrency_sampler(
         {
             return;
         }
+        let mut slots = gauge_slots(
+            &election,
+            crate::gauge_election::GaugeSampler::Concurrency,
+            &serde_json::json!({ "queues": sorted_set(&queues) }),
+            &pools,
+        );
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -32325,7 +32418,7 @@ fn spawn_concurrency_sampler(
             // Skip the whole tick on any shard read failure so a partial aggregate
             // does not under-report concurrency during a storage outage (#522).
             let mut read_failed = false;
-            for pool in &pools {
+            for (shard, slot) in pools.iter().zip(slots.iter_mut()) {
                 // Selected against `cancel` (issue #1426), mirroring
                 // `spawn_schedule_overdue_sampler`. A cancelled acquisition
                 // abandons the rest of this tick's shards, same as any
@@ -32333,7 +32426,7 @@ fn spawn_concurrency_sampler(
                 // loop.
                 let get_result = tokio::select! {
                     () = cancel.cancelled() => None,
-                    result = pool.get() => Some(result),
+                    result = shard.pool.get() => Some(result),
                 };
                 let Some(get_result) = get_result else {
                     read_failed = true;
@@ -32350,8 +32443,17 @@ fn spawn_concurrency_sampler(
                         continue;
                     }
                 };
-                match queue::concurrency_key_stats(&mut conn, &queues).await {
-                    Ok(stats) => {
+                let sampled = slot
+                    .sample(&mut conn, &*telemetry.metrics, async |conn| {
+                        let stats = queue::concurrency_key_stats(conn, &queues).await?;
+                        Ok(stats
+                            .into_iter()
+                            .map(ConcurrencyRead::from)
+                            .collect::<Vec<_>>())
+                    })
+                    .await;
+                match sampled {
+                    Ok((stats, _role)) => {
                         for stat in &stats {
                             // Grouped by (key, task_type) so workflow and activity
                             // budgets for the same key do not collide on the label.
@@ -32402,6 +32504,7 @@ fn spawn_concurrency_sampler(
                 break;
             }
         }
+        release_gauge_slots(&mut slots, &pools).await;
     })
 }
 
@@ -32411,10 +32514,11 @@ fn spawn_concurrency_sampler(
 /// Stops when the cancellation token fires.
 fn spawn_rate_limit_sampler(
     // One pool per shard to aggregate over (see `spawn_queue_depth_sampler`).
-    pools: Vec<DbPool>,
+    pools: Vec<GaugeShard>,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     interval: Duration,
+    election: crate::gauge_election::GaugeElection,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // No recorder configured: never issue the sampler SQL (issue #1428,
@@ -32422,6 +32526,12 @@ fn spawn_rate_limit_sampler(
         if !telemetry.metrics.is_enabled() {
             return;
         }
+        let mut slots = gauge_slots(
+            &election,
+            crate::gauge_election::GaugeSampler::RateLimit,
+            &serde_json::Value::Null,
+            &pools,
+        );
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -32448,7 +32558,7 @@ fn spawn_rate_limit_sampler(
             // Skip the whole tick on any shard read failure so a partial aggregate
             // does not under-report available tokens during a storage outage (#522).
             let mut read_failed = false;
-            for pool in &pools {
+            for (shard, slot) in pools.iter().zip(slots.iter_mut()) {
                 // Selected against `cancel` (issue #1426), mirroring
                 // `spawn_schedule_overdue_sampler`. A cancelled acquisition
                 // abandons the rest of this tick's shards, same as any
@@ -32456,7 +32566,7 @@ fn spawn_rate_limit_sampler(
                 // loop.
                 let get_result = tokio::select! {
                     () = cancel.cancelled() => None,
-                    result = pool.get() => Some(result),
+                    result = shard.pool.get() => Some(result),
                 };
                 let Some(get_result) = get_result else {
                     read_failed = true;
@@ -32474,10 +32584,18 @@ fn spawn_rate_limit_sampler(
                     }
                 };
 
-                let result = queue::sample_rate_limit_buckets(&mut conn).await;
+                let result = slot
+                    .sample(&mut conn, &*telemetry.metrics, async |conn| {
+                        let buckets = queue::sample_rate_limit_buckets(conn).await?;
+                        Ok(buckets
+                            .into_iter()
+                            .map(RateLimitRead::from)
+                            .collect::<Vec<_>>())
+                    })
+                    .await;
 
                 match result {
-                    Ok(buckets) => {
+                    Ok((buckets, _role)) => {
                         for bucket in buckets {
                             *tokens_by_key.entry(bucket.key.clone()).or_insert(0.0) +=
                                 bucket.estimated_tokens;
@@ -32514,11 +32632,15 @@ fn spawn_rate_limit_sampler(
                 break;
             }
         }
+        release_gauge_slots(&mut slots, &pools).await;
     })
 }
 
 /// Periodically sample the dead-letter queue entry count and forward it to
 /// the configured [`MetricsRecorder`](crate::telemetry::MetricsRecorder).
+///
+/// The count is exact, and its read does not grow with the DLQ. See
+/// [`crate::dlq::DLQ_DEPTH_SQL`].
 ///
 /// Runs on the same cadence as the queue-depth sampler. For sharded
 /// deployments the caller should spawn one instance per shard, passing the
@@ -32527,11 +32649,11 @@ fn spawn_rate_limit_sampler(
 ///
 /// Stops when the cancellation token fires.
 fn spawn_dlq_depth_sampler(
-    pool: DbPool,
+    shard: GaugeShard,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
-    shard_id: u16,
     interval: Duration,
+    election: crate::gauge_election::GaugeElection,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // No recorder configured: never issue the sampler SQL (issue #1428,
@@ -32539,6 +32661,15 @@ fn spawn_dlq_depth_sampler(
         if !telemetry.metrics.is_enabled() {
             return;
         }
+        let shard_id = u16::try_from(shard.shard.as_i32()).unwrap_or(0);
+        let pool = shard.pool.clone();
+        let shards = vec![shard];
+        let mut slots = gauge_slots(
+            &election,
+            crate::gauge_election::GaugeSampler::Dlq,
+            &serde_json::Value::Null,
+            &shards,
+        );
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -32565,8 +32696,20 @@ fn spawn_dlq_depth_sampler(
                 }
             };
 
-            match crate::dlq::dead_letter_count(&mut conn).await {
-                Ok(count) => {
+            let sampled = slots[0]
+                .sample(&mut conn, &*telemetry.metrics, async |conn| {
+                    crate::dlq::dead_letter_count(conn).await
+                })
+                .await;
+            match sampled {
+                Ok((count, _role)) => {
+                    if count < 0 {
+                        tracing::warn!(
+                            shard_id,
+                            count,
+                            "dlq depth counter is negative; run harvest_dead_letter_recount()"
+                        );
+                    }
                     let depth = u64::try_from(count).unwrap_or(0);
                     telemetry.metrics.record_dlq_entries(shard_id, depth);
                 }
@@ -32579,6 +32722,7 @@ fn spawn_dlq_depth_sampler(
                 break;
             }
         }
+        release_gauge_slots(&mut slots, &shards).await;
     })
 }
 
@@ -32598,15 +32742,22 @@ fn spawn_dlq_depth_sampler(
 #[cfg(feature = "db")]
 fn spawn_queue_pause_sampler(
     // One pool per shard to aggregate over (see spawn_queue_depth_sampler).
-    pools: Vec<DbPool>,
+    pools: Vec<GaugeShard>,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     interval: Duration,
+    election: crate::gauge_election::GaugeElection,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if !telemetry.metrics.is_enabled() {
             return;
         }
+        let mut slots = gauge_slots(
+            &election,
+            crate::gauge_election::GaugeSampler::QueuePause,
+            &serde_json::Value::Null,
+            &pools,
+        );
         // Queues reported paused on the previous cycle, so a resume can be
         // zero-filled exactly once rather than leaving a stale `1`.
         let mut previously_paused: std::collections::BTreeSet<String> =
@@ -32622,7 +32773,7 @@ fn spawn_queue_pause_sampler(
                 std::collections::BTreeSet::new();
             let mut read_failed = false;
 
-            for pool in &pools {
+            for (shard, slot) in pools.iter().zip(slots.iter_mut()) {
                 // Selected against `cancel` (issue #1426), mirroring
                 // `spawn_schedule_overdue_sampler`. A cancelled acquisition
                 // abandons the rest of this tick's shards, same as any
@@ -32630,7 +32781,7 @@ fn spawn_queue_pause_sampler(
                 // loop.
                 let get_result = tokio::select! {
                     () = cancel.cancelled() => None,
-                    result = pool.get() => Some(result),
+                    result = shard.pool.get() => Some(result),
                 };
                 let Some(get_result) = get_result else {
                     read_failed = true;
@@ -32640,8 +32791,13 @@ fn spawn_queue_pause_sampler(
                     read_failed = true;
                     continue;
                 };
-                match crate::queue_pause::paused_queue_names(&mut conn).await {
-                    Ok(names) => currently_paused.extend(names),
+                let sampled = slot
+                    .sample(&mut conn, &*telemetry.metrics, async |conn| {
+                        crate::queue_pause::paused_queue_names(conn).await
+                    })
+                    .await;
+                match sampled {
+                    Ok((names, _role)) => currently_paused.extend(names),
                     Err(error) => {
                         read_failed = true;
                         tracing::debug!(error = %error, "queue pause sample failed");
@@ -32664,6 +32820,7 @@ fn spawn_queue_pause_sampler(
                 break;
             }
         }
+        release_gauge_slots(&mut slots, &pools).await;
     })
 }
 
@@ -32768,7 +32925,7 @@ fn spawn_schedule_overdue_sampler(
             // starts while a fast schedule is already wedged then detects it
             // within one cadence grace window, not after the initial ceiling
             // sleep.
-            let now = chrono::Utc::now();
+            let now = jiff::Timestamp::now();
             // Aggregate verdicts across ALL shard pools into one (kind, name) map
             // (overdue if any shard's same-named schedule is overdue) BEFORE
             // emitting, mirroring the queue_depth precedent. This closes the
@@ -33924,7 +34081,7 @@ async fn sample_one_shard(
 /// with no such worker are counted as stranded and emitted via
 /// `harvest.shard.stranded_pending`.
 #[cfg(feature = "db")]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn spawn_stranded_work_sampler(
     sharded_pool: crate::shard::ShardedDbPool,
     freshness_window: Duration,
@@ -33937,8 +34094,33 @@ fn spawn_stranded_work_sampler(
     // Map of activity_name → required_capabilities JSON for activities that
     // declare `requires`; back-fills the eligibility gate for un-snapshotted rows.
     activity_requirements: std::collections::HashMap<String, serde_json::Value>,
+    election: crate::gauge_election::GaugeElection,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // Iterate ALL shards so unassigned writable shards with stranded
+        // work are surfaced, not just the shards this worker covers.
+        let shards: Vec<GaugeShard> = sharded_pool
+            .iter_shards()
+            .map(|(shard_id, pool)| GaugeShard {
+                shard: shard_id,
+                fence: Some(shard_id),
+                pool: pool.clone(),
+            })
+            .collect();
+        // A map has no order, so the key reads it sorted.
+        let requirements: std::collections::BTreeMap<&String, &serde_json::Value> =
+            activity_requirements.iter().collect();
+        let inputs = serde_json::json!({
+            "circuit_breakers": sorted_set(&circuit_breaker_activities),
+            "requirements": requirements,
+            "freshness_ms": u64::try_from(freshness_window.as_millis()).unwrap_or(u64::MAX),
+        });
+        let mut slots = gauge_slots(
+            &election,
+            crate::gauge_election::GaugeSampler::StrandedWork,
+            &inputs,
+            &shards,
+        );
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -33948,176 +34130,162 @@ fn spawn_stranded_work_sampler(
                 break;
             }
 
-            // Iterate ALL shards so unassigned writable shards with stranded
-            // work are surfaced, not just the shards this worker covers.
-            for (shard_id, shard_pool) in sharded_pool.iter_shards() {
+            for (shard, slot) in shards.iter().zip(slots.iter_mut()) {
+                let shard_id = shard.shard;
                 let shard_u16 = u16::try_from(shard_id.as_i32()).unwrap_or(0);
-
-                // Claimable pending demands for this shard, grouped by
-                // (queue, required_capabilities, ...) so coverage can honour the
-                // same eligibility claim_task enforces (issue #522 review).
-                let mut demands: Vec<crate::queue::ClaimablePendingDemand> = {
-                    // Selected against `cancel` (issue #1426): an unselected
-                    // `pool.get()` here can park shutdown forever. Cancellation
-                    // abandons the remaining shards this tick, same as the
-                    // multi-pool samplers above.
-                    let get_result = tokio::select! {
-                        () = cancel.cancelled() => break,
-                        result = shard_pool.get() => result,
-                    };
-                    let mut conn = match get_result {
-                        Ok(conn) => conn,
-                        Err(error) => {
-                            tracing::debug!(
-                                shard_id = %shard_id.as_i32(),
-                                error = %error,
-                                "stranded-work sampler could not acquire DB connection"
-                            );
-                            continue;
-                        }
-                    };
-                    match crate::queue::claimable_pending_demand_by_queue(
-                        &mut conn,
-                        &circuit_breaker_activities,
-                    )
-                    .await
-                    {
-                        Ok(demands) => demands,
-                        Err(error) => {
-                            tracing::debug!(
-                                shard_id = %shard_id.as_i32(),
-                                error = %error,
-                                "stranded-work count query failed"
-                            );
-                            continue;
-                        }
+                // Selected against `cancel`: an unselected `pool.get()` here
+                // can park shutdown forever. Cancellation abandons the
+                // remaining shards this tick, same as the multi-pool samplers
+                // above.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => break,
+                    result = shard.pool.get() => result,
+                };
+                let mut conn = match get_result {
+                    Ok(conn) => conn,
+                    Err(error) => {
+                        tracing::debug!(
+                            shard_id = %shard_id.as_i32(),
+                            error = %error,
+                            "stranded-work sampler could not acquire DB connection"
+                        );
+                        continue;
                     }
                 };
-
-                // Back-fill effective requirements for activity rows that did not
-                // snapshot required_capabilities (legacy/manual enqueues). The
-                // coverage check below then applies the same activity eligibility
-                // claim_task's $6 gate enforces.
-                crate::queue::apply_activity_requirements(&mut demands, &activity_requirements);
-
-                if demands.is_empty() {
-                    // No claimable work — emit 0 so the gauge resets cleanly.
-                    telemetry
-                        .metrics
-                        .record_shard_stranded_pending(shard_u16, 0);
-                    continue;
-                }
-
-                // Healthy active workers assigned to this shard. Kept whole (not
-                // collapsed to queue names) so the capability check below can see
-                // each worker's polled queues *and* labels.
-                let covering_workers: Vec<crate::workers::WorkerRow> = {
-                    // Selected against `cancel` (issue #1426); see the demands
-                    // acquisition above.
-                    let get_result = tokio::select! {
-                        () = cancel.cancelled() => break,
-                        result = shard_pool.get() => result,
-                    };
-                    let Ok(mut conn) = get_result else {
-                        continue;
-                    };
-                    let filters = crate::workers::WorkerFilters {
-                        status: Some(crate::workers::WorkerStatus::Active.as_str().to_string()),
-                        shard_id: Some(shard_id.as_i32()),
-                        health: Some(crate::workers::WorkerHealth::Healthy),
-                        limit: i64::MAX,
-                        ..Default::default()
-                    };
-                    match crate::workers::list_workers(&mut conn, &filters, freshness_window).await
-                    {
-                        Ok(workers) => workers,
-                        Err(error) => {
-                            tracing::debug!(
-                                error = %error,
-                                "worker list query failed for stranded-work sampler"
-                            );
-                            continue;
-                        }
-                    }
-                };
-
-                // Build compatibility set for this shard (issue #171 routing).
-                // Used to honour the same required_build_id eligibility
-                // claim_task enforces. On load failure fall back to an empty set
-                // (the exact-match rule still applies).
-                let compat_set = {
-                    // Selected against `cancel` (issue #1426); see the demands
-                    // acquisition above.
-                    let get_result = tokio::select! {
-                        () = cancel.cancelled() => break,
-                        result = shard_pool.get() => result,
-                    };
-                    let Ok(mut conn) = get_result else {
-                        continue;
-                    };
-                    crate::build_routing::load_compat_set(&mut conn)
+                // The elected worker computes the count. The others use its row.
+                let sampled = slot
+                    .sample(&mut conn, &*telemetry.metrics, async |conn| {
+                        stranded_pending_on_shard(
+                            conn,
+                            shard_id,
+                            freshness_window,
+                            &circuit_breaker_activities,
+                            &activity_requirements,
+                        )
                         .await
-                        .unwrap_or_default()
-                };
-
-                // A demand is covered when some covering worker polls its queue.
-                // That worker also satisfies its required_capabilities (the
-                // same Exact/In label match claim_task applies). It is
-                // build-eligible for its required_build_id (the same exact or
-                // compatible rule). When an unexpired sticky lease holds the
-                // row, it *is* the lease owner, because only the owner can
-                // claim until the lease expires. All
-                // constraints are checked against the *same* worker so a task
-                // needing several is not falsely covered by different workers
-                // each satisfying only one. No requirement ⇒ that dimension is
-                // trivially satisfied; unparseable capabilities fall back to the
-                // other dimensions so the sampler never fabricates a
-                // false-positive stranded signal.
-                let demand_covered = |demand: &crate::queue::ClaimablePendingDemand| -> bool {
-                    let reqs = demand.required_capabilities.as_ref().and_then(|caps| {
-                        serde_json::from_value::<Vec<crate::eligibility::Requirement>>(caps.clone())
-                            .ok()
-                    });
-                    covering_workers.iter().any(|w| {
-                        let polls_queue = w.worker.queues.as_array().is_some_and(|qs| {
-                            qs.iter()
-                                .any(|v| v.as_str() == Some(demand.queue_name.as_str()))
-                        });
-                        if !polls_queue {
-                            return false;
-                        }
-                        if demand
-                            .sticky_owner
-                            .as_deref()
-                            .is_some_and(|owner| owner != w.worker.worker_id)
-                        {
-                            return false;
-                        }
-                        if !compat_set
-                            .is_eligible(&w.worker.build_id, demand.required_build_id.as_deref())
-                        {
-                            return false;
-                        }
-                        reqs.as_ref().is_none_or(|reqs| {
-                            let labels =
-                                crate::payload_codec::string_valued_labels(&w.worker.labels);
-                            crate::eligibility::matches_requirements(reqs, &labels)
-                        })
                     })
-                };
-
-                // Sum pending tasks across demands no covering worker can claim.
-                let stranded: u64 = demands
-                    .iter()
-                    .filter(|demand| !demand_covered(demand))
-                    .map(|demand| u64::try_from(demand.count).unwrap_or(0))
-                    .sum();
-                telemetry
-                    .metrics
-                    .record_shard_stranded_pending(shard_u16, stranded);
+                    .await;
+                match sampled {
+                    Ok((stranded, _role)) => {
+                        telemetry
+                            .metrics
+                            .record_shard_stranded_pending(shard_u16, stranded);
+                    }
+                    // A failed read skips the emit, so the gauge holds.
+                    Err(error) => {
+                        tracing::debug!(
+                            shard_id = %shard_id.as_i32(),
+                            error = %error,
+                            "stranded-work sample failed"
+                        );
+                    }
+                }
             }
         }
+        release_gauge_slots(&mut slots, &shards).await;
     })
+}
+
+/// The claimable pending tasks on one shard that no covering live worker can
+/// claim.
+///
+/// One connection runs the three reads in turn. A failed demand or worker
+/// read fails the sample. A failed compatibility read falls back to an empty
+/// set, so the exact-match rule still applies.
+#[cfg(feature = "db")]
+async fn stranded_pending_on_shard(
+    conn: &mut AsyncPgConnection,
+    shard_id: crate::types::ShardId,
+    freshness_window: Duration,
+    circuit_breaker_activities: &[String],
+    activity_requirements: &std::collections::HashMap<String, serde_json::Value>,
+) -> HarvestResult<u64> {
+    // Claimable pending demands for this shard, grouped by
+    // (queue, required_capabilities, ...) so coverage can honour the
+    // same eligibility claim_task enforces.
+    let mut demands =
+        crate::queue::claimable_pending_demand_by_queue(conn, circuit_breaker_activities).await?;
+
+    // Back-fill effective requirements for activity rows that did not
+    // snapshot required_capabilities (legacy/manual enqueues). The
+    // coverage check below then applies the same activity eligibility
+    // claim_task's $6 gate enforces.
+    crate::queue::apply_activity_requirements(&mut demands, activity_requirements);
+
+    if demands.is_empty() {
+        // No claimable work. A 0 resets the gauge cleanly.
+        return Ok(0);
+    }
+
+    // Healthy active workers assigned to this shard. Kept whole (not
+    // collapsed to queue names) so the capability check below can see
+    // each worker's polled queues *and* labels.
+    let filters = crate::workers::WorkerFilters {
+        status: Some(crate::workers::WorkerStatus::Active.as_str().to_string()),
+        shard_id: Some(shard_id.as_i32()),
+        health: Some(crate::workers::WorkerHealth::Healthy),
+        limit: i64::MAX,
+        ..Default::default()
+    };
+    let covering_workers = crate::workers::list_workers(conn, &filters, freshness_window).await?;
+
+    // Build compatibility set for this shard (build routing).
+    // Used to honour the same required_build_id eligibility
+    // claim_task enforces. On load failure fall back to an empty set
+    // (the exact-match rule still applies).
+    let compat_set = crate::build_routing::load_compat_set(conn)
+        .await
+        .unwrap_or_default();
+
+    // A demand is covered when some covering worker polls its queue.
+    // That worker also satisfies its required_capabilities (the
+    // same Exact/In label match claim_task applies). It is
+    // build-eligible for its required_build_id (the same exact or
+    // compatible rule). When an unexpired sticky lease holds the
+    // row, it *is* the lease owner, because only the owner can
+    // claim until the lease expires. All
+    // constraints are checked against the *same* worker so a task
+    // needing several is not falsely covered by different workers
+    // each satisfying only one. No requirement ⇒ that dimension is
+    // trivially satisfied; unparseable capabilities fall back to the
+    // other dimensions so the sampler never fabricates a
+    // false-positive stranded signal.
+    let demand_covered = |demand: &crate::queue::ClaimablePendingDemand| -> bool {
+        let reqs = demand.required_capabilities.as_ref().and_then(|caps| {
+            serde_json::from_value::<Vec<crate::eligibility::Requirement>>(caps.clone()).ok()
+        });
+        covering_workers.iter().any(|w| {
+            let polls_queue = w.worker.queues.as_array().is_some_and(|qs| {
+                qs.iter()
+                    .any(|v| v.as_str() == Some(demand.queue_name.as_str()))
+            });
+            if !polls_queue {
+                return false;
+            }
+            if demand
+                .sticky_owner
+                .as_deref()
+                .is_some_and(|owner| owner != w.worker.worker_id)
+            {
+                return false;
+            }
+            if !compat_set.is_eligible(&w.worker.build_id, demand.required_build_id.as_deref()) {
+                return false;
+            }
+            reqs.as_ref().is_none_or(|reqs| {
+                let labels = crate::payload_codec::string_valued_labels(&w.worker.labels);
+                crate::eligibility::matches_requirements(reqs, &labels)
+            })
+        })
+    };
+
+    // Sum pending tasks across demands no covering worker can claim.
+    let stranded: u64 = demands
+        .iter()
+        .filter(|demand| !demand_covered(demand))
+        .map(|demand| u64::try_from(demand.count).unwrap_or(0))
+        .sum();
+    Ok(stranded)
 }
 
 // ---------------------------------------------------------------------------
@@ -34260,7 +34428,7 @@ pub struct Worker {
     /// this value. `sync_drain_deadline` rejects any observed deadline that is
     /// not strictly greater than this maximum. So a lagging shard cannot revert
     /// the cell to a stale shorter value.
-    drain_deadline_max: Arc<Mutex<Option<chrono::DateTime<chrono::Utc>>>>,
+    drain_deadline_max: Arc<Mutex<Option<jiff::Timestamp>>>,
     /// Per-worker in-process LRU cache for suspended workflow event histories.
     ///
     /// Populated after each suspension; consulted at the start of each workflow
@@ -34529,12 +34697,140 @@ fn spawn_pause_auto_resumer(
     })
 }
 
+/// One shard that a gauge sampler reads.
+#[derive(Clone)]
+struct GaugeShard {
+    /// The shard of the lease row and of the shared sample.
+    shard: crate::types::ShardId,
+    /// The shard of the DR write fence. `None` names the worker database.
+    fence: Option<crate::types::ShardId>,
+    /// The pool of this shard.
+    pool: DbPool,
+}
+
+/// The per-shard read of the queue-depth sampler.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct QueueDepthRead {
+    /// Bounded pending depth per queue.
+    depths: Vec<(String, i64)>,
+    /// Oldest claimable pending age per queue, in seconds.
+    ages: Vec<(String, f64)>,
+}
+
+/// The fields of one concurrency group that the concurrency sampler uses.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ConcurrencyRead {
+    key: String,
+    task_type: String,
+    max_concurrent: i32,
+    in_flight: i64,
+    pending: i64,
+}
+
+impl From<queue::ConcurrencyKeyStats> for ConcurrencyRead {
+    fn from(stat: queue::ConcurrencyKeyStats) -> Self {
+        Self {
+            key: stat.key,
+            task_type: stat.task_type,
+            max_concurrent: stat.max_concurrent,
+            in_flight: stat.in_flight,
+            pending: stat.pending,
+        }
+    }
+}
+
+/// One rate-limit bucket that the rate-limit sampler uses.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RateLimitRead {
+    key: String,
+    refill_rate: f64,
+    estimated_tokens: f64,
+}
+
+impl From<queue::RateLimitBucketSample> for RateLimitRead {
+    fn from(bucket: queue::RateLimitBucketSample) -> Self {
+        Self {
+            key: bucket.key,
+            refill_rate: bucket.refill_rate,
+            estimated_tokens: bucket.estimated_tokens,
+        }
+    }
+}
+
+/// `items`, sorted and without duplicates, for a lease key.
+///
+/// A set of queues or activities has no order. One set must give one key.
+fn sorted_set(items: &[String]) -> Vec<&str> {
+    let mut sorted: Vec<&str> = items.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    sorted
+}
+
+/// One election slot per shard for `sampler`, keyed by its `inputs`.
+fn gauge_slots(
+    election: &crate::gauge_election::GaugeElection,
+    sampler: crate::gauge_election::GaugeSampler,
+    inputs: &serde_json::Value,
+    shards: &[GaugeShard],
+) -> Vec<crate::gauge_election::GaugeSlot> {
+    let key = crate::gauge_election::gauge_lease_key(sampler, inputs);
+    shards
+        .iter()
+        .map(|shard| {
+            crate::gauge_election::GaugeSlot::new(
+                election,
+                sampler,
+                key.clone(),
+                shard.shard,
+                shard.fence,
+            )
+        })
+        .collect()
+}
+
+/// Expire each lease that a stopping sampler led.
+///
+/// A standby then leads on its next tick, not after the TTL. Best effort,
+/// and bounded like the timeout checker release. A failure leaves the lease
+/// to expire. The shards release together, each within its own bound. So a
+/// slow shard cannot use up the time of the others.
+async fn release_gauge_slots(
+    slots: &mut [crate::gauge_election::GaugeSlot],
+    shards: &[GaugeShard],
+) {
+    let releases = slots
+        .iter_mut()
+        .zip(shards)
+        .filter(|(slot, _)| slot.has_led())
+        .map(|(slot, shard)| async move {
+            let release = async {
+                let mut conn = shard.pool.get().await.map_err(|e| e.to_string())?;
+                slot.release(&mut conn).await.map_err(|e| e.to_string())
+            };
+            let outcome =
+                tokio::time::timeout(crate::scanner_lease::LEASE_RELEASE_BOUND, release).await;
+            let error = match outcome {
+                Ok(Ok(())) => return,
+                Ok(Err(error)) => error,
+                Err(_elapsed) => "timed out".to_string(),
+            };
+            tracing::debug!(
+                sampler = slot.sampler().as_str(),
+                shard = slot.shard().as_i32(),
+                error = %error,
+                "gauge sampler lease release failed"
+            );
+        });
+    futures::future::join_all(releases).await;
+}
+
 /// What the database gauge samplers read (issue #2668).
 struct GaugeSamplerInputs {
     /// One pool for each shard. The fleet-wide gauges sum over them.
-    pools: Vec<DbPool>,
-    /// The DLQ shard label and pool of each DLQ sampler.
-    dlq_pools: Vec<(u16, DbPool)>,
+    pools: Vec<GaugeShard>,
+    /// The shard and pool of each DLQ sampler.
+    dlq_pools: Vec<GaugeShard>,
     /// The pools of the stranded-work sampler. `None` without a sharded pool.
     stranded: Option<crate::shard::ShardedDbPool>,
     /// The queues that this worker polls.
@@ -34547,6 +34843,8 @@ struct GaugeSamplerInputs {
     soft_threshold: u64,
     /// How recent a heartbeat must be for a worker to cover a shard.
     stranded_freshness: Duration,
+    /// How workers share the reads. One elected worker reads each shard.
+    election: crate::gauge_election::GaugeElection,
 }
 
 /// The tasks that [`spawn_gauge_samplers`] starts.
@@ -34594,6 +34892,10 @@ impl GaugeSamplerHandles {
 /// The stranded-work sampler starts only with a sharded pool and a metrics
 /// recorder. Each other sampler returns at once when no recorder is set. The
 /// concurrency sampler also stays on for a DEBUG subscriber.
+///
+/// With election on, one worker reads each shard for each sampler. The
+/// others use its read. Every worker still emits each gauge. See
+/// [`crate::gauge_election`].
 fn spawn_gauge_samplers(
     config: &WorkerRuntimeConfig,
     inputs: GaugeSamplerInputs,
@@ -34610,6 +34912,7 @@ fn spawn_gauge_samplers(
         activity_requirements,
         soft_threshold,
         stranded_freshness,
+        election,
     } = inputs;
     let stranded_work = stranded
         .filter(|_| telemetry.metrics.is_enabled())
@@ -34622,6 +34925,7 @@ fn spawn_gauge_samplers(
                 interval,
                 circuit_breaker_activities.clone(),
                 activity_requirements,
+                election.clone(),
             )
         });
     GaugeSamplerHandles {
@@ -34632,6 +34936,7 @@ fn spawn_gauge_samplers(
             queues.clone(),
             interval,
             circuit_breaker_activities,
+            election.clone(),
         ),
         concurrency: spawn_concurrency_sampler(
             pools.clone(),
@@ -34639,17 +34944,25 @@ fn spawn_gauge_samplers(
             telemetry.clone(),
             queues,
             interval,
+            election.clone(),
         ),
         rate_limit: spawn_rate_limit_sampler(
             pools.clone(),
             cancel.clone(),
             telemetry.clone(),
             interval,
+            election.clone(),
         ),
         dlq_depth: dlq_pools
             .into_iter()
-            .map(|(shard_id, pool)| {
-                spawn_dlq_depth_sampler(pool, cancel.clone(), telemetry.clone(), shard_id, interval)
+            .map(|shard| {
+                spawn_dlq_depth_sampler(
+                    shard,
+                    cancel.clone(),
+                    telemetry.clone(),
+                    interval,
+                    election.clone(),
+                )
             })
             .collect(),
         queue_pause: spawn_queue_pause_sampler(
@@ -34657,6 +34970,7 @@ fn spawn_gauge_samplers(
             cancel.clone(),
             telemetry.clone(),
             interval,
+            election.clone(),
         ),
         history_oversized: spawn_history_oversized_sampler(
             pools.clone(),
@@ -34664,12 +34978,14 @@ fn spawn_gauge_samplers(
             telemetry.clone(),
             soft_threshold,
             interval,
+            election.clone(),
         ),
         workflow_active: spawn_workflow_active_sampler(
             pools,
             cancel.clone(),
             telemetry.clone(),
             interval,
+            election,
         ),
         stranded_work,
     }
@@ -34684,11 +35000,12 @@ fn spawn_gauge_samplers(
 /// operator uses the hard ceiling or a manual continue-as-new.
 fn spawn_history_oversized_sampler(
     // One pool per shard to aggregate over (see `spawn_queue_depth_sampler`).
-    pools: Vec<DbPool>,
+    pools: Vec<GaugeShard>,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     soft_threshold: u64,
     interval: Duration,
+    election: crate::gauge_election::GaugeElection,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // No recorder configured: never issue the sampler SQL (issue #1428,
@@ -34696,6 +35013,12 @@ fn spawn_history_oversized_sampler(
         if !telemetry.metrics.is_enabled() {
             return;
         }
+        let mut slots = gauge_slots(
+            &election,
+            crate::gauge_election::GaugeSampler::HistoryOversized,
+            &serde_json::json!({ "soft_threshold": soft_threshold }),
+            &pools,
+        );
         let mut reported_workflows = std::collections::HashSet::new();
         loop {
             tokio::select! {
@@ -34712,7 +35035,7 @@ fn spawn_history_oversized_sampler(
             // (or the zero-fill below) must not clear the gauge during an outage
             // (#522).
             let mut read_failed = false;
-            for pool in &pools {
+            for (shard, slot) in pools.iter().zip(slots.iter_mut()) {
                 // Selected against `cancel` (issue #1426), mirroring
                 // `spawn_schedule_overdue_sampler`. A cancelled acquisition
                 // abandons the rest of this tick's shards, same as any
@@ -34720,7 +35043,7 @@ fn spawn_history_oversized_sampler(
                 // loop.
                 let get_result = tokio::select! {
                     () = cancel.cancelled() => None,
-                    result = pool.get() => Some(result),
+                    result = shard.pool.get() => Some(result),
                 };
                 let Some(get_result) = get_result else {
                     read_failed = true;
@@ -34738,8 +35061,13 @@ fn spawn_history_oversized_sampler(
                     }
                 };
 
-                match sample_history_oversized_counts(&mut conn, soft_threshold).await {
-                    Ok(counts) => {
+                let sampled = slot
+                    .sample(&mut conn, &*telemetry.metrics, async |conn| {
+                        sample_history_oversized_counts(conn, soft_threshold).await
+                    })
+                    .await;
+                match sampled {
+                    Ok((counts, _role)) => {
                         for (workflow_name, count) in counts {
                             *count_by_workflow.entry(workflow_name).or_insert(0) += count;
                         }
@@ -34778,6 +35106,7 @@ fn spawn_history_oversized_sampler(
                 break;
             }
         }
+        release_gauge_slots(&mut slots, &pools).await;
     })
 }
 
@@ -34829,7 +35158,9 @@ async fn sample_history_oversized_counts(
 ///
 /// Bounded by construction so the `state` metric label can only ever be one
 /// of two values — the cardinality-safety guarantee is the enum itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum ActiveWorkflowState {
     /// A `RUNNING` execution (issue #603 nd-blocked runs stay `RUNNING`).
     Running,
@@ -34979,16 +35310,23 @@ pub(crate) fn merge_active_shard_counts(
 /// `spawn_queue_depth_sampler`).
 fn spawn_workflow_active_sampler(
     // One pool per shard to aggregate over (see `spawn_queue_depth_sampler`).
-    pools: Vec<DbPool>,
+    pools: Vec<GaugeShard>,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     interval: Duration,
+    election: crate::gauge_election::GaugeElection,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // No recorder configured: never issue the sampler SQL.
         if !telemetry.metrics.is_enabled() {
             return;
         }
+        let mut slots = gauge_slots(
+            &election,
+            crate::gauge_election::GaugeSampler::WorkflowActive,
+            &serde_json::Value::Null,
+            &pools,
+        );
         let mut reported: std::collections::HashSet<(String, ActiveWorkflowState)> =
             std::collections::HashSet::new();
         loop {
@@ -35001,7 +35339,7 @@ fn spawn_workflow_active_sampler(
             // shard's per-(workflow, state) counts for a fleet-wide gauge.
             let mut per_shard: Vec<Vec<(String, ActiveWorkflowState, u64)>> = Vec::new();
             let mut read_failed = false;
-            for pool in &pools {
+            for (shard, slot) in pools.iter().zip(slots.iter_mut()) {
                 // Selected against `cancel` (issue #1426), mirroring
                 // `spawn_schedule_overdue_sampler`. A cancelled acquisition
                 // abandons the rest of this tick's shards, same as any
@@ -35009,7 +35347,7 @@ fn spawn_workflow_active_sampler(
                 // loop.
                 let get_result = tokio::select! {
                     () = cancel.cancelled() => None,
-                    result = pool.get() => Some(result),
+                    result = shard.pool.get() => Some(result),
                 };
                 let Some(get_result) = get_result else {
                     read_failed = true;
@@ -35027,8 +35365,13 @@ fn spawn_workflow_active_sampler(
                     }
                 };
 
-                match sample_active_workflow_counts(&mut conn).await {
-                    Ok(rows) => per_shard.push(rows),
+                let sampled = slot
+                    .sample(&mut conn, &*telemetry.metrics, async |conn| {
+                        sample_active_workflow_counts(conn).await
+                    })
+                    .await;
+                match sampled {
+                    Ok((rows, _role)) => per_shard.push(rows),
                     Err(error) => {
                         tracing::debug!(error = %error, "active workflow sample failed");
                         read_failed = true;
@@ -35059,6 +35402,7 @@ fn spawn_workflow_active_sampler(
                 break;
             }
         }
+        release_gauge_slots(&mut slots, &pools).await;
     })
 }
 
@@ -35636,7 +35980,7 @@ impl Drop for DispatchReservation {
 /// `attempt` alone does not identify a claim. A release of an unstarted
 /// claim restores it, so a later claim can reuse it. Each claim writes a new
 /// `started_at` (issue #1813).
-type ClaimKey = (uuid::Uuid, i32, chrono::DateTime<chrono::Utc>);
+type ClaimKey = (uuid::Uuid, i32, jiff::Timestamp);
 
 /// The claims of this worker instance (issue #1813).
 #[derive(Debug, Default)]
@@ -36217,7 +36561,7 @@ enum DeciderEvent {
 
 /// The claim-order key of a ready execution (issue #2308): the higher
 /// effective priority first, then the earlier claim-order due time.
-type ReadyKey = (std::cmp::Reverse<i32>, chrono::DateTime<chrono::Utc>);
+type ReadyKey = (std::cmp::Reverse<i32>, jiff::Timestamp);
 
 /// The local state of one owner decider (issue #2255).
 ///
@@ -36405,7 +36749,7 @@ impl DeciderState {
     /// Queue `exec` with the key of a row that is due now at normal
     /// priority.
     fn insert_unranked(&mut self, exec: uuid::Uuid) {
-        self.insert(exec, (std::cmp::Reverse(0), chrono::Utc::now()));
+        self.insert(exec, (std::cmp::Reverse(0), jiff::Timestamp::now()));
     }
 
     /// Queue every unkeyed hint unranked. Free permits cover all of them, so
@@ -36831,7 +37175,7 @@ enum ReferenceOutcome {
 fn reference_outcome(
     probe: Option<&crate::queue::DispatchProbe>,
     redeliveries: u32,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
     settings: &crate::dispatch::DispatchSettings,
     saturated_delay: Option<Duration>,
 ) -> ReferenceOutcome {
@@ -36860,8 +37204,7 @@ fn reference_outcome(
     if probe.scheduled_at > now {
         // Not yet due. Hold the reference until the due time, so the channel
         // parks it instead of cycling it once per poll.
-        let until = (probe.scheduled_at - now)
-            .to_std()
+        let until = std::time::Duration::try_from(probe.scheduled_at - now)
             .unwrap_or(settings.release_backoff_cap);
         return ReferenceOutcome::Release(until.min(settings.release_backoff_cap));
     }
@@ -39276,33 +39619,47 @@ impl Worker {
         // backlog and throttling on non-default shards too. Otherwise use the
         // single default pool (legacy behavior). All workers aggregate the
         // same full set, so the gauges stay consistent across the fleet.
-        #[cfg(feature = "db")]
-        let sampler_pools: Vec<DbPool> = self.config.sharded_pool.as_ref().map_or_else(
-            || vec![pool.clone()],
-            |sp| sp.iter_shards().map(|(_, p)| p.clone()).collect(),
+        //
+        // Without a sharded pool, the one database keys its lease and its
+        // shared sample as shard 0, and its DR fence as the worker database.
+        let single = |shard: crate::types::ShardId| GaugeShard {
+            shard,
+            fence: None,
+            pool: pool.clone(),
+        };
+        let sampler_pools: Vec<GaugeShard> = self.config.sharded_pool.as_ref().map_or_else(
+            || vec![single(crate::types::ShardId::new(0))],
+            |sp| {
+                sp.iter_shards()
+                    .map(|(shard, p)| GaugeShard {
+                        shard,
+                        fence: Some(shard),
+                        pool: p.clone(),
+                    })
+                    .collect()
+            },
         );
-        #[cfg(not(feature = "db"))]
-        let sampler_pools: Vec<DbPool> = vec![pool.clone()];
 
         // DLQ depth gauge: one sampler per shard assignment, so each shard that
         // this worker owns is reported. With no assignment, one sampler reads
         // shard 0. A sharded pool gives each sampler its shard pool (fix #5).
-        let mut dlq_pools: Vec<(u16, DbPool)> = self
+        let mut dlq_pools: Vec<GaugeShard> = self
             .config
             .shard_assignments
             .iter()
             .map(|shard| {
-                let shard_id = u16::try_from(shard.as_i32()).unwrap_or(0);
-                let shard_pool = self
-                    .config
-                    .sharded_pool
-                    .as_ref()
-                    .map_or_else(|| pool.clone(), |sp| sp.pool_for(*shard).clone());
-                (shard_id, shard_pool)
+                self.config.sharded_pool.as_ref().map_or_else(
+                    || single(*shard),
+                    |sp| GaugeShard {
+                        shard: *shard,
+                        fence: Some(*shard),
+                        pool: sp.pool_for(*shard).clone(),
+                    },
+                )
             })
             .collect();
         if dlq_pools.is_empty() {
-            dlq_pools.push((0, pool.clone()));
+            dlq_pools.push(single(crate::types::ShardId::new(0)));
         }
         // Every sampler that reads the database for a gauge runs on
         // `gauge_sample_interval` (issue #2668).
@@ -39323,6 +39680,11 @@ impl Worker {
                 // The heartbeat sets the freshness window, so the liveness
                 // check agrees with the heartbeat.
                 stranded_freshness: self.config.worker_heartbeat_interval.saturating_mul(2),
+                election: crate::gauge_election::GaugeElection::new(
+                    &self.config.scanner,
+                    self.config.worker_id.clone(),
+                    self.config.gauge_sample_interval,
+                ),
             },
             &self.shutdown,
             self.registry.telemetry(),
@@ -39833,7 +40195,7 @@ impl Worker {
         // grace window.
         #[cfg(feature = "db")]
         let schedule_overdue_sampler = Some(spawn_schedule_overdue_sampler(
-            sampler_pools,
+            sampler_pools.into_iter().map(|shard| shard.pool).collect(),
             self.shutdown.clone(),
             self.registry.telemetry().clone(),
             self.config.poll_interval,
@@ -40637,7 +40999,7 @@ impl Worker {
                 let outcome = reference_outcome(
                     probe.as_ref(),
                     lease.redeliveries,
-                    chrono::Utc::now(),
+                    jiff::Timestamp::now(),
                     &installed.settings,
                     saturated_delay,
                 );
@@ -43243,9 +43605,9 @@ impl Worker {
                 // It uses the same `now` that arms the timeout below. It is
                 // threaded down, so an inline local activity's reported
                 // deadline never outlives the cycle.
-                let workflow_task_deadline = chrono::Duration::from_std(workflow_task_timeout)
+                let workflow_task_deadline = jiff::SignedDuration::try_from(workflow_task_timeout)
                     .ok()
-                    .and_then(|budget| chrono::Utc::now().checked_add_signed(budget));
+                    .and_then(|budget| jiff::Timestamp::now().checked_add(budget).ok());
                 // Issue #804: the budget goes to `process_task`, which scopes
                 // it to the decision cycle. It is not wrapped around the call.
                 // A wrap here also bounded the capability-miss
@@ -44634,7 +44996,7 @@ async fn quarantine_workflow_task_timeout_outcome(
                         .set((
                             task_dsl::state.eq("FAILED"),
                             task_dsl::error.eq(Some(error_msg.clone())),
-                            task_dsl::completed_at.eq(Some(chrono::Utc::now())),
+                            task_dsl::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
                         ))
                         .execute(conn)
                         .await
@@ -44669,7 +45031,7 @@ async fn quarantine_workflow_task_timeout_outcome(
                             exec_dsl::state.eq("FAILED"),
                             exec_dsl::output.eq(None::<serde_json::Value>),
                             exec_dsl::error.eq(Some(error_msg.clone())),
-                            exec_dsl::completed_at.eq(Some(chrono::Utc::now())),
+                            exec_dsl::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
                         ))
                         .execute(conn)
                         .await;
@@ -44963,15 +45325,19 @@ async fn claim_failed_its_task(
     claim_attempt: i32,
 ) -> bool {
     use crate::schema::harvest_task_queue::dsl;
+    use diesel::BoolExpressionMethods as _;
     let Ok(mut conn) = crate::pool::acquire_within_pool_bound(pool).await else {
         return false;
     };
     dsl::harvest_task_queue
         .find(task_id)
-        .filter(dsl::state.eq("FAILED"))
-        .filter(dsl::worker_id.eq(worker_id))
-        .filter(dsl::crash_strikes.eq(claim_crash_strikes))
-        .filter(dsl::attempt.eq(claim_attempt))
+        .filter(crate::row_guard::row_guard(
+            dsl::state
+                .eq("FAILED")
+                .and(dsl::worker_id.eq(worker_id))
+                .and(dsl::crash_strikes.eq(claim_crash_strikes))
+                .and(dsl::attempt.eq(claim_attempt)),
+        ))
         .select(dsl::id)
         .first::<uuid::Uuid>(&mut conn)
         .await
@@ -45001,6 +45367,7 @@ pub async fn reset_timed_out_workflow_task(
     claim_attempt: i32,
 ) -> ClaimRecovery {
     use crate::schema::harvest_task_queue::dsl;
+    use diesel::BoolExpressionMethods as _;
 
     // Retry both the pool acquire and the release write. Without the retry, a
     // short pool saturation leaves the task stuck in RUNNING on a live worker.
@@ -45029,8 +45396,6 @@ pub async fn reset_timed_out_workflow_task(
         let written = diesel::update(
             dsl::harvest_task_queue
                 .find(task_id)
-                .filter(dsl::state.eq("RUNNING"))
-                .filter(dsl::worker_id.eq(worker_id))
                 // Claim-epoch guard (issue #1459). It is the same race
                 // `queue::release_task_for_capability_miss` already guards.
                 // `poison_pill::requeue_orphan` hands an orphan back as `PENDING`
@@ -45046,18 +45411,23 @@ pub async fn reset_timed_out_workflow_task(
                 // being stuck is not a crash. Its re-claim would then still match
                 // on `crash_strikes` alone. This reset must also check `attempt`,
                 // which `claim_task` bumps on every claim without exception.
-                .filter(dsl::crash_strikes.eq(claim_crash_strikes))
-                .filter(dsl::attempt.eq(claim_attempt)),
+                .filter(crate::row_guard::row_guard(
+                    dsl::state
+                        .eq("RUNNING")
+                        .and(dsl::worker_id.eq(worker_id))
+                        .and(dsl::crash_strikes.eq(claim_crash_strikes))
+                        .and(dsl::attempt.eq(claim_attempt)),
+                )),
         )
         .set((
             dsl::state.eq("PENDING"),
             dsl::worker_id.eq(None::<String>),
-            dsl::started_at.eq(None::<chrono::DateTime<chrono::Utc>>),
-            dsl::last_heartbeat_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+            dsl::started_at.eq(None::<crate::time::sql::SqlTimestamp>),
+            dsl::last_heartbeat_at.eq(None::<crate::time::sql::SqlTimestamp>),
             // Clear sticky affinity so any worker can reclaim the task immediately
             // rather than waiting for the expired lease of the hung worker.
             dsl::sticky_worker_id.eq(None::<String>),
-            dsl::sticky_until.eq(None::<chrono::DateTime<chrono::Utc>>),
+            dsl::sticky_until.eq(None::<crate::time::sql::SqlTimestamp>),
             // `capability_misses` is deliberately NOT reset here (issue #804).
             //
             // It is tempting to: a workflow-task timeout usually means the handler
@@ -45856,8 +46226,8 @@ mod tests {
 
     fn scheduled(
         activity_id: ActivityExecId,
-        at: chrono::DateTime<chrono::Utc>,
-    ) -> (chrono::DateTime<chrono::Utc>, WorkflowEvent) {
+        at: jiff::Timestamp,
+    ) -> (jiff::Timestamp, WorkflowEvent) {
         (
             at,
             WorkflowEvent::ActivityScheduled {
@@ -45871,8 +46241,8 @@ mod tests {
 
     fn completed(
         activity_id: ActivityExecId,
-        at: chrono::DateTime<chrono::Utc>,
-    ) -> (chrono::DateTime<chrono::Utc>, WorkflowEvent) {
+        at: jiff::Timestamp,
+    ) -> (jiff::Timestamp, WorkflowEvent) {
         (
             at,
             WorkflowEvent::ActivityCompleted {
@@ -45884,7 +46254,7 @@ mod tests {
 
     #[test]
     fn any_activity_wait_already_resolved_is_false_on_an_empty_wait_set() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let open = ActivityExecId::new();
         let history: Vec<WorkflowEvent> = vec![scheduled(open, now).1];
         assert!(!any_activity_wait_already_resolved(&history, &[]));
@@ -45892,7 +46262,7 @@ mod tests {
 
     #[test]
     fn any_activity_wait_already_resolved_is_false_when_none_have_terminated() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let open_a = ActivityExecId::new();
         let open_b = ActivityExecId::new();
         let history: Vec<WorkflowEvent> = vec![scheduled(open_a, now).1, scheduled(open_b, now).1];
@@ -45904,7 +46274,7 @@ mod tests {
 
     #[test]
     fn any_activity_wait_already_resolved_is_true_when_one_of_several_has_completed() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let open = ActivityExecId::new();
         let resolved = ActivityExecId::new();
         let unrelated = ActivityExecId::new();
@@ -46446,7 +46816,7 @@ mod tests {
         // registration default — the override wins.
         assert_eq!(
             wasm_effective_deadline(
-                Some(chrono::Duration::seconds(300)),
+                Some(jiff::SignedDuration::from_secs(300)),
                 Some(Duration::from_secs(30)),
             ),
             Some(Duration::from_secs(300)),
@@ -46454,7 +46824,7 @@ mod tests {
         // A shorter override also wins over a longer default.
         assert_eq!(
             wasm_effective_deadline(
-                Some(chrono::Duration::seconds(5)),
+                Some(jiff::SignedDuration::from_secs(5)),
                 Some(Duration::from_secs(30)),
             ),
             Some(Duration::from_secs(5)),
@@ -46712,6 +47082,15 @@ mod tests {
         }
     }
 
+    /// Shard 0 on `pool`, as a worker without a sharded pool reads it.
+    fn test_gauge_shard(pool: &DbPool) -> GaugeShard {
+        GaugeShard {
+            shard: crate::types::ShardId::new(0),
+            fence: None,
+            pool: pool.clone(),
+        }
+    }
+
     /// Spawns the four samplers issue #1428 named, against the same `pool`,
     /// `cancel`, `telemetry`, and `interval`. The extra per-sampler
     /// arguments (queue names, shard id, soft threshold) are representative
@@ -46722,27 +47101,37 @@ mod tests {
         telemetry: &Arc<crate::telemetry::TelemetryConfig>,
         interval: Duration,
     ) -> Vec<tokio::task::JoinHandle<()>> {
+        let election = crate::gauge_election::GaugeElection::unelected();
         vec![
             spawn_concurrency_sampler(
-                vec![pool.clone()],
+                vec![test_gauge_shard(pool)],
                 cancel.clone(),
                 telemetry.clone(),
                 vec!["default".to_string()],
                 interval,
+                election.clone(),
             ),
             spawn_rate_limit_sampler(
-                vec![pool.clone()],
+                vec![test_gauge_shard(pool)],
                 cancel.clone(),
                 telemetry.clone(),
                 interval,
+                election.clone(),
             ),
-            spawn_dlq_depth_sampler(pool.clone(), cancel.clone(), telemetry.clone(), 0, interval),
+            spawn_dlq_depth_sampler(
+                test_gauge_shard(pool),
+                cancel.clone(),
+                telemetry.clone(),
+                interval,
+                election.clone(),
+            ),
             spawn_history_oversized_sampler(
-                vec![pool.clone()],
+                vec![test_gauge_shard(pool)],
                 cancel.clone(),
                 telemetry.clone(),
                 100,
                 interval,
+                election,
             ),
         ]
     }
@@ -46858,11 +47247,12 @@ mod tests {
         let listener = accept_counting_pool().await;
         let cancel = CancellationToken::new();
         let handle = spawn_concurrency_sampler(
-            vec![listener.pool.clone()],
+            vec![test_gauge_shard(&listener.pool)],
             cancel.clone(),
             telemetry,
             vec!["default".to_string()],
             interval,
+            crate::gauge_election::GaugeElection::unelected(),
         );
 
         // The accept is real loopback I/O, not paused time. A slow runner can
@@ -46917,14 +47307,21 @@ mod tests {
     /// Every gauge sampler input points at the one counting pool.
     fn counting_gauge_inputs(pool: &DbPool) -> GaugeSamplerInputs {
         GaugeSamplerInputs {
-            pools: vec![pool.clone()],
-            dlq_pools: vec![(0, pool.clone())],
+            pools: vec![test_gauge_shard(pool)],
+            dlq_pools: vec![test_gauge_shard(pool)],
             stranded: Some(crate::shard::ShardedDbPool::single(pool.clone())),
             queues: vec!["default".to_string()],
             circuit_breaker_activities: Vec::new(),
             activity_requirements: std::collections::HashMap::new(),
             soft_threshold: 100,
             stranded_freshness: Duration::from_secs(10),
+            // Election on, as in a default worker. The counting pool never
+            // connects, so these tests prove the cadence, not the election.
+            election: crate::gauge_election::GaugeElection::new(
+                &crate::scanner_lease::ScannerConfig::default(),
+                "counting-worker",
+                Duration::from_secs(3),
+            ),
         }
     }
 
@@ -47722,13 +48119,13 @@ mod tests {
     /// direction: a deadline-aware activity skips its checkpoint and loses work.
     #[test]
     fn local_attempt_deadline_clamps_to_the_enclosing_workflow_task_budget() {
-        let cycle_start = chrono::Utc::now();
-        let enclosing = cycle_start + chrono::Duration::seconds(60);
+        let cycle_start = jiff::Timestamp::now();
+        let enclosing = cycle_start + jiff::SignedDuration::from_secs(60);
 
         // The stock-defaults case: both budgets are 60s, but the attempt starts
         // 30s into the cycle (a previous local attempt burned it). Unclamped it
         // would claim 30s past the kill.
-        let now = cycle_start + chrono::Duration::seconds(30);
+        let now = cycle_start + jiff::SignedDuration::from_secs(30);
         assert_eq!(
             local_attempt_deadline(now, Duration::from_secs(60), Some(enclosing)),
             Some(enclosing),
@@ -47736,7 +48133,7 @@ mod tests {
         );
 
         // Even a first attempt drifts: the cycle always starts before us.
-        let now = cycle_start + chrono::Duration::milliseconds(250);
+        let now = cycle_start + jiff::SignedDuration::from_millis(250);
         assert_eq!(
             local_attempt_deadline(now, Duration::from_secs(60), Some(enclosing)),
             Some(enclosing),
@@ -47748,14 +48145,14 @@ mod tests {
         let now = cycle_start;
         assert_eq!(
             local_attempt_deadline(now, Duration::from_secs(5), Some(enclosing)),
-            Some(now + chrono::Duration::seconds(5)),
+            Some(now + jiff::SignedDuration::from_secs(5)),
             "a short start_to_close is the earlier clock and must be reported"
         );
 
         // Workflow-task timeout disabled: the per-attempt budget is the only clock.
         assert_eq!(
             local_attempt_deadline(now, Duration::from_secs(5), None),
-            Some(now + chrono::Duration::seconds(5))
+            Some(now + jiff::SignedDuration::from_secs(5))
         );
 
         // An unrepresentable per-attempt budget falls back to the enclosing
@@ -47953,8 +48350,8 @@ mod tests {
     /// order. `workflow_sim_ingest_tests` checks the rule on the real ingest.
     #[test]
     fn sim_wake_order_matches_merge_wake_events() {
-        let base = chrono::Utc::now();
-        let at = |secs: u64| base + chrono::Duration::seconds(i64::try_from(secs).unwrap());
+        let base = jiff::Timestamp::now();
+        let at = |secs: u64| base + jiff::SignedDuration::from_secs(i64::try_from(secs).unwrap());
         for seed in 0..2_000 {
             let mut rng = crate::dst::SplitMix64::new(seed);
             let clock = rng.below(8);
@@ -47974,7 +48371,7 @@ mod tests {
                 .map(|(i, &secs)| (format!("s{i}"), serde_json::json!(i), secs))
                 .collect();
 
-            let mut due: Vec<(TimerId, chrono::DateTime<chrono::Utc>)> = timers
+            let mut due: Vec<(TimerId, jiff::Timestamp)> = timers
                 .iter()
                 .filter(|(_, deadline)| *deadline <= clock)
                 .map(|(id, deadline)| (id.clone(), at(*deadline)))
@@ -47999,8 +48396,8 @@ mod tests {
 
     #[test]
     fn merge_wake_events_signal_before_deadline_is_recorded_first() {
-        let fires_at = chrono::Utc::now();
-        let received_at = fires_at - chrono::Duration::seconds(30);
+        let fires_at = jiff::Timestamp::now();
+        let received_at = fires_at - jiff::SignedDuration::from_secs(30);
         let events = merge_wake_events(
             vec![(TimerId::new("__signal_timeout:1:approval"), fires_at)],
             vec![(
@@ -48020,8 +48417,8 @@ mod tests {
 
     #[test]
     fn merge_wake_events_signal_after_deadline_is_recorded_after_timer() {
-        let fires_at = chrono::Utc::now();
-        let received_at = fires_at + chrono::Duration::seconds(30);
+        let fires_at = jiff::Timestamp::now();
+        let received_at = fires_at + jiff::SignedDuration::from_secs(30);
         let events = merge_wake_events(
             vec![(TimerId::new("__signal_timeout:1:approval"), fires_at)],
             vec![(
@@ -48039,7 +48436,7 @@ mod tests {
     #[test]
     fn merge_wake_events_tie_goes_to_the_timer() {
         // A signal received exactly at the deadline did not beat it.
-        let fires_at = chrono::Utc::now();
+        let fires_at = jiff::Timestamp::now();
         let events = merge_wake_events(
             vec![(TimerId::new("t"), fires_at)],
             vec![("approval".to_string(), Value::Null, fires_at)],
@@ -48051,22 +48448,25 @@ mod tests {
 
     #[test]
     fn merge_wake_events_preserves_relative_order_within_each_kind() {
-        let base = chrono::Utc::now();
+        let base = jiff::Timestamp::now();
         let events = merge_wake_events(
             vec![
                 (TimerId::new("t1"), base),
-                (TimerId::new("t2"), base + chrono::Duration::seconds(10)),
+                (
+                    TimerId::new("t2"),
+                    base + jiff::SignedDuration::from_secs(10),
+                ),
             ],
             vec![
                 (
                     "s1".to_string(),
                     Value::Null,
-                    base - chrono::Duration::seconds(5),
+                    base - jiff::SignedDuration::from_secs(5),
                 ),
                 (
                     "s2".to_string(),
                     Value::Null,
-                    base + chrono::Duration::seconds(5),
+                    base + jiff::SignedDuration::from_secs(5),
                 ),
             ],
         );
@@ -48084,7 +48484,7 @@ mod tests {
 
     #[test]
     fn merge_wake_events_handles_single_kind_batches() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let only_timers = merge_wake_events(vec![(TimerId::new("t1"), now)], vec![]);
         assert_eq!(only_timers.len(), 1);
         assert!(matches!(&only_timers[0], WorkflowEvent::TimerFired { .. }));
@@ -49964,7 +50364,7 @@ mod tests {
         let claims = LiveClaims::default();
         let shutdown = CancellationToken::new();
         let task = uuid::Uuid::new_v4();
-        let at = chrono::Utc::now();
+        let at = jiff::Timestamp::now();
         drop(LiveClaim::new(&claims, Some((task, 1, at)), &shutdown));
         let held = LiveClaim::new(&claims, Some((task, 2, at)), &shutdown);
         let snapshot = || {
@@ -50026,7 +50426,7 @@ mod tests {
     fn a_settled_claim_never_joins_the_ended_set() {
         let claims = LiveClaims::default();
         let shutdown = CancellationToken::new();
-        let key = (uuid::Uuid::new_v4(), 1, chrono::Utc::now());
+        let key = (uuid::Uuid::new_v4(), 1, jiff::Timestamp::now());
         let held = LiveClaim::new(&claims, Some(key), &shutdown);
         shutdown.cancel();
         settle_claim(&claims, Some(key));
@@ -52237,15 +52637,15 @@ mod tests {
     }
 
     #[test]
-    fn havoc_chrono_duration_panic() {
+    fn havoc_duration_out_of_bounds() {
         let max_safe_secs = i64::MAX as u64;
-        let result = chrono_duration_from_secs(max_safe_secs, "timeout");
+        let result = signed_duration_from_secs(max_safe_secs, "timeout");
         assert!(result.is_err());
         assert!(
             result
                 .unwrap_err()
                 .to_string()
-                .contains("exceeds chrono::Duration bounds")
+                .contains("exceeds the duration bounds")
         );
     }
 
@@ -54353,7 +54753,7 @@ mod tests {
         assert_eq!(worker_stale_secs(Duration::from_millis(100)), 1);
         // Doubling happens before rounding: 1500ms -> 3s, not 2s.
         assert_eq!(worker_stale_secs(Duration::from_millis(1500)), 3);
-        // Absurd values clamp instead of overflowing downstream chrono math.
+        // Absurd values clamp instead of overflowing downstream duration math.
         assert_eq!(
             worker_stale_secs(Duration::from_secs(u64::MAX)),
             crate::poison_pill::MAX_WORKER_STALE_SECS
@@ -56238,21 +56638,31 @@ mod tests {
 
     #[test]
     fn deadline_would_be_exceeded_none_is_unbounded() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         assert!(!deadline_would_be_exceeded(
             None,
             now,
-            chrono::Duration::seconds(300)
+            jiff::SignedDuration::from_secs(300)
         ));
     }
 
     #[test]
     fn deadline_would_be_exceeded_true_when_retry_lands_past_deadline() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         assert!(deadline_would_be_exceeded(
-            Some(now + chrono::Duration::seconds(30)),
+            Some(now + jiff::SignedDuration::from_secs(30)),
             now,
-            chrono::Duration::seconds(300)
+            jiff::SignedDuration::from_secs(300)
+        ));
+    }
+
+    #[test]
+    fn deadline_would_be_exceeded_true_when_the_retry_overflows_the_range() {
+        let now = jiff::Timestamp::now();
+        assert!(deadline_would_be_exceeded(
+            Some(jiff::Timestamp::MAX),
+            now,
+            jiff::SignedDuration::from_secs(400_000_000_000)
         ));
     }
 
@@ -56262,10 +56672,10 @@ mod tests {
         // in flight shifts the row's deadline forward. The fresh (shifted) value
         // must clear the check, even though the stale claim-time snapshot would
         // not.
-        let now = chrono::Utc::now();
-        let stale_snapshot = Some(now - chrono::Duration::seconds(1));
-        let shifted_fresh = Some(now + chrono::Duration::hours(1));
-        let delay = chrono::Duration::seconds(300);
+        let now = jiff::Timestamp::now();
+        let stale_snapshot = Some(now - jiff::SignedDuration::from_secs(1));
+        let shifted_fresh = Some(now + jiff::SignedDuration::from_hours(1));
+        let delay = jiff::SignedDuration::from_secs(300);
         assert!(deadline_would_be_exceeded(stale_snapshot, now, delay));
         assert!(!deadline_would_be_exceeded(shifted_fresh, now, delay));
     }
@@ -56274,9 +56684,14 @@ mod tests {
 
     #[test]
     fn recheck_missing_task_row_is_handled() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         assert_eq!(
-            schedule_to_close_recheck_outcome("RUNNING", None, now, chrono::Duration::seconds(1)),
+            schedule_to_close_recheck_outcome(
+                "RUNNING",
+                None,
+                now,
+                jiff::SignedDuration::from_secs(1)
+            ),
             Some(ScheduleToCloseTimeoutOutcome::Handled)
         );
     }
@@ -56285,14 +56700,17 @@ mod tests {
     fn recheck_concurrently_resolved_task_is_handled_even_when_paused() {
         // A task another writer already resolved must never be requeued —
         // Handled wins over the PAUSED check.
-        let now = chrono::Utc::now();
-        let row = ("FAILED".to_string(), Some(now - chrono::Duration::hours(1)));
+        let now = jiff::Timestamp::now();
+        let row = (
+            "FAILED".to_string(),
+            Some(now - jiff::SignedDuration::from_hours(1)),
+        );
         assert_eq!(
             schedule_to_close_recheck_outcome(
                 "PAUSED",
                 Some(&row),
                 now,
-                chrono::Duration::seconds(300)
+                jiff::SignedDuration::from_secs(300)
             ),
             Some(ScheduleToCloseTimeoutOutcome::Handled)
         );
@@ -56305,17 +56723,17 @@ mod tests {
         // Both the snapshot and the row-current deadline are exceeded, so
         // only the locked PAUSED re-check can save the task from being
         // deadline-failed mid-pause.
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let row = (
             "RUNNING".to_string(),
-            Some(now - chrono::Duration::seconds(1)),
+            Some(now - jiff::SignedDuration::from_secs(1)),
         );
         assert_eq!(
             schedule_to_close_recheck_outcome(
                 "PAUSED",
                 Some(&row),
                 now,
-                chrono::Duration::seconds(300)
+                jiff::SignedDuration::from_secs(300)
             ),
             Some(ScheduleToCloseTimeoutOutcome::ExecutionPaused)
         );
@@ -56323,17 +56741,17 @@ mod tests {
 
     #[test]
     fn recheck_shifted_deadline_aborts_the_timeout() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let row = (
             "RUNNING".to_string(),
-            Some(now + chrono::Duration::hours(1)),
+            Some(now + jiff::SignedDuration::from_hours(1)),
         );
         assert_eq!(
             schedule_to_close_recheck_outcome(
                 "RUNNING",
                 Some(&row),
                 now,
-                chrono::Duration::seconds(300)
+                jiff::SignedDuration::from_secs(300)
             ),
             Some(ScheduleToCloseTimeoutOutcome::DeadlineShifted)
         );
@@ -56341,17 +56759,17 @@ mod tests {
 
     #[test]
     fn recheck_running_with_exceeded_deadline_proceeds_to_enforce() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let row = (
             "RUNNING".to_string(),
-            Some(now - chrono::Duration::seconds(1)),
+            Some(now - jiff::SignedDuration::from_secs(1)),
         );
         assert_eq!(
             schedule_to_close_recheck_outcome(
                 "RUNNING",
                 Some(&row),
                 now,
-                chrono::Duration::seconds(300)
+                jiff::SignedDuration::from_secs(300)
             ),
             None
         );
@@ -56364,7 +56782,7 @@ mod tests {
             update_id,
             name: name.to_string(),
             input: Value::Null,
-            timestamp: chrono::Utc::now(),
+            timestamp: jiff::Timestamp::now(),
         }
     }
 
@@ -56375,7 +56793,7 @@ mod tests {
     fn admit_ts_of(
         history: &[WorkflowEvent],
         id: crate::types::UpdateId,
-    ) -> Option<chrono::DateTime<chrono::Utc>> {
+    ) -> Option<jiff::Timestamp> {
         history.iter().find_map(|e| match e {
             WorkflowEvent::UpdateAdmitted {
                 update_id,
@@ -56399,7 +56817,7 @@ mod tests {
             [] as [(
                 std::string::String,
                 bool,
-                std::option::Option<chrono::DateTime<chrono::Utc>>
+                std::option::Option<jiff::Timestamp>
             ); 0]
         );
     }
@@ -56592,14 +57010,14 @@ mod tests {
         // A RecordUpdateResult whose UpdateAdmitted is not in the loaded history
         // yields no admit timestamp. So the histogram sample is SKIPPED (never a
         // bogus 0), while the completed/failed counter still fires.
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         assert_eq!(update_admit_duration_secs(None, now), None);
     }
 
     #[test]
     fn update_admit_duration_secs_measures_positive_delta_in_seconds() {
-        let admit = chrono::Utc::now();
-        let now = admit + chrono::Duration::milliseconds(2500);
+        let admit = jiff::Timestamp::now();
+        let now = admit + jiff::SignedDuration::from_millis(2500);
         let secs = update_admit_duration_secs(Some(admit), now).expect("some duration");
         assert!((secs - 2.5).abs() < 1e-6, "expected ~2.5s, got {secs}");
     }
@@ -56608,8 +57026,8 @@ mod tests {
     fn update_admit_duration_secs_clamps_negative_skew_to_zero() {
         // Terminal time BEFORE the recorded admit (clock skew across appends)
         // must clamp to 0 — never emit a negative/garbage sample.
-        let admit = chrono::Utc::now();
-        let now = admit - chrono::Duration::seconds(5);
+        let admit = jiff::Timestamp::now();
+        let now = admit - jiff::SignedDuration::from_secs(5);
         assert_eq!(update_admit_duration_secs(Some(admit), now), Some(0.0));
     }
 
@@ -56620,7 +57038,7 @@ mod tests {
         // unresolved one carries None (name "unknown", no histogram sample).
         let ok_id = crate::types::UpdateId::new();
         let missing_id = crate::types::UpdateId::new();
-        let admit_ts = chrono::Utc::now();
+        let admit_ts = jiff::Timestamp::now();
         let history = vec![WorkflowEvent::UpdateAdmitted {
             update_id: ok_id,
             name: "set_priority".to_string(),
@@ -56758,7 +57176,7 @@ mod tests {
             worker_id: None,
             attempt,
             max_attempts,
-            scheduled_at: chrono::Utc::now(),
+            scheduled_at: jiff::Timestamp::now(),
             started_at: None,
             completed_at: None,
             last_heartbeat_at: None,
@@ -56805,8 +57223,8 @@ mod tests {
             Some(serde_json::to_value(RetryPolicy::fixed(3, Duration::from_secs(2))).unwrap());
         let delay = timeout_retry_delay(&task, "timeout: StartToClose for call_api")
             .expect("attempt 1 of 3 retries");
-        assert!(delay > chrono::Duration::zero());
-        assert!(delay <= chrono::Duration::seconds(2));
+        assert!(delay > jiff::SignedDuration::ZERO);
+        assert!(delay <= jiff::SignedDuration::from_secs(2));
     }
 
     #[test]
@@ -56844,7 +57262,7 @@ mod tests {
     fn circuit_defer_delay_never_spins_hot() {
         let task = retry_after_test_task(1, 3);
         let delay = circuit_defer_delay(Some(Duration::from_millis(1)), Duration::ZERO, &task);
-        assert!(delay >= chrono::Duration::from_std(CIRCUIT_DEFER_MIN).unwrap());
+        assert!(delay >= jiff::SignedDuration::try_from(CIRCUIT_DEFER_MIN).unwrap());
     }
 
     #[test]
@@ -56852,7 +57270,7 @@ mod tests {
         // A forced-open breaker, or a probe in flight, reports no probe time.
         // A short cooldown must not then set a short poll.
         let task = retry_after_test_task(1, 3);
-        let floor = chrono::Duration::from_std(CIRCUIT_DEFER_UNSCHEDULED).unwrap();
+        let floor = jiff::SignedDuration::try_from(CIRCUIT_DEFER_UNSCHEDULED).unwrap();
         for cooldown in [
             Duration::ZERO,
             Duration::from_millis(50),
@@ -56860,7 +57278,8 @@ mod tests {
         ] {
             assert!(circuit_defer_delay(None, cooldown, &task) >= floor);
         }
-        let max = chrono::Duration::from_std(CIRCUIT_DEFER_MAX + CIRCUIT_DEFER_MAX / 4).unwrap();
+        let max =
+            jiff::SignedDuration::try_from(CIRCUIT_DEFER_MAX + CIRCUIT_DEFER_MAX / 4).unwrap();
         assert!(circuit_defer_delay(None, Duration::from_secs(3600), &task) <= max);
     }
 
@@ -56917,7 +57336,7 @@ mod tests {
         let delay = next_retry_delay(&task, &error, Some(&policy), Duration::from_mins(15))
             .unwrap()
             .expect("an attempt is still available");
-        assert_eq!(delay, chrono::Duration::seconds(2));
+        assert_eq!(delay, jiff::SignedDuration::from_secs(2));
     }
 
     #[test]
@@ -56931,7 +57350,7 @@ mod tests {
         let delay = next_retry_delay(&task, &error, Some(&policy), Duration::from_secs(1))
             .unwrap()
             .expect("an attempt is still available");
-        assert_eq!(delay, chrono::Duration::seconds(1));
+        assert_eq!(delay, jiff::SignedDuration::from_secs(1));
     }
 
     #[test]
@@ -56948,7 +57367,7 @@ mod tests {
             .expect("an attempt is still available");
         assert_eq!(
             delay,
-            chrono::Duration::seconds(2),
+            jiff::SignedDuration::from_secs(2),
             "a zero hint must fall through to the policy delay, not resolve to an immediate retry"
         );
     }
@@ -56962,7 +57381,7 @@ mod tests {
         let delay = next_retry_delay(&task, "boom", Some(&policy), Duration::from_mins(15))
             .unwrap()
             .expect("an attempt is still available");
-        assert_eq!(delay, chrono::Duration::seconds(5));
+        assert_eq!(delay, jiff::SignedDuration::from_secs(5));
     }
 
     #[test]
@@ -56982,7 +57401,7 @@ mod tests {
         let delay = next_retry_delay(&task, &error, Some(&policy), Duration::ZERO)
             .unwrap()
             .expect("an attempt is still available");
-        assert_eq!(delay, chrono::Duration::seconds(0));
+        assert_eq!(delay, jiff::SignedDuration::from_secs(0));
     }
 
     /// The no-policy fallback jitters within one second (issue #1792).
@@ -56997,8 +57416,11 @@ mod tests {
             let delay = next_retry_delay(&task, "boom", None, Duration::from_mins(15))
                 .unwrap()
                 .expect("an attempt is still available");
-            assert!(delay >= chrono::Duration::zero());
-            assert!(delay <= chrono::Duration::seconds(1), "{delay:?} > 1s");
+            assert!(delay >= jiff::SignedDuration::ZERO);
+            assert!(
+                delay <= jiff::SignedDuration::from_secs(1),
+                "{delay:?} > 1s"
+            );
             delays.insert(delay);
         }
         assert!(delays.len() > 1, "100 tasks got one delay {delays:?}");
@@ -57017,7 +57439,10 @@ mod tests {
             let delay = next_retry_delay(&task, "boom", Some(&policy), Duration::from_mins(15))
                 .unwrap()
                 .expect("an attempt is still available");
-            assert!(delay <= chrono::Duration::seconds(1), "{delay:?} > 1s");
+            assert!(
+                delay <= jiff::SignedDuration::from_secs(1),
+                "{delay:?} > 1s"
+            );
             delays.insert(delay);
         }
         assert!(delays.len() > 1, "100 tasks got one delay {delays:?}");
@@ -57074,7 +57499,7 @@ mod tests {
         let delay = next_retry_delay(&task, &error, None, Duration::from_mins(15))
             .unwrap()
             .expect("an attempt is still available");
-        assert_eq!(delay, chrono::Duration::milliseconds(250));
+        assert_eq!(delay, jiff::SignedDuration::from_millis(250));
     }
 
     // ── local activities must honor retry_after too (issue #744, PR #1140) ──
@@ -57204,13 +57629,13 @@ mod tests {
             input: serde_json::json!({}),
             output: None,
             error: None,
-            started_at: chrono::Utc::now(),
+            started_at: jiff::Timestamp::now(),
             completed_at: None,
             parent_id: None,
             queue_name: "default".to_string(),
-            execution_timeout: Some(chrono::Duration::seconds(600)),
+            execution_timeout: Some(jiff::SignedDuration::from_secs(600)),
             deadline_at: None,
-            sla: Some(chrono::Duration::seconds(300)),
+            sla: Some(jiff::SignedDuration::from_secs(300)),
             sla_deadline_at: None,
             sla_breached: false,
             sla_breached_at: None,
@@ -57246,16 +57671,42 @@ mod tests {
             start_source_ref: None,
             started_by: None,
             current_details: None,
-            chain_execution_timeout: Some(chrono::Duration::seconds(86_400)),
-            chain_deadline_at: Some(chrono::Utc::now() + chrono::Duration::seconds(80_000)),
+            chain_execution_timeout: Some(jiff::SignedDuration::from_secs(86_400)),
+            chain_deadline_at: Some(
+                jiff::Timestamp::now() + jiff::SignedDuration::from_secs(80_000),
+            ),
             history_bloat_warned_at: None,
             triage_note: None,
             quota_key: None,
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
             migrated_run_terminal_at: None,
             rebalance: crate::models::RebalanceMarkers::default(),
             tenant: None,
         }
+    }
+
+    /// A stored timeout past the jiff range does not panic the worker. A
+    /// deadline that `chrono` held saturates to `Timestamp::MAX`. A deadline
+    /// past the `chrono` range is NULL.
+    #[test]
+    fn same_type_successor_with_a_huge_stored_timeout_has_no_deadline() {
+        let mut execution = can803_predecessor();
+        execution.execution_timeout = Some(jiff::SignedDuration::from_secs(400_000_000_000));
+        execution.sla = Some(jiff::SignedDuration::from_secs(400_000_000_000));
+        let now = jiff::Timestamp::now();
+        let defaults =
+            resolve_continue_as_new_successor_defaults(&execution, None, None, None, now);
+        assert_eq!(defaults.execution_timeout, execution.execution_timeout);
+        assert_eq!(defaults.deadline_at, Some(jiff::Timestamp::MAX));
+        assert_eq!(defaults.sla_deadline_at, Some(jiff::Timestamp::MAX));
+
+        let past_chrono = jiff::SignedDuration::from_millis(i64::MAX);
+        execution.execution_timeout = Some(past_chrono);
+        execution.sla = Some(past_chrono);
+        let defaults =
+            resolve_continue_as_new_successor_defaults(&execution, None, None, None, now);
+        assert_eq!(defaults.deadline_at, None);
+        assert_eq!(defaults.sla_deadline_at, None);
     }
 
     /// AC1/AC4: a same-type continuation (`new_workflow_type: None`) keeps the
@@ -57264,7 +57715,7 @@ mod tests {
     #[test]
     fn can803_same_type_carries_every_lifecycle_column_verbatim() {
         let execution = can803_predecessor();
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let defaults =
             resolve_continue_as_new_successor_defaults(&execution, None, None, None, now);
 
@@ -57280,11 +57731,11 @@ mod tests {
         // Per-run deadlines re-anchor to the successor's start.
         assert_eq!(
             defaults.deadline_at,
-            Some(now + chrono::Duration::seconds(600))
+            Some(now + jiff::SignedDuration::from_secs(600))
         );
         assert_eq!(
             defaults.sla_deadline_at,
-            Some(now + chrono::Duration::seconds(300))
+            Some(now + jiff::SignedDuration::from_secs(300))
         );
         // The #617 chain cap is CHAIN-scoped: carried verbatim, never re-anchored.
         assert_eq!(
@@ -57305,7 +57756,7 @@ mod tests {
         let execution = can803_predecessor();
         let mut target = can803_wf_info("paid_subscription");
         target.chain_execution_timeout = Some(Duration::from_secs(3));
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
 
         let defaults =
             resolve_continue_as_new_successor_defaults(&execution, Some(&target), None, None, now);
@@ -57322,7 +57773,7 @@ mod tests {
             defaults.chain_execution_timeout,
             target
                 .chain_execution_timeout
-                .and_then(|d| chrono::Duration::from_std(d).ok()),
+                .and_then(|d| jiff::SignedDuration::try_from(d).ok()),
             "a type change must not adopt the target's own chain cap"
         );
     }
@@ -57341,18 +57792,18 @@ mod tests {
         target.severity = Some("SEV1");
         target.retry_policy = Some(crate::policy::RetryPolicy::fixed(5, Duration::from_secs(2)));
 
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let defaults =
             resolve_continue_as_new_successor_defaults(&execution, Some(&target), None, None, now);
 
         assert_eq!(
             defaults.execution_timeout,
-            Some(chrono::Duration::seconds(7_200)),
+            Some(jiff::SignedDuration::from_secs(7_200)),
             "execution_timeout must come from the target type (#243)"
         );
         assert_eq!(
             defaults.sla,
-            Some(chrono::Duration::seconds(1_800)),
+            Some(jiff::SignedDuration::from_secs(1_800)),
             "sla must come from the target type (#487)"
         );
         assert_eq!(
@@ -57372,11 +57823,11 @@ mod tests {
         );
         assert_eq!(
             defaults.deadline_at,
-            Some(now + chrono::Duration::seconds(7_200))
+            Some(now + jiff::SignedDuration::from_secs(7_200))
         );
         assert_eq!(
             defaults.sla_deadline_at,
-            Some(now + chrono::Duration::seconds(1_800))
+            Some(now + jiff::SignedDuration::from_secs(1_800))
         );
     }
 
@@ -57392,7 +57843,7 @@ mod tests {
             Some(&target),
             None,
             None,
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         );
 
         assert!(defaults.execution_timeout.is_none());
@@ -57414,17 +57865,17 @@ mod tests {
         target.execution_timeout = Some(Duration::from_secs(60));
         target.sla = Some(Duration::from_secs(600));
 
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let defaults =
             resolve_continue_as_new_successor_defaults(&execution, Some(&target), None, None, now);
         assert_eq!(
             defaults.sla,
-            Some(chrono::Duration::seconds(60)),
+            Some(jiff::SignedDuration::from_secs(60)),
             "sla must clamp down to the hard timeout"
         );
         assert_eq!(
             defaults.sla_deadline_at,
-            Some(now + chrono::Duration::seconds(60))
+            Some(now + jiff::SignedDuration::from_secs(60))
         );
     }
 
@@ -57448,12 +57899,43 @@ mod tests {
             Some(&target),
             None,
             None,
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         );
         assert!(
             defaults.deadline_at.is_none(),
             "an unrepresentable deadline must degrade to None, never panic"
         );
+    }
+
+    /// `chrono` held `now` plus 10,000 years, so it accepted this transition.
+    /// The deadline saturates to `Timestamp::MAX`, as at the start path.
+    #[test]
+    fn can803_cross_type_far_timeout_inside_the_chrono_range_saturates() {
+        let execution = can803_predecessor();
+        let ten_thousand_years = Duration::from_hours(87_660_000);
+        let mut target = can803_wf_info("paid_subscription");
+        target.execution_timeout = Some(ten_thousand_years);
+        target.sla = Some(ten_thousand_years);
+        let now = jiff::Timestamp::now();
+
+        let defaults =
+            resolve_continue_as_new_successor_defaults(&execution, Some(&target), None, None, now);
+        assert!(
+            classify_successor_deadline_representable(
+                "paid_subscription",
+                defaults.execution_timeout,
+                now,
+            )
+            .is_ok()
+        );
+        assert_eq!(defaults.deadline_at, Some(jiff::Timestamp::MAX));
+        assert!(defaults.sla.is_some());
+        assert_eq!(defaults.sla_deadline_at, Some(jiff::Timestamp::MAX));
+
+        let mut same_type = can803_predecessor();
+        same_type.execution_timeout = defaults.execution_timeout;
+        let carried = resolve_continue_as_new_successor_defaults(&same_type, None, None, None, now);
+        assert_eq!(carried.deadline_at, Some(jiff::Timestamp::MAX));
     }
 
     /// AC5: the blank / unregistered / registered matrix for a continuation
@@ -57611,31 +58093,37 @@ mod tests {
         let mut target = can803_wf_info("paid_subscription");
         target.execution_timeout = Some(Duration::from_hours(720));
 
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let defaults = resolve_continue_as_new_successor_defaults(
             &execution,
             Some(&target),
-            Some(chrono::Duration::hours(1)),
+            Some(jiff::SignedDuration::from_hours(1)),
             None,
             now,
         );
         assert_eq!(
             defaults.execution_timeout,
-            Some(chrono::Duration::hours(1)),
+            Some(jiff::SignedDuration::from_hours(1)),
             "the declared 30d must clamp down to the operator's 1h ceiling"
         );
-        assert_eq!(defaults.deadline_at, Some(now + chrono::Duration::hours(1)));
+        assert_eq!(
+            defaults.deadline_at,
+            Some(now + jiff::SignedDuration::from_hours(1))
+        );
 
         // A declaration already under the ceiling is untouched.
         target.execution_timeout = Some(Duration::from_secs(60));
         let under = resolve_continue_as_new_successor_defaults(
             &execution,
             Some(&target),
-            Some(chrono::Duration::hours(1)),
+            Some(jiff::SignedDuration::from_hours(1)),
             None,
             now,
         );
-        assert_eq!(under.execution_timeout, Some(chrono::Duration::seconds(60)));
+        assert_eq!(
+            under.execution_timeout,
+            Some(jiff::SignedDuration::from_secs(60))
+        );
     }
 
     /// The fleet-wide workflow-attempts ceiling (#523) applies to a cross-type
@@ -57652,7 +58140,7 @@ mod tests {
         let execution = can803_predecessor();
         let mut target = can803_wf_info("paid_subscription");
         target.retry_policy = Some(RetryPolicy::fixed(100, Duration::from_secs(1)));
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
 
         let clamped = resolve_continue_as_new_successor_defaults(
             &execution,
@@ -57714,7 +58202,7 @@ mod tests {
             None,
             None,
             Some(3),
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         );
         assert_eq!(
             defaults.workflow_retry_policy,
@@ -57816,13 +58304,13 @@ mod tests {
     /// field" outcome, as a diagnosable terminal failure instead of a panic.
     #[test]
     fn can803_unrepresentable_execution_timeout_is_rejected() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
 
         // Representable: allowed, and no ceiling needed.
         assert!(
             classify_successor_deadline_representable(
                 "paid_subscription",
-                Some(chrono::Duration::hours(24)),
+                Some(jiff::SignedDuration::from_hours(24)),
                 now,
             )
             .is_ok(),
@@ -57838,9 +58326,9 @@ mod tests {
 
         // Unrepresentable: rejected, naming the target so an operator can find
         // the offending declaration without reading the source.
-        let unrepresentable = chrono::Duration::seconds(8_640_000_000_000);
+        let unrepresentable = jiff::SignedDuration::from_secs(8_640_000_000_000);
         assert!(
-            now.checked_add_signed(unrepresentable).is_none(),
+            now.checked_add(unrepresentable).ok().is_none(),
             "fixture premise: this duration must overflow DateTime<Utc>"
         );
         let error = classify_successor_deadline_representable(
@@ -57869,18 +58357,18 @@ mod tests {
         let execution = can803_predecessor();
         let mut target = can803_wf_info("paid_subscription");
         target.execution_timeout = Some(Duration::from_hours(2_400_000_000));
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
 
         let defaults = resolve_continue_as_new_successor_defaults(
             &execution,
             Some(&target),
-            Some(chrono::Duration::hours(24)),
+            Some(jiff::SignedDuration::from_hours(24)),
             None,
             now,
         );
         assert_eq!(
             defaults.execution_timeout,
-            Some(chrono::Duration::hours(24)),
+            Some(jiff::SignedDuration::from_hours(24)),
             "the ceiling must clamp the declaration down"
         );
         assert!(
@@ -57900,7 +58388,7 @@ mod tests {
         let execution = can803_predecessor();
         let mut target = can803_wf_info("paid_subscription");
         target.sla = Some(Duration::from_hours(2_400_000_000));
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
 
         let defaults =
             resolve_continue_as_new_successor_defaults(&execution, Some(&target), None, None, now);
@@ -58127,7 +58615,7 @@ mod tests {
             Some(&target),
             None,
             None,
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         );
         assert!(
             defaults.sla.is_none() && defaults.sla_deadline_at.is_none(),
@@ -59043,7 +59531,7 @@ mod tests {
         let ids = RecordedDispatchIds::from_history(&[
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -59096,7 +59584,7 @@ mod tests {
             ExecutionId::new(),
             vec![WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -59170,7 +59658,7 @@ mod tests {
         let exec_id = ExecutionId::new();
         let started = WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: chrono::Utc::now(),
+            timestamp: jiff::Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -59231,10 +59719,7 @@ mod tests {
         }
     }
 
-    fn probe(
-        state: &str,
-        scheduled_at: chrono::DateTime<chrono::Utc>,
-    ) -> crate::queue::DispatchProbe {
+    fn probe(state: &str, scheduled_at: jiff::Timestamp) -> crate::queue::DispatchProbe {
         crate::queue::DispatchProbe {
             state: state.to_string(),
             scheduled_at,
@@ -59249,8 +59734,8 @@ mod tests {
     #[test]
     fn a_saturated_reference_is_released_for_the_limit_delay() {
         let settings = dispatch_settings();
-        let now = chrono::Utc::now();
-        let due = probe("PENDING", now - chrono::Duration::seconds(1));
+        let now = jiff::Timestamp::now();
+        let due = probe("PENDING", now - jiff::SignedDuration::from_secs(1));
         let delay = Duration::from_millis(80);
         for redeliveries in [0, 5, 40] {
             assert_eq!(
@@ -59260,7 +59745,7 @@ mod tests {
             );
         }
         // A row that is not yet due keeps waiting for its due time.
-        let later = probe("PENDING", now + chrono::Duration::seconds(5));
+        let later = probe("PENDING", now + jiff::SignedDuration::from_secs(5));
         assert_eq!(
             reference_outcome(Some(&later), 0, now, &settings, Some(delay)),
             ReferenceOutcome::Release(Duration::from_secs(5)),
@@ -59272,8 +59757,8 @@ mod tests {
         // The owner of the pin must see the reference soon, so the delay must
         // not grow past the sticky window (issue #1798).
         let settings = dispatch_settings();
-        let now = chrono::Utc::now();
-        let mut pinned = probe("PENDING", now - chrono::Duration::seconds(1));
+        let now = jiff::Timestamp::now();
+        let mut pinned = probe("PENDING", now - jiff::SignedDuration::from_secs(1));
         pinned.pinned_elsewhere = true;
 
         for redeliveries in [0, 3, 40] {
@@ -59288,8 +59773,8 @@ mod tests {
     #[test]
     fn a_due_gated_row_is_released_with_a_growing_delay() {
         let settings = dispatch_settings();
-        let now = chrono::Utc::now();
-        let due = probe("PENDING", now - chrono::Duration::seconds(1));
+        let now = jiff::Timestamp::now();
+        let due = probe("PENDING", now - jiff::SignedDuration::from_secs(1));
 
         assert_eq!(
             reference_outcome(Some(&due), 0, now, &settings, None),
@@ -59308,8 +59793,8 @@ mod tests {
     #[test]
     fn a_row_that_is_not_due_yet_is_held_until_its_due_time() {
         let settings = dispatch_settings();
-        let now = chrono::Utc::now();
-        let later = probe("PENDING", now + chrono::Duration::milliseconds(500));
+        let now = jiff::Timestamp::now();
+        let later = probe("PENDING", now + jiff::SignedDuration::from_millis(500));
 
         assert_eq!(
             reference_outcome(Some(&later), 0, now, &settings, None),
@@ -59320,8 +59805,8 @@ mod tests {
     #[test]
     fn a_far_future_row_is_held_no_longer_than_the_backoff_cap() {
         let settings = dispatch_settings();
-        let now = chrono::Utc::now();
-        let far = probe("PENDING", now + chrono::Duration::days(7));
+        let now = jiff::Timestamp::now();
+        let far = probe("PENDING", now + crate::time::days(7));
 
         assert_eq!(
             reference_outcome(Some(&far), 0, now, &settings, None),
@@ -59332,7 +59817,7 @@ mod tests {
     #[test]
     fn a_running_or_terminal_row_is_acked() {
         let settings = dispatch_settings();
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         for state in ["RUNNING", "COMPLETED", "FAILED", "CANCELLED"] {
             assert_eq!(
                 reference_outcome(Some(&probe(state, now)), 0, now, &settings, None),
@@ -59345,7 +59830,7 @@ mod tests {
     #[test]
     fn a_parked_workflow_row_gets_three_short_releases_and_is_then_acked() {
         let settings = dispatch_settings();
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let parked = crate::queue::DispatchProbe {
             state: "RUNNING".to_string(),
             scheduled_at: now,
@@ -59418,7 +59903,7 @@ mod tests {
     #[test]
     fn an_absent_row_gets_three_short_releases_and_is_then_acked() {
         let settings = dispatch_settings();
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
 
         for redeliveries in 0..DISPATCH_ABSENT_ROW_RELEASES {
             assert_eq!(
@@ -59543,7 +60028,7 @@ mod tests {
         crate::queue::OwnerRow {
             exec_id: uuid::Uuid::new_v4(),
             priority,
-            due_at: chrono::Utc::now() - chrono::Duration::seconds(age_secs - handicap),
+            due_at: jiff::Timestamp::now() - jiff::SignedDuration::from_secs(age_secs - handicap),
         }
     }
 
@@ -61291,7 +61776,7 @@ mod tests {
         crate::dispatch::DispatchHint {
             task_id: uuid::Uuid::new_v4(),
             queue_name: queue.to_string(),
-            scheduled_at: chrono::Utc::now(),
+            scheduled_at: jiff::Timestamp::now(),
             priority: 0,
             shard: None,
             kind: None,
@@ -61459,7 +61944,7 @@ mod tests {
     fn a_full_reconcile_page_keeps_the_cursor() {
         let cursor = crate::queue::DispatchCursor {
             priority: 5,
-            scheduled_at: chrono::Utc::now(),
+            scheduled_at: jiff::Timestamp::now(),
             id: uuid::Uuid::new_v4(),
         };
         assert_eq!(
@@ -61475,7 +61960,7 @@ mod tests {
     fn a_short_reconcile_page_wraps_the_cursor() {
         let cursor = crate::queue::DispatchCursor {
             priority: 5,
-            scheduled_at: chrono::Utc::now(),
+            scheduled_at: jiff::Timestamp::now(),
             id: uuid::Uuid::new_v4(),
         };
         assert_eq!(

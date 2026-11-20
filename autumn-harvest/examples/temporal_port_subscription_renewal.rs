@@ -160,7 +160,7 @@ mod tests {
     fn started_event(input: serde_json::Value) -> WorkflowEvent {
         WorkflowEvent::WorkflowStarted {
             input,
-            timestamp: chrono::Utc::now(),
+            timestamp: jiff::Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -292,7 +292,7 @@ mod tests {
             WorkflowEvent::SideEffectRecorded {
                 kind: SideEffectKind::Now,
                 name: None,
-                value: json!(chrono::Utc::now().timestamp_millis()),
+                value: json!(jiff::Timestamp::now().as_millisecond()),
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,

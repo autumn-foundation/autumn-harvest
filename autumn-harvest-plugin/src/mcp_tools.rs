@@ -1139,8 +1139,8 @@ struct McpStatusResponse {
     current_details: Option<String>,
     output: Option<serde_json::Value>,
     error: Option<String>,
-    started_at: chrono::DateTime<chrono::Utc>,
-    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    started_at: jiff::Timestamp,
+    completed_at: Option<jiff::Timestamp>,
 }
 
 impl McpStatusResponse {

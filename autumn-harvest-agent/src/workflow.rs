@@ -19,6 +19,7 @@
 //! results. That keeps replay deterministic.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::pin::Pin;
 use std::time::Duration;
 
 use autumn_harvest::llm_budget::LlmBudgetExceeded;
@@ -52,8 +53,8 @@ use crate::harness::{
 use crate::heartbeat::{HeartbeatTask, agent_heartbeat_info};
 use crate::loop_guard::{LoopTracker, LoopVerdict, warning_note};
 use crate::memory::{
-    MEMORY_TOOL, MemoryBlock, MemoryOp, MemoryScope, MemorySnapshot, MemoryTool, apply_to,
-    edit_result,
+    MEMORY_TOOL, MemoryBlock, MemoryOp, MemoryScope, MemorySnapshot, MemoryTool,
+    READ_ONLY_SNAPSHOT_PATCH, SnapshotAccess, apply_to, edit_result,
 };
 use crate::mesh::{
     DELEGATE_TOOL, DelegateArgs, DelegationRecord, INVALID_NAME, Mandate, Peer, Refusal,
@@ -641,7 +642,7 @@ pub(crate) async fn drive(
             agent: agent.as_ref(),
             live: false,
         };
-        let stop = match run_segment(ctx, run, &mut progress, &mut tree, input).await {
+        let stop = match boxed_run_segment(ctx, run, &mut progress, &mut tree, input).await {
             Ok(stop) => stop,
             Err(error) if task.report_failure => {
                 return Ok((progress.failure(error, &tree), delivered));
@@ -983,6 +984,22 @@ pub(crate) async fn run_segment(
             }
         }
     }
+}
+
+/// [`run_segment`] on the heap.
+///
+/// It makes its future in its own frame, as [`autumn_harvest::frame`]
+/// explains (issue #2752). The future names a lifetime and holds `&mut`
+/// borrows, so a closure future would be a harvest-verify boundary.
+#[inline(never)]
+pub(crate) fn boxed_run_segment<'a>(
+    ctx: &'a WorkflowContext,
+    run: Run<'a>,
+    progress: &'a mut Progress,
+    tree: &'a mut Tree,
+    input: &'a str,
+) -> Pin<Box<impl Future<Output = Result<AgentStop, String>> + 'a>> {
+    Box::pin(run_segment(ctx, run, progress, tree, input))
 }
 
 /// Read the policy of the answer check of `task` and admit the check
@@ -1396,6 +1413,16 @@ async fn model_turn(
     }
 }
 
+/// [`model_turn`] on the heap. See [`boxed_run_segment`].
+#[inline(never)]
+fn boxed_model_turn(
+    ctx: &WorkflowContext,
+    live: bool,
+    request: ModelTurnRequest,
+) -> Pin<Box<impl Future<Output = HarvestResult<Option<ModelTurn>>> + '_>> {
+    Box::pin(model_turn(ctx, live, request))
+}
+
 /// Send one model turn: as a delta on the last window when the run allows
 /// it, else in the full form (issue #2264).
 ///
@@ -1409,7 +1436,7 @@ async fn send_turn(
     mut request: ModelTurnRequest,
 ) -> HarvestResult<Option<ModelTurn>> {
     if !progress.delta {
-        return model_turn(ctx, live, request).await;
+        return boxed_model_turn(ctx, live, request).await;
     }
     request.remember = true;
     let window = std::mem::take(&mut request.messages);
@@ -1426,7 +1453,7 @@ async fn send_turn(
             messages: window[sent.len..].to_vec(),
             ..request.clone()
         };
-        match model_turn(ctx, live, delta).await {
+        match boxed_model_turn(ctx, live, delta).await {
             Err(error) if error.activity_error_type() == Some(PREFIX_MISSING) => {}
             other => {
                 if matches!(other, Ok(Some(_))) {
@@ -1438,7 +1465,7 @@ async fn send_turn(
     }
     let sent = Sent::of(&window);
     request.messages = window;
-    let turn = model_turn(ctx, live, request).await;
+    let turn = boxed_model_turn(ctx, live, request).await;
     if matches!(turn, Ok(Some(_))) {
         progress.sent = Some(sent);
     }
@@ -1563,10 +1590,16 @@ async fn system_prompt(
         .execute_activity(&agent_memory_snapshot_info(), scope.clone())
         .await
         .map_err(|e| e.to_string())?;
-    let prompt = system.as_ref().map_or_else(
-        || snapshot.text().to_owned(),
-        |system| format!("{system}\n\n{}", snapshot.text()),
-    );
+    // The prompt must not name a tool that the run lacks. The gate keeps the
+    // edit head in the replay of a history from before the change.
+    let text = if task.memory_tool_scope().is_none() && ctx.patched(READ_ONLY_SNAPSHOT_PATCH) {
+        crate::memory::with_access(snapshot.text(), SnapshotAccess::Read)
+    } else {
+        snapshot.text().to_owned()
+    };
+    let prompt = system
+        .as_ref()
+        .map_or_else(|| text.clone(), |system| format!("{system}\n\n{text}"));
     Ok((Some(prompt), snapshot.labels()))
 }
 
@@ -2531,14 +2564,7 @@ async fn delegate(
         agent: Some(&child_agent),
         live: run.live,
     };
-    let ended = Box::pin(run_segment(
-        ctx,
-        child_run,
-        &mut child,
-        tree,
-        &child_task.input,
-    ))
-    .await;
+    let ended = boxed_run_segment(ctx, child_run, &mut child, tree, &child_task.input).await;
     // A failed child paid for its turns, so the parent counts them.
     if ended.is_err() {
         progress.usage = progress.usage.saturating_add(child.usage);
@@ -3597,7 +3623,7 @@ pub async fn agent_model_turn(
             tenant,
             |_content| {},
             Some(&publish),
-            autumn_harvest::chrono::Utc::now(),
+            autumn_harvest::time::Timestamp::now(),
         )
         .await?;
     if let Some(latency) = latency {

@@ -55,7 +55,6 @@ use std::time::Duration as StdDuration;
 
 use autumn_harvest::calendar::plan_backfill_with_calendar;
 use autumn_harvest::policy::{Schedule, SkipPolicy};
-use chrono::{NaiveDate, TimeZone, Utc};
 
 /// Reads `key` as a `usize`, using `default` only when the variable is
 /// genuinely *absent*. A *present but malformed* value is a configuration
@@ -82,7 +81,7 @@ fn env_usize(key: &str, default: usize) -> usize {
 /// measured delta. A long-lived calendar's rows come back from
 /// `SELECT ... WHERE calendar_name = $1` with no `ORDER BY`, so insertion
 /// order (not date order) is what a real caller gets.
-fn build_exclusions(before: NaiveDate, count: usize) -> Vec<NaiveDate> {
+fn build_exclusions(before: jiff::civil::Date, count: usize) -> Vec<jiff::civil::Date> {
     let window_days = i64::try_from(count).expect("count fits i64").max(1);
     // A stride coprime with `window_days` visits every offset in
     // `1..=window_days` exactly once before repeating, so `window_days`
@@ -92,7 +91,7 @@ fn build_exclusions(before: NaiveDate, count: usize) -> Vec<NaiveDate> {
     for i in 0..count {
         #[allow(clippy::cast_possible_wrap)]
         let offset = ((i as i64) * stride).rem_euclid(window_days) + 1;
-        dates.push(before - chrono::Duration::days(offset));
+        dates.push(before - autumn_harvest::time::days(offset));
     }
     dates
 }
@@ -133,10 +132,11 @@ fn main() {
     // mistaken for a valid (implausibly fast) measurement.
     assert!(reps > 0, "CALENDAR_PROFILE_REPS must be at least 1, got 0");
 
-    let from = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
-    let to = from + chrono::Duration::hours(i64::try_from(slots - 1).expect("slots fits i64"));
+    let from = autumn_harvest::time::utc_ymd_hms(2026, 6, 1, 0, 0, 0).unwrap();
+    let to =
+        from + jiff::SignedDuration::from_hours(i64::try_from(slots - 1).expect("slots fits i64"));
     let schedule = Schedule::Interval(StdDuration::from_secs(3600));
-    let excluded_dates = build_exclusions(from.date_naive(), exclusions);
+    let excluded_dates = build_exclusions(autumn_harvest::time::utc_date(from), exclusions);
     // A duplicate would silently shrink the BTreeSet the fix builds from
     // this list without shrinking the Vec the baseline scans. That would
     // make the two sides measure a different `n`. Checked once, outside

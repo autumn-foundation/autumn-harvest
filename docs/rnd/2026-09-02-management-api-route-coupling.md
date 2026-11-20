@@ -1,5 +1,10 @@
 # 🏛️ Keystone findings memo: management-API route coupling
 
+> **Update (2026-11-16).** `2026-11-16-branch-merge-conflict-census.md` measured
+> merge conflicts directly. From 2026-08-27 to 2026-11-16, `api.rs` caused 14 of
+> 485 conflicted branch merges (2.9%), in 12 PRs. The coordination risk below
+> does not show up as conflicts. Do not split `api.rs` to cut conflicts.
+
 **Status:** findings memo — no RFC, no decision required from architecture review.
 **Scope examined:** `autumn-harvest/`, `autumn-harvest-plugin/`, `autumn-harvest-cli/`
 only (the workspace crates with source history relevant to the management

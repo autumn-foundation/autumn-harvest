@@ -130,7 +130,7 @@ With the `testing` feature:
 
 ## Dependencies
 
-**Core**: tokio, serde_json, chrono, uuid, thiserror, tracing, croner
+**Core**: tokio, serde_json, jiff, uuid, thiserror, tracing, croner
 
 **Optional (`db` feature, on by default)**: deadpool, diesel, diesel-async,
 diesel_migrations, percent-encoding, tokio-postgres

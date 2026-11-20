@@ -42,6 +42,7 @@
 
 #![allow(clippy::too_many_lines, clippy::similar_names)]
 
+use jiff_diesel::ToDiesel;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -336,7 +337,7 @@ async fn mark_every_20th_failed(conns: &mut [AsyncPgConnection; 2], nodes: &[Nod
         diesel::update(wfx::table.filter(wfx::id.eq_any(&failed_ids[shard])))
             .set((
                 wfx::state.eq("FAILED"),
-                wfx::completed_at.eq(chrono::Utc::now()),
+                wfx::completed_at.eq(jiff::Timestamp::now().to_diesel()),
                 wfx::error.eq(Some("synthetic failure for perf fixture".to_string())),
             ))
             .execute(&mut conns[shard])

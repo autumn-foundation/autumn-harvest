@@ -162,6 +162,11 @@ struct HarvestRuntimeSlot {
     /// cost signal (autumn#1720).
     cost_deferral: crate::cost::CostDeferral,
     runtime: Option<HarvestRuntime>,
+    /// The loops of the Harvest background tasks. The runner fills it.
+    hosted: crate::background::HostedLoops,
+    /// The task switches of this build. The startup hook checks the runner
+    /// plan against them.
+    switches: crate::process_role::LoopSwitches,
     /// Broker connector registrations (issue #944), stashed alongside the
     /// builder so `start_harvest_runtime` can spawn one consumer loop each
     /// once the API state and pools exist.
@@ -1670,7 +1675,7 @@ pub const HARVEST_ROUTE_GROUP: &str = "harvest";
 ///
 /// It must equal the `autumn-web` requirement in this crate's `Cargo.toml`.
 /// A unit test enforces that, so a dependency bump cannot leave it stale.
-pub const AUTUMN_WEB_REQUIREMENT: &str = "0.10";
+pub const AUTUMN_WEB_REQUIREMENT: &str = "0.11";
 
 /// The compatibility contract that [`HarvestPlugin`] declares to Autumn.
 ///
@@ -1790,8 +1795,10 @@ impl HarvestPlugin {
             &self.builder,
             self.sqlite_per_tenant,
         ));
+        // The SQLite driver is the only writer, so no role moves it. A role
+        // can still name a Harvest capability.
         crate::sqlite::build(
-            app,
+            crate::background::declare_capabilities(app),
             crate::sqlite::SqliteParts {
                 builder: self.builder,
                 api_path: self.api_path,
@@ -2040,10 +2047,28 @@ impl HarvestPlugin {
         // Issue #2374: the store of the agent profile overlay routes.
         api_state.set_agent_overlay_store(agent_overlay_store);
 
+        // Issue #796: the synthetic canary registers its probe workflow and
+        // activity, and a retention override for their runs. It goes in here,
+        // after the MCP and webhook routes read the workflows. The task
+        // switches below then see its retention override.
+        let builder = match api_state.canary_config() {
+            Some(cfg) => crate::canary::register_canary(builder, &cfg),
+            None => builder,
+        };
+
+        // Autumn places each Harvest runtime by role. The tasks read the
+        // explicit switches and the declared queues of this build.
+        let hosted = crate::background::HostedLoops::default();
+        let switches = build_loop_switches(&builder);
+        let app =
+            crate::background::register(app, switches, declared_worker_queues(&builder), &hosted);
+
         let slot = Arc::new(Mutex::new(HarvestRuntimeSlot {
             builder: Some(builder),
             cost_deferral,
             runtime: None,
+            hosted,
+            switches,
             #[cfg(feature = "connectors")]
             connectors,
         }));
@@ -2163,6 +2188,52 @@ impl HarvestPlugin {
             app
         }
     }
+}
+
+/// The queue of the built-in webhook delivery workflow.
+#[cfg(feature = "webhooks")]
+const WEBHOOK_QUEUE: &str = "webhooks";
+
+/// Declare the webhook queue, once.
+#[cfg(feature = "webhooks")]
+fn ensure_webhook_queue(builder: &mut HarvestBuilder) {
+    let queues = &mut builder.worker_config_mut().queues;
+    if !queues.iter().any(|q| q == WEBHOOK_QUEUE) {
+        queues.push(WEBHOOK_QUEUE.to_owned());
+    }
+}
+
+/// The queues that the worker of this build declares.
+///
+/// The startup hook adds the webhook queue, so the list holds it too.
+fn declared_worker_queues(builder: &HarvestBuilder) -> Vec<String> {
+    #[allow(unused_mut)]
+    let mut queues = builder.worker_config().queues.clone();
+    #[cfg(feature = "webhooks")]
+    if !queues.iter().any(|q| q == WEBHOOK_QUEUE) {
+        queues.push(WEBHOOK_QUEUE.to_owned());
+    }
+    queues
+}
+
+/// The explicit switch of each Harvest runtime in this build.
+///
+/// A config that does not load gives no switch. The startup hook loads it
+/// again and stops the boot with the error.
+fn build_loop_switches(builder: &HarvestBuilder) -> crate::process_role::LoopSwitches {
+    loop_switches_with_env(builder, &autumn_web::config::OsEnv)
+}
+
+/// [`build_loop_switches`] with an explicit environment.
+fn loop_switches_with_env(
+    builder: &HarvestBuilder,
+    env: &dyn autumn_web::config::Env,
+) -> crate::process_role::LoopSwitches {
+    let retention = builder.retention_config().enabled();
+    HarvestRuntimeConfig::load_with_env(env).map_or_else(
+        |_| HarvestRuntimeConfig::default().loop_switches(retention),
+        |config| config.loop_switches(retention),
+    )
 }
 
 /// The MCP settings of a plugin (issues #597, #2005 and #2471).
@@ -2464,12 +2535,14 @@ async fn start_harvest_runtime(
     probe_harvest_pool(&harvest_pool).await;
     let router = ShardRouter::single();
 
-    let (builder, cost_deferral, runtime_already_started) = {
+    let (builder, cost_deferral, runtime_already_started, hosted, switches) = {
         let mut guard = slot.lock().unwrap_or_else(PoisonError::into_inner);
         (
             guard.builder.take(),
             guard.cost_deferral.clone(),
             guard.runtime.is_some(),
+            guard.hosted.clone(),
+            guard.switches,
         )
     };
     #[cfg(feature = "connectors")]
@@ -2502,25 +2575,10 @@ async fn start_harvest_runtime(
             .workflows(autumn_harvest::prelude::workflows![webhook_delivery])
             .activities(autumn_harvest::prelude::activities![deliver_webhook]);
 
-        if !builder
-            .worker_config_mut()
-            .queues
-            .iter()
-            .any(|q| q == "webhooks")
-        {
-            builder
-                .worker_config_mut()
-                .queues
-                .push("webhooks".to_string());
-        }
+        ensure_webhook_queue(&mut builder);
     }
 
-    // Issue #796: register the built-in synthetic liveness canary when enabled.
-    // `None` (the default) leaves the builder untouched, so a deployment that
-    // never calls `synthetic_canary` is byte-for-byte identical (AC1).
-    if let Some(cfg) = api_state.canary_config() {
-        builder = crate::canary::register_canary(builder, &cfg);
-    }
+    // Issue #796: the build registered the synthetic canary, if enabled.
 
     // The autumn cost signal holds the deferrable activity types
     // (autumn#1720). `try_build` validates the names.
@@ -2687,10 +2745,15 @@ async fn start_harvest_runtime(
     let runner = HarvestRunner::start(
         built,
         &harvest_config,
-        // The gate above already ran for this boot (issue #1128).
-        runner_resources.with_startup_orphan_gate_already_run(),
+        // The gate above already ran for this boot (issue #1128). The Autumn
+        // background tasks run the loops.
+        runner_resources
+            .with_startup_orphan_gate_already_run()
+            .with_hosted_loops(hosted.clone()),
     )
     .await?;
+    // The Autumn tasks start after this hook. Each one must find its loop.
+    hosted.check_placement(switches, state.role());
     let harvest_db_pool = runner.storage_pool();
     // Defense-in-depth: the pre-flight above catches WorkerConfig::with_sharded_pool;
     // this catches any future path that sets runner_resources.sharded_pool.
@@ -2798,8 +2861,8 @@ async fn start_harvest_runtime(
                 // the default chain cap.
                 let ceiling = |d: Option<std::time::Duration>| {
                     d.map(|d| {
-                        autumn_harvest::chrono::Duration::from_std(d)
-                            .unwrap_or(autumn_harvest::chrono::Duration::MAX)
+                        autumn_harvest::time::from_std_bounded(d)
+                            .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
                     })
                 };
                 let max_execution_timeout_ceiling =
@@ -3351,9 +3414,9 @@ struct WebhookRunDefaults {
     owner: Option<&'static str>,
     runbook_url: Option<&'static str>,
     severity: Option<&'static str>,
-    execution_timeout: Option<autumn_harvest::chrono::Duration>,
-    chain_execution_timeout: Option<autumn_harvest::chrono::Duration>,
-    sla: Option<autumn_harvest::chrono::Duration>,
+    execution_timeout: Option<autumn_harvest::jiff::SignedDuration>,
+    chain_execution_timeout: Option<autumn_harvest::jiff::SignedDuration>,
+    sla: Option<autumn_harvest::jiff::SignedDuration>,
     retry_policy: Option<autumn_harvest::policy::RetryPolicy>,
 }
 
@@ -3366,9 +3429,8 @@ struct WebhookRunDefaults {
 fn webhook_run_defaults(
     registry: Option<&autumn_harvest::worker::HandlerRegistry>,
 ) -> WebhookRunDefaults {
-    let to_chrono = |d: Option<std::time::Duration>| {
-        d.and_then(|d| autumn_harvest::chrono::Duration::from_std(d).ok())
-    };
+    let to_signed =
+        |d: Option<std::time::Duration>| d.and_then(autumn_harvest::time::from_std_bounded);
     registry
         .and_then(|registry| {
             registry.workflows.get("webhook_delivery").map(|wf| {
@@ -3378,9 +3440,9 @@ fn webhook_run_defaults(
                     owner: wf.owner,
                     runbook_url: wf.runbook_url,
                     severity: wf.severity,
-                    execution_timeout: to_chrono(execution_timeout),
-                    chain_execution_timeout: to_chrono(registry.chain_execution_timeout(wf.name)),
-                    sla: to_chrono(sla),
+                    execution_timeout: to_signed(execution_timeout),
+                    chain_execution_timeout: to_signed(registry.chain_execution_timeout(wf.name)),
+                    sla: to_signed(sla),
                     retry_policy: wf.retry_policy.clone(),
                 }
             })
@@ -3403,8 +3465,8 @@ mod webhook_run_defaults_tests {
         HandlerRegistry::new(vec![info], vec![])
     }
 
-    const fn minutes(n: i64) -> Option<autumn_harvest::chrono::Duration> {
-        autumn_harvest::chrono::Duration::try_minutes(n)
+    const fn minutes(n: i64) -> Option<autumn_harvest::jiff::SignedDuration> {
+        autumn_harvest::jiff::SignedDuration::try_from_mins(n)
     }
 
     /// With no override, the start takes the declared timeout and SLA.
@@ -3612,13 +3674,37 @@ mod tests {
         assert_eq!(HARVEST_ROUTE_GROUP, "harvest");
     }
 
+    /// The build reads the worker override, so its tasks take it.
+    #[test]
+    fn the_build_switches_read_the_worker_override() {
+        use crate::process_role::HarvestLoop;
+        use autumn_web::config::MockEnv;
+
+        let builder = HarvestBuilder::new();
+        let env = MockEnv::new().with("AUTUMN_HARVEST__WORKER_ENABLED", "true");
+        let switches = loop_switches_with_env(&builder, &env);
+        assert_eq!(switches.explicit(HarvestLoop::Worker), Some(true));
+        assert_eq!(switches.explicit(HarvestLoop::Batch), Some(true));
+        assert_eq!(switches.explicit(HarvestLoop::Scheduler), None);
+
+        // The default build keeps audit retention, so the role places the
+        // janitor. `process_role` tests the build with retention off.
+        assert!(builder.retention_config().enabled());
+        assert_eq!(switches.explicit(HarvestLoop::Retention), None);
+
+        // A config that does not load gives no worker switch.
+        let bad = MockEnv::new().with("AUTUMN_HARVEST__WORKER_ENABLED", "maybe");
+        let switches = loop_switches_with_env(&builder, &bad);
+        assert_eq!(switches.explicit(HarvestLoop::Worker), None);
+    }
+
     /// The range excludes the previous and the next `autumn-web` series.
     #[test]
     fn contract_rejects_other_autumn_web_series() {
         use autumn_web::plugin_contract::{ContractVerdict, evaluate};
 
         let contract = harvest_plugin_contract();
-        for other in ["0.9.0", "0.11.0"] {
+        for other in ["0.10.0", "0.12.0"] {
             assert!(
                 matches!(evaluate(&contract, other), ContractVerdict::Incompatible(_)),
                 "autumn-web {other} must be outside the declared range"

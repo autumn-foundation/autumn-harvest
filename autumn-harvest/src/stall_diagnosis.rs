@@ -106,7 +106,7 @@
 //! from the age of the last event. So a workflow sleeping on a month-long
 //! timer stays `healthy` (issue #809 AC4).
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 /// Triage-level verdict for a single execution.
@@ -185,12 +185,12 @@ pub enum BlockedOn {
         signal_name: String,
         /// When the wait began, where recorded history can date it.
         #[serde(skip_serializing_if = "Option::is_none")]
-        since: Option<DateTime<Utc>>,
+        since: Option<Timestamp>,
     },
     /// Sleeping on a durable timer that has not fired yet.
     SleepingTimer {
         /// When the timer is due to fire.
-        fires_at: DateTime<Utc>,
+        fires_at: Timestamp,
     },
     /// Waiting on a child workflow that has not reached a terminal state.
     PendingChild {
@@ -211,7 +211,7 @@ pub enum BlockedOn {
         last_error: Option<String>,
         /// When the next attempt becomes claimable (the task's `scheduled_at`).
         #[serde(skip_serializing_if = "Option::is_none")]
-        next_attempt_at: Option<DateTime<Utc>>,
+        next_attempt_at: Option<Timestamp>,
     },
     /// The dispatcher pushed an activity into the future with no failure
     /// recorded against it.
@@ -225,7 +225,7 @@ pub enum BlockedOn {
         #[serde(skip_serializing_if = "Option::is_none")]
         activity_name: Option<String>,
         /// When the task becomes claimable again (the task's `scheduled_at`).
-        next_attempt_at: DateTime<Utc>,
+        next_attempt_at: Timestamp,
     },
     /// **No live worker is polling this activity's task queue.** The condition
     /// issue #486's coarse `pending_activity` bucket cannot express, and the one
@@ -258,7 +258,7 @@ pub enum BlockedOn {
         /// Issue #1193: `cooldown_until` alone is NOT a safe
         /// discriminator. `CircuitBreakerPolicy::new` accepts any
         /// `std::time::Duration` for its cooldown. An organically-tripped
-        /// breaker with a cooldown outside `chrono`'s range also reports
+        /// breaker with a cooldown outside jiff's range also reports
         /// `cooldown_until: None` (see `circuit_cooldown_until` in `api.rs`).
         /// By that field alone, it looks like a forced-open breaker. This
         /// field is the fix. It comes from the registry's own flag, so it is
@@ -272,7 +272,7 @@ pub enum BlockedOn {
         /// field is informational only. Read `forced_open` for the authoritative
         /// origin, not the presence of this field.
         #[serde(skip_serializing_if = "Option::is_none")]
-        cooldown_until: Option<DateTime<Utc>>,
+        cooldown_until: Option<Timestamp>,
     },
     /// The activity's rate-limit bucket is exhausted.
     ActivityRateLimited {
@@ -340,7 +340,7 @@ pub enum BlockedOn {
     /// a healthy sleep.
     TimerOverdue {
         /// The deadline that has already elapsed.
-        fires_at: DateTime<Utc>,
+        fires_at: Timestamp,
         /// How far past the deadline the run is, in whole seconds.
         overdue_by_seconds: i64,
     },
@@ -359,7 +359,7 @@ pub enum BlockedOn {
         actor: Option<String>,
         /// When the pause took effect.
         #[serde(skip_serializing_if = "Option::is_none")]
-        since: Option<DateTime<Utc>>,
+        since: Option<Timestamp>,
     },
     /// Replay detected non-determinism and the engine blocked the run
     /// (issue #603) rather than failing it terminally.
@@ -371,7 +371,7 @@ pub enum BlockedOn {
     /// names it: roll back (or forward-fix) the workflow code.
     NonDeterminismBlocked {
         /// When the engine first blocked this run.
-        since: DateTime<Utc>,
+        since: Timestamp,
         /// The recorded divergence, where one was stamped.
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
@@ -399,7 +399,7 @@ pub enum BlockedOn {
         name: Option<String>,
         /// When the wait began, where recorded history can date it.
         #[serde(skip_serializing_if = "Option::is_none")]
-        since: Option<DateTime<Utc>>,
+        since: Option<Timestamp>,
     },
     /// **No live worker is polling the queue the run's own workflow task sits
     /// on.** The workflow-task analogue of [`Self::ActivityNoWorker`]: the
@@ -500,7 +500,7 @@ impl BlockedOn {
             // Keyed on `forced_open`, NOT on `cooldown_until.is_some()`
             // (PR #1365). `CircuitBreakerPolicy::new` accepts any
             // `std::time::Duration`. An organically-tripped breaker configured
-            // with a cooldown outside `chrono`'s representable range ALSO
+            // with a cooldown outside jiff's representable range ALSO
             // reports `cooldown_until: None`. By that field alone it is
             // indistinguishable from a forced-open one.
             // `forced_open` is sourced straight from the registry's own flag,
@@ -567,7 +567,7 @@ pub struct PendingActivityFacts {
     /// The most recent failure text recorded on the task row, if any.
     pub last_error: Option<String>,
     /// The task's `scheduled_at`: when it becomes claimable.
-    pub scheduled_at: DateTime<Utc>,
+    pub scheduled_at: Timestamp,
     /// The rate-limit bucket key, where one applies.
     pub rate_limit_key: Option<String>,
     /// The per-key concurrency key, where one applies.
@@ -600,7 +600,7 @@ pub struct PendingActivityFacts {
     /// The activity's breaker phase, when it is blocking dispatch.
     pub circuit_phase: Option<BlockingCircuitPhase>,
     /// When a half-open probe becomes admissible, if that is knowable.
-    pub circuit_cooldown_until: Option<DateTime<Utc>>,
+    pub circuit_cooldown_until: Option<Timestamp>,
     /// **Authoritative**: `true` when an operator explicitly forced this
     /// breaker open, sourced from `CircuitSnapshot::forced_open` directly.
     /// Meaningful only when `circuit_phase` is `Some(Open)`; always `false`
@@ -647,7 +647,7 @@ pub struct AwaitedSignalFacts {
     /// The awaited signal's name.
     pub signal_name: String,
     /// When the wait began, where recorded history can date it.
-    pub since: Option<DateTime<Utc>>,
+    pub since: Option<Timestamp>,
 }
 
 /// The engine's recorded nondeterminism block (issue #603).
@@ -657,7 +657,7 @@ pub struct AwaitedSignalFacts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NdBlockFacts {
     /// `nd_blocked_at` — when the engine first blocked this run.
-    pub blocked_at: DateTime<Utc>,
+    pub blocked_at: Timestamp,
     /// `nd_block_reason` — the recorded divergence.
     pub reason: Option<String>,
     /// `nd_block_count` — how many times the block has re-fired.
@@ -668,7 +668,7 @@ pub struct NdBlockFacts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingTimerFacts {
     /// When the timer is due to fire.
-    pub fires_at: DateTime<Utc>,
+    pub fires_at: Timestamp,
 }
 
 /// The run's OWN workflow task row (`task_type = 'workflow'`).
@@ -689,7 +689,7 @@ pub struct WorkflowTaskFacts {
     /// The task queue the decision cycle is dispatched on.
     pub queue_name: String,
     /// When the row becomes claimable.
-    pub scheduled_at: DateTime<Utc>,
+    pub scheduled_at: Timestamp,
     /// `true` when an operator has paused `queue_name` (issue #619).
     pub queue_paused: bool,
     /// `true` when at least one worker could *claim* this row right now.
@@ -715,7 +715,7 @@ pub struct WorkflowTaskFacts {
     /// timer's `fires_at` cannot: whether one of THOSE THREE write paths
     /// produced the row's current shape. See
     /// [`wake_source_repended_this_row`].
-    pub created_at: Option<DateTime<Utc>>,
+    pub created_at: Option<Timestamp>,
     /// The `fires_at` of the durable timer this row is currently armed for
     /// (issue #1402). `None` when no timer owns this row.
     ///
@@ -743,7 +743,7 @@ pub struct WorkflowTaskFacts {
     /// `scheduled_at` to the originally-armed timer either. The first two
     /// clearers also stamp `created_at` fresh; see
     /// [`wake_source_repended_this_row`] for that fingerprint.
-    pub timer_fires_at: Option<DateTime<Utc>>,
+    pub timer_fires_at: Option<Timestamp>,
 }
 
 /// A durable wait that replay named but no side table of this endpoint shows.
@@ -757,7 +757,7 @@ pub struct ReplayWaitFacts {
     /// The awaitable's label, where replay names one.
     pub name: Option<String>,
     /// When the wait began, where recorded history can date it.
-    pub since: Option<DateTime<Utc>>,
+    pub since: Option<Timestamp>,
 }
 
 /// The complete, already-gathered fact set for one execution.
@@ -770,7 +770,7 @@ pub struct DiagnosisInputs {
     /// Who requested the pause, where recorded.
     pub pause_actor: Option<String>,
     /// When the pause took effect.
-    pub paused_since: Option<DateTime<Utc>>,
+    pub paused_since: Option<Timestamp>,
     /// Every pending activity task row for this execution.
     pub activities: Vec<PendingActivityFacts>,
     /// Every pending external handoff for this execution.
@@ -812,7 +812,7 @@ pub struct DiagnosisInputs {
 /// and the diagnose endpoint's reason-code builder, so all three name the
 /// same set of currently-blocking rows (issue #1371).
 #[must_use]
-pub fn activity_circuit_currently_blocks(facts: &PendingActivityFacts, now: DateTime<Utc>) -> bool {
+pub fn activity_circuit_currently_blocks(facts: &PendingActivityFacts, now: Timestamp) -> bool {
     match facts.circuit_phase {
         None => false,
         Some(BlockingCircuitPhase::HalfOpen) => true,
@@ -912,7 +912,7 @@ pub const fn activity_precedence(blocked: &BlockedOn) -> u8 {
 /// `activity_precedence_for_facts_props::matches_classify_then_precedence`
 /// keeps the two functions from drifting apart.
 #[must_use]
-fn activity_precedence_for_facts(facts: &PendingActivityFacts, now: DateTime<Utc>) -> u8 {
+fn activity_precedence_for_facts(facts: &PendingActivityFacts, now: Timestamp) -> u8 {
     if facts.task_state != "PENDING" {
         return if facts.claimant_is_live.unwrap_or(facts.has_live_worker) {
             0 // HealthyInProgress
@@ -978,7 +978,7 @@ fn activity_precedence_for_facts(facts: &PendingActivityFacts, now: DateTime<Utc
 /// A row that is due, unimpeded and simply waiting for a free dispatch slot is
 /// also `HealthyInProgress`.
 #[must_use]
-pub fn classify_pending_activity(facts: &PendingActivityFacts, now: DateTime<Utc>) -> BlockedOn {
+pub fn classify_pending_activity(facts: &PendingActivityFacts, now: Timestamp) -> BlockedOn {
     // A task a worker already holds is progressing, but only while that worker
     // is alive. A claimed row on a queue with no live poller is an orphan
     // (issue #367). The reclaimer heals it within a poll interval. The
@@ -1289,7 +1289,7 @@ pub fn classify_workflow_task(facts: &WorkflowTaskFacts) -> Option<BlockedOn> {
 /// Absent facts (`None`) resolve to `true`, preserving the pre-gate behaviour
 /// for callers that do not supply a workflow task row.
 #[must_use]
-pub fn workflow_wake_was_missed(task: Option<&WorkflowTaskFacts>, now: DateTime<Utc>) -> bool {
+pub fn workflow_wake_was_missed(task: Option<&WorkflowTaskFacts>, now: Timestamp) -> bool {
     let Some(task) = task else {
         return true;
     };
@@ -1299,7 +1299,7 @@ pub fn workflow_wake_was_missed(task: Option<&WorkflowTaskFacts>, now: DateTime<
     if task.state != "PENDING" {
         return false;
     }
-    (now - task.scheduled_at).num_seconds() >= TIMER_OVERDUE_GRACE_SECONDS
+    (now - task.scheduled_at).as_secs() >= TIMER_OVERDUE_GRACE_SECONDS
 }
 
 /// Tolerance for matching the workflow task's `scheduled_at` against a
@@ -1330,8 +1330,8 @@ const TIMER_OWNERSHIP_TOLERANCE_SECONDS: i64 = 2;
 /// [`wake_source_repended_this_row`] is the proof that closes that gap.
 /// Callers MUST also consult it, never this function alone.
 #[must_use]
-fn timer_owns_the_wake(scheduled_at: DateTime<Utc>, fires_at: DateTime<Utc>) -> bool {
-    (scheduled_at - fires_at).num_seconds().abs() <= TIMER_OWNERSHIP_TOLERANCE_SECONDS
+fn timer_owns_the_wake(scheduled_at: Timestamp, fires_at: Timestamp) -> bool {
+    (scheduled_at - fires_at).as_secs().abs() <= TIMER_OWNERSHIP_TOLERANCE_SECONDS
 }
 
 /// How far NEGATIVE `created_at - scheduled_at` can go and still count as
@@ -1395,7 +1395,7 @@ fn wake_source_repended_this_row(task: &WorkflowTaskFacts) -> bool {
     let Some(created_at) = task.created_at else {
         return false;
     };
-    let gap_seconds = (created_at - task.scheduled_at).num_seconds();
+    let gap_seconds = (created_at - task.scheduled_at).as_secs();
     gap_seconds >= WAKE_REPEND_MIN_GAP_SECONDS
 }
 
@@ -1455,9 +1455,9 @@ fn wake_source_repended_this_row(task: &WorkflowTaskFacts) -> bool {
 fn is_the_missed_timer_wake(
     timer: &PendingTimerFacts,
     task: Option<&WorkflowTaskFacts>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> bool {
-    (now - timer.fires_at).num_seconds() >= TIMER_OVERDUE_GRACE_SECONDS
+    (now - timer.fires_at).as_secs() >= TIMER_OVERDUE_GRACE_SECONDS
         && task.is_none_or(|task| {
             task.scheduled_at == timer.fires_at
                 || ((task.timer_fires_at == Some(timer.fires_at)
@@ -1472,7 +1472,7 @@ fn is_the_missed_timer_wake(
 /// the caller reports [`ExecutionHealth::Terminal`] with the terminal outcome
 /// instead.
 #[must_use]
-pub fn classify_execution(inputs: &DiagnosisInputs, now: DateTime<Utc>) -> Option<BlockedOn> {
+pub fn classify_execution(inputs: &DiagnosisInputs, now: Timestamp) -> Option<BlockedOn> {
     // A terminal execution has nothing to diagnose, whatever stale rows linger.
     if inputs.is_terminal {
         return None;
@@ -1656,7 +1656,7 @@ pub fn classify_execution(inputs: &DiagnosisInputs, now: DateTime<Utc>) -> Optio
     {
         return Some(BlockedOn::TimerOverdue {
             fires_at: overdue.fires_at,
-            overdue_by_seconds: (now - overdue.fires_at).num_seconds(),
+            overdue_by_seconds: (now - overdue.fires_at).as_secs(),
         });
     }
 
@@ -1758,6 +1758,7 @@ fn summarize_activity_cause(blocked: &BlockedOn) -> Option<String> {
             next_attempt_at.map_or_else(
                 || format!("{who} is in retry backoff after attempt {attempt}"),
                 |at| {
+                    let at = crate::time::utc_display(at);
                     format!(
                         "{who} is in retry backoff after attempt {attempt}; next attempt at {at}"
                     )
@@ -1769,6 +1770,7 @@ fn summarize_activity_cause(blocked: &BlockedOn) -> Option<String> {
             next_attempt_at,
         } => {
             let who = activity_phrase(activity_name.as_ref());
+            let next_attempt_at = crate::time::utc_display(*next_attempt_at);
             format!(
                 "{who} was deferred by the dispatcher with no failure recorded \
                      (rate limit, session capacity, or capability miss); \
@@ -1793,7 +1795,7 @@ fn summarize_activity_cause(blocked: &BlockedOn) -> Option<String> {
         // Forced vs organic is decided by `forced_open` -- the registry's own
         // flag -- NOT by whether `cooldown_until` could be computed. An
         // organically-tripped breaker configured with a cooldown outside
-        // `chrono`'s representable range also reports no `cooldown_until`
+        // jiff's representable range also reports no `cooldown_until`
         // (issue #1193). So that field alone cannot tell the two apart. The
         // messages below still land on the right one.
         BlockedOn::ActivityCircuitOpen {
@@ -1818,6 +1820,7 @@ fn summarize_activity_cause(blocked: &BlockedOn) -> Option<String> {
                 )
             },
             |until| {
+                let until = crate::time::utc_display(until);
                 format!(
                     "the circuit breaker for activity '{activity_name}' is open and will \
                          automatically admit a recovery probe at {until} -- no operator action \
@@ -1870,7 +1873,10 @@ pub fn summarize(blocked: &BlockedOn) -> String {
             format!("waiting for signal '{signal_name}' to be sent")
         }
         BlockedOn::SleepingTimer { fires_at } => {
-            format!("sleeping on a durable timer until {fires_at}")
+            format!(
+                "sleeping on a durable timer until {}",
+                crate::time::utc_display(*fires_at)
+            )
         }
         BlockedOn::PendingChild {
             child_exec_id,
@@ -1880,8 +1886,9 @@ pub fn summarize(blocked: &BlockedOn) -> String {
             fires_at,
             overdue_by_seconds,
         } => format!(
-            "a durable timer was due at {fires_at} ({overdue_by_seconds}s ago) but nothing fired \
-             it — the owning workflow task was never claimed"
+            "a durable timer was due at {} ({overdue_by_seconds}s ago) but nothing fired \
+             it — the owning workflow task was never claimed",
+            crate::time::utc_display(*fires_at)
         ),
         BlockedOn::AwaitingExternalHandoff {
             token,
@@ -1916,9 +1923,10 @@ pub fn summarize(blocked: &BlockedOn) -> String {
             reason,
             block_count,
         } => format!(
-            "replay detected non-determinism, so the engine blocked this run at {since} \
+            "replay detected non-determinism, so the engine blocked this run at {} \
              (block #{block_count}) rather than failing it; it stays blocked until the \
              divergent build is rolled back{}",
+            crate::time::utc_display(*since),
             reason
                 .as_ref()
                 .map_or_else(String::new, |r| format!(" -- recorded divergence: {r}"))
@@ -1936,10 +1944,10 @@ pub fn summarize(blocked: &BlockedOn) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use jiff::Timestamp;
 
-    fn t(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(1_800_000_000 + secs, 0).unwrap()
+    fn t(secs: i64) -> Timestamp {
+        Timestamp::new(1_800_000_000 + secs, 0).unwrap()
     }
 
     /// `kind()` and the serialized `blocked_on.type` are two independent
@@ -2245,7 +2253,7 @@ mod tests {
             activity_name: "charge_card".to_string(),
             phase: BlockingCircuitPhase::Open,
             forced_open: false,
-            cooldown_until: Some(chrono::Utc::now()),
+            cooldown_until: Some(jiff::Timestamp::now()),
         };
         assert_eq!(organic_open.health(), ExecutionHealth::Degraded);
 
@@ -2676,7 +2684,7 @@ mod tests {
     }
 
     /// AC (issue #1193): take an ORGANIC trip whose cooldown could not be
-    /// represented, e.g. a policy cooldown outside `chrono`'s range. By
+    /// represented, e.g. a policy cooldown outside jiff's range. By
     /// `cooldown_until` alone it looks identical to a forced-open breaker. Both
     /// are `None`. `circuit_forced_open: false` is what keeps it
     /// `degraded` instead of being misreported as `stalled`.
@@ -4904,7 +4912,7 @@ mod tests {
              operator to force-close it: {summary}"
         );
         assert!(
-            summary.contains(&until.to_string()),
+            summary.contains(&crate::time::utc_display(until)),
             "the summary must state the automatic-recovery deadline: {summary}"
         );
         assert!(
@@ -5766,8 +5774,7 @@ mod tests {
         /// `scheduled_at` (`t(10)`), or AFTER it. So the sweep exercises the
         /// `organic_cooldown_clears_by_dispatch` guard's boundary in every case,
         /// not at a single hardcoded `None`.
-        fn circuit_cooldown_until() -> impl Strategy<Value = Option<chrono::DateTime<chrono::Utc>>>
-        {
+        fn circuit_cooldown_until() -> impl Strategy<Value = Option<jiff::Timestamp>> {
             prop_oneof![
                 Just(None),
                 Just(Some(t(-5))),

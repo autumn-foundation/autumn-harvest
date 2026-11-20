@@ -160,17 +160,6 @@ ignore = [
     # refresh, the same way the `croner` duplicate above picked up a newer
     # release with no version bump on our side. No ignore entry needed.
 
-    # RUSTSEC-2026-0459 — libsqlite3-sys, bundled SQLite before 3.54.0 can
-    # return uninitialised page-cache memory when it opens a database with a
-    # sibling `-wal` file of another page size. The fix is libsqlite3-sys
-    # 0.39. No graph can take it yet: the crate declares `links = "sqlite3"`,
-    # so one version serves every user, and diesel 2.3.14 (the newest) and
-    # autumn-web 0.10 still require 0.38. rusqlite 0.41 already moved.
-    # Reachability: Harvest opens only the SQLite files that it creates in
-    # its own data directory. An attacker must plant a crafted file pair
-    # there, which needs write access to that directory already.
-    { id = "RUSTSEC-2026-0459", reason = "no compatible upgrade: libsqlite3-sys is a `links` crate, and diesel 2.3.14 and autumn-web 0.10 still require 0.38. Local only: an attacker must plant a crafted database and -wal pair in the data directory that Harvest creates. Revisit: diesel and autumn-web accept libsqlite3-sys >= 0.39; then move rusqlite to 0.41." },
-
     # RUSTSEC-2023-0071 — rsa 0.9.10 Marvin Attack (timing side-channel on
     # private-key ops). Pulled by jsonwebtoken -> autumn-web; whether this is
     # reachable depends on whether autumn-web ever performs RSA *signing*
@@ -358,6 +347,14 @@ ignore = [
     # links it. Revisit: Rhai moves to compact_str or smol_str, or the example
     # drops Rhai.
     { id = "RUSTSEC-2026-0249", reason = "unmaintained, not a vulnerability, no safe upgrade: smartstring arrives only through rhai in examples/rhai-scripts (publish = false). No published crate links it. Revisit: rhai drops smartstring, or the example drops rhai." },
+
+    # RUSTSEC-2026-0543: chrono 0.4.45 is unmaintained. It reports no
+    # vulnerability, and no safe upgrade exists. Harvest uses jiff (ADR
+    # 0018), and the `bans` deny list keeps chrono out of every Harvest
+    # crate. autumn-web 0.11 uses jiff too. chrono arrives only through smop,
+    # in xtask and examples/rhai-scripts. Neither is published. Revisit: smop
+    # drops chrono.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained, not a vulnerability, no safe upgrade: Harvest uses jiff (ADR 0018) and bans chrono. chrono arrives only through smop in xtask and examples/rhai-scripts (publish = false). Revisit: smop drops chrono." },
 ]
 
 # ---------------------------------------------------------------------------
@@ -484,7 +481,14 @@ allow-wildcard-paths = true
 highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"
-deny = []
+# ADR 0018: Harvest uses `jiff` for dates and times. These bans keep `chrono`
+# and `chrono-tz` out of every crate that Harvest writes. A crate may depend
+# on them only when it is a listed wrapper. The one wrapper is a third-party
+# crate that Harvest does not control.
+deny = [
+    { crate = "chrono", wrappers = ["smop"], reason = "Harvest uses jiff (ADR 0018)" },
+    { crate = "chrono-tz", reason = "Harvest uses jiff (ADR 0018)" },
+]
 skip = []
 skip-tree = []
 

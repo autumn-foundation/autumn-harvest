@@ -41,10 +41,15 @@ const RUN_TABLES: [&str; 9] = [
 /// order. The cursor moves past a row that the purge cannot delete, so each
 /// batch makes progress.
 ///
+/// The query names that index. SQLite 3.54 can prefer the workflow name
+/// index for a pass of one type. Each batch then sorts every closed run of
+/// that type.
+///
 /// `?5` names the one type of the pass, or is `NULL` for every type. `?6`
 /// is a JSON array of the types that the pass leaves to their own pass.
 const CANDIDATES: &str = "\
     SELECT closed_at, exec_id, workflow_name FROM harvest_executions \
+    INDEXED BY idx_harvest_executions_closed \
     WHERE closed_at IS NOT NULL AND closed_at < ?1 \
       AND (closed_at, exec_id) > (?2, ?3) \
       AND state IN ('COMPLETED', 'FAILED', 'CANCELLED', 'TERMINATED', \

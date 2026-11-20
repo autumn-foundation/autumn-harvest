@@ -28,9 +28,9 @@ use autumn_harvest_plugin::{management_api_response_fields, management_api_route
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::Utc;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
@@ -232,7 +232,7 @@ async fn seed_event_under_key(pool: &DbPool, codecs: &PayloadCodecs, key_id: &st
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: json!({"user": "alice"}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,

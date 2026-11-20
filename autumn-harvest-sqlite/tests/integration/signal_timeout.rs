@@ -23,7 +23,7 @@ use std::time::Duration;
 use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::json;
 
 fn temp_db() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -71,7 +71,7 @@ async fn approval_gate(ctx: &WorkflowContext, _n: i64) -> Result<String, String>
 #[tokio::test]
 async fn wait_for_signal_timeout_signal_wins_completes_and_deletes_deadline_timer() {
     let (_dir, path) = temp_db();
-    let t0: DateTime<Utc> = DateTime::from_timestamp(3_000_000, 0).unwrap();
+    let t0: Timestamp = Timestamp::from_second(3_000_000).unwrap();
 
     let mut rt = SqliteRuntime::open(&path).unwrap();
     rt.register_workflow(&approval_gate_info());
@@ -98,7 +98,7 @@ async fn wait_for_signal_timeout_signal_wins_completes_and_deletes_deadline_time
     // COMPLETES. With the bug, this `.unwrap()` panicked on
     // `Err(Unsupported("Unknown"))` from the terminal drain.
     let state = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(1))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(1))
         .await
         .unwrap();
     assert!(
@@ -147,7 +147,7 @@ async fn wait_for_signal_timeout_signal_wins_completes_and_deletes_deadline_time
 async fn wait_for_signal_timeout_deadline_wins_returns_none() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&approval_gate_info());
-    let t0: DateTime<Utc> = DateTime::from_timestamp(3_000_000, 0).unwrap();
+    let t0: Timestamp = Timestamp::from_second(3_000_000).unwrap();
     let exec = rt.start_workflow("approval_gate", json!(0)).unwrap();
 
     // Block on the signal (timer not yet due).
@@ -160,7 +160,7 @@ async fn wait_for_signal_timeout_deadline_wins_returns_none() {
     // NO signal delivered. Drive past the deadline: the timer fires, the race
     // resolves to the timeout branch (None), and the workflow completes.
     let state = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(3601))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(3601))
         .await
         .unwrap();
     assert!(
@@ -201,7 +201,7 @@ fn event_pos(history: &[WorkflowEvent], pred: impl Fn(&WorkflowEvent) -> bool) -
 async fn late_signal_does_not_beat_expired_timeout() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&approval_gate_info());
-    let t0: DateTime<Utc> = DateTime::from_timestamp(3_000_000, 0).unwrap();
+    let t0: Timestamp = Timestamp::from_second(3_000_000).unwrap();
     let exec = rt.start_workflow("approval_gate", json!(0)).unwrap();
 
     // Block on the signal; the deadline is armed at t0 + 3600.
@@ -217,14 +217,14 @@ async fn late_signal_does_not_beat_expired_timeout() {
         exec,
         "approval",
         json!("late"),
-        t0 + chrono::Duration::seconds(3601),
+        t0 + jiff::SignedDuration::from_secs(3601),
     )
     .unwrap();
 
     // Drive past the deadline. The deadline expired at or before the signal
     // arrived, so the TIMEOUT wins — NOT the late signal.
     let state = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(3602))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(3602))
         .await
         .unwrap();
     assert!(
@@ -264,7 +264,7 @@ async fn on_time_signal_still_wins() {
     // not drive order.
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&approval_gate_info());
-    let t0: DateTime<Utc> = DateTime::from_timestamp(3_000_000, 0).unwrap();
+    let t0: Timestamp = Timestamp::from_second(3_000_000).unwrap();
     let exec = rt.start_workflow("approval_gate", json!(0)).unwrap();
 
     let state = rt.run_until_blocked_as_of(exec, t0).await.unwrap();
@@ -278,14 +278,14 @@ async fn on_time_signal_still_wins() {
         exec,
         "approval",
         json!("alice"),
-        t0 + chrono::Duration::seconds(10),
+        t0 + jiff::SignedDuration::from_secs(10),
     )
     .unwrap();
 
     // … but the run is only driven PAST the deadline. The on-time signal must
     // still win the approval.
     let state = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(3700))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(3700))
         .await
         .unwrap();
     assert!(
@@ -353,7 +353,7 @@ async fn receive_signal_timeout_signal_wins_with_trailing_activity_completes() {
             Ok(json!(input.as_i64().unwrap_or_default()))
         }),
     );
-    let t0: DateTime<Utc> = DateTime::from_timestamp(3_000_000, 0).unwrap();
+    let t0: Timestamp = Timestamp::from_second(3_000_000).unwrap();
     let exec = rt
         .start_workflow("typed_approval_then_work", json!(5))
         .unwrap();
@@ -370,7 +370,7 @@ async fn receive_signal_timeout_signal_wins_with_trailing_activity_completes() {
     // Signal wins; the teardown rides the SAME batch as the trailing activity's
     // dispatch. Pre-fix `apply_commands` rejected it as Unsupported.
     let state = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(1))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(1))
         .await
         .unwrap();
     assert!(

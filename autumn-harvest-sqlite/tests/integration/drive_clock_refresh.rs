@@ -1,7 +1,7 @@
 //! Regression tests for the public drivers re-reading the wall clock **once per
 //! decision cycle** (`run_until_blocked` / `poll_once`, issue #1069).
 //!
-//! The public `run_until_blocked` once captured `Utc::now()` a single time. It
+//! The public `run_until_blocked` once captured `Timestamp::now()` a single time. It
 //! reused that timestamp for every internal `drive_one_cycle`. A cycle can use real
 //! time, for example a 2-second activity body before a timer arms in a later cycle.
 //! That timer's absolute deadline then counted from the START of the outer call, not
@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use autumn_harvest::prelude::*;
 use autumn_harvest_sqlite::{ActivitySpec, RunState, SqliteRuntime};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 fn temp_db() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -82,7 +82,7 @@ async fn timer_armed_after_a_slow_activity_anchors_to_its_arm_cycle_not_call_sta
     let exec = rt.start_workflow("activity_then_timer", json!(7)).unwrap();
 
     // t0 = the instant the drive starts.
-    let t0: DateTime<Utc> = DateTime::from_timestamp(5_000_000, 0).unwrap();
+    let t0: Timestamp = Timestamp::from_second(5_000_000).unwrap();
 
     // Cycle 1 at t0: schedules + runs the activity (durable progress).
     assert!(
@@ -92,7 +92,7 @@ async fn timer_armed_after_a_slow_activity_anchors_to_its_arm_cycle_not_call_sta
 
     // ~2s of real time elapsed while the activity ran; cycle 2 at t0+2s arms the
     // timer. (Each `poll_once_as_of` drives exactly one cycle for the one run.)
-    let t_arm = t0 + chrono::Duration::seconds(2);
+    let t_arm = t0 + jiff::SignedDuration::from_secs(2);
     assert!(
         rt.poll_once_as_of(t_arm).await.unwrap(),
         "cycle 2 (arm timer) must make progress"
@@ -103,7 +103,7 @@ async fn timer_armed_after_a_slow_activity_anchors_to_its_arm_cycle_not_call_sta
     // overdue by the time it was actually armed.
     assert_eq!(
         timer_fire_at(&path, exec),
-        t_arm.timestamp_millis() + 1000,
+        t_arm.as_millisecond() + 1000,
         "timer must anchor to its true arm instant (t0+2s + 1s), not the drive's start"
     );
 
@@ -117,7 +117,7 @@ async fn timer_armed_after_a_slow_activity_anchors_to_its_arm_cycle_not_call_sta
 
     // At the true deadline (t0+3s) it fires and the run completes.
     let state = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(3))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(3))
         .await
         .unwrap();
     assert!(
@@ -139,9 +139,9 @@ async fn public_run_until_blocked_refreshes_the_clock_per_cycle() {
     let exec = rt.start_workflow("activity_then_timer", json!(7)).unwrap();
 
     // Advancing clock: read #1 (the activity cycle) returns t0. Every later read
-    // returns t0 + 2s. A once-captured `Utc::now()` would see t0 for the whole call.
-    let t0: DateTime<Utc> = DateTime::from_timestamp(6_000_000, 0).unwrap();
-    let two_s_later = t0 + chrono::Duration::seconds(2);
+    // returns t0 + 2s. A once-captured `Timestamp::now()` would see t0 for the whole call.
+    let t0: Timestamp = Timestamp::from_second(6_000_000).unwrap();
+    let two_s_later = t0 + jiff::SignedDuration::from_secs(2);
     let reads = Arc::new(AtomicUsize::new(0));
     let reads_for_clock = Arc::clone(&reads);
     rt.set_clock(move || {
@@ -170,7 +170,7 @@ async fn public_run_until_blocked_refreshes_the_clock_per_cycle() {
     // clock (t0+2s + 1s = t0+3s), NOT the call-start clock (t0+1s).
     assert_eq!(
         timer_fire_at(&path, exec),
-        two_s_later.timestamp_millis() + 1000,
+        two_s_later.as_millisecond() + 1000,
         "the timer's deadline must reflect the per-cycle (arm-instant) clock, not the call start"
     );
 
@@ -187,7 +187,7 @@ async fn public_run_until_blocked_refreshes_the_clock_per_cycle() {
 
     // And it still fires at its true deadline (t0+3s).
     let state = rt
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(3))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(3))
         .await
         .unwrap();
     assert!(
@@ -199,9 +199,9 @@ async fn public_run_until_blocked_refreshes_the_clock_per_cycle() {
 /// Read the clock, then wait one second on a timer, then read it again.
 #[workflow]
 async fn two_clock_reads(ctx: &WorkflowContext, _n: i64) -> Result<Vec<i64>, String> {
-    let first = ctx.system_now().timestamp_millis();
+    let first = ctx.system_now().as_millisecond();
     ctx.timer("pause", 1).await.map_err(|e| e.to_string())?;
-    Ok(vec![first, ctx.system_now().timestamp_millis()])
+    Ok(vec![first, ctx.system_now().as_millisecond()])
 }
 
 // A clock read takes the clock of its cycle, as the timers do (issue #2276).
@@ -214,8 +214,8 @@ async fn a_clock_read_takes_the_clock_of_its_cycle() {
     let mut rt = SqliteRuntime::open(&path).unwrap();
     rt.register_workflow(&two_clock_reads_info());
     let exec = rt.start_workflow("two_clock_reads", json!(0)).unwrap();
-    let t0: DateTime<Utc> = "2031-02-03T04:05:06Z".parse().unwrap();
-    let t1 = t0 + chrono::Duration::seconds(5);
+    let t0: Timestamp = "2031-02-03T04:05:06Z".parse().unwrap();
+    let t1 = t0 + jiff::SignedDuration::from_secs(5);
     assert!(matches!(
         rt.run_until_blocked_as_of(exec, t0).await.unwrap(),
         RunState::WaitingTimer
@@ -226,7 +226,7 @@ async fn a_clock_read_takes_the_clock_of_its_cycle() {
     };
     assert_eq!(
         output,
-        json!([t0.timestamp_millis(), t1.timestamp_millis()]),
+        json!([t0.as_millisecond(), t1.as_millisecond()]),
         "each read returns the clock of the cycle that made it"
     );
 }

@@ -30,8 +30,9 @@
 
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::throttle::{THROTTLE_FIRE_BATCH_SIZE, bucket_key, fire_due_throttled_starts};
-use chrono::{Duration as ChronoDuration, Utc};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::{SignedDuration, Timestamp};
+use jiff_diesel::ToDiesel;
 use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres;
 
@@ -177,7 +178,7 @@ async fn seed_throttle_row(
     throttle_key: &str,
     bkey: &str,
     workflow_id: &str,
-    deferred_at: chrono::DateTime<Utc>,
+    deferred_at: jiff::Timestamp,
 ) {
     diesel::sql_query(
         "INSERT INTO harvest_start_throttle \
@@ -189,7 +190,7 @@ async fn seed_throttle_row(
     .bind::<diesel::sql_types::Text, _>(throttle_key)
     .bind::<diesel::sql_types::Text, _>(bkey)
     .bind::<diesel::sql_types::Text, _>(workflow_id)
-    .bind::<diesel::sql_types::Timestamptz, _>(deferred_at)
+    .bind::<diesel::sql_types::Timestamptz, _>(deferred_at.to_diesel())
     .execute(conn)
     .await
     .expect("seed throttle row");
@@ -226,7 +227,7 @@ async fn claimed_batch_prelocks_bucket_keys_with_bounded_round_trips() {
     // (hot-tenant depth 2..5) get `deferred_at` far in the future of every
     // rn=1 row. They never displace a distinct key out of the claimed
     // batch.
-    let base = Utc::now() - ChronoDuration::hours(2);
+    let base = Timestamp::now() - SignedDuration::from_hours(2);
     for i in 0..N_KEYS {
         let throttle_key = format!("tenant-{i}");
         let key = bucket_key("throttled_flow", &throttle_key);
@@ -237,7 +238,7 @@ async fn claimed_batch_prelocks_bucket_keys_with_bounded_round_trips() {
             &throttle_key,
             &key,
             &format!("wf-{i}-0"),
-            base + ChronoDuration::seconds(i),
+            base + SignedDuration::from_secs(i),
         )
         .await;
         if i < HOT_KEYS {
@@ -248,7 +249,7 @@ async fn claimed_batch_prelocks_bucket_keys_with_bounded_round_trips() {
                     &throttle_key,
                     &key,
                     &format!("wf-{i}-{depth}"),
-                    base + ChronoDuration::seconds(10 * N_KEYS + i * 10 + depth),
+                    base + SignedDuration::from_secs(10 * N_KEYS + i * 10 + depth),
                 )
                 .await;
             }

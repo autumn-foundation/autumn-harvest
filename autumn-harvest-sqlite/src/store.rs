@@ -129,17 +129,12 @@ impl RunConfig {
     /// The timeout and the deadline that a workflow context gets, so
     /// `ctx.deadline()` reads the same values on a drive, an update and a
     /// query.
-    pub fn context_deadline(
-        &self,
-    ) -> (
-        Option<chrono::Duration>,
-        Option<chrono::DateTime<chrono::Utc>>,
-    ) {
+    pub fn context_deadline(&self) -> (Option<jiff::SignedDuration>, Option<jiff::Timestamp>) {
         (
             self.execution_timeout_ms
-                .and_then(chrono::Duration::try_milliseconds),
+                .map(jiff::SignedDuration::from_millis),
             self.deadline_at
-                .and_then(chrono::DateTime::from_timestamp_millis),
+                .map(autumn_harvest::time::from_millisecond_clamped),
         )
     }
 }
@@ -578,7 +573,7 @@ fn release_run(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<()> {
 /// The wall clock in epoch microseconds. A terminal write stores it as
 /// `closed_at` (issue #2027).
 fn now_micros() -> i64 {
-    chrono::Utc::now().timestamp_micros()
+    jiff::Timestamp::now().as_microsecond()
 }
 
 /// Store the start time, the memo and the search attributes of a new run

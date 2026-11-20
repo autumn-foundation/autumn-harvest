@@ -46,7 +46,7 @@ use std::any::TypeId;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::Value;
 
 use crate::context::{SharedState, WorkflowCommand, empty_shared_state};
@@ -280,7 +280,7 @@ impl std::fmt::Display for ReplayReport {
 /// # use autumn_harvest::testing::HistorySnapshot;
 /// # use autumn_harvest::types::ExecutionId;
 /// # use autumn_harvest::event::WorkflowEvent;
-/// # use chrono::Utc;
+/// # use jiff::Timestamp;
 /// # use serde_json::Value;
 /// let snapshot = HistorySnapshot {
 ///     workflow_name: "onboarding".to_string(),
@@ -288,7 +288,7 @@ impl std::fmt::Display for ReplayReport {
 ///     events: vec![
 ///         WorkflowEvent::WorkflowStarted {
 ///             input: Value::Null,
-///             timestamp: Utc::now(),
+///             timestamp: Timestamp::now(),
 ///             last_completion_result: None,
 ///             last_error: None,
 ///             scheduled_time: None,
@@ -339,13 +339,19 @@ pub struct HistorySnapshot {
         skip_serializing_if = "Option::is_none",
         with = "crate::history_export::opt_duration_millis"
     )]
-    pub execution_timeout: Option<chrono::Duration>,
+    pub execution_timeout: Option<jiff::SignedDuration>,
     /// The execution's live (pause/resume/redrive-shifted) absolute `deadline_at`
     /// (issue #772). When `Some`, the internal continue-as-new budget check reads
     /// this instead of the nominal `start + execution_timeout`. `None` (absent /
     /// legacy snapshot) falls back to no live deadline (the nominal is used).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// A `chrono` snapshot can hold a deadline past the jiff range, which
+    /// clamps on a read.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::time::serde_clamped::option::deserialize"
+    )]
+    pub deadline_at: Option<jiff::Timestamp>,
     /// The spawning parent's execution id (issue #698).
     ///
     /// It comes from the `harvest_workflow_executions.parent_id` column and
@@ -440,7 +446,7 @@ pub struct WorkflowReplayer {
     /// `WorkflowContext` (issue #772) so replays can exercise deadline-aware
     /// `continue_as_new`. `None` (the default) matches a workflow with no
     /// execution timeout.
-    execution_timeout: Option<chrono::Duration>,
+    execution_timeout: Option<jiff::SignedDuration>,
     /// Effective spawning-parent execution id threaded into the replayed
     /// `WorkflowContext` (issue #698). It lives in no `WorkflowEvent`, so a
     /// pure-history replay cannot recover it from the fixture alone. Set it
@@ -599,13 +605,13 @@ struct SampledExecution {
     shard_id: crate::types::ShardId,
     execution_id: crate::types::ExecutionId,
     workflow_name: String,
-    created_at: chrono::DateTime<chrono::Utc>,
+    created_at: jiff::Timestamp,
     context_headers: Option<serde_json::Value>,
     // Issue #772: per-execution deadline-aware CAN inputs, threaded into the
     // canary replay so the deadline branch is enabled and computed against the
     // row's own (pause/resume/redrive-shifted) deadline.
-    execution_timeout: Option<chrono::Duration>,
-    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    execution_timeout: Option<jiff::SignedDuration>,
+    deadline_at: Option<jiff::Timestamp>,
     // Issue #698: the sampled row's spawning-parent id (`parent_id` column),
     // threaded into the canary replay so a parent-aware child does not
     // false-report non-determinism.
@@ -678,7 +684,7 @@ impl WorkflowReplayer {
     /// fires on the deadline branch. A history that continued-as-new because
     /// of the deadline would then replay as a divergence.
     #[must_use]
-    pub const fn with_execution_timeout(mut self, execution_timeout: chrono::Duration) -> Self {
+    pub const fn with_execution_timeout(mut self, execution_timeout: jiff::SignedDuration) -> Self {
         self.execution_timeout = Some(execution_timeout);
         self
     }
@@ -1193,8 +1199,8 @@ impl WorkflowReplayer {
     async fn replay_from_snapshot_effective(
         &self,
         snapshot: HistorySnapshot,
-        execution_timeout: Option<chrono::Duration>,
-        deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+        execution_timeout: Option<jiff::SignedDuration>,
+        deadline_at: Option<jiff::Timestamp>,
         parent_execution_id: Option<ExecutionId>,
         workflow_id: Option<String>,
         // Issue #798: the execution's task queue, so a workflow branching on
@@ -1391,8 +1397,8 @@ impl WorkflowReplayer {
     async fn replay_canary_snapshot_effective(
         &self,
         snapshot: HistorySnapshot,
-        execution_timeout: Option<chrono::Duration>,
-        deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+        execution_timeout: Option<jiff::SignedDuration>,
+        deadline_at: Option<jiff::Timestamp>,
         parent_execution_id: Option<ExecutionId>,
         workflow_id: Option<String>,
         queue_name: Option<String>,
@@ -2144,10 +2150,10 @@ async fn query_running_executions(
     Vec<(
         uuid::Uuid,
         String,
-        chrono::DateTime<chrono::Utc>,
+        jiff::Timestamp,
         Option<serde_json::Value>,
-        Option<chrono::Duration>,
-        Option<chrono::DateTime<chrono::Utc>>,
+        Option<jiff::SignedDuration>,
+        Option<jiff::Timestamp>,
         Option<uuid::Uuid>,
         String,
         String,
@@ -2199,10 +2205,10 @@ async fn query_running_executions(
         .load::<(
             uuid::Uuid,
             String,
-            chrono::DateTime<chrono::Utc>,
+            crate::time::sql::SqlTimestamp,
             Option<serde_json::Value>,
-            Option<chrono::Duration>,
-            Option<chrono::DateTime<chrono::Utc>>,
+            Option<crate::time::sql::PgDuration>,
+            Option<crate::time::sql::SqlTimestamp>,
             Option<uuid::Uuid>,
             String,
             String,
@@ -2212,7 +2218,38 @@ async fn query_running_executions(
         .await
         .map_err(crate::error::database_error)?;
 
-    Ok(rows)
+    Ok(rows
+        .into_iter()
+        .map(
+            |(
+                exec_id,
+                name,
+                created,
+                headers,
+                timeout,
+                deadline,
+                parent,
+                business_id,
+                queue,
+                source,
+                continued_from,
+            )| {
+                (
+                    exec_id,
+                    name,
+                    created.to_jiff(),
+                    headers,
+                    timeout.map(|duration| duration.0),
+                    deadline.map(crate::time::sql::SqlTimestamp::to_jiff),
+                    parent,
+                    business_id,
+                    queue,
+                    source,
+                    continued_from,
+                )
+            },
+        )
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -2318,8 +2355,8 @@ pub struct ReplayCanaryReport {
 struct DbReplayMeta {
     workflow_name: String,
     headers: HashMap<String, String>,
-    execution_timeout: Option<chrono::Duration>,
-    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    execution_timeout: Option<jiff::SignedDuration>,
+    deadline_at: Option<jiff::Timestamp>,
     // Issue #698: the row's spawning-parent id (`parent_id` column), so
     // `replay_from_db` replays a parent-aware child deterministically.
     parent_execution_id: Option<ExecutionId>,
@@ -2370,8 +2407,8 @@ async fn load_workflow_name_and_headers(
     ): (
         String,
         Option<serde_json::Value>,
-        Option<chrono::Duration>,
-        Option<chrono::DateTime<chrono::Utc>>,
+        Option<crate::time::sql::PgDuration>,
+        Option<crate::time::sql::SqlTimestamp>,
         Option<uuid::Uuid>,
         String,
         String,
@@ -2406,8 +2443,8 @@ async fn load_workflow_name_and_headers(
     Ok(DbReplayMeta {
         workflow_name: name,
         headers,
-        execution_timeout,
-        deadline_at,
+        execution_timeout: execution_timeout.map(|duration| duration.0),
+        deadline_at: deadline_at.map(crate::time::sql::SqlTimestamp::to_jiff),
         // Issue #698: map the nullable `parent_id` into an `ExecutionId`.
         parent_execution_id: parent_uuid.map(ExecutionId::from_uuid),
         // Issue #698: the row's business `workflow_id`.
@@ -3992,7 +4029,7 @@ pub struct ReplayVerifier {
 #[derive(Debug, Clone, Default)]
 struct FixtureReplayDefaults {
     context_headers: HashMap<String, String>,
-    execution_timeout: Option<chrono::Duration>,
+    execution_timeout: Option<jiff::SignedDuration>,
     parent_execution_id: Option<ExecutionId>,
     /// Fallback start provenance for a fixture that omits it (issue #2082).
     start_provenance: crate::types::StartProvenance,
@@ -5293,7 +5330,7 @@ pub struct TestRunOutcome {
     state: SharedState,
     /// Construction-time `simulated_now` (= `WorkflowStarted` timestamp), used
     /// to compute `final_now()` and `elapsed()` (issue #526).
-    start_time: DateTime<Utc>,
+    start_time: Timestamp,
     /// Effective `execution_timeout` budget carried from the `WorkflowTestEnv`
     /// that produced this outcome (issue #772). `replay_check` re-applies it
     /// to its `WorkflowReplayer`, so the deadline branch is enabled during the
@@ -5301,7 +5338,7 @@ pub struct TestRunOutcome {
     /// `SideEffectRecorded{Now}` deadline probe is left unconsumed. It is then
     /// reported as a FALSE non-determinism. `None` (the default / no-timeout
     /// run) leaves the replayer's deadline branch off, matching the live run.
-    execution_timeout: Option<chrono::Duration>,
+    execution_timeout: Option<jiff::SignedDuration>,
     /// The spawning-parent execution id carried from the `WorkflowTestEnv` that
     /// produced this outcome (issue #698). `replay_check` re-applies it. So a
     /// **child** workflow whose command-affecting control flow branches on
@@ -5356,14 +5393,15 @@ pub struct TestRunOutcome {
 }
 
 /// The virtual clock after `events`: `start_time` plus the fired timer time.
-fn virtual_now(start_time: DateTime<Utc>, events: &[WorkflowEvent]) -> DateTime<Utc> {
+fn virtual_now(start_time: Timestamp, events: &[WorkflowEvent]) -> Timestamp {
     let total_secs: u64 = fired_timer_duration_secs(events);
-    start_time
-        + chrono::Duration::seconds(
-            i64::try_from(total_secs)
-                .unwrap_or(i64::MAX / 1000)
-                .min(i64::MAX / 1000),
-        )
+    let delta = jiff::SignedDuration::from_secs(
+        i64::try_from(total_secs)
+            .unwrap_or(i64::MAX / 1000)
+            .min(i64::MAX / 1000),
+    );
+    // A far timer saturates, so a "wait forever" timer never panics.
+    crate::time::checked_add_chrono_range(start_time, delta).unwrap_or(Timestamp::MAX)
 }
 
 /// Reconstruct the final virtual-clock elapsed (in seconds) from the durable
@@ -5489,7 +5527,7 @@ impl TestRunOutcome {
     /// `ctx.timer` path always fires and is always sequential. So the sum is
     /// unchanged from the earlier sum-of-durations model.
     #[must_use]
-    pub fn final_now(&self) -> DateTime<Utc> {
+    pub fn final_now(&self) -> Timestamp {
         virtual_now(self.start_time, &self.events)
     }
 
@@ -5497,7 +5535,7 @@ impl TestRunOutcome {
     ///
     /// Equivalent to `final_now() - start_time`.
     #[must_use]
-    pub fn elapsed(&self) -> chrono::Duration {
+    pub fn elapsed(&self) -> jiff::SignedDuration {
         self.final_now() - self.start_time
     }
 
@@ -5678,7 +5716,7 @@ pub struct WorkflowTestRun<'env> {
     handler: WorkflowHandlerFn,
     input: Value,
     exec_id: ExecutionId,
-    start_time: DateTime<Utc>,
+    start_time: Timestamp,
     history: Vec<WorkflowEvent>,
     /// Signals not yet in history. The next cycle ingests them at task-prep.
     pending_signals: Vec<(String, Value)>,
@@ -5710,7 +5748,7 @@ impl WorkflowTestRun<'_> {
     ///
     /// It is the start time plus the time of every timer that fired.
     #[must_use]
-    pub fn now(&self) -> DateTime<Utc> {
+    pub fn now(&self) -> Timestamp {
         virtual_now(self.start_time, self.events())
     }
 
@@ -6094,7 +6132,7 @@ pub struct WorkflowTestEnv {
     child_mocks: HashMap<String, MockFn>,
     /// Simulated wall-clock time.  Used as the `WorkflowStarted` timestamp so
     /// `ctx.now()` inside the workflow function is deterministic.
-    simulated_now: DateTime<Utc>,
+    simulated_now: Timestamp,
     /// Whether [`with_frozen_anchor`](Self::with_frozen_anchor) set the
     /// clock. A simulation run otherwise starts at a fixed time (issue #2033).
     anchor_frozen: bool,
@@ -6111,7 +6149,7 @@ pub struct WorkflowTestEnv {
     /// Simulated last-error for testing incremental scheduled jobs (issue #488).
     last_error: Option<String>,
     /// Simulated scheduled fire-time (logical slot) for testing scheduled workflows (issue #508).
-    scheduled_time: Option<chrono::DateTime<chrono::Utc>>,
+    scheduled_time: Option<jiff::Timestamp>,
     /// Metrics recorder injected into the `WorkflowContext` on each iteration.
     /// Defaults to `NoOpMetrics`; inject a counting recorder to assert that
     /// `ctx.metrics()` calls fire exactly once per logical occurrence.
@@ -6137,7 +6175,7 @@ pub struct WorkflowTestEnv {
     /// Effective `execution_timeout` budget threaded into the `WorkflowContext`
     /// (issue #772) so a run can exercise deadline-aware `should_continue_as_new`.
     /// `None` (the default) matches a workflow with no execution timeout.
-    execution_timeout: Option<chrono::Duration>,
+    execution_timeout: Option<jiff::SignedDuration>,
     /// Durable per-execution log policy (issue #790) threaded into the
     /// `WorkflowContext` this env builds. `None` (the default) reproduces a
     /// deployment with the durable sink DISABLED, so `ctx.log_*` records
@@ -6201,7 +6239,7 @@ impl WorkflowTestEnv {
             retry_sequences: HashMap::new(),
             seeded_mocks: HashMap::new(),
             child_mocks: HashMap::new(),
-            simulated_now: Utc::now(),
+            simulated_now: Timestamp::now(),
             anchor_frozen: false,
             queued_signals: Vec::new(),
             build_id: None,
@@ -6474,7 +6512,7 @@ impl WorkflowTestEnv {
     /// The clock still *advances* from `anchor` as durable timers fire
     /// (issue #526); this pins only its starting point.
     #[must_use]
-    pub const fn with_frozen_anchor(mut self, anchor: DateTime<Utc>) -> Self {
+    pub const fn with_frozen_anchor(mut self, anchor: Timestamp) -> Self {
         self.simulated_now = anchor;
         self.anchor_frozen = true;
         self
@@ -6510,7 +6548,7 @@ impl WorkflowTestEnv {
     ///
     /// Mirrors `ctx.scheduled_time()` in production scheduled runs (issue #508).
     #[must_use]
-    pub const fn with_scheduled_time(mut self, slot: chrono::DateTime<chrono::Utc>) -> Self {
+    pub const fn with_scheduled_time(mut self, slot: jiff::Timestamp) -> Self {
         self.scheduled_time = Some(slot);
         self
     }
@@ -6625,7 +6663,7 @@ impl WorkflowTestEnv {
     /// can then reason about deadline-aware continue-as-new inside a live
     /// test run.
     #[must_use]
-    pub const fn with_execution_timeout(mut self, execution_timeout: chrono::Duration) -> Self {
+    pub const fn with_execution_timeout(mut self, execution_timeout: jiff::SignedDuration) -> Self {
         self.execution_timeout = Some(execution_timeout);
         self
     }
@@ -6674,7 +6712,7 @@ impl WorkflowTestEnv {
     /// [`TestRunOutcome::final_now`]: crate::testing::TestRunOutcome::final_now
     /// [`TestRunOutcome::elapsed`]: crate::testing::TestRunOutcome::elapsed
     #[must_use]
-    pub const fn now(&self) -> DateTime<Utc> {
+    pub const fn now(&self) -> Timestamp {
         self.simulated_now
     }
 
@@ -6863,7 +6901,7 @@ impl WorkflowTestEnv {
         result: Result<Value, String>,
         events: Vec<WorkflowEvent>,
         exec_id: ExecutionId,
-        start_time: DateTime<Utc>,
+        start_time: Timestamp,
         side_output: RecordedSideOutput,
     ) -> TestRunOutcome {
         TestRunOutcome {
@@ -6918,7 +6956,7 @@ impl WorkflowTestEnv {
         pending_cmds: &[WorkflowCommand],
         mut history: Vec<WorkflowEvent>,
         exec_id: ExecutionId,
-        start_time: DateTime<Utc>,
+        start_time: Timestamp,
         side_output: RecordedSideOutput,
     ) -> TestRunOutcome {
         Self::record_terminal_pending_commands(pending_cmds, &mut history);
@@ -7123,7 +7161,7 @@ impl WorkflowTestEnv {
     }
 
     /// The fresh mock state of one run (issue #2033).
-    pub(crate) fn run_mocks(&self, seed: u64, start: DateTime<Utc>) -> RunMocks {
+    pub(crate) fn run_mocks(&self, seed: u64, start: Timestamp) -> RunMocks {
         RunMocks {
             call_counts: HashMap::new(),
             retry_sequences: self.retry_sequences.clone(),
@@ -7143,7 +7181,7 @@ pub(crate) struct RunMocks {
     /// The seed that a seeded mock derives its generator from.
     pub(crate) seed: u64,
     /// The start time of the run, which anchors the virtual clock.
-    pub(crate) start: DateTime<Utc>,
+    pub(crate) start: Timestamp,
 }
 
 /// What a deferred delivery resolves (issue #2033).
@@ -7998,7 +8036,7 @@ mod tests {
     use super::*;
     use crate::types::ActivityExecId;
     use crate::types::TimerId;
-    use chrono::Utc;
+    use jiff::Timestamp;
     use std::future::Future;
     use std::pin::Pin;
 
@@ -8095,6 +8133,18 @@ mod tests {
     }
 
     #[test]
+    fn virtual_now_saturates_a_fired_timer_past_the_jiff_range() {
+        let start = Timestamp::constant(1_700_000_000, 0);
+        let forever = [ts("forever", 400_000_000_000), tf("forever")];
+        assert_eq!(virtual_now(start, &forever), Timestamp::MAX);
+        let hour = [ts("hour", 3_600), tf("hour")];
+        assert_eq!(
+            virtual_now(start, &hour),
+            start + jiff::SignedDuration::from_hours(1)
+        );
+    }
+
+    #[test]
     fn fired_timer_duration_counts_only_fired_arms() {
         // Classic timer: every TimerStarted fires — sum unchanged.
         assert_eq!(
@@ -8187,7 +8237,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -8210,7 +8260,7 @@ mod tests {
     async fn simple_replay_succeeds() {
         let events = vec![WorkflowEvent::WorkflowStarted {
             input: serde_json::json!("hi"),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -8222,8 +8272,8 @@ mod tests {
 
     fn timed_out(events: &mut Vec<WorkflowEvent>) {
         events.push(WorkflowEvent::WorkflowExecutionTimedOut {
-            deadline: Utc::now(),
-            timed_out_at: Utc::now(),
+            deadline: Timestamp::now(),
+            timed_out_at: Timestamp::now(),
         });
     }
 
@@ -8308,7 +8358,7 @@ mod tests {
         let history = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -8551,7 +8601,7 @@ mod tests {
         let failed = vec![
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -8690,7 +8740,7 @@ mod tests {
             execution_id: ExecutionId::new(),
             events: vec![WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!({"order_id": 42}),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -8732,7 +8782,7 @@ mod tests {
                         crate::erase::ERASURE_TOMBSTONE_KEY,
                     ),
                 }),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -8769,7 +8819,7 @@ mod tests {
             execution_id: ExecutionId::new(),
             events: vec![WorkflowEvent::WorkflowStarted {
                 input: crate::erase::erasure_tombstone(),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,

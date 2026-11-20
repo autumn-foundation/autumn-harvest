@@ -30,7 +30,7 @@ use autumn_harvest::context::{
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::executor::{QueryReplayOutcome, drive_query_replay};
 use autumn_harvest::types::{ActivityExecId, ExecutionId, ExternalTarget, UpdateId};
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 
 // ── Test workflow handlers ────────────────────────────────────────────────
@@ -148,11 +148,11 @@ fn mutex_workflow<'a>(
 
 // ── History builders ──────────────────────────────────────────────────────
 
-const fn ts(offset_secs: i64) -> DateTime<Utc> {
-    DateTime::<Utc>::from_timestamp(1_750_000_000 + offset_secs, 0).expect("valid ts")
+const fn ts(offset_secs: i64) -> Timestamp {
+    Timestamp::constant(1_750_000_000 + offset_secs, 0)
 }
 
-const fn started_row(at: DateTime<Utc>) -> (DateTime<Utc>, WorkflowEvent) {
+const fn started_row(at: Timestamp) -> (Timestamp, WorkflowEvent) {
     (
         at,
         WorkflowEvent::WorkflowStarted {
@@ -165,14 +165,14 @@ const fn started_row(at: DateTime<Utc>) -> (DateTime<Utc>, WorkflowEvent) {
     )
 }
 
-fn events_of(rows: &[(DateTime<Utc>, WorkflowEvent)]) -> Vec<WorkflowEvent> {
+fn events_of(rows: &[(Timestamp, WorkflowEvent)]) -> Vec<WorkflowEvent> {
     rows.iter().map(|(_, e)| e.clone()).collect()
 }
 
 /// A benign trailing event, appended AFTER an awaitable's own scheduling event.
 /// So `last_event_at` differs from the scheduling timestamp. That proves
 /// `since` comes from the awaitable's own event, not the last-event fallback.
-fn marker_row(at: DateTime<Utc>) -> (DateTime<Utc>, WorkflowEvent) {
+fn marker_row(at: Timestamp) -> (Timestamp, WorkflowEvent) {
     (
         at,
         WorkflowEvent::MarkerRecorded {
@@ -196,7 +196,7 @@ const DRIVE_BUDGET: Duration = Duration::from_secs(5);
 /// Drives `handler` over `rows`, asserts the drive suspends, and projects the
 /// drained command buffer — the exact pipeline the endpoint composes.
 fn drive_and_project(
-    rows: &[(DateTime<Utc>, WorkflowEvent)],
+    rows: &[(Timestamp, WorkflowEvent)],
     handler: autumn_harvest::info::WorkflowHandlerFn,
 ) -> autumn_harvest::awaitables::AwaitablesProjection {
     let ctx = build_ctx(ExecutionId::new(), events_of(rows));
@@ -274,7 +274,7 @@ fn signal_timeout_race_folds_deadline_into_signal_awaitable() {
     assert_eq!(awaitable.name.as_deref(), Some("approval"));
     assert_eq!(
         awaitable.deadline,
-        Some(ts(10) + ChronoDuration::seconds(3600)),
+        Some(ts(10) + SignedDuration::from_secs(3600)),
         "the race deadline is the reserved timer's fire time"
     );
     assert_eq!(
@@ -345,7 +345,7 @@ fn unfired_timer_reports_deadline() {
     assert_eq!(awaitable.since, Some(ts(5)));
     assert_eq!(
         awaitable.deadline,
-        Some(ts(5) + ChronoDuration::seconds(300)),
+        Some(ts(5) + SignedDuration::from_secs(300)),
         "timer deadline = armed-at + duration"
     );
 }
@@ -807,7 +807,7 @@ fn history_only_external_activity_reports_deadline() {
     );
     assert_eq!(
         awaitable.deadline,
-        Some(ts(9) + ChronoDuration::seconds(86_400)),
+        Some(ts(9) + SignedDuration::from_secs(86_400)),
         "external activity deadline = awaiting-since + schedule_to_close"
     );
 }
@@ -1123,7 +1123,7 @@ fn external_activity_command_reports_external_with_deadline() {
     assert_eq!(awaitable.since, Some(ts(9)));
     assert_eq!(
         awaitable.deadline,
-        Some(ts(9) + ChronoDuration::seconds(86_400))
+        Some(ts(9) + SignedDuration::from_secs(86_400))
     );
 }
 
@@ -1240,7 +1240,7 @@ fn orphan_race_timer_falls_back_to_timer_awaitable() {
     assert_eq!(kinds_of(&projection.awaitables), vec![AwaitableKind::Timer]);
     assert_eq!(
         projection.awaitables[0].deadline,
-        Some(ts(10) + ChronoDuration::seconds(3600)),
+        Some(ts(10) + SignedDuration::from_secs(3600)),
         "the orphan race arm keeps its deadline"
     );
 }
@@ -1314,14 +1314,14 @@ fn duplicate_signal_race_waiters_each_keep_their_own_deadline() {
     );
     assert_eq!(
         projection.awaitables[0].deadline,
-        Some(ts(10) + ChronoDuration::seconds(60)),
+        Some(ts(10) + SignedDuration::from_secs(60)),
         "first waiter keeps the 60s deadline (armed at ts(10)): {:?}",
         projection.awaitables
     );
     assert_eq!(projection.awaitables[0].since, Some(ts(10)));
     assert_eq!(
         projection.awaitables[1].deadline,
-        Some(ts(20) + ChronoDuration::seconds(120)),
+        Some(ts(20) + SignedDuration::from_secs(120)),
         "second waiter keeps the 120s deadline (armed at ts(20)): {:?}",
         projection.awaitables
     );
@@ -1386,7 +1386,7 @@ fn child_timeout_race_folds_deadline_into_child_awaitable() {
     assert_eq!(awaitable.since, Some(ts(60)));
     assert_eq!(
         awaitable.deadline,
-        Some(ts(61) + ChronoDuration::seconds(600)),
+        Some(ts(61) + SignedDuration::from_secs(600)),
         "the child race deadline is the reserved timer's fire time"
     );
 }
@@ -1476,13 +1476,13 @@ fn duplicate_child_race_waiters_each_keep_their_own_deadline() {
     );
     assert_eq!(
         projection.awaitables[0].deadline,
-        Some(ts(11) + ChronoDuration::seconds(300)),
+        Some(ts(11) + SignedDuration::from_secs(300)),
         "first child waiter keeps the 300s deadline: {:?}",
         projection.awaitables
     );
     assert_eq!(
         projection.awaitables[1].deadline,
-        Some(ts(21) + ChronoDuration::seconds(600)),
+        Some(ts(21) + SignedDuration::from_secs(600)),
         "second child waiter keeps the 600s deadline: {:?}",
         projection.awaitables
     );
@@ -1523,7 +1523,7 @@ fn history_only_child_timeout_race_folds_deadline() {
     );
     assert_eq!(
         projection.awaitables[0].deadline,
-        Some(ts(61) + ChronoDuration::seconds(600))
+        Some(ts(61) + SignedDuration::from_secs(600))
     );
 }
 
@@ -1585,13 +1585,13 @@ fn history_only_duplicate_child_race_waiters_each_keep_their_own_deadline() {
     );
     assert_eq!(
         projection.awaitables[0].deadline,
-        Some(ts(11) + ChronoDuration::seconds(300)),
+        Some(ts(11) + SignedDuration::from_secs(300)),
         "first child waiter keeps the 300s deadline: {:?}",
         projection.awaitables
     );
     assert_eq!(
         projection.awaitables[1].deadline,
-        Some(ts(21) + ChronoDuration::seconds(600)),
+        Some(ts(21) + SignedDuration::from_secs(600)),
         "second child waiter keeps the 600s deadline (not collapsed): {:?}",
         projection.awaitables
     );
@@ -1737,7 +1737,7 @@ fn history_only_resolved_signal_race_closes_oldest_arm_by_recorded_order() {
     // the resolved waiter's 60s deadline ~half the time. The fix closes the
     // front-most `index.timer_order` arm. Loop many times to defeat the
     // per-HashMap seed and pin the RED reliably (issue #615).
-    let deadline_120s = ts(10) + ChronoDuration::seconds(120);
+    let deadline_120s = ts(10) + SignedDuration::from_secs(120);
     for _ in 0..1000 {
         let rows = vec![
             started_row(ts(0)),
@@ -1802,7 +1802,7 @@ fn history_only_resolved_child_race_closes_oldest_arm_by_recorded_order() {
     // pin the RED reliably (issue #615).
     let child_a = ExecutionId::new();
     let child_b = ExecutionId::new();
-    let deadline_600s = ts(11) + ChronoDuration::seconds(600);
+    let deadline_600s = ts(11) + SignedDuration::from_secs(600);
     for _ in 0..1000 {
         let rows = vec![
             started_row(ts(0)),

@@ -12,6 +12,7 @@
 //! suite starts a testcontainers Postgres 16.
 
 use autumn_harvest::schema::harvest_task_queue_ext;
+use jiff_diesel::ToDiesel;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -22,12 +23,13 @@ use autumn_harvest::prelude::*;
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
 use autumn_harvest::schema::{harvest_task_queue, harvest_workers, harvest_workflow_executions};
 use autumn_harvest::store;
+use autumn_harvest::time::sql::SqlTimestamp;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker};
 use autumn_harvest::{ExecutionId, ShardId};
 
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use uuid::Uuid;
 
 use crate::integration_e2e::{
@@ -282,7 +284,7 @@ async fn seed_workflow(conn: &mut AsyncPgConnection, queue: &str, activity: &str
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -293,7 +295,7 @@ async fn seed_workflow(conn: &mut AsyncPgConnection, queue: &str, activity: &str
     .expect("append WorkflowStarted");
     let mut params = EnqueueParams::new(queue, TaskType::Workflow, input);
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     queue::enqueue(conn, &params)
         .await
         .expect("enqueue workflow task");
@@ -307,7 +309,7 @@ struct ActivityRow {
     worker_id: Option<String>,
     attempt: i32,
     error: Option<String>,
-    scheduled_at: chrono::DateTime<Utc>,
+    scheduled_at: jiff::Timestamp,
 }
 
 async fn activity_row(url: &str, exec_id: ExecutionId) -> Option<ActivityRow> {
@@ -322,13 +324,7 @@ async fn activity_row(url: &str, exec_id: ExecutionId) -> Option<ActivityRow> {
             harvest_task_queue::error,
             harvest_task_queue::scheduled_at,
         ))
-        .first::<(
-            String,
-            Option<String>,
-            i32,
-            Option<String>,
-            chrono::DateTime<Utc>,
-        )>(&mut conn)
+        .first::<(String, Option<String>, i32, Option<String>, SqlTimestamp)>(&mut conn)
         .await
         .optional()
         .expect("load activity row")
@@ -338,7 +334,7 @@ async fn activity_row(url: &str, exec_id: ExecutionId) -> Option<ActivityRow> {
                 worker_id,
                 attempt,
                 error,
-                scheduled_at,
+                scheduled_at: scheduled_at.to_jiff(),
             },
         )
 }
@@ -356,7 +352,7 @@ async fn plant_claim(conn: &mut AsyncPgConnection, queue: &str, worker_id: &str)
             harvest_task_queue::state.eq("RUNNING"),
             harvest_task_queue::worker_id.eq(Some(worker_id)),
             harvest_task_queue::attempt.eq(1),
-            harvest_task_queue::started_at.eq(Some(Utc::now())),
+            harvest_task_queue::started_at.eq(Some(Timestamp::now()).to_diesel()),
         ))
         .execute(conn)
         .await
@@ -503,7 +499,7 @@ async fn release_abandoned_claim_requeues_the_claim_and_is_fenced() {
     let started_at = task.started_at.expect("a claimed row has started_at");
     // A re-claim after a release that restored `attempt` has the same epoch
     // but a new `started_at`.
-    let reclaimed = started_at - chrono::Duration::milliseconds(1);
+    let reclaimed = started_at - jiff::SignedDuration::from_millis(1);
     for (stale, stamp) in [
         (
             queue::TaskClaim::new(task.id, "another-worker", task.attempt),
@@ -576,9 +572,10 @@ async fn drain_stops_keeping_the_lease_once_the_claim_is_lost() {
         harvest_workers::table
             .find(&worker_a)
             .select(harvest_workers::last_heartbeat_at)
-            .first::<chrono::DateTime<Utc>>(conn)
+            .first::<SqlTimestamp>(conn)
             .await
             .expect("load the worker row")
+            .to_jiff()
     };
     let before = beat(&mut conn).await;
     tokio::time::sleep(Duration::from_secs(2)).await;

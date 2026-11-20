@@ -140,7 +140,7 @@ pub trait PayloadStore: Send + Sync + 'static {
     fn list(
         &self,
         prefix: &str,
-        created_before: chrono::DateTime<chrono::Utc>,
+        created_before: jiff::Timestamp,
         cursor: Option<&str>,
     ) -> Option<PayloadStoreFuture<'_, BlobPage>> {
         let _ = (prefix, created_before, cursor);
@@ -160,7 +160,7 @@ pub trait PayloadStore: Send + Sync + 'static {
     fn delete_if_older(
         &self,
         key: &str,
-        created_before: chrono::DateTime<chrono::Utc>,
+        created_before: jiff::Timestamp,
     ) -> Option<PayloadStoreFuture<'_, bool>> {
         let _ = (key, created_before);
         None
@@ -173,7 +173,7 @@ pub struct StoredBlob {
     /// The key that [`PayloadStore::put`] returned.
     pub key: String,
     /// The time of the latest write of the key.
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: jiff::Timestamp,
 }
 
 /// One page of a [`PayloadStore::list`] result (issue #2123).
@@ -235,7 +235,7 @@ impl PayloadStore for CountingStore {
     fn list(
         &self,
         prefix: &str,
-        created_before: chrono::DateTime<chrono::Utc>,
+        created_before: jiff::Timestamp,
         cursor: Option<&str>,
     ) -> Option<PayloadStoreFuture<'_, BlobPage>> {
         self.inner.list(prefix, created_before, cursor)
@@ -244,7 +244,7 @@ impl PayloadStore for CountingStore {
     fn delete_if_older(
         &self,
         key: &str,
-        created_before: chrono::DateTime<chrono::Utc>,
+        created_before: jiff::Timestamp,
     ) -> Option<PayloadStoreFuture<'_, bool>> {
         self.inner.delete_if_older(key, created_before)
     }
@@ -607,7 +607,7 @@ mod tests {
     #[test]
     fn a_store_cannot_list_by_default() {
         let store = MemStore::new();
-        assert!(store.list("", chrono::Utc::now(), None).is_none());
+        assert!(store.list("", jiff::Timestamp::now(), None).is_none());
     }
 
     /// A counting copy counts the blobs it uploads and nothing else.

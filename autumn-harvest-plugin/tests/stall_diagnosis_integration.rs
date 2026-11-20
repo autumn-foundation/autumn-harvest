@@ -29,6 +29,7 @@
 
 #![allow(clippy::too_many_lines)]
 
+use jiff_diesel::ToDiesel;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -52,11 +53,11 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{TimeZone, Utc};
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -612,7 +613,7 @@ fn started_event() -> WorkflowEvent {
     WorkflowEvent::WorkflowStarted {
         input: Value::Null,
         // Deliberately ancient: proves `health` is never derived from event age.
-        timestamp: Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap(),
+        timestamp: autumn_harvest::time::utc_ymd_hms(2020, 1, 1, 0, 0, 0).unwrap(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -880,7 +881,7 @@ async fn ac5_organically_tripped_circuit_reports_a_derived_cooldown_until() {
     // in which this process's breaker is the one that gates dispatch.
     seed_live_worker(&pool, LOCAL_WORKER_ID, "payments").await;
 
-    let before = Utc::now();
+    let before = Timestamp::now();
     let body = diagnose(&app, exec_id).await;
     assert_eq!(kind(&body), "activity_circuit_open", "body: {body}");
     assert_eq!(
@@ -897,11 +898,11 @@ async fn ac5_organically_tripped_circuit_reports_a_derived_cooldown_until() {
     let cooldown = body["blocked_on"]["cooldown_until"]
         .as_str()
         .unwrap_or_else(|| panic!("an organically tripped breaker must carry a cooldown: {body}"));
-    let parsed = chrono::DateTime::parse_from_rfc3339(cooldown)
-        .unwrap_or_else(|e| panic!("cooldown_until must be RFC3339 ({e}): {cooldown}"))
-        .with_timezone(&Utc);
+    let parsed = cooldown
+        .parse::<Timestamp>()
+        .unwrap_or_else(|e| panic!("cooldown_until must be RFC3339 ({e}): {cooldown}"));
     assert!(
-        parsed > before && parsed <= before + chrono::Duration::seconds(31),
+        parsed > before && parsed <= before + jiff::SignedDuration::from_secs(31),
         "cooldown must land inside the policy's 30s window: {parsed} vs {before}"
     );
 }
@@ -1970,7 +1971,7 @@ async fn overdue_timer_still_wins_after_a_queue_pause_resume_shift() {
     // Already overdue by 2 hours before the pause ever starts -- the same
     // shape a real hours-long operator pause leaves behind once dispatch
     // catches up.
-    let fires_at = Utc::now() - chrono::Duration::hours(2);
+    let fires_at = Timestamp::now() - jiff::SignedDuration::from_hours(2);
     {
         let mut conn = pool.get().await.expect("pooled conn");
         diesel::sql_query(
@@ -2012,7 +2013,7 @@ async fn overdue_timer_still_wins_after_a_queue_pause_resume_shift() {
         )
         .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
         .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-        .bind::<diesel::sql_types::Timestamptz, _>(fires_at)
+        .bind::<diesel::sql_types::Timestamptz, _>(fires_at.to_diesel())
         .execute(&mut conn)
         .await
         .expect("seed the timer");
@@ -2054,9 +2055,11 @@ async fn overdue_timer_still_wins_after_a_queue_pause_resume_shift() {
 #[derive(diesel::QueryableByName)]
 struct ScheduledAtAndTimerFiresAt {
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    scheduled_at: chrono::DateTime<Utc>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::SqlTimestamp)]
+    scheduled_at: jiff::Timestamp,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    timer_fires_at: Option<chrono::DateTime<Utc>>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+    timer_fires_at: Option<jiff::Timestamp>,
 }
 
 /// Issue #1402. A row already armed by `reschedule_task` before the
@@ -2080,7 +2083,7 @@ async fn migration_backfill_lets_a_pre_existing_armed_timer_survive_a_later_resu
 
     let exec_id = seed_execution(&pool, "timer_wf", "RUNNING", vec![started_event()]).await;
     let task_id = Uuid::new_v4();
-    let fires_at = Utc::now() - chrono::Duration::hours(2);
+    let fires_at = Timestamp::now() - jiff::SignedDuration::from_hours(2);
     {
         let mut conn = pool.get().await.expect("pooled conn");
 
@@ -2098,7 +2101,7 @@ async fn migration_backfill_lets_a_pre_existing_armed_timer_survive_a_later_resu
         )
         .bind::<diesel::sql_types::Uuid, _>(task_id)
         .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-        .bind::<diesel::sql_types::Timestamptz, _>(fires_at)
+        .bind::<diesel::sql_types::Timestamptz, _>(fires_at.to_diesel())
         .execute(&mut conn)
         .await
         .expect("seed a pre-migration-shaped armed row");
@@ -2118,7 +2121,7 @@ async fn migration_backfill_lets_a_pre_existing_armed_timer_survive_a_later_resu
         )
         .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
         .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-        .bind::<diesel::sql_types::Timestamptz, _>(fires_at)
+        .bind::<diesel::sql_types::Timestamptz, _>(fires_at.to_diesel())
         .execute(&mut conn)
         .await
         .expect("seed the timer");
@@ -2144,7 +2147,7 @@ async fn migration_backfill_lets_a_pre_existing_armed_timer_survive_a_later_resu
         // Compared against the row's own stored `scheduled_at`, not the
         // Rust-side `fires_at` the row was seeded from. Postgres
         // `TIMESTAMPTZ` rounds to microseconds, one step coarser than
-        // `chrono`'s nanosecond value. The two never compare equal
+        // the nanosecond value of `jiff`. The two never compare equal
         // directly, even though the backfill copied one from the other.
         assert_eq!(
             row.timer_fires_at,

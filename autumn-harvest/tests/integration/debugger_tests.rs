@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 // ── fixtures ────────────────────────────────────────────────────────────────
 
 fn started() -> WorkflowEvent {
-    WorkflowEvent::workflow_started(json!({}), chrono::Utc::now())
+    WorkflowEvent::workflow_started(json!({}), jiff::Timestamp::now())
 }
 
 fn scheduled(id: ActivityExecId, name: &str) -> WorkflowEvent {
@@ -2155,7 +2155,7 @@ async fn a_signal_park_opens_a_signal_awaitable() {
             "wf",
             vec![WorkflowEvent::workflow_started(
                 serde_json::json!({}),
-                chrono::Utc::now(),
+                jiff::Timestamp::now(),
             )],
         ))
         .await

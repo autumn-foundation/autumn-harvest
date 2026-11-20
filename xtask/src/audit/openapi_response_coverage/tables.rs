@@ -186,6 +186,33 @@ pub const FIELD_KEEPING: &[&str] = &[
 pub const KNOWN_DESERIALIZERS: &[(&str, &str)] =
     &[("deserialize_tristate", r"Option<\s*Option<.+>\s*>")];
 
+/// Field deserializers of `autumn_harvest`, trusted by their full path.
+///
+/// Each one reads the JSON form of the declared type, so the audit reads
+/// the field as if it had no `deserialize_with`. They read the text that
+/// `chrono` read (ADR 0018). The attribute must name the full path, and the
+/// field must have the type that the entry accepts.
+/// `trusted_deserializers_exist` checks that each function exists with its
+/// result type.
+pub const TRUSTED_DESERIALIZERS: &[(&str, &str)] = &[
+    (
+        "autumn_harvest::time::parse::de::required",
+        r"(?:jiff::)?Timestamp",
+    ),
+    (
+        "autumn_harvest::time::parse::de::optional",
+        r"Option<\s*(?:jiff::)?Timestamp\s*>",
+    ),
+    (
+        "autumn_harvest::time::parse::de::tristate",
+        r"Option<\s*Option<\s*(?:jiff::)?Timestamp\s*>\s*>",
+    ),
+    (
+        "autumn_harvest::time::parse::de::dates",
+        r"Vec<\s*(?:jiff::)?civil::Date\s*>",
+    ),
+];
+
 /// The `OpenAPI` type of each Rust scalar that a query struct uses.
 ///
 /// The audit reports an unlisted type. It does not guess one. A type from

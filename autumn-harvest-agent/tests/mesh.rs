@@ -1499,8 +1499,8 @@ async fn a_zero_peer_cap_is_an_exhausted_budget() {
 // Test-quality gaps from review.
 
 /// A wall-clock instant `seconds` from now, to fire a durable timer early.
-fn later(seconds: i64) -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc::now() + chrono::Duration::seconds(seconds)
+fn later(seconds: i64) -> jiff::Timestamp {
+    jiff::Timestamp::now() + jiff::SignedDuration::from_secs(seconds)
 }
 
 // AC3, AC6: a child that a woken follow-up segment starts is read-only.

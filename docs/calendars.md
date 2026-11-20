@@ -150,17 +150,17 @@ Pure functions are available without the `db` feature:
 ```rust
 use autumn_harvest::calendar::{apply_skip_policy, calendar_excludes_weekends};
 use autumn_harvest::policy::SkipPolicy;
-use chrono::NaiveDate;
+use jiff::civil::date;
 
 let excluded = vec![
-    NaiveDate::from_ymd_opt(2026, 1, 19).unwrap(), // MLK Day
+    date(2026, 1, 19), // MLK Day
 ];
 
 // The scheduler derives this flag from the calendar name.
 let exclude_weekends = calendar_excludes_weekends("us-federal-holidays");
 assert!(!exclude_weekends);
 
-let fire_date = NaiveDate::from_ymd_opt(2026, 1, 19).unwrap();
+let fire_date = date(2026, 1, 19);
 
 // Returns None → skip
 assert!(apply_skip_policy(fire_date, SkipPolicy::Skip, &excluded, exclude_weekends).is_none());
@@ -172,7 +172,7 @@ let next = apply_skip_policy(
     &excluded,
     exclude_weekends,
 );
-assert_eq!(next, NaiveDate::from_ymd_opt(2026, 1, 20));
+assert_eq!(next, Some(date(2026, 1, 20)));
 ```
 
 Pass `calendar_excludes_weekends(name)` as the fourth argument to match the scheduler.

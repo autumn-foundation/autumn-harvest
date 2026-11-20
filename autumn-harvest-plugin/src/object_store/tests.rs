@@ -27,7 +27,7 @@ fn sample_doc(execution_id: ExecutionId) -> HistoryExportDocument {
         events: vec![WorkflowEvent::WorkflowCompleted {
             output: serde_json::json!({ "secret": MARKER }),
         }],
-        exported_at: chrono::Utc::now(),
+        exported_at: jiff::Timestamp::now(),
         payload_policy: HistoryPayloadPolicy::Full,
         max_bytes: Some(usize::MAX),
         context_headers: None,

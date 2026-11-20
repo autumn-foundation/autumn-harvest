@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use jiff::Timestamp;
 use redis::aio::ConnectionManager;
 use redis::streams::{
     StreamClaimReply, StreamPendingCountReply, StreamReadOptions, StreamReadReply,
@@ -37,7 +37,7 @@ use redis::{AsyncCommands, RedisError, Script};
 use uuid::Uuid;
 
 use crate::adapter::{ClaimedTask, TaskQueueAdapter};
-use crate::envelope::{EnqueueParams, TaskEnvelope};
+use crate::envelope::{EnqueueParams, TaskEnvelope, due_after};
 use crate::error::{RedisAdapterError, RedisAdapterResult};
 use crate::naming::{dlq_key, scheduled_payloads_key, scheduled_zset_key, stream_key};
 
@@ -239,7 +239,7 @@ impl RedisTaskQueue {
         // A group created after the entries land starts above them, so it
         // never reads them.
         self.ensure_group(queue_name).await?;
-        let now_ms = Utc::now().timestamp_millis();
+        let now_ms = Timestamp::now().as_millisecond();
         let mut conn = self.conn.clone();
         let promoted: i64 = self
             .promote_script
@@ -380,7 +380,7 @@ impl RedisTaskQueue {
         let payload = envelope.to_payload()?;
         let zset = self.zset_key(&envelope.queue_name);
         let payloads = self.payloads_key(&envelope.queue_name);
-        let score = envelope.scheduled_at.timestamp_millis();
+        let score = envelope.scheduled_at.as_millisecond();
         let task_id = envelope.task_id.to_string();
         let mut conn = self.conn.clone();
         // Pipeline so the ZADD and HSET land atomically (or at least without
@@ -507,7 +507,7 @@ impl TaskQueueAdapter for RedisTaskQueue {
     async fn enqueue(&self, params: EnqueueParams) -> RedisAdapterResult<Uuid> {
         let task_id = Uuid::new_v4();
         let envelope = TaskEnvelope::from_params(params, task_id)?;
-        if envelope.scheduled_at <= Utc::now() {
+        if envelope.scheduled_at <= Timestamp::now() {
             self.enqueue_immediate(&envelope).await?;
         } else {
             self.enqueue_delayed(&envelope).await?;
@@ -549,11 +549,9 @@ impl TaskQueueAdapter for RedisTaskQueue {
         // same task_id so consumers and DLQ records stay correlated across
         // attempts.
         self.ack(&task.envelope.queue_name, &task.entry_id).await?;
-        let chrono_delay = chrono::Duration::from_std(delay)
-            .map_err(|e| RedisAdapterError::DurationOutOfRange(format!("retry delay: {e}")))?;
         let mut next = task.envelope.clone();
-        next.scheduled_at = Utc::now() + chrono_delay;
-        if next.scheduled_at <= Utc::now() {
+        next.scheduled_at = due_after(Timestamp::now(), delay, "retry delay")?;
+        if next.scheduled_at <= Timestamp::now() {
             self.enqueue_immediate(&next).await
         } else {
             self.enqueue_delayed(&next).await

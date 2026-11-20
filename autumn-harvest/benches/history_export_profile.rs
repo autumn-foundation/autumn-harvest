@@ -70,15 +70,15 @@ fn build_request(
         shard_id: 0,
         state: "COMPLETED".to_string(),
         events,
-        exported_at: chrono::Utc::now(),
+        exported_at: jiff::Timestamp::now(),
         payload_policy: HistoryPayloadPolicy::Full,
         // Archival always exports with no ceiling (`retention.rs` passes
         // `Some(usize::MAX)`), so `measure_export_bytes` is never short
         // circuited by an early size-limit rejection.
         max_bytes: Some(usize::MAX),
         context_headers: None,
-        execution_timeout: Some(chrono::Duration::hours(24)),
-        deadline_at: Some(chrono::Utc::now() + chrono::Duration::hours(24)),
+        execution_timeout: Some(jiff::SignedDuration::from_hours(24)),
+        deadline_at: Some(jiff::Timestamp::now() + jiff::SignedDuration::from_hours(24)),
         start_provenance: None,
         parent_execution_id: None,
     }

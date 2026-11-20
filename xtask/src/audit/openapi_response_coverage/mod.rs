@@ -151,8 +151,9 @@
 //! its wire name or any alias. Any other serde attribute, on the struct or
 //! on a field, is a check 7 finding. The audit cannot read the wire layout
 //! it makes. A field `deserialize_with` is read only when
-//! `KNOWN_DESERIALIZERS` models it. A new custom deserializer must be added
-//! to that table, or its field is a finding.
+//! `KNOWN_DESERIALIZERS` or `TRUSTED_DESERIALIZERS` models it. A new custom
+//! deserializer must be added to one of those tables, or its field is a
+//! finding.
 //!
 //! Check 7 stops the audit from skipping what it cannot read. A
 //! `from_slice` call it cannot read is a finding. So is a body type it
@@ -932,6 +933,65 @@ mod tests {
         let mut sorted = listed.clone();
         sorted.sort_unstable();
         assert_eq!(keys, sorted);
+    }
+
+    #[test]
+    fn trusted_deserializers_exist() {
+        let source = std::fs::read_to_string(
+            crate::util::repo_root().join("autumn-harvest/src/time/parse.rs"),
+        )
+        .expect("read the parse module");
+        let results = [
+            ("required", "Timestamp"),
+            ("optional", "Option<Timestamp>"),
+            ("tristate", "Option<Option<Timestamp>>"),
+            ("dates", "Vec<civil::Date>"),
+        ];
+        for (path, _) in tables::TRUSTED_DESERIALIZERS {
+            let name = path.rsplit("::").next().expect("a path segment");
+            let (_, result) = results
+                .iter()
+                .find(|(listed, _)| *listed == name)
+                .unwrap_or_else(|| panic!("{path} has no expected result type"));
+            let compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+            let start = compact
+                .find(&format!("pubfn{name}<'de,D:Deserializer<'de>>"))
+                .unwrap_or_else(|| panic!("{path} is missing from time/parse.rs"));
+            let tail = &compact[start..];
+            assert!(
+                tail.contains(&format!("->Result<{result},D::Error>")),
+                "{path} does not return Result<{result}, D::Error>"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trusted_deserializer_reads_only_its_declared_type() {
+        let required = "autumn_harvest::time::parse::de::required";
+        assert!(serde::modeled_deserializer(
+            Some(required),
+            "jiff::Timestamp"
+        ));
+        assert!(serde::modeled_deserializer(Some(required), "Timestamp"));
+        assert!(!serde::modeled_deserializer(
+            Some(required),
+            "Option<jiff::Timestamp>"
+        ));
+        let optional = "autumn_harvest::time::parse::de::optional";
+        assert!(serde::modeled_deserializer(
+            Some(optional),
+            "Option<jiff::Timestamp>"
+        ));
+        assert!(!serde::modeled_deserializer(Some(optional), "String"));
+        let dates = "autumn_harvest::time::parse::de::dates";
+        assert!(serde::modeled_deserializer(
+            Some(dates),
+            "Vec<jiff::civil::Date>"
+        ));
+        assert!(!serde::modeled_deserializer(
+            Some("time::parse::de::dates"),
+            "Vec<jiff::civil::Date>"
+        ));
     }
 
     #[test]

@@ -179,7 +179,7 @@ async fn token(State(idp): State<Idp>, Form(form): Form<HashMap<String, String>>
         Ok(plan) => plan,
         Err(reason) => return (StatusCode::BAD_REQUEST, reason).into_response(),
     };
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
     let mut claims = json!({
         "iss": idp.issuer,
         "sub": "user-42",
@@ -683,7 +683,7 @@ pub async fn a_token_with_a_wrong_nonce_is_refused(backend: &impl OidcBackend) {
 
 pub async fn an_expired_id_token_is_refused(backend: &impl OidcBackend) {
     let idp = start_idp().await;
-    let past = chrono::Utc::now().timestamp() - 600;
+    let past = jiff::Timestamp::now().as_second() - 600;
     set_claims(
         &idp,
         json!({ "groups": ["harvest-admins"], "exp": past, "iat": past - 300 }),

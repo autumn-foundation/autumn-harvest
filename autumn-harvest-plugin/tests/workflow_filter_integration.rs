@@ -7,6 +7,7 @@
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
 use autumn_harvest::table_split::SetExt;
+use jiff_diesel::ToDiesel;
 use std::collections::BTreeMap;
 
 use autumn_harvest::schema::harvest_workflow_executions;
@@ -581,7 +582,7 @@ async fn sse_stream_resume_after_migration_uses_the_translated_event_id_cursor()
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("COMPLETED".to_string()),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut target)
         .await
@@ -857,10 +858,10 @@ async fn workflow_list_filter_nd_blocked() {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
         .await
         .expect("failed to connect to stamp nd-block columns");
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     diesel::update(harvest_workflow_executions::table.find(blocked.as_uuid()))
         .set((
-            harvest_workflow_executions::nd_blocked_at.eq(Some(now)),
+            harvest_workflow_executions::nd_blocked_at.eq(Some(now).to_diesel()),
             SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(Some(
                 "non-deterministic replay: activity mismatch".to_string(),
             ))),
@@ -872,7 +873,7 @@ async fn workflow_list_filter_nd_blocked() {
     diesel::update(harvest_workflow_executions::table.find(stale.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("CANCELLED"),
-            harvest_workflow_executions::nd_blocked_at.eq(Some(now)),
+            harvest_workflow_executions::nd_blocked_at.eq(Some(now).to_diesel()),
             SetExt(
                 harvest_workflow_executions_ext::nd_block_reason
                     .eq(Some("non-deterministic replay: timer mismatch".to_string())),
@@ -911,17 +912,13 @@ async fn workflow_list_filter_nd_blocked() {
 
 /// Stamp `created_at` directly on an already-inserted execution so tests can
 /// control insertion order without relying on `NOW()` timing.
-async fn set_created_at(
-    database_url: &str,
-    exec_id: ExecutionId,
-    ts: chrono::DateTime<chrono::Utc>,
-) {
+async fn set_created_at(database_url: &str, exec_id: ExecutionId, ts: jiff::Timestamp) {
     use diesel::ExpressionMethods;
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
         .expect("failed to connect for set_created_at");
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-        .set(harvest_workflow_executions::created_at.eq(ts))
+        .set(harvest_workflow_executions::created_at.eq(ts.to_diesel()))
         .execute(&mut conn)
         .await
         .expect("set_created_at should succeed");
@@ -960,9 +957,7 @@ async fn workflow_list_started_after_before_filters_are_applied() {
     let new_wf = seed_workflow(&database_url, ShardId::new(0), "billing", "wf-new", None).await;
 
     // Back-date wf-old to 2025.
-    let old_ts = chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
+    let old_ts = "2025-01-01T00:00:00Z".parse::<jiff::Timestamp>().unwrap();
     set_created_at(&database_url, old, old_ts).await;
 
     // Also stamp started_at so the filter on started_at works.
@@ -971,7 +966,7 @@ async fn workflow_list_started_after_before_filters_are_applied() {
             .await
             .unwrap();
         diesel::update(harvest_workflow_executions::table.find(old.as_uuid()))
-            .set(harvest_workflow_executions::started_at.eq(old_ts))
+            .set(harvest_workflow_executions::started_at.eq(old_ts.to_diesel()))
             .execute(&mut conn)
             .await
             .unwrap();
@@ -1068,8 +1063,7 @@ async fn workflow_list_pagination_returns_envelope() {
         )
         .await;
         let ts =
-            chrono::DateTime::from_timestamp(1_750_000_000 + i64::try_from(i).unwrap() * 10, 0)
-                .unwrap();
+            jiff::Timestamp::from_second(1_750_000_000 + i64::try_from(i).unwrap() * 10).unwrap();
         set_created_at(&database_url, exec_id, ts).await;
     }
 
@@ -1127,8 +1121,7 @@ async fn workflow_list_pagination_asc_order() {
         )
         .await;
         let ts =
-            chrono::DateTime::from_timestamp(1_750_000_000 + i64::try_from(i).unwrap() * 10, 0)
-                .unwrap();
+            jiff::Timestamp::from_second(1_750_000_000 + i64::try_from(i).unwrap() * 10).unwrap();
         set_created_at(&database_url, exec_id, ts).await;
     }
 
@@ -1178,8 +1171,7 @@ async fn workflow_list_pagination_keyset_stability_under_concurrent_inserts() {
         )
         .await;
         let ts =
-            chrono::DateTime::from_timestamp(1_700_000_000 + i64::try_from(i).unwrap() * 10, 0)
-                .unwrap();
+            jiff::Timestamp::from_second(1_700_000_000 + i64::try_from(i).unwrap() * 10).unwrap();
         set_created_at(&database_url, exec_id, ts).await;
     }
 
@@ -1202,8 +1194,7 @@ async fn workflow_list_pagination_keyset_stability_under_concurrent_inserts() {
             None,
         )
         .await;
-        let ts =
-            chrono::DateTime::from_timestamp(2_000_000_000 + i64::try_from(i).unwrap(), 0).unwrap();
+        let ts = jiff::Timestamp::from_second(2_000_000_000 + i64::try_from(i).unwrap()).unwrap();
         set_created_at(&database_url, exec_id, ts).await;
     }
 
@@ -1246,7 +1237,7 @@ async fn workflow_list_pagination_sharded_global_order() {
         set_created_at(
             &shard0_url,
             exec_id,
-            chrono::DateTime::from_timestamp(base_ts + i64::try_from(i).unwrap() * 20, 0).unwrap(),
+            jiff::Timestamp::from_second(base_ts + i64::try_from(i).unwrap() * 20).unwrap(),
         )
         .await;
     }
@@ -1262,8 +1253,7 @@ async fn workflow_list_pagination_sharded_global_order() {
         set_created_at(
             &shard1_url,
             exec_id,
-            chrono::DateTime::from_timestamp(base_ts + 10 + i64::try_from(i).unwrap() * 20, 0)
-                .unwrap(),
+            jiff::Timestamp::from_second(base_ts + 10 + i64::try_from(i).unwrap() * 20).unwrap(),
         )
         .await;
     }

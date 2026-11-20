@@ -16,7 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 /// File name of the per-session record, written inside the session directory.
@@ -83,7 +83,7 @@ pub struct SessionRecord {
     /// before `pg_ctl start`, not stamped once at session-directory
     /// creation. `initdb` has no timeout, so an earlier stamp could exhaust
     /// the grace window before the gap it covers even begins.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 impl SessionRecord {
@@ -201,7 +201,7 @@ pub fn record_is_self_consistent(record: &SessionRecord, session_dir: &Path) -> 
 /// record is written could delay reaping it, never bring one forward. This
 /// is a dev-only tool, and the cost of that is a leaked directory, not a
 /// wrong deletion.
-const POSTMASTER_STARTUP_GRACE: chrono::Duration = chrono::Duration::seconds(15);
+const POSTMASTER_STARTUP_GRACE: jiff::SignedDuration = jiff::SignedDuration::from_secs(15);
 
 /// Decide what to do with one session record.
 ///
@@ -222,7 +222,7 @@ pub fn decide_reap(
     owner_alive: bool,
     postmaster: PostmasterIdentity,
     self_pid: u32,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> ReapDecision {
     // Liveness first, and `owner_alive` is an *identity* answer: the caller
     // computes it from the recorded owner start token, not from the pid alone.
@@ -252,7 +252,7 @@ pub fn decide_reap(
             ReapDecision::Skip(SkipReason::PostmasterIdentityUnknown)
         }
         (None, PostmasterIdentity::NotRunning)
-            if now.signed_duration_since(record.created_at) < POSTMASTER_STARTUP_GRACE =>
+            if now.duration_since(record.created_at) < POSTMASTER_STARTUP_GRACE =>
         {
             ReapDecision::Skip(SkipReason::PossiblyStillStarting)
         }

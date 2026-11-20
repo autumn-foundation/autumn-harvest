@@ -15,6 +15,7 @@ use diesel::SelectableHelper;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use jiff_diesel::ToDiesel;
 
 use crate::error::HarvestResult;
 use crate::event::WorkflowEvent;
@@ -45,7 +46,7 @@ pub struct WorkflowChildFilters {
 /// Cursor anchor for paged child workflow queries.
 #[derive(Debug, Clone)]
 pub struct WorkflowChildCursor {
-    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub started_at: jiff::Timestamp,
     pub exec_id: uuid::Uuid,
 }
 
@@ -66,8 +67,8 @@ pub struct WorkflowChildRow {
     pub exec_id: ExecutionId,
     pub workflow_name: String,
     pub status: String,
-    pub started_at: chrono::DateTime<chrono::Utc>,
-    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub started_at: jiff::Timestamp,
+    pub completed_at: Option<jiff::Timestamp>,
     pub error_summary: Option<String>,
     pub shard_id: i32,
     pub depth: u8,
@@ -82,8 +83,8 @@ type WorkflowChildProjection = (
     uuid::Uuid,
     String,
     String,
-    chrono::DateTime<chrono::Utc>,
-    Option<chrono::DateTime<chrono::Utc>>,
+    crate::time::sql::SqlTimestamp,
+    Option<crate::time::sql::SqlTimestamp>,
     Option<String>,
     i32,
     Option<String>,
@@ -1317,7 +1318,7 @@ pub async fn admit_update_event_with_codecs(
                 update_id,
                 name,
                 input,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
             };
             append_events_with_codecs(conn, exec_id, &[event], next_id, codecs).await?;
             Ok((execution.workflow_name, execution.queue_name))
@@ -1721,7 +1722,7 @@ pub async fn load_timestamped_history(
 pub async fn load_history_with_timestamps(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
-) -> HarvestResult<Vec<(chrono::DateTime<chrono::Utc>, WorkflowEvent)>> {
+) -> HarvestResult<Vec<(jiff::Timestamp, WorkflowEvent)>> {
     use crate::models::HarvestEvent;
 
     let rows: Vec<HarvestEvent> = harvest_events::table
@@ -2031,7 +2032,7 @@ pub struct PagedHistoryEvent {
     /// Sequential event index within this execution (`event_id` column).
     pub event_id: i32,
     /// Wall-clock timestamp recorded when the event was appended.
-    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub timestamp: jiff::Timestamp,
     /// Deserialized workflow event (for structured inspection and pattern matching).
     pub event: crate::event::WorkflowEvent,
     /// Raw adjacently-tagged JSON exactly as stored in `harvest_events.event_data`.
@@ -2208,9 +2209,9 @@ pub async fn load_workflow_children(
     if let Some(cursor) = &filters.cursor {
         query = query.filter(
             harvest_workflow_executions::started_at
-                .lt(cursor.started_at)
+                .lt(cursor.started_at.to_diesel())
                 .or(harvest_workflow_executions::started_at
-                    .eq(cursor.started_at)
+                    .eq(cursor.started_at.to_diesel())
                     .and(harvest_workflow_executions::id.lt(cursor.exec_id))),
         );
     }
@@ -2249,8 +2250,8 @@ pub async fn load_workflow_children(
                             id,
                             workflow_name,
                             state,
-                            started_at,
-                            completed_at,
+                            started_at.to_jiff(),
+                            completed_at.map(crate::time::sql::SqlTimestamp::to_jiff),
                             error,
                             shard_id,
                             depth,
@@ -2267,8 +2268,8 @@ fn workflow_child_row_from_parts(
     id: uuid::Uuid,
     workflow_name: String,
     state: String,
-    started_at: chrono::DateTime<chrono::Utc>,
-    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    started_at: jiff::Timestamp,
+    completed_at: Option<jiff::Timestamp>,
     error: Option<String>,
     shard_id: i32,
     depth: u8,
@@ -2352,9 +2353,9 @@ pub async fn load_workflow_children_multi(
     if let Some(cursor) = &filters.cursor {
         query = query.filter(
             harvest_workflow_executions::started_at
-                .lt(cursor.started_at)
+                .lt(cursor.started_at.to_diesel())
                 .or(harvest_workflow_executions::started_at
-                    .eq(cursor.started_at)
+                    .eq(cursor.started_at.to_diesel())
                     .and(harvest_workflow_executions::id.lt(cursor.exec_id))),
         );
     }
@@ -2393,8 +2394,8 @@ pub async fn load_workflow_children_multi(
                             id,
                             workflow_name,
                             state,
-                            started_at,
-                            completed_at,
+                            started_at.to_jiff(),
+                            completed_at.map(crate::time::sql::SqlTimestamp::to_jiff),
                             error,
                             shard_id,
                             depth,
@@ -2442,9 +2443,9 @@ pub struct LineageChildRow {
     /// filter vocabulary of `GET /workflows`.
     pub state: String,
     /// When this execution started.
-    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub started_at: jiff::Timestamp,
     /// When this execution reached a terminal state, if it has.
-    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub completed_at: Option<jiff::Timestamp>,
     /// Shard this row was read from.
     pub shard_id: i32,
     /// How this child was spawned (awaited vs detached).
@@ -2459,8 +2460,8 @@ type LineageChildProjection = (
     String,
     String,
     String,
-    chrono::DateTime<chrono::Utc>,
-    Option<chrono::DateTime<chrono::Utc>>,
+    crate::time::sql::SqlTimestamp,
+    Option<crate::time::sql::SqlTimestamp>,
     i32,
     Option<String>,
 );
@@ -2544,8 +2545,8 @@ fn lineage_child_row_from_parts(parts: LineageChildProjection) -> LineageChildRo
         workflow_name,
         workflow_id,
         state,
-        started_at,
-        completed_at,
+        started_at: started_at.to_jiff(),
+        completed_at: completed_at.map(crate::time::sql::SqlTimestamp::to_jiff),
         shard_id,
         await_mode,
         parent_close_policy,
@@ -2909,7 +2910,7 @@ pub struct WorkflowLogQuery<'a> {
     pub after_seq: Option<i64>,
     /// Wall-clock lower bound on `occurred_at` (exclusive). Independent of
     /// `after_seq`; both may be set and are `AND`ed.
-    pub since: Option<chrono::DateTime<chrono::Utc>>,
+    pub since: Option<jiff::Timestamp>,
     /// Level allow-list. Empty means "all levels".
     pub levels: &'a [&'a str],
     /// Page size. The caller is responsible for clamping it.
@@ -2936,7 +2937,7 @@ pub async fn load_workflow_logs(
         q = q.filter(dsl::seq.gt(after));
     }
     if let Some(since) = query.since {
-        q = q.filter(dsl::occurred_at.gt(since));
+        q = q.filter(dsl::occurred_at.gt(since.to_diesel()));
     }
     if !query.levels.is_empty() {
         // The truncation marker is a `warn` row, so a `?level=warn` filter
@@ -3360,7 +3361,7 @@ mod tests {
     use super::*;
     use crate::event::WorkflowEvent;
     use crate::types::{ActivityExecId, ExecutionId};
-    use chrono::Utc;
+    use jiff::Timestamp;
 
     #[test]
     fn stored_event_has_sequential_event_id() {
@@ -3368,7 +3369,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!({}),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -3464,7 +3465,7 @@ mod tests {
                     ExecutionId::new(),
                     WorkflowEvent::WorkflowStarted {
                         input: serde_json::json!(payload),
-                        timestamp: Utc::now(),
+                        timestamp: Timestamp::now(),
                         last_completion_result: None,
                         last_error: None,
                         scheduled_time: None,
@@ -3519,7 +3520,7 @@ mod tests {
                 ExecutionId::new_for_shard(shard),
                 WorkflowEvent::WorkflowStarted {
                     input: serde_json::json!({}),
-                    timestamp: Utc::now(),
+                    timestamp: Timestamp::now(),
                     last_completion_result: None,
                     last_error: None,
                     scheduled_time: None,
@@ -3595,7 +3596,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -3624,7 +3625,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!({"user": "alice"}),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,

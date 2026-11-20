@@ -390,7 +390,7 @@ pub struct WorkflowExecuteSpanMeta {
     /// The clock of the cycle, when the runtime fixes one (issue #2276). A
     /// live `system_now` then returns it. The SQLite runtime sets it, so the
     /// clock reads of a workflow agree with its timers.
-    pub drive_clock: Option<chrono::DateTime<chrono::Utc>>,
+    pub drive_clock: Option<jiff::Timestamp>,
     /// Whether this cycle is a deterministic replay (recorded as `harvest.replay`).
     pub is_replay: bool,
     /// W3C traceparent linking back to the original trace, present only on
@@ -402,7 +402,7 @@ pub struct WorkflowExecuteSpanMeta {
     /// The [`WorkflowContext`] uses it as the deadline fallback and as the
     /// total budget for the deadline-fraction continue-as-new check. `None` when
     /// the workflow has no `execution_timeout`.
-    pub execution_timeout: Option<chrono::Duration>,
+    pub execution_timeout: Option<jiff::SignedDuration>,
     /// The authoritative absolute deadline for this run (issue #772), read live
     /// from the execution row's `deadline_at` column.
     ///
@@ -410,7 +410,7 @@ pub struct WorkflowExecuteSpanMeta {
     /// **effective** deadline that the timeout scanner enforces. Pause/resume
     /// (#383) and redrive push it past `started_at + execution_timeout`.
     /// `None` = fall back to start + timeout.
-    pub deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub deadline_at: Option<jiff::Timestamp>,
     /// The execution id of the parent workflow that spawned this run, or `None`
     /// for a top-level run (issue #698). The worker populates it from the
     /// execution row's `parent_id` column so a child workflow can identify its
@@ -1202,12 +1202,12 @@ pub async fn run_workflow_strict(
     state: SharedState,
     context_headers: std::collections::HashMap<String, String>,
     metrics: std::sync::Arc<dyn MetricsRecorder>,
-    execution_timeout: Option<chrono::Duration>,
+    execution_timeout: Option<jiff::SignedDuration>,
     // Issue #772: the per-execution live effective `deadline_at`, shifted by
     // pause/resume and redrive. The internal continue-as-new budget check then
     // uses the deadline that the timeout scanner enforces. `None` falls back to
     // `start + execution_timeout` (the file/JSON replay path).
-    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    deadline_at: Option<jiff::Timestamp>,
     // Issue #698: the spawning parent's execution id. It lives in no
     // `WorkflowEvent`, so a pure-history replay cannot recover it.
     // `WorkflowReplayer::with_parent_execution_id` threads it here. A child that
@@ -1300,10 +1300,10 @@ pub(crate) async fn run_workflow_strict_advancing_clock(
     state: SharedState,
     context_headers: std::collections::HashMap<String, String>,
     metrics: std::sync::Arc<dyn MetricsRecorder>,
-    execution_timeout: Option<chrono::Duration>,
+    execution_timeout: Option<jiff::SignedDuration>,
     // Issue #772: per-execution live effective `deadline_at` (see
     // [`run_workflow_strict`]).
-    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    deadline_at: Option<jiff::Timestamp>,
     // Issue #698: the spawning parent's execution id (see [`run_workflow_strict`]).
     parent_execution_id: Option<ExecutionId>,
     // Issue #698: workflow type name / business `workflow_id` (see
@@ -1596,10 +1596,10 @@ pub(crate) async fn run_workflow_canary(
     state: SharedState,
     context_headers: std::collections::HashMap<String, String>,
     metrics: std::sync::Arc<dyn MetricsRecorder>,
-    execution_timeout: Option<chrono::Duration>,
+    execution_timeout: Option<jiff::SignedDuration>,
     // Issue #772: per-execution live effective `deadline_at` (see
     // [`run_workflow_strict`]).
-    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    deadline_at: Option<jiff::Timestamp>,
     // Issue #698: the spawning parent's execution id (see [`run_workflow_strict`]).
     // `run_canary` reads it from the `parent_id` column of the sampled row.
     parent_execution_id: Option<ExecutionId>,
@@ -2304,7 +2304,9 @@ pub(crate) async fn drive_workflow(
     tracing::Span,
     Option<crate::shard::ShardRouter>,
 ) {
-    drive_workflow_keep(ctx, handler, input, span_meta, None)
+    // The keep future holds the context by value. On the heap, it adds only a
+    // pointer to each caller frame in a debug build (issue #2752).
+    crate::frame::boxed(|| drive_workflow_keep(ctx, handler, input, span_meta, None))
         .await
         .into_tuple()
 }
@@ -2323,7 +2325,9 @@ pub(crate) async fn drive_workflow_keep(
 ) -> DriveResult {
     let ctx = std::sync::Arc::new(ctx);
     let future = owned_handler_future(&ctx, handler, input);
-    drive_cycle(ctx, future, span_meta, None, keep).await
+    // On the heap, the cycle adds only a pointer to each caller frame in a
+    // debug build (issue #2752).
+    crate::frame::boxed(|| drive_cycle(ctx, future, span_meta, None, keep)).await
 }
 
 /// Runs the next cycle of a resident workflow (issue #1798).
@@ -2337,7 +2341,7 @@ pub(crate) async fn drive_resumed(
     span_meta: Option<&WorkflowExecuteSpanMeta>,
     key: crate::resident::ResidentKey,
 ) -> DriveResult {
-    drive_cycle(ctx, future, span_meta, Some(false), Some(key)).await
+    crate::frame::boxed(|| drive_cycle(ctx, future, span_meta, Some(false), Some(key))).await
 }
 
 /// Opens the `harvest.workflow.execute` span of one cycle.
@@ -2615,7 +2619,7 @@ mod tests {
     use super::*;
     use crate::event::WorkflowEvent;
     use crate::types::{ActivityExecId, ExecutionId};
-    use chrono::Utc;
+    use jiff::Timestamp;
     use std::pin::Pin;
 
     /// A trivial workflow that just returns its input.
@@ -2708,7 +2712,7 @@ mod tests {
         // Full history: workflow started and the echo handler completes immediately.
         let history = vec![WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -2729,7 +2733,7 @@ mod tests {
         let exec_id = ExecutionId::new();
         let history = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -2754,7 +2758,7 @@ mod tests {
         let history = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -2794,7 +2798,7 @@ mod tests {
         let exec_id = ExecutionId::new();
         let history = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -2828,7 +2832,7 @@ mod tests {
         let exec_id = ExecutionId::new();
         let history = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -2872,7 +2876,7 @@ mod tests {
         let exec_id = ExecutionId::new();
         let history = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -2921,7 +2925,7 @@ mod tests {
         let exec_id = ExecutionId::new();
         let history = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -2949,7 +2953,7 @@ mod tests {
         let exec_id = ExecutionId::new();
         let history = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -2985,7 +2989,7 @@ mod tests {
         let history = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -3036,7 +3040,7 @@ mod tests {
     fn started() -> WorkflowEvent {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -3286,7 +3290,7 @@ mod tests {
         // ScheduleActivity command and block on the oneshot.
         let history = vec![WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -3327,7 +3331,7 @@ mod tests {
         let exec_id = ExecutionId::new();
         let history = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -3360,7 +3364,7 @@ mod tests {
         let history = vec![
             WorkflowEvent::WorkflowStarted {
                 input: input.clone(),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -3420,7 +3424,7 @@ mod tests {
         let history = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -3446,7 +3450,7 @@ mod tests {
         let exec_id = ExecutionId::new();
         let history = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -3600,7 +3604,7 @@ mod tests {
         vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,

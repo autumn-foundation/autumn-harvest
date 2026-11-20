@@ -57,7 +57,9 @@ mod db_tests {
     use autumn_harvest::types::ExecutionId;
     use diesel::sql_types::{Nullable, Text, Timestamptz, Uuid as SqlUuid};
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+    use jiff_diesel::ToDiesel;
     use std::time::Duration;
+
     use testcontainers::ContainerAsync;
     use testcontainers::ImageExt;
     use testcontainers_modules::postgres::Postgres;
@@ -140,7 +142,8 @@ mod db_tests {
         #[diesel(sql_type = Nullable<Text>)]
         sticky_worker_id: Option<String>,
         #[diesel(sql_type = Nullable<Timestamptz>)]
-        sticky_until: Option<chrono::DateTime<chrono::Utc>>,
+        #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+        sticky_until: Option<jiff::Timestamp>,
     }
 
     async fn read_session_columns(conn: &mut AsyncPgConnection, task_id: Uuid) -> SessionColumns {
@@ -371,7 +374,7 @@ mod db_tests {
     async fn insert_worker(
         conn: &mut AsyncPgConnection,
         worker_id: &str,
-        last_heartbeat_at: chrono::DateTime<chrono::Utc>,
+        last_heartbeat_at: jiff::Timestamp,
         status: &str,
     ) {
         diesel::sql_query(
@@ -382,7 +385,7 @@ mod db_tests {
                      '{}'::jsonb, 1)",
         )
         .bind::<Text, _>(worker_id)
-        .bind::<Timestamptz, _>(last_heartbeat_at)
+        .bind::<Timestamptz, _>(last_heartbeat_at.to_diesel())
         .bind::<Text, _>(status)
         .execute(conn)
         .await
@@ -396,7 +399,7 @@ mod db_tests {
     async fn setup_active_session(
         conn: &mut AsyncPgConnection,
         host_worker_id: &str,
-        session_expires_at: chrono::DateTime<chrono::Utc>,
+        session_expires_at: jiff::Timestamp,
     ) -> (ExecutionId, Uuid, ActivityExecId, Uuid) {
         let exec_id = insert_execution(conn).await;
         let activity_id = ActivityExecId::new();
@@ -407,7 +410,7 @@ mod db_tests {
             exec_id,
             &[WorkflowEvent::WorkflowStarted {
                 input: serde_json::Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -488,7 +491,7 @@ mod db_tests {
     #[tokio::test]
     async fn broken_session_scanner_reclaims_session_with_no_worker_row() {
         let (mut conn, _c) = setup().await;
-        let far_future = chrono::Utc::now() + chrono::Duration::hours(1);
+        let far_future = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1);
         let (exec_id, session_id, activity_id, task_id) =
             setup_active_session(&mut conn, "worker-ghost", far_future).await;
 
@@ -529,8 +532,8 @@ mod db_tests {
     #[tokio::test]
     async fn broken_session_scanner_leaves_healthy_session_untouched() {
         let (mut conn, _c) = setup().await;
-        insert_worker(&mut conn, "worker-alive", chrono::Utc::now(), "Active").await;
-        let far_future = chrono::Utc::now() + chrono::Duration::hours(1);
+        insert_worker(&mut conn, "worker-alive", jiff::Timestamp::now(), "Active").await;
+        let far_future = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1);
         let (_exec_id, session_id, _activity_id, task_id) =
             setup_active_session(&mut conn, "worker-alive", far_future).await;
 
@@ -553,8 +556,8 @@ mod db_tests {
     #[tokio::test]
     async fn broken_session_scanner_reclaims_session_with_expired_lease_even_if_host_alive() {
         let (mut conn, _c) = setup().await;
-        insert_worker(&mut conn, "worker-alive", chrono::Utc::now(), "Active").await;
-        let already_expired = chrono::Utc::now() - chrono::Duration::seconds(5);
+        insert_worker(&mut conn, "worker-alive", jiff::Timestamp::now(), "Active").await;
+        let already_expired = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(5);
         let (_exec_id, session_id, _activity_id, task_id) =
             setup_active_session(&mut conn, "worker-alive", already_expired).await;
 
@@ -576,8 +579,14 @@ mod db_tests {
     #[tokio::test]
     async fn broken_session_scanner_reclaims_session_hosted_by_draining_worker() {
         let (mut conn, _c) = setup().await;
-        insert_worker(&mut conn, "worker-draining", chrono::Utc::now(), "Draining").await;
-        let far_future = chrono::Utc::now() + chrono::Duration::hours(1);
+        insert_worker(
+            &mut conn,
+            "worker-draining",
+            jiff::Timestamp::now(),
+            "Draining",
+        )
+        .await;
+        let far_future = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1);
         let (_exec_id, session_id, _activity_id, task_id) =
             setup_active_session(&mut conn, "worker-draining", far_future).await;
 
@@ -600,7 +609,7 @@ mod db_tests {
     #[tokio::test]
     async fn broken_session_scanner_ignores_already_completed_session() {
         let (mut conn, _c) = setup().await;
-        let far_future = chrono::Utc::now() + chrono::Duration::hours(1);
+        let far_future = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1);
         let (_exec_id, session_id, _activity_id, task_id) =
             setup_active_session(&mut conn, "worker-ghost", far_future).await;
         sessions::record_session_completed(
@@ -740,7 +749,7 @@ mod db_tests {
             exec_id,
             &[WorkflowEvent::WorkflowStarted {
                 input: serde_json::Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -752,7 +761,7 @@ mod db_tests {
 
         let mut params = EnqueueParams::new("default", TaskType::Workflow, serde_json::Value::Null);
         params.workflow_exec_id = Some(exec_id.as_uuid());
-        params.scheduled_at = chrono::Utc::now() - chrono::Duration::seconds(5);
+        params.scheduled_at = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(5);
         queue::enqueue(&mut conn, &params)
             .await
             .expect("enqueue workflow task");
@@ -947,7 +956,7 @@ mod db_tests {
             exec_id,
             "w-1",
             "default",
-            chrono::Utc::now() + chrono::Duration::minutes(5),
+            jiff::Timestamp::now() + jiff::SignedDuration::from_mins(5),
         )
         .await
         .expect("record the session");

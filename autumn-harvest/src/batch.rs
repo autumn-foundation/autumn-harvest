@@ -173,13 +173,14 @@ mod db {
     use super::{
         BatchAction, BatchFilter, BatchJobStatus, BatchTargetError, DEFAULT_BATCH_CONCURRENCY,
     };
-    use chrono::{DateTime, Utc};
     use diesel::ExpressionMethods;
     use diesel::OptionalExtension;
     use diesel::QueryDsl;
     use diesel::SelectableHelper;
     use diesel_async::AsyncPgConnection;
     use diesel_async::RunQueryDsl;
+    use jiff::Timestamp;
+    use jiff_diesel::ToDiesel;
     use serde::Serialize;
     use serde_json::Value;
     use uuid::Uuid;
@@ -360,8 +361,8 @@ mod db {
             .set((
                 harvest_batch_jobs::status.eq(BatchJobStatus::Running.as_str()),
                 harvest_batch_jobs::total.eq(total),
-                harvest_batch_jobs::started_at.eq(Some(Utc::now())),
-                harvest_batch_jobs::updated_at.eq(Utc::now()),
+                harvest_batch_jobs::started_at.eq(Some(Timestamp::now()).to_diesel()),
+                harvest_batch_jobs::updated_at.eq(Timestamp::now().to_diesel()),
             ))
             .execute(conn)
             .await
@@ -390,7 +391,8 @@ mod db {
         job_id: Uuid,
         total: i64,
     ) -> HarvestResult<bool> {
-        let lease_threshold = Utc::now() - chrono::Duration::seconds(BATCH_JOB_LEASE_SECS);
+        let lease_threshold =
+            Timestamp::now() - jiff::SignedDuration::from_secs(BATCH_JOB_LEASE_SECS);
         let claimed: Option<Uuid> = diesel::sql_query(
             "UPDATE harvest_batch_jobs \
              SET status = 'Running', \
@@ -403,7 +405,7 @@ mod db {
              RETURNING id",
         )
         .bind::<diesel::sql_types::Uuid, _>(job_id)
-        .bind::<diesel::sql_types::Timestamptz, _>(lease_threshold)
+        .bind::<diesel::sql_types::Timestamptz, _>(lease_threshold.to_diesel())
         .bind::<diesel::sql_types::BigInt, _>(total)
         .get_result::<ClaimedId>(conn)
         .await
@@ -456,7 +458,7 @@ mod db {
             .set((
                 harvest_batch_jobs::completed.eq(harvest_batch_jobs::completed + delta_completed),
                 harvest_batch_jobs::failed.eq(harvest_batch_jobs::failed + delta_failed),
-                harvest_batch_jobs::updated_at.eq(Utc::now()),
+                harvest_batch_jobs::updated_at.eq(Timestamp::now().to_diesel()),
                 harvest_batch_jobs::errors
                     .eq(sql::<Jsonb>("errors || ").bind::<Jsonb, _>(errors_value)),
                 harvest_batch_jobs::processed_ids
@@ -473,8 +475,8 @@ mod db {
         diesel::update(harvest_batch_jobs::table.find(id))
             .set((
                 harvest_batch_jobs::status.eq(BatchJobStatus::Completed.as_str()),
-                harvest_batch_jobs::completed_at.eq(Some(Utc::now())),
-                harvest_batch_jobs::updated_at.eq(Utc::now()),
+                harvest_batch_jobs::completed_at.eq(Some(Timestamp::now()).to_diesel()),
+                harvest_batch_jobs::updated_at.eq(Timestamp::now().to_diesel()),
             ))
             .execute(conn)
             .await
@@ -510,10 +512,10 @@ mod db {
         pub total: i64,
         pub completed: i64,
         pub failed: i64,
-        pub started_at: Option<DateTime<Utc>>,
-        pub completed_at: Option<DateTime<Utc>>,
+        pub started_at: Option<Timestamp>,
+        pub completed_at: Option<Timestamp>,
         pub errors: Vec<BatchTargetError>,
-        pub created_at: DateTime<Utc>,
+        pub created_at: Timestamp,
         pub created_by: Option<String>,
     }
 
@@ -1053,8 +1055,8 @@ mod db {
         diesel::update(harvest_batch_jobs::table.find(id))
             .set((
                 harvest_batch_jobs::status.eq(BatchJobStatus::Failed.as_str()),
-                harvest_batch_jobs::completed_at.eq(Some(Utc::now())),
-                harvest_batch_jobs::updated_at.eq(Utc::now()),
+                harvest_batch_jobs::completed_at.eq(Some(Timestamp::now()).to_diesel()),
+                harvest_batch_jobs::updated_at.eq(Timestamp::now().to_diesel()),
                 harvest_batch_jobs::errors.eq(serde_json::json!([{
                     "execution_id": "",
                     "reason": reason,

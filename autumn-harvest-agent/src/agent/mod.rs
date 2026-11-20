@@ -49,6 +49,7 @@ use std::time::Duration;
 use autumn_harvest::entity::{ENTITY_OP_SIGNAL, Entity, EntityMessage, Wake};
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
+use autumn_harvest::time::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::consolidate::{
@@ -62,14 +63,14 @@ use crate::flow::Released;
 use crate::followup::{Followups, WAKE_MESSAGE};
 use crate::heartbeat::{DEFAULT_HEARTBEAT_PROMPT, HeartbeatTask};
 use crate::loop_guard::LoopGuard;
-use crate::memory::{EditKey, MemoryScope};
+use crate::memory::{EditKey, MemoryScope, READ_ONLY_SNAPSHOT_PATCH, SnapshotAccess};
 use crate::mesh::{Mandate, Refusal};
 use crate::message::{ChatMessage, ChatRole, RunId, SessionId};
 use crate::sampling::{OpSample, SampleFailure, sample_task};
 use crate::skill::SkillText;
 use crate::types::{AgentStop, AgentTask, DEFAULT_APPROVAL_TIMEOUT_SECS, DEFAULT_MAX_STEPS};
 use crate::workflow::{
-    Member, Outbox, Progress, Run, SteerBook, Tree, deliver, discover, harness, run_segment,
+    Member, Outbox, Progress, Run, SteerBook, Tree, boxed_run_segment, deliver, discover, harness,
 };
 use crate::workspace::{WorkspaceMount, WorkspaceRef};
 use autumn_harvest::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES;
@@ -1383,15 +1384,17 @@ impl Agent {
     }
 }
 
+/// The state after one segment, with the stop and the answer of a segment
+/// that completed. `Err` is a refusal of a peer message.
+type SegmentEnd = (AgentState, Result<Option<(AgentStop, String)>, Refusal>);
+
 /// Handle one op of `run`.
 ///
 /// The handler closure returns this future, not the future of
 /// [`AgentRun::handle`]. harvest-verify reads a future type that names a
 /// lifetime, as `AgentRun<'_>` does, as one that can write through its
-/// fields. The future also stays unboxed, so harvest-verify can follow it.
-// The engine keeps the workflow future on the heap, so the size of this
-// inline future costs no stack.
-#[allow(clippy::large_futures)]
+/// fields. The handler closure returns this future unboxed, so harvest-verify
+/// can follow it. The entity loop puts it on the heap (issue #2752).
 async fn handle_op(
     run: &AgentRun<'_>,
     state: AgentState,
@@ -1449,6 +1452,19 @@ async fn load_run(ctx: &WorkflowContext, id: Result<AgentId, String>) -> AgentRu
     }
 }
 
+/// [`load_run`] on the heap.
+///
+/// It makes its future in its own frame, as [`autumn_harvest::frame`]
+/// explains (issue #2752). The future names a lifetime, so a closure future
+/// would be a harvest-verify boundary. A named function is not.
+#[inline(never)]
+fn boxed_load_run(
+    ctx: &WorkflowContext,
+    id: Result<AgentId, String>,
+) -> Pin<Box<impl Future<Output = AgentRun<'_>>>> {
+    Box::pin(load_run(ctx, id))
+}
+
 /// The durable agent workflow. The workflow id is the [`AgentId`].
 ///
 /// Each op runs one segment of the agent loop. See the [module
@@ -1458,14 +1474,11 @@ async fn load_run(ctx: &WorkflowContext, id: Result<AgentId, String>) -> AgentRu
 ///
 /// Returns an engine error of the entity loop, for example a cancel.
 #[workflow]
-// The entity future holds the op future inline. The engine keeps the
-// workflow future on the heap, so a box here adds only an allocation.
-#[allow(clippy::large_futures)]
 pub async fn agent(ctx: &WorkflowContext, input: serde_json::Value) -> Result<AgentState, String> {
     // `format!` and not `to_string`: harvest-verify trusts `format`, but not
     // the blanket `ToString` impl on a type of this crate.
     let id = AgentId::parse(ctx.workflow_id()).map_err(|err| format!("{err}"));
-    let run = load_run(ctx, id).await;
+    let run = boxed_load_run(ctx, id).await;
     let max_ops = run
         .profile
         .as_ref()
@@ -1484,15 +1497,30 @@ pub async fn agent(ctx: &WorkflowContext, input: serde_json::Value) -> Result<Ag
             |state, op: AgentOp| handle_op(&run, state, op),
             |state: &AgentState| {
                 let (at, op) = state.next_wake(profile)?;
-                Some(Wake::new(
-                    autumn_harvest::chrono::DateTime::from_timestamp_millis(at)?,
-                    op,
-                ))
+                Some(Wake::new(wake_time(at)?, op))
             },
             |state: &mut AgentState| std::mem::take(&mut state.reload_requested),
         )
         .await
         .map_err(|err| err.to_string())
+}
+
+/// The first millisecond that `chrono` could hold, in the year -262143.
+const CHRONO_MIN_MS: i64 = -8_334_601_315_200_000;
+
+/// The last millisecond that `chrono` could hold, in the year 262142.
+const CHRONO_MAX_MS: i64 = 8_210_266_876_799_999;
+
+/// The time of a wake at `at_ms` epoch milliseconds.
+///
+/// Replay calls the wake hook again, so the hook must give a wake for each
+/// time that `chrono` gave one. A recorded run then keeps its clock reads
+/// and timers. `chrono` gave `None` outside its own range. Inside that
+/// range, a time past the range of jiff clamps to its first or last instant.
+fn wake_time(at_ms: i64) -> Option<Timestamp> {
+    (CHRONO_MIN_MS..=CHRONO_MAX_MS)
+        .contains(&at_ms)
+        .then(|| autumn_harvest::time::from_millisecond_clamped(at_ms))
 }
 
 /// Book the next heartbeat of `profile`. See [`wake::next_heartbeat`].
@@ -1526,7 +1554,7 @@ impl AgentRun<'_> {
             state.incarnation = self.ctx.new_uuid().to_string();
         }
         // One recorded clock read per op. Replay reads the same time.
-        let now = self.ctx.system_now().timestamp_millis();
+        let now = self.ctx.system_now().as_millisecond();
         self.publish(&state, self.profile.as_ref().ok(), "running", now);
         let mut ticked = false;
         let mut reload = None;
@@ -1535,8 +1563,8 @@ impl AgentRun<'_> {
                 AgentOp::Control(Control::ReloadProfile) => {
                     reload = Some(self.boxed_reload_read().await);
                 }
-                AgentOp::Control(control) => state = self.control(state, control).await,
-                AgentOp::Unpark => state = self.unpark(state).await,
+                AgentOp::Control(control) => state = self.boxed_control(state, control).await,
+                AgentOp::Unpark => state = self.boxed_unpark(state).await,
                 _ => {}
             },
             Admit::Hold => {
@@ -1546,7 +1574,7 @@ impl AgentRun<'_> {
             }
             Admit::Run => {
                 ticked = matches!(op, AgentOp::HeartbeatTick);
-                state = self.work(state, op).await;
+                state = self.boxed_work(state, op).await;
             }
             Admit::Skip => {}
         }
@@ -1554,7 +1582,7 @@ impl AgentRun<'_> {
         // longer than the interval then never makes the next one due at
         // once, so waiting ops run first.
         let booked_at = if ticked {
-            self.ctx.system_now().timestamp_millis()
+            self.ctx.system_now().as_millisecond()
         } else {
             now
         };
@@ -1598,15 +1626,81 @@ impl AgentRun<'_> {
 
     /// [`reload_read`](Self::reload_read) on the heap.
     ///
-    /// A debug build makes a future in the frame of its caller before it
-    /// boxes it. This function owns that frame, and it returns before the
-    /// poll. So the frame of `handle` holds a pointer only. With the future
-    /// inline, each op needs more stack, and a 1 MiB main thread overflows.
+    /// Each `boxed_` function makes its future in its own frame, as
+    /// [`autumn_harvest::frame`] explains (issue #2752). Each future names a
+    /// lifetime, so a closure future would be a harvest-verify boundary.
     #[inline(never)]
     fn boxed_reload_read(
         &self,
     ) -> Pin<Box<impl Future<Output = Result<Box<AgentProfile>, String>> + '_>> {
         Box::pin(self.reload_read())
+    }
+
+    /// [`work`](Self::work) on the heap.
+    #[inline(never)]
+    fn boxed_work(
+        &self,
+        state: AgentState,
+        op: AgentOp,
+    ) -> Pin<Box<impl Future<Output = AgentState> + '_>> {
+        Box::pin(self.work(state, op))
+    }
+
+    /// [`control`](Self::control) on the heap.
+    #[inline(never)]
+    fn boxed_control(
+        &self,
+        state: AgentState,
+        control: Control,
+    ) -> Pin<Box<impl Future<Output = AgentState> + '_>> {
+        Box::pin(self.control(state, control))
+    }
+
+    /// [`unpark`](Self::unpark) on the heap.
+    #[inline(never)]
+    fn boxed_unpark(&self, state: AgentState) -> Pin<Box<impl Future<Output = AgentState> + '_>> {
+        Box::pin(self.unpark(state))
+    }
+
+    /// [`sampled`](Self::sampled) on the heap.
+    #[inline(never)]
+    fn boxed_sampled<'s>(
+        &'s self,
+        state: AgentState,
+        input: &'s str,
+        sample: &'s OpSample,
+        mode: Mode<'s>,
+        peer: Option<PeerSegment<'s>>,
+    ) -> Pin<Box<impl Future<Output = SegmentEnd> + 's>> {
+        Box::pin(self.sampled(state, input, sample, mode, peer))
+    }
+
+    /// [`run_segment_as`](Self::run_segment_as) on the heap.
+    #[inline(never)]
+    fn boxed_run_segment_as<'s>(
+        &'s self,
+        state: AgentState,
+        input: &'s str,
+        mode: Mode<'s>,
+        peer: Option<PeerSegment<'s>>,
+    ) -> Pin<Box<impl Future<Output = SegmentEnd> + 's>> {
+        Box::pin(self.run_segment_as(state, input, mode, peer))
+    }
+
+    /// [`peer_message`](Self::peer_message) on the heap.
+    #[inline(never)]
+    fn boxed_peer_message(
+        &self,
+        state: AgentState,
+        envelope: PeerEnvelope,
+    ) -> Pin<Box<impl Future<Output = AgentState> + '_>> {
+        Box::pin(self.peer_message(state, envelope))
+    }
+
+    /// [`tick`](Self::tick) on the heap.
+    #[inline(never)]
+    fn boxed_tick(&self, state: AgentState) -> Pin<Box<impl Future<Output = AgentState> + '_>> {
+        Box::pin(self.tick(state))
     }
 
     /// The profile of one op and its overlay version (issue #2372).
@@ -1952,7 +2046,7 @@ impl AgentRun<'_> {
             );
             return;
         }
-        let at_ms = self.ctx.system_now().timestamp_millis();
+        let at_ms = self.ctx.system_now().as_millisecond();
         let max_text = usize::try_from(settings.max_text_bytes).unwrap_or(usize::MAX);
         let append = EpisodeAppend {
             scope: episode_scope(id),
@@ -2057,7 +2151,7 @@ impl AgentRun<'_> {
         scope: &str,
     ) -> Result<u64, String> {
         self.workspace_floor(state, scope).await?;
-        let now = self.ctx.system_now().timestamp_millis();
+        let now = self.ctx.system_now().as_millisecond();
         state.workspace_generation = next_generation(state.workspace_generation, now);
         Ok(state.workspace_generation)
     }
@@ -2111,7 +2205,7 @@ impl AgentRun<'_> {
                     // A person is present, so a new follow-up chain starts.
                     state.chain = 0;
                     let (mut state, outcome) = self
-                        .sampled(state, &message.text, sample, Mode::Attended, None)
+                        .boxed_sampled(state, &message.text, sample, Mode::Attended, None)
                         .await;
                     // A mesh budget refused each draw before it spent a
                     // token. The message waits for the next period, first in
@@ -2143,8 +2237,8 @@ impl AgentRun<'_> {
                 }
                 state
             }
-            AgentOp::PeerMessage(envelope) => self.peer_message(state, envelope).await,
-            AgentOp::HeartbeatTick => self.tick(state).await,
+            AgentOp::PeerMessage(envelope) => self.boxed_peer_message(state, envelope).await,
+            AgentOp::HeartbeatTick => self.boxed_tick(state).await,
             AgentOp::FollowupDue => {
                 if state.followup_due_ms.take().is_none() {
                     return state;
@@ -2204,11 +2298,11 @@ impl AgentRun<'_> {
                 };
                 let (next, outcome) = match &envelope.sample {
                     Some(sample) => {
-                        self.sampled(state, &input, sample, Mode::Peer, Some(peer))
+                        self.boxed_sampled(state, &input, sample, Mode::Peer, Some(peer))
                             .await
                     }
                     None => {
-                        self.run_segment_as(state, &input, Mode::Peer, Some(peer))
+                        self.boxed_run_segment_as(state, &input, Mode::Peer, Some(peer))
                             .await
                     }
                 };
@@ -2306,7 +2400,7 @@ impl AgentRun<'_> {
 
     /// Run one segment with `input` and fold it into `state`.
     async fn segment(&self, state: AgentState, input: &str, mode: Mode<'_>) -> AgentState {
-        self.run_segment_as(state, input, mode, None).await.0
+        self.boxed_run_segment_as(state, input, mode, None).await.0
     }
 
     /// Start one op: check the run, drain the stale interrupts, read the op
@@ -2380,7 +2474,7 @@ impl AgentRun<'_> {
         input: &str,
         mode: Mode<'_>,
         peer: Option<PeerSegment<'_>>,
-    ) -> (AgentState, Result<Option<(AgentStop, String)>, Refusal>) {
+    ) -> SegmentEnd {
         let mut task = match self.open_op(&mut state, input, mode, peer.as_ref()).await {
             Ok(task) => task,
             Err(Some(refusal)) => return (state, Err(refusal)),
@@ -2426,7 +2520,8 @@ impl AgentRun<'_> {
             .map_or_else(Vec::new, |peer| peer.waiting.to_vec());
         let mut tree = segment_tree(&mut state, id, profile, run_id.clone(), waiting);
         if task.memory_in_state {
-            progress.memory = Some(open_memory(&mut state, &mut task, &mut tree));
+            let access = memory_access(self.ctx, task.memory_writable());
+            progress.memory = Some(open_memory(&mut state, &mut task, &mut tree, access));
         }
         open_notes(&mut task, &state, &mut progress, &mut tree);
         let run = Run {
@@ -2436,7 +2531,7 @@ impl AgentRun<'_> {
                 .map_or(self.member.as_ref(), |peer| Some(peer.member)),
             live: true,
         };
-        let result = run_segment(self.ctx, run, &mut progress, &mut tree, input).await;
+        let result = boxed_run_segment(self.ctx, run, &mut progress, &mut tree, input).await;
         fold_segment(&mut state, &mut progress, tree);
         let refused = refused_untouched(&state, rounds);
         if state.workspace != head {
@@ -2464,7 +2559,7 @@ impl AgentRun<'_> {
                 {
                     let delay =
                         i64::try_from(planned.delay_secs.saturating_mul(1_000)).unwrap_or(i64::MAX);
-                    let ended = self.ctx.system_now().timestamp_millis();
+                    let ended = self.ctx.system_now().as_millisecond();
                     state.followup_due_ms = Some(ended.saturating_add(delay));
                 }
                 if task.deliver {
@@ -2512,7 +2607,7 @@ impl AgentRun<'_> {
         sample: &OpSample,
         mode: Mode<'_>,
         peer: Option<PeerSegment<'_>>,
-    ) -> (AgentState, Result<Option<(AgentStop, String)>, Refusal>) {
+    ) -> SegmentEnd {
         let mut task = match self.open_op(&mut state, input, mode, peer.as_ref()).await {
             Ok(task) => task,
             Err(Some(refusal)) => return (state, Err(refusal)),
@@ -2526,7 +2621,15 @@ impl AgentRun<'_> {
             }
         };
         let stream = task.stream;
-        draw_op_task(&mut task, &state, profile, peer.as_ref());
+        // A draw has no `memory` tool, so it reads the snapshot only. The
+        // gate is asked only when the draw renders a snapshot. Otherwise the
+        // access is not read.
+        let access = if task.memory_in_state && !state.memory.is_empty() {
+            memory_access(self.ctx, false)
+        } else {
+            None
+        };
+        draw_op_task(&mut task, &state, profile, peer.as_ref(), access);
         // Each draw carries the task in its input. A task over the input cap
         // would fail the spawn after the policy read, so it fails here.
         if crate::bounds::exceeds_bytes(&task, DEFAULT_MAX_WORKFLOW_INPUT_BYTES) {
@@ -2666,6 +2769,7 @@ fn draw_op_task(
     state: &AgentState,
     profile: &AgentProfile,
     peer: Option<&PeerSegment<'_>>,
+    access: Option<SnapshotAccess>,
 ) {
     if let Some(peer) = peer {
         let mandate = peer.member.mandate();
@@ -2695,7 +2799,7 @@ fn draw_op_task(
     }
     if task.memory_in_state && !state.memory.is_empty() {
         // A draw reads the state memory but cannot edit it.
-        let snapshot = crate::memory::render_snapshot(&state.memory);
+        let snapshot = render_state_memory(&state.memory, access);
         task.system = Some(match task.system.take() {
             Some(system) => format!("{system}\n\n{snapshot}"),
             None => snapshot,
@@ -2703,6 +2807,34 @@ fn draw_op_task(
         task.flow_labels
             .extend(crate::memory::snapshot_labels(&state.memory));
     }
+}
+
+/// The snapshot access of a state-memory segment that has the `memory`
+/// tool when `writable` is true.
+///
+/// The workflow renders this snapshot, so a replay rebuilds the prompt. A
+/// history from before the patch gate rendered the legacy edit head, and
+/// `None` keeps that head. The gate is asked at each render, so a writable
+/// segment keeps the old wording too.
+fn memory_access(ctx: &WorkflowContext, writable: bool) -> Option<SnapshotAccess> {
+    if !ctx.patched(READ_ONLY_SNAPSHOT_PATCH) {
+        None
+    } else if writable {
+        Some(SnapshotAccess::Edit)
+    } else {
+        Some(SnapshotAccess::Read)
+    }
+}
+
+/// Render the state memory under `access`. `None` renders the legacy head.
+fn render_state_memory(
+    blocks: &[crate::memory::MemoryBlock],
+    access: Option<SnapshotAccess>,
+) -> String {
+    access.map_or_else(
+        || crate::memory::render_legacy_snapshot(blocks),
+        |access| crate::memory::render_snapshot(blocks, access),
+    )
 }
 
 /// The durable record of the selected answer of a strategy op, or `None`
@@ -2834,11 +2966,12 @@ fn open_memory(
     state: &mut AgentState,
     task: &mut AgentTask,
     tree: &mut Tree,
+    access: Option<SnapshotAccess>,
 ) -> Vec<crate::memory::MemoryBlock> {
     if state.memory.is_empty() {
         state.memory = crate::memory::MemoryBlock::defaults();
     }
-    let snapshot = crate::memory::render_snapshot(&state.memory);
+    let snapshot = render_state_memory(&state.memory, access);
     task.system = Some(match task.system.take() {
         Some(system) => format!("{system}\n\n{snapshot}"),
         None => snapshot,
@@ -3116,6 +3249,19 @@ mod tests {
         assert_eq!(next_generation(5_000, 1_000), 5_001, "a clock behind");
         assert_eq!(next_generation(7, -1), 8, "a time before 1970");
         assert_eq!(next_generation(u64::MAX, 0), u64::MAX);
+    }
+
+    #[test]
+    fn a_wake_exists_where_chrono_gave_one() {
+        assert_eq!(
+            wake_time(1_700_000_000_123),
+            Some(Timestamp::constant(1_700_000_000, 123_000_000))
+        );
+        assert_eq!(wake_time(CHRONO_MAX_MS), Some(Timestamp::MAX));
+        assert_eq!(wake_time(CHRONO_MIN_MS), Some(Timestamp::MIN));
+        assert_eq!(wake_time(CHRONO_MAX_MS + 1), None);
+        assert_eq!(wake_time(CHRONO_MIN_MS - 1), None);
+        assert_eq!(wake_time(i64::MAX), None);
     }
 
     #[test]

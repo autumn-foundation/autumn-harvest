@@ -289,7 +289,7 @@ Two replay-safe, event-free accessors back this: `ctx.deadline()` (the
 **nominal** `WorkflowStarted` timestamp + effective `execution_timeout`, or
 `None` when there is no timeout) and `ctx.time_until_deadline()` (remaining time
 to the nominal deadline, measured against the replay-safe recorded clock
-`ctx.system_now()`, **never** `chrono::Utc::now()`). A workflow with **no**
+`ctx.system_now()`, **never** `jiff::Timestamp::now()`). A workflow with **no**
 `execution_timeout` behaves exactly as before and records nothing extra. Tune
 the fraction with `HarvestBuilder::history_continue_as_new_deadline_fraction(f64)`
 (clamped to `[0.0, 1.0]`). **No new event variant, no migration** — the nominal

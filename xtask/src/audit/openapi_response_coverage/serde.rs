@@ -8,7 +8,9 @@ use super::mask::code_only;
 use super::py::{self, paren};
 use super::state::{self, StructBlock};
 use super::syntax::split_expression;
-use super::tables::{FIELD_KEEPING, KNOWN_DESERIALIZERS, LAYOUT_KEEPING, QUOTED, wire_types};
+use super::tables::{
+    FIELD_KEEPING, KNOWN_DESERIALIZERS, LAYOUT_KEEPING, QUOTED, TRUSTED_DESERIALIZERS, wire_types,
+};
 
 /// One serde item: its key, its form (`=`, `(` or none) and its value.
 ///
@@ -181,9 +183,9 @@ pub fn unreadable_serde(block: &StructBlock) -> Vec<String> {
 ///
 /// A key passes when `FIELD_KEEPING` names it, and `rename` only in its
 /// `rename = ".."` form. `deserialize_with` passes only for a deserializer
-/// in `KNOWN_DESERIALIZERS`. The field must have the type that entry accepts.
-/// The audited file must define the function with an `Option<Option<T>>`
-/// result.
+/// in `KNOWN_DESERIALIZERS` or `TRUSTED_DESERIALIZERS`. The field must have
+/// the type that entry accepts. The audited file must define a function of
+/// `KNOWN_DESERIALIZERS` with an `Option<Option<T>>` result.
 pub fn unreadable_field_serde(items: &[SerdeItem], declared_type: &str) -> HashSet<String> {
     let mut found = HashSet::new();
     for (name, form, value) in items {
@@ -203,9 +205,16 @@ pub fn unreadable_field_serde(items: &[SerdeItem], declared_type: &str) -> HashS
     found
 }
 
-/// Whether `KNOWN_DESERIALIZERS` models `function` for a field of this type.
+/// Whether `KNOWN_DESERIALIZERS` or `TRUSTED_DESERIALIZERS` models
+/// `function` for a field of this type.
 pub fn modeled_deserializer(function: Option<&str>, declared_type: &str) -> bool {
     let function = function.unwrap_or("");
+    if let Some((_, shape)) = TRUSTED_DESERIALIZERS
+        .iter()
+        .find(|(path, _)| *path == function)
+    {
+        return py::full(shape, declared_type.trim());
+    }
     let Some((_, shape)) = KNOWN_DESERIALIZERS
         .iter()
         .find(|(name, _)| *name == function)

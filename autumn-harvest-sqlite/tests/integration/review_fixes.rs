@@ -20,7 +20,7 @@
 use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest_sqlite::{ActivitySpec, ExecutionOutcome, RunState, SqliteError, SqliteRuntime};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::json;
 
 fn temp_db() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -316,7 +316,7 @@ async fn double_timer_same_id(ctx: &WorkflowContext, _n: i64) -> Result<String, 
 #[tokio::test]
 async fn reused_timer_id_fires_again_after_a_prior_fire() {
     let (_dir, path) = temp_db();
-    let t0: DateTime<Utc> = DateTime::from_timestamp(3_000_000, 0).unwrap();
+    let t0: Timestamp = Timestamp::from_second(3_000_000).unwrap();
 
     let exec;
     {
@@ -331,7 +331,7 @@ async fn reused_timer_id_fires_again_after_a_prior_fire() {
         // Fire the first timer; the SECOND arm of "tick" is created (deadline
         // t0+10+5 = t0+15, not yet due at t0+10) and the run blocks again.
         let state = rt
-            .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(10))
+            .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(10))
             .await
             .unwrap();
         assert!(
@@ -344,7 +344,7 @@ async fn reused_timer_id_fires_again_after_a_prior_fire() {
     let mut rt2 = SqliteRuntime::open(&path).unwrap();
     rt2.register_workflow(&double_timer_same_id_info());
     let state = rt2
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(20))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(20))
         .await
         .unwrap();
     assert!(

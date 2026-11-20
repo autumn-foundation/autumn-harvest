@@ -259,7 +259,8 @@ struct DeliveryRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     target_url: String,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    next_attempt_at: chrono::DateTime<chrono::Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    next_attempt_at: jiff::Timestamp,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     attempt: i32,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
@@ -653,7 +654,7 @@ async fn scanner_reschedules_with_backoff_on_non_2xx() {
         .await
         .expect("evaluate triggers");
 
-    let before = chrono::Utc::now();
+    let before = jiff::Timestamp::now();
     let processed = fire_due_completion_deliveries(&mut conn, &None, &[])
         .await
         .expect("scanner tick");
@@ -746,7 +747,7 @@ async fn scanner_schedules_backoff_from_attempt_completion_not_claim_time() {
         .expect("scanner tick");
     assert_eq!(processed, 1);
 
-    let after_tick = chrono::Utc::now();
+    let after_tick = jiff::Timestamp::now();
     let rows = load_deliveries(&mut conn, exec_id).await;
     assert_eq!(rows[0].state, "PENDING");
     assert!(
@@ -1021,7 +1022,7 @@ async fn scanner_honours_retry_after_on_429() {
     );
     let exec_id = enqueue_one_delivery(&mut conn).await;
 
-    let before = chrono::Utc::now();
+    let before = jiff::Timestamp::now();
     fire_due_completion_deliveries(&mut conn, &None, &[])
         .await
         .expect("scanner tick");
@@ -1032,7 +1033,7 @@ async fn scanner_honours_retry_after_on_429() {
     // Postgres keeps microseconds, so allow 1 ms for the truncation.
     assert!(
         rows[0].next_attempt_at
-            >= before + chrono::Duration::seconds(10) - chrono::Duration::milliseconds(1),
+            >= before + jiff::SignedDuration::from_secs(10) - jiff::SignedDuration::from_millis(1),
         "next attempt {} must be 10 s or more after {before}",
         rows[0].next_attempt_at
     );
@@ -1068,7 +1069,7 @@ async fn bulk_replay_spreads_callback_dead_letters() {
         assert_eq!(callback_dead_letter_count(&mut conn, *exec_id).await, 1);
     }
 
-    let before = chrono::Utc::now();
+    let before = jiff::Timestamp::now();
     let filter = autumn_harvest::dlq::BulkDlqFilter {
         queue_name: Some("completion-callback".to_string()),
         limit: Some(10),
@@ -1088,7 +1089,7 @@ async fn bulk_replay_spreads_callback_dead_letters() {
         latest = latest.max(rows[0].next_attempt_at);
     }
     assert!(
-        latest >= before + chrono::Duration::seconds(30),
+        latest >= before + jiff::SignedDuration::from_secs(30),
         "the last delivery must wait in the last slot, got {latest} after {before}"
     );
 }

@@ -44,7 +44,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use autumn_harvest::models::WorkflowExecution;
 use autumn_harvest::store::{AwaitMode, LineageChildRow};
 use autumn_harvest::types::ExecutionId;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 
 use crate::api::KNOWN_WORKFLOW_STATES;
@@ -152,9 +152,9 @@ pub struct LineageNode {
     /// filter vocabulary of `GET /workflows`.
     pub state: String,
     /// When this execution started.
-    pub started_at: DateTime<Utc>,
+    pub started_at: Timestamp,
     /// When this execution reached a terminal state; `null` while it is live.
-    pub closed_at: Option<DateTime<Utc>>,
+    pub closed_at: Option<Timestamp>,
     /// The parent that spawned this execution. `null` for a top-level run; a
     /// non-null value on the tree's own root means the operator re-rooted at a
     /// mid-tree node.
@@ -767,10 +767,10 @@ fn collect_states(
 mod tests {
     use super::*;
     use autumn_harvest::types::{ParentClosePolicy, ShardId};
-    use chrono::{Duration, TimeZone};
+    use jiff::{SignedDuration, Timestamp};
 
-    fn t(offset: i64) -> chrono::DateTime<Utc> {
-        Utc.timestamp_opt(1_700_000_000, 0).unwrap() + Duration::seconds(offset)
+    fn t(offset: i64) -> jiff::Timestamp {
+        Timestamp::new(1_700_000_000, 0).unwrap() + SignedDuration::from_secs(offset)
     }
 
     fn id(n: u128) -> ExecutionId {

@@ -785,7 +785,7 @@ async fn warm_decisions_keep_update_results_batched_with_an_external_signal() {
             update_id,
             name: "bump".to_string(),
             input: serde_json::json!({}),
-            timestamp: chrono::Utc::now(),
+            timestamp: jiff::Timestamp::now(),
         }],
         1,
     )

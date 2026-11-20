@@ -199,7 +199,7 @@ fn name_missing_table(error: diesel::result::Error) -> diesel::result::Error {
 }
 
 fn now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
+    jiff::Timestamp::now().as_millisecond()
 }
 
 /// Create the outbox table on the app's primary database, and check its

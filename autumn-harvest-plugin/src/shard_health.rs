@@ -9,12 +9,12 @@ use autumn_harvest::scheduler::SchedulerMonitor;
 use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::DbPool;
 use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, WorkerStatus, list_workers};
-use chrono::{DateTime, Utc};
 use diesel::migration::MigrationSource;
 use diesel::pg::Pg;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use futures::future::join_all;
+use jiff::Timestamp;
 use serde::Serialize;
 
 use crate::api::{HarvestApiRuntime, HarvestApiState};
@@ -42,7 +42,7 @@ pub enum ShardRole {
 #[derive(Debug, Clone, Serialize)]
 pub struct ShardHealthReport {
     pub overall_readiness: ShardReadiness,
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: Timestamp,
     pub freshness_window_secs: u64,
     pub candidate_shard: Option<i32>,
     pub shards: Vec<ShardHealthRow>,
@@ -62,7 +62,7 @@ pub struct ShardHealthRow {
     pub scheduler: ShardSchedulerCoverage,
     pub queue_depth: QueueDepthSummary,
     pub dlq: DlqSummary,
-    pub last_health_sample_time: Option<DateTime<Utc>>,
+    pub last_health_sample_time: Option<Timestamp>,
     pub readiness: ShardReadiness,
     pub reason_codes: Vec<String>,
     pub blocking_reasons: Vec<String>,
@@ -96,7 +96,7 @@ pub struct ShardSchedulerCoverage {
     pub enabled: bool,
     pub ready: bool,
     pub running: bool,
-    pub last_tick_at: Option<DateTime<Utc>>,
+    pub last_tick_at: Option<Timestamp>,
     pub tick_interval_ms: u64,
     pub freshness_window_secs: u64,
     pub schedule_count: usize,
@@ -162,7 +162,7 @@ struct WorkerReadiness {
     coverage: Vec<QueueWorkerCoverage>,
     active_worker_count: usize,
     stale_worker_count: usize,
-    last_health_sample_time: Option<DateTime<Utc>>,
+    last_health_sample_time: Option<Timestamp>,
     reason_codes: Vec<String>,
     blocking_reasons: Vec<String>,
     error_summary: Option<String>,
@@ -187,7 +187,7 @@ pub async fn build_shard_health_report(
     api_state: &HarvestApiState,
     candidate_shard: Option<i32>,
 ) -> ShardHealthReport {
-    let observed_at = Utc::now();
+    let observed_at = Timestamp::now();
     let freshness_window = api_state.worker_stale_threshold();
     let runtime = api_state.runtime().ok();
     let required_migrations = required_migration_versions();
@@ -507,7 +507,7 @@ async fn observe_shard(
     candidate_shard: Option<i32>,
     freshness_window: Duration,
     required_migrations: &Result<Vec<String>, String>,
-    observed_at: DateTime<Utc>,
+    observed_at: Timestamp,
 ) -> ShardHealthRow {
     let roles = roles_for_shard(shard_id, runtime);
     let candidate = candidate_shard == Some(shard_id);
@@ -844,7 +844,7 @@ fn worker_readiness(
     required_queues: &BTreeSet<String>,
     workers: Result<Vec<WorkerRow>, String>,
     freshness_window: Duration,
-    observed_at: DateTime<Utc>,
+    observed_at: Timestamp,
 ) -> WorkerReadiness {
     let mut blocking_reasons = Vec::new();
     match workers {
@@ -903,9 +903,9 @@ fn worker_readiness(
 }
 
 fn push_health_freshness_blocker(
-    last_seen: Option<DateTime<Utc>>,
+    last_seen: Option<Timestamp>,
     freshness_window: Duration,
-    observed_at: DateTime<Utc>,
+    observed_at: Timestamp,
     reason_codes: &mut Vec<String>,
     blocking_reasons: &mut Vec<String>,
 ) {
@@ -914,9 +914,7 @@ fn push_health_freshness_blocker(
         blocking_reasons.push("no worker health data recorded on shard".to_string());
         return;
     };
-    let elapsed = observed_at
-        .signed_duration_since(last_seen)
-        .to_std()
+    let elapsed = std::time::Duration::try_from(observed_at.duration_since(last_seen))
         .unwrap_or(Duration::ZERO);
     if elapsed > freshness_window {
         push_reason_code(reason_codes, REASON_WORKER_HEALTH_STALE);
@@ -1178,7 +1176,7 @@ fn scheduler_coverage(
     schedules: Option<&[ScheduleProbe]>,
     shard_id: i32,
     freshness_window: Duration,
-    observed_at: DateTime<Utc>,
+    observed_at: Timestamp,
 ) -> ShardSchedulerCoverage {
     let snapshot = runtime.map_or_else(
         || SchedulerMonitor::offline().snapshot(),
@@ -1204,9 +1202,7 @@ fn scheduler_coverage(
     if !snapshot.running {
         error = Some("scheduler coverage is required but scheduler is not running".to_string());
     } else if let Some(last_tick_at) = snapshot.last_tick_at {
-        let elapsed = observed_at
-            .signed_duration_since(last_tick_at)
-            .to_std()
+        let elapsed = std::time::Duration::try_from(observed_at.duration_since(last_tick_at))
             .unwrap_or(Duration::ZERO);
         if elapsed > scheduler_window {
             error = Some(format!(
@@ -1331,7 +1327,7 @@ mod tests {
 
     fn make_worker_row(shard_id: i32, status: &str, health: WorkerHealth) -> WorkerRow {
         use autumn_harvest::models::HarvestWorker;
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         WorkerRow {
             worker: HarvestWorker {
                 worker_id: format!("test-worker-{shard_id}"),
@@ -1378,7 +1374,7 @@ mod tests {
 
     fn worker_row_with_shard_assignments(shard_assignments: &[i64], queues: &[&str]) -> WorkerRow {
         use autumn_harvest::models::HarvestWorker;
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         WorkerRow {
             worker: HarvestWorker {
                 worker_id: "legacy-worker".to_string(),

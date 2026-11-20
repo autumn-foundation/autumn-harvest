@@ -117,7 +117,7 @@ async fn delayed_task_is_invisible_until_due() {
     let q = "delayed".to_string();
 
     let mut params = EnqueueParams::new(&q, TaskType::Workflow, serde_json::json!(null));
-    params.scheduled_at = chrono::Utc::now() + chrono::Duration::milliseconds(400);
+    params.scheduled_at = jiff::Timestamp::now() + jiff::SignedDuration::from_millis(400);
     let _ = queue.enqueue(params).await.expect("enqueue");
 
     // Immediately after enqueue, claim sees nothing -- the task is on the
