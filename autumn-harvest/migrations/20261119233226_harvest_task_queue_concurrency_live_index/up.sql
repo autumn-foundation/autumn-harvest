@@ -16,17 +16,18 @@
 -- 3. The `concurrency_pending_keys` CTE of the full claim statement. Only a
 --    fallback claim runs it.
 --
--- The claim cap re-check counts `RUNNING` rows and tests no cap. So it cannot
--- use this index, and it keeps `harvest_task_queue_concurrency_key_running`.
+-- The claim cap re-check counts `RUNNING` rows with no
+-- `concurrency_cap IS NOT NULL` filter. So it cannot use this index, and it
+-- keeps `harvest_task_queue_concurrency_key_running`.
 --
 -- `docs/performance-concurrency-live-index.md` records the read and the
 -- write cost.
 --
 -- ## Write cost
 --
--- A row with no key or no cap never enters the index. A keyed row adds one
--- entry when it is enqueued and one when it is claimed. Its completion adds
--- none, because a finished row is not live.
+-- A row with no key or no cap never enters the index. The enqueue of a keyed
+-- row adds one entry. Its claim adds one more. Its completion adds none,
+-- because a finished row is not live.
 --
 -- Each indexed column is in another index already, except `concurrency_cap`.
 -- Each write that changes `state` is not HOT already. An operator cap rewrite

@@ -3,8 +3,8 @@
 This page follows issue #2678. `queue::concurrency_key_stats` feeds the gauges
 `harvest.concurrency.in_flight` and `harvest.concurrency.deferred`. It counts
 the `PENDING` and `RUNNING` rows with a concurrency key and a cap. No index
-held the `PENDING` rows with a key. So each call was a parallel sequential
-scan of `harvest_task_queue`. `docs/design/DESIGN-2678.md` records the
+held the `PENDING` rows with a key. So each call was a sequential scan of
+`harvest_task_queue`, in parallel at the medium and large sizes. `docs/design/DESIGN-2678.md` records the
 decision.
 
 ## 🎯 Workload
@@ -28,7 +28,8 @@ is calls, buffers and WAL, not wall-clock.
 ## 📈 Profile (before)
 
 `concurrency_key_stats` buffers per call
-(`docs/perf-artifacts/worker-sampler-cadence/baseline-statement-costs.md`):
+(`docs/perf-artifacts/worker-sampler-cadence/after-statement-costs.md`, the
+state on `trunk-dev` before this change):
 
 | pending rows | buffers per call |
 |--:|--:|
@@ -41,7 +42,7 @@ The cost follows the table. At 300,000 pending rows the scan read about
 
 ## 🧭 Plan
 
-Before, at the large size (`baseline-large-explain.txt`):
+Before, at the large size (`after-large-explain.txt`):
 
 ```
 Finalize GroupAggregate
@@ -98,11 +99,12 @@ No query text changes.
 At the large size, 3,449 live rows hold a key and a cap. One call reads 6
 index pages and 1,467 heap pages, so the cost follows the keyed rows.
 
-The other statements of the harness read the same buffers as before, with one
-exception. At the medium size `oldest_pending_ages` read 875 buffers against
+The other statements of the harness read the same buffers as in
+`after-statement-costs.md`, with one exception. At the medium size `oldest_pending_ages` read 875 buffers against
 1,614. Its plan does not use the index. A direct `EXPLAIN` on a fresh medium
 fixture reads 1,361 buffers with and without the index
-(`oldest-pending-ages-*-medium.txt`). So the difference comes from the
+(`oldest-pending-ages-*-medium.txt`, seeded with `medium-fixture.sql`). So
+the difference comes from the
 state of the run, not from the index.
 
 ### Write
@@ -125,6 +127,11 @@ Per call (`docs/perf-artifacts/concurrency-live-index/write-costs.md`):
   one WAL record and 87 bytes.
 - A completion adds none. A finished row is not live.
 - A row with no key pays nothing.
+- An operator cap rewrite (`set_live_activity_caps`) changes only
+  `concurrency_cap`. Before, no index held that column, so the update could be
+  HOT. The predicate of the index names it, so the update is not HOT now. It
+  adds one entry to each index of the row. The rewrite is rare, so the harness
+  does not measure it.
 - One keyed task costs 3,749 WAL bytes in all, against 3,556 before. That is
   5.4% more.
 
@@ -139,8 +146,9 @@ Per call (`docs/perf-artifacts/concurrency-live-index/write-costs.md`):
   it reads 3,444 in an index scan, 83% fewer
   (`docs/perf-artifacts/concurrency-live-index/pending-keys-*-large.txt`).
   `large-fixture.sql` in that directory seeds the fixture.
-- The claim cap re-check and `release_claim_if_over_cap` count `RUNNING` rows
-  and test no cap. They cannot use the index, and they keep
+- The claim cap re-check and `release_claim_if_over_cap` count `RUNNING` rows.
+  Their count has no `concurrency_cap IS NOT NULL` filter, so the planner
+  cannot prove the predicate of the index. They keep
   `harvest_task_queue_concurrency_key_running`.
 
 ## Follow-ups
@@ -149,11 +157,13 @@ Per call (`docs/perf-artifacts/concurrency-live-index/write-costs.md`):
   index does not cause this cost, and it does not change it. The step
   `seek_running_counts` reads every `RUNNING` row through
   `harvest_task_queue_running_worker_idx`. It then joins them to the pending
-  keys. So each keyed claim reads about one buffer for each running task.
-  Issue #2744 tracks it.
+  keys. So each keyed claim reads about one buffer for each running task
+  (`keyed-claim-plan.txt`, from `keyed-claim.sql` on
+  `keyed-claim-fixture.sql`). Issue #2744 tracks it.
 - An index-only form (`INCLUDE (state, worker_id, concurrency_cap,
-  queue_name)`) read 27 buffers on a vacuumed fixture. A live queue churns,
-  so its rows are seldom all-visible. It was not chosen.
+  queue_name)`) read 27 buffers on a vacuumed fixture, in a design-time run
+  with no committed artifact. A live queue churns, so its rows are seldom
+  all-visible. The design keeps the plain form.
 
 ## 🔬 Reproduce
 
@@ -165,3 +175,14 @@ HARVEST_TEST_DATABASE_URL=postgres://… cargo test -p autumn-harvest \
   --test integration -- --ignored --exact \
   concurrency_live_index_perf::zz_capture_concurrency_live_index_write_costs --nocapture
 ```
+
+The `psql` artifacts run on a database with every migration applied. Seed it,
+then run the statement file:
+
+```sh
+psql -d <db> -f docs/perf-artifacts/concurrency-live-index/large-fixture.sql
+psql -d <db> -c 'VACUUM ANALYZE harvest_task_queue'
+psql -d <db> -f docs/perf-artifacts/concurrency-live-index/pending-keys.sql
+```
+
+Drop `idx_harvest_tq_concurrency_live` first for a "before" run.

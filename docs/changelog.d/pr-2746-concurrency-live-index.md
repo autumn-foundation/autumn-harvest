@@ -13,13 +13,15 @@ pending rows.
   guide has a row for it.
 - Three statements use the index: the gauge read, the admin attribution read
   `concurrency_key_workflows`, and the `concurrency_pending_keys` step of a
-  fallback claim. The claim cap re-check tests no cap, so it keeps
-  `harvest_task_queue_concurrency_key_running`.
+  fallback claim. The claim cap re-check has no `concurrency_cap IS NOT NULL`
+  filter, so it keeps `harvest_task_queue_concurrency_key_running`.
 - Read cost per gauge call falls by 93% at each size: 672 to 44, 6,794 to
   499 and 20,230 to 1,473 buffers at 10,000, 100,000 and 300,000 pending
   rows. See `docs/performance-concurrency-live-index.md`.
 - Write cost: a keyed enqueue and a keyed claim each add one WAL record, about
   100 bytes. A completion and every write of a row with no key do not change.
+  An operator cap rewrite is no longer a HOT update, because the predicate
+  names `concurrency_cap`.
 - Gates: `concurrency_live_index_tests` plans the gauge and attribution reads
   and bounds the buffers of the gauge read and of the pending-keys step. Each
   gate failed before the migration and passes after it. A group test pins

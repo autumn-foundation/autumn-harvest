@@ -5,16 +5,19 @@
 `queue::concurrency_key_stats` feeds the gauges `harvest.concurrency.in_flight`
 and `harvest.concurrency.deferred`. It counts the `PENDING` and `RUNNING` rows
 that hold a concurrency key and a cap. No index holds the `PENDING` rows with
-a key. So the plan is a parallel sequential scan of `harvest_task_queue`.
+a key. So the plan is a sequential scan of `harvest_task_queue`. It runs in
+parallel at the medium and large sizes.
 
 At 300,000 pending rows one call reads 20,230 buffers to return 56 groups
-(`docs/perf-artifacts/worker-sampler-cadence/baseline-statement-costs.md`).
+(`docs/perf-artifacts/worker-sampler-cadence/after-statement-costs.md`).
 The cost follows the size of the table, not the number of keyed rows.
 
 ## Facts (white hat)
 
 Measured on PG 16 with the fixture of `worker_sampler_cadence_perf` at the
-large size (300,000 pending rows, 30,000 running rows):
+large size (300,000 pending rows, 30,000 running rows). These are design-time
+`psql` runs with no committed artifact. The harness run of the chosen index
+reads 1,473 buffers (`docs/performance-concurrency-live-index.md`).
 
 | candidate index | stats buffers | index pages |
 |:--|--:|--:|
@@ -28,18 +31,19 @@ large size (300,000 pending rows, 30,000 running rows):
   The engine sets both together. Only an operator can clear a cap.
 - `concurrency_key`, `task_type`, `state`, `worker_id` and `queue_name` are
   in other indexes already. `concurrency_cap` is in no index.
-- A generic plan of the stats statement uses A, B and C.
+- A generic plan of the stats statement can use each of A, B and C.
 - `concurrency_key_workflows` has the same row filter, so it can use the
   same index.
 - The claim recheck and `release_claim_if_over_cap` count `RUNNING` rows by
-  key and task type. They test no cap, so A and C cannot serve them.
+  key and task type. The count has no `concurrency_cap IS NOT NULL` filter,
+  so A and C cannot serve them.
   `harvest_task_queue_concurrency_key_running` serves them today, at the
   same buffer count as B.
 - The full claim statement has the CTE `concurrency_pending_keys`. It reads
   the due `PENDING` rows with a key and a cap. The window claim drops it, so
   it runs only on a fallback. A fallback runs when the window finds no row,
   for example when each key at the head is at its cap. The claim turns off
-  bitmap scans. With that setting, at 300,000 pending rows, that CTE reads
+  bitmap scans and sorts. With that setting, at 300,000 pending rows, that CTE reads
   20,154 buffers in a sequential scan. With A it reads 3,444.
 
 ## Brainstorm (green hat)
@@ -94,8 +98,9 @@ CREATE INDEX idx_harvest_tq_concurrency_live
       AND state IN ('PENDING', 'RUNNING');
 ```
 
-- The key columns are the `GROUP BY` columns. So the aggregate reads the
-  index in group order.
+- The key columns are the `GROUP BY` columns. A plain index scan can feed
+  the group step in order. The planner picks a bitmap scan and a sort at the
+  large size.
 - The migration uses the guarded build of
   `docs/upgrading/online-migrations.md`, section 5. The test bundle sends all
   migrations as one batch, which rejects `CONCURRENTLY`.
@@ -110,10 +115,13 @@ CREATE INDEX idx_harvest_tq_concurrency_live
 
 ## Test plan
 
-- RED: plan gates for `CONCURRENCY_STATS_SQL`, `CONCURRENCY_ATTRIBUTION_SQL`
-  and the pending-keys CTE name the new index. A buffer test seeds unkeyed
-  rows and a few keyed rows, and bounds the reads of one stats call.
-- RED: a group test compares the stats with a reference count.
+- RED: plan gates for `CONCURRENCY_STATS_SQL` and
+  `CONCURRENCY_ATTRIBUTION_SQL` name the new index. Buffer gates seed unkeyed
+  rows and a few keyed rows. They bound the reads of one stats call and of
+  the pending-keys CTE under the claim settings. A plan gate cannot cover
+  that CTE, because other indexes can serve it on an empty table.
+- A group test compares the stats with hand-counted groups. The SQL text does
+  not change, so it passes before and after. It pins the results.
 - GREEN: the migration. `migration_lock_safety` and `migration_hygiene` pass.
 - Evidence: `worker_sampler_cadence_perf` at three sizes, and a write-cost
   harness for enqueue, claim and completion, with and without the index.

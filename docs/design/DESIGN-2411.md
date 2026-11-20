@@ -30,6 +30,8 @@ limit (#1836) is a separate cap for each worker.
 - The cache of #2410 holds one `ActivityDefaultFields` per activity. Each
   process reloads it within `RUN_DEFAULTS_TTL` plus one loop period.
 - No index covers `concurrency_cap`. An update of it can stay a HOT update.
+  `docs/design/DESIGN-2678.md` later adds an index whose predicate names it.
+  Since then, an update of it is not HOT.
 
 ## Brainstorm
 

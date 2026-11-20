@@ -2829,6 +2829,9 @@ standalone note rather than part of the claim-path attribution table above:
   query had a quadratic plan. A `NOT EXISTS` probe fixes the plan. One 15 s
   gauge interval cuts the sampler buffers per worker-hour by 98.3% at the
   small size.
+* [`docs/performance-concurrency-live-index.md`](performance-concurrency-live-index.md)
+  — the concurrency gauge read the whole task queue (issue #2678). A partial
+  index on the live keyed rows cuts each call by 93% at each size.
 * [`docs/performance-completion-trigger-outbox-queue.md`](performance-completion-trigger-outbox-queue.md)
   — the per-row `harvest_schedules` lookup in
   `completion_trigger::enforce_completion_triggers_outbox`'s cross-shard
