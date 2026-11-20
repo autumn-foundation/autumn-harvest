@@ -113,28 +113,30 @@ Per call (`docs/perf-artifacts/concurrency-live-index/write-costs.md`):
 
 | phase | statement | buffers before | buffers after | WAL records before | WAL records after | WAL bytes before | WAL bytes after |
 |:--|:--|--:|--:|--:|--:|--:|--:|
-| keyed | enqueue | 13.2 | 15.2 | 8.05 | 9.08 | 2,292 | 2,397 |
-| keyed | claim | 1,094.2 | 1,096.3 | 10.12 | 11.18 | 748 | 835 |
-| keyed | claim cap re-check | 4.0 | 4.0 | 0 | 0 | 0 | 0 |
-| keyed | complete | 19.1 | 19.1 | 6.07 | 6.08 | 516 | 517 |
-| plain | enqueue | 13.2 | 13.2 | 8.04 | 8.05 | 2,359 | 2,357 |
-| plain | claim | 97.2 | 97.2 | 9.08 | 9.09 | 679 | 679 |
-| plain | complete | 19.1 | 19.1 | 6.03 | 6.03 | 505 | 506 |
+| keyed | enqueue | 13.2 | 15.2 | 8.05 | 9.07 | 2,309 | 2,401 |
+| keyed | claim | 1,094.2 | 1,096.3 | 10.12 | 11.17 | 746 | 825 |
+| keyed | `release_claim_if_over_cap` | 4.0 | 4.0 | 0 | 0 | 0 | 0 |
+| keyed | complete | 19.1 | 19.1 | 6.07 | 6.07 | 516 | 516 |
+| plain | enqueue | 13.2 | 13.2 | 8.05 | 8.04 | 2,334 | 2,381 |
+| plain | claim | 97.3 | 97.3 | 9.09 | 9.09 | 685 | 681 |
+| plain | complete | 19.1 | 19.1 | 6.03 | 6.03 | 506 | 506 |
 
-- A keyed enqueue adds one index entry: one WAL record, 105 bytes, and two
+- A keyed enqueue adds one index entry: one WAL record, 92 bytes, and two
   buffers.
 - A keyed claim adds one index entry for the `RUNNING` version of the row:
-  one WAL record and 87 bytes.
+  one WAL record and 79 bytes.
 - A completion adds none. A finished row is not live.
-- A row with no key pays nothing.
+- A row with no key pays nothing. Its WAL record counts do not change. The
+  plain enqueue bytes differ by 47, because the size of each full-page image
+  varies from run to run.
+- One keyed task costs 3,742 WAL bytes in all, against 3,571 before. That is
+  4.8% more.
 - Two operator cap rewrites, `set_live_activity_caps` and
   `raise_waiting_concurrency_caps`, change only `concurrency_cap`. Before, no
   index held that column, so their updates could be HOT. The predicate of the
   index names it, so the updates are not HOT now. Each adds one entry to each
   index of the row. The rewrites are rare, so the harness does not measure
   them.
-- One keyed task costs 3,749 WAL bytes in all, against 3,556 before. That is
-  5.4% more.
 
 ## Other readers
 
@@ -151,7 +153,8 @@ Per call (`docs/perf-artifacts/concurrency-live-index/write-costs.md`):
   with `concurrency_cap < $2`. That test implies a cap. On the large fixture
   it read 635,675 buffers through the primary key. With the index it reads
   3,422 (`raise-caps-*-large.txt`, from `raise-caps.sql`).
-- The claim cap re-check and `release_claim_if_over_cap` count `RUNNING` rows.
+- The cap re-check inside the claim statement and `release_claim_if_over_cap`
+  count `RUNNING` rows.
   Their count has no `concurrency_cap IS NOT NULL` filter, so the planner
   cannot prove the predicate of the index. They keep
   `harvest_task_queue_concurrency_key_running`.

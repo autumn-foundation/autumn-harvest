@@ -10,11 +10,14 @@
 //! `enable_seqscan` off and a generic plan. The deciding check is the index
 //! name.
 //!
-//! The buffer gates keep the default planner settings. They seed many rows
-//! with no key and a few keyed rows. One call must then read a number of
-//! buffers near the keyed rows, not near the table. A plan gate cannot cover
-//! the pending keys of the full claim. On an empty table, other indexes can
-//! serve that step too, so the planner may pick any of them.
+//! The buffer gates plan each statement as the engine does. The gauge read is
+//! an unnamed statement, so it gets a custom plan. The claim applies
+//! `CLAIM_PLAN_SETTINGS_SQL`, so its pending keys get a generic plan with
+//! bitmap scans off. The gates seed many rows with no key and a few keyed
+//! rows. One call must then read a number of buffers near the keyed rows, not
+//! near the table. A plan gate cannot cover the pending keys of the full
+//! claim. On an empty table, other indexes can serve that step too, so the
+//! planner may pick any of them.
 
 use std::fmt::Write as _;
 
@@ -81,8 +84,12 @@ fn pending_keys_sql() -> String {
         })
         .expect("the pending-keys CTE closes");
     let body = full[start..end].to_owned();
+    let only_queue_list = body.match_indices('$').all(|(i, _)| {
+        let mut after = body[i + 1..].chars();
+        after.next() == Some('2') && !after.next().is_some_and(|c| c.is_ascii_digit())
+    });
     assert!(
-        body.contains("$2") && !body.contains("$1") && !body.contains("$3"),
+        body.contains("$2") && only_queue_list,
         "the pending-keys CTE binds only the queue list: {body}"
     );
     body.replace("$2", "$1")
@@ -150,11 +157,11 @@ async fn seed(conn: &mut diesel_async::AsyncPgConnection) {
         .expect("vacuum the task queue");
 }
 
-/// Return the shared buffers that one generic-plan call of `sql` reads on
-/// queue `w`, and its plan.
+/// Return the shared buffers that one call of `sql` reads on queue `w`, and
+/// its plan.
 ///
 /// `settings` holds `SET LOCAL` statements. They apply to the call only, as
-/// the claim applies `CLAIM_PLAN_SETTINGS_SQL`.
+/// the claim applies `CLAIM_PLAN_SETTINGS_SQL`. They choose the plan mode.
 async fn call_buffers(
     conn: &mut diesel_async::AsyncPgConnection,
     settings: &str,
@@ -162,18 +169,17 @@ async fn call_buffers(
 ) -> (i64, String) {
     conn.batch_execute(&format!(
         "BEGIN; {settings}; \
-         SET LOCAL plan_cache_mode = force_generic_plan; \
          PREPARE concurrency_live_gate AS {sql}"
     ))
     .await
-    .expect("prepare the gated statement");
+    .unwrap_or_else(|e| panic!("PREPARE failed: {e}\n{sql}"));
     let lines: Vec<PlanLine> = diesel::sql_query(
         "EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF) \
          EXECUTE concurrency_live_gate(ARRAY['w'])",
     )
     .load(conn)
     .await
-    .expect("explain the gated statement");
+    .unwrap_or_else(|e| panic!("EXPLAIN failed: {e}\n{sql}"));
     conn.batch_execute("DEALLOCATE concurrency_live_gate; COMMIT")
         .await
         .expect("deallocate the gated statement");
@@ -182,12 +188,13 @@ async fn call_buffers(
         .map(|l| l.line)
         .collect::<Vec<_>>()
         .join("\n");
-    // The first `Buffers:` line belongs to the top node. It includes the
-    // buffers of each child node.
+    // The top node has the lines before the first child arrow. Its
+    // `Buffers:` line includes the buffers of each child node.
     let top = plan
         .lines()
+        .take_while(|l| !l.trim_start().starts_with("->"))
         .find(|l| l.trim_start().starts_with("Buffers:"))
-        .unwrap_or_else(|| panic!("the plan has no buffer line:\n{plan}"));
+        .unwrap_or_else(|| panic!("the top node has no buffer line:\n{plan}"));
     let buffers = ["hit=", "read="]
         .iter()
         .filter_map(|field| {
@@ -215,8 +222,12 @@ async fn seeded_pages(conn: &mut diesel_async::AsyncPgConnection) -> i64 {
     table.pages
 }
 
-/// The most buffers that one gated call may read. The index holds fewer than
-/// 50 keyed live rows. A scan of the fixture reads more than 400 pages.
+/// The most buffers that one gated call may read.
+///
+/// The index holds 48 entries: 43 on queue `w`, with 2 `RUNNING` rows that
+/// have no worker, and 5 on queue `x`. The worst case reads one heap page per
+/// entry and 2 index pages, so 50 buffers. A scan of the fixture reads more
+/// than 400 pages.
 const BUFFER_BOUND: i64 = 60;
 
 /// One stats call reads buffers in proportion to the keyed rows, not to
@@ -227,7 +238,12 @@ async fn concurrency_stats_buffers_follow_the_keyed_rows() {
     let mut conn = claim_bench_db::connect(&bench.url).await;
     let pages = seeded_pages(&mut conn).await;
 
-    let (buffers, plan) = call_buffers(&mut conn, "", CONCURRENCY_STATS_SQL).await;
+    let (buffers, plan) = call_buffers(
+        &mut conn,
+        "SET LOCAL plan_cache_mode = force_custom_plan",
+        CONCURRENCY_STATS_SQL,
+    )
+    .await;
     assert!(
         buffers <= BUFFER_BOUND,
         "one stats call read {buffers} buffers of a {pages}-page table:\n{plan}"
@@ -237,7 +253,7 @@ async fn concurrency_stats_buffers_follow_the_keyed_rows() {
 /// The `concurrency_pending_keys` CTE of the full claim reads the due keyed
 /// rows, not each due row of the queue. The window claim drops that CTE, so
 /// only a fallback claim runs it. The gate plans it with the settings of the
-/// claim, which turn off bitmap scans.
+/// claim, which force a generic plan and turn off bitmap scans.
 #[tokio::test(flavor = "multi_thread")]
 async fn claim_fallback_pending_keys_follow_the_keyed_rows() {
     let bench = plan_gate_db().await;

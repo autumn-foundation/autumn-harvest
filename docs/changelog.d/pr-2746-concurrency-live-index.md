@@ -19,8 +19,8 @@ pending rows.
 - Read cost per gauge call falls by 93% at each size: 672 to 44, 6,794 to
   499 and 20,230 to 1,473 buffers at 10,000, 100,000 and 300,000 pending
   rows. See `docs/performance-concurrency-live-index.md`.
-- Write cost: a keyed enqueue and a keyed claim each add one WAL record, about
-  100 bytes. A completion and every write of a row with no key do not change.
+- Write cost: a keyed enqueue and a keyed claim each add one WAL record, 79
+  to 92 bytes. One keyed task writes 4.8% more WAL. A completion and every write of a row with no key do not change.
   The two operator cap rewrites are no longer HOT updates, because the
   predicate names `concurrency_cap`.
 - Gates: `concurrency_live_index_tests` plans the gauge and attribution reads

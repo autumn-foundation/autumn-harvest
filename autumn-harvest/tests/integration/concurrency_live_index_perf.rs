@@ -16,12 +16,15 @@
 //! rows on other queues. So the index has depth, and each claim reads a real
 //! backlog.
 //!
+//! Autovacuum is off for the task queue after the seed. So each run sees the
+//! same plans and the same page state.
+//!
 //! The capture is `#[ignore]`d. It needs a superuser and a preloaded
 //! `pg_stat_statements`. `HARVEST_TEST_DATABASE_URL` names an admin URL.
 //! Without it the harness starts a Postgres container. Output goes to
 //! `docs/perf-artifacts/concurrency-live-index/`.
 
-#![allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+#![allow(clippy::cast_precision_loss)]
 
 use std::fmt::Write as _;
 
@@ -60,7 +63,7 @@ const KINDS: [Kind; 4] = [
         fragment: "worker_info AS",
     },
     Kind {
-        label: "claim cap re-check",
+        label: "release_claim_if_over_cap",
         fragment: ") > harvest_task_queue.concurrency_cap",
     },
     Kind {
@@ -103,6 +106,8 @@ impl Cost {
 struct StatRow {
     #[diesel(sql_type = Text)]
     query: String,
+    #[diesel(sql_type = BigInt)]
+    queryid: i64,
     #[diesel(sql_type = BigInt)]
     calls: i64,
     #[diesel(sql_type = BigInt)]
@@ -151,9 +156,14 @@ async fn seed(conn: &mut AsyncPgConnection) {
     )
     .await
     .expect("seed the background");
+    // An autovacuum in the middle of a phase replans the claim and prunes
+    // pages at random times. So the harness turns it off after the seed.
     conn.batch_execute("VACUUM ANALYZE harvest_task_queue")
         .await
         .expect("vacuum");
+    conn.batch_execute("ALTER TABLE harvest_task_queue SET (autovacuum_enabled = false)")
+        .await
+        .expect("turn off autovacuum");
 }
 
 async fn reset(conn: &mut AsyncPgConnection, db_name: &str) {
@@ -169,7 +179,7 @@ async fn reset(conn: &mut AsyncPgConnection, db_name: &str) {
 
 async fn snapshot(conn: &mut AsyncPgConnection, db_name: &str) -> Vec<StatRow> {
     diesel::sql_query(format!(
-        "SELECT query, calls, (shared_blks_hit + shared_blks_read) AS buffers, \
+        "SELECT query, queryid, calls, (shared_blks_hit + shared_blks_read) AS buffers, \
                 shared_blks_dirtied AS dirtied, wal_records, wal_fpi, \
                 wal_bytes::BIGINT AS wal_bytes \
          FROM pg_stat_statements \
@@ -223,8 +233,14 @@ fn classify(rows: &[StatRow]) -> (Vec<Cost>, Cost, String) {
         let query: String = row.query.chars().take(140).collect();
         let _ = writeln!(
             raw,
-            "calls={} buffers={} dirtied={} wal_records={} wal_fpi={} wal_bytes={} | {query}",
-            row.calls, row.buffers, row.dirtied, row.wal_records, row.wal_fpi, row.wal_bytes
+            "queryid={} calls={} buffers={} dirtied={} wal_records={} wal_fpi={} wal_bytes={} | {query}",
+            row.queryid,
+            row.calls,
+            row.buffers,
+            row.dirtied,
+            row.wal_records,
+            row.wal_fpi,
+            row.wal_bytes
         );
     }
     (kinds, other, raw)
@@ -266,17 +282,12 @@ async fn zz_capture_concurrency_live_index_write_costs() {
             run_phase(&mut conn, keyed).await;
             let rows = snapshot(&mut conn, &db_name).await;
             let (kinds, other, raw) = classify(&rows);
-            for (kind, cost) in KINDS.iter().zip(&kinds).chain([(
-                &Kind {
-                    label: "other",
-                    fragment: "",
-                },
-                &other,
-            )]) {
+            let labels = KINDS.iter().map(|k| k.label).chain(["other"]);
+            for (label, cost) in labels.zip(kinds.iter().chain([&other])) {
                 let _ = writeln!(
                     table,
                     "| {variant} | {phase} | {} | {} | {:.1} | {:.2} | {:.2} | {:.3} | {:.0} |",
-                    kind.label,
+                    label,
                     cost.calls,
                     cost.per_call(cost.buffers),
                     cost.per_call(cost.dirtied),
