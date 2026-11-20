@@ -295,8 +295,35 @@ fn show(version: Option<OverlayVersion>) -> String {
     version.map_or_else(|| "none (the base profile)".to_owned(), |v| v.to_string())
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<(), Box<dyn Error>> {
+/// The stack of the thread that runs the walk.
+///
+/// The SQLite runtime drives each workflow on the calling thread. A debug
+/// build of the walk needs about 760 KiB of stack on Linux, and more on
+/// Windows. The main thread of a Windows process gets 1 MiB only, so the
+/// walk overflowed it in CI. A spawned thread gets the stack that it asks
+/// for, so the walk runs there. `autumn-harvest-cli/src/main.rs` does the
+/// same. Reproduce the overflow on Linux with `ulimit -s 768`.
+const WALK_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let walk = std::thread::Builder::new()
+        .name("agent-refine".to_owned())
+        .stack_size(WALK_STACK_BYTES)
+        .spawn(|| -> Result<(), String> {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            runtime
+                .block_on(walk_and_report())
+                .map_err(|e| e.to_string())
+        })?;
+    walk.join().map_err(|_| "the walk thread panicked")??;
+    Ok(())
+}
+
+/// Run the walk, print each step, and check the outcome.
+async fn walk_and_report() -> Result<(), Box<dyn Error>> {
     let outcome = run(&RefineDecision::Approve).await?;
     println!("op 1 check: {:?}", outcome.op1);
     println!("version before: {}", show(outcome.before));
