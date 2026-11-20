@@ -45,7 +45,9 @@ The owner take tests `workflow_exec_id` and `task_type = 'workflow'`. So
 `splice_one_row_predicates` adds the id test of a one-row claim. It also
 wraps the state test of both scans with `row_guard_sql!`. The planner cannot
 prove a partial index predicate from the `CASE`. So the by-id claim reads
-the primary key, and the owner take reads `idx_harvest_tq_workflow`.
+the primary key, and the owner take reads `idx_harvest_tq_workflow_task`.
+That index holds the one workflow task row of each run. See
+`docs/performance-claim-release-guard.md`.
 
 The window claim keeps the plain state test. It needs its partial indexes.
 
@@ -85,10 +87,11 @@ fixture. With 1,024 keys on the pending rows, the by-id claim read 8,629 /
 these two scans. They read by key, so `row_guard_sql!` cannot help them.
 They need their own fix.
 
-The owner take reads each row of its run through `idx_harvest_tq_workflow`.
-A run with many activity rows, or with terminal rows that retention has not
-removed, costs one heap read per row. The plan from fresh statistics reads
-the same rows, so the fix does not change this cost.
+The owner take read each row of its run through `idx_harvest_tq_workflow`.
+A run with many activity rows cost one heap read for each row. The
+workflow task index of migration `20261120145312` removes that cost. The
+owner take now reads one row for any run size. The table above predates
+that index.
 
 ## 🔬 Reproduce
 

@@ -76,8 +76,8 @@ plan = "docs/ledger/plans/autumn-harvest/timeout.md"
 driver = "per_tick"
 backend = ["postgres"]
 kind = ["read"]
-tables = []
-measured = "unmeasured"
+tables = ["harvest_task_queue"]
+measured = "docs/performance-claim-release-guard.md"
 plan = "docs/ledger/plans/autumn-harvest/timeout.md"
 
 ["force_fail_activity"]
@@ -92,8 +92,8 @@ plan = "docs/ledger/plans/autumn-harvest/timeout.md"
 driver = "per_tick"
 backend = ["postgres"]
 kind = ["read"]
-tables = []
-measured = "unmeasured"
+tables = ["harvest_task_queue"]
+measured = "docs/performance-claim-release-guard.md"
 plan = "docs/ledger/plans/autumn-harvest/timeout.md"
 
 ["lock_task_for_timeout"]

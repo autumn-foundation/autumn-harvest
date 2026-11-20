@@ -2305,7 +2305,9 @@ pub(crate) async fn serve_recorded_activities(
             harvest_task_queue::table
                 .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
                 .filter(harvest_task_queue::activity_id.eq(Some(activity_id.as_uuid())))
-                .filter(harvest_task_queue::state.eq_any(["PENDING", "RUNNING"])),
+                .filter(crate::row_guard::row_guard(
+                    harvest_task_queue::state.eq_any(["PENDING", "RUNNING"]),
+                )),
         )
         .set((
             harvest_task_queue::state.eq("CANCELLED"),

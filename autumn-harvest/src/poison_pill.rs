@@ -738,11 +738,11 @@ mod scanner {
             diesel::update(
                 task_dsl::harvest_task_queue
                     .filter(task_dsl::workflow_exec_id.eq(exec_id.as_uuid()))
-                    .filter(
+                    .filter(crate::row_guard::row_guard(
                         task_dsl::state
                             .eq("PENDING")
                             .or(task_dsl::state.eq("RUNNING")),
-                    ),
+                    )),
             )
             .set((
                 task_dsl::state.eq("FAILED"),

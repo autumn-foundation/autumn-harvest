@@ -4464,7 +4464,7 @@ pub fn owned_claim_by_id_query(fenced: bool) -> &'static str {
 ///
 /// It is [`splice_by_id_predicate`] keyed by the execution id of a
 /// workflow row. Each run has one workflow-task row, so the claim names one
-/// row. `idx_harvest_tq_workflow` finds it.
+/// row. `idx_harvest_tq_workflow_task` finds it.
 fn splice_by_execution_predicate(base: &str, bind: &str) -> String {
     splice_one_row_predicates(
         base,
@@ -5422,8 +5422,8 @@ pub async fn owner_scan(
 ///
 /// A wake names an execution only. The owner decider calls this to rank
 /// hints against each other and against the scan. It reads one row per
-/// execution through `idx_harvest_tq_workflow`. A row that is not `PENDING`
-/// and due gives no key.
+/// execution through `idx_harvest_tq_workflow_task`. A row that is not
+/// `PENDING` and due gives no key.
 ///
 /// # Errors
 ///
@@ -5451,14 +5451,19 @@ pub async fn owner_keys(
 }
 
 /// SQL for [`owner_keys`].
-const OWNER_KEYS_SQL: &str = concat!(
+///
+/// The `state` test goes through `row_guard_sql!`. The plain `task_type` test
+/// lets the planner read each row through `idx_harvest_tq_workflow_task`, not
+/// through a partial index of pending rows.
+pub(crate) const OWNER_KEYS_SQL: &str = concat!(
     "SELECT workflow_exec_id AS exec_id, 0::float8 AS wait_secs, \
             priority AS eff_priority, ",
     claim_order_due_sql!(),
     " AS due_at \
      FROM harvest_task_queue \
-     WHERE workflow_exec_id = ANY($1) AND state = 'PENDING' \
-       AND task_type = 'workflow' AND scheduled_at <= NOW()"
+     WHERE workflow_exec_id = ANY($1) AND task_type = 'workflow' AND ",
+    crate::row_guard::row_guard_sql!("state = 'PENDING'"),
+    " AND scheduled_at <= NOW()"
 );
 
 /// What a dispatch reference's row looks like right now (issue #1312).
@@ -7170,7 +7175,9 @@ pub async fn fail_open_tasks_for_execution(
     diesel::update(
         dsl::harvest_task_queue
             .filter(dsl::workflow_exec_id.eq(Some(exec_id.as_uuid())))
-            .filter(dsl::state.eq_any(["PENDING", "RUNNING"])),
+            .filter(crate::row_guard::row_guard(
+                dsl::state.eq_any(["PENDING", "RUNNING"]),
+            )),
     )
     .set((
         dsl::state.eq("FAILED"),
@@ -7202,7 +7209,9 @@ pub async fn cancel_open_tasks_for_execution(
     diesel::update(
         dsl::harvest_task_queue
             .filter(dsl::workflow_exec_id.eq(Some(exec_id.as_uuid())))
-            .filter(dsl::state.eq_any(["PENDING", "RUNNING"])),
+            .filter(crate::row_guard::row_guard(
+                dsl::state.eq_any(["PENDING", "RUNNING"]),
+            )),
     )
     .set((
         dsl::state.eq("CANCELLED"),
@@ -10254,19 +10263,13 @@ pub async fn wake_workflow_task(
     // claimable at once when the execution is RUNNING again. But no fresh
     // NOTIFY went out for it, so a LISTEN-based worker sleeps until the next
     // poll interval. Notify those queues too, so resume re-arms promptly.
-    let already_due: Vec<PendingHintRow> = diesel::sql_query(
-        "SELECT id, queue_name, scheduled_at, priority, task_type FROM harvest_task_queue \
-         WHERE workflow_exec_id = $1 \
-           AND task_type = 'workflow' \
-           AND state = 'PENDING' \
-           AND scheduled_at <= $2",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-    .bind::<diesel::sql_types::Timestamptz, _>(Timestamp::now().to_diesel())
-    .cache_prepared()
-    .load(conn)
-    .await
-    .map_err(crate::error::database_error)?;
+    let already_due: Vec<PendingHintRow> = diesel::sql_query(already_due_workflow_task_query())
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .bind::<diesel::sql_types::Timestamptz, _>(Timestamp::now().to_diesel())
+        .cache_prepared()
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
 
     repended.extend(already_due);
 
@@ -10347,40 +10350,59 @@ async fn primary_repend_workflow_task(
 
 /// SQL for [`primary_repend_workflow_task`]. Extracted as a `const fn` so its
 /// WHERE clause is unit-testable without a database.
-const fn primary_repend_workflow_task_query() -> &'static str {
-    "UPDATE harvest_task_queue \
-     SET state = 'PENDING', \
-         worker_id = NULL, \
-         started_at = NULL, \
-         scheduled_at = $2, \
-         created_at = clock_timestamp(), \
-         activity_name = NULL, \
-         timer_fires_at = NULL, \
-         sticky_until = CASE \
-             WHEN sticky_worker_id IS NOT NULL AND sticky_timeout IS NOT NULL \
-             THEN NOW() + sticky_timeout \
-             ELSE sticky_until \
-         END \
-     WHERE workflow_exec_id = $1 \
-       AND task_type = 'workflow' \
-       AND ( \
-           (state = 'RUNNING' AND worker_id IS NULL AND started_at IS NULL) \
-           OR (state = 'PENDING' AND scheduled_at > $2 AND activity_name = 'mixed_signal_suspension') \
-       ) \
-     RETURNING id, queue_name, scheduled_at, priority, task_type"
+///
+/// The `state` and `worker_id` tests go through `row_guard_sql!`. The plain
+/// `task_type` test lets the planner read the row through
+/// `idx_harvest_tq_workflow_task`, which holds one row for each run.
+pub(crate) const fn primary_repend_workflow_task_query() -> &'static str {
+    concat!(
+        "UPDATE harvest_task_queue \
+         SET state = 'PENDING', \
+             worker_id = NULL, \
+             started_at = NULL, \
+             scheduled_at = $2, \
+             created_at = clock_timestamp(), \
+             activity_name = NULL, \
+             timer_fires_at = NULL, \
+             sticky_until = CASE \
+                 WHEN sticky_worker_id IS NOT NULL AND sticky_timeout IS NOT NULL \
+                 THEN NOW() + sticky_timeout \
+                 ELSE sticky_until \
+             END \
+         WHERE workflow_exec_id = $1 AND task_type = 'workflow' AND ",
+        crate::row_guard::row_guard_sql!(
+            "(state = 'RUNNING' AND worker_id IS NULL AND started_at IS NULL) \
+             OR (state = 'PENDING' AND scheduled_at > $2 \
+                 AND activity_name = 'mixed_signal_suspension')"
+        ),
+        " RETURNING id, queue_name, scheduled_at, priority, task_type"
+    )
+}
+
+/// SQL for the due-row read of [`wake_workflow_task`]: the `PENDING`
+/// workflow task of `$1` that is due by `$2`. The guard goes through
+/// `row_guard_sql!`, as in [`primary_repend_workflow_task_query`].
+pub(crate) const fn already_due_workflow_task_query() -> &'static str {
+    concat!(
+        "SELECT id, queue_name, scheduled_at, priority, task_type FROM harvest_task_queue \
+         WHERE workflow_exec_id = $1 AND task_type = 'workflow' AND ",
+        crate::row_guard::row_guard_sql!("state = 'PENDING'"),
+        " AND scheduled_at <= $2"
+    )
 }
 
 /// SQL for [`wake_workflow_task`]'s dropped-wake fallback: marks a still-claimed
 /// `RUNNING` row (`worker_id IS NOT NULL`) as wake-requested when the primary
 /// re-pend UPDATE above matched no parked row. Extracted as a `const fn` so its
-/// WHERE clause is unit-testable without a database.
-const fn wake_requested_fallback_query() -> &'static str {
-    "UPDATE harvest_task_queue \
-     SET wake_requested = TRUE \
-     WHERE workflow_exec_id = $1 \
-       AND task_type = 'workflow' \
-       AND state = 'RUNNING' \
-       AND worker_id IS NOT NULL"
+/// WHERE clause is unit-testable without a database. The guard goes through
+/// `row_guard_sql!`, as in [`primary_repend_workflow_task_query`].
+pub(crate) const fn wake_requested_fallback_query() -> &'static str {
+    concat!(
+        "UPDATE harvest_task_queue \
+         SET wake_requested = TRUE \
+         WHERE workflow_exec_id = $1 AND task_type = 'workflow' AND ",
+        crate::row_guard::row_guard_sql!("state = 'RUNNING' AND worker_id IS NOT NULL")
+    )
 }
 
 /// Update the priority of a pending task via the management API.
@@ -10458,7 +10480,9 @@ pub async fn session_has_other_live_tasks(
             .filter(dsl::workflow_exec_id.eq(Some(workflow_exec_id)))
             .filter(dsl::session_id.eq(Some(session_id)))
             .filter(dsl::id.ne(except_task_id))
-            .filter(dsl::state.eq_any(["PENDING", "RUNNING"])),
+            .filter(crate::row_guard::row_guard(
+                dsl::state.eq_any(["PENDING", "RUNNING"]),
+            )),
     ))
     .get_result::<bool>(conn)
     .await
@@ -16306,6 +16330,10 @@ mod tests {
             "a signal/child/handoff wake must clear the stale timer-provenance \
              marker (issue #1402): {sql}",
         );
+        assert!(
+            sql.contains("WHERE workflow_exec_id = $1 AND task_type = 'workflow' AND (CASE WHEN "),
+            "the guard must stay hidden from the planner: {sql}",
+        );
     }
 
     #[test]
@@ -16318,6 +16346,29 @@ mod tests {
             sql.contains("worker_id IS NOT NULL"),
             "fallback must only mark a row that is currently claimed (mid-processing), \
              never a genuinely parked or PENDING row",
+        );
+        assert!(
+            sql.contains("WHERE workflow_exec_id = $1 AND task_type = 'workflow' AND (CASE WHEN "),
+            "the guard must stay hidden from the planner: {sql}",
+        );
+    }
+
+    #[test]
+    fn the_wake_due_row_read_and_owner_keys_hide_their_guards() {
+        let due = already_due_workflow_task_query();
+        assert!(
+            due.contains(
+                "workflow_exec_id = $1 AND task_type = 'workflow' \
+                 AND (CASE WHEN state = 'PENDING' THEN true END) AND scheduled_at <= $2"
+            ),
+            "{due}"
+        );
+        assert!(
+            OWNER_KEYS_SQL.contains(
+                "workflow_exec_id = ANY($1) AND task_type = 'workflow' \
+                 AND (CASE WHEN state = 'PENDING' THEN true END) AND scheduled_at <= NOW()"
+            ),
+            "{OWNER_KEYS_SQL}"
         );
     }
 

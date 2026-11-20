@@ -1,9 +1,9 @@
 #![cfg(feature = "db")]
-//! The one-row task statements read the table through a full index.
+//! The guarded task statements read the table through their key index.
 //!
-//! Each statement in `row_guard::guarded_statements` finds one row by `id`,
-//! or by execution id for the owner take. Its guard on `state` and
-//! `worker_id` must not let the planner choose a partial index. Two fixtures make the planner try:
+//! Each statement in `row_guard::guarded_statements` finds task rows by `id`
+//! or by execution id. Its guard on `state` and `worker_id` must not let the
+//! planner choose a partial index. Two fixtures make the planner try:
 //!
 //! - Grouped: 100,000 rows, and 5 to 200 `RUNNING` rows for each of 100
 //!   workers. At 5 to 50 rows per worker, `running_worker_idx` can cost less
@@ -17,7 +17,9 @@
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a Postgres server, or let
 //! each test start a container.
 
-use autumn_harvest::row_guard::{GuardedStatement, guarded_statements};
+use autumn_harvest::row_guard::{
+    EXECUTION_INDEX, GuardedStatement, PRIMARY_KEY, WORKFLOW_TASK_INDEX, guarded_statements,
+};
 use diesel::QueryableByName;
 use diesel::sql_types::Text;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
@@ -230,8 +232,19 @@ async fn plan_of(
     serde_json::from_str(&plan.plan).expect("plan is JSON")
 }
 
-/// Each scan of `harvest_task_queue` in `node`: `(alias, node type, index)`.
-fn task_queue_scans(node: &serde_json::Value, out: &mut Vec<(String, String, String)>) {
+/// One scan of `harvest_task_queue` in a plan.
+#[derive(Debug)]
+struct Scan {
+    alias: String,
+    node: String,
+    index: String,
+    /// True when the scan tests an index condition. An index scan with no
+    /// condition reads the whole index.
+    keyed: bool,
+}
+
+/// Each scan of `harvest_task_queue` in `node`.
+fn task_queue_scans(node: &serde_json::Value, out: &mut Vec<Scan>) {
     if node.get("Relation Name").and_then(|v| v.as_str()) == Some("harvest_task_queue")
         && node.get("Node Type").and_then(|v| v.as_str()) != Some("ModifyTable")
     {
@@ -241,18 +254,40 @@ fn task_queue_scans(node: &serde_json::Value, out: &mut Vec<(String, String, Str
                 .unwrap_or_default()
                 .to_owned()
         };
-        let index = if text("Node Type") == "Bitmap Heap Scan" {
+        let bitmap = text("Node Type") == "Bitmap Heap Scan";
+        let index = if bitmap {
             bitmap_indexes(node).join(",")
         } else {
             text("Index Name")
         };
-        out.push((text("Alias"), text("Node Type"), index));
+        out.push(Scan {
+            alias: text("Alias"),
+            node: text("Node Type"),
+            index,
+            keyed: if bitmap {
+                bitmap_conditions(node)
+            } else {
+                node.get("Index Cond").is_some()
+            },
+        });
     }
     if let Some(children) = node.get("Plans").and_then(|v| v.as_array()) {
         for child in children {
             task_queue_scans(child, out);
         }
     }
+}
+
+/// True when each bitmap index scan under `node` tests an index condition.
+fn bitmap_conditions(node: &serde_json::Value) -> bool {
+    node.get("Plans")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .all(|child| {
+            let scan = child.get("Node Type").and_then(|v| v.as_str()) == Some("Bitmap Index Scan");
+            (!scan || child.get("Index Cond").is_some()) && bitmap_conditions(child)
+        })
 }
 
 /// The indexes that the bitmap index scans under `node` read.
@@ -285,45 +320,72 @@ fn exempt(statement: &str, alias: &str) -> bool {
     alias == "recheck" || (is_claim(statement) && alias == "t")
 }
 
-/// Each statement on `conn` that leaves its full index, as a message.
+/// True when each checked scan in `plan` reads `index` with a condition.
 ///
-/// Each checked scan reads the full index of the statement or the primary
-/// key. A claim reads its candidate through its full index, then updates
-/// the row through the primary key.
-async fn primary_key_failures(conn: &mut AsyncPgConnection, fixture: &str) -> Vec<String> {
-    let mut failures = Vec::new();
+/// A scan may also read the primary key. A claim reads its candidate through
+/// its key index, then updates the row through the primary key.
+fn reads_key_index(plan: &serde_json::Value, statement: &str, index: &str) -> (bool, Vec<Scan>) {
+    let mut scans = Vec::new();
+    task_queue_scans(&plan[0]["Plan"], &mut scans);
+    scans.retain(|scan| !exempt(statement, &scan.alias));
+    let on_key = !scans.is_empty()
+        && scans.iter().all(|scan| {
+            (scan.node.starts_with("Index") || scan.node == "Bitmap Heap Scan")
+                && (scan.index == index || scan.index == PRIMARY_KEY)
+                && scan.keyed
+        });
+    (on_key, scans)
+}
+
+/// What the plan check found on one fixture.
+#[derive(Default)]
+struct KeyIndexReport {
+    /// Each guarded statement that leaves its key index, as a message.
+    failures: Vec<String>,
+    /// For each key index, the number of plain forms that leave it. A
+    /// fixture that provokes no plain form tests nothing.
+    plain_leaves: std::collections::BTreeMap<&'static str, usize>,
+}
+
+/// Each statement on `conn` that leaves its key index. Each raw statement
+/// is also planned in its plain form, as a negative control.
+async fn key_index_report(conn: &mut AsyncPgConnection, fixture: &str) -> KeyIndexReport {
+    let mut report = KeyIndexReport::default();
     for statement in guarded_statements() {
+        let index = statement.index;
         for (settings_name, settings) in SETTINGS {
             for cache_mode in ["force_generic_plan", "force_custom_plan"] {
                 let plan = plan_of(conn, &statement, settings, cache_mode).await;
-                let mut scans = Vec::new();
-                task_queue_scans(&plan[0]["Plan"], &mut scans);
-                let checked: Vec<_> = scans
-                    .iter()
-                    .filter(|(a, _, _)| !exempt(statement.name, a))
-                    .collect();
-                let on_pkey = !checked.is_empty()
-                    && checked.iter().all(|(_, node, index)| {
-                        (node.starts_with("Index") || node == "Bitmap Heap Scan")
-                            && (index == "harvest_task_queue_pkey" || index == statement.index)
-                    });
-                if !on_pkey {
-                    failures.push(format!(
-                        "{fixture}/{settings_name}/{cache_mode}: {} scans {checked:?}",
+                let (on_key, scans) = reads_key_index(&plan, statement.name, index);
+                if !on_key {
+                    report.failures.push(format!(
+                        "{fixture}/{settings_name}/{cache_mode}: {} scans {scans:?}",
                         statement.name
                     ));
+                }
+                let unguarded = plain_form(&statement.sql);
+                if statement.raw && unguarded != statement.sql {
+                    let control = GuardedStatement {
+                        sql: unguarded,
+                        ..statement.clone()
+                    };
+                    let control_plan = plan_of(conn, &control, settings, cache_mode).await;
+                    if !reads_key_index(&control_plan, statement.name, index).0 {
+                        *report.plain_leaves.entry(index).or_default() += 1;
+                    }
                 }
             }
         }
     }
-    failures
+    report
 }
 
 #[tokio::test]
-async fn by_id_guards_use_the_primary_key_for_any_slot_count() {
+async fn guarded_statements_use_their_key_index_for_any_slot_count() {
     let (server, _guard) = setup_server().await;
     let mut db = Db::create(&server).await;
     let mut failures = Vec::new();
+    let mut plain_leaves = 0;
     for per_worker in [5, 20, 50, 200] {
         db.conn
             .batch_execute("TRUNCATE harvest_task_queue CASCADE")
@@ -332,12 +394,15 @@ async fn by_id_guards_use_the_primary_key_for_any_slot_count() {
         seed(&mut db.conn, ROWS, per_worker * WORKERS).await;
         analyze(&mut db.conn).await;
         let fixture = format!("{per_worker} per worker");
-        failures.extend(primary_key_failures(&mut db.conn, &fixture).await);
+        let report = key_index_report(&mut db.conn, &fixture).await;
+        failures.extend(report.failures);
+        plain_leaves += report.plain_leaves.values().sum::<usize>();
     }
     db.drop().await;
+    assert!(plain_leaves > 0, "no plain form leaves its key index");
     assert!(
         failures.is_empty(),
-        "these one-row statements leave their full index:\n{}",
+        "these guarded statements leave their key index:\n{}",
         failures.join("\n")
     );
 }
@@ -345,7 +410,7 @@ async fn by_id_guards_use_the_primary_key_for_any_slot_count() {
 /// The statistics come from a table with no live row. The live rows arrive
 /// after the analyze, as a load arrives after an idle period.
 #[tokio::test]
-async fn by_id_guards_use_the_primary_key_after_an_idle_analyze() {
+async fn guarded_statements_use_their_key_index_after_an_idle_analyze() {
     let (server, _guard) = setup_server().await;
     let mut db = Db::create(&server).await;
     seed_runs(&mut db.conn, ROWS).await;
@@ -361,11 +426,22 @@ async fn by_id_guards_use_the_primary_key_after_an_idle_analyze() {
         .expect("seed terminal rows");
     analyze(&mut db.conn).await;
     seed(&mut db.conn, 2_000, 2_000).await;
-    let failures = primary_key_failures(&mut db.conn, "idle statistics").await;
+    let KeyIndexReport {
+        failures,
+        plain_leaves,
+    } = key_index_report(&mut db.conn, "idle statistics").await;
     db.drop().await;
+    // Each key kind must leave its index in its plain form here, or this
+    // fixture does not test it.
+    for index in [PRIMARY_KEY, EXECUTION_INDEX, WORKFLOW_TASK_INDEX] {
+        assert!(
+            plain_leaves.get(index).is_some_and(|n| *n > 0),
+            "no plain form leaves {index}: {plain_leaves:?}"
+        );
+    }
     assert!(
         failures.is_empty(),
-        "these one-row statements leave their full index:\n{}",
+        "these guarded statements leave their key index:\n{}",
         failures.join("\n")
     );
 }
@@ -429,9 +505,12 @@ async fn assert_truth_table(conn: &mut AsyncPgConnection) {
 /// Seed rows for the differential test: every mix of state, worker, kind,
 /// queue, activity, cap and strike count that a guard reads.
 ///
-/// Each row has its own execution, so an owner take names one row. The
-/// execution of a row with the held activity is paused. A workflow row with
-/// a crash strike is in decision partition 3, which no owner holds.
+/// Each row has its own execution, so an owner take and a by-execution
+/// statement read one row. The execution of a row with the held activity is
+/// paused. A workflow row with a crash strike is in decision partition 3,
+/// which no owner holds. It is also a mixed-signal suspension that is due
+/// later. A row with no worker is parked. A row with a cap has a deadline,
+/// and a row with no strike has an unconsumed signal.
 async fn seed_differential(conn: &mut AsyncPgConnection) {
     conn.batch_execute(
         "INSERT INTO harvest_queue_pauses (queue_name, reason) VALUES ('held', 'test'); \
@@ -455,12 +534,18 @@ async fn seed_differential(conn: &mut AsyncPgConnection) {
          INSERT INTO harvest_task_queue \
              (queue_name, task_type, input, state, worker_id, started_at, attempt, \
               crash_strikes, activity_name, concurrency_key, concurrency_cap, \
-              workflow_exec_id, decision_partition) \
-         SELECT q, k, '{}'::jsonb, s, w, now(), 1, c, \
-                CASE WHEN k = 'activity' THEN a END, \
+              workflow_exec_id, decision_partition, scheduled_at, schedule_to_close_at) \
+         SELECT q, k, '{}'::jsonb, s, w, CASE WHEN w IS NOT NULL THEN now() END, 1, c, \
+                CASE WHEN k = 'activity' THEN a \
+                     WHEN c = 1 THEN 'mixed_signal_suspension' END, \
                 CASE WHEN cap THEN 'key' END, CASE WHEN cap THEN 0 END, exec, \
-                CASE WHEN k = 'workflow' AND c = 1 THEN 3 END \
-         FROM seeded",
+                CASE WHEN k = 'workflow' AND c = 1 THEN 3 END, \
+                CASE WHEN c = 1 THEN now() + INTERVAL '1 hour' ELSE now() END, \
+                CASE WHEN cap THEN now() + INTERVAL '1 hour' END \
+         FROM seeded; \
+         INSERT INTO harvest_signals (workflow_exec_id, signal_name, payload) \
+         SELECT workflow_exec_id, 'nudge', '{}'::jsonb FROM harvest_task_queue \
+         WHERE crash_strikes = 0",
     )
     .await
     .expect("seed differential rows");
@@ -485,12 +570,13 @@ struct Digest {
 ///
 /// A claim polls the two seeded queues as `$2`. Its `$5` and `$6` list no
 /// activity, so no row skips its rate limit or its capability test. An
-/// owner take names the execution of the row, not the row.
+/// owner take and a by-execution statement name the execution of the row,
+/// not the row.
 fn arguments(statement: &GuardedStatement, row: &Row) -> Vec<String> {
-    let id = if statement.name.starts_with("take_by_execution") {
-        &row.exec
-    } else {
+    let id = if statement.index == PRIMARY_KEY {
         &row.id
+    } else {
+        &row.exec
     };
     let claim = is_claim(statement.name);
     statement
@@ -640,28 +726,65 @@ enum Order {
 /// One concurrent writer beside one release.
 struct Case {
     name: &'static str,
-    release: &'static str,
+    release: String,
     writer: &'static str,
     order: Order,
     want: usize,
 }
 
-/// Run `sql` as the release of `case` on a new claimed row. Return the
-/// number of rows that the release changed.
+/// `sql` with each `$n` replaced by `value`. A `$n` followed by a digit is a
+/// different parameter, so it stays.
+fn with_parameter(sql: &str, n: usize, value: &str) -> String {
+    let marker = format!("${n}");
+    let mut out = String::with_capacity(sql.len());
+    let mut rest = sql;
+    while let Some(at) = rest.find(&marker) {
+        let after = &rest[at + marker.len()..];
+        out.push_str(&rest[..at]);
+        if after.starts_with(|c: char| c.is_ascii_digit()) {
+            out.push_str(&marker);
+        } else {
+            out.push_str(value);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The raw guarded statement named `name`.
+fn guarded(name: &str) -> GuardedStatement {
+    guarded_statements()
+        .into_iter()
+        .find(|s| s.name == name && s.raw)
+        .unwrap_or_else(|| panic!("no raw guarded statement {name}"))
+}
+
+/// Run `statement` with `sql` as the release of `case` on a new claimed
+/// workflow task row. Return the number of rows that the release changed.
+///
+/// A by-id release binds the row id and `worker-7`. A by-execution release
+/// puts the execution id and `now()` into the SQL text for `$1` and `$2`.
 async fn run_beside_writer(
     setup: &mut AsyncPgConnection,
     db_url: &str,
     case: &Case,
+    statement: &GuardedStatement,
     sql: String,
 ) -> usize {
     let id = uuid::Uuid::new_v4();
+    let execution = uuid::Uuid::new_v4();
     let queue = format!("q-{id}");
     setup
         .batch_execute(&format!(
-            "INSERT INTO harvest_task_queue \
-                 (id, queue_name, task_type, input, state, worker_id, started_at, attempt) \
-             VALUES ('{id}', '{queue}', 'activity', '{{}}'::jsonb, 'RUNNING', \
-                     'worker-7', now(), 1)"
+            "INSERT INTO harvest_workflow_executions \
+                 (id, workflow_name, workflow_id, shard_id, input, state) \
+             VALUES ('{execution}', 'w', '{execution}', 0, '{{}}', 'RUNNING'); \
+             INSERT INTO harvest_task_queue \
+                 (id, queue_name, task_type, input, state, worker_id, started_at, attempt, \
+                  workflow_exec_id) \
+             VALUES ('{id}', '{queue}', 'workflow', '{{}}'::jsonb, 'RUNNING', \
+                     'worker-7', now(), 1, '{execution}')"
         ))
         .await
         .expect("insert claimed row");
@@ -680,13 +803,32 @@ async fn run_beside_writer(
     }
 
     let mut release_conn = AsyncPgConnection::establish(db_url).await.expect("release");
+    let by_id = statement.index == PRIMARY_KEY;
+    let mut by_execution = sql.clone();
+    if !by_id {
+        for (at, ty) in statement.param_types.iter().enumerate() {
+            let value = match *ty {
+                "uuid" => format!("'{execution}'::uuid"),
+                "timestamptz" => "now()".to_owned(),
+                other => panic!("{}: no value for a {other} parameter", case.name),
+            };
+            by_execution = with_parameter(&by_execution, at + 1, &value);
+        }
+    }
     let release = tokio::spawn(async move {
-        diesel::sql_query(sql)
-            .bind::<diesel::sql_types::Uuid, _>(id)
-            .bind::<Text, _>("worker-7")
-            .execute(&mut release_conn)
-            .await
-            .expect("release")
+        if by_id {
+            diesel::sql_query(sql)
+                .bind::<diesel::sql_types::Uuid, _>(id)
+                .bind::<Text, _>("worker-7")
+                .execute(&mut release_conn)
+                .await
+                .expect("release")
+        } else {
+            diesel::sql_query(by_execution)
+                .execute(&mut release_conn)
+                .await
+                .expect("release")
+        }
     });
     if case.order == Order::HoldsTheRow {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -719,45 +861,82 @@ async fn run_beside_writer(
 /// release still applies. A pause is seen only when it commits before the
 /// release starts. In production, `try_lock_queue_for_claim` orders a later
 /// pause after the claim.
+///
+/// The wake cases run by execution. A wake fallback that waits on a park
+/// sees the parked row, which has no worker, so it changes nothing. The
+/// wake then re-pends the parked row.
 #[tokio::test]
 async fn a_release_beside_a_completion_reclaim_or_pause_matches_the_plain_form() {
     use autumn_harvest::queue_pause::{release_claim_if_queue_paused_query, release_claim_query};
 
+    const PARK: &str = "UPDATE harvest_task_queue SET worker_id = NULL, started_at = NULL \
+                        WHERE id = $ID";
     let cases = [
         Case {
             name: "completion",
-            release: release_claim_query(),
+            release: release_claim_query().to_owned(),
             writer: "UPDATE harvest_task_queue SET state = 'COMPLETED' WHERE id = $ID",
             order: Order::HoldsTheRow,
             want: 0,
         },
         Case {
             name: "reclaim",
-            release: release_claim_query(),
+            release: release_claim_query().to_owned(),
             writer: "UPDATE harvest_task_queue SET worker_id = 'worker-8' WHERE id = $ID",
             order: Order::HoldsTheRow,
             want: 0,
         },
         Case {
             name: "heartbeat",
-            release: release_claim_query(),
+            release: release_claim_query().to_owned(),
             writer: "UPDATE harvest_task_queue SET last_heartbeat_at = now() WHERE id = $ID",
             order: Order::HoldsTheRow,
             want: 1,
         },
         Case {
             name: "pause in flight during the release",
-            release: release_claim_if_queue_paused_query(),
+            release: release_claim_if_queue_paused_query().to_owned(),
             writer: "INSERT INTO harvest_queue_pauses (queue_name, reason) VALUES ($QUEUE, 'test')",
             order: Order::CommitsLast,
             want: 0,
         },
         Case {
             name: "pause before the release starts",
-            release: release_claim_if_queue_paused_query(),
+            release: release_claim_if_queue_paused_query().to_owned(),
             writer: "INSERT INTO harvest_queue_pauses (queue_name, reason) VALUES ($QUEUE, 'test')",
             order: Order::CommitsFirst,
             want: 1,
+        },
+        Case {
+            name: "park while a wake fallback waits",
+            release: guarded("wake_fallback").sql,
+            writer: PARK,
+            order: Order::HoldsTheRow,
+            want: 0,
+        },
+        Case {
+            name: "heartbeat while a wake fallback waits",
+            release: guarded("wake_fallback").sql,
+            writer: "UPDATE harvest_task_queue SET last_heartbeat_at = now() WHERE id = $ID",
+            order: Order::HoldsTheRow,
+            want: 1,
+        },
+        Case {
+            name: "park before a wake re-pend",
+            release: guarded("wake_repend").sql,
+            writer: PARK,
+            order: Order::CommitsFirst,
+            want: 1,
+        },
+        // The re-pend reads a snapshot from before the park. That row has a
+        // worker, so the re-pend matches nothing and never waits on the lock
+        // that the uncommitted park holds.
+        Case {
+            name: "park after a wake re-pend",
+            release: guarded("wake_repend").sql,
+            writer: PARK,
+            order: Order::CommitsLast,
+            want: 0,
         },
     ];
 
@@ -765,8 +944,12 @@ async fn a_release_beside_a_completion_reclaim_or_pause_matches_the_plain_form()
     let db = Db::create(&server).await;
     let mut setup = AsyncPgConnection::establish(&db.url).await.expect("setup");
     for case in &cases {
-        for sql in [case.release.to_owned(), plain_form(case.release)] {
-            let changed = run_beside_writer(&mut setup, &db.url, case, sql).await;
+        let statement = guarded_statements()
+            .into_iter()
+            .find(|s| s.raw && s.sql == case.release)
+            .unwrap_or_else(|| panic!("{}: no raw guarded statement has this SQL", case.name));
+        for sql in [case.release.clone(), plain_form(&case.release)] {
+            let changed = run_beside_writer(&mut setup, &db.url, case, &statement, sql).await;
             assert_eq!(
                 changed, case.want,
                 "{}: the release changed {changed} rows",

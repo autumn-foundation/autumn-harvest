@@ -258,7 +258,7 @@ driver = "per_request"
 backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_external_tasks", "harvest_task_queue"]
-measured = "unmeasured"
+measured = "docs/performance-claim-release-guard.md"
 plan = "docs/ledger/plans/autumn-harvest/execution.md"
 
 ["stage_signal_with_idempotency"]

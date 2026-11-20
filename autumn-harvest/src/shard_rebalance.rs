@@ -708,7 +708,8 @@ pub(crate) use db::forwarding_hop_conflict;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub use db::{
-    OBSERVE_SQL, QUIESCENCE_SQL, STAGED_CHILD_DELETES, STAGED_SIGNALS_SQL, STAGED_TIMERS_SQL,
+    OBSERVE_SQL, QUIESCENCE_SQL, SIGNAL_REPEND_SQL, STAGED_CHILD_DELETES, STAGED_SIGNALS_SQL,
+    STAGED_TASK_SQL, STAGED_TIMERS_SQL,
 };
 
 #[cfg(feature = "db")]
@@ -1545,17 +1546,11 @@ mod db {
         // comment). `to_jsonb` keeps every column, including the sticky hint and
         // the concurrency key, so the restored row is the one that was parked.
         let staged_task: Option<Value> = {
-            let row: Option<NullableJsonRow> = diesel::sql_query(
-                "SELECT to_jsonb(t) AS payload FROM harvest_task_queue t \
-                  WHERE t.workflow_exec_id = $1 AND t.task_type = 'workflow' \
-                    AND ((t.state = 'RUNNING' AND t.worker_id IS NULL) \
-                         OR (t.state = 'PENDING' AND t.scheduled_at > NOW())) \
-                  ORDER BY t.scheduled_at LIMIT 1",
-            )
-            .bind::<SqlUuid, _>(exec_id.as_uuid())
-            .get_result(source)
-            .await
-            .optional_row()?;
+            let row: Option<NullableJsonRow> = diesel::sql_query(STAGED_TASK_SQL)
+                .bind::<SqlUuid, _>(exec_id.as_uuid())
+                .get_result(source)
+                .await
+                .optional_row()?;
             row.and_then(|r| r.payload)
         };
 
@@ -1882,6 +1877,36 @@ mod db {
     /// Every signal of one execution, consumed or not, as one JSON array.
     pub const STAGED_SIGNALS_SQL: &str = "SELECT COALESCE(jsonb_agg(to_jsonb(s)), '[]'::jsonb) \
          AS payload FROM harvest_signals s WHERE s.workflow_exec_id = $1";
+
+    /// The parked or timer-pended workflow task of one execution, as JSON.
+    ///
+    /// The `state` and `worker_id` tests go through `row_guard_sql!`, so the
+    /// planner reads the row through the workflow task index.
+    pub const STAGED_TASK_SQL: &str = concat!(
+        "SELECT to_jsonb(t) AS payload FROM harvest_task_queue t \
+         WHERE t.workflow_exec_id = $1 AND t.task_type = 'workflow' AND ",
+        crate::row_guard::row_guard_sql!(
+            "(t.state = 'RUNNING' AND t.worker_id IS NULL) \
+             OR (t.state = 'PENDING' AND t.scheduled_at > NOW())"
+        ),
+        " ORDER BY t.scheduled_at LIMIT 1"
+    );
+
+    /// Re-pend the parked workflow task of one execution when it has an
+    /// unconsumed signal.
+    pub const SIGNAL_REPEND_SQL: &str = concat!(
+        "UPDATE harvest_task_queue t \
+            SET state = 'PENDING', scheduled_at = NOW(), \
+                created_at = clock_timestamp(), \
+                timer_fires_at = NULL, \
+                wake_requested = FALSE \
+          WHERE t.workflow_exec_id = $1 AND t.task_type = 'workflow' AND ",
+        crate::row_guard::row_guard_sql!(
+            "t.state IN ('PENDING', 'RUNNING') AND t.worker_id IS NULL AND t.started_at IS NULL"
+        ),
+        " AND EXISTS (SELECT 1 FROM harvest_signals s \
+                      WHERE s.workflow_exec_id = $1 AND NOT s.consumed)"
+    );
 
     /// Everything a staged copy writes apart from the execution row itself.
     pub const STAGED_CHILD_DELETES: &[&str] = &[
@@ -2872,7 +2897,8 @@ mod db {
         // copy holds the same requests and claims them. A stale row here
         // would cost each later claim on this shard one probe.
         let sql = format!(
-            "WITH sealed AS ( \
+            concat!(
+                "WITH sealed AS ( \
                  UPDATE harvest_workflow_executions e \
                     SET state = 'MIGRATED', migrated_to_shard = $2, migrated_at = NOW(), \
                         completed_at = COALESCE(e.completed_at, NOW()) \
@@ -2883,9 +2909,9 @@ mod db {
                  UPDATE harvest_task_queue t \
                     SET state = 'CANCELLED', worker_id = NULL, completed_at = NOW(), \
                         error = 'execution migrated to shard ' || $2::text \
-                  WHERE t.workflow_exec_id = $1 AND t.task_type = 'workflow' \
-                    AND t.state IN ('PENDING', 'RUNNING') \
-                    AND EXISTS (SELECT 1 FROM sealed) \
+                  WHERE t.workflow_exec_id = $1 AND t.task_type = 'workflow' AND ",
+                crate::row_guard::row_guard_sql!("t.state IN ('PENDING', 'RUNNING')"),
+                " AND EXISTS (SELECT 1 FROM sealed) \
                  RETURNING t.id \
              ), forgotten AS ( \
                  DELETE FROM harvest_entity_state s \
@@ -2897,6 +2923,10 @@ mod db {
                  RETURNING p.event_row_id \
              ) \
              SELECT (SELECT count(*) FROM sealed)::BIGINT AS sealed_rows"
+            ),
+            QUIESCENCE_SQL = QUIESCENCE_SQL,
+            HISTORY_UNCHANGED_SQL = HISTORY_UNCHANGED_SQL,
+            LEGAL_HOLD_UNCHANGED_SQL = LEGAL_HOLD_UNCHANGED_SQL,
         );
 
         // The re-check and the seal run inside an EXPLICIT transaction that
@@ -3269,22 +3299,11 @@ mod db {
                     // #1191's `wake_source_repended_this_row`. Every
                     // other repend of a workflow-type row already leaves
                     // it.
-                    diesel::sql_query(
-                        "UPDATE harvest_task_queue t \
-                            SET state = 'PENDING', scheduled_at = NOW(), \
-                                created_at = clock_timestamp(), \
-                                timer_fires_at = NULL, \
-                                wake_requested = FALSE \
-                          WHERE t.workflow_exec_id = $1 AND t.task_type = 'workflow' \
-                            AND t.state IN ('PENDING', 'RUNNING') \
-                            AND t.worker_id IS NULL AND t.started_at IS NULL \
-                            AND EXISTS (SELECT 1 FROM harvest_signals s \
-                                        WHERE s.workflow_exec_id = $1 AND NOT s.consumed)",
-                    )
-                    .bind::<SqlUuid, _>(exec_id.as_uuid())
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(database_error)?;
+                    diesel::sql_query(SIGNAL_REPEND_SQL)
+                        .bind::<SqlUuid, _>(exec_id.as_uuid())
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(database_error)?;
                     // Issue #2253: the run arrived on this database. Its
                     // owner here wakes, and drops any entry from an earlier
                     // stay of the run.
