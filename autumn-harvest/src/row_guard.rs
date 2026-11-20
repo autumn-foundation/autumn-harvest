@@ -794,7 +794,7 @@ mod tests {
                     while let Some((i, c)) = chars.next() {
                         match c {
                             '\\' => match chars.next() {
-                                Some((_, '\n')) => {
+                                Some((_, '\n' | '\r')) => {
                                     while chars.peek().is_some_and(|(_, c)| c.is_whitespace()) {
                                         chars.next();
                                     }
@@ -861,7 +861,7 @@ mod tests {
             let Some(open) = clause.strip_suffix(" AND") else {
                 continue;
             };
-            let next = source[end..].trim_start_matches([',', ' ', '\n', '\t']);
+            let next = source[end..].trim_start_matches(|c: char| c == ',' || c.is_whitespace());
             let next = next
                 .strip_prefix("$crate::row_guard::")
                 .or_else(|| next.strip_prefix("crate::row_guard::"))
@@ -1113,6 +1113,26 @@ mod tests {
             literals,
             ["SELECT 1 FROM harvest_task_queue WHERE id = $1", "x"]
         );
+    }
+
+    /// A Windows checkout has CRLF line ends. The walks read it as rustc does.
+    #[test]
+    fn the_walks_read_crlf_sources() {
+        let guarded = "concat!(\r\n    \"UPDATE harvest_task_queue SET x = 1 \\\r\n     WHERE id = $1 AND \",\r\n    \
+                       crate::row_guard::row_guard_sql!(\"state = 'RUNNING'\")\r\n)";
+        assert_eq!(raw_failures(guarded), Vec::<String>::new());
+        let plain = guarded.replace(
+            "crate::row_guard::row_guard_sql!(\"state = 'RUNNING'\")",
+            "\"state = 'R'\"",
+        );
+        assert_eq!(raw_failures(&plain).len(), 1, "{plain}");
+        let literals: Vec<String> = string_literals("\"a \\\r\n    b\"")
+            .into_iter()
+            .map(|(_, _, l)| l)
+            .collect();
+        assert_eq!(literals, ["a b"]);
+        let chain = "dsl::harvest_task_queue\r\n    .filter(dsl::id.eq(id))\r\n    .filter(dsl::state.eq(\"R\"));";
+        assert_eq!(diesel_failures(chain).1.len(), 1);
     }
 
     #[test]
