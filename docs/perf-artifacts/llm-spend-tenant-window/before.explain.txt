@@ -1,0 +1,179 @@
+-- before: LLM_SPEND_SQL, scope large (support_agent / tenant-0), window 86400 s --
+Nested Loop  (cost=639253.53..639253.58 rows=1 width=32) (actual rows=1 loops=1)
+  Output: ((LEAST(COALESCE(sum(((harvest_llm_ledger.input_tokens)::numeric + (harvest_llm_ledger.output_tokens)::numeric)), '0'::numeric), '9223372036854775807'::numeric))::bigint), ((LEAST(COALESCE(sum((harvest_llm_ledger.cost_usd_micros)::numeric), '0'::numeric), '9223372036854775807'::numeric))::bigint), ((LEAST(COALESCE(sum((sum(((l.input_tokens)::numeric + (l.output_tokens)::numeric)))), '0'::numeric), '9223372036854775807'::numeric))::bigint), ((LEAST(COALESCE(sum((sum((l.cost_usd_micros)::numeric))), '0'::numeric), '9223372036854775807'::numeric))::bigint)
+  Buffers: shared hit=24457 read=10388 written=8
+  I/O Timings: shared read=22.596 write=0.069
+  ->  Aggregate  (cost=1020.81..1020.83 rows=1 width=16) (actual rows=1 loops=1)
+        Output: (LEAST(COALESCE(sum(((harvest_llm_ledger.input_tokens)::numeric + (harvest_llm_ledger.output_tokens)::numeric)), '0'::numeric), '9223372036854775807'::numeric))::bigint, (LEAST(COALESCE(sum((harvest_llm_ledger.cost_usd_micros)::numeric), '0'::numeric), '9223372036854775807'::numeric))::bigint
+        Buffers: shared hit=24
+        ->  Bitmap Heap Scan on public.harvest_llm_ledger  (cost=14.57..1016.91 rows=260 width=24) (actual rows=20 loops=1)
+              Output: harvest_llm_ledger.workflow_exec_id, harvest_llm_ledger.event_id, harvest_llm_ledger.call_index, harvest_llm_ledger.activity_name, harvest_llm_ledger.model, harvest_llm_ledger.input_tokens, harvest_llm_ledger.output_tokens, harvest_llm_ledger.cost_usd_micros, harvest_llm_ledger.latency_ms, harvest_llm_ledger.recorded_at
+              Recheck Cond: (harvest_llm_ledger.workflow_exec_id = '00000000-0000-4000-9000-000000000001'::uuid)
+              Heap Blocks: exact=20
+              Buffers: shared hit=24
+              ->  Bitmap Index Scan on harvest_llm_ledger_pkey  (cost=0.00..14.51 rows=260 width=0) (actual rows=20 loops=1)
+                    Index Cond: (harvest_llm_ledger.workflow_exec_id = '00000000-0000-4000-9000-000000000001'::uuid)
+                    Buffers: shared hit=4
+  ->  Aggregate  (cost=638232.72..638232.74 rows=1 width=16) (actual rows=1 loops=1)
+        Output: (LEAST(COALESCE(sum((sum(((l.input_tokens)::numeric + (l.output_tokens)::numeric)))), '0'::numeric), '9223372036854775807'::numeric))::bigint, (LEAST(COALESCE(sum((sum((l.cost_usd_micros)::numeric))), '0'::numeric), '9223372036854775807'::numeric))::bigint
+        Buffers: shared hit=24433 read=10388 written=8
+        I/O Timings: shared read=22.596 write=0.069
+        ->  Nested Loop  (cost=1069.09..638229.73 rows=597 width=64) (actual rows=571 loops=1)
+              Output: (sum(((l.input_tokens)::numeric + (l.output_tokens)::numeric))), (sum((l.cost_usd_micros)::numeric))
+              Buffers: shared hit=24433 read=10388 written=8
+              I/O Timings: shared read=22.596 write=0.069
+              ->  Nested Loop  (cost=0.84..475.90 rows=597 width=16) (actual rows=571 loops=1)
+                    Output: w.id
+                    Buffers: shared hit=64 read=518 written=2
+                    I/O Timings: shared read=1.293 write=0.008
+                    ->  Index Scan using harvest_workflow_executions_pkey on public.harvest_workflow_executions  (cost=0.42..8.44 rows=1 width=24) (actual rows=1 loops=1)
+                          Output: harvest_workflow_executions.workflow_name, harvest_workflow_executions.quota_key
+                          Index Cond: (harvest_workflow_executions.id = '00000000-0000-4000-9000-000000000001'::uuid)
+                          Buffers: shared hit=4
+                    ->  Index Scan using idx_harvest_we_llm_tenant on public.harvest_workflow_executions w  (cost=0.42..467.07 rows=40 width=40) (actual rows=571 loops=1)
+                          Output: w.id, w.workflow_name, w.quota_key
+                          Index Cond: ((w.workflow_name = harvest_workflow_executions.workflow_name) AND (w.quota_key = harvest_workflow_executions.quota_key) AND (COALESCE(w.completed_at, 'infinity'::timestamp with time zone) >= (now() - '24:00:00'::interval)))
+                          Filter: ((w.state <> ALL ('{MIGRATING,MIGRATED}'::text[])) OR ((w.state = 'MIGRATED'::text) AND (hashed SubPlan 2)))
+                          Buffers: shared hit=60 read=518 written=2
+                          I/O Timings: shared read=1.293 write=0.008
+                          SubPlan 2
+                            ->  Seq Scan on public.harvest_shard_migrations m  (cost=0.00..13.88 rows=2 width=16) (never executed)
+                                  Output: m.execution_id
+                                  Filter: (m.phase = 'COMMITTED'::text)
+              ->  Aggregate  (cost=1068.24..1068.25 rows=1 width=64) (actual rows=1 loops=571)
+                    Output: sum(((l.input_tokens)::numeric + (l.output_tokens)::numeric)), sum((l.cost_usd_micros)::numeric)
+                    Buffers: shared hit=24369 read=9870 written=6
+                    I/O Timings: shared read=21.303 write=0.061
+                    ->  Bitmap Heap Scan on public.harvest_llm_ledger l  (cost=14.61..1068.04 rows=13 width=24) (actual rows=32 loops=571)
+                          Output: l.workflow_exec_id, l.event_id, l.call_index, l.activity_name, l.model, l.input_tokens, l.output_tokens, l.cost_usd_micros, l.latency_ms, l.recorded_at
+                          Recheck Cond: (l.workflow_exec_id = w.id)
+                          Filter: (l.recorded_at >= (now() - '24:00:00'::interval))
+                          Rows Removed by Filter: 31
+                          Heap Blocks: exact=31693
+                          Buffers: shared hit=24369 read=9870 written=6
+                          I/O Timings: shared read=21.303 write=0.061
+                          ->  Bitmap Index Scan on harvest_llm_ledger_pkey  (cost=0.00..14.60 rows=273 width=0) (actual rows=63 loops=571)
+                                Index Cond: (l.workflow_exec_id = w.id)
+                                Buffers: shared hit=1635 read=911 written=2
+                                I/O Timings: shared read=2.335 write=0.021
+Settings: jit = 'off'
+Query Identifier: -3814836377978414761
+Planning:
+  Buffers: shared hit=50
+Planning Time: 0.683 ms
+Execution Time: 75.598 ms
+
+-- before: LLM_SPEND_SQL, scope medium (support_agent / tenant-1), window 86400 s --
+Nested Loop  (cost=639253.53..639253.58 rows=1 width=32) (actual rows=1 loops=1)
+  Output: ((LEAST(COALESCE(sum(((harvest_llm_ledger.input_tokens)::numeric + (harvest_llm_ledger.output_tokens)::numeric)), '0'::numeric), '9223372036854775807'::numeric))::bigint), ((LEAST(COALESCE(sum((harvest_llm_ledger.cost_usd_micros)::numeric), '0'::numeric), '9223372036854775807'::numeric))::bigint), ((LEAST(COALESCE(sum((sum(((l.input_tokens)::numeric + (l.output_tokens)::numeric)))), '0'::numeric), '9223372036854775807'::numeric))::bigint), ((LEAST(COALESCE(sum((sum((l.cost_usd_micros)::numeric))), '0'::numeric), '9223372036854775807'::numeric))::bigint)
+  Buffers: shared hit=10344
+  ->  Aggregate  (cost=1020.81..1020.83 rows=1 width=16) (actual rows=1 loops=1)
+        Output: (LEAST(COALESCE(sum(((harvest_llm_ledger.input_tokens)::numeric + (harvest_llm_ledger.output_tokens)::numeric)), '0'::numeric), '9223372036854775807'::numeric))::bigint, (LEAST(COALESCE(sum((harvest_llm_ledger.cost_usd_micros)::numeric), '0'::numeric), '9223372036854775807'::numeric))::bigint
+        Buffers: shared hit=24
+        ->  Bitmap Heap Scan on public.harvest_llm_ledger  (cost=14.57..1016.91 rows=260 width=24) (actual rows=20 loops=1)
+              Output: harvest_llm_ledger.workflow_exec_id, harvest_llm_ledger.event_id, harvest_llm_ledger.call_index, harvest_llm_ledger.activity_name, harvest_llm_ledger.model, harvest_llm_ledger.input_tokens, harvest_llm_ledger.output_tokens, harvest_llm_ledger.cost_usd_micros, harvest_llm_ledger.latency_ms, harvest_llm_ledger.recorded_at
+              Recheck Cond: (harvest_llm_ledger.workflow_exec_id = '00000000-0000-4000-9000-000000000002'::uuid)
+              Heap Blocks: exact=20
+              Buffers: shared hit=24
+              ->  Bitmap Index Scan on harvest_llm_ledger_pkey  (cost=0.00..14.51 rows=260 width=0) (actual rows=20 loops=1)
+                    Index Cond: (harvest_llm_ledger.workflow_exec_id = '00000000-0000-4000-9000-000000000002'::uuid)
+                    Buffers: shared hit=4
+  ->  Aggregate  (cost=638232.72..638232.74 rows=1 width=16) (actual rows=1 loops=1)
+        Output: (LEAST(COALESCE(sum((sum(((l.input_tokens)::numeric + (l.output_tokens)::numeric)))), '0'::numeric), '9223372036854775807'::numeric))::bigint, (LEAST(COALESCE(sum((sum((l.cost_usd_micros)::numeric))), '0'::numeric), '9223372036854775807'::numeric))::bigint
+        Buffers: shared hit=10320
+        ->  Nested Loop  (cost=1069.09..638229.73 rows=597 width=64) (actual rows=154 loops=1)
+              Output: (sum(((l.input_tokens)::numeric + (l.output_tokens)::numeric))), (sum((l.cost_usd_micros)::numeric))
+              Buffers: shared hit=10320
+              ->  Nested Loop  (cost=0.84..475.90 rows=597 width=16) (actual rows=154 loops=1)
+                    Output: w.id
+                    Buffers: shared hit=162
+                    ->  Index Scan using harvest_workflow_executions_pkey on public.harvest_workflow_executions  (cost=0.42..8.44 rows=1 width=24) (actual rows=1 loops=1)
+                          Output: harvest_workflow_executions.workflow_name, harvest_workflow_executions.quota_key
+                          Index Cond: (harvest_workflow_executions.id = '00000000-0000-4000-9000-000000000002'::uuid)
+                          Buffers: shared hit=4
+                    ->  Index Scan using idx_harvest_we_llm_tenant on public.harvest_workflow_executions w  (cost=0.42..467.07 rows=40 width=40) (actual rows=154 loops=1)
+                          Output: w.id, w.workflow_name, w.quota_key
+                          Index Cond: ((w.workflow_name = harvest_workflow_executions.workflow_name) AND (w.quota_key = harvest_workflow_executions.quota_key) AND (COALESCE(w.completed_at, 'infinity'::timestamp with time zone) >= (now() - '24:00:00'::interval)))
+                          Filter: ((w.state <> ALL ('{MIGRATING,MIGRATED}'::text[])) OR ((w.state = 'MIGRATED'::text) AND (hashed SubPlan 2)))
+                          Buffers: shared hit=158
+                          SubPlan 2
+                            ->  Seq Scan on public.harvest_shard_migrations m  (cost=0.00..13.88 rows=2 width=16) (never executed)
+                                  Output: m.execution_id
+                                  Filter: (m.phase = 'COMMITTED'::text)
+              ->  Aggregate  (cost=1068.24..1068.25 rows=1 width=64) (actual rows=1 loops=154)
+                    Output: sum(((l.input_tokens)::numeric + (l.output_tokens)::numeric)), sum((l.cost_usd_micros)::numeric)
+                    Buffers: shared hit=10158
+                    ->  Bitmap Heap Scan on public.harvest_llm_ledger l  (cost=14.61..1068.04 rows=13 width=24) (actual rows=33 loops=154)
+                          Output: l.workflow_exec_id, l.event_id, l.call_index, l.activity_name, l.model, l.input_tokens, l.output_tokens, l.cost_usd_micros, l.latency_ms, l.recorded_at
+                          Recheck Cond: (l.workflow_exec_id = w.id)
+                          Filter: (l.recorded_at >= (now() - '24:00:00'::interval))
+                          Rows Removed by Filter: 44
+                          Heap Blocks: exact=9459
+                          Buffers: shared hit=10158
+                          ->  Bitmap Index Scan on harvest_llm_ledger_pkey  (cost=0.00..14.60 rows=273 width=0) (actual rows=78 loops=154)
+                                Index Cond: (l.workflow_exec_id = w.id)
+                                Buffers: shared hit=699
+Settings: jit = 'off'
+Query Identifier: -3814836377978414761
+Planning:
+  Buffers: shared hit=50
+Planning Time: 1.261 ms
+Execution Time: 14.732 ms
+
+-- before: LLM_SPEND_SQL, scope small (support_agent / tenant-3), window 86400 s --
+Nested Loop  (cost=639253.53..639253.58 rows=1 width=32) (actual rows=1 loops=1)
+  Output: ((LEAST(COALESCE(sum(((harvest_llm_ledger.input_tokens)::numeric + (harvest_llm_ledger.output_tokens)::numeric)), '0'::numeric), '9223372036854775807'::numeric))::bigint), ((LEAST(COALESCE(sum((harvest_llm_ledger.cost_usd_micros)::numeric), '0'::numeric), '9223372036854775807'::numeric))::bigint), ((LEAST(COALESCE(sum((sum(((l.input_tokens)::numeric + (l.output_tokens)::numeric)))), '0'::numeric), '9223372036854775807'::numeric))::bigint), ((LEAST(COALESCE(sum((sum((l.cost_usd_micros)::numeric))), '0'::numeric), '9223372036854775807'::numeric))::bigint)
+  Buffers: shared hit=1912
+  ->  Aggregate  (cost=1020.81..1020.83 rows=1 width=16) (actual rows=1 loops=1)
+        Output: (LEAST(COALESCE(sum(((harvest_llm_ledger.input_tokens)::numeric + (harvest_llm_ledger.output_tokens)::numeric)), '0'::numeric), '9223372036854775807'::numeric))::bigint, (LEAST(COALESCE(sum((harvest_llm_ledger.cost_usd_micros)::numeric), '0'::numeric), '9223372036854775807'::numeric))::bigint
+        Buffers: shared hit=24
+        ->  Bitmap Heap Scan on public.harvest_llm_ledger  (cost=14.57..1016.91 rows=260 width=24) (actual rows=20 loops=1)
+              Output: harvest_llm_ledger.workflow_exec_id, harvest_llm_ledger.event_id, harvest_llm_ledger.call_index, harvest_llm_ledger.activity_name, harvest_llm_ledger.model, harvest_llm_ledger.input_tokens, harvest_llm_ledger.output_tokens, harvest_llm_ledger.cost_usd_micros, harvest_llm_ledger.latency_ms, harvest_llm_ledger.recorded_at
+              Recheck Cond: (harvest_llm_ledger.workflow_exec_id = '00000000-0000-4000-9000-000000000003'::uuid)
+              Heap Blocks: exact=20
+              Buffers: shared hit=24
+              ->  Bitmap Index Scan on harvest_llm_ledger_pkey  (cost=0.00..14.51 rows=260 width=0) (actual rows=20 loops=1)
+                    Index Cond: (harvest_llm_ledger.workflow_exec_id = '00000000-0000-4000-9000-000000000003'::uuid)
+                    Buffers: shared hit=4
+  ->  Aggregate  (cost=638232.72..638232.74 rows=1 width=16) (actual rows=1 loops=1)
+        Output: (LEAST(COALESCE(sum((sum(((l.input_tokens)::numeric + (l.output_tokens)::numeric)))), '0'::numeric), '9223372036854775807'::numeric))::bigint, (LEAST(COALESCE(sum((sum((l.cost_usd_micros)::numeric))), '0'::numeric), '9223372036854775807'::numeric))::bigint
+        Buffers: shared hit=1888
+        ->  Nested Loop  (cost=1069.09..638229.73 rows=597 width=64) (actual rows=79 loops=1)
+              Output: (sum(((l.input_tokens)::numeric + (l.output_tokens)::numeric))), (sum((l.cost_usd_micros)::numeric))
+              Buffers: shared hit=1888
+              ->  Nested Loop  (cost=0.84..475.90 rows=597 width=16) (actual rows=79 loops=1)
+                    Output: w.id
+                    Buffers: shared hit=87
+                    ->  Index Scan using harvest_workflow_executions_pkey on public.harvest_workflow_executions  (cost=0.42..8.44 rows=1 width=24) (actual rows=1 loops=1)
+                          Output: harvest_workflow_executions.workflow_name, harvest_workflow_executions.quota_key
+                          Index Cond: (harvest_workflow_executions.id = '00000000-0000-4000-9000-000000000003'::uuid)
+                          Buffers: shared hit=4
+                    ->  Index Scan using idx_harvest_we_llm_tenant on public.harvest_workflow_executions w  (cost=0.42..467.07 rows=40 width=40) (actual rows=79 loops=1)
+                          Output: w.id, w.workflow_name, w.quota_key
+                          Index Cond: ((w.workflow_name = harvest_workflow_executions.workflow_name) AND (w.quota_key = harvest_workflow_executions.quota_key) AND (COALESCE(w.completed_at, 'infinity'::timestamp with time zone) >= (now() - '24:00:00'::interval)))
+                          Filter: ((w.state <> ALL ('{MIGRATING,MIGRATED}'::text[])) OR ((w.state = 'MIGRATED'::text) AND (hashed SubPlan 2)))
+                          Buffers: shared hit=83
+                          SubPlan 2
+                            ->  Seq Scan on public.harvest_shard_migrations m  (cost=0.00..13.88 rows=2 width=16) (never executed)
+                                  Output: m.execution_id
+                                  Filter: (m.phase = 'COMMITTED'::text)
+              ->  Aggregate  (cost=1068.24..1068.25 rows=1 width=64) (actual rows=1 loops=79)
+                    Output: sum(((l.input_tokens)::numeric + (l.output_tokens)::numeric)), sum((l.cost_usd_micros)::numeric)
+                    Buffers: shared hit=1801
+                    ->  Bitmap Heap Scan on public.harvest_llm_ledger l  (cost=14.61..1068.04 rows=13 width=24) (actual rows=25 loops=79)
+                          Output: l.workflow_exec_id, l.event_id, l.call_index, l.activity_name, l.model, l.input_tokens, l.output_tokens, l.cost_usd_micros, l.latency_ms, l.recorded_at
+                          Recheck Cond: (l.workflow_exec_id = w.id)
+                          Filter: (l.recorded_at >= (now() - '24:00:00'::interval))
+                          Rows Removed by Filter: 9
+                          Heap Blocks: exact=1470
+                          Buffers: shared hit=1801
+                          ->  Bitmap Index Scan on harvest_llm_ledger_pkey  (cost=0.00..14.60 rows=273 width=0) (actual rows=34 loops=79)
+                                Index Cond: (l.workflow_exec_id = w.id)
+                                Buffers: shared hit=331
+Settings: jit = 'off'
+Query Identifier: -3814836377978414761
+Planning:
+  Buffers: shared hit=50
+Planning Time: 0.812 ms
+Execution Time: 3.130 ms
+
