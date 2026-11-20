@@ -360,8 +360,33 @@ impl Outcome {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+/// The stack of the thread that runs the mesh.
+///
+/// A debug build polls the mesh through deep frames. The Windows main thread
+/// has 1 MiB, and `agent_refine` overflowed it with the same shape. A spawned
+/// thread gets the stack that the spawn asks for. 8 MiB is the Linux default
+/// for a main thread.
+///
+/// Reproduce a small main stack on Linux with `ulimit -s 512`.
+const MESH_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let mesh = std::thread::Builder::new()
+        .name("sqlite-mesh".to_owned())
+        .stack_size(MESH_STACK_BYTES)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            runtime.block_on(mesh_main()).map_err(|e| e.to_string())
+        })?;
+    let result = mesh.join().map_err(|_| "the mesh thread panicked")?;
+    result.map_err(Into::into)
+}
+
+/// Run the mesh, print each line and check each claim.
+async fn mesh_main() -> Result<(), Box<dyn Error>> {
     // The directory and the database files go away when `dir` drops.
     let dir = tempfile::tempdir()?;
     let mut lines = Vec::new();
