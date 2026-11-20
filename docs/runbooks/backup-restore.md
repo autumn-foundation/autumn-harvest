@@ -64,7 +64,7 @@ The DLQ depth gauge reads `harvest_dead_letter_counts`. Triggers on
 `--disable-triggers` restore copy both tables, so they agree. A data-only
 restore with the triggers on, or a restore of `harvest_dead_letters` alone,
 does not. After such a restore, run `SELECT harvest_dead_letter_recount();`
-on each shard.
+on each shard as the table owner, at `READ COMMITTED`.
 
 ---
 

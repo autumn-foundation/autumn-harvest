@@ -5,10 +5,9 @@
 //! the final resting place for permanently failed tasks.
 //!
 //! Triggers keep the DLQ depth in `harvest_dead_letter_counts`. Each insert
-//! and delete statement updates one counter row in its own transaction. In a
-//! `REPEATABLE READ` transaction, that update can fail with a serialization
-//! error when another writer changed the row. Retry the transaction, as for
-//! any write at that level. The engine writes at `READ COMMITTED`.
+//! and delete statement inserts one delta row, in the transaction of that
+//! statement. A writer locks no counter row, so it never waits and never
+//! raises a serialization failure.
 
 use crate::schema::harvest_workflow_executions_ext;
 use jiff_diesel::ToDiesel;
@@ -809,12 +808,11 @@ pub async fn dead_letter_with_codecs(
 /// The DLQ depth statement of [`dead_letter_count`].
 ///
 /// Triggers on `harvest_dead_letters` keep `harvest_dead_letter_counts`
-/// exact. The sum of its rows is the committed row count of the DLQ. So the
-/// statement reads a few rows at any DLQ size, not each dead letter.
-pub const DLQ_DEPTH_SQL: &str = concat!(
-    "SELECT COALESCE(SUM(entries), 0)::BIGINT AS entries ",
-    "FROM harvest_dead_letter_counts",
-);
+/// exact. `harvest_dead_letter_depth()` sums its rows. The writers and
+/// [`fold_dead_letter_counts`] keep those rows few. So the statement does not
+/// read the dead letters. The function is `SECURITY DEFINER`, so a role needs
+/// no grant on the counter table.
+pub const DLQ_DEPTH_SQL: &str = "SELECT harvest_dead_letter_depth() AS entries";
 
 #[derive(diesel::QueryableByName)]
 struct DepthRow {
@@ -824,8 +822,9 @@ struct DepthRow {
 
 /// Count the total number of entries in the dead-letter queue.
 ///
-/// The count is exact. It reads the counter of [`DLQ_DEPTH_SQL`], so its
-/// cost does not grow with the DLQ.
+/// The count is exact, unless a write bypassed the triggers. Then
+/// [`recount_dead_letters`] repairs it. It reads the counter of
+/// [`DLQ_DEPTH_SQL`], so its cost does not grow with the DLQ.
 ///
 /// # Errors
 ///
@@ -836,6 +835,51 @@ pub async fn dead_letter_count(conn: &mut AsyncPgConnection) -> HarvestResult<i6
         .await
         .map_err(crate::error::database_error)?;
     Ok(row.entries)
+}
+
+/// Run `sql`, a `SELECT` of one counter function, in a `READ COMMITTED`
+/// transaction. The level is pinned, not inherited from the session.
+async fn counter_call(conn: &mut AsyncPgConnection, sql: &'static str) -> HarvestResult<i64> {
+    let mut tx = conn.build_transaction().read_committed();
+    let row: DepthRow = Box::pin(tx.run(async |c| {
+        diesel::sql_query(sql)
+            .get_result::<DepthRow>(c)
+            .await
+            .map_err(HarvestError::from)
+    }))
+    .await?;
+    Ok(row.entries)
+}
+
+/// Fold the free delta rows of the DLQ depth counter into one row.
+///
+/// Each dead-letter statement adds one delta row. A writer folds with a
+/// chance of 1 in 32. The DLQ sampler also calls this function, so the gauge
+/// read stays a few rows when every writer runs at `SERIALIZABLE`. A row that
+/// another open transaction holds stays as it is.
+///
+/// Returns the count of rows that the fold removed.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] on query failure.
+pub async fn fold_dead_letter_counts(conn: &mut AsyncPgConnection) -> HarvestResult<i64> {
+    counter_call(conn, "SELECT harvest_dead_letter_fold() AS entries").await
+}
+
+/// Set the DLQ depth counter to the exact count of `harvest_dead_letters`.
+///
+/// It repairs a drift: for example after a write with the triggers off, a
+/// data-only restore, or a promotion of a logical standby. It locks the DLQ
+/// against writes until it commits, and it reads the whole DLQ once.
+///
+/// Returns the exact count.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] on query failure or a lock timeout.
+pub async fn recount_dead_letters(conn: &mut AsyncPgConnection) -> HarvestResult<i64> {
+    counter_call(conn, "SELECT harvest_dead_letter_recount() AS entries").await
 }
 
 /// The age in whole seconds of the newest dead letter, or `NULL` with none.

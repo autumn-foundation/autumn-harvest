@@ -148,6 +148,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          declarative_update_tests
 linux        autumn-harvest         integration                      -                          deep_backlog_fixture_tests
 linux        autumn-harvest         integration                      -                          delayed_start_tests
+linux        autumn-harvest         integration                      -                          dlq_depth_counter_tests
 linux        autumn-harvest         integration                      -                          drain_release_tests
 linux        autumn-harvest         integration                      -                          dst_differential_tests
 linux        autumn-harvest         integration                      -                          dst_world_tests

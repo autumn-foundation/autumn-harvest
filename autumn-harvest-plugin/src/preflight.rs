@@ -450,14 +450,6 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
     ("harvest_signals", &["SELECT", "INSERT", "UPDATE"]),
     ("harvest_timers", &["SELECT", "INSERT", "UPDATE", "DELETE"]),
     ("harvest_dead_letters", &["SELECT", "INSERT", "DELETE"]),
-    // A trigger on each dead-letter insert and delete updates the DLQ depth
-    // counter. It runs as the writer, so a missing grant fails that write.
-    // An insert adds a counter row when every row is locked. The DLQ gauge
-    // reads the table.
-    (
-        "harvest_dead_letter_counts",
-        &["SELECT", "INSERT", "UPDATE"],
-    ),
     ("harvest_external_tasks", &["SELECT", "INSERT", "UPDATE"]),
     ("harvest_workers", &["SELECT", "INSERT", "UPDATE"]),
     // Each worker heartbeat upserts its stats and prunes old rows (issue
@@ -1527,6 +1519,9 @@ async fn check_dlq_read_access(api_state: &HarvestApiState) -> PreflightCheckRes
     )
 }
 
+/// Reads one row of the DLQ, to prove that the role can read the table.
+const DLQ_READ_PROBE_SQL: &str = "SELECT 1 FROM harvest_dead_letters LIMIT 1";
+
 async fn observe_dlq_read_access(shard_id: i32, shard_pool: &DbPool) -> ShardObservation {
     let Ok(mut conn) = shard_pool.get().await else {
         return ShardObservation {
@@ -1539,13 +1534,28 @@ async fn observe_dlq_read_access(shard_id: i32, shard_pool: &DbPool) -> ShardObs
         };
     };
 
-    dlq::dead_letter_count(&mut conn).await.map_or_else(
-        |_| ShardObservation {
+    // The depth reads a counter, not the DLQ. So the probe reads one row of
+    // the DLQ too: the list, the redrive and the API read that table.
+    let table_readable = diesel::sql_query(DLQ_READ_PROBE_SQL)
+        .execute(&mut conn)
+        .await
+        .is_ok();
+    let count = if table_readable {
+        dlq::dead_letter_count(&mut conn).await.ok()
+    } else {
+        None
+    };
+    count.map_or_else(
+        || ShardObservation {
             passed: false,
             details: json!({
                 "shard_id": shard_id,
                 "status": "fail",
-                "error": "dead-letter table is not readable",
+                "error": if table_readable {
+                    "dead-letter depth is not readable"
+                } else {
+                    "dead-letter table is not readable"
+                },
             }),
         },
         |count| ShardObservation {
@@ -2516,17 +2526,6 @@ mod tests {
             .find(|(name, _)| *name == "harvest_partition_exports")
             .map(|(_, privileges)| *privileges);
         assert_eq!(log, Some(&["SELECT", "INSERT"][..]));
-    }
-
-    /// Each dead-letter write updates the DLQ depth counter through a
-    /// trigger. A missing grant fails the failure transaction.
-    #[test]
-    fn the_dlq_depth_counter_is_covered_by_the_privilege_probe() {
-        let covered = HARVEST_WRITE_PRIVILEGE_REQUIREMENTS
-            .iter()
-            .find(|(name, _)| *name == "harvest_dead_letter_counts")
-            .map(|(_, privileges)| *privileges);
-        assert_eq!(covered, Some(&["SELECT", "INSERT", "UPDATE"][..]));
     }
 
     /// A reshard carry reads, writes and deletes the override floors. A

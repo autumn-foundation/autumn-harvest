@@ -32594,7 +32594,8 @@ fn spawn_rate_limit_sampler(
 /// Periodically sample the dead-letter queue entry count and forward it to
 /// the configured [`MetricsRecorder`](crate::telemetry::MetricsRecorder).
 ///
-/// The count is exact, and its read does not grow with the DLQ. See
+/// The count is exact, and its read does not grow with the DLQ. Each sample
+/// first folds the delta rows of the counter. See
 /// [`crate::dlq::DLQ_DEPTH_SQL`].
 ///
 /// Runs on the same cadence as the queue-depth sampler. For sharded
@@ -32642,8 +32643,20 @@ fn spawn_dlq_depth_sampler(
                 }
             };
 
+            // The fold keeps the counter a few rows. A failure leaves more
+            // rows to read, and the count stays exact.
+            if let Err(error) = crate::dlq::fold_dead_letter_counts(&mut conn).await {
+                tracing::debug!(error = %error, shard_id, "dlq depth fold failed");
+            }
             match crate::dlq::dead_letter_count(&mut conn).await {
                 Ok(count) => {
+                    if count < 0 {
+                        tracing::warn!(
+                            shard_id,
+                            count,
+                            "dlq depth counter is negative; run harvest_dead_letter_recount()"
+                        );
+                    }
                     let depth = u64::try_from(count).unwrap_or(0);
                     telemetry.metrics.record_dlq_entries(shard_id, depth);
                 }

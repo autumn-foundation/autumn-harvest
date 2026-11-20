@@ -2829,6 +2829,10 @@ standalone note rather than part of the claim-path attribution table above:
   query had a quadratic plan. A `NOT EXISTS` probe fixes the plan. One 15 s
   gauge interval cuts the sampler buffers per worker-hour by 98.3% at the
   small size.
+* [`docs/performance-dlq-depth-counter.md`](performance-dlq-depth-counter.md)
+  — the DLQ depth gauge read every dead letter: 744,158 buffers per call at
+  1M dead letters. A counter of delta rows, kept by triggers, makes it 1
+  buffer. A one-row dead-letter write costs about 3 to 9 buffers more.
 * [`docs/performance-completion-trigger-outbox-queue.md`](performance-completion-trigger-outbox-queue.md)
   — the per-row `harvest_schedules` lookup in
   `completion_trigger::enforce_completion_triggers_outbox`'s cross-shard

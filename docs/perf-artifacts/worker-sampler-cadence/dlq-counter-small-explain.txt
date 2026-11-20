@@ -1,33 +1,31 @@
 -- concurrency_key_stats
-GroupAggregate  (cost=1092.32..1092.73 rows=13 width=33) (actual time=1.873..1.899 rows=44 loops=1)
+GroupAggregate  (cost=1092.32..1092.73 rows=13 width=33) (actual time=2.063..2.109 rows=44 loops=1)
   Group Key: concurrency_key, task_type
   Buffers: shared hit=672
-  ->  Sort  (cost=1092.32..1092.35 rows=14 width=28) (actual time=1.867..1.871 rows=107 loops=1)
+  ->  Sort  (cost=1092.32..1092.35 rows=14 width=28) (actual time=2.056..2.061 rows=107 loops=1)
         Sort Key: concurrency_key, task_type
         Sort Method: quicksort  Memory: 30kB
         Buffers: shared hit=672
-        ->  Seq Scan on harvest_task_queue  (cost=0.05..1092.05 rows=14 width=28) (actual time=0.052..1.823 rows=107 loops=1)
+        ->  Seq Scan on harvest_task_queue  (cost=0.05..1092.05 rows=14 width=28) (actual time=0.027..2.012 rows=107 loops=1)
               Filter: ((concurrency_key IS NOT NULL) AND (concurrency_cap IS NOT NULL) AND (queue_name = ANY ('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])) AND ((state = 'PENDING'::text) OR ((state = 'RUNNING'::text) AND (worker_id IS NOT NULL))))
               Rows Removed by Filter: 20893
               Buffers: shared hit=672
 Planning:
   Buffers: shared hit=8
-Planning Time: 0.240 ms
-Execution Time: 1.914 ms
+Planning Time: 0.228 ms
+Execution Time: 2.125 ms
 
 -- sample_rate_limit_buckets
 Seq Scan on harvest_rate_limit_buckets  (cost=0.00..3.50 rows=9 width=33) (actual time=0.004..0.008 rows=10 loops=1)
   Filter: (((key)::text !~~ 'dyn-rate:%'::text) AND ((key)::text !~~ 'start-throttle:%'::text))
   Rows Removed by Filter: 90
   Buffers: shared hit=2
-Planning Time: 0.029 ms
+Planning Time: 0.031 ms
 Execution Time: 0.014 ms
 
 -- dead_letter_count
-Aggregate  (cost=29.63..29.64 rows=1 width=8) (actual time=0.005..0.005 rows=1 loops=1)
+Result  (cost=0.00..0.26 rows=1 width=8) (actual time=0.050..0.050 rows=1 loops=1)
   Buffers: shared hit=1
-  ->  Seq Scan on harvest_dead_letter_counts  (cost=0.00..25.70 rows=1570 width=8) (actual time=0.002..0.002 rows=1 loops=1)
-        Buffers: shared hit=1
-Planning Time: 0.016 ms
-Execution Time: 0.011 ms
+Planning Time: 0.005 ms
+Execution Time: 0.053 ms
 

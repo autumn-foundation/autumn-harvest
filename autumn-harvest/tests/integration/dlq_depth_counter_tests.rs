@@ -147,7 +147,7 @@ fn plan_relations_and_buffers(plan: &serde_json::Value) -> (Vec<String>, i64) {
 }
 
 #[tokio::test]
-async fn the_gauge_reads_a_few_rows_at_any_dlq_size() {
+async fn the_gauge_read_does_not_scale_with_the_dlq() {
     let mut f = fixture("dlq_depth_read").await;
     insert_rows(&mut f.conn, 50_000).await;
     f.conn
@@ -155,6 +155,9 @@ async fn the_gauge_reads_a_few_rows_at_any_dlq_size() {
         .await
         .expect("analyze");
 
+    // The first call on a connection loads the function from the catalog. A
+    // pooled sampler connection pays that once.
+    gauge(&mut f.conn).await;
     let row: PlanRow = diesel::sql_query(format!(
         "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {}",
         dlq::DLQ_DEPTH_SQL
@@ -298,11 +301,6 @@ async fn open_writers_never_wait_for_the_counter() {
 
     assert_exact(&mut f.conn, "open writers").await;
     assert_eq!(gauge(&mut f.conn).await, 3 + WRITERS_I64 / 2 - 1);
-    let rows = counter_rows(&mut f.conn).await;
-    assert!(
-        rows <= WRITERS_I64 + 2,
-        "the counter grows to the peak count of open writers at most: {rows} rows"
-    );
 }
 
 #[tokio::test]
@@ -313,10 +311,8 @@ async fn recount_repairs_a_drift() {
     for n in 0..4 {
         dlq::dead_letter(conn, &entry(n)).await.expect("insert");
     }
-    // A replica-role session fires no trigger, so the counter drifts.
-    conn.transaction::<(), diesel::result::Error, _>(async |conn| {
-        conn.batch_execute("SET LOCAL session_replication_role = replica")
-            .await?;
+    // A write with the triggers off makes the counter drift.
+    autumn_harvest::append_only::with_guard_off(conn, async |conn| {
         insert_rows(conn, 7).await;
         Ok(())
     })
@@ -325,7 +321,7 @@ async fn recount_repairs_a_drift() {
     assert_eq!(gauge(conn).await, 9);
     assert_eq!(exact(conn).await, 16);
 
-    let recounted = scalar(conn, "SELECT harvest_dead_letter_recount() AS n").await;
+    let recounted = dlq::recount_dead_letters(conn).await.expect("recount");
     assert_eq!(recounted, 16);
     assert_exact(conn, "a recount").await;
     assert_eq!(counter_rows(conn).await, 1, "a recount folds the rows");
@@ -351,7 +347,7 @@ fn counter_migration_dir() -> std::path::PathBuf {
 
 async fn run_migration_file(conn: &mut AsyncPgConnection, path: &std::path::Path) {
     let sql = std::fs::read_to_string(path).expect("read the migration file");
-    conn.batch_execute(&format!("BEGIN; {sql}; COMMIT;"))
+    conn.batch_execute(&format!("BEGIN;\n{sql}\n;\nCOMMIT;"))
         .await
         .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
 }
@@ -376,4 +372,146 @@ async fn the_migration_seeds_the_counter_from_existing_rows() {
 
     insert_rows(conn, 1).await;
     assert_exact(conn, "an insert after the migration").await;
+}
+
+/// Opens a transaction at `level` and takes its snapshot. The snapshot query
+/// reads no table, so at `SERIALIZABLE` it takes no predicate lock of its own.
+async fn begin_with_snapshot(url: &str, level: &str) -> AsyncPgConnection {
+    let mut conn = AsyncPgConnection::establish(url).await.expect("connection");
+    conn.batch_execute(&format!("BEGIN ISOLATION LEVEL {level}; SELECT 1;"))
+        .await
+        .expect("begin and take a snapshot");
+    conn
+}
+
+/// A session default of `REPEATABLE READ` or `SERIALIZABLE` must not turn
+/// overlapping dead-letter writes into serialization failures.
+#[tokio::test]
+async fn writers_above_read_committed_never_conflict_on_the_counter() {
+    let mut f = fixture("dlq_depth_isolation").await;
+    let url = f.db.url();
+    for level in ["REPEATABLE READ", "SERIALIZABLE"] {
+        let mut base = Vec::new();
+        for n in 0..3 {
+            base.push(
+                dlq::dead_letter(&mut f.conn, &entry(n))
+                    .await
+                    .expect("insert"),
+            );
+        }
+        let mut first = begin_with_snapshot(&url, level).await;
+        let mut second = begin_with_snapshot(&url, level).await;
+        // Other writers commit after both snapshots.
+        for n in 0..5 {
+            dlq::dead_letter(&mut f.conn, &entry(n))
+                .await
+                .expect("insert");
+        }
+        dlq::discard_dead_letters_batch(&mut f.conn, &base[..2])
+            .await
+            .expect("delete");
+        dlq::dead_letter(&mut first, &entry(10))
+            .await
+            .unwrap_or_else(|e| panic!("{level}: the first writer conflicted: {e}"));
+        dlq::dead_letter(&mut second, &entry(11))
+            .await
+            .unwrap_or_else(|e| panic!("{level}: the second writer conflicted: {e}"));
+        // The second writer deletes a row that no other writer touches.
+        dlq::discard_dead_letters_batch(&mut second, &base[2..])
+            .await
+            .unwrap_or_else(|e| panic!("{level}: the delete conflicted: {e}"));
+        first
+            .batch_execute("COMMIT")
+            .await
+            .unwrap_or_else(|e| panic!("{level}: the first commit failed: {e}"));
+        second
+            .batch_execute("COMMIT")
+            .await
+            .unwrap_or_else(|e| panic!("{level}: the second commit failed: {e}"));
+        assert_exact(&mut f.conn, level).await;
+    }
+}
+
+/// A role with grants on `harvest_dead_letters` alone writes, deletes and
+/// reads the depth. So an upgrade needs no new grant, and an older binary
+/// keeps its dead-letter writes.
+#[tokio::test]
+async fn a_role_without_a_counter_grant_writes_and_reads_the_depth() {
+    let mut f = fixture("dlq_depth_grants").await;
+    let role = format!("dlq_depth_{}", Uuid::new_v4().simple());
+    f.conn
+        .batch_execute(&format!(
+            "CREATE ROLE {role} LOGIN PASSWORD 'pw'; \
+             GRANT SELECT, INSERT, DELETE ON harvest_dead_letters TO {role}; \
+             GRANT SELECT ON harvest_workflow_executions TO {role};"
+        ))
+        .await
+        .expect("create a role");
+    let url = crate::throwaway_db::with_credentials(&f.db.url(), &role, "pw");
+    let outcome = async {
+        let mut conn = AsyncPgConnection::establish(&url)
+            .await
+            .map_err(|e| e.to_string())?;
+        let id = dlq::dead_letter(&mut conn, &entry(1))
+            .await
+            .map_err(|e| e.to_string())?;
+        dlq::dead_letter(&mut conn, &entry(2))
+            .await
+            .map_err(|e| e.to_string())?;
+        dlq::discard_dead_letters_batch(&mut conn, &[id])
+            .await
+            .map_err(|e| e.to_string())?;
+        dlq::dead_letter_count(&mut conn)
+            .await
+            .map_err(|e| e.to_string())
+    }
+    .await;
+    f.conn
+        .batch_execute(&format!(
+            "REVOKE ALL ON harvest_dead_letters, harvest_workflow_executions FROM {role}; \
+             DROP OWNED BY {role}; DROP ROLE {role};"
+        ))
+        .await
+        .expect("drop the role");
+    assert_eq!(outcome, Ok(1), "a role without a counter grant must work");
+    assert_exact(&mut f.conn, "writes of a role without a counter grant").await;
+}
+
+/// A recount on an old snapshot would miss rows that committed before its
+/// lock. It must refuse, not drift.
+#[tokio::test]
+async fn recount_refuses_a_snapshot_older_than_its_lock() {
+    let f = fixture("dlq_depth_recount_rr").await;
+    let mut conn = begin_with_snapshot(&f.db.url(), "REPEATABLE READ").await;
+    let refused = conn
+        .batch_execute("SELECT harvest_dead_letter_recount()")
+        .await;
+    assert!(
+        refused.is_err(),
+        "a recount at REPEATABLE READ must raise, not count an old snapshot"
+    );
+}
+
+/// Each dead-letter statement adds a delta row. The writers and the fold keep
+/// the live row count small, so the gauge read stays a few rows.
+#[tokio::test]
+async fn the_counter_stays_small_under_many_writes() {
+    const WRITES: i64 = 2_000;
+    let mut f = fixture("dlq_depth_fold").await;
+    for _ in 0..WRITES {
+        insert_rows(&mut f.conn, 1).await;
+    }
+    assert_exact(&mut f.conn, "many single-row writes").await;
+    let rows = counter_rows(&mut f.conn).await;
+    // A writer folds with a chance of 1 in 32. The chance of 600 writes with
+    // no fold is below 1 in 10^8.
+    assert!(rows < 600, "the writers must fold the counter: {rows} rows");
+
+    let folded = dlq::fold_dead_letter_counts(&mut f.conn)
+        .await
+        .expect("fold");
+    assert!(folded <= rows, "the fold removes free rows only: {folded}");
+    assert_eq!(counter_rows(&mut f.conn).await, 1);
+    assert_exact(&mut f.conn, "a fold").await;
+    assert_eq!(gauge(&mut f.conn).await, WRITES);
 }

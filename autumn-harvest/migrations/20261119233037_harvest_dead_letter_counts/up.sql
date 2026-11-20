@@ -2,47 +2,55 @@
 --
 -- The `harvest.dlq.entries` gauge read `COUNT(*)` of `harvest_dead_letters`.
 -- That read scans the whole DLQ, and a DLQ is largest in an incident. Now the
--- gauge reads the sum of `harvest_dead_letter_counts.entries`.
+-- gauge reads `harvest_dead_letter_depth()`, the sum of
+-- `harvest_dead_letter_counts.entries`.
 --
--- Triggers keep the sum exact. Each `INSERT` and `DELETE` statement on
--- `harvest_dead_letters` adds its row count to one counter row, in the same
--- transaction. A rollback undoes both. So a reader sees the exact committed
--- count. A `TRUNCATE` empties the counter. An `UPDATE` changes no count.
+-- ## Delta rows
 --
--- ## No writer waits for the counter
+-- Each `INSERT` and `DELETE` statement on `harvest_dead_letters` inserts one
+-- delta row: its row count, negative for a delete. The row commits or rolls
+-- back with the statement, so the sum is the exact committed count. A
+-- `TRUNCATE` empties the counter. An `UPDATE` changes no count.
 --
--- A writer locks a free counter row with `FOR UPDATE SKIP LOCKED`. When every
--- row is locked by another open transaction, the writer inserts a new row.
--- So the counter adds no lock wait to a failure transaction, and so it cannot
--- close a deadlock with the execution row locks of that transaction.
+-- A writer only inserts. It reads no counter row and locks none. So a writer
+-- never waits for another writer, and it cannot raise a serialization failure
+-- at `REPEATABLE READ` or `SERIALIZABLE`. A writer also never reads a dead row
+-- version, so a long transaction elsewhere does not slow it.
 --
--- A writer adds a row only when all rows are locked by other transactions.
--- So the row count stays at or below the peak count of concurrent writers.
--- `harvest_dead_letter_recount()` folds all rows into one.
+-- ## The fold
 --
--- An `UPDATE` of a counter row in a `REPEATABLE READ` transaction can fail
--- with a serialization error. Every engine writer uses `READ COMMITTED`.
+-- `harvest_dead_letter_fold()` deletes each delta row that no open
+-- transaction holds, and inserts their sum as one row. A writer calls it with
+-- a chance of 1 in 32. The DLQ sampler calls it each gauge interval. So the
+-- gauge reads a few rows. At `SERIALIZABLE` a writer does not fold, because
+-- the read of the fold could abort the transaction of the writer at commit.
 --
--- ## Grants
+-- The fold takes `ROW EXCLUSIVE` on `harvest_dead_letters`, as a writer does.
+-- So it cannot run during a `TRUNCATE` or a recount, which would miss the row
+-- that it inserts.
 --
--- The trigger runs as the writer of the dead letter. A role that writes
--- dead letters needs `SELECT`, `INSERT` and `UPDATE` on the counter table.
--- A role that truncates the DLQ or runs the recount also needs `DELETE`.
+-- ## Privileges
+--
+-- The trigger function, the fold and the depth read are `SECURITY DEFINER`.
+-- So a role that writes or reads dead letters needs no grant on the counter
+-- table, and an older binary keeps working after this migration. Each function
+-- pins `search_path` with `pg_temp` last, so a temporary table cannot shadow
+-- the counter. `harvest_dead_letter_recount()` is for the table owner only.
 --
 -- ## Lock
 --
 -- `LOCK TABLE` takes `SHARE ROW EXCLUSIVE` on `harvest_dead_letters`. It waits
 -- for each open dead-letter write, and then blocks new ones until the commit.
 -- So no write falls between the seed count and the triggers. The seed reads
--- the whole DLQ once: about 150 ms at 1,000,000 rows. A failure transaction
--- that writes a dead letter waits for that time. `lock_timeout` bounds the
--- wait for the lock. When it fires, run the migration again.
+-- the whole DLQ once. `lock_timeout` bounds the wait for the lock. When it
+-- fires, run the migration again.
 SET LOCAL lock_timeout = '5s';
 
 LOCK TABLE harvest_dead_letters IN SHARE ROW EXCLUSIVE MODE;
 
--- `slot` is a random key, so a new row never waits on a unique check. The
--- primary key also gives logical replication its replica identity.
+-- `slot` is a random key, so an insert never waits on a unique check, and no
+-- sequence must follow a promotion. The primary key also gives logical
+-- replication its replica identity.
 CREATE TABLE harvest_dead_letter_counts (
     slot    UUID   PRIMARY KEY DEFAULT gen_random_uuid(),
     entries BIGINT NOT NULL
@@ -51,20 +59,62 @@ CREATE TABLE harvest_dead_letter_counts (
 COMMENT ON TABLE harvest_dead_letter_counts IS
     'The sum of entries is the row count of harvest_dead_letters. Triggers on that table keep it exact.';
 
--- `SET search_path` pins name resolution to the schema of Harvest, as
--- `harvest_entity_state_project` does. A session cannot shadow a name.
 DO $harvest_dead_letter_counts$
 BEGIN
+    EXECUTE pg_catalog.format($harvest_dead_letter_depth_fn$
+CREATE FUNCTION harvest_dead_letter_depth()
+RETURNS BIGINT
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = %I, pg_catalog, pg_temp
+AS $harvest_dead_letter_depth_body$
+    SELECT COALESCE(SUM(entries), 0)::BIGINT FROM harvest_dead_letter_counts
+$harvest_dead_letter_depth_body$
+$harvest_dead_letter_depth_fn$, current_schema());
+
+    EXECUTE pg_catalog.format($harvest_dead_letter_fold_fn$
+CREATE FUNCTION harvest_dead_letter_fold()
+RETURNS BIGINT
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = %I, pg_catalog, pg_temp
+AS $harvest_dead_letter_fold_body$
+DECLARE
+    removed BIGINT;
+    total BIGINT;
+BEGIN
+    -- A recount and a truncate take a stronger lock, so they wait for the fold.
+    LOCK TABLE harvest_dead_letters IN ROW EXCLUSIVE MODE;
+    IF (SELECT count(*) FROM harvest_dead_letter_counts) < 2 THEN
+        RETURN 0;
+    END IF;
+    WITH gone AS (
+        DELETE FROM harvest_dead_letter_counts
+         WHERE slot IN (SELECT slot FROM harvest_dead_letter_counts
+                        FOR UPDATE SKIP LOCKED)
+        RETURNING entries
+    )
+    SELECT count(*), COALESCE(sum(entries), 0) INTO removed, total FROM gone;
+    IF removed > 0 THEN
+        INSERT INTO harvest_dead_letter_counts (entries) VALUES (total);
+    END IF;
+    RETURN removed;
+END
+$harvest_dead_letter_fold_body$
+$harvest_dead_letter_fold_fn$, current_schema());
+
     EXECUTE pg_catalog.format($harvest_dead_letter_count_apply_fn$
 CREATE FUNCTION harvest_dead_letter_count_apply()
 RETURNS TRIGGER
 LANGUAGE plpgsql
-SET search_path = %I, pg_catalog
+SECURITY DEFINER
+SET search_path = %I, pg_catalog, pg_temp
 AS $harvest_dead_letter_count_apply_body$
 DECLARE
     delta BIGINT;
 BEGIN
-    -- A truncate holds `ACCESS EXCLUSIVE`, so no counter row is in use.
+    -- A truncate holds `ACCESS EXCLUSIVE`, so no fold runs now.
     IF TG_OP = 'TRUNCATE' THEN
         DELETE FROM harvest_dead_letter_counts;
         RETURN NULL;
@@ -77,13 +127,16 @@ BEGIN
     IF TG_OP = 'DELETE' THEN
         delta := -delta;
     END IF;
-    -- Lock a free row, or a row that this transaction holds. Never wait.
-    UPDATE harvest_dead_letter_counts
-       SET entries = entries + delta
-     WHERE slot = (SELECT slot FROM harvest_dead_letter_counts
-                   LIMIT 1 FOR UPDATE SKIP LOCKED);
-    IF NOT FOUND THEN
-        INSERT INTO harvest_dead_letter_counts (entries) VALUES (delta);
+    INSERT INTO harvest_dead_letter_counts (entries) VALUES (delta);
+    IF random() < 1.0 / 32
+       AND current_setting('transaction_isolation') <> 'serializable' THEN
+        -- At `REPEATABLE READ`, a row that another fold removed after this
+        -- snapshot raises a serialization failure. Skip the fold, not the write.
+        BEGIN
+            PERFORM harvest_dead_letter_fold();
+        EXCEPTION WHEN serialization_failure THEN
+            NULL;
+        END;
     END IF;
     RETURN NULL;
 END
@@ -94,14 +147,20 @@ $harvest_dead_letter_count_apply_fn$, current_schema());
 CREATE FUNCTION harvest_dead_letter_recount()
 RETURNS BIGINT
 LANGUAGE plpgsql
-SET search_path = %I, pg_catalog
+SECURITY DEFINER
+SET search_path = %I, pg_catalog, pg_temp
 AS $harvest_dead_letter_recount_body$
 DECLARE
     total BIGINT;
 BEGIN
-    -- Wait for each open dead-letter write, then block new ones until the
-    -- commit. A writer locks this table before the counter, so the order
-    -- matches and the two cannot deadlock.
+    -- At a higher level the count would read the snapshot from before the
+    -- lock. It would then miss each row that committed in the wait.
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'harvest_dead_letter_recount() needs READ COMMITTED, not %%',
+            current_setting('transaction_isolation');
+    END IF;
+    -- Wait for each open dead-letter write and fold, then block new ones until
+    -- the commit. Each writer locks this table before the counter.
     LOCK TABLE harvest_dead_letters IN SHARE ROW EXCLUSIVE MODE;
     SELECT count(*) INTO total FROM harvest_dead_letters;
     DELETE FROM harvest_dead_letter_counts;
@@ -113,10 +172,17 @@ $harvest_dead_letter_recount_fn$, current_schema());
 END
 $harvest_dead_letter_counts$;
 
+-- The recount locks the DLQ against writes, so only the owner runs it.
+REVOKE ALL ON FUNCTION harvest_dead_letter_recount() FROM PUBLIC;
+
+COMMENT ON FUNCTION harvest_dead_letter_depth() IS
+    'The row count of harvest_dead_letters, read from harvest_dead_letter_counts.';
+COMMENT ON FUNCTION harvest_dead_letter_fold() IS
+    'Folds the free delta rows of harvest_dead_letter_counts into one row. Returns the rows removed.';
 COMMENT ON FUNCTION harvest_dead_letter_count_apply() IS
-    'Adds the row count of each INSERT or DELETE statement on harvest_dead_letters to harvest_dead_letter_counts.';
+    'Inserts the row count of each INSERT or DELETE statement on harvest_dead_letters into harvest_dead_letter_counts.';
 COMMENT ON FUNCTION harvest_dead_letter_recount() IS
-    'Sets harvest_dead_letter_counts to the exact count of harvest_dead_letters and folds it into one row. Repairs a drift.';
+    'Sets harvest_dead_letter_counts to the exact count of harvest_dead_letters in one row. Repairs a drift. Needs READ COMMITTED.';
 
 CREATE TRIGGER harvest_dead_letter_count_insert_trg
     AFTER INSERT ON harvest_dead_letters
@@ -135,4 +201,6 @@ CREATE TRIGGER harvest_dead_letter_count_truncate_trg
     FOR EACH STATEMENT
     EXECUTE FUNCTION harvest_dead_letter_count_apply();
 
-SELECT harvest_dead_letter_recount();
+-- The seed runs after the lock, so its snapshot sees every committed row.
+INSERT INTO harvest_dead_letter_counts (entries)
+SELECT count(*) FROM harvest_dead_letters;

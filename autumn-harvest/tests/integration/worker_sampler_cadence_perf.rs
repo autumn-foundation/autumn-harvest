@@ -117,7 +117,7 @@ const KINDS: [Kind; 7] = [
     },
     Kind {
         label: "dlq (dead_letter_count)",
-        fragment: "FROM harvest_dead_letter_counts",
+        fragment: "harvest_dead_letter_depth",
     },
     Kind {
         label: "queue pause (paused_queue_names)",
@@ -584,6 +584,14 @@ async fn measure_writes(admin: &str, size: &Size, table: &mut String) {
     let mut conn = AsyncPgConnection::establish(&db.url())
         .await
         .expect("connection");
+    if without_counter() {
+        conn.batch_execute(&format!(
+            "BEGIN;\n{}\n;\nCOMMIT;",
+            include_str!("../../migrations/20261119233037_harvest_dead_letter_counts/down.sql")
+        ))
+        .await
+        .expect("drop the counter");
+    }
     conn.batch_execute("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
         .await
         .expect("pg_stat_statements extension");
@@ -611,7 +619,8 @@ async fn measure_writes(admin: &str, size: &Size, table: &mut String) {
 
     let insert = "INSERT INTO \"harvest_dead_letters\"";
     let delete = "DELETE FROM \"harvest_dead_letters\"";
-    let counter = "UPDATE harvest_dead_letter_counts";
+    // The trigger body: its delta insert and, now and then, a fold.
+    let counter = "harvest_dead_letter_counts";
 
     reset_stats(&mut conn, &db_name).await;
     let mut ids = Vec::with_capacity(WRITES);
@@ -628,7 +637,7 @@ async fn measure_writes(admin: &str, size: &Size, table: &mut String) {
     write_row(
         table,
         size.name,
-        "insert, one row: nested counter update",
+        "insert, one row: nested counter work",
         cost,
     );
 
@@ -644,7 +653,7 @@ async fn measure_writes(admin: &str, size: &Size, table: &mut String) {
     write_row(
         table,
         size.name,
-        "discard, one row: nested counter update",
+        "discard, one row: nested counter work",
         cost,
     );
 
@@ -668,13 +677,14 @@ async fn measure_writes(admin: &str, size: &Size, table: &mut String) {
     write_row(
         table,
         size.name,
-        "discard, 100 rows: nested counter update",
+        "discard, 100 rows: nested counter work",
         cost,
     );
 
+    measure_held_snapshot(&mut conn, &db, size, table).await;
+
     reset_stats(&mut conn, &db_name).await;
     let url = db.url();
-    let started = std::time::Instant::now();
     let writers: Vec<_> = (0..WRITERS)
         .map(|w| {
             let url = url.clone();
@@ -682,6 +692,9 @@ async fn measure_writes(admin: &str, size: &Size, table: &mut String) {
                 let mut conn = AsyncPgConnection::establish(&url)
                     .await
                     .expect("writer connection");
+                conn.batch_execute("SET pg_stat_statements.track = 'all'")
+                    .await
+                    .expect("track nested statements");
                 for n in 0..WRITES_PER_WRITER {
                     autumn_harvest::dlq::dead_letter(&mut conn, &write_entry(w * 1000 + n))
                         .await
@@ -693,16 +706,126 @@ async fn measure_writes(admin: &str, size: &Size, table: &mut String) {
     for writer in writers {
         writer.await.expect("writer task");
     }
-    let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let label = format!("insert, {WRITERS} connections at once");
     let cost = timed_cost(&mut conn, &db_name, insert).await;
+    write_row(table, size.name, &label, cost);
+    let cost = timed_cost(&mut conn, &db_name, counter).await;
     write_row(
         table,
         size.name,
-        &format!("insert, {WRITERS} connections ({wall_ms:.0} ms wall)"),
+        &format!("{label}: nested counter work"),
         cost,
     );
+    if !without_counter() {
+        let _ = writeln!(
+            table,
+            "| {} | counter rows after the concurrent inserts: {} | | | | |",
+            size.name,
+            counter_rows(&mut conn).await
+        );
+    }
     drop(conn);
     drop(db);
+}
+
+/// Dead letters that the held-snapshot phase inserts.
+const HELD_WRITES: usize = 2_000;
+
+/// `PERF_WITHOUT_COUNTER=1` drops the counter after the migration. A run with
+/// it measures the writes as they were before the counter.
+fn without_counter() -> bool {
+    std::env::var_os("PERF_WITHOUT_COUNTER").is_some()
+}
+
+async fn counter_rows(conn: &mut AsyncPgConnection) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct Rows {
+        #[diesel(sql_type = BigInt)]
+        n: i64,
+    }
+    diesel::sql_query("SELECT COUNT(*)::BIGINT AS n FROM harvest_dead_letter_counts")
+        .get_result::<Rows>(conn)
+        .await
+        .expect("counter rows")
+        .n
+}
+
+/// The writes and the gauge read while another session holds a snapshot open.
+/// Vacuum then keeps each dead row version, as during a long `pg_dump`.
+async fn measure_held_snapshot(
+    conn: &mut AsyncPgConnection,
+    db: &ThrowawayDb,
+    size: &Size,
+    table: &mut String,
+) {
+    let db_name = db.name();
+    let mut holder = AsyncPgConnection::establish(&db.url())
+        .await
+        .expect("holder connection");
+    holder
+        .batch_execute(
+            "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1 FROM harvest_dead_letters LIMIT 1;",
+        )
+        .await
+        .expect("hold a snapshot");
+    reset_stats(conn, db_name).await;
+    for n in 0..HELD_WRITES {
+        autumn_harvest::dlq::dead_letter(conn, &write_entry(n))
+            .await
+            .expect("insert under a held snapshot");
+    }
+    let label = format!("insert, one row, snapshot held ({HELD_WRITES} writes)");
+    let cost = timed_cost(conn, db_name, "INSERT INTO \"harvest_dead_letters\"").await;
+    write_row(table, size.name, &label, cost);
+
+    let gauge = if without_counter() {
+        "SELECT COUNT(*)::BIGINT AS entries FROM harvest_dead_letters"
+    } else {
+        autumn_harvest::dlq::DLQ_DEPTH_SQL
+    };
+    reset_stats(conn, db_name).await;
+    for _ in 0..5 {
+        diesel::sql_query(gauge)
+            .execute(conn)
+            .await
+            .expect("gauge read");
+    }
+    let fragment = if without_counter() {
+        "FROM harvest_dead_letters"
+    } else {
+        "harvest_dead_letter_depth"
+    };
+    let cost = timed_cost(conn, db_name, fragment).await;
+    write_row(
+        table,
+        size.name,
+        &format!("gauge read after {HELD_WRITES} writes, snapshot held"),
+        cost,
+    );
+    if !without_counter() {
+        #[derive(diesel::QueryableByName)]
+        struct Pages {
+            #[diesel(sql_type = BigInt)]
+            n: i64,
+        }
+        let pages: Pages = diesel::sql_query(
+            "SELECT (pg_relation_size('harvest_dead_letter_counts') / 8192)::BIGINT AS n",
+        )
+        .get_result(conn)
+        .await
+        .expect("counter pages");
+        let _ = writeln!(
+            table,
+            "| {} | counter after {HELD_WRITES} writes, snapshot held: {} rows, {} pages | | | | |",
+            size.name,
+            counter_rows(conn).await,
+            pages.n
+        );
+    }
+    holder
+        .batch_execute("COMMIT")
+        .await
+        .expect("release the snapshot");
 }
 
 /// Writes the per-call cost of the dead-letter writes for every size.
@@ -714,7 +837,8 @@ async fn zz_capture_dead_letter_write_costs() {
     let label = std::env::var("PERF_LABEL").unwrap_or_else(|_| "write-baseline".to_owned());
     let mut table = format!(
         "-- {label}: dead-letter writes, {WRITES} single writes, \
-         {DISCARD_BATCH}-row batches, {WRITERS} x {WRITES_PER_WRITER} concurrent inserts\n\
+         {DISCARD_BATCH}-row batches, {HELD_WRITES} writes under a held snapshot, \
+         {WRITERS} x {WRITES_PER_WRITER} concurrent inserts\n\
          | size | statement | calls | buffers | buffers per call | ms per call |\n\
          |:--|:--|--:|--:|--:|--:|\n"
     );
