@@ -69,7 +69,7 @@ gives a rule.
 | A direct restore between the drain end and `end_restore` | Its `release` binds the pending entry to the current file first. `end_restore` then finds another entry and does nothing. |
 | An inode number comes back and revives an old entry | Each `release` binds the entry to the current file, or drops it. So an entry names the current file or the file just before it. A restore never gives the current number again. |
 | A re-created tenant takes the target of the old one | `on_delete` removes the target file. |
-| The open restores a Harvest file that already follows the database | A superseded entry forces a restore only when the Harvest file has no database record. |
+| The open restores a Harvest file that already follows the database | A superseded entry forces a restore only when the Harvest file has no database record. Issue #2721 replaces this rule: a reused identity can match the record, so a superseded entry always forces a restore. See `DESIGN-2721.md`. |
 | A stale-epoch open releases between the request and the drain | Each release before the return writes the target again, from the entry before the request. The release of the drain comes last. |
 | An open during the drain removes the pending target | The open reads the entry from before the request. It keeps the pending target and drops the earlier one, which it used. |
 | An open after the publish and before the return serves the wrong point in time | When the pending target of an unreturned restore moved, the open refuses. A retry after the return applies the target. The refusal also frees the drain from a stale-epoch open. |

@@ -12,14 +12,6 @@ use autumn_web::webhook_outbound::{
     WebhookDeliveryLog, WebhookOutboundManager, WebhookSubscriptionStatus,
 };
 
-/// Returns `at` as the `chrono` value of a delivery log.
-///
-/// `WebhookDeliveryLog::timestamp` is an `autumn-web` field with a `chrono`
-/// type. Every `jiff` instant converts, so the fallback is never used.
-fn log_timestamp(at: Timestamp) -> chrono::DateTime<chrono::Utc> {
-    crate::chrono_boundary::to_chrono(at).unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebhookDeliveryInput {
     pub subscription_id: String,
@@ -108,7 +100,7 @@ pub async fn deliver_webhook(
                 "SubscriptionNotFound: active subscription {} not found",
                 input.subscription_id
             )),
-            timestamp: log_timestamp(Timestamp::now()),
+            timestamp: Timestamp::now(),
         };
         manager.store().log_delivery(log).await.ok();
 
@@ -135,7 +127,7 @@ pub async fn deliver_webhook(
             max_attempts: 5,
             is_dlq: false,
             last_error: Some("SubscriptionDisabled: Webhook subscription is disabled".to_owned()),
-            timestamp: log_timestamp(Timestamp::now()),
+            timestamp: Timestamp::now(),
         };
         manager.store().log_delivery(log).await.ok();
 
@@ -169,7 +161,7 @@ pub async fn deliver_webhook(
         max_attempts,
         is_dlq: false,
         last_error: None,
-        timestamp: log_timestamp(Timestamp::now()),
+        timestamp: Timestamp::now(),
     };
 
     let start = std::time::Instant::now();
@@ -186,7 +178,7 @@ pub async fn deliver_webhook(
     let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     log.elapsed_ms = elapsed;
-    log.timestamp = log_timestamp(Timestamp::now());
+    log.timestamp = Timestamp::now();
 
     match response {
         Ok(res) => {

@@ -1886,6 +1886,8 @@ mod db {
     /// Everything a staged copy writes apart from the execution row itself.
     pub const STAGED_CHILD_DELETES: &[&str] = &[
         "DELETE FROM harvest_events WHERE workflow_exec_id = $1",
+        // The outbox trigger writes these rows when the staged events go in.
+        "DELETE FROM harvest_external_outbox_pending WHERE workflow_exec_id = $1",
         "DELETE FROM harvest_timers WHERE workflow_exec_id = $1",
         "DELETE FROM harvest_signals WHERE workflow_exec_id = $1",
         "DELETE FROM harvest_payload_refs WHERE workflow_exec_id = $1",
@@ -2865,6 +2867,10 @@ mod db {
         // `forgotten` removes the entity state row of the sealed run (issue
         // #2259). The target now holds the live row. A stale copy here would
         // answer a read on this shard.
+        //
+        // `unclaimed` removes the outbox rows of the sealed run. The target
+        // copy holds the same requests and claims them. A stale row here
+        // would cost each later claim on this shard one probe.
         let sql = format!(
             "WITH sealed AS ( \
                  UPDATE harvest_workflow_executions e \
@@ -2885,6 +2891,10 @@ mod db {
                  DELETE FROM harvest_entity_state s \
                   WHERE s.execution_id = $1 AND EXISTS (SELECT 1 FROM sealed) \
                  RETURNING s.id \
+             ), unclaimed AS ( \
+                 DELETE FROM harvest_external_outbox_pending p \
+                  WHERE p.workflow_exec_id = $1 AND EXISTS (SELECT 1 FROM sealed) \
+                 RETURNING p.event_row_id \
              ) \
              SELECT (SELECT count(*) FROM sealed)::BIGINT AS sealed_rows"
         );

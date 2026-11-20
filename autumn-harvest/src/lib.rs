@@ -366,6 +366,8 @@ pub mod event_batch;
 #[doc(hidden)]
 pub mod execution;
 pub mod executor;
+/// The pending table of the external outbox and its trigger.
+pub mod external_outbox;
 /// Shard-placement-aware resolution for `workflow_id`-addressed external
 /// signal/cancel targets (issue #1146).
 #[cfg(feature = "db")]
@@ -639,6 +641,9 @@ pub mod models;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod notify;
+/// A background loop that its caller spawns or runs.
+#[cfg(feature = "db")]
+pub mod prepared_loop;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod queue;

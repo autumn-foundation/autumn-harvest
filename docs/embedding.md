@@ -55,16 +55,16 @@ multi-shard pool, run one invocation per shard, each with its own
 
 **These crates.** The Axum types come from the `autumn_web::reexports::axum`
 re-export, so the version always matches the router. The `path` keys point
-into a checkout of this repository, next to your crate. Remove them to build
-against the 0.10.0 release from crates.io. That release needs
-`autumn-web = "0.10"`.
+into a checkout of this repository, next to your crate. The checkout needs
+`autumn-web = "0.11"`. Remove the `path` keys to build against the 0.10.0
+release from crates.io. That release needs `autumn-web = "0.10"`.
 
 ```toml
 [dependencies]
 autumn-harvest = { version = "0.10.0", path = "../autumn-harvest/autumn-harvest" }
 # `metrics` adds the Prometheus recorder. `webhooks` adds webhook receivers.
 autumn-harvest-plugin = { version = "0.10.0", path = "../autumn-harvest/autumn-harvest-plugin", features = ["metrics", "webhooks"] }
-autumn-web = "0.10"
+autumn-web = "0.11"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 ```
 

@@ -63,8 +63,9 @@ const DEVICES: &[&str] = &[
 const ROOT_TMPFS_OPTIONS: &str = "mode=755,size=1m";
 
 /// The options of the `tmpfs` that covers a masked directory. It holds
-/// nothing, and the code cannot open it.
-const MASK_TMPFS_OPTIONS: &str = "mode=000,size=4k,nr_inodes=2";
+/// nothing. Mode `555` lets the code list it as empty (issue #2719). The
+/// mount is read-only, so the code cannot write it.
+const MASK_TMPFS_OPTIONS: &str = "mode=555,size=4k,nr_inodes=2";
 
 /// The `statvfs` flags that map to the same mount flag.
 const ST_COPIED: libc::c_ulong = 1 | 2 | 4 | 8 | 1024 | 2048;
@@ -84,9 +85,9 @@ pub enum FsIsolation {
     /// The file system of the worker, minus these paths.
     ///
     /// Each path must be absolute, must exist, and must not hold `..` or cover
-    /// the work directory. A path that resolves to a
-    /// directory shows empty. A path that resolves to another kind of file
-    /// reads as `/dev/null`, so a socket refuses the connection.
+    /// the work directory. A path that resolves to a directory lists as
+    /// empty, and the code cannot write it. A path that resolves to another
+    /// kind of file reads as `/dev/null`, so a socket refuses the connection.
     ///
     /// A mask hides a path, not an inode. A hard link, a bind mount or a
     /// path that the list omits still reaches the data. Sibling runs in the
@@ -845,12 +846,36 @@ mod tests {
             return;
         }
         let (dir, _file) = secret_dir();
+        let path = dir.path().display();
+        // Check the exit code. A pipe into `wc -l` also prints 0 when `ls`
+        // fails (issue #2719).
         let out = run(
             FsIsolation::Mask(vec![dir.path().to_path_buf()]),
-            &format!("ls -A {} | wc -l", dir.path().display()),
+            &format!("ls -A {path}; echo rc=$?; ls -A {path}/.; echo rc=$?"),
         )
         .await;
-        assert_eq!(out.stdout.trim(), "0", "{}", out.stderr);
+        assert_eq!(out.stdout, "rc=0\nrc=0\n", "{}", out.stderr);
+        assert_eq!(out.stderr, "");
+    }
+
+    #[tokio::test]
+    async fn a_masked_directory_hides_its_files() {
+        if !needs_isolation().await {
+            return;
+        }
+        let (dir, file) = secret_dir();
+        let out = run(
+            FsIsolation::Mask(vec![dir.path().to_path_buf()]),
+            &format!("cat {}", file.display()),
+        )
+        .await;
+        assert_eq!(out.status, RunStatus::Exited { code: 1 });
+        assert_eq!(out.stdout, "");
+        assert!(
+            out.stderr.contains("No such file or directory"),
+            "{}",
+            out.stderr
+        );
     }
 
     #[tokio::test]
@@ -1183,18 +1208,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_masked_directory_is_not_writable_and_has_no_mode() {
+    async fn a_masked_directory_is_read_only() {
         if !needs_isolation().await {
             return;
         }
         let (dir, _file) = secret_dir();
         let path = dir.path().display();
+        // A non-root worker owns the mask root, so mode `555` alone does not
+        // stop a `chmod`. Only the read-only mount gives `EROFS` here.
         let out = run(
             FsIsolation::Mask(vec![dir.path().to_path_buf()]),
-            &format!("touch {path}/x 2>/dev/null; echo rc=$?; stat -c %a {path}"),
+            &format!("touch {path}/x; chmod 755 {path}; stat -c %a {path}"),
         )
         .await;
-        assert_eq!(out.stdout, "rc=1\n0\n", "{}", out.stderr);
+        assert_eq!(out.stdout, "555\n", "{}", out.stderr);
+        assert_eq!(
+            out.stderr.matches("Read-only file system").count(),
+            2,
+            "{}",
+            out.stderr
+        );
     }
 
     #[tokio::test]
