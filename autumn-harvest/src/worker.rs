@@ -32639,6 +32639,9 @@ fn spawn_rate_limit_sampler(
 /// Periodically sample the dead-letter queue entry count and forward it to
 /// the configured [`MetricsRecorder`](crate::telemetry::MetricsRecorder).
 ///
+/// The count is exact, and its read does not grow with the DLQ. See
+/// [`crate::dlq::DLQ_DEPTH_SQL`].
+///
 /// Runs on the same cadence as the queue-depth sampler. For sharded
 /// deployments the caller should spawn one instance per shard, passing the
 /// shard-specific pool; single-shard deployments pass their single pool and
@@ -32700,6 +32703,13 @@ fn spawn_dlq_depth_sampler(
                 .await;
             match sampled {
                 Ok((count, _role)) => {
+                    if count < 0 {
+                        tracing::warn!(
+                            shard_id,
+                            count,
+                            "dlq depth counter is negative; run harvest_dead_letter_recount()"
+                        );
+                    }
                     let depth = u64::try_from(count).unwrap_or(0);
                     telemetry.metrics.record_dlq_entries(shard_id, depth);
                 }

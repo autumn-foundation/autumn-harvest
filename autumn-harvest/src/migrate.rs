@@ -1019,7 +1019,11 @@ async fn apply_in_transaction(
     let version = script.version.clone();
     let sql = script.sql.clone();
 
-    let result: Result<(), ApplyError> = Box::pin(conn.transaction(async |tx| {
+    // The level is pinned, not inherited. At `REPEATABLE READ`, the ledger
+    // check below would take the snapshot before a lock in the body. A seed
+    // count in the body would then miss rows that committed in the wait.
+    let mut transaction = conn.build_transaction().read_committed();
+    let result: Result<(), ApplyError> = Box::pin(transaction.run(async |tx| {
         if lock_ledger {
             diesel::sql_query(format!(
                 "LOCK TABLE {MIGRATION_LEDGER} IN {LEDGER_LOCK_MODE} MODE"

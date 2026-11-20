@@ -119,6 +119,11 @@ CREATE SUBSCRIPTION harvest_dr_shard0
   WITH (create_slot = false, slot_name = 'harvest_dr_shard0', copy_data = true);
 ```
 
+The apply worker writes with the triggers off. So the standby copies the
+DLQ depth counter of the primary, `harvest_dead_letter_counts`, and its own
+migration seed stays in the sum. `harvest dr promote` recounts it from
+`harvest_dead_letters`, so the gauge is exact after a failover.
+
 > Creating the slot separately, with `create_slot = false`, is required only
 > when publisher and subscriber share one Postgres instance (as the drill's
 > two-database topology does): `CREATE SUBSCRIPTION` runs in a transaction and
@@ -381,7 +386,7 @@ These direct-database commands are exempt, by design:
 | Command | Why it is not fenced |
 | --- | --- |
 | `harvest dr fence` | It moves write authority. Fencing it would block the failover. |
-| `harvest dr promote` | It runs during the failover, before workers start. It only advances sequences. |
+| `harvest dr promote` | It runs during the failover, before workers start. It advances sequences and recounts the DLQ depth counter. |
 | `harvest migrate run` | Logical replication carries no DDL. You must migrate both regions. |
 | `harvest backup verify`, `harvest dr status`, `harvest partition status`, `harvest migrate status` | They read only. |
 
