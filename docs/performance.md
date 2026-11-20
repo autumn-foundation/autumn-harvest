@@ -3138,3 +3138,8 @@ standalone note rather than part of the claim-path attribution table above:
 * [`docs/performance-retention-pass-statement-cache.md`](performance-retention-pass-statement-cache.md)
   — the retention candidate loop planned five statements per candidate.
   `cached_stmt` keeps them prepared (`pg_stat_statements`, `retention_reclaim_bench`).
+* [`docs/performance-claim-release-guard.md`](performance-claim-release-guard.md)
+  — a by-id task row statement could leave the primary key for a partial
+  index that matched its `state` or `worker_id` guard (issue #2713). A `CASE`
+  guard keeps each one on the primary key (recheck buffers 24 → 6 at 20
+  rows per worker, and 201 → 6 after an idle analyze, 1M-row fixture).
