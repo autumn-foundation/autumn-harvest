@@ -45315,15 +45315,19 @@ async fn claim_failed_its_task(
     claim_attempt: i32,
 ) -> bool {
     use crate::schema::harvest_task_queue::dsl;
+    use diesel::BoolExpressionMethods as _;
     let Ok(mut conn) = crate::pool::acquire_within_pool_bound(pool).await else {
         return false;
     };
     dsl::harvest_task_queue
         .find(task_id)
-        .filter(dsl::state.eq("FAILED"))
-        .filter(dsl::worker_id.eq(worker_id))
-        .filter(dsl::crash_strikes.eq(claim_crash_strikes))
-        .filter(dsl::attempt.eq(claim_attempt))
+        .filter(crate::row_guard::row_guard(
+            dsl::state
+                .eq("FAILED")
+                .and(dsl::worker_id.eq(worker_id))
+                .and(dsl::crash_strikes.eq(claim_crash_strikes))
+                .and(dsl::attempt.eq(claim_attempt)),
+        ))
         .select(dsl::id)
         .first::<uuid::Uuid>(&mut conn)
         .await
@@ -45353,6 +45357,7 @@ pub async fn reset_timed_out_workflow_task(
     claim_attempt: i32,
 ) -> ClaimRecovery {
     use crate::schema::harvest_task_queue::dsl;
+    use diesel::BoolExpressionMethods as _;
 
     // Retry both the pool acquire and the release write. Without the retry, a
     // short pool saturation leaves the task stuck in RUNNING on a live worker.
@@ -45381,8 +45386,6 @@ pub async fn reset_timed_out_workflow_task(
         let written = diesel::update(
             dsl::harvest_task_queue
                 .find(task_id)
-                .filter(dsl::state.eq("RUNNING"))
-                .filter(dsl::worker_id.eq(worker_id))
                 // Claim-epoch guard (issue #1459). It is the same race
                 // `queue::release_task_for_capability_miss` already guards.
                 // `poison_pill::requeue_orphan` hands an orphan back as `PENDING`
@@ -45398,8 +45401,13 @@ pub async fn reset_timed_out_workflow_task(
                 // being stuck is not a crash. Its re-claim would then still match
                 // on `crash_strikes` alone. This reset must also check `attempt`,
                 // which `claim_task` bumps on every claim without exception.
-                .filter(dsl::crash_strikes.eq(claim_crash_strikes))
-                .filter(dsl::attempt.eq(claim_attempt)),
+                .filter(crate::row_guard::row_guard(
+                    dsl::state
+                        .eq("RUNNING")
+                        .and(dsl::worker_id.eq(worker_id))
+                        .and(dsl::crash_strikes.eq(claim_crash_strikes))
+                        .and(dsl::attempt.eq(claim_attempt)),
+                )),
         )
         .set((
             dsl::state.eq("PENDING"),

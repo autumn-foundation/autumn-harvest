@@ -368,6 +368,8 @@ mod retry_now_tests;
 #[cfg(feature = "db")]
 mod retry_override_db_tests;
 mod retry_override_guard;
+#[cfg(feature = "db")]
+mod row_guard_plan_db_tests;
 mod run_defaults_chain_guard;
 #[cfg(feature = "db")]
 mod run_defaults_chain_tests;
