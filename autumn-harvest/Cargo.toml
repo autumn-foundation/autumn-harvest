@@ -166,7 +166,9 @@ schemars = { version = "1.2", optional = true }
 # patched release). 48.0.6 is the first with the RUSTSEC-2026-0363 and
 # RUSTSEC-2026-0364 fixes. 48.0.7 is the first with the RUSTSEC-2026-0378 and
 # RUSTSEC-2026-0379 fixes. 48.0.8 is the first with the RUSTSEC-2026-0422 to
-# RUSTSEC-2026-0424 fixes. The floor is now the 50.x line, above all of them. Pin
+# RUSTSEC-2026-0424 fixes. The floor is now the 50.x line, above all of them.
+# 50.0.2 is the first 50.x release with the RUSTSEC-2026-0569 to
+# RUSTSEC-2026-0573 fixes. Pin
 # it so a downstream consumer enabling `wasm-activities` can't silently resolve
 # back to a vulnerable release (same
 # reasoning as tokio-postgres above -- a workspace's own Cargo.lock never
