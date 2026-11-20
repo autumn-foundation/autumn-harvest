@@ -975,7 +975,7 @@ async fn the_trigger_survives_each_layout_change() {
         assert_eq!(table, legacy_unresolved(conn, &[exec]).await);
         assert_eq!(
             claim_one(conn, external_signal_outbox_claim_query()).await,
-            table.iter().next().copied(),
+            table.as_slice().first().copied(),
             "the claim still joins each row to its event"
         );
     };
@@ -1127,7 +1127,7 @@ fn the_table_matches_the_legacy_unresolved_set() {
         .enable_all()
         .build()
         .expect("runtime");
-    let (url, _container) = runtime.block_on(setup_test_database_url_or_env());
+    let (url, container) = runtime.block_on(setup_test_database_url_or_env());
     let cases = std::env::var("PROPTEST_CASES")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1142,7 +1142,7 @@ fn the_table_matches_the_legacy_unresolved_set() {
             runtime.block_on(check_against_the_legacy_set(&url, ops))
         })
         .unwrap();
-    runtime.block_on(async move { drop(_container) });
+    runtime.block_on(async move { drop(container) });
 }
 
 /// The buffer parser reads the top node and ignores the planning line.
