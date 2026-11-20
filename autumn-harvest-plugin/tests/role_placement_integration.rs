@@ -8,6 +8,8 @@
 //! Requires Docker. Each test uses a multi-thread runtime, because
 //! `TestApp::plugin` blocks on plugin startup.
 
+#![allow(clippy::unused_async)]
+
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
@@ -76,12 +78,25 @@ fn app_config(db: &TestPg, role: &str) -> autumn_web::config::AutumnConfig {
         "role = \"{role}\"\nprofile = \"test\"\n\
          [security.csrf]\nenabled = false\n\
          [actuator]\nsensitive = true\n\
-         [jobs]\nbackend = \"postgres\"\n"
+         [jobs]\nbackend = \"postgres\"\n{PRESETS}"
     ))
     .expect("the config parses");
     config.database.url = Some(db.url.clone());
     config
 }
+
+/// Two named roles. `cron` turns the Harvest worker off and keeps Autumn
+/// job workers. `flows` keeps the Harvest worker with no Autumn job worker.
+const PRESETS: &str = "\
+[roles.cron]
+base = \"combined\"
+capabilities = { \"harvest.worker\" = false, \"harvest.scheduler\" = true }
+
+[roles.flows]
+base = \"combined\"
+job_workers = false
+capabilities = { \"harvest.worker\" = true }
+";
 
 fn build(db: &TestPg, role: &str) -> TestClient {
     let plugin = HarvestPlugin::new()
@@ -110,6 +125,19 @@ fn running(tasks: &BTreeMap<String, Value>) -> Vec<String> {
         .filter(|(name, task)| name.starts_with("harvest.") && task["status"] == "running")
         .map(|(name, _)| name.clone())
         .collect()
+}
+
+/// Wait until the run completes, or fail after 30 s.
+async fn wait_for_completion(client: &TestClient, id: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let now = status(client, id).await;
+        if now == "completed" {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the run did not complete: {now}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Start one run and return its id.
@@ -158,15 +186,43 @@ async fn a_combined_role_runs_each_harvest_task_and_completes_a_run() {
         "{tasks:?}"
     );
     let id = start(&client).await;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let now = status(&client, &id).await;
-        if now == "completed" {
-            break;
-        }
-        assert!(Instant::now() < deadline, "the run did not complete: {now}");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    wait_for_completion(&client, &id).await;
+    // A task with no prepared loop fails after its start. Each task still
+    // runs, so the runner gave each one its loop.
+    let tasks = fetch_tasks(&client).await;
+    assert_eq!(running(&tasks).len(), 5, "{tasks:?}");
+}
+
+/// A named role turns the Harvest worker off and keeps the rest. Autumn
+/// job workers stay on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_named_role_turns_off_the_harvest_worker() {
+    let db = setup_db().await;
+    let client = build(&db, "cron");
+    let tasks = fetch_tasks(&client).await;
+    assert_eq!(
+        running(&tasks),
+        ["harvest.batch", "harvest.retention", "harvest.scheduler"],
+        "{tasks:?}"
+    );
+    assert_eq!(tasks["harvest.worker"]["status"], "not_placed");
+    let id = start(&client).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_ne!(status(&client, &id).await, "completed");
+}
+
+/// The reverse: a named role with no Autumn job worker runs the Harvest
+/// worker, and completes the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_named_role_runs_the_harvest_worker_without_job_workers() {
+    let db = setup_db().await;
+    let client = build(&db, "flows");
+    let tasks = fetch_tasks(&client).await;
+    assert_eq!(tasks["harvest.worker"]["status"], "running", "{tasks:?}");
+    // Autumn places a task with queues only where job workers run.
+    assert_eq!(tasks["harvest.queues"]["status"], "not_placed");
+    let id = start(&client).await;
+    wait_for_completion(&client, &id).await;
 }
 
 /// A `web` role runs no Harvest task. It starts a run, but no worker here
@@ -182,6 +238,7 @@ async fn a_web_role_runs_no_harvest_task_and_leaves_the_run_open() {
         "harvest.scheduler",
         "harvest.retention",
         "harvest.batch",
+        "harvest.queues",
     ] {
         assert_eq!(tasks[name]["status"], "not_placed", "{name}");
         assert_eq!(tasks[name]["runs_here"], false, "{name}");

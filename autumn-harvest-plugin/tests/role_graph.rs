@@ -7,6 +7,8 @@
 //!
 //! No Docker, no database.
 
+#![allow(clippy::unused_async)]
+
 use std::path::Path;
 use std::process::Command;
 
@@ -41,14 +43,16 @@ async fn role_graph_child() {
     if std::env::var_os(CHILD).is_none() {
         return;
     }
-    autumn_web::app()
-        .plugin(
-            HarvestPlugin::new()
-                .workflows(vec![__autumn_workflow_info_rg_echo()])
-                .worker(WorkerConfig::default().with_queues(["default", "priority"])),
-        )
-        .run()
-        .await;
+    Box::pin(
+        autumn_web::app()
+            .plugin(
+                HarvestPlugin::new()
+                    .workflows(vec![__autumn_workflow_info_rg_echo()])
+                    .worker(WorkerConfig::default().with_queues(["default", "priority"])),
+            )
+            .run(),
+    )
+    .await;
 }
 
 /// Run the child app with `dump` set, in a directory with [`AUTUMN_TOML`].
@@ -56,7 +60,12 @@ fn dump(dump: &str, dir: &Path) -> String {
     std::fs::write(dir.join("autumn.toml"), AUTUMN_TOML).expect("write autumn.toml");
     let exe = std::env::current_exe().expect("the test binary");
     let out = Command::new(exe)
-        .args(["role_graph_child", "--exact", "--nocapture", "--test-threads=1"])
+        .args([
+            "role_graph_child",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .current_dir(dir)
         .env(CHILD, "1")
         .env(dump, "1")
@@ -64,7 +73,14 @@ fn dump(dump: &str, dir: &Path) -> String {
         .env_remove("AUTUMN_ROLE")
         .output()
         .expect("the child runs");
-    String::from_utf8_lossy(&out.stdout).into_owned()
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "the child failed: {}\nstdout: {stdout}\nstderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    stdout
 }
 
 /// A fresh directory under the target dir of this test.
@@ -114,15 +130,19 @@ fn the_graph_lists_each_harvest_task_and_the_roles_that_run_it() {
         );
     }
     let queues = task("harvest.queues");
-    assert_eq!(
-        queues["background"]["queues"],
-        serde_json::json!(["default", "priority"])
-    );
+    // A feature can declare more queues, such as `webhooks`.
+    let declared = queues["background"]["queues"].as_array().expect("queues");
+    for queue in ["default", "priority"] {
+        assert!(declared.contains(&Value::from(queue)), "{declared:?}");
+    }
     assert_eq!(
         queues["background"]["roles"],
         serde_json::json!(["combined", "worker"])
     );
-    assert_eq!(task("harvest.worker")["background"]["parent"], "job_workers");
+    assert_eq!(
+        task("harvest.worker")["background"]["parent"],
+        "job_workers"
+    );
 }
 
 /// `autumn doctor` reads this manifest, so it covers the Harvest queues.

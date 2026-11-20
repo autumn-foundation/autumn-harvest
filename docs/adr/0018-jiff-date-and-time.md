@@ -74,7 +74,7 @@ Accepted.
    held `chrono` types in its webhook delivery log and its tenant restore
    target, so the plugin converted at that boundary. `autumn-web` 0.11
    takes `jiff` values, so the plugin passes them through. `deny.toml`
-   bans both crates, and lists the crates that may still wrap them.
+   bans both crates, and lists the one crate that may still wrap `chrono`.
 
 ## Consequences
 

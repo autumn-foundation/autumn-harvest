@@ -33,10 +33,10 @@ pub mod audit_sink;
 /// AWS KMS binding for the core AES-256-GCM payload codec (issue #1825).
 #[cfg(feature = "aws-kms")]
 pub mod aws_kms;
-/// Startup and shutdown steps that `HarvestPlugin` and `HarvestEmbedding`
-/// share (issue #1613).
 /// Harvest runtimes as Autumn background tasks.
 mod background;
+/// Startup and shutdown steps that `HarvestPlugin` and `HarvestEmbedding`
+/// share (issue #1613).
 mod boot;
 pub mod canary;
 pub mod config;

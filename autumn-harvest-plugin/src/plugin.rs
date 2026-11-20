@@ -164,6 +164,9 @@ struct HarvestRuntimeSlot {
     runtime: Option<HarvestRuntime>,
     /// The loops of the Harvest background tasks. The runner fills it.
     hosted: crate::background::HostedLoops,
+    /// The task switches of this build. The startup hook checks the runner
+    /// plan against them.
+    switches: crate::process_role::LoopSwitches,
     /// Broker connector registrations (issue #944), stashed alongside the
     /// builder so `start_harvest_runtime` can spawn one consumer loop each
     /// once the API state and pools exist.
@@ -2044,21 +2047,28 @@ impl HarvestPlugin {
         // Issue #2374: the store of the agent profile overlay routes.
         api_state.set_agent_overlay_store(agent_overlay_store);
 
+        // Issue #796: the synthetic canary registers its probe workflow and
+        // activity, and a retention override for their runs. It goes in here,
+        // after the MCP and webhook routes read the workflows. The task
+        // switches below then see its retention override.
+        let builder = match api_state.canary_config() {
+            Some(cfg) => crate::canary::register_canary(builder, &cfg),
+            None => builder,
+        };
+
         // Autumn places each Harvest runtime by role. The tasks read the
         // explicit switches and the declared queues of this build.
         let hosted = crate::background::HostedLoops::default();
-        let app = crate::background::register(
-            app,
-            build_loop_switches(&builder),
-            declared_worker_queues(&builder),
-            &hosted,
-        );
+        let switches = build_loop_switches(&builder);
+        let app =
+            crate::background::register(app, switches, declared_worker_queues(&builder), &hosted);
 
         let slot = Arc::new(Mutex::new(HarvestRuntimeSlot {
             builder: Some(builder),
             cost_deferral,
             runtime: None,
             hosted,
+            switches,
             #[cfg(feature = "connectors")]
             connectors,
         }));
@@ -2211,8 +2221,16 @@ fn declared_worker_queues(builder: &HarvestBuilder) -> Vec<String> {
 /// A config that does not load gives no switch. The startup hook loads it
 /// again and stops the boot with the error.
 fn build_loop_switches(builder: &HarvestBuilder) -> crate::process_role::LoopSwitches {
+    loop_switches_with_env(builder, &autumn_web::config::OsEnv)
+}
+
+/// [`build_loop_switches`] with an explicit environment.
+fn loop_switches_with_env(
+    builder: &HarvestBuilder,
+    env: &dyn autumn_web::config::Env,
+) -> crate::process_role::LoopSwitches {
     let retention = builder.retention_config().enabled();
-    HarvestRuntimeConfig::load().map_or_else(
+    HarvestRuntimeConfig::load_with_env(env).map_or_else(
         |_| HarvestRuntimeConfig::default().loop_switches(retention),
         |config| config.loop_switches(retention),
     )
@@ -2517,13 +2535,14 @@ async fn start_harvest_runtime(
     probe_harvest_pool(&harvest_pool).await;
     let router = ShardRouter::single();
 
-    let (builder, cost_deferral, runtime_already_started, hosted) = {
+    let (builder, cost_deferral, runtime_already_started, hosted, switches) = {
         let mut guard = slot.lock().unwrap_or_else(PoisonError::into_inner);
         (
             guard.builder.take(),
             guard.cost_deferral.clone(),
             guard.runtime.is_some(),
             guard.hosted.clone(),
+            guard.switches,
         )
     };
     #[cfg(feature = "connectors")]
@@ -2559,12 +2578,7 @@ async fn start_harvest_runtime(
         ensure_webhook_queue(&mut builder);
     }
 
-    // Issue #796: register the built-in synthetic liveness canary when enabled.
-    // `None` (the default) leaves the builder untouched, so a deployment that
-    // never calls `synthetic_canary` is byte-for-byte identical (AC1).
-    if let Some(cfg) = api_state.canary_config() {
-        builder = crate::canary::register_canary(builder, &cfg);
-    }
+    // Issue #796: the build registered the synthetic canary, if enabled.
 
     // The autumn cost signal holds the deferrable activity types
     // (autumn#1720). `try_build` validates the names.
@@ -2735,9 +2749,11 @@ async fn start_harvest_runtime(
         // background tasks run the loops.
         runner_resources
             .with_startup_orphan_gate_already_run()
-            .with_hosted_loops(hosted),
+            .with_hosted_loops(hosted.clone()),
     )
     .await?;
+    // The Autumn tasks start after this hook. Each one must find its loop.
+    hosted.check_placement(switches, state.role());
     let harvest_db_pool = runner.storage_pool();
     // Defense-in-depth: the pre-flight above catches WorkerConfig::with_sharded_pool;
     // this catches any future path that sets runner_resources.sharded_pool.
@@ -3656,6 +3672,28 @@ mod tests {
     fn harvest_routes_have_a_stable_group() {
         assert_eq!(HarvestPlugin::new().route_group(), "harvest");
         assert_eq!(HARVEST_ROUTE_GROUP, "harvest");
+    }
+
+    /// The build reads the worker override, so its tasks take it.
+    #[test]
+    fn the_build_switches_read_the_worker_override() {
+        use crate::process_role::HarvestLoop;
+        use autumn_web::config::MockEnv;
+
+        let builder = HarvestBuilder::new();
+        let env = MockEnv::new().with("AUTUMN_HARVEST__WORKER_ENABLED", "true");
+        let switches = loop_switches_with_env(&builder, &env);
+        assert_eq!(switches.explicit(HarvestLoop::Worker), Some(true));
+        assert_eq!(switches.explicit(HarvestLoop::Batch), Some(true));
+        assert_eq!(switches.explicit(HarvestLoop::Scheduler), None);
+
+        // Retention is off in this build, so its task is off.
+        assert_eq!(switches.explicit(HarvestLoop::Retention), Some(false));
+
+        // A config that does not load gives no worker switch.
+        let bad = MockEnv::new().with("AUTUMN_HARVEST__WORKER_ENABLED", "maybe");
+        let switches = loop_switches_with_env(&builder, &bad);
+        assert_eq!(switches.explicit(HarvestLoop::Worker), None);
     }
 
     /// The range excludes the previous and the next `autumn-web` series.

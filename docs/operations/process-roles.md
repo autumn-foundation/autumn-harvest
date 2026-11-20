@@ -30,7 +30,7 @@ off:
 ```toml
 [roles.cron]
 base = "worker"
-capabilities = { "harvest.worker" = false, "harvest.scheduler" = true }
+capabilities = { "harvest.worker" = false }
 
 [roles.flows]
 base = "worker"
@@ -53,9 +53,11 @@ runs none. `pin = []` turns off `job_workers`, so it also turns off
 - An explicit value wins. Set it in `[harvest]` or with
   `AUTUMN_HARVEST__WORKER_ENABLED` and `AUTUMN_HARVEST__SCHEDULER_ENABLED`.
 - An explicit value against the role logs one `warn!` per switch. The
-  warning names the switch, its value, the role and the capability. An
-  explicit `true` on a role that does not place the task also gets the
-  Autumn warning for a forced task.
+  warning names the switch, its value, the role and the capability.
+- An explicit `true` on a role that does not place a task also gets the
+  Autumn warning for a forced task. `worker_enabled = true` on `web`
+  warns for `harvest.worker`, `harvest.batch` and `harvest.queues`.
+  `run_on = "all"` on `web` warns for `harvest.retention`.
 - At startup, Harvest logs one line with each value and its source:
   `explicit`, `role` or `default`. The SQLite backend logs the source
   `sqlite`.
@@ -100,18 +102,29 @@ its capability, the roles that run it and its state on this process.
 task, `harvest.queues`, runs nothing. It declares the Harvest queues to
 Autumn. See [Coverage](#coverage).
 
-- **Shutdown.** Autumn cancels each task, then waits for at most half of
-  the remaining `server.shutdown_timeout_secs`. The worker drains its
-  in-flight tasks in that time. Autumn aborts a task that does not stop,
-  and the leases return its work to the queue. Size
-  `server.shutdown_timeout_secs` for the worker drain.
+- **Shutdown.** Autumn cancels each task when the listener stops, then
+  waits for at most half of the remaining `server.shutdown_timeout_secs`.
+  Each Harvest loop runs on its own Tokio task. So when Autumn aborts a
+  slow task, the loop still finishes its drain. The Harvest shutdown hook
+  then waits for each loop. With the defaults, Autumn waits 15 s, and the
+  worker drains for up to `WorkerConfig::shutdown_timeout` (25 s). Set
+  `server.shutdown_timeout_secs` to at least twice that value, and keep
+  `terminationGracePeriodSeconds` above it.
+- **A combined process stops its worker first.** The worker stops when
+  the listener stops, before in-flight HTTP requests end. A request that
+  waits for a run on this process, such as a durable route, then needs
+  another worker to finish the run.
+- **Autumn one-off tasks run no Harvest loop.** `autumn task` runs the
+  startup hooks, but no background task. Harvest logs the runtimes that
+  it did not start.
 - **A standalone runner**, `HarvestEmbedding` included, has no Autumn
   host. It spawns each runtime itself, as before.
 - **Retention follows the role.** That is the default,
   `run_on = "scheduler"`. An explicit `scheduler_enabled` moves retention
   with it. With none, the `harvest.maintenance` capability decides.
 - **`run_on = "all"` runs retention on each process**, as in 0.9.0.
-  Row leases keep concurrent janitors correct. Set it in
+  Row leases keep concurrent janitors correct. On a `web` role, Autumn
+  logs its forced-task warning for `harvest.retention` at each boot. Set it in
   `autumn.toml`, or with `AUTUMN_HARVEST_RETENTION__RUN_ON=all`:
 
   ```toml
@@ -127,7 +140,8 @@ Autumn. See [Coverage](#coverage).
 - **The dispatch-metrics sampler runs only with no worker.** A worker
   runs its own copy. Two copies would emit each gauge twice.
 - A process with retention on but not placed logs one `info!` at
-  startup. The line names `run_on` and the fix.
+  startup. The line names `harvest.maintenance`, `scheduler_enabled` and
+  the fix.
 - A typo in `run_on` stops the boot on the SQLite backend too, though
   SQLite ignores the value.
 - The SQLite backend runs retention in its driver on every role. It
@@ -252,6 +266,10 @@ Each queue needs a tier that polls it. Otherwise a run on it waits.
   that runs the Harvest worker, runs Autumn job workers and drains a
   Harvest queue. A role with no Autumn job worker, such as `flows` above,
   still runs the Harvest worker, but Autumn counts no Harvest queue there.
+- Autumn applies the role `pin`, or `jobs.pin`, to `harvest.queues`.
+  Harvest does not read `jobs.pin`. So a `jobs.pin` that names no Harvest
+  queue hides the Harvest queues from Autumn, though the worker still
+  polls them.
 
 With the `webhooks` feature, the built-in `webhooks` queue is a declared
 queue too. Narrow it out only when another tier polls it.
@@ -362,7 +380,8 @@ spec:
       labels: { app: orders, role: worker }
     spec:
       # A worker drains in-flight tasks for up to its shutdown timeout.
-      # Keep this period longer. See kubernetes-probes.md.
+      # Keep this period above server.shutdown_timeout_secs, which is at
+      # least twice that timeout. See kubernetes-probes.md.
       terminationGracePeriodSeconds: 60
       containers:
         - name: orders

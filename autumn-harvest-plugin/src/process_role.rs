@@ -89,8 +89,9 @@ impl HarvestLoop {
 /// The explicit switch of each Harvest runtime, from the Harvest config.
 ///
 /// `None` lets the role decide. Each Autumn background task takes its value,
-/// and so does the runner. So the two always agree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// and so does the runner. So the two always agree. The default sets no
+/// switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LoopSwitches {
     worker: Option<bool>,
     scheduler: Option<bool>,
@@ -415,7 +416,7 @@ pub(crate) mod tests {
     }
 
     /// Resolve the role that `toml` selects.
-    pub(crate) fn resolve_role(toml: &str) -> Role {
+    pub fn resolve_role(toml: &str) -> Role {
         toml::from_str::<autumn_web::config::AutumnConfig>(toml)
             .expect("parses")
             .resolve_role()

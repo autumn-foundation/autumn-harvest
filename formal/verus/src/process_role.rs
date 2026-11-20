@@ -245,6 +245,30 @@ pub proof fn theorem_a_built_in_role_keeps_its_janitor(
 {
 }
 
+/// An explicit scheduler value moves the janitor with it, on any role.
+pub proof fn theorem_an_explicit_scheduler_moves_retention(
+    enabled: bool,
+    scheduler: bool,
+    default: bool,
+)
+    ensures
+        spec_switch_value(
+            spec_retention_switch(enabled, RetentionRunOn::Scheduler, Some(scheduler)),
+            default,
+        ) == (enabled && scheduler),
+{
+}
+
+/// With no scheduler switch, the `harvest.maintenance` default alone places
+/// the janitor. So a named role with no scheduler, but with maintenance,
+/// still runs it.
+pub proof fn theorem_maintenance_places_retention_with_no_switch(enabled: bool, default: bool)
+    ensures
+        spec_switch_value(spec_retention_switch(enabled, RetentionRunOn::Scheduler, None), default)
+            == (enabled && default),
+{
+}
+
 /// A `web` role with no explicit value runs no janitor.
 pub proof fn theorem_a_web_role_runs_no_janitor_by_default(enabled: bool)
     ensures

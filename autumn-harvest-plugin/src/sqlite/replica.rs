@@ -33,7 +33,7 @@
 //!
 //! Autumn ADR 0040 plans a destination for a lifecycle hook, scoped to
 //! `<key prefix>/<engine name>/`. This module uses that layout now, on the
-//! public parts of autumn-web 0.10.
+//! public parts of autumn-web 0.11.
 
 use std::collections::HashMap;
 use std::fs::File;

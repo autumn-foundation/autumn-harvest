@@ -14,9 +14,11 @@ Harvest runtime by role. One `AUTUMN_ROLE` per process is enough. See
 - **Background tasks.** The worker, the scheduler, the retention janitor and
   the batch executor run as the Autumn tasks `harvest.worker`,
   `harvest.scheduler`, `harvest.retention` and `harvest.batch`. The startup
-  hook builds each loop, and the task runs it until the Autumn drain. No
-  loop runs on a detached `tokio::spawn` from `on_startup`. A standalone
-  runner spawns its loops as before. `/actuator/tasks` and `autumn graph`
+  hook builds each loop, and the task starts it and stops it on the Autumn
+  token. None of these four loops is spawned from `on_startup`. Each loop
+  runs on its own Tokio task, so an Autumn abort cannot cut a drain short,
+  and the shutdown hook waits for it. A standalone runner spawns its loops
+  as before. The synthetic canary now registers at build. `/actuator/tasks` and `autumn graph`
   list each task and the roles that run it.
 - **Queues.** The task `harvest.queues` declares the Harvest queues, so the
   role `pin` check, `autumn jobs manifest` and `autumn doctor` include them.
@@ -36,3 +38,4 @@ Harvest runtime by role. One `AUTUMN_ROLE` per process is enough. See
   cannot turn on a capability above its base. `background.rs` tests each
   role through Autumn: built-in roles, a preset that turns the Harvest
   worker off, the reverse, explicit switches and `/actuator/tasks`.
+- **Schema.** No migration and no new `WorkflowEvent` variant.

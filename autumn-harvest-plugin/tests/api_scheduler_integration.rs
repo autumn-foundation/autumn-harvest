@@ -3856,7 +3856,7 @@ async fn wait_for_sweep(database_url: &str, exec_id: uuid::Uuid) -> bool {
     false
 }
 
-/// Issue #2478: retention runs where the scheduler runs. A `web` placement
+/// Issue #2478: an explicit scheduler switch moves retention. A `web` placement
 /// runs no sweep, and `run-now` names the fix. A `combined` role sweeps.
 /// `run_on = "all"` sweeps on a `web` placement, as before the change.
 #[tokio::test]

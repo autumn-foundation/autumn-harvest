@@ -15,8 +15,8 @@ and 0.11 as different crates.
 1. Bump your own `autumn-web` entry to `"0.11"` in the same change.
 2. Check that `cargo tree -i autumn-web` shows one version.
 
-`HarvestPlugin` declares the range `0.11`. An app on `autumn-web` 0.10
-stops at `AppBuilder::plugin` with a message that names both versions.
+An app on `autumn-web` 0.10 does not compile: `HarvestPlugin` implements
+the 0.11 `Plugin` trait. `HarvestPlugin` also declares the range `0.11`.
 
 `autumn-web` 0.11 also moves these crates. Bump them in your own manifest
 if you name them:
@@ -48,11 +48,18 @@ depends on `chrono`, under any feature.
 
 - **The Autumn drain stops the Harvest loops.** The worker, the
   scheduler, the retention janitor and the batch executor run as Autumn
-  background tasks. At shutdown, Autumn cancels them before the
-  `on_shutdown` hooks, and waits for at most half of the remaining
-  `server.shutdown_timeout_secs`. Set that timeout to at least twice the
-  time that your worker needs to drain. Autumn aborts a task that does not
-  stop, and the leases return its work to the queue.
+  background tasks. Autumn cancels them when the listener stops, before
+  the `on_shutdown` hooks. It waits for at most half of the remaining
+  `server.shutdown_timeout_secs`, 15 s with the defaults. Each loop runs
+  on its own Tokio task, so an abort of the Autumn task does not cut its
+  drain short. The Harvest shutdown hook waits for each loop. Set
+  `server.shutdown_timeout_secs` to at least twice
+  `WorkerConfig::shutdown_timeout` (25 s by default).
+- **A combined process stops its worker when the listener stops.** A
+  request that waits for a run on this process, such as a durable route,
+  needs another worker to finish the run during the drain.
+- **Autumn one-off tasks run no Harvest loop.** `autumn task` runs the
+  startup hooks, but no background task.
 - **Named roles place Harvest.** Before, Harvest read only the base of a
   `[roles.<name>]` preset and logged a warning. Now it reads the Harvest
   capabilities of the preset. A preset with `job_workers = false` or

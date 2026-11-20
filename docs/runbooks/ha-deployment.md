@@ -151,8 +151,8 @@ Expected steady-state: `lost_race / claimed ≈ 0` for fast schedules (< tick in
 Set `AUTUMN_ROLE=web` or `AUTUMN_ROLE=worker` on each replica. A `web`
 replica runs no Harvest worker and no scheduler tick. Only the `worker`
 replicas tick and claim, so the contract above holds among them. The
-retention janitor follows the scheduler, so it runs on the `worker`
-replicas only (issue #2478). See
+retention janitor follows the `harvest.maintenance` capability, so it
+runs on the `worker` replicas only (issue #2478). See
 [`docs/operations/process-roles.md`](../operations/process-roles.md).
 
 ### Multi-Shard

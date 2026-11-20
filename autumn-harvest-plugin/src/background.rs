@@ -13,10 +13,16 @@
 //! | `harvest.batch` | `harvest.maintenance` | the batch executor |
 //! | `harvest.queues` | `harvest.worker` | nothing: it declares the queues |
 //!
-//! The `on_startup` hook builds the runtime. With a host, the runner spawns
+//! The `on_startup` hook builds the runtime. With a host, the runner starts
 //! no loop. It puts each loop that the role places in [`HostedLoops`]. Each
-//! task takes its loop and runs it until Autumn cancels the task token. So
-//! the Autumn drain stops each loop.
+//! task takes its loop, starts it, and stops it when Autumn cancels the task
+//! token. So the Autumn drain stops each loop.
+//!
+//! The loop runs on its own Tokio task. Autumn aborts a background task that
+//! does not stop within its drain budget. An abort must not cut a worker
+//! drain or a retention transaction short. So the abort ends only the Autumn
+//! task, and the loop finishes its stop. `HarvestRunner::stop` waits for each
+//! loop through its [`HostedStop`].
 //!
 //! `harvest.queues` carries the declared queues. Autumn then includes them in
 //! the role `pin` check and in `autumn jobs manifest`. The worker task has no
@@ -31,6 +37,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use autumn_web::AutumnError;
 use autumn_web::app::AppBuilder;
 use autumn_web::background::BackgroundTask;
+use autumn_web::config::Role;
 use tokio_util::sync::CancellationToken;
 
 use crate::process_role::{HARVEST_CAPABILITIES, HARVEST_WORKER, HarvestLoop, LoopSwitches};
@@ -44,12 +51,31 @@ type LoopFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 /// One hosted loop: it runs until its token is cancelled.
 type LoopRun = Box<dyn FnOnce(CancellationToken) -> LoopFuture + Send>;
 
+/// The stop of one hosted loop, for `HarvestRunner::stop`.
+#[derive(Debug)]
+pub struct HostedStop {
+    stop: CancellationToken,
+    done: CancellationToken,
+}
+
+impl HostedStop {
+    /// Ask the loop to stop. A second call does nothing.
+    pub fn signal(&self) {
+        self.stop.cancel();
+    }
+
+    /// Wait until the loop returns, or until its unused run is dropped.
+    pub async fn wait(&self) {
+        self.done.cancelled().await;
+    }
+}
+
 /// The loops that the runner prepared for the Autumn background tasks.
 ///
 /// The plugin creates one value and gives a clone to each task and to the
 /// runner. The runner puts a loop. The task of that loop takes it.
 #[derive(Clone, Default)]
-pub(crate) struct HostedLoops {
+pub struct HostedLoops {
     slots: Arc<Mutex<BTreeMap<HarvestLoop, LoopRun>>>,
 }
 
@@ -64,7 +90,7 @@ impl std::fmt::Debug for HostedLoops {
 
 impl HostedLoops {
     /// Put the loop of `runtime`. A later put replaces it.
-    pub(crate) fn put<F, Fut>(&self, runtime: HarvestLoop, run: F)
+    pub fn put<F, Fut>(&self, runtime: HarvestLoop, run: F)
     where
         F: FnOnce(CancellationToken) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
@@ -76,6 +102,70 @@ impl HostedLoops {
             .insert(runtime, run);
     }
 
+    /// Put a loop that runs on its own Tokio task.
+    ///
+    /// The Autumn task starts it, then stops it on the task token. An abort
+    /// of the Autumn task does not stop it. The returned [`HostedStop`] stops
+    /// it and waits for it. When no task takes the loop, [`Self::clear`]
+    /// drops it, and the wait returns.
+    pub fn put_detached<F, Fut>(&self, runtime: HarvestLoop, run: F) -> HostedStop
+    where
+        F: FnOnce(CancellationToken) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let stop = CancellationToken::new();
+        let done = CancellationToken::new();
+        // The guard marks the loop done when it returns, panics, or never
+        // runs.
+        let guard = done.clone().drop_guard();
+        let (loop_stop, loop_done) = (stop.clone(), done.clone());
+        self.put(runtime, move |host| async move {
+            let inner_stop = loop_stop.clone();
+            let mut task = tokio::spawn(async move {
+                let _guard = guard;
+                run(inner_stop).await;
+            });
+            tokio::select! {
+                biased;
+                joined = &mut task => resume_panic(joined),
+                () = host.cancelled() => {
+                    loop_stop.cancel();
+                    resume_panic(task.await);
+                }
+            }
+            loop_done.cancelled().await;
+        });
+        HostedStop { stop, done }
+    }
+
+    /// Log an error for each runtime whose loop does not match its task.
+    ///
+    /// Call it after the runner starts and before Autumn starts the tasks.
+    /// `switches` are the task switches of the build. A mismatch means a
+    /// task with no loop, or a loop that no task runs.
+    pub fn check_placement(&self, switches: LoopSwitches, role: &Role) {
+        let prepared: Vec<HarvestLoop> = self
+            .slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .copied()
+            .collect();
+        for runtime in HarvestLoop::ALL {
+            let task = switches.runs(runtime, Some(role));
+            let prepared = prepared.contains(&runtime);
+            if task != prepared {
+                tracing::error!(
+                    task = runtime.task_name(),
+                    task_runs = task,
+                    loop_prepared = prepared,
+                    role = role.name(),
+                    "the Harvest runtime and its Autumn task disagree on this process"
+                );
+            }
+        }
+    }
+
     /// Take the loop of `runtime`, if the runner put one.
     fn take(&self, runtime: HarvestLoop) -> Option<LoopRun> {
         self.slots
@@ -84,12 +174,21 @@ impl HostedLoops {
             .remove(&runtime)
     }
 
-    /// Drop each loop that no task took.
-    pub(crate) fn clear(&self) {
-        self.slots
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
+    /// Drop each loop that no task took, and return their runtimes.
+    pub fn clear(&self) -> Vec<HarvestLoop> {
+        let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        let dropped = slots.keys().copied().collect();
+        slots.clear();
+        dropped
+    }
+}
+
+/// Resume the panic of a loop task in the Autumn task, so Autumn records it.
+fn resume_panic(joined: Result<(), tokio::task::JoinError>) {
+    if let Err(error) = joined
+        && error.is_panic()
+    {
+        std::panic::resume_unwind(error.into_panic());
     }
 }
 
@@ -97,7 +196,7 @@ impl HostedLoops {
 ///
 /// Each backend calls it. So `[roles.<name>] capabilities` can name a
 /// Harvest capability on the SQLite backend too, which has no tasks.
-pub(crate) fn declare_capabilities(app: AppBuilder) -> AppBuilder {
+pub fn declare_capabilities(app: AppBuilder) -> AppBuilder {
     HARVEST_CAPABILITIES
         .into_iter()
         .fold(app, AppBuilder::plugin_capability)
@@ -107,7 +206,7 @@ pub(crate) fn declare_capabilities(app: AppBuilder) -> AppBuilder {
 ///
 /// `switches` gives the explicit switch of each task. `queues` are the
 /// declared worker queues.
-pub(crate) fn register(
+pub fn register(
     app: AppBuilder,
     switches: LoopSwitches,
     queues: Vec<String>,
@@ -443,8 +542,94 @@ capabilities = { \"harvest.worker\" = true }
         idle(&loops, HarvestLoop::Batch);
         assert!(loops.take(HarvestLoop::Worker).is_some());
         assert!(loops.take(HarvestLoop::Worker).is_none());
-        loops.clear();
+        assert_eq!(loops.clear(), [HarvestLoop::Batch]);
         assert!(loops.take(HarvestLoop::Batch).is_none());
         assert!(format!("{loops:?}").contains("HostedLoops"));
+    }
+
+    /// An abort of the Autumn task does not cut the stop of the loop short.
+    /// The stop handle waits for the loop to finish.
+    #[tokio::test]
+    async fn an_abort_of_the_task_does_not_cut_the_loop_short() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let loops = HostedLoops::default();
+        let seen = Arc::clone(&finished);
+        let stop = loops.put_detached(HarvestLoop::Retention, move |stop| async move {
+            stop.cancelled().await;
+            // A slow drain, longer than the abort below.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            seen.store(true, Ordering::SeqCst);
+        });
+        let run = loops.take(HarvestLoop::Retention).expect("a loop");
+        let host = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(run(host.clone()));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        host.cancel();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        task.abort();
+        assert!(!finished.load(Ordering::SeqCst), "the drain is still on");
+        tokio::time::timeout(Duration::from_secs(5), stop.wait())
+            .await
+            .expect("the loop finishes its drain");
+        assert!(finished.load(Ordering::SeqCst));
+    }
+
+    /// A loop that no task takes is done once it is dropped.
+    #[tokio::test]
+    async fn an_untaken_loop_is_done_when_dropped() {
+        let loops = HostedLoops::default();
+        let stop = loops.put_detached(HarvestLoop::Batch, |stop| async move {
+            stop.cancelled().await;
+        });
+        stop.signal();
+        assert_eq!(loops.clear(), [HarvestLoop::Batch]);
+        tokio::time::timeout(Duration::from_secs(5), stop.wait())
+            .await
+            .expect("a dropped loop is done");
+    }
+
+    /// A panic of the loop reaches the Autumn task, so Autumn records it.
+    #[tokio::test]
+    async fn a_loop_panic_reaches_the_autumn_task() {
+        let loops = HostedLoops::default();
+        let stop = loops.put_detached(HarvestLoop::Worker, |_stop| async move {
+            panic!("the loop broke");
+        });
+        let run = loops.take(HarvestLoop::Worker).expect("a loop");
+        let joined = tokio::spawn(run(tokio_util::sync::CancellationToken::new())).await;
+        assert!(joined.expect_err("the task panics").is_panic());
+        tokio::time::timeout(Duration::from_secs(5), stop.wait())
+            .await
+            .expect("a panicked loop is done");
+    }
+
+    /// The placement check names a runtime whose loop and task disagree.
+    #[test]
+    fn the_placement_check_logs_each_mismatch() {
+        let role = config("role = \"worker\"\n")
+            .resolve_role()
+            .expect("resolves");
+        let loops = HostedLoops::default();
+        for runtime in [
+            HarvestLoop::Worker,
+            HarvestLoop::Scheduler,
+            HarvestLoop::Batch,
+        ] {
+            idle(&loops, runtime);
+        }
+        let out = crate::process_role::capture_logs(tracing::Level::ERROR, || {
+            loops.check_placement(default_switches(), &role);
+        });
+        assert!(out.contains("harvest.retention"), "{out}");
+        assert_eq!(
+            out.lines().filter(|l| l.contains(" ERROR ")).count(),
+            1,
+            "{out}"
+        );
+        idle(&loops, HarvestLoop::Retention);
+        let out = crate::process_role::capture_logs(tracing::Level::ERROR, || {
+            loops.check_placement(default_switches(), &role);
+        });
+        assert!(!out.contains(" ERROR "), "{out}");
     }
 }

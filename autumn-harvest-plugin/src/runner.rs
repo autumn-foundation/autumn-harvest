@@ -761,8 +761,8 @@ impl DeferredAuditExportInstall {
 /// The startup line of a process with retention on but not placed (issue
 /// #2478).
 const RETENTION_NOT_PLACED_LOG: &str = "harvest retention janitor not started on this runtime: \
-     harvest.retention.run_on = \"scheduler\" and this process runs no scheduler. Set run_on = \
-     \"all\" to run it here";
+     the role does not run harvest.maintenance, or harvest.scheduler_enabled = false. Set \
+     run_on = \"all\" to run it here";
 
 /// The background tasks that one runtime starts (issue #2477).
 ///
@@ -1070,8 +1070,11 @@ pub struct HarvestRunner {
     /// (issue #1429). `stop` cancels and joins it.
     dispatch_metrics_sampler: Option<(CancellationToken, JoinHandle<()>)>,
     /// The loops given to Autumn background tasks, if any. The Autumn drain
-    /// stops them before `stop` runs.
+    /// signals them before `stop` runs.
     hosted: Option<crate::background::HostedLoops>,
+    /// The stop of each hosted loop. `stop` waits for each one, so an abort
+    /// of an Autumn task cannot cut a drain short.
+    hosted_stops: Vec<crate::background::HostedStop>,
 }
 
 /// Background batch-operations executor handle (issue #102).
@@ -1543,13 +1546,14 @@ impl HarvestRunner {
             .map(|_| prepared.worker_runtime_config.worker_id.clone());
         // With a host, each loop goes to its Autumn background task, which
         // runs it until the Autumn drain. Otherwise the runner spawns it.
+        let mut hosted_stops = Vec::new();
         let worker_handle = worker.as_ref().and_then(|worker| {
             let worker = Arc::clone(worker);
             let pool = harvest_pool.clone();
             if let Some(hosted) = &hosted {
-                hosted.put(HarvestLoop::Worker, move |stop| {
+                hosted_stops.push(hosted.put_detached(HarvestLoop::Worker, move |stop| {
                     run_worker_until(worker, pool, stop)
-                });
+                }));
                 None
             } else {
                 Some(tokio::spawn(async move {
@@ -1571,7 +1575,9 @@ impl HarvestRunner {
             .map_or_else(SchedulerMonitor::offline, PreparedScheduler::monitor);
         let scheduler = prepared_scheduler.and_then(|scheduler| {
             if let Some(hosted) = &hosted {
-                hosted.put(HarvestLoop::Scheduler, move |stop| scheduler.run(stop));
+                hosted_stops.push(
+                    hosted.put_detached(HarvestLoop::Scheduler, move |stop| scheduler.run(stop)),
+                );
                 None
             } else {
                 Some(scheduler.spawn())
@@ -1580,8 +1586,9 @@ impl HarvestRunner {
         // The API reads archived history back through the same archiver
         // (issue #1983).
         let api_history_archiver = prepared.history_archiver.clone();
-        // Issue #2478: retention runs where the scheduler runs, unless
-        // `run_on = "all"`. So a `web` replica runs no delete sweep.
+        // Issue #2478: an explicit `scheduler_enabled` moves retention with
+        // it. With none, `harvest.maintenance` places it. So a `web` replica
+        // runs no delete sweep.
         let prepared_retention = if plan.retention() {
             RetentionRuntime::prepare_with_hooks(
                 prepared.storage_pool.sharded_pool().clone(),
@@ -1625,7 +1632,9 @@ impl HarvestRunner {
             .map(PreparedRetention::trigger_sender);
         let retention = prepared_retention.and_then(|retention| {
             if let Some(hosted) = &hosted {
-                hosted.put(HarvestLoop::Retention, move |stop| retention.run(stop));
+                hosted_stops.push(
+                    hosted.put_detached(HarvestLoop::Retention, move |stop| retention.run(stop)),
+                );
                 None
             } else {
                 Some(retention.spawn())
@@ -1642,9 +1651,9 @@ impl HarvestRunner {
             };
             let tick = std::time::Duration::from_millis(config.batch.tick_interval_ms);
             if let Some(hosted) = &hosted {
-                hosted.put(HarvestLoop::Batch, move |stop| {
+                hosted_stops.push(hosted.put_detached(HarvestLoop::Batch, move |stop| {
                     run_batch_executor(pool, executor_config, tick, stop)
-                });
+                }));
                 None
             } else {
                 Some(BatchRuntime::spawn(pool, executor_config, tick))
@@ -1701,6 +1710,7 @@ impl HarvestRunner {
             dispatch_shard_generations,
             dispatch_metrics_sampler,
             hosted,
+            hosted_stops,
         })
     }
 
@@ -1769,10 +1779,22 @@ impl HarvestRunner {
             dispatch_shard_generations,
             dispatch_metrics_sampler,
             hosted,
+            hosted_stops,
         } = self;
-        // A loop that no task took never ran. Drop it.
+        // Signal each hosted loop. A loop that no task took never ran, so it
+        // is dropped. A host that starts no background task is one example:
+        // the one-off task mode of Autumn.
+        for hosted_stop in &hosted_stops {
+            hosted_stop.signal();
+        }
         if let Some(hosted) = hosted {
-            hosted.clear();
+            let dropped = hosted.clear();
+            if !dropped.is_empty() {
+                tracing::info!(
+                    runtimes = ?dropped,
+                    "harvest runtimes not started: no Autumn background task took them"
+                );
+            }
         }
 
         {
@@ -1821,6 +1843,11 @@ impl HarvestRunner {
             && let Err(error) = worker_handle.await
         {
             tracing::warn!(error = %error, "harvest worker task failed during shutdown");
+        }
+        // The worker drain and an open retention pass finish here, with the
+        // budget of the shutdown hook.
+        for hosted_stop in &hosted_stops {
+            hosted_stop.wait().await;
         }
         // Send the wakes of the last writes before the runtime can stop the
         // notify senders (issue #1796).
@@ -3226,6 +3253,30 @@ mod tests {
         );
     }
 
+    /// A cancelled token ends the batch loop before its first tick, so it
+    /// reads no database.
+    #[tokio::test]
+    async fn the_batch_loop_returns_on_a_cancelled_token() {
+        let stop = tokio_util::sync::CancellationToken::new();
+        stop.cancel();
+        let executor_config = autumn_harvest::batch::BatchExecutorConfig {
+            concurrency: 1,
+            metrics: std::sync::Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+            payload_codecs: autumn_harvest::payload_codec::PayloadCodecs::default(),
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::run_batch_executor(
+                ShardedDbPool::single(tagged_pool(1)),
+                executor_config,
+                std::time::Duration::from_secs(60),
+                stop,
+            ),
+        )
+        .await
+        .expect("the loop returns at once");
+    }
+
     /// The role of `base`, as `AppState::role` gives it.
     fn role_of(base: autumn_web::config::ProcessRole) -> autumn_web::config::Role {
         autumn_web::config::Role::from(base)
@@ -3770,6 +3821,7 @@ mod tests {
             dispatch_shard_generations: Vec::new(),
             dispatch_metrics_sampler: None,
             hosted: None,
+            hosted_stops: Vec::new(),
         }
     }
 
