@@ -1,0 +1,23 @@
+migrated idle_after
+history 1..10000 2.897119410 s
+== H up to 10000, before vacuum
+explain top:    Buffers: shared hit=4320 read=3 dirtied=6
+stat:     10 |     900 |       90 |    0 |                 0
+== H up to 10000, after vacuum
+explain top:    Buffers: shared hit=6
+stat:     10 |       0 |        0 |    0 |                 0
+history 10001..50000 6.582844491 s
+== H up to 50000, before vacuum
+explain top:    Buffers: shared hit=17008 read=361 dirtied=359 written=253
+stat:     10 |    3610 |      361 |    0 |                 0
+== H up to 50000, after vacuum
+explain top:    Buffers: shared hit=6
+stat:     10 |       0 |        0 |    0 |                 0
+history 50001..200000 27.130212135 s
+== H up to 200000, before vacuum
+explain top:    Buffers: shared hit=88623 read=1394 dirtied=1392 written=1300
+stat:     10 |   13940 |     1394 |    0 |                 0
+== H up to 200000, after vacuum
+explain top:    Buffers: shared hit=6
+stat:     10 |       0 |        0 |    0 |                 0
+200000

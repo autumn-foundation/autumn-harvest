@@ -376,6 +376,11 @@ impl Replicas {
         };
         if !path.exists() || replaced {
             self.drop_parked(key);
+            // A missing file can leave stray sidecars. They go aside first,
+            // so no open starts a new file beside an old WAL (issue #2759).
+            if !path.exists() {
+                set_aside(key, path)?;
+            }
             match target {
                 Some(target) => self.restore_explicit(key, path, target.time())?,
                 None if replaced => self.follow_replaced(key, path)?,
@@ -401,8 +406,17 @@ impl Replicas {
                 }
             }
             // The open used the target, or the target does not apply to
-            // this database. It goes in both cases.
-            _ => remove_quietly(&suffixed(path, TARGET_SUFFIX)),
+            // this database. It goes in both cases. A target that stays
+            // applies again at the next open, so a failed removal refuses
+            // this open. The runtime then writes no run that the next open
+            // rolls back (issue #2753).
+            _ => write_entry(path, None).map_err(|error| {
+                format!(
+                    "the Harvest file of {key} is at its restore target, but the target \
+                     stays, so the open refuses: {error}. Open the tenant again once the \
+                     target file can be removed"
+                )
+            })?,
         }
         Ok(())
     }
@@ -1267,13 +1281,18 @@ fn read_entry(path: &Path) -> Result<Option<Entry>, String> {
 fn write_entry(path: &Path, entry: Option<&Entry>) -> Result<(), String> {
     let file = suffixed(path, TARGET_SUFFIX);
     let Some(entry) = entry else {
-        return match std::fs::remove_file(&file) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(format!("cannot remove {}: {error}", file.display())),
-        };
+        return remove_if_present(&file);
     };
     write_atomic(&file, &entry.render())
+}
+
+/// Remove `file`. A missing file is not an error. Any other error is.
+fn remove_if_present(file: &Path) -> Result<(), String> {
+    match std::fs::remove_file(file) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("cannot remove {}: {error}", file.display())),
+    }
 }
 
 /// The entry from before a request that wrote `entry`.
@@ -1361,24 +1380,108 @@ fn write_atomic(file: &Path, text: &str) -> Result<(), String> {
 
 /// Move the Harvest file at `path` and its sidecars aside. The next open
 /// then starts an empty file. An operator can still read the old one.
+///
+/// Sidecars with no main file go aside too, so no new file starts beside an
+/// old WAL. A failed move refuses. The main file then stays at `path`. See
+/// [`move_aside`].
 fn set_aside(key: &FleetDbKey, path: &Path) -> Result<(), String> {
-    if !path.exists() {
+    if !path.exists() && !sidecars(path).any(|sidecar| sidecar.exists()) {
         return Ok(());
     }
     let _publish = SideLock::acquire(path, PUBLISH_LOCK_SUFFIX)?;
-    let _writer = autumn_harvest_sqlite::FileWriterLock::acquire(path)
-        .map_err(|error| format!("cannot lock {} to set it aside: {error}", path.display()))?;
-    let aside = suffixed(path, &format!(".aside-{}", unique()));
-    for suffix in SIDECARS {
-        let sidecar = suffixed(path, suffix);
-        if sidecar.exists() {
-            let _ = std::fs::rename(&sidecar, suffixed(&aside, suffix));
+    // The writer lock needs the main file. With no main file, no runtime
+    // has the file open.
+    let has_main = path.exists();
+    let _writer = if has_main {
+        Some(
+            autumn_harvest_sqlite::FileWriterLock::acquire(path).map_err(|error| {
+                format!("cannot lock {} to set it aside: {error}", path.display())
+            })?,
+        )
+    } else {
+        None
+    };
+    let aside = free_aside(path, unique);
+    move_aside(path, &aside, has_main, |from, to| std::fs::rename(from, to))
+        .map_err(|error| format!("cannot set {} aside: {error}", path.display()))?;
+    if has_main {
+        tracing::warn!(tenant = %key, aside = %aside.display(), "the Harvest file does not belong to the tenant database: it is set aside");
+    } else {
+        tracing::warn!(tenant = %key, aside = %aside.display(), "the Harvest file is missing, but its sidecars stay: they are set aside");
+    }
+    Ok(())
+}
+
+/// The first aside path from `next` that no file of the set uses. A rename
+/// replaces its target, and a name from [`unique`] repeats after a restart
+/// that reuses the process id. Call it under the publish lock.
+fn free_aside(path: &Path, mut next: impl FnMut() -> String) -> PathBuf {
+    loop {
+        let aside = suffixed(path, &format!(".aside-{}", next()));
+        if !aside.exists() && !sidecars(&aside).any(|sidecar| sidecar.exists()) {
+            return aside;
         }
     }
-    std::fs::rename(path, &aside)
-        .map_err(|error| format!("cannot set {} aside: {error}", path.display()))?;
-    tracing::warn!(tenant = %key, aside = %aside.display(), "the Harvest file does not belong to the tenant database: it is set aside");
-    Ok(())
+}
+
+/// Move the file at `path` and its sidecars to `aside`, with `rename`.
+///
+/// Each sidecar moves first, and the main file last. So no sidecar stays at
+/// `path` without its main file, and no open starts a new file beside an
+/// old WAL. A failed move moves back each moved sidecar, last first, and
+/// the move refuses. When each move back works, the main file keeps its
+/// WAL (issue #2759). Without `has_main`, only the stray sidecars move.
+fn move_aside(
+    path: &Path,
+    aside: &Path,
+    has_main: bool,
+    rename: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), String> {
+    // The Verus model formal/verus/src/set_aside.rs proves this order.
+    let mut moved = Vec::new();
+    for suffix in SIDECARS {
+        let (from, to) = (suffixed(path, suffix), suffixed(aside, suffix));
+        match rename(&from, &to) {
+            Ok(()) => moved.push((from, to)),
+            // The sidecar is absent. A check before the rename could race.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(move_back(moved, &from, &to, &error, &rename)),
+        }
+    }
+    if !has_main {
+        return Ok(());
+    }
+    rename(path, aside).map_err(|error| move_back(moved, path, aside, &error, &rename))
+}
+
+/// Move back each sidecar in `moved`, last first, after the failed move of
+/// `from` to `to`. A failed move back leaves its sidecar aside. The text
+/// names each such sidecar. The next open sets the main file aside under a
+/// new name, so the operator must move the sidecar back before it.
+fn move_back(
+    moved: Vec<(PathBuf, PathBuf)>,
+    from: &Path,
+    to: &Path,
+    error: &std::io::Error,
+    rename: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> String {
+    use std::fmt::Write as _;
+    let mut text = format!(
+        "cannot move {} to {}: {error}",
+        from.display(),
+        to.display()
+    );
+    for (home, aside) in moved.into_iter().rev() {
+        if let Err(error) = rename(&aside, &home) {
+            let _ = write!(
+                text,
+                ". {} stays aside: move it back to {} before the next open of the tenant: {error}",
+                aside.display(),
+                home.display()
+            );
+        }
+    }
+    text
 }
 
 /// Publish the restored file `staging` at `path`. See
@@ -1398,11 +1501,54 @@ fn publish(staging: &Path, path: &Path, replace: bool) -> Result<(), String> {
     } else {
         None
     };
-    // The frames of the old file must not replay onto the restored one.
-    for sidecar in sidecars(path) {
-        remove_quietly(&sidecar);
+    // The frames of the old file must not replay onto the restored one. So
+    // its sidecars move aside first. A failure puts them back, and the old
+    // file keeps its WAL.
+    let moved = move_sidecars_aside(path)?;
+    if let Err(error) = std::fs::rename(staging, path) {
+        return Err(put_back(&moved, error.to_string()));
     }
-    std::fs::rename(staging, path).map_err(|error| error.to_string())
+    // A copy that stays has a private name, so no open reads it.
+    for sidecar in &moved {
+        remove_quietly(&aside_of(sidecar));
+    }
+    Ok(())
+}
+
+/// The private name of `sidecar` while a publish runs. The publish lock
+/// makes it unique to that publish.
+fn aside_of(sidecar: &Path) -> PathBuf {
+    suffixed(sidecar, ".publishing")
+}
+
+/// Move each sidecar of `path` to its private name. When one cannot move,
+/// put back the ones that moved, and refuse.
+fn move_sidecars_aside(path: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut moved = Vec::new();
+    for sidecar in sidecars(path) {
+        match std::fs::rename(&sidecar, aside_of(&sidecar)) {
+            Ok(()) => moved.push(sidecar),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                let why = format!("cannot move {} aside: {error}", sidecar.display());
+                return Err(put_back(&moved, why));
+            }
+        }
+    }
+    Ok(moved)
+}
+
+/// Put back each sidecar in `moved`. Give `why`, and name each sidecar that
+/// did not come back.
+fn put_back(moved: &[PathBuf], why: String) -> String {
+    use std::fmt::Write as _;
+    let mut why = why;
+    for sidecar in moved {
+        if let Err(error) = std::fs::rename(aside_of(sidecar), sidecar) {
+            let _ = write!(why, "; cannot put back {}: {error}", sidecar.display());
+        }
+    }
+    why
 }
 
 /// An OS lock on `<file><suffix>`. It waits for another holder.
@@ -2366,6 +2512,299 @@ mod tests {
         assert!(aside, "an operator can still read the old file");
     }
 
+    /// Where a test file is.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum At {
+        Path,
+        Aside,
+        Nowhere,
+    }
+
+    /// The text of the test file of `suffix`. The main file has no suffix.
+    fn tag(suffix: &str) -> &[u8] {
+        if suffix.is_empty() {
+            b"main"
+        } else {
+            suffix.as_bytes()
+        }
+    }
+
+    /// A Harvest file in `dir` with the sidecars of `suffixes`. Each file
+    /// holds its tag.
+    fn file_with(dir: &Path, suffixes: &[&str]) -> PathBuf {
+        let path = dir.join("acme.harvest.db");
+        for suffix in std::iter::once(&"").chain(suffixes) {
+            std::fs::write(suffixed(&path, suffix), tag(suffix)).unwrap();
+        }
+        path
+    }
+
+    /// Where the file of `suffix` is. Its text must be whole, and it must
+    /// not be in two places.
+    fn at(path: &Path, aside: &Path, suffix: &str) -> At {
+        let here = std::fs::read(suffixed(path, suffix)).ok();
+        let there = std::fs::read(suffixed(aside, suffix)).ok();
+        for found in [&here, &there].into_iter().flatten() {
+            assert_eq!(found.as_slice(), tag(suffix), "the text of {suffix:?}");
+        }
+        match (here, there) {
+            (Some(_), None) => At::Path,
+            (None, Some(_)) => At::Aside,
+            (None, None) => At::Nowhere,
+            (Some(_), Some(_)) => panic!("{suffix:?} is in two places"),
+        }
+    }
+
+    /// Assert that the main file and the sidecars of `suffixes` are at
+    /// `want`, and that no other sidecar exists.
+    fn assert_together(path: &Path, aside: &Path, suffixes: &[&str], want: At) {
+        assert_eq!(at(path, aside, ""), want, "the main file");
+        for suffix in SIDECARS {
+            let expected = if suffixes.contains(&suffix) {
+                want
+            } else {
+                At::Nowhere
+            };
+            assert_eq!(at(path, aside, suffix), expected, "{suffix}");
+        }
+    }
+
+    /// Assert that no sidecar stays at `path` without its main file.
+    fn assert_safe(path: &Path) {
+        if !path.exists() {
+            for sidecar in sidecars(path) {
+                assert!(!sidecar.exists(), "{} has no main file", sidecar.display());
+            }
+        }
+    }
+
+    /// A rename that fails for each source in `refused`.
+    fn refusing(refused: Vec<PathBuf>) -> impl Fn(&Path, &Path) -> std::io::Result<()> {
+        move |from, to| {
+            if refused.iter().any(|file| file == from) {
+                return Err(std::io::Error::other("the file is in use"));
+            }
+            std::fs::rename(from, to)
+        }
+    }
+
+    /// A set-aside moves the main file and each sidecar together.
+    #[test]
+    fn a_set_aside_moves_each_sidecar_with_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_with(dir.path(), &["-wal", "-journal"]);
+        set_aside(&FleetDbKey::Slot(1), &path).unwrap();
+        let mut aside: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|file| file.to_string_lossy().contains(".aside-"))
+            .collect();
+        aside.sort();
+        assert_eq!(aside.len(), 3, "{aside:?}");
+        assert_together(&path, &aside[0], &["-wal", "-journal"], At::Aside);
+    }
+
+    /// A set-aside never moves a file onto an earlier aside set. A process
+    /// id can repeat after a restart, and so can a name from `unique`.
+    #[test]
+    fn an_aside_name_in_use_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("acme.harvest.db");
+        std::fs::write(suffixed(&path, ".aside-a-wal"), b"old").unwrap();
+        std::fs::write(suffixed(&path, ".aside-b"), b"old").unwrap();
+        let mut names = ["a", "b", "c"].into_iter().map(str::to_owned);
+        let aside = free_aside(&path, || names.next().unwrap());
+        assert_eq!(aside, suffixed(&path, ".aside-c"));
+    }
+
+    /// Sidecars with no main file go aside. A new file never starts beside
+    /// an old WAL.
+    #[test]
+    fn stray_sidecars_go_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_with(dir.path(), &["-wal", "-journal"]);
+        std::fs::remove_file(&path).unwrap();
+        set_aside(&FleetDbKey::Slot(1), &path).unwrap();
+        assert_safe(&path);
+        let aside = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".aside-"))
+            .count();
+        assert_eq!(aside, 2, "an operator can still read the sidecars");
+    }
+
+    /// An open of a missing Harvest file sets each stray sidecar aside
+    /// first. With no replica, the open then starts an empty file.
+    #[test]
+    fn an_open_never_starts_a_file_beside_a_stray_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let replicas = replicas(dir.path());
+        let key = replicas.fleet.key_for("acme").unwrap();
+        let path = file_with(dir.path(), &["-wal"]);
+        std::fs::remove_file(&path).unwrap();
+        let db = database(dir.path(), "acme.db");
+        replicas.prepare(&key, &path, &db, None).unwrap();
+        assert_safe(&path);
+    }
+
+    /// A sidecar that cannot move refuses the set-aside. The main file
+    /// keeps its WAL, so no old frame replays onto a new file (issue #2759).
+    #[test]
+    fn a_sidecar_that_cannot_move_refuses_the_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_with(dir.path(), &["-wal", "-shm"]);
+        let aside = suffixed(&path, ".aside-test");
+        let shm = suffixed(&path, "-shm");
+        let error = move_aside(&path, &aside, true, refusing(vec![shm.clone()]))
+            .expect_err("the -shm cannot move");
+        assert!(error.contains(&shm.display().to_string()), "{error}");
+        assert!(error.contains("the file is in use"), "{error}");
+        assert_together(&path, &aside, &["-wal", "-shm"], At::Path);
+    }
+
+    /// A main file that cannot move keeps its sidecars. They move back.
+    #[test]
+    fn a_main_file_that_cannot_move_keeps_its_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_with(dir.path(), &["-wal", "-journal"]);
+        let aside = suffixed(&path, ".aside-test");
+        let error = move_aside(&path, &aside, true, refusing(vec![path.clone()]))
+            .expect_err("the main file cannot move");
+        assert!(error.contains("the file is in use"), "{error}");
+        assert_together(&path, &aside, &["-wal", "-journal"], At::Path);
+    }
+
+    /// A failed move back leaves a sidecar aside. The main file stays, so
+    /// the set-aside stays safe. The error names the stranded sidecar.
+    #[test]
+    fn a_failed_undo_names_the_stranded_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_with(dir.path(), &["-wal", "-shm"]);
+        let aside = suffixed(&path, ".aside-test");
+        let stranded = suffixed(&aside, "-wal");
+        let refused = vec![suffixed(&path, "-shm"), stranded.clone()];
+        let error =
+            move_aside(&path, &aside, true, refusing(refused)).expect_err("the -shm cannot move");
+        assert!(error.contains(&stranded.display().to_string()), "{error}");
+        assert_eq!(at(&path, &aside, ""), At::Path);
+        assert_eq!(at(&path, &aside, "-shm"), At::Path);
+        assert_eq!(at(&path, &aside, "-wal"), At::Aside);
+        assert_safe(&path);
+    }
+
+    proptest::proptest! {
+        // This test runs the real mover under each fault script. It checks
+        // the outcome that the Verus model formal/verus/src/set_aside.rs
+        // gives. `fails` holds the fault of each forward rename, in call
+        // order. `back` tells which sidecar cannot move back.
+        #[test]
+        fn the_mover_keeps_the_files_together(
+            has_main in proptest::bool::ANY,
+            present in proptest::array::uniform3(proptest::bool::ANY),
+            fails in proptest::array::uniform4(proptest::bool::ANY),
+            back in proptest::array::uniform3(proptest::bool::ANY),
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let suffixes: Vec<&str> = SIDECARS
+                .iter()
+                .zip(present)
+                .filter_map(|(suffix, present)| present.then_some(*suffix))
+                .collect();
+            let path = file_with(dir.path(), &suffixes);
+            if !has_main {
+                std::fs::remove_file(&path).unwrap();
+            }
+            let aside = suffixed(&path, ".aside-test");
+            let prefix = aside.to_string_lossy().into_owned();
+            let calls = std::cell::Cell::new(0_usize);
+            let moved = std::cell::RefCell::new(Vec::new());
+            let undone = std::cell::RefCell::new(Vec::new());
+            let rename = |from: &Path, to: &Path| {
+                if has_main {
+                    assert_safe(&path);
+                }
+                let backward = from.to_string_lossy().starts_with(&prefix);
+                let named = if backward { from } else { to };
+                let suffix = named.to_string_lossy()[prefix.len()..].to_owned();
+                let index = SIDECARS.iter().position(|known| *known == suffix);
+                if backward {
+                    let index = index.expect("only a sidecar moves back");
+                    undone.borrow_mut().push(index);
+                    if back[index] {
+                        return Err(std::io::Error::other("injected"));
+                    }
+                } else if fails[calls.replace(calls.get() + 1)] {
+                    return Err(std::io::Error::other("injected"));
+                }
+                std::fs::rename(from, to)?;
+                if let (false, Some(index)) = (backward, index) {
+                    moved.borrow_mut().push(index);
+                }
+                Ok(())
+            };
+            let result = move_aside(&path, &aside, has_main, rename);
+            if has_main {
+                assert_safe(&path);
+            }
+
+            // The outcome of the model under the same scripts.
+            let stop = fails[..SIDECARS.len()].iter().position(|fails| *fails);
+            let ok = stop.is_none() && (!has_main || !fails[SIDECARS.len()]);
+            let reached = stop.unwrap_or(SIDECARS.len());
+            proptest::prop_assert_eq!(result.is_ok(), ok, "{:?}", result);
+            let main = match (has_main, ok) {
+                (false, _) => At::Nowhere,
+                (true, true) => At::Aside,
+                (true, false) => At::Path,
+            };
+            proptest::prop_assert_eq!(at(&path, &aside, ""), main);
+            for (index, suffix) in SIDECARS.iter().enumerate() {
+                let want = if !present[index] {
+                    At::Nowhere
+                } else if ok || (index < reached && back[index]) {
+                    At::Aside
+                } else {
+                    At::Path
+                };
+                proptest::prop_assert_eq!(at(&path, &aside, suffix), want, "{}", suffix);
+            }
+
+            // A failure moves back each moved sidecar, last first.
+            let mut moved = moved.into_inner();
+            moved.reverse();
+            let want = if ok { Vec::new() } else { moved };
+            proptest::prop_assert_eq!(undone.into_inner(), want);
+        }
+    }
+
+    /// Another process that holds a sidecar open blocks its move on
+    /// Windows. The set-aside refuses, and the main file keeps its WAL.
+    #[cfg(windows)]
+    #[test]
+    fn a_sidecar_held_open_refuses_the_set_aside() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // The share mode of a reader that refuses a delete or a rename.
+        const FILE_SHARE_READ: u32 = 0x1;
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_with(dir.path(), &["-wal", "-shm"]);
+        let shm = suffixed(&path, "-shm");
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&shm)
+            .unwrap();
+        let error = set_aside(&FleetDbKey::Slot(1), &path).expect_err("the -shm is held open");
+        assert!(error.contains(&shm.display().to_string()), "{error}");
+        drop(held);
+        let nowhere = dir.path().join("nowhere");
+        assert_together(&path, &nowhere, &["-wal", "-shm"], At::Path);
+        set_aside(&FleetDbKey::Slot(1), &path).unwrap();
+        assert!(!path.exists(), "the retry sets the file aside");
+        assert_safe(&path);
+    }
+
     /// A new tenant database with a Harvest replica takes its latest file.
     #[test]
     fn a_new_database_takes_the_latest_harvest_replica() {
@@ -2402,6 +2841,54 @@ mod tests {
         drop(theirs);
     }
 
+    /// An old Harvest file with a WAL and a shared-memory file, and a
+    /// restored file to publish over it.
+    fn old_file_and_staging(dir: &Path) -> (PathBuf, PathBuf) {
+        let path = dir.join("acme.harvest.db");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::write(suffixed(&path, "-wal"), b"frames").unwrap();
+        std::fs::write(suffixed(&path, "-shm"), b"index").unwrap();
+        let staging = dir.join("staging.db");
+        std::fs::write(&staging, b"restored").unwrap();
+        (path, staging)
+    }
+
+    /// A sidecar that cannot move aside refuses the publish. The WAL moved
+    /// first, and it comes back, so the old file keeps its frames.
+    #[test]
+    fn a_sidecar_that_cannot_move_refuses_the_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, staging) = old_file_and_staging(dir.path());
+        let shm = suffixed(&path, "-shm");
+        // A directory at the private name stops the move of `-shm` only.
+        std::fs::create_dir(aside_of(&shm)).unwrap();
+        std::fs::write(aside_of(&shm).join("block"), b"").unwrap();
+
+        let error = publish(&staging, &path, true).expect_err("the -shm cannot move");
+        assert!(error.contains("cannot move"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"old", "the old file stays");
+        assert_eq!(
+            std::fs::read(suffixed(&path, "-wal")).unwrap(),
+            b"frames",
+            "the WAL comes back"
+        );
+        assert_eq!(std::fs::read(&shm).unwrap(), b"index");
+        assert!(staging.exists(), "the caller discards the staging file");
+    }
+
+    /// A publish removes the old sidecars and their private copies.
+    #[test]
+    fn a_publish_removes_the_old_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, staging) = old_file_and_staging(dir.path());
+        publish(&staging, &path, true).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"restored");
+        for sidecar in sidecars(&path) {
+            assert!(!sidecar.exists(), "{}", sidecar.display());
+            assert!(!aside_of(&sidecar).exists(), "{}", sidecar.display());
+        }
+    }
+
     /// A slot database ships under its slot prefix.
     #[test]
     fn a_slot_replica_sits_under_the_slot_prefix() {
@@ -2409,13 +2896,45 @@ mod tests {
         assert_eq!(root, "app/test/fleet/slot/00042/harvest");
     }
 
-    /// A destination that refuses each upload while it is down.
+    /// A destination that refuses each upload while it is down. Its next
+    /// read can also block a file, as [`block`] does.
     struct Flaky {
         inner: FileDestination,
         down: AtomicBool,
+        blocked: Mutex<Option<PathBuf>>,
     }
 
     impl Flaky {
+        fn new(dir: &Path, down: bool) -> Arc<Self> {
+            Arc::new(Self {
+                inner: FileDestination::new(dir.join("replicas")).unwrap(),
+                down: AtomicBool::new(down),
+                blocked: Mutex::new(None),
+            })
+        }
+
+        /// The [`Replicas`] that ship to this destination.
+        fn replicas(self: &Arc<Self>, dir: &Path) -> Replicas {
+            Replicas::new(
+                TenantReplica::new(Arc::clone(self) as Arc<dyn ReplicaDestination>, settings()),
+                Arc::new(autumn_web::time::SystemClock),
+                fleet(&dir.join("fleet")),
+            )
+        }
+
+        /// Block `file` at the next read. An open reads the replica after
+        /// it reads the target, and before it records the database.
+        fn block_at_next_read(&self, file: PathBuf) {
+            *self.blocked.lock().unwrap() = Some(file);
+        }
+
+        fn read(&self) {
+            let blocked = self.blocked.lock().unwrap().take();
+            if let Some(file) = blocked {
+                block(&file);
+            }
+        }
+
         fn refused(&self) -> Result<(), autumn_web::replication::DestinationError> {
             if self.down.load(Ordering::SeqCst) {
                 return Err(autumn_web::replication::DestinationError::Io {
@@ -2448,6 +2967,7 @@ mod tests {
             self.inner.put_file(key, path)
         }
         fn get(&self, key: &str) -> Result<Vec<u8>, autumn_web::replication::DestinationError> {
+            self.read();
             self.inner.get(key)
         }
         fn get_to_file(
@@ -2455,12 +2975,14 @@ mod tests {
             key: &str,
             path: &Path,
         ) -> Result<(), autumn_web::replication::DestinationError> {
+            self.read();
             self.inner.get_to_file(key, path)
         }
         fn list(
             &self,
             prefix: &str,
         ) -> Result<Vec<String>, autumn_web::replication::DestinationError> {
+            self.read();
             self.inner.list(prefix)
         }
         fn delete(&self, key: &str) -> Result<(), autumn_web::replication::DestinationError> {
@@ -2473,18 +2995,8 @@ mod tests {
     #[test]
     fn a_failed_close_parks_the_shipper_until_the_backlog_ships() {
         let dir = tempfile::tempdir().unwrap();
-        let flaky = Arc::new(Flaky {
-            inner: FileDestination::new(dir.path().join("replicas")).unwrap(),
-            down: AtomicBool::new(false),
-        });
-        let replicas = Replicas::new(
-            TenantReplica::new(
-                Arc::clone(&flaky) as Arc<dyn ReplicaDestination>,
-                settings(),
-            ),
-            Arc::new(autumn_web::time::SystemClock),
-            fleet(&dir.path().join("fleet")),
-        );
+        let flaky = Flaky::new(dir.path(), false);
+        let replicas = flaky.replicas(dir.path());
         let key = replicas.fleet.key_for("acme").unwrap();
         let path = super::super::fleet::tenant_harvest_file(&replicas.fleet.path_of(&key));
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -2520,18 +3032,8 @@ mod tests {
     #[test]
     fn a_release_drops_a_parked_shipper() {
         let dir = tempfile::tempdir().unwrap();
-        let flaky = Arc::new(Flaky {
-            inner: FileDestination::new(dir.path().join("replicas")).unwrap(),
-            down: AtomicBool::new(true),
-        });
-        let replicas = Replicas::new(
-            TenantReplica::new(
-                Arc::clone(&flaky) as Arc<dyn ReplicaDestination>,
-                settings(),
-            ),
-            Arc::new(autumn_web::time::SystemClock),
-            fleet(&dir.path().join("fleet")),
-        );
+        let flaky = Flaky::new(dir.path(), true);
+        let replicas = flaky.replicas(dir.path());
         let key = replicas.fleet.key_for("acme").unwrap();
         let path = dir.path().join("acme.harvest.db");
         let runtime = autumn_harvest_sqlite::SqliteRuntime::open_replicated(&path).unwrap();
@@ -2542,6 +3044,87 @@ mod tests {
         assert!(replicas.parked_map().contains_key(&key));
         replicas.release(&key);
         assert!(replicas.parked_map().is_empty());
+    }
+
+    /// Put a non-empty directory at `file`. `remove_file` then fails on
+    /// each OS. It keeps the text of `file` as `<file>.kept`.
+    fn block(file: &Path) {
+        std::fs::rename(file, suffixed(file, ".kept")).unwrap();
+        std::fs::create_dir(file).unwrap();
+        std::fs::write(file.join("block"), b"").unwrap();
+    }
+
+    /// Undo [`block`]. The target file is back as the failed removal left
+    /// it.
+    fn unblock(file: &Path) {
+        std::fs::remove_dir_all(file).unwrap();
+        std::fs::rename(suffixed(file, ".kept"), file).unwrap();
+    }
+
+    /// A `HarvestFleet::restore` of `acme` that waits for the next open. The
+    /// open removes its target, and that removal fails.
+    fn a_blocked_target(dir: &Path) -> (Replicas, FleetDbKey, PathBuf, PathBuf) {
+        let flaky = Flaky::new(dir, false);
+        let replicas = flaky.replicas(dir);
+        let (key, path, db) = shipped_acme(dir, &replicas);
+        harvest_restore(&replicas, &key, &db, None);
+        assert!(matches!(entry(&path), Some(Entry::Committed { .. })));
+        flaky.block_at_next_read(suffixed(&path, TARGET_SUFFIX));
+        (replicas, key, path, db)
+    }
+
+    /// Open `key` while its target is blocked. The open must refuse at the
+    /// removal of the target, after the restore.
+    fn refuse_at_the_target(replicas: &Replicas, key: &FleetDbKey, path: &Path, db: &Path) {
+        let refused = replicas.prepare(key, path, db, None);
+        let error = refused.expect_err("the target stays, so the open refuses");
+        assert!(error.contains("cannot remove"), "{error}");
+    }
+
+    /// A failed removal of the target refuses the open. No runtime then
+    /// writes a run that the next open rolls back (issue #2753).
+    #[test]
+    fn a_failed_target_removal_refuses_the_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let (replicas, key, path, db) = a_blocked_target(dir.path());
+        refuse_at_the_target(&replicas, &key, &path, &db);
+        assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 6);
+        assert_eq!(
+            std::fs::read_to_string(suffixed(&path, IDENTITY_SUFFIX)).unwrap(),
+            database_identity(&db).unwrap(),
+            "the record is written before the target goes"
+        );
+        let kept = std::fs::read_to_string(suffixed(&path, ".restore-target.kept")).unwrap();
+        assert!(
+            matches!(Entry::parse(&kept), Some(Entry::Committed { .. })),
+            "the target stays for the next open"
+        );
+    }
+
+    /// A retry after a failed removal applies the same target again. The
+    /// Harvest file stays at the target, and the target goes.
+    #[test]
+    fn a_retry_after_a_failed_removal_keeps_the_harvest_file_at_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let (replicas, key, path, db) = a_blocked_target(dir.path());
+        refuse_at_the_target(&replicas, &key, &path, &db);
+        unblock(&suffixed(&path, TARGET_SUFFIX));
+        assert!(matches!(entry(&path), Some(Entry::Committed { .. })));
+
+        // A mark on the file shows that the retry restores it again.
+        let runtime = autumn_harvest_sqlite::SqliteRuntime::open_replicated(&path).unwrap();
+        runtime.raise_fleet_epoch(9).unwrap();
+        drop(runtime);
+        replicas.prepare(&key, &path, &db, None).unwrap();
+        assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 6);
+        assert_eq!(entry(&path), None, "the retry removes the target");
+
+        // The runtime writes after the open. A later open keeps the write.
+        let runtime = autumn_harvest_sqlite::SqliteRuntime::open_replicated(&path).unwrap();
+        runtime.raise_fleet_epoch(7).unwrap();
+        drop(runtime);
+        replicas.prepare(&key, &path, &db, None).unwrap();
+        assert_eq!(autumn_harvest_sqlite::fleet_epoch::read(&path).unwrap(), 7);
     }
 
     /// Without a replica, a missing file stays missing.

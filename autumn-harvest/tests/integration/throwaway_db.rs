@@ -30,6 +30,22 @@ pub fn with_database(url: &str, database: &str) -> String {
     )
 }
 
+/// The DSN `url` with its user and password set. A test that connects as a
+/// role of its own uses it.
+pub fn with_credentials(url: &str, user: &str, password: &str) -> String {
+    let Some(scheme_end) = url_scheme_len(url) else {
+        return set_conninfo(&set_conninfo(url, "user", user), "password", password);
+    };
+    let rest = &url[scheme_end..];
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let host_start = rest[..authority_end].rfind('@').map_or(0, |at| at + 1);
+    format!(
+        "{}{user}:{password}@{}",
+        &url[..scheme_end],
+        &rest[host_start..]
+    )
+}
+
 /// The DSN `url` with its `application_name` set to `app`. A test tags its
 /// sessions this way, so it can find them in `pg_stat_activity`.
 pub fn with_application_name(url: &str, app: &str) -> String {
@@ -259,7 +275,7 @@ impl Drop for ThrowawayDb {
 
 #[cfg(test)]
 mod tests {
-    use super::{with_application_name, with_database};
+    use super::{with_application_name, with_credentials, with_database};
 
     #[test]
     fn a_url_dsn_keeps_its_query_options() {
@@ -356,6 +372,26 @@ mod tests {
         assert_eq!(
             with_application_name("host=h dbname=db", "app"),
             "host='h' dbname='db' application_name='app'"
+        );
+    }
+
+    #[test]
+    fn with_credentials_replaces_the_user_of_a_url_and_a_keyword_dsn() {
+        assert_eq!(
+            with_credentials(
+                "postgres://postgres:postgres@db:5432/harvest?sslmode=require",
+                "r",
+                "p"
+            ),
+            "postgres://r:p@db:5432/harvest?sslmode=require"
+        );
+        assert_eq!(
+            with_credentials("postgres://db:5432/harvest", "r", "p"),
+            "postgres://r:p@db:5432/harvest"
+        );
+        assert_eq!(
+            with_credentials("host=db user=postgres dbname=harvest", "r", "p"),
+            "host='db' dbname='harvest' user='r' password='p'"
         );
     }
 }

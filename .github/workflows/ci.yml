@@ -1311,12 +1311,28 @@ jobs:
       - name: Run the agent mesh example
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo run -p autumn-harvest-agent --features sqlite,eval,sandbox,anthropic,openai --example sqlite_mesh
+      # Issue #2741. AppArmor on Ubuntu can refuse a mount in a user
+      # namespace. The gate then fails the isolation tests. This step allows
+      # the namespace. It prints the old value as evidence.
+      - name: Allow user namespaces for the isolation tests (Linux)
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 1
+        run: |
+          knob=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [ -e "${knob}" ]; then
+            echo "apparmor_restrict_unprivileged_userns was $(cat "${knob}")"
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       # Sandboxed code activities. The tests need no KVM: a fake VMM, fake
       # `firecracker` and `jailer` scripts and a fake API server stand in. The
       # Linux backends compile on Linux only, so the other OSes run the
       # portable protocol, policy and capture tests.
+      # `HARVEST_TEST_REQUIRE_ISOLATION=1` turns each isolation skip into a
+      # failure (issue #2741). Only the Linux tests read it.
+      # `sandbox::isolation_gate` checks that this step sets it.
       - name: Run sandboxed code activity tests
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
+        env:
+          HARVEST_TEST_REQUIRE_ISOLATION: "1"
         run: cargo sandbox-test
       - name: Run sandbox guest agent tests
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
@@ -1608,7 +1624,7 @@ jobs:
           manifest-key: ${{ github.job }}-${{ strategy.job-index }}
       # The shards install the same version. The archive format is internal
       # to nextest, so the two ends must agree.
-      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         if: needs.changes.outputs.code == 'true'
         with:
           tool: cargo-nextest@0.9.111
@@ -1849,7 +1865,7 @@ jobs:
           sudo docker image prune --all --force > /dev/null 2>&1 || true
           df -h /
       # The same version as `test-db-archive`, which wrote the archive.
-      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         if: needs.changes.outputs.code == 'true'
         with:
           tool: cargo-nextest@0.9.111
@@ -3306,7 +3322,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-deny@0.20.2
       - name: cargo deny check (advisories, licenses, bans, sources)

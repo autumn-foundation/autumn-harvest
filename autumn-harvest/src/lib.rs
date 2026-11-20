@@ -366,6 +366,8 @@ pub mod event_batch;
 #[doc(hidden)]
 pub mod execution;
 pub mod executor;
+/// The pending table of the external outbox and its trigger.
+pub mod external_outbox;
 /// Shard-placement-aware resolution for `workflow_id`-addressed external
 /// signal/cancel targets (issue #1146).
 #[cfg(feature = "db")]
@@ -547,6 +549,8 @@ pub mod scanner_lease;
 pub mod schema_contract;
 /// Worker session fleet-side registry and pure decision functions (issue #606).
 pub mod sessions;
+/// Shape census: the usual and the rare paths over many runs.
+pub mod shape_census;
 pub mod shard;
 /// A task-local fence on the shards one request may reach (issue #1803).
 pub mod shard_fence;
@@ -649,6 +653,9 @@ pub mod prepared_loop;
 pub mod queue;
 /// Metric-gated automatic abort of a build ramp (issue #1814).
 pub mod ramp_guard;
+/// Keep a by-id task row statement on the primary key.
+#[doc(hidden)]
+pub mod row_guard;
 /// Operator overrides for per-type `sla` and `execution_timeout` (issue #2387).
 pub mod run_defaults;
 #[cfg(feature = "sandbox-activities")]

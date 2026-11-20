@@ -224,7 +224,12 @@ let backend = ProcessBackend::new(ExecOptions {
   `PIVOT_READ_ONLY`: `/usr`, the library directories, and a few files of
   `/etc`. It mounts no `/proc`. The code cannot write a `read_only` path.
   A runtime in another directory, such as `/opt/node`, needs that directory
-  in `read_only`. A path that does not exist is skipped.
+  in `read_only`. A path that does not exist is skipped. The new root holds
+  each link on the way to a listed path, and the pivot binds the file or
+  directory at the end. So a chain of links works, also from a link in a
+  bound directory such as `/usr/local/bin`. A link into `/proc` stays a
+  link, and the pivot binds nothing in `/proc`. The setup needs `/proc` in
+  the worker.
 - **`Mask`** fails open. A directory lists as empty, and the code cannot
   write it. A file, or a socket, reads as `/dev/null`. A mask hides a
   path, not an inode, so a hard link or a second path still reaches the
@@ -232,6 +237,11 @@ let backend = ProcessBackend::new(ExecOptions {
   not hide `/proc`. Each path must be absolute and must exist. It must not
   hold `..` or cover the work directory. Otherwise the run is refused with
   a config error.
+- **`Mask` is not a boundary under a non-root worker.** The code has the
+  uid of the worker, so it can open `/proc/<pid>/root` of the worker. That
+  path shows the file system of the worker, with no mask. A mask stops a
+  mistake. It does not stop code that looks for a path. Use `Pivot` for
+  code that you do not trust.
 - Both settings need a mount namespace. A non-root worker enters it through
   its user namespace. When the host refuses, the run fails closed with
   `SandboxUnavailable`. `sandbox::fs_isolation::fs_isolation_available()`
@@ -608,6 +618,14 @@ cargo sandbox-test
 cargo test -p autumn-harvest-sandbox-guest
 cargo test -p autumn-harvest-agent --features sqlite,eval,sandbox
 ```
+
+On a host without a mount or a network namespace, a test that needs one
+skips. A few check only the fail-closed path. Both pass, and libtest hides
+the `skipped` line. Set `HARVEST_TEST_REQUIRE_ISOLATION=1` to make each such
+test fail, as CI does. On Ubuntu, AppArmor can refuse the namespace to a
+non-root user. To allow it, run
+`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`. The change
+lasts until the next reboot.
 
 The `Sandbox (KVM)` workflow boots real microVMs on a GitHub runner with
 `/dev/kvm`. It runs on each pull request that changes the sandbox code, and

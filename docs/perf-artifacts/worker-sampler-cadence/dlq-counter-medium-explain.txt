@@ -1,0 +1,40 @@
+-- concurrency_key_stats
+Finalize GroupAggregate  (cost=9470.07..9489.62 rows=69 width=33) (actual time=21.571..26.213 rows=56 loops=1)
+  Group Key: concurrency_key, task_type
+  Buffers: shared hit=6794
+  ->  Gather Merge  (cost=9470.07..9487.28 rows=132 width=33) (actual time=21.562..26.180 rows=56 loops=1)
+        Workers Planned: 2
+        Workers Launched: 2
+        Buffers: shared hit=6794
+        ->  Partial GroupAggregate  (cost=8470.04..8472.02 rows=66 width=33) (actual time=6.604..6.666 rows=19 loops=3)
+              Group Key: concurrency_key, task_type
+              Buffers: shared hit=6794
+              ->  Sort  (cost=8470.04..8470.21 rows=66 width=28) (actual time=6.599..6.613 rows=394 loops=3)
+                    Sort Key: concurrency_key, task_type
+                    Sort Method: quicksort  Memory: 113kB
+                    Buffers: shared hit=6794
+                    Worker 0:  Sort Method: quicksort  Memory: 25kB
+                    Worker 1:  Sort Method: quicksort  Memory: 25kB
+                    ->  Parallel Seq Scan on harvest_task_queue  (cost=0.05..8468.05 rows=66 width=28) (actual time=0.841..6.402 rows=394 loops=3)
+                          Filter: ((concurrency_key IS NOT NULL) AND (concurrency_cap IS NOT NULL) AND (queue_name = ANY ('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])) AND ((state = 'PENDING'::text) OR ((state = 'RUNNING'::text) AND (worker_id IS NOT NULL))))
+                          Rows Removed by Filter: 69606
+                          Buffers: shared hit=6718
+Planning:
+  Buffers: shared hit=8
+Planning Time: 0.290 ms
+Execution Time: 26.235 ms
+
+-- sample_rate_limit_buckets
+Seq Scan on harvest_rate_limit_buckets  (cost=0.00..29.00 rows=91 width=34) (actual time=0.005..0.054 rows=100 loops=1)
+  Filter: (((key)::text !~~ 'dyn-rate:%'::text) AND ((key)::text !~~ 'start-throttle:%'::text))
+  Rows Removed by Filter: 900
+  Buffers: shared hit=14
+Planning Time: 0.033 ms
+Execution Time: 0.063 ms
+
+-- dead_letter_count
+Result  (cost=0.00..0.26 rows=1 width=8) (actual time=0.058..0.059 rows=1 loops=1)
+  Buffers: shared hit=1
+Planning Time: 0.006 ms
+Execution Time: 0.061 ms
+

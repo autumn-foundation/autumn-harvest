@@ -3,6 +3,11 @@
 //! Tasks that exhaust all retry attempts are moved to the `harvest_dead_letters`
 //! table for post-mortem inspection and potential manual reprocessing. This is
 //! the final resting place for permanently failed tasks.
+//!
+//! Triggers keep the DLQ depth in `harvest_dead_letter_counts`. Each insert
+//! and delete statement inserts one delta row, in the transaction of that
+//! statement. A writer locks no counter row, so it never waits and never
+//! raises a serialization failure.
 
 use crate::schema::harvest_workflow_executions_ext;
 use jiff_diesel::ToDiesel;
@@ -800,21 +805,81 @@ pub async fn dead_letter_with_codecs(
         .ok_or_else(|| HarvestError::Database("insert returned no ID".into()))
 }
 
+/// The DLQ depth statement of [`dead_letter_count`].
+///
+/// Triggers on `harvest_dead_letters` keep `harvest_dead_letter_counts`
+/// exact. `harvest_dead_letter_depth()` sums its rows.
+/// [`fold_dead_letter_counts`] keeps those rows few. So the statement does not
+/// read the dead letters. The function is `SECURITY DEFINER`, so a role needs
+/// no grant on the counter table.
+pub const DLQ_DEPTH_SQL: &str = "SELECT harvest_dead_letter_depth() AS entries";
+
+#[derive(diesel::QueryableByName)]
+struct DepthRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    entries: i64,
+}
+
 /// Count the total number of entries in the dead-letter queue.
+///
+/// The count is exact, unless a write bypassed the triggers. Then
+/// [`recount_dead_letters`] repairs it. It reads the counter of
+/// [`DLQ_DEPTH_SQL`], so its cost does not grow with the DLQ.
 ///
 /// # Errors
 ///
 /// Returns [`HarvestError::Database`] on query failure.
 pub async fn dead_letter_count(conn: &mut AsyncPgConnection) -> HarvestResult<i64> {
-    use crate::schema::harvest_dead_letters::dsl;
-
-    let count: i64 = dsl::harvest_dead_letters
-        .count()
+    let row: DepthRow = diesel::sql_query(DLQ_DEPTH_SQL)
         .get_result(conn)
         .await
         .map_err(crate::error::database_error)?;
+    Ok(row.entries)
+}
 
-    Ok(count)
+/// Run `sql`, a `SELECT` of one counter function, in a `READ COMMITTED`
+/// transaction. The level is pinned, not inherited from the session.
+async fn counter_call(conn: &mut AsyncPgConnection, sql: &'static str) -> HarvestResult<i64> {
+    let mut tx = conn.build_transaction().read_committed();
+    let row: DepthRow = Box::pin(tx.run(async |c| {
+        diesel::sql_query(sql)
+            .get_result::<DepthRow>(c)
+            .await
+            .map_err(HarvestError::from)
+    }))
+    .await?;
+    Ok(row.entries)
+}
+
+/// Fold the free delta rows of the DLQ depth counter into one row.
+///
+/// Each dead-letter statement adds one delta row. The timeout pass calls this
+/// function once per tick, so the gauge reads a few rows. A fold scans the
+/// whole counter, so no writer calls it. A row that another open transaction
+/// holds stays as it is.
+///
+/// Returns the count of rows that the fold removed.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] on query failure.
+pub async fn fold_dead_letter_counts(conn: &mut AsyncPgConnection) -> HarvestResult<i64> {
+    counter_call(conn, "SELECT harvest_dead_letter_fold() AS entries").await
+}
+
+/// Set the DLQ depth counter to the exact count of `harvest_dead_letters`.
+///
+/// It repairs a drift: for example after a write with the triggers off, a
+/// data-only restore, or a promotion of a logical standby. It locks the DLQ
+/// against writes until it commits, and it reads the whole DLQ once.
+///
+/// Returns the exact count.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] on query failure or a lock timeout.
+pub async fn recount_dead_letters(conn: &mut AsyncPgConnection) -> HarvestResult<i64> {
+    counter_call(conn, "SELECT harvest_dead_letter_recount() AS entries").await
 }
 
 /// The age in whole seconds of the newest dead letter, or `NULL` with none.

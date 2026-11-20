@@ -53,7 +53,7 @@ Statements: 1. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT COUNT(*) FROM "harvest_dead_letters"` | `harvest_dead_letters`: Bitmap Heap Scan on `idx_harvest_dl_queue_failed` |
+| 1 | `SELECT harvest_dead_letter_depth() AS entries` | no table |
 
 ## `dead_letter_with_codecs`
 
