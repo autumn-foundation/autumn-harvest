@@ -1,4 +1,4 @@
-## One elected gauge sampler per shard (issue #2679)
+## One elected gauge sampler per shard (issue #2679, PR #2750)
 
 Each worker ran every database gauge sampler, and the fleet-wide samplers
 read every shard. W workers paid W reads of each shard for one answer.
@@ -14,6 +14,14 @@ younger than three sample intervals. Otherwise it reads the shard itself.
   reads, not who emits, so it cannot drop or double-count a gauge. A standby
   emits the leader's read, so a gauge that grows with time, such as the
   oldest pending age, is up to one interval behind.
+- **Rules that read a time-based gauge.** The alert rule
+  `harvest_queue_schedule_to_start_high` reads
+  `harvest_queue_oldest_pending_age > 30` as its fallback expression. On a
+  standby that gauge is up to one interval old, so the rule can fire up to
+  one interval (15 s by default) later. Two dashboard panels read time-based
+  gauges the same way: the oldest pending age and the rate-limit tokens. No
+  other rule or panel changes. Each reads a value that does not depend on
+  the read time.
 - The row write needs a live lease of the writer. An outdated leader writes
   nothing.
 - `harvest.scanner.pass` gains `scanner="gauge_<sampler>"`. Its non-standby
