@@ -295,8 +295,30 @@ fn show(version: Option<OverlayVersion>) -> String {
     version.map_or_else(|| "none (the base profile)".to_owned(), |v| v.to_string())
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<(), Box<dyn Error>> {
+/// The stack of the thread that runs the walk.
+///
+/// A debug build polls the walk through deep frames. On Windows the main
+/// thread has a 1 MiB stack, and the walk overflowed it there. So the walk
+/// runs on a thread with a stack that this example sets.
+const WALK_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let walker = std::thread::Builder::new()
+        .name("agent-refine".to_owned())
+        .stack_size(WALK_STACK_BYTES)
+        .spawn(|| -> Result<(), String> {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            runtime.block_on(refine_walk()).map_err(|e| e.to_string())
+        })?;
+    walker.join().map_err(|_| "the walk thread panicked")??;
+    Ok(())
+}
+
+/// Run the walk and print each step.
+async fn refine_walk() -> Result<(), Box<dyn Error>> {
     let outcome = run(&RefineDecision::Approve).await?;
     println!("op 1 check: {:?}", outcome.op1);
     println!("version before: {}", show(outcome.before));
