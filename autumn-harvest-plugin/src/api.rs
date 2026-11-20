@@ -44214,6 +44214,9 @@ impl<Q> diesel::query_builder::Query for Explain<Q> {
     type SqlType = diesel::sql_types::Text;
 }
 
+/// Diesel runs only a marked statement type.
+impl<Q> diesel::query_dsl::RunQueryDslSupport for Explain<Q> {}
+
 /// Builds the default `GET /workflows` query, with no `SELECT` list.
 #[allow(clippy::too_many_lines)]
 fn workflow_list_query(

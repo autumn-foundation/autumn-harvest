@@ -534,34 +534,32 @@ fn clone(& self) -> (r: Self) ensures r ==* self,
 }
 impl Copy for ProcessRole {
 }
-pub open spec fn spec_role_default(role: Option < ProcessRole >) -> bool { match role { Some(ProcessRole::Web) => false, _ => true, } }
-pub open spec fn spec_switch_value(explicit: Option < bool >, default: bool) -> bool { match explicit { Some(value) => value, None => default, } }
-pub open spec fn spec_contradicts(explicit: Option < bool >, role: Option < ProcessRole >) -> bool { match explicit { Some(value) => role.is_some() && value != spec_role_default(role), None => false, } }
-pub fn role_default(role: Option < ProcessRole >) -> (r: bool) ensures r == spec_role_default(role),
-pub fn switch_value(explicit: Option < bool >, default: bool) -> (r: bool) ensures r == spec_switch_value(explicit, default),
-pub fn contradicts_role(explicit: Option < bool >, role: Option < ProcessRole >) -> (r: bool) ensures r == spec_contradicts(explicit, role),
-pub fn resolve_switch(explicit: Option < bool >, role: Option < ProcessRole >) -> (r: (bool, bool)) ensures r.0 == spec_switch_value(explicit, spec_role_default(role)), r.1 == spec_contradicts(explicit, role),
-pub proof fn theorem_a_web_role_runs_nothing_by_default() ensures ! spec_switch_value(None, spec_role_default(Some(ProcessRole::Web))),
-pub proof fn theorem_a_worker_or_combined_role_runs_both_by_default(role: ProcessRole) requires role != ProcessRole::Web, ensures spec_switch_value(None, spec_role_default(Some(role))),
-pub proof fn theorem_no_role_keeps_the_old_default() ensures spec_switch_value(None, spec_role_default(None)),
-pub proof fn theorem_an_explicit_value_wins(value: bool, role: Option < ProcessRole >) ensures spec_switch_value(Some(value), spec_role_default(role)) == value,
-pub proof fn theorem_a_warning_marks_each_override(explicit: Option < bool >, role: Option < ProcessRole >,) ensures role.is_some() ==> (spec_contradicts(explicit, role) <==> spec_switch_value(explicit, spec_role_default(role),) != spec_role_default(role)), role.is_none() ==>! spec_contradicts(explicit, role),
 pub enum RetentionRunOn { Scheduler, All, }
 impl Clone for RetentionRunOn {
 fn clone(& self) -> (r: Self) ensures r ==* self,
 }
 impl Copy for RetentionRunOn {
 }
-pub open spec fn spec_retention_placed(run_on: RetentionRunOn, scheduler: bool) -> bool { match run_on { RetentionRunOn::Scheduler => scheduler, RetentionRunOn::All => true, } }
-pub open spec fn spec_runs_retention(enabled: bool, run_on: RetentionRunOn, scheduler: bool,) -> bool { enabled && spec_retention_placed(run_on, scheduler) }
-pub fn retention_placed(run_on: RetentionRunOn, scheduler: bool) -> (r: bool) ensures r == spec_retention_placed(run_on, scheduler),
-pub fn runs_retention(enabled: bool, run_on: RetentionRunOn, scheduler: bool) -> (r: bool) ensures r == spec_runs_retention(enabled, run_on, scheduler),
-pub proof fn theorem_retention_follows_the_scheduler(enabled: bool, scheduler: bool) ensures spec_runs_retention(enabled, RetentionRunOn::Scheduler, scheduler) == (enabled && scheduler),
-pub proof fn theorem_a_web_role_runs_no_retention_by_default(enabled: bool) ensures ! spec_runs_retention(enabled, RetentionRunOn::Scheduler, spec_switch_value(None, spec_role_default(Some(ProcessRole::Web))),),
-pub proof fn theorem_other_roles_run_retention_by_default(role: Option < ProcessRole >) requires role != Some(ProcessRole::Web), ensures spec_runs_retention(true, RetentionRunOn::Scheduler, spec_switch_value(None, spec_role_default(role)),),
-pub proof fn theorem_an_explicit_scheduler_moves_retention(enabled: bool, scheduler: bool, role: Option < ProcessRole >,) ensures spec_runs_retention(enabled, RetentionRunOn::Scheduler, spec_switch_value(Some(scheduler), spec_role_default(role)),) == (enabled && scheduler),
-pub proof fn theorem_run_on_all_runs_retention_everywhere(enabled: bool, scheduler: bool) ensures spec_runs_retention(enabled, RetentionRunOn::All, scheduler) == enabled,
-pub proof fn theorem_disabled_retention_never_runs(run_on: RetentionRunOn, scheduler: bool) ensures ! spec_runs_retention(false, run_on, scheduler),
+pub open spec fn spec_base_default(role: Option < ProcessRole >) -> bool { match role { Some(ProcessRole::Web) => false, _ => true, } }
+pub open spec fn spec_runs_plugin(preset: Option < bool >, runs_parent: bool, base_runs_parent: bool,) -> bool { match preset { Some(value) => value && base_runs_parent, None => runs_parent, } }
+pub open spec fn spec_switch_value(explicit: Option < bool >, default: bool) -> bool { match explicit { Some(value) => value, None => default, } }
+pub open spec fn spec_contradicts(explicit: Option < bool >, role_default: Option < bool >) -> bool { match (explicit, role_default) { (Some(value), Some(default)) => value != default, _ => false, } }
+pub open spec fn spec_default(role_default: Option < bool >) -> bool { match role_default { Some(default) => default, None => true, } }
+pub open spec fn spec_retention_switch(enabled: bool, run_on: RetentionRunOn, scheduler: Option < bool >,) -> Option < bool > { if ! enabled { Some(false) } else { match run_on { RetentionRunOn::All => Some(true), RetentionRunOn::Scheduler => scheduler, } } }
+pub open spec fn spec_old_retention(enabled: bool, run_on: RetentionRunOn, scheduler: bool,) -> bool { enabled && match run_on { RetentionRunOn::Scheduler => scheduler, RetentionRunOn::All => true, } }
+pub fn switch_value(explicit: Option < bool >, default: bool) -> (r: bool) ensures r == spec_switch_value(explicit, default),
+pub fn contradicts_role(explicit: Option < bool >, role_default: Option < bool >) -> (r: bool) ensures r == spec_contradicts(explicit, role_default),
+pub fn resolve_switch(explicit: Option < bool >, role_default: Option < bool >) -> (r: (bool, bool)) ensures r.0 == spec_switch_value(explicit, spec_default(role_default)), r.1 == spec_contradicts(explicit, role_default),
+pub fn retention_switch(enabled: bool, run_on: RetentionRunOn, scheduler: Option < bool >) -> (r: Option < bool >) ensures r == spec_retention_switch(enabled, run_on, scheduler),
+pub proof fn theorem_an_explicit_value_wins(value: bool, default: bool) ensures spec_switch_value(Some(value), default) == value,
+pub proof fn theorem_no_role_keeps_the_old_default() ensures spec_switch_value(None, spec_default(None)),
+pub proof fn theorem_a_warning_marks_each_override(explicit: Option < bool >, role_default: Option < bool >,) ensures role_default.is_some() ==> (spec_contradicts(explicit, role_default) <==> spec_switch_value(explicit, spec_default(role_default)) != spec_default(role_default,)), role_default.is_none() ==>! spec_contradicts(explicit, role_default),
+pub proof fn theorem_a_preset_stays_within_its_base(preset: Option < bool >) ensures ! spec_runs_plugin(preset, false, false),
+pub proof fn theorem_a_preset_turns_one_capability_off(runs_parent: bool, base_runs_parent: bool) ensures ! spec_runs_plugin(Some(false), runs_parent, base_runs_parent), spec_runs_plugin(None, runs_parent, base_runs_parent) == runs_parent,
+pub proof fn theorem_a_built_in_role_keeps_its_janitor(enabled: bool, run_on: RetentionRunOn, scheduler: Option < bool >, role: Option < ProcessRole >,) ensures spec_switch_value(spec_retention_switch(enabled, run_on, scheduler), spec_base_default(role),) == spec_old_retention(enabled, run_on, spec_switch_value(scheduler, spec_base_default(role)),),
+pub proof fn theorem_a_web_role_runs_no_janitor_by_default(enabled: bool) ensures ! spec_switch_value(spec_retention_switch(enabled, RetentionRunOn::Scheduler, None), spec_base_default(Some(ProcessRole::Web)),),
+pub proof fn theorem_run_on_all_runs_retention_everywhere(enabled: bool, scheduler: Option < bool >, default: bool,) ensures spec_switch_value(spec_retention_switch(enabled, RetentionRunOn::All, scheduler), default) == enabled,
+pub proof fn theorem_disabled_retention_never_runs(run_on: RetentionRunOn, scheduler: Option < bool >, default: bool,) ensures ! spec_switch_value(spec_retention_switch(false, run_on, scheduler), default),
 
 ## formal/verus/src/refine_gate.rs
 pub enum GateEvent { Deadline, Unreadable, Reject, Activated, Refused, Conflict, }

@@ -637,6 +637,9 @@ pub mod models;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod notify;
+/// A background loop that its caller spawns or runs.
+#[cfg(feature = "db")]
+pub mod prepared_loop;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod queue;

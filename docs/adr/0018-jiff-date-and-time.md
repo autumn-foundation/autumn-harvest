@@ -70,12 +70,11 @@ Accepted.
    A model duration keeps the `chrono` form `[seconds, nanoseconds]` through
    `time::serde_secs_nanos`. The jiff form is an ISO 8601 string, and the
    two forms cannot read each other.
-7. `chrono` stays a dependency of `autumn-harvest-plugin` only behind its
-   `webhooks` and `sqlite` features. `autumn-web` 0.10 holds `chrono`
-   types in its webhook delivery log and its tenant restore target. The
-   plugin converts at that boundary, in `chrono_boundary.rs`. No other
-   Harvest crate depends on `chrono` or `chrono-tz`. `deny.toml` bans both
-   crates, and lists the crates that may still wrap them.
+7. No Harvest crate depends on `chrono` or `chrono-tz`. `autumn-web` 0.10
+   held `chrono` types in its webhook delivery log and its tenant restore
+   target, so the plugin converted at that boundary. `autumn-web` 0.11
+   takes `jiff` values, so the plugin passes them through. `deny.toml`
+   bans both crates, and lists the crates that may still wrap them.
 
 ## Consequences
 

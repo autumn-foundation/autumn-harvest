@@ -13,21 +13,57 @@ A `web` replica still starts workflows, signals runs and serves the
 management API. It claims no task and fires no schedule. The `worker`
 replicas do that work.
 
+## Harvest capabilities
+
+Harvest declares three Autumn plugin capabilities. Each one takes its
+default from a built-in capability of the role:
+
+| Capability | Default from | Runtimes |
+|---|---|---|
+| `harvest.worker` | `job_workers` | worker |
+| `harvest.scheduler` | `scheduler` | scheduler |
+| `harvest.maintenance` | `maintenance` | retention janitor, batch executor |
+
+A named role can turn each one off, or keep it on when it turns the parent
+off:
+
+```toml
+[roles.cron]
+base = "worker"
+capabilities = { "harvest.worker" = false, "harvest.scheduler" = true }
+
+[roles.flows]
+base = "worker"
+job_workers = false
+capabilities = { "harvest.worker" = true }
+```
+
+`cron` runs the Harvest scheduler and Autumn job workers, but no Harvest
+worker. `flows` runs the Harvest worker, but no Autumn job worker. A role
+cannot turn on a capability that its base does not run, so a `web` base
+runs none. `pin = []` turns off `job_workers`, so it also turns off
+`harvest.worker` unless the role sets it.
+
 ## Rules
 
-- `harvest.worker_enabled` and `harvest.scheduler_enabled` are unset by
-  default. An unset switch follows the role.
+- The role is the primary knob. Set `AUTUMN_ROLE` and, for a named role,
+  its `capabilities`.
+- `harvest.worker_enabled` and `harvest.scheduler_enabled` are overrides.
+  They are unset by default, and an unset switch follows the role.
 - An explicit value wins. Set it in `[harvest]` or with
   `AUTUMN_HARVEST__WORKER_ENABLED` and `AUTUMN_HARVEST__SCHEDULER_ENABLED`.
 - An explicit value against the role logs one `warn!` per switch. The
-  warning names the switch, its value and the role.
+  warning names the switch, its value, the role and the capability. An
+  explicit `true` on a role that does not place the task also gets the
+  Autumn warning for a forced task.
 - At startup, Harvest logs one line with each value and its source:
   `explicit`, `role` or `default`. The SQLite backend logs the source
   `sqlite`.
 - A runtime with no Autumn `AppState` has no role. A standalone
   `HarvestRunner` is one example. Both switches then stay on.
-- The SQLite backend always runs its driver. The `web` role does not stop
-  it, and Harvest logs a warning. Set `harvest.worker_enabled = true` to
+- The SQLite backend always runs its driver. A role that turns off
+  `harvest.worker`, `web` included, does not stop it, and Harvest logs a
+  warning. Set `harvest.worker_enabled = true` to
   remove the warning. The SQLite backend has no schedules, so it ignores
   `harvest.scheduler_enabled`. See [`docs/sqlite-plugin.md`](../sqlite-plugin.md).
 
@@ -45,21 +81,35 @@ backend = "postgres"
 Each role runs these Harvest runtimes. No switch is set, and retention
 is on.
 
-| Runtime | `web` | `worker`, `combined`, no role |
-|---|---|---|
-| Worker | off | on |
-| Scheduler | off | on |
-| Batch executor | off | on |
-| Retention janitor | off | on |
-| Dispatch-metrics sampler | on | off: the worker samples |
-| Post-commit notify sender | on | on |
-| Codec key refresh | on | off: the worker refreshes |
+| Runtime | Autumn task | `web` | `worker`, `combined`, no role |
+|---|---|---|---|
+| Worker | `harvest.worker` | off | on |
+| Scheduler | `harvest.scheduler` | off | on |
+| Batch executor | `harvest.batch` | off | on |
+| Retention janitor | `harvest.retention` | off | on |
+| Dispatch-metrics sampler | none | on | off: the worker samples |
+| Post-commit notify sender | none | on | on |
+| Codec key refresh | none | on | off: the worker refreshes |
 
 The test `each_role_places_each_runtime` in `runner.rs` pins this table.
 
-- **Retention runs where the scheduler runs.** That is the default,
+Autumn starts each task after the startup hooks, on a role that places
+it. `GET /actuator/tasks` lists each task under `background_tasks`, with
+its capability, the roles that run it and its state on this process.
+`autumn graph` lists the same tasks as `background_task` nodes. A fifth
+task, `harvest.queues`, runs nothing. It declares the Harvest queues to
+Autumn. See [Coverage](#coverage).
+
+- **Shutdown.** Autumn cancels each task, then waits for at most half of
+  the remaining `server.shutdown_timeout_secs`. The worker drains its
+  in-flight tasks in that time. Autumn aborts a task that does not stop,
+  and the leases return its work to the queue. Size
+  `server.shutdown_timeout_secs` for the worker drain.
+- **A standalone runner**, `HarvestEmbedding` included, has no Autumn
+  host. It spawns each runtime itself, as before.
+- **Retention follows the role.** That is the default,
   `run_on = "scheduler"`. An explicit `scheduler_enabled` moves retention
-  with it.
+  with it. With none, the `harvest.maintenance` capability decides.
 - **`run_on = "all"` runs retention on each process**, as in 0.9.0.
   Row leases keep concurrent janitors correct. Set it in
   `autumn.toml`, or with `AUTUMN_HARVEST_RETENTION__RUN_ON=all`:
@@ -72,6 +122,8 @@ The test `each_role_places_each_runtime` in `runner.rs` pins this table.
   An unknown value stops the boot.
 - **The notify sender runs on each process.** A `web` replica writes rows
   too, so it sends the notifications that wake the waiters.
+- **The batch executor follows the role.** An explicit `worker_enabled`
+  moves it with the worker. With none, `harvest.maintenance` decides.
 - **The dispatch-metrics sampler runs only with no worker.** A worker
   runs its own copy. Two copies would emit each gauge twice.
 - A process with retention on but not placed logs one `info!` at
@@ -151,12 +203,9 @@ pin and the fix. An explicit list always wins over the pin.
 Harvest reads the `pin` of a `[roles.<name>]` preset only. It does not
 read `jobs.pin` or `AUTUMN_JOBS__PIN`. A built-in role has no pin.
 
-Harvest follows only the `base` of a preset. A preset
-that turns off `job_workers`, `scheduler` or `retention` does not stop the
-Harvest worker, the scheduler or the janitor. `pin = []` turns off
-`job_workers`, so it does not stop the Harvest worker either. Harvest logs
-one `warn!` for such a preset. Set `harvest.worker_enabled` and
-`harvest.scheduler_enabled` to match. A later release maps each capability.
+A preset places each Harvest runtime through the Harvest capabilities.
+See [Harvest capabilities](#harvest-capabilities). The pin narrows the
+queues of a worker that the role places. It does not stop the worker.
 
 ### Route groups
 
@@ -196,7 +245,13 @@ Each queue needs a tier that polls it. Otherwise a run on it waits.
   runtime is installed, or a writable shard gave no answer.
 - `harvest queue coverage --strict` exits `2` when that list is not empty,
   `null` or missing. An older server omits it, so the gate fails closed.
-- The `autumn doctor --strict` hook waits for a change in Autumn.
+- The task `harvest.queues` declares each queue to Autumn. So
+  `autumn jobs manifest` lists them, and the `autumn doctor` coverage
+  check includes them. A role `pin` that names only Harvest queues does
+  not log the Autumn "pin matches no work" error. The task runs on a role
+  that runs the Harvest worker, runs Autumn job workers and drains a
+  Harvest queue. A role with no Autumn job worker, such as `flows` above,
+  still runs the Harvest worker, but Autumn counts no Harvest queue there.
 
 With the `webhooks` feature, the built-in `webhooks` queue is a declared
 queue too. Narrow it out only when another tier polls it.
@@ -344,6 +399,12 @@ serves no Harvest route, so it uses the Autumn probes `/live` and `/ready`.
 See [`kubernetes-probes.md`](kubernetes-probes.md).
 
 ## Upgrade note
+
+Harvest now needs `autumn-web` 0.11, and Autumn places each Harvest
+runtime. Read [`autumn-web` 0.11](../upgrading/autumn-web-0.11.md) first.
+A named role now places Harvest through its capabilities.
+
+The notes below are for the upgrade to 0.10.0.
 
 Before 0.10.0, a `web` replica ran the Harvest worker and scheduler.
 It no longer does. A fleet with only `web` replicas then claims no task.

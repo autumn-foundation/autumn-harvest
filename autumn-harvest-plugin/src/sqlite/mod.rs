@@ -659,7 +659,7 @@ async fn start(
             runtime_config.mode
         )));
     }
-    apply_driver_check(runtime_config.worker_enabled, state.role().base())?;
+    apply_driver_check(runtime_config.worker_enabled, state.role())?;
     refuse_worker_queues(&runtime_config.worker.queues)?;
     if let Some(pin) = crate::worker_queues::role_pin(state.role()) {
         tracing::info!(
@@ -1115,7 +1115,7 @@ const fn sqlite_scheduler(explicit: Option<bool>) -> bool {
 enum DriverCheck {
     /// Run the driver.
     Run,
-    /// Run the driver, and warn that the `web` role does not stop it.
+    /// Run the driver, and warn that the role does not stop it.
     RunAgainstRole,
     /// Refuse the boot.
     Refuse,
@@ -1124,9 +1124,12 @@ enum DriverCheck {
 /// Warn or refuse the boot after [`driver_check`].
 fn apply_driver_check(
     explicit: Option<bool>,
-    role: autumn_web::config::ProcessRole,
+    role: &autumn_web::config::Role,
 ) -> autumn_web::AutumnResult<()> {
-    let check = driver_check(explicit, role);
+    let check = driver_check(
+        explicit,
+        role.runs_plugin(crate::process_role::HARVEST_WORKER),
+    );
     if check != DriverCheck::Refuse {
         let source = if explicit.is_some() {
             "explicit"
@@ -1134,7 +1137,7 @@ fn apply_driver_check(
             "sqlite"
         };
         tracing::info!(
-            role = %role.as_str(),
+            role = %role.name(),
             worker_enabled = true,
             worker_source = %source,
             "harvest SQLite driver runs on every process role"
@@ -1144,9 +1147,10 @@ fn apply_driver_check(
         DriverCheck::Run => Ok(()),
         DriverCheck::RunAgainstRole => {
             tracing::warn!(
-                "the Autumn process role `web` does not turn off the Harvest SQLite driver: \
+                "the Autumn process role `{}` does not turn off the Harvest SQLite driver: \
                  the app process is the only writer, so it always runs the driver. Set \
-                 harvest.worker_enabled = true to remove this warning"
+                 harvest.worker_enabled = true to remove this warning",
+                role.name()
             );
             Ok(())
         }
@@ -1177,11 +1181,12 @@ fn refuse_worker_queues(queues: &[String]) -> autumn_web::AutumnResult<()> {
 ///
 /// One process holds the writer lock. A process with no driver could not
 /// write at all, so an API-only replica is not a SQLite topology. An
-/// explicit `false` is refused. The `web` role default does not apply.
-fn driver_check(explicit: Option<bool>, role: autumn_web::config::ProcessRole) -> DriverCheck {
+/// explicit `false` is refused. `worker_default` is the `harvest.worker`
+/// default of the role. A role default of off does not apply.
+const fn driver_check(explicit: Option<bool>, worker_default: bool) -> DriverCheck {
     match explicit {
         Some(false) => DriverCheck::Refuse,
-        None if role == autumn_web::config::ProcessRole::Web => DriverCheck::RunAgainstRole,
+        None if !worker_default => DriverCheck::RunAgainstRole,
         Some(true) | None => DriverCheck::Run,
     }
 }
@@ -1191,23 +1196,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_sqlite_driver_ignores_the_web_role_default() {
-        use autumn_web::config::ProcessRole;
-        for role in [ProcessRole::Combined, ProcessRole::Web, ProcessRole::Worker] {
+    fn the_sqlite_driver_ignores_the_role_default() {
+        use autumn_web::config::{ProcessRole, Role};
+        for default in [true, false] {
             assert_eq!(
-                driver_check(Some(false), role),
+                driver_check(Some(false), default),
                 DriverCheck::Refuse,
-                "{role:?}"
+                "{default}"
             );
-            assert_eq!(driver_check(Some(true), role), DriverCheck::Run, "{role:?}");
+            assert_eq!(
+                driver_check(Some(true), default),
+                DriverCheck::Run,
+                "{default}"
+            );
         }
-        assert_eq!(
-            driver_check(None, ProcessRole::Web),
-            DriverCheck::RunAgainstRole
+        assert_eq!(driver_check(None, false), DriverCheck::RunAgainstRole);
+        assert_eq!(driver_check(None, true), DriverCheck::Run);
+        let worker = Role::from(ProcessRole::Worker);
+        assert!(apply_driver_check(Some(false), &worker).is_err());
+    }
+
+    /// A named role that turns off `harvest.worker` gets the warning too.
+    #[test]
+    fn the_sqlite_driver_warns_for_a_named_role() {
+        use crate::process_role::capture_logs;
+
+        let cron = crate::process_role::tests::resolve_role(
+            "role = \"cron\"\n[roles.cron]\nbase = \"worker\"\n\
+             capabilities = { \"harvest.worker\" = false }\n",
         );
-        assert_eq!(driver_check(None, ProcessRole::Worker), DriverCheck::Run);
-        assert_eq!(driver_check(None, ProcessRole::Combined), DriverCheck::Run);
-        assert!(apply_driver_check(Some(false), ProcessRole::Worker).is_err());
+        let out = capture_logs(tracing::Level::WARN, || {
+            assert!(apply_driver_check(None, &cron).is_ok());
+        });
+        assert!(out.contains("role `cron`"), "{out}");
     }
 
     /// Issue #2477: a `web` SQLite app warns that its driver still runs, and
@@ -1218,9 +1239,10 @@ mod tests {
 
         use crate::process_role::capture_logs;
 
-        let run = |explicit, role| {
+        let run = |explicit, role: ProcessRole| {
+            let role = autumn_web::config::Role::from(role);
             capture_logs(tracing::Level::INFO, || {
-                assert!(apply_driver_check(explicit, role).is_ok());
+                assert!(apply_driver_check(explicit, &role).is_ok());
             })
         };
         let out = run(None, ProcessRole::Web);

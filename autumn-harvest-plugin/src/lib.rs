@@ -35,11 +35,10 @@ pub mod audit_sink;
 pub mod aws_kms;
 /// Startup and shutdown steps that `HarvestPlugin` and `HarvestEmbedding`
 /// share (issue #1613).
+/// Harvest runtimes as Autumn background tasks.
+mod background;
 mod boot;
 pub mod canary;
-/// The `chrono` values that the `autumn-web` API still takes.
-#[cfg(any(feature = "webhooks", feature = "sqlite"))]
-mod chrono_boundary;
 pub mod config;
 /// Broker event-source connectors for workflow triggers (issue #944).
 ///
