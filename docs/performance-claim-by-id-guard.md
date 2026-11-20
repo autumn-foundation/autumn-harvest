@@ -3,7 +3,7 @@
 Issue #2751 follows issue #2713. The by-id claim finds one
 `harvest_task_queue` row by `id`. Its `candidate` and
 `concurrency_pending_keys` scans also test `state = 'PENDING'`. After an
-idle analyze, the plan read a `PENDING` partial index instead of the primary
+idle analyze, the plan read a live-row partial index instead of the primary
 key. The cost then grew with the live backlog. The owner take, which claims
 the workflow task of one execution, had the same defect.
 
@@ -84,6 +84,11 @@ fixture. With 1,024 keys on the pending rows, the by-id claim read 8,629 /
 13,782 buffers before the fix and 7,439 / 7,441 after. Every claim form has
 these two scans. They read by key, so `row_guard_sql!` cannot help them.
 They need their own fix.
+
+The owner take reads each row of its run through `idx_harvest_tq_workflow`.
+A run with many activity rows, or with terminal rows that retention has not
+removed, costs one heap read per row. The plan from fresh statistics reads
+the same rows, so the fix does not change this cost.
 
 ## 🔬 Reproduce
 

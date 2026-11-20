@@ -2,7 +2,7 @@
 
 The by-id claim tests `state = 'PENDING'` in its `candidate` and
 `concurrency_pending_keys` scans. After an idle analyze, the plan read a
-`PENDING` partial index and filtered on `id`, so its cost grew with the
+live-row partial index and filtered on `id`, so its cost grew with the
 live backlog. The owner take had the same defect.
 
 - `splice_one_row_predicates` adds the id test of each one-row claim. It

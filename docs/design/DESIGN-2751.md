@@ -26,9 +26,9 @@ generic and the custom plan.
 | by-id claim, fenced | `idx_harvest_tq_claim_seek` | `harvest_task_queue_pkey` |
 | by-id claim, owned | `idx_harvest_tq_claim_seek` | `harvest_task_queue_pkey` |
 | by-id claim, owned and fenced | `idx_harvest_tq_claim_seek` | `harvest_task_queue_pkey` |
-| owner take, plain and fenced | a `PENDING` partial index | `idx_harvest_tq_workflow` |
+| owner take, plain and fenced | a live-row partial index | `idx_harvest_tq_workflow` |
 
-The hypothesis holds. Each variant leaves the primary key in each of the
+The hypothesis holds. Each variant leaves its full index in each of the
 four plan modes.
 
 The owner take (`owned_claim_by_execution_query`) is the same splice,
@@ -61,7 +61,7 @@ Decision: option 1, through one splice helper for both one-row claims.
 
 | Way to fail | Prevention |
 |---|---|
-| The guard reaches the window claim, which needs its partial indexes. | Only the one-row splice adds it. A unit test pins the plain state test in the window claim and in each fair and kind form. |
+| The guard reaches the window claim, which needs its partial indexes. | Only the one-row splice adds it. A unit test pins the plain state test in the window claim and in a sample of its fenced, fair, kind and owned forms. |
 | A future edit renames the anchor, and the guard silently goes away. | The splice asserts that the anchor appears twice. A unit test pins two guards in each variant. The plan test fails on a plain scan. |
 | The `CASE` gives NULL where the plain test gives false. | Both are top-level `AND` terms of a `WHERE` clause. The truth-table test covers every input. A differential run of each variant matches the plain form on every seeded row. |
 | The row lock rechecks a new row version and skips the `CASE`. | Postgres rechecks every qual of a `FOR UPDATE` scan. `SKIP LOCKED` does not change the quals. |

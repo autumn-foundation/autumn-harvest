@@ -7,11 +7,14 @@
 //! matches the guard, then filters on `id`. A cached generic plan keeps that
 //! choice.
 //!
+//! The one-row claims test `state` beside an id test in the same way.
+//!
 //! `row_guard_sql!` and `row_guard` hide such a guard from the planner.
 //! [`guarded_statements`] lists each raw statement in scope and a sample of
 //! each Diesel guard shape. A DB test checks that the generic and the custom
-//! plan of each one read the table through its primary key. See
-//! `docs/performance-claim-release-guard.md`.
+//! plan of each one read the table through its full index. That index is
+//! usually the primary key. See `docs/performance-claim-release-guard.md`
+//! and `docs/performance-claim-by-id-guard.md`.
 
 #[cfg(feature = "db")]
 use diesel::QueryDsl;
@@ -57,7 +60,7 @@ where
 #[cfg(feature = "db")]
 const PRIMARY_KEY: &str = "harvest_task_queue_pkey";
 
-/// One by-id statement and the types of its parameters.
+/// One one-row statement and the types of its parameters.
 #[cfg(feature = "db")]
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -413,7 +416,7 @@ fn one_row_claims() -> Vec<GuardedStatement> {
 
 #[cfg(all(test, feature = "db"))]
 mod tests {
-    use super::guarded_statements;
+    use super::{guarded_statements, one_row_claims};
 
     /// The engine files that hold by-id task queue statements.
     const SOURCES: [(&str, &str); 6] = [
@@ -498,6 +501,17 @@ mod tests {
                 statement.name,
                 statement.sql
             );
+        }
+    }
+
+    /// A one-row claim guards the state test of both of its scans.
+    #[test]
+    fn every_one_row_claim_has_two_guards() {
+        let guard = row_guard_sql!("state = 'PENDING'");
+        let claims = one_row_claims();
+        assert_eq!(claims.len(), 6);
+        for claim in claims {
+            assert_eq!(claim.sql.matches(guard).count(), 2, "{}", claim.name);
         }
     }
 

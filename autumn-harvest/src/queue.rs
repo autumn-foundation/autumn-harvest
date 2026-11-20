@@ -3840,7 +3840,7 @@ const BY_ID_ANCHOR: &str = "AND NOT (harvest_task_queue.queue_name = ANY(paused_
 /// full-scan form.
 const BY_ID_KEYS_ANCHOR: &str = "AND concurrency_cap IS NOT NULL ";
 
-/// The row test of `candidate` and of `concurrency_pending_keys`.
+/// The queue and state test of `candidate` and of `concurrency_pending_keys`.
 ///
 /// It appears once in each of the two scans of the full-scan form.
 const BY_ID_STATE_ANCHOR: &str = "queue_name = ANY($2) AND state = 'PENDING' ";
@@ -3863,7 +3863,8 @@ const BY_ID_STATE_GUARD: &str = concat!(
 ///
 /// Two predicates go in, both binding the same task id. The first restricts
 /// `candidate` to the named row, which is what makes the claim a by-id claim.
-/// The second restricts `concurrency_pending_keys` to the named row.
+/// The second restricts `concurrency_pending_keys` to the named row. The
+/// state test of both scans also goes into a row guard.
 /// [`splice_one_row_predicates`] does the splice.
 ///
 /// # Why the CTE needs its own predicate
@@ -3918,11 +3919,11 @@ fn splice_one_row_predicates(base: &str, candidate: &str, keys: &str) -> String 
 
 /// [`claim_task_query`] restricted to one named row (issue #1312).
 ///
-/// Identical to the full-scan form of the claim query plus two predicates on
-/// the row id: one in the `candidate` CTE and one in
-/// `concurrency_pending_keys`. The state test of both scans is in a row
-/// guard, so each scan reads the primary key. The full-scan form has no seek window (issue
-/// #1971), because a window cannot help a claim of one row. Every one of the
+/// The full-scan form of the claim query with two predicates on the row id:
+/// one in the `candidate` CTE and one in `concurrency_pending_keys`. A row
+/// guard hides the state test of both scans, so each scan reads the primary
+/// key. The full-scan form has no seek window (issue #1971), because a window
+/// cannot help a claim of one row. Every one of the
 /// thirteen claim gates still applies. A dispatch reference names a row; it
 /// never authorizes a claim. Binds `$7` task id on top of the base query's
 /// `$1..$6`.
