@@ -471,6 +471,13 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
     // (issue #1795). A missing grant does not stop enforcement: the worker
     // fails open and every replica runs every pass, as before the lease.
     ("harvest_scanner_leases", &["SELECT", "INSERT", "UPDATE"]),
+    // The elected gauge sampler of a shard writes its read here, and prunes
+    // old rows. A missing grant does not stop a gauge: each worker then
+    // reads the shard itself, as before the election.
+    (
+        "harvest_gauge_samples",
+        &["SELECT", "INSERT", "UPDATE", "DELETE"],
+    ),
     // The DR bump ends every owner lease in its transaction (issue #2251). A
     // missing grant fails the bump. In owner mode (issue #2252), each
     // decision locks a row FOR KEY SHARE, which needs UPDATE, and each
@@ -2536,6 +2543,17 @@ mod tests {
         let covered = HARVEST_WRITE_PRIVILEGE_REQUIREMENTS
             .iter()
             .find(|(name, _)| *name == "harvest_schedule_override_receipts")
+            .map(|(_, privileges)| *privileges);
+        assert_eq!(covered, Some(&["SELECT", "INSERT", "UPDATE", "DELETE"][..]));
+    }
+
+    /// The elected gauge sampler writes its read and prunes old rows. A
+    /// missing grant makes every worker read each shard itself.
+    #[test]
+    fn the_shared_gauge_samples_are_covered_by_the_privilege_probe() {
+        let covered = HARVEST_WRITE_PRIVILEGE_REQUIREMENTS
+            .iter()
+            .find(|(name, _)| *name == "harvest_gauge_samples")
             .map(|(_, privileges)| *privileges);
         assert_eq!(covered, Some(&["SELECT", "INSERT", "UPDATE", "DELETE"][..]));
     }

@@ -390,6 +390,8 @@ pub mod fork;
     reason = "fuzz harness code: a failed `expect` is a finding"
 )]
 pub mod fuzzing;
+/// One elected gauge sampler per shard and sampler kind.
+pub mod gauge_election;
 /// Group commit of one decision partition (issue #2256).
 pub mod group_commit;
 /// Deterministic workflow guardrail rule catalog (issue #173).
