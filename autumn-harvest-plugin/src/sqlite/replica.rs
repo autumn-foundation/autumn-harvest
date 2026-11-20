@@ -1412,12 +1412,54 @@ fn publish(staging: &Path, path: &Path, replace: bool) -> Result<(), String> {
     } else {
         None
     };
-    // The frames of the old file must not replay onto the restored one. A
-    // sidecar that stays refuses the publish, and the old file stays whole.
-    for sidecar in sidecars(path) {
-        remove_if_present(&sidecar)?;
+    // The frames of the old file must not replay onto the restored one. So
+    // its sidecars move aside first. A failure puts them back, and the old
+    // file keeps its WAL.
+    let moved = move_sidecars_aside(path)?;
+    if let Err(error) = std::fs::rename(staging, path) {
+        return Err(put_back(&moved, error.to_string()));
     }
-    std::fs::rename(staging, path).map_err(|error| error.to_string())
+    // A copy that stays has a private name, so no open reads it.
+    for sidecar in &moved {
+        remove_quietly(&aside_of(sidecar));
+    }
+    Ok(())
+}
+
+/// The private name of `sidecar` while a publish runs. The publish lock
+/// makes it unique to that publish.
+fn aside_of(sidecar: &Path) -> PathBuf {
+    suffixed(sidecar, ".publishing")
+}
+
+/// Move each sidecar of `path` to its private name. When one cannot move,
+/// put back the ones that moved, and refuse.
+fn move_sidecars_aside(path: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut moved = Vec::new();
+    for sidecar in sidecars(path) {
+        match std::fs::rename(&sidecar, aside_of(&sidecar)) {
+            Ok(()) => moved.push(sidecar),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                let why = format!("cannot move {} aside: {error}", sidecar.display());
+                return Err(put_back(&moved, why));
+            }
+        }
+    }
+    Ok(moved)
+}
+
+/// Put back each sidecar in `moved`. Give `why`, and name each sidecar that
+/// did not come back.
+fn put_back(moved: &[PathBuf], why: String) -> String {
+    use std::fmt::Write as _;
+    let mut why = why;
+    for sidecar in moved {
+        if let Err(error) = std::fs::rename(aside_of(sidecar), sidecar) {
+            let _ = write!(why, "; cannot put back {}: {error}", sidecar.display());
+        }
+    }
+    why
 }
 
 /// An OS lock on `<file><suffix>`. It waits for another holder.
@@ -2417,23 +2459,52 @@ mod tests {
         drop(theirs);
     }
 
-    /// A sidecar of the old file that stays refuses the publish. Its frames
-    /// would replay onto the restored file.
-    #[test]
-    fn a_sidecar_that_stays_refuses_the_publish() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("acme.harvest.db");
+    /// An old Harvest file with a WAL and a shared-memory file, and a
+    /// restored file to publish over it.
+    fn old_file_and_staging(dir: &Path) -> (PathBuf, PathBuf) {
+        let path = dir.join("acme.harvest.db");
         std::fs::write(&path, b"old").unwrap();
-        let wal = suffixed(&path, "-wal");
-        std::fs::create_dir(&wal).unwrap();
-        std::fs::write(wal.join("frames"), b"").unwrap();
-        let staging = dir.path().join("staging.db");
+        std::fs::write(suffixed(&path, "-wal"), b"frames").unwrap();
+        std::fs::write(suffixed(&path, "-shm"), b"index").unwrap();
+        let staging = dir.join("staging.db");
         std::fs::write(&staging, b"restored").unwrap();
+        (path, staging)
+    }
 
-        let error = publish(&staging, &path, true).expect_err("the WAL stays");
-        assert!(error.contains("cannot remove"), "{error}");
+    /// A sidecar that cannot move aside refuses the publish. The WAL moved
+    /// first, and it comes back, so the old file keeps its frames.
+    #[test]
+    fn a_sidecar_that_cannot_move_refuses_the_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, staging) = old_file_and_staging(dir.path());
+        let shm = suffixed(&path, "-shm");
+        // A directory at the private name stops the move of `-shm` only.
+        std::fs::create_dir(aside_of(&shm)).unwrap();
+        std::fs::write(aside_of(&shm).join("block"), b"").unwrap();
+
+        let error = publish(&staging, &path, true).expect_err("the -shm cannot move");
+        assert!(error.contains("cannot move"), "{error}");
         assert_eq!(std::fs::read(&path).unwrap(), b"old", "the old file stays");
+        assert_eq!(
+            std::fs::read(suffixed(&path, "-wal")).unwrap(),
+            b"frames",
+            "the WAL comes back"
+        );
+        assert_eq!(std::fs::read(&shm).unwrap(), b"index");
         assert!(staging.exists(), "the caller discards the staging file");
+    }
+
+    /// A publish removes the old sidecars and their private copies.
+    #[test]
+    fn a_publish_removes_the_old_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, staging) = old_file_and_staging(dir.path());
+        publish(&staging, &path, true).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"restored");
+        for sidecar in sidecars(&path) {
+            assert!(!sidecar.exists(), "{}", sidecar.display());
+            assert!(!aside_of(&sidecar).exists(), "{}", sidecar.display());
+        }
     }
 
     /// A slot database ships under its slot prefix.
