@@ -1,4 +1,4 @@
-## A keyed claim counts only the running rows of its own keys (issue #2744)
+## A keyed claim counts only the running rows of its own keys (issue #2744, PR #2761)
 
 The claim gate compares the running count of each pending key with its cap.
 The window CTE `seek_running_counts` counted all keys in one pass. Under the
