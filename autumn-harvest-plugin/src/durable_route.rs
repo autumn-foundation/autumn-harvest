@@ -3626,12 +3626,10 @@ mod tests {
     }
 
     /// A subscriber that writes every event, and each span when it closes.
+    ///
+    /// `crate::trace_keepers` keeps the callsite cache stable while the
+    /// capture is live.
     pub(super) fn capture() -> (Captured, tracing::Dispatch) {
-        // With one live dispatcher, tracing-core lets another test thread
-        // cache a callsite as never. A second dispatcher for the whole
-        // process turns that path off.
-        static KEEP: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
-        KEEP.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new()));
         let captured = Captured::default();
         let writer = captured.clone();
         let subscriber = tracing_subscriber::fmt()

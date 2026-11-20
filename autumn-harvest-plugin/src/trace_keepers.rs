@@ -28,7 +28,6 @@ fn keeper() -> tracing::Dispatch {
     tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new())
 }
 
-#[cfg(test)]
 mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
