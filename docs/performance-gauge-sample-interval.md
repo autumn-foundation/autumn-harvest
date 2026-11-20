@@ -131,7 +131,7 @@ ends. The test fails when a single sampler uses `poll_interval`.
   sampler per shard would cut the calls by the worker count.
 - `concurrency_key_stats` scanned the whole task queue, because no index
   covered its PENDING rows. `idx_harvest_tq_concurrency_live` now covers them.
-  See `docs/performance-concurrency-live-index.md`.
+  See [the live keyed index page](performance-concurrency-live-index.md).
 
 ## 🔬 Reproduce
 
