@@ -30,9 +30,9 @@ use diesel::sql_types::{Bool, BoolOrNullableBool};
 /// index condition. It also cannot prove a partial index predicate from
 /// it. So it finds the row through `id = $1` and the primary key.
 ///
-/// Use it only beside a primary key test, such as `id = $1`. A scan without
-/// `id` needs its index. Use it only as a top-level `AND` term. `NOT` or `OR`
-/// on a NULL result changes the rows.
+/// Use it only beside a test that finds few rows through a full index, such
+/// as `id = $1`. Any other scan needs its partial index. Use it only as a
+/// top-level `AND` term. `NOT` or `OR` on a NULL result changes the rows.
 macro_rules! row_guard_sql {
     ($guard:literal) => {
         concat!("(CASE WHEN ", $guard, " THEN true END)")
@@ -53,6 +53,10 @@ where
     diesel::dsl::case_when::<_, _, Bool>(guard, true)
 }
 
+/// The primary key of `harvest_task_queue`.
+#[cfg(feature = "db")]
+const PRIMARY_KEY: &str = "harvest_task_queue_pkey";
+
 /// One by-id statement and the types of its parameters.
 #[cfg(feature = "db")]
 #[doc(hidden)]
@@ -67,6 +71,9 @@ pub struct GuardedStatement {
     /// True when `sql` is the production text. A Diesel entry is false: it
     /// has the production guard, but its other clauses are a sample.
     pub raw: bool,
+    /// The full index that finds the row. The plan may also read the
+    /// primary key.
+    pub index: &'static str,
 }
 
 #[cfg(feature = "db")]
@@ -77,7 +84,14 @@ impl GuardedStatement {
             sql: sql.to_owned(),
             param_types: param_types.to_vec(),
             raw: true,
+            index: PRIMARY_KEY,
         }
+    }
+
+    /// The same statement, with its row found through `index`.
+    const fn via(mut self, index: &'static str) -> Self {
+        self.index = index;
+        self
     }
 
     fn diesel<Q>(name: &'static str, query: &Q, param_types: &[&'static str]) -> Self
@@ -217,6 +231,8 @@ pub fn guarded_statements() -> Vec<GuardedStatement> {
         ));
     }
 
+    statements.extend(one_row_claims());
+
     let id = uuid::Uuid::nil();
     let claim = queue::TaskClaim::new(id, "worker", 1);
 
@@ -326,6 +342,73 @@ pub fn guarded_statements() -> Vec<GuardedStatement> {
     ));
 
     statements
+}
+
+/// Each variant of the one-row claim.
+///
+/// The by-id claim has a plain, a fenced, an owned and an owned fenced
+/// form. Its fair form is the same text as the plain form. The owner take
+/// claims the workflow task of one execution, plain or fenced. It finds the
+/// row through `idx_harvest_tq_workflow`.
+///
+/// Each claim binds `$1..$6`. The fence binds two arrays before the id. The
+/// owned gate binds the holder and the partition mask after the id.
+#[cfg(feature = "db")]
+fn one_row_claims() -> Vec<GuardedStatement> {
+    use crate::queue::{
+        ClaimFairness, claim_by_id_query_for, owned_claim_by_execution_query,
+        owned_claim_by_id_query,
+    };
+
+    const CLAIM: [&str; 6] = ["text", "text[]", "text", "bigint", "text[]", "text[]"];
+    const FENCE: [&str; 2] = ["integer[]", "bigint[]"];
+    const OWNER: [&str; 2] = ["text", "bytea"];
+
+    let types = |fenced: bool, owned: bool| {
+        let mut types = CLAIM.to_vec();
+        if fenced {
+            types.extend(FENCE);
+        }
+        types.push("uuid");
+        if owned {
+            types.extend(OWNER);
+        }
+        types
+    };
+    vec![
+        GuardedStatement::raw(
+            "claim_by_id",
+            claim_by_id_query_for(false, ClaimFairness::Off),
+            &types(false, false),
+        ),
+        GuardedStatement::raw(
+            "claim_by_id_fenced",
+            claim_by_id_query_for(true, ClaimFairness::Off),
+            &types(true, false),
+        ),
+        GuardedStatement::raw(
+            "claim_by_id_owned",
+            owned_claim_by_id_query(false),
+            &types(false, true),
+        ),
+        GuardedStatement::raw(
+            "claim_by_id_owned_fenced",
+            owned_claim_by_id_query(true),
+            &types(true, true),
+        ),
+        GuardedStatement::raw(
+            "take_by_execution",
+            owned_claim_by_execution_query(false),
+            &types(false, true),
+        )
+        .via("idx_harvest_tq_workflow"),
+        GuardedStatement::raw(
+            "take_by_execution_fenced",
+            owned_claim_by_execution_query(true),
+            &types(true, true),
+        )
+        .via("idx_harvest_tq_workflow"),
+    ]
 }
 
 #[cfg(all(test, feature = "db"))]
