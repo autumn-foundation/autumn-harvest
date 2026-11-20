@@ -16,6 +16,10 @@
 #   clean PRs can also merge into a new finding.
 # - `schema-acknowledgement` checks each change of the schema contract since
 #   trunk against its acknowledgement, for the same reason.
+# - `crate-packaging` packages and verifies each publishable crate. The
+#   maintainer publishes by hand after the tag, so a packaging defect must
+#   show here first. The job holds no registry token. `docs/releasing.md`
+#   gives the publish order.
 #
 # `release_pr_ci` in the core integration tests guards this file.
 name: Release PR
@@ -134,3 +138,32 @@ jobs:
           else
             echo "no artifact at ${BASE_SHA}: first introduction, nothing to compare"
           fi
+
+  crate-packaging:
+    name: Release PR crate packaging
+    runs-on: ubuntu-latest
+    # `cargo package` builds each crate again from its `.crate` file.
+    timeout-minutes: 120
+    if: github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # Each verify build has its own target directory. Free the disk as the
+      # ci.yml `test` jobs do.
+      - name: Free runner disk before the verify builds
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          df -h /
+      # No registry token. `cargo package` reads the public index only.
+      - name: Package each publishable crate (cargo xtask check crate-packaging)
+        env:
+          # No debug info. It halves the size of each verify build.
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: cargo xtask check crate-packaging

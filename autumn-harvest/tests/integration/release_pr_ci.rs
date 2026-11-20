@@ -10,6 +10,10 @@
 //! merge. It also runs the two gates that diff against the PR base. They
 //! cover the whole release there. A push run diffs against one push only, and
 //! a newer push can cancel it.
+//!
+//! It also packages each publishable crate, with no registry token. The
+//! maintainer publishes by hand after the tag, so a packaging defect must
+//! show on the release PR first.
 
 use serde_yaml::Value;
 
@@ -171,4 +175,75 @@ fn a_trunk_dev_push_decides_docs_only_against_trunk() {
             "the changes job must use `{needle}`:\n{runs}"
         );
     }
+}
+
+/// A release PR packages each publishable crate before the tag.
+#[test]
+fn release_pr_packages_every_publishable_crate() {
+    let doc = parse_workflow(RELEASE_PR);
+    let runs = job_runs(&doc, "crate-packaging");
+    assert!(
+        runs.contains("cargo xtask check crate-packaging"),
+        "the release PR must run the packaging check:\n{runs}"
+    );
+    for flag in ["--plan-only", "--no-verify", "--allow-dirty"] {
+        assert!(
+            !runs.contains(flag),
+            "the release PR runs the full check, with no `{flag}`:\n{runs}"
+        );
+    }
+    assert_ne!(
+        doc["jobs"]["crate-packaging"]["if"].as_str(),
+        None,
+        "a draft release PR skips the slow packaging build"
+    );
+}
+
+/// Publishing stays manual. No release job holds a registry token.
+#[test]
+fn no_release_workflow_holds_a_registry_token_or_publishes() {
+    let release_pr = parse_workflow(RELEASE_PR);
+    let job = serde_yaml::to_string(&release_pr["jobs"]["crate-packaging"]).expect("job");
+    assert!(
+        !job.contains("secrets."),
+        "the packaging job must read no secret:\n{job}"
+    );
+    let permissions = &release_pr["jobs"]["crate-packaging"]["permissions"];
+    assert!(
+        permissions.is_null() || permissions["contents"].as_str() == Some("read"),
+        "the packaging job must keep the read-only token: {permissions:?}"
+    );
+    for rel in [RELEASE_PR, ".github/workflows/release.yml"] {
+        let text = std::fs::read_to_string(super::ci_run_coverage::repo_root().join(rel))
+            .expect("workflow");
+        for needle in ["CARGO_REGISTRY_TOKEN", "NPM_TOKEN", "NODE_AUTH_TOKEN"] {
+            assert!(!text.contains(needle), "{rel} must not hold `{needle}`");
+        }
+        for run in workflow_run_commands(&parse_workflow(rel)) {
+            for needle in ["cargo publish", "npm publish"] {
+                assert!(
+                    !run.contains(needle),
+                    "{rel}: the maintainer publishes by hand, not CI: {run}"
+                );
+            }
+        }
+    }
+}
+
+/// Each pull request checks the publish order, so a new crate cannot reach
+/// release day with no `publish = false` and no place in the order.
+#[test]
+fn lint_checks_the_publish_plan_on_each_pull_request() {
+    let ci = parse_workflow(CI);
+    let runs = ci["jobs"]["lint"]["steps"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .filter_map(|step| step.get("run").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        runs.contains("cargo xtask check crate-packaging --plan-only"),
+        "the lint job must run the plan check"
+    );
 }

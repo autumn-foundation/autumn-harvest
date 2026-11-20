@@ -90,6 +90,7 @@ An audit also needs a row in [`docs/audits/README.md`](audits/README.md).
 | `cargo xtask check changelog-connector-migration-version` | `xtask/src/check/changelog_connector_migration_version.rs` | `scripts/check-changelog-connector-migration-version.sh` |
 | `cargo xtask check child-idempotency-examples` | `xtask/src/check/child_idempotency_examples.rs` | `scripts/check-child-idempotency-examples.sh` |
 | `cargo xtask check continue-as-new-checkpoint-example` | `xtask/src/check/continue_as_new_checkpoint_example.rs` | `scripts/check-continue-as-new-checkpoint-example.sh` |
+| `cargo xtask check crate-packaging` | `xtask/src/check/crate_packaging.rs` | none |
 | `cargo xtask check dags-schedules-examples` | `xtask/src/check/dags_schedules_examples.rs` | `scripts/check-dags-schedules-examples.sh` |
 | `cargo xtask check default-run` | `xtask/src/check/default_run.rs` | `scripts/check-default-run.sh` |
 | `cargo xtask check dev-database-url-placeholder-caveat` | `xtask/src/check/dev_database_url_placeholder_caveat.rs` | `scripts/check-dev-database-url-placeholder-caveat.sh` |

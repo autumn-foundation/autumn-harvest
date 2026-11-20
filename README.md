@@ -63,6 +63,9 @@ Upgrading an existing deployment? See the
 [0.9.0 → 0.10.0 upgrade guide](docs/upgrading/0.10.0.md) — the previous
 [0.8.0 → 0.9.0 upgrade guide](docs/upgrading/0.9.0.md) covers the hop before that.
 
+Which releases get fixes, and for how long, is in the
+[support window](docs/upgrading/README.md#support-window).
+
 Working on the engine itself? [`docs/architecture.md`](docs/architecture.md) is
 the workspace, design-decision, module and macro reference, and
 [`docs/shipped-work.md`](docs/shipped-work.md) is the verbatim record of what

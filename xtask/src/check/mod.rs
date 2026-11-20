@@ -11,6 +11,7 @@ pub mod broker_connector_dead_letter_sink_example;
 pub mod changelog_connector_migration_version;
 pub mod child_idempotency_examples;
 pub mod continue_as_new_checkpoint_example;
+pub mod crate_packaging;
 pub mod dags_schedules_examples;
 pub mod default_run;
 pub mod dev_database_url_placeholder_caveat;
@@ -53,6 +54,8 @@ pub enum Command {
     ChildIdempotencyExamples(child_idempotency_examples::Args),
     /// Port of `scripts/check-continue-as-new-checkpoint-example.sh`.
     ContinueAsNewCheckpointExample(continue_as_new_checkpoint_example::Args),
+    /// Checks that each publishable crate packages for crates.io.
+    CratePackaging(crate_packaging::Args),
     /// Port of `scripts/check-dags-schedules-examples.sh`.
     DagsSchedulesExamples(dags_schedules_examples::Args),
     /// Port of `scripts/check-default-run.sh`.
@@ -115,6 +118,7 @@ pub fn run(command: Command) -> Result<ExitCode> {
         Command::ContinueAsNewCheckpointExample(args) => {
             continue_as_new_checkpoint_example::run(args)
         }
+        Command::CratePackaging(args) => crate_packaging::run(args),
         Command::DagsSchedulesExamples(args) => dags_schedules_examples::run(args),
         Command::DefaultRun(args) => default_run::run(args),
         Command::DevDatabaseUrlPlaceholderCaveat(args) => {

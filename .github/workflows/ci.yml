@@ -225,6 +225,12 @@ jobs:
         # crate must ship both license texts. Cargo does not copy a root file
         # into a crate. See xtask/src/check/license_files.rs.
         run: cargo xtask check license-files
+      - name: Check the crate publish plan
+        # Each publishable crate must be in the publish order of
+        # docs/releasing.md, after its dependencies. Every other crate sets
+        # `publish = false`. Release PRs run the full packaging check. See
+        # xtask/src/check/crate_packaging.rs.
+        run: cargo xtask check crate-packaging --plan-only
       - name: Check cargo-dev root caveat is documented
         # Guards a real, reproduced-live defect: `cargo dev` is the flagship
         # "no database, no Docker, nothing to configure" front door
