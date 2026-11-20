@@ -21,7 +21,7 @@
 //!
 //! Four partial indexes
 //! (`20260911213344_harvest_external_outbox_scan_indexes`) fix the first two.
-//! The pending table (`20261119232545_harvest_external_outbox_pending`) fixes
+//! The pending table (`20261119232545` and `20261120004046`) fixes
 //! the third: the claim reads one row for each unresolved request.
 //! `external_outbox_pending_tests` gates that table and the idle claim cost.
 //!

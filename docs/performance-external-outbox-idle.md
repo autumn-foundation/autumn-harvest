@@ -41,7 +41,8 @@ The legacy figures match the issue to the buffer.
 
 ## 🔧 Change
 
-Migration `20261119232545_harvest_external_outbox_pending` adds
+Migrations `20261119232545_harvest_external_outbox_pending` and
+`20261120004046_harvest_external_outbox_projection` add
 `harvest_external_outbox_pending`, one row for each unresolved request. The
 trigger `harvest_external_outbox_projection_trg` keeps it on `INSERT` into
 `harvest_events`:
@@ -49,10 +50,10 @@ trigger `harvest_external_outbox_projection_trg` keeps it on `INSERT` into
 - A request adds a row, unless its run already holds its resolution.
 - A resolution deletes each row of its run with the same type and key.
 
-The claim reads the table in `(requested_at, event_row_id)` order. It finds
-each event by its id in a `LATERAL` probe, and keeps each legacy predicate
-there. The lock moves into that probe. So it comes after the type, key and
-resolution checks, and it still locks the event row only. See
+The claim reads the table in `(requested_at, event_row_id)` order. A
+`LATERAL` probe checks each event by its id with each legacy predicate, after
+the executions probe. The event row then joins by that id alone, and the
+lock stays at the top: it falls only on the row that the claim returns. See
 `external_outbox_claim_query!` in `timeout.rs`.
 
 ## 📊 Measurement
@@ -90,25 +91,28 @@ at least 942,191.
 ## 💸 Write cost
 
 `wal.sql` inserts 10,000 requests, then 10,000 resolutions, with a
-`CHECKPOINT` before each step. Three runs on each schema:
+`CHECKPOINT` before each step. Three runs on each schema, in `wal-runs.txt`:
 
 | step | WAL bytes per row, before | after | time per 10,000 rows, before | after |
 |:--|--:|--:|--:|--:|
-| request | 1,007 | 1,494 to 1,534 | 191 to 262 ms | 511 to 560 ms |
-| resolution | 1,123 to 1,128 | 1,271 | 199 to 228 ms | 292 to 301 ms |
+| request | 1,007 | 1,493 | 188 to 215 ms | 559 to 605 ms |
+| resolution | 1,123 | 1,271 | 191 to 244 ms | 304 to 323 ms |
 
-So a request costs about 490 to 530 more bytes of WAL and about 30 µs. A
-resolution costs about 145 bytes and 9 µs. `wal-runs.txt` holds the runs. The request adds one heap row and three index
-entries, and the trigger runs one resolution probe. The other event types do
-not call the function: the `WHEN` clause filters them in the executor.
+So a request costs about 490 more bytes of WAL and about 40 µs. A
+resolution costs about 150 bytes and 10 µs. The request adds one heap row
+and three index entries, and the trigger runs one resolution probe. The
+other event types do not call the function: the `WHEN` clause filters them
+in the executor.
 
 ## 🗄️ Migration cost
 
 The backfill reads each request once and probes its resolution. It took
-1.4 s at H = 200k (`backfill-h200k.txt`). `CREATE TRIGGER` holds `SHARE ROW
-EXCLUSIVE` on `harvest_events` until the commit. The foreign key holds it on
-`harvest_workflow_executions`. So event appends, run starts and run state
-changes wait that long.
+about 1.1 to 1.4 s at H = 200k (`backfill-h200k.txt`). `CREATE TRIGGER`
+holds `SHARE ROW EXCLUSIVE` on `harvest_events` until the commit, so event
+appends wait that long. The table and its foreign key come in the previous
+migration. So no transaction locks both hot tables, and the migration
+cannot deadlock a transaction that appends an event and then updates its
+run.
 
 ## ✅ Equivalence
 
@@ -144,8 +148,11 @@ to `20261114213149`. Run `wal.sql` on a fresh database at each schema.
 
 - **A stranded request keeps its row.** A request whose run ends before
   delivery stays unresolved. Its row stays until retention removes the run.
-  The claim reads it and drops it at the executions probe. The cost follows
-  the number of such requests, not H.
+  Each claim reads it and drops it at the executions probe: about 3 buffers.
+  A review measured 15,103 buffers for each claim over 5,000 cancelled runs
+  with an open await. The cost follows the number of such requests, not H.
+  A row cannot go when its run ends: a redrive reopens a `FAILED` run under
+  the same id, and the legacy claim then delivers its open request.
 - **The cancel and await families are covered by construction.** One
   template builds the three claims, and the gates run each family. Only the
   signal family was measured on the issue fixture.

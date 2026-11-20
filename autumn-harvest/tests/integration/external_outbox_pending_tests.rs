@@ -32,8 +32,8 @@ use crate::integration_e2e::setup_test_database_url_or_env;
 /// The table under test.
 const PENDING_TABLE: &str = "harvest_external_outbox_pending";
 
-/// The migration that adds the table.
-const MIGRATION_DIR: &str = "20261119232545_harvest_external_outbox_pending";
+/// The migration that installs the trigger and the backfill.
+const MIGRATION_DIR: &str = "20261120004046_harvest_external_outbox_projection";
 
 /// The most buffers that an idle claim may read.
 ///
@@ -43,6 +43,14 @@ const IDLE_CLAIM_BUDGET: u64 = 16;
 
 /// The most buffers that a claim of one pending request may read.
 const ONE_ROW_CLAIM_BUDGET: u64 = 48;
+
+/// The most buffers that a stranded request may add to each claim: one probe
+/// of its run. A stranded request is unresolved, and its run has stopped or
+/// lives on another shard.
+const STRANDED_ROW_BUDGET: u64 = 6;
+
+/// A shard that no claim in this file serves.
+const OTHER_SHARD: i32 = 7;
 
 /// One outbox family: the request type, the two resolution types and the
 /// correlation key.
@@ -114,14 +122,24 @@ fn unique(prefix: &str) -> String {
     format!("{prefix}-{}", &suffix[..12])
 }
 
-/// Insert one run in `state` and return its id.
+/// Insert one run in `state` on shard 0 and return its id.
 async fn insert_run(conn: &mut AsyncPgConnection, workflow_name: &str, state: &str) -> uuid::Uuid {
+    insert_run_on(conn, workflow_name, state, 0).await
+}
+
+/// Insert one run in `state` on `shard` and return its id.
+async fn insert_run_on(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    state: &str,
+    shard: i32,
+) -> uuid::Uuid {
     let id = uuid::Uuid::new_v4();
     conn.batch_execute(&format!(
         "INSERT INTO harvest_workflow_executions \
              (id, workflow_name, workflow_id, run_id, shard_id, state, input, queue_name, \
               started_at, created_at) \
-         VALUES ('{id}', '{workflow_name}', '{workflow_name}-{id}', gen_random_uuid(), 0, \
+         VALUES ('{id}', '{workflow_name}', '{workflow_name}-{id}', gen_random_uuid(), {shard}, \
                  '{state}', '{{}}'::jsonb, 'default', NOW(), NOW())"
     ))
     .await
@@ -261,6 +279,36 @@ async fn claim_buffers(conn: &mut AsyncPgConnection, sql: &str) -> (u64, String)
     (top_node_buffers(&plan), plan)
 }
 
+/// Run one claim as the scanner does, on shard 0, and return the row id it
+/// claims.
+async fn claim_one(conn: &mut AsyncPgConnection, sql: &str) -> Option<i64> {
+    claim_on(conn, sql, 0).await
+}
+
+/// Run one claim for `shard` and return the row id it claims.
+async fn claim_on(conn: &mut AsyncPgConnection, sql: &str, shard: i32) -> Option<i64> {
+    let rows: Vec<IdRow> = diesel::sql_query(sql)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(vec![shard])
+        .bind::<diesel::sql_types::Array<BigInt>, _>(Vec::<i64>::new())
+        .load(conn)
+        .await
+        .expect("run the claim");
+    rows.into_iter().next().map(|r| r.id)
+}
+
+/// The cohort partition of the database clock, so a test near midnight
+/// names the partition that `NOW()` writes to.
+async fn partition_of_now(conn: &mut AsyncPgConnection) -> String {
+    let now: Vec<InstantRow> = diesel::sql_query("SELECT NOW() AS requested_at")
+        .load(conn)
+        .await
+        .expect("read the database clock");
+    autumn_harvest::partition::partition_name(autumn_harvest::partition::cohort_start(
+        now[0].requested_at,
+        autumn_harvest::partition::DEFAULT_COHORT_WIDTH_SECS,
+    ))
+}
+
 /// Sum `hit` and `read` on the first `Buffers:` line. `EXPLAIN` omits the
 /// line for a node that reads no buffer.
 fn top_node_buffers(plan: &str) -> u64 {
@@ -385,8 +433,8 @@ async fn a_resolution_of_another_run_or_family_leaves_the_row() {
     let (url, _container) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
     for (slot, family) in FAMILIES.iter().enumerate() {
-        let exec = insert_run(&mut conn, &unique("outbox_pending_scope"), "RUNNING").await;
-        let other = insert_run(&mut conn, &unique("outbox_pending_scope"), "RUNNING").await;
+        let exec = insert_run(&mut conn, &unique("outbox_pending_scope"), "COMPLETED").await;
+        let other = insert_run(&mut conn, &unique("outbox_pending_scope"), "COMPLETED").await;
         let request = keyed_event(&mut conn, exec, 1, family.requested, family.key, "k").await;
         keyed_event(&mut conn, other, 1, family.resolved[0], family.key, "k").await;
         let foreign = &FAMILIES[(slot + 1) % FAMILIES.len()];
@@ -514,7 +562,7 @@ async fn a_row_goes_with_its_run() {
 async fn a_row_keeps_the_request_instant() {
     let (url, _container) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
-    let exec = insert_run(&mut conn, &unique("outbox_pending_instant"), "RUNNING").await;
+    let exec = insert_run(&mut conn, &unique("outbox_pending_instant"), "COMPLETED").await;
     let rows: Vec<IdRow> = diesel::sql_query(format!(
         "INSERT INTO harvest_events (workflow_exec_id, event_id, event_type, event_data, timestamp) \
          VALUES ('{exec}', 1, 'ExternalSignalRequested', \
@@ -533,6 +581,24 @@ async fn a_row_keeps_the_request_instant() {
     .expect("read the row");
     let expected: Timestamp = "2020-01-02T03:04:05Z".parse().unwrap();
     assert_eq!(instant[0].requested_at, expected);
+}
+
+/// A request that rolls back leaves no row. The row commits with its event.
+#[tokio::test]
+async fn a_rolled_back_request_leaves_no_row() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let exec = insert_run(&mut conn, &unique("outbox_pending_rollback"), "COMPLETED").await;
+    conn.batch_execute(&format!(
+        "BEGIN; \
+         INSERT INTO harvest_events (workflow_exec_id, event_id, event_type, event_data, timestamp) \
+         VALUES {}; \
+         ROLLBACK;",
+        event_values(exec, 1, "ExternalSignalRequested", "{\"signal_id\": \"k\"}")
+    ))
+    .await
+    .expect("insert and roll back");
+    assert_eq!(pending_ids(&mut conn, &[exec]).await, Vec::<i64>::new());
 }
 
 // ── the claim ────────────────────────────────────────────────────────────────
@@ -575,18 +641,197 @@ async fn an_idle_claim_does_not_read_the_resolved_history() {
     for (slot, family) in FAMILIES.iter().enumerate() {
         let event_id = i32::try_from(slot).unwrap() + 1;
         keyed_event(&mut conn, exec, event_id, family.requested, family.key, "p").await;
+        let request = pending_ids(&mut conn, &[exec]).await;
         let (buffers, plan) = claim_buffers(&mut conn, (family.query)()).await;
         assert!(
-            plan.contains("rows=1 "),
-            "{}: the claim returns the pending request\n{plan}",
+            plan.lines().next().is_some_and(|l| l.contains("rows=1 ")),
+            "{}: the claim returns one row\n{plan}",
+            family.requested
+        );
+        assert_eq!(
+            claim_one(&mut conn, (family.query)()).await,
+            request.last().copied(),
+            "{}: the claim returns the pending request",
             family.requested
         );
         assert!(
-            buffers <= ONE_ROW_CLAIM_BUDGET,
+            buffers > 0 && buffers <= ONE_ROW_CLAIM_BUDGET,
             "{}: a claim of one request read {buffers} buffers\n{plan}",
             family.requested
         );
     }
+}
+
+/// A stranded request is unresolved, but its run has stopped or lives on
+/// another shard. It keeps its row until retention removes the run. Each
+/// such row adds one executions probe to a claim, and the claim locks none.
+#[tokio::test]
+async fn a_stranded_request_costs_one_probe_and_takes_no_lock() {
+    let bench = isolated_db().await;
+    let mut conn = claim_bench_db::connect(&bench.url).await;
+    let mut stranded = Vec::new();
+    for n in 0..100 {
+        let done = insert_run(&mut conn, "outbox_stranded", "COMPLETED").await;
+        let away = insert_run_on(&mut conn, "outbox_stranded", "RUNNING", OTHER_SHARD).await;
+        for exec in [done, away] {
+            stranded.push(
+                keyed_event(
+                    &mut conn,
+                    exec,
+                    1,
+                    "ExternalSignalRequested",
+                    "signal_id",
+                    &format!("s{n}"),
+                )
+                .await,
+            );
+        }
+    }
+    conn.batch_execute(
+        "ANALYZE harvest_external_outbox_pending; ANALYZE harvest_workflow_executions;",
+    )
+    .await
+    .expect("analyze");
+
+    let rows = u64::try_from(stranded.len()).unwrap();
+    let (buffers, plan) = claim_buffers(&mut conn, external_signal_outbox_claim_query()).await;
+    assert!(
+        buffers <= IDLE_CLAIM_BUDGET + rows * STRANDED_ROW_BUDGET,
+        "{rows} stranded requests cost {buffers} buffers\n{plan}"
+    );
+
+    let mut other = claim_bench_db::connect(&bench.url).await;
+    conn.batch_execute("BEGIN").await.expect("begin");
+    assert_eq!(
+        claim_one(&mut conn, external_signal_outbox_claim_query()).await,
+        None
+    );
+    let locked: Vec<IdRow> = diesel::sql_query(format!(
+        "SELECT id FROM harvest_events WHERE id IN ({}) FOR UPDATE NOWAIT",
+        stranded
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+    .load(&mut other)
+    .await
+    .expect("the claim must lock no stranded request");
+    assert_eq!(locked.len(), stranded.len());
+    conn.batch_execute("COMMIT").await.expect("commit");
+}
+
+/// Two claimers in flight take two requests. `SKIP LOCKED` passes the row
+/// that the first one holds, and each takes the oldest that is free.
+#[tokio::test]
+async fn two_claimers_take_two_requests_in_order() {
+    let bench = isolated_db().await;
+    let mut first = claim_bench_db::connect(&bench.url).await;
+    let mut second = claim_bench_db::connect(&bench.url).await;
+    let exec = insert_run(&mut first, "outbox_two_claimers", "RUNNING").await;
+    let older = keyed_event(
+        &mut first,
+        exec,
+        1,
+        "ExternalSignalRequested",
+        "signal_id",
+        "a",
+    )
+    .await;
+    let newer = keyed_event(
+        &mut first,
+        exec,
+        2,
+        "ExternalSignalRequested",
+        "signal_id",
+        "b",
+    )
+    .await;
+
+    first.batch_execute("BEGIN").await.expect("begin");
+    second.batch_execute("BEGIN").await.expect("begin");
+    let sql = external_signal_outbox_claim_query();
+    assert_eq!(claim_one(&mut first, sql).await, Some(older));
+    assert_eq!(claim_one(&mut second, sql).await, Some(newer));
+    assert_eq!(claim_on(&mut second, sql, OTHER_SHARD).await, None);
+    first.batch_execute("COMMIT").await.expect("commit");
+    second.batch_execute("COMMIT").await.expect("commit");
+}
+
+/// A stale row, for a request that a resolution already closed, never makes
+/// the claim deliver again. The table is a candidate set, not an authority.
+#[tokio::test]
+async fn a_stale_row_does_not_claim_a_resolved_request() {
+    let bench = isolated_db().await;
+    let mut conn = claim_bench_db::connect(&bench.url).await;
+    let exec = insert_run(&mut conn, "outbox_stale_row", "RUNNING").await;
+    let request = keyed_event(
+        &mut conn,
+        exec,
+        1,
+        "ExternalSignalRequested",
+        "signal_id",
+        "k",
+    )
+    .await;
+    keyed_event(
+        &mut conn,
+        exec,
+        2,
+        "ExternalSignalDelivered",
+        "signal_id",
+        "k",
+    )
+    .await;
+    conn.batch_execute(&format!(
+        "INSERT INTO {PENDING_TABLE} \
+             (event_row_id, workflow_exec_id, request_type, correlation_id, requested_at) \
+         VALUES ({request}, '{exec}', 'ExternalSignalRequested', 'k', NOW()), \
+                (-1, '{exec}', 'ExternalSignalRequested', 'gone', NOW())"
+    ))
+    .await
+    .expect("plant stale rows");
+    assert_eq!(
+        claim_one(&mut conn, external_signal_outbox_claim_query()).await,
+        None
+    );
+}
+
+/// A backlog with accurate statistics reads the claim index in order. A
+/// scan and a sort of each pending row would make a drain quadratic.
+#[tokio::test]
+async fn a_backlog_claim_reads_the_claim_index_in_order() {
+    let bench = isolated_db().await;
+    let mut conn = claim_bench_db::connect(&bench.url).await;
+    for _ in 0..50 {
+        insert_run(&mut conn, "outbox_backlog", "RUNNING").await;
+    }
+    conn.batch_execute(
+        "INSERT INTO harvest_events (workflow_exec_id, event_id, event_type, event_data, timestamp) \
+         SELECT x.id, g, 'ExternalSignalRequested', \
+                jsonb_build_object('type', 'ExternalSignalRequested', \
+                    'data', jsonb_build_object('signal_id', 'b-' || g)), \
+                NOW() - (g || ' seconds')::interval \
+         FROM harvest_workflow_executions x, generate_series(1, 100) g \
+         WHERE x.workflow_name = 'outbox_backlog'; \
+         ANALYZE harvest_external_outbox_pending; ANALYZE harvest_events; \
+         ANALYZE harvest_workflow_executions;",
+    )
+    .await
+    .expect("seed a backlog of 5,000 requests");
+    let (buffers, plan) = claim_buffers(&mut conn, external_signal_outbox_claim_query()).await;
+    assert!(
+        plan.contains("idx_harvest_external_outbox_pending_claim"),
+        "the claim reads the claim index\n{plan}"
+    );
+    assert!(
+        !plan.contains("Sort"),
+        "the index supplies the order\n{plan}"
+    );
+    assert!(
+        buffers <= ONE_ROW_CLAIM_BUDGET,
+        "a claim over a backlog read {buffers} buffers\n{plan}"
+    );
 }
 
 // ── the migration ────────────────────────────────────────────────────────────
@@ -656,6 +901,37 @@ async fn the_migration_backfills_each_unresolved_request() {
         .await
         .expect("apply the migration");
     assert_eq!(pending_ids(&mut conn, &execs).await, expected);
+    for row in pending_rows(&mut conn, &execs).await {
+        let family = FAMILIES
+            .iter()
+            .find(|f| f.requested == row.request_type)
+            .expect("a known request type");
+        assert!(
+            ["open", "left"].contains(&row.correlation_id.as_str()),
+            "{}: the backfill copies the key, not {}",
+            family.requested,
+            row.correlation_id
+        );
+    }
+    // A resolution after the backfill finds its row by the copied key.
+    for (slot, family) in FAMILIES.iter().enumerate() {
+        let running = execs[slot * 2];
+        let base = i32::try_from(slot).unwrap() * 10;
+        keyed_event(
+            &mut conn,
+            running,
+            base + 4,
+            family.resolved[0],
+            family.key,
+            "open",
+        )
+        .await;
+    }
+    assert_eq!(
+        pending_ids(&mut conn, &execs).await.len(),
+        3,
+        "only the stranded rows stay"
+    );
 
     let later = insert_run(&mut conn, "outbox_backfill", "RUNNING").await;
     keyed_event(
@@ -694,6 +970,13 @@ async fn the_trigger_survives_each_layout_change() {
         assert!(
             pending_ids(conn, &[exec]).await.contains(&id),
             "the trigger adds a row after the layout change"
+        );
+        let table = pending_ids(conn, &[exec]).await;
+        assert_eq!(table, legacy_unresolved(conn, &[exec]).await);
+        assert_eq!(
+            claim_one(conn, external_signal_outbox_claim_query()).await,
+            table.iter().next().copied(),
+            "the claim still joins each row to its event"
         );
     };
     request(&mut conn).await;
@@ -751,10 +1034,7 @@ async fn a_default_partition_drain_keeps_the_table_exact() {
         .await
         .expect("convert");
     }
-    let today = autumn_harvest::partition::partition_name(autumn_harvest::partition::cohort_start(
-        Timestamp::now(),
-        autumn_harvest::partition::DEFAULT_COHORT_WIDTH_SECS,
-    ));
+    let today = partition_of_now(&mut conn).await;
     conn.batch_execute(&format!("DROP TABLE {today}"))
         .await
         .expect("park new rows in the DEFAULT partition");
@@ -766,11 +1046,26 @@ async fn a_default_partition_drain_keeps_the_table_exact() {
     keyed_event(&mut conn, exec, 3, family.resolved[0], family.key, "shut").await;
     assert_eq!(pending_ids(&mut conn, &[exec]).await, vec![open]);
 
+    // The partitioned layout keeps the events of a removed run until a
+    // partition drops. The drain moves them too, and must not fail on them.
+    let orphan = insert_run(&mut conn, "outbox_drain", "RUNNING").await;
+    keyed_event(&mut conn, orphan, 1, family.requested, family.key, "lost").await;
+    conn.batch_execute(&format!(
+        "DELETE FROM harvest_workflow_executions WHERE id = '{orphan}'"
+    ))
+    .await
+    .expect("remove the run, keep its events");
+
     let moved = autumn_harvest::partition::drain_default(&mut conn)
         .await
         .expect("drain");
-    assert!(moved >= 3, "the drain moves the parked rows");
+    assert!(moved >= 4, "the drain moves the parked rows");
     assert_eq!(pending_ids(&mut conn, &[exec]).await, vec![open]);
+    assert_eq!(pending_ids(&mut conn, &[orphan]).await, Vec::<i64>::new());
+    assert_eq!(
+        claim_one(&mut conn, external_signal_outbox_claim_query()).await,
+        Some(open)
+    );
 }
 
 // ── property ─────────────────────────────────────────────────────────────────
@@ -790,8 +1085,8 @@ fn ops() -> impl Strategy<Value = Vec<Op>> {
 async fn check_against_the_legacy_set(url: &str, ops: Vec<Op>) -> Result<(), TestCaseError> {
     let mut conn = connect(url).await;
     let execs = [
-        insert_run(&mut conn, "outbox_pending_prop", "RUNNING").await,
-        insert_run(&mut conn, "outbox_pending_prop", "RUNNING").await,
+        insert_run(&mut conn, "outbox_pending_prop", "COMPLETED").await,
+        insert_run(&mut conn, "outbox_pending_prop", "COMPLETED").await,
     ];
     let mut next_event = [1i32, 1i32];
     let mut statement: Vec<String> = Vec::new();
@@ -847,4 +1142,18 @@ fn the_table_matches_the_legacy_unresolved_set() {
             runtime.block_on(check_against_the_legacy_set(&url, ops))
         })
         .unwrap();
+    runtime.block_on(async move { drop(_container) });
+}
+
+/// The buffer parser reads the top node and ignores the planning line.
+#[test]
+fn the_buffer_parser_reads_the_top_node() {
+    let plan = "Limit (actual rows=1 loops=1)\n  Buffers: shared hit=12 read=1\n  \
+                ->  Index Scan (actual rows=1 loops=1)\n        Buffers: shared hit=4\n\
+                Planning:\n  Buffers: shared hit=254";
+    assert_eq!(top_node_buffers(plan), 13);
+    assert_eq!(
+        top_node_buffers("Limit (actual rows=0 loops=1)\nPlanning:\n  Buffers: shared hit=9"),
+        0
+    );
 }

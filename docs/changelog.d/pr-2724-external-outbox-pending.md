@@ -5,7 +5,8 @@ each claim walked every request the deployment ever made: 942,191 buffers
 at 200,000 resolved requests and no pending request. After a vacuum of the
 new table, it reads 0.
 
-Migration `20261119232545` adds `harvest_external_outbox_pending`, one row
+Migrations `20261119232545` and `20261120004046` add
+`harvest_external_outbox_pending`, one row
 for each unresolved signal, cancel or await request. An `AFTER INSERT`
 trigger on `harvest_events` adds the row with the request. It deletes the
 row with the resolution, in the same transaction, on every insert path. A
@@ -25,5 +26,5 @@ preflight checks `SELECT`, `INSERT` and `DELETE` on the table.
 Evidence: `external_outbox_pending_tests` gates the trigger, the backfill,
 each layout change and a `DEFAULT` partition drain. It also bounds the idle
 claim, and a property test compares the table with the legacy set. Write
-cost: about 490 to 530 bytes of WAL and about 30 µs for each request. See
+cost: about 490 bytes of WAL and about 40 µs for each request. See
 `docs/performance-external-outbox-idle.md` and `docs/design/DESIGN-2724.md`.

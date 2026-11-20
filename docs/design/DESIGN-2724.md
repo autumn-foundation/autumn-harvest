@@ -42,9 +42,11 @@ such claims about twice a second.
 | A pending row outlives its run. | A foreign key cascades the delete. A shard move deletes the rows of a staged copy. |
 | A moved row has no run (partitioned layout). The foreign key fails the move. | The trigger skips a row with no run, as the entity projection does. |
 | The backfill misses a request that commits during the migration. | `CREATE TRIGGER` takes `SHARE ROW EXCLUSIVE`. No insert runs until the commit, so the backfill sees each committed request. |
+| The migration deadlocks a transaction that appends an event and then updates its run. | The foreign key and the trigger go in two migrations, so no transaction locks both tables. |
+| A drain inserts a row for a run that a concurrent delete removes. The foreign key fails the drain. | The trigger probes the run `FOR KEY SHARE`, so it waits for the delete and then skips the row. |
 | The worker role cannot write the new table. Every request insert fails. | The upgrade guide lists the grants, as for `harvest_entity_state`. |
 | Concurrent resolutions deadlock on the pending row. | The claim locks the event row only, as before. A resolution deletes the pending row last, after its other locks. |
-| The claim locks a row that it then discards. | The lock sits inside the event probe, after the type, key and resolution checks. It still locks the event row only. |
+| The claim locks a row that it then discards. | The checks run in an unlocked probe. The lock stays at the top, on the one row that the claim returns. |
 
 ## Six thinking hats
 
@@ -81,7 +83,11 @@ Option 2, the remedy that the issue recommends, written by a trigger:
 - The claim reads the table in `(requested_at, event_row_id)` order. It
   keeps every legacy predicate, so it selects a subset of the legacy rows.
   The table holds each unresolved request, so the subset is the whole set.
-- The migration backfills each unresolved request in one transaction.
+- Two migrations. The first adds the table, its foreign key and the
+  function. The second installs the trigger and backfills each unresolved
+  request in one transaction. So no transaction locks both hot tables.
+- A stranded request keeps its row until retention. A redrive can reopen a
+  `FAILED` run, so a row cannot go when its run ends.
 - `idx_harvest_events_external_outbox_pending` stays for a rolling deploy.
 
 ## Acceptance criteria

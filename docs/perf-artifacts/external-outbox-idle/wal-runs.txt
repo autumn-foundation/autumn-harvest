@@ -1,0 +1,30 @@
+NOTICE:  database "wal_before" does not exist, skipping
+== before run 1
+Time: 188.037 ms
+Time: 190.886 ms
+     1007.3568000000000000 |        1122.5488000000000000
+NOTICE:  database "wal_after" does not exist, skipping
+== after run 1
+Time: 558.867 ms
+Time: 312.290 ms
+     1492.9656000000000000 |        1271.3520000000000000
+NOTICE:  database "wal_before" does not exist, skipping
+== before run 2
+Time: 215.315 ms
+Time: 199.984 ms
+     1007.3592000000000000 |        1122.5464000000000000
+NOTICE:  database "wal_after" does not exist, skipping
+== after run 2
+Time: 603.647 ms
+Time: 323.230 ms
+     1493.6296000000000000 |        1271.3480000000000000
+NOTICE:  database "wal_before" does not exist, skipping
+== before run 3
+Time: 196.569 ms
+Time: 244.438 ms
+     1007.3568000000000000 |        1122.5488000000000000
+NOTICE:  database "wal_after" does not exist, skipping
+== after run 3
+Time: 605.471 ms
+Time: 304.155 ms
+     1493.6152000000000000 |        1271.3480000000000000

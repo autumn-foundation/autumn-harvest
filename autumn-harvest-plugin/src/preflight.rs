@@ -2524,7 +2524,7 @@ mod tests {
     fn the_external_outbox_pending_table_is_covered_by_the_privilege_probe() {
         let covered = HARVEST_WRITE_PRIVILEGE_REQUIREMENTS
             .iter()
-            .find(|(name, _)| *name == "harvest_external_outbox_pending")
+            .find(|(name, _)| *name == autumn_harvest::external_outbox::PENDING_TABLE)
             .map(|(_, privileges)| *privileges);
         assert_eq!(covered, Some(&["SELECT", "INSERT", "DELETE"][..]));
     }

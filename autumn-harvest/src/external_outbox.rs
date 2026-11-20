@@ -92,10 +92,14 @@ pub(crate) fn create_projection_trigger_sql() -> String {
 mod tests {
     use super::*;
 
-    const UP: &str =
+    const TABLE_UP: &str =
         include_str!("../migrations/20261119232545_harvest_external_outbox_pending/up.sql");
-    const DOWN: &str =
+    const TABLE_DOWN: &str =
         include_str!("../migrations/20261119232545_harvest_external_outbox_pending/down.sql");
+    const TRIGGER_UP: &str =
+        include_str!("../migrations/20261120004046_harvest_external_outbox_projection/up.sql");
+    const TRIGGER_DOWN: &str =
+        include_str!("../migrations/20261120004046_harvest_external_outbox_projection/down.sql");
 
     fn squash(sql: &str) -> String {
         sql.split_whitespace()
@@ -106,20 +110,28 @@ mod tests {
     }
 
     /// The migration and the partition paths must install the same trigger.
+    /// The first migration holds no trigger, so no transaction locks both hot
+    /// tables.
     #[test]
-    fn the_migration_installs_the_projection_trigger() {
+    fn the_migrations_install_the_projection_trigger() {
         let trigger = squash(&create_projection_trigger_sql());
-        assert!(squash(UP).contains(&trigger), "{trigger}");
-        for name in [PENDING_TABLE, PROJECTION_FUNCTION, PROJECTION_TRIGGER] {
-            assert!(UP.contains(name), "the migration must use {name}");
-            assert!(DOWN.contains(name), "the revert must drop {name}");
+        assert!(squash(TRIGGER_UP).contains(&trigger), "{trigger}");
+        assert!(!TABLE_UP.contains("CREATE TRIGGER"));
+        assert!(!TRIGGER_UP.contains("REFERENCES"));
+        for name in [PENDING_TABLE, PROJECTION_FUNCTION] {
+            assert!(
+                TABLE_UP.contains(name),
+                "the first migration must add {name}"
+            );
+            assert!(TABLE_DOWN.contains(name), "its revert must drop {name}");
         }
+        assert!(TRIGGER_DOWN.contains(PROJECTION_TRIGGER));
     }
 
     /// The function, the backfill and the `CHECK` name each type and key.
     #[test]
     fn the_migration_names_each_family() {
-        let up = squash(UP);
+        let up = squash(&format!("{TABLE_UP}\n{TRIGGER_UP}"));
         for family in FAMILIES {
             let [first, second] = family.resolved;
             assert!(

@@ -1,0 +1,15 @@
+-- 20261119232545 then 20261120004046 on the issue fixture at H = 200k
+PostgreSQL 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1) on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+-- 20261119232545_harvest_external_outbox_pending
+Time: 0.424 ms
+Time: 9.859 ms
+Time: 1.314 ms
+Time: 1.090 ms
+Time: 0.602 ms
+Time: 3.253 ms
+Time: 0.101 ms
+-- 20261120004046_harvest_external_outbox_projection
+Time: 0.247 ms
+Time: 1.441 ms
+INSERT 0 0
+Time: 2825.597 ms (00:02.826)

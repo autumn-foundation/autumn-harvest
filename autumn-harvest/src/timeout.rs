@@ -292,18 +292,23 @@ pub const fn workflow_history_ceiling_query() -> &'static str {
 /// `INNER JOIN` against 6,358. It buys a plan that cannot change shape with
 /// the statistics.
 ///
-/// The event pin is load-bearing. A plain join lets the planner read the
-/// request rows through `idx_harvest_events_external_outbox_pending`. The
-/// literal `event_type` makes that index usable. An equivalence class
-/// carries the literal over a join qual too. A qual such as `ev.event_type
-/// = p.request_type` would not stop it either. On a small fixture the planner chose
-/// that walk under a `Materialize`. The walk reads the whole history again.
+/// The event pin is load-bearing. A plain join that carries the legacy
+/// predicates lets the planner read the request rows through
+/// `idx_harvest_events_external_outbox_pending`. The literal `event_type`
+/// makes that index usable. An equivalence class carries the literal over a
+/// join qual too. A qual such as `ev.event_type = p.request_type` would not
+/// stop it either. On a small fixture the planner chose that walk under a
+/// `Materialize`. The walk reads the whole history again.
 ///
-/// `e` is a subquery, so `FOR UPDATE OF e` takes its lock inside it. The lock
-/// comes after the type, key and resolution checks. The executions probe can
-/// run after the lock. The claim then locks the request of a run that is not
-/// RUNNING, and skips it. The lock ends with the step transaction. Erasure
-/// and codec rotation update event rows, so each waits one step at most.
+/// So the `unresolved` probe holds every legacy predicate, and returns only
+/// the id. It names `running`, so it runs after the executions probe. The
+/// outer `e` joins by that id alone. No literal reaches `e`, so the history
+/// index cannot serve it.
+///
+/// `FOR UPDATE OF e` stays at the top. The lock falls only on the row that
+/// the `LIMIT` returns, after each check, as in the legacy query. A lock
+/// inside a subquery runs for each candidate. Under a scan and a sort, it
+/// locks each pending request of the shard for the whole step.
 ///
 /// The resolution check stays a `NOT EXISTS`. A `LEFT JOIN LATERAL ... WHERE
 /// res.resolved IS NULL` selects the same rows and costs more. As an
@@ -344,10 +349,10 @@ macro_rules! external_outbox_claim_query {
                  LIMIT 1 \
              ) running ON TRUE \
              JOIN LATERAL ( \
-                 SELECT ev.id, ev.workflow_exec_id, ev.event_id, ev.event_type, \
-                        ev.event_data, ev.timestamp \
+                 SELECT ev.id AS event_row_id \
                  FROM harvest_events ev \
                  WHERE ev.id = p.event_row_id \
+                   AND running.running_exec = 1 \
                    AND ev.event_type = '",
             $requested,
             "' \
@@ -369,7 +374,8 @@ macro_rules! external_outbox_claim_query {
             "' \
                    ) \
                  LIMIT 1 \
-             ) e ON TRUE \
+             ) unresolved ON TRUE \
+             JOIN harvest_events e ON e.id = unresolved.event_row_id \
              WHERE p.request_type = '",
             $requested,
             "' \
@@ -8439,6 +8445,15 @@ mod tests {
             // request history again.
             assert_eq!(sql.matches("JOIN LATERAL").count(), 2, "{sql}");
             assert!(sql.contains("WHERE ev.id = p.event_row_id"), "{sql}");
+            // The outer event row carries no literal, so the history index
+            // cannot serve it. The lock is on that row, at the top.
+            assert!(
+                sql.contains("JOIN harvest_events e ON e.id = unresolved.event_row_id WHERE"),
+                "{}",
+                sql.split_whitespace().collect::<Vec<_>>().join(" ")
+            );
+            // The event probe follows the executions probe.
+            assert!(sql.contains("AND running.running_exec = 1"), "{sql}");
             // Keeps the resolution check an anti-join.
             assert!(sql.contains("NOT EXISTS"), "{sql}");
             assert!(!sql.contains("LEFT JOIN LATERAL"), "{sql}");
