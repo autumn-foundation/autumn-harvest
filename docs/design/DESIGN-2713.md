@@ -135,3 +135,141 @@ Out of scope:
    under a concurrent pause, completion and reclaim.
 7. A Ledger page records the before and after cost, end to end and on the
    fixture.
+
+## Addendum: by-execution statements
+
+The first change kept the by-id statements on the primary key. The issue
+also names "the completion and re-pend UPDATEs". The re-pend statements
+find task rows by `workflow_exec_id`, not by `id`. They have the same
+defect, through `idx_harvest_tq_workflow`.
+
+### Facts (white hat)
+
+Fixture: 1,000,000 rows, 4 rows per execution. Generic plan. Buffers are
+`shared hit + read` of the top plan node. The idle case analyzes terminal
+rows only. Then 40,000 live rows arrive with no new analyze.
+
+| Statement | Grouped, 5 per worker | Idle statistics |
+|---|--:|--:|
+| wake re-pend | 4 → 4 | 1,411 → 4 |
+| wake fallback | 507 → 9 | 1,235 → 9 |
+| due-row read of a wake | 4 → 4 | 1,220 → 4 |
+| owner key read | 12 → 4 | 1,221 → 4 |
+| fail or cancel of open tasks | 64 → 69 | 1,462 → 60 |
+| drain of a failed or timed-out run | 69 → 69 | 1,466 → 60 |
+| deadline shift of a resume | 1 → 5 | 1,338 → 148 |
+| in-flight count | 4 → 4 | 1,412 → 5 |
+| pending-row delete of a cancel | 4 → 4 | 18 → 4 |
+| parked-row read of a migration | 7 → 7 | 1,414 → 7 |
+| fork loser cancel | 2 → 2 | 2 → 2 |
+| session liveness check | 2 → 4 | 2 → 4 |
+
+The fallback has the issue's own defect. At 5 `RUNNING` rows per worker,
+it scans all of `running_worker_idx` with `worker_id IS NOT NULL`. That
+reads every `RUNNING` row in the table, not only those of one worker.
+
+With idle statistics, most statements scan a partial index of live rows.
+That reads every live row. A wake runs the re-pend on each activity
+completion, signal and child result.
+
+A write figure includes the rows that it changes. The deadline shift
+changes four rows with a deadline, so it reads more than a read does.
+
+In the grouped fixture, the plain deadline shift reads an empty partial
+index. In production, that index holds each live task with a deadline.
+
+The fork cancel and the session check also key on `activity_id` and
+`session_id`. Their plain form chose its keyed index here. In an earlier
+fixture with no session rows, the plain session check chose
+`idx_harvest_tq_live_created`, and the plain fork cancel did the same with
+no activity rows. The choice depends on index sizes, so it is not stable.
+The `CASE` form costs 2 or 4 buffers in each fixture.
+
+### Options (green hat, brainstorming)
+
+1. Hide the guard with `row_guard_sql!` and `row_guard`, as for the by-id
+   statements.
+2. Add `(workflow_exec_id, state)` to each partial index. That needs a
+   concurrent build of several indexes on a hot table.
+3. Make the execution index partial on the live states. A wake also reads
+   terminal rows, and the idle case still picks `live_created`.
+4. Accept the cost. The idle case reads every live row on each wake.
+
+Decision: option 1. It is the same form, the same proof and no migration.
+
+### Reverse brainstorming: how can this change fail?
+
+| Way to fail | Prevention |
+|---|---|
+| The guard hides a key column, such as `session_id` or `activity_id`. | Wrap only `state`, `task_type` and `worker_id` terms. Keep each key test plain. A `session_id` test then has no index, so the execution index serves it. |
+| An `OR` guard is split, and part of it stays plain. | Wrap the whole parenthesized `OR` as one top-level `AND` term. |
+| A guard in a CTE wraps the `EXISTS` of the CTE. | Wrap the guard only. The `EXISTS` term stays a separate top-level term. |
+| A wake fallback misses a park, so a wake is lost. | A concurrency test runs the fallback behind a park in both forms. |
+| A new by-execution statement uses a plain guard. | The source walks check every engine file, not six. |
+| The plan test expects the primary key for a by-execution statement. | Each statement names the index that it must read. |
+
+### Feelings (red hat)
+
+A second family makes the rule broader. One rule for both families is
+easier to keep than a list of exceptions.
+
+### Risks (black hat)
+
+- Semantics. The truth table, the differential run and the concurrency test
+  cover the new statements.
+- A by-execution statement with no other index. Each one keys on
+  `workflow_exec_id`, and `idx_harvest_tq_workflow` covers every row.
+- The fork cancel keys on `activity_id` too. It must keep
+  `idx_harvest_tq_activity_id`.
+- The session check loses `idx_harvest_tq_session_active`. It reads 4
+  buffers, not 2, when the plain form chooses that index. The plain form
+  can also choose a scan of every live row, so the trade is accepted.
+
+### Benefits (yellow hat)
+
+- A wake costs a few buffers for any queue size and any statistics.
+- No migration and no index build.
+
+### Scope (blue hat)
+
+In scope: each statement that finds task rows by `workflow_exec_id` and
+guards them on `state`, `task_type` or `worker_id`.
+
+- `queue`: the wake re-pend, the wake fallback, the due-row read of a wake,
+  the owner key read, the fail and cancel of open tasks, and the session
+  liveness check.
+- `execution`: the deadline shift of a resume and the pending-row delete
+  of a cancel.
+- The drains of `poison_pill`, `worker` and `timeout`.
+- The fork loser cancel, the reset count and the retention count.
+- `shard_rebalance`: the parked-row read, the seal cancel and the signal
+  re-pend.
+
+Out of scope: a join on `workflow_exec_id`, and a scan that excludes
+executions. Neither one keys on an execution. The deadline shift of
+`harvest_external_tasks` is on another table.
+
+### Plan
+
+1. RED. Add the by-execution statements to `guarded_statements`, each with
+   its key index. Seed the plan test with executions. The plan test then
+   fails for each statement that leaves its key index. Widen the source
+   walks to every engine file and to by-execution keys.
+2. GREEN. Wrap each guard. Extract the inline wake read to a `const fn`,
+   and the two inline migration statements to constants.
+3. Proof. Add the by-execution raw statements to the differential run. Add
+   a fallback-behind-a-park case and a re-pend case to the concurrency test.
+4. Measure. Record the fixture figures on the performance page.
+5. REFACTOR. Run the gates.
+
+### Acceptance criteria
+
+8. Each by-execution statement in scope reads its key index at 5 to 200
+   `RUNNING` rows per worker and after an idle analyze, under the generic
+   and the custom plan.
+9. Each raw by-execution statement keeps the same rows in both forms, and
+   the wake fallback and re-pend keep them beside a concurrent park.
+10. A source walk over every engine file fails on a plain by-id or
+    by-execution guard.
+11. The performance page records the before and after cost of the
+    by-execution statements.

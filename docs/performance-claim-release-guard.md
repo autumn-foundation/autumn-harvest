@@ -129,6 +129,59 @@ Issue #2713 measured 21.8 buffers per recheck on another machine. There the
 bench chose `idx_harvest_tq_running_started`. The total stays within run
 noise.
 
+## 🧭 By-execution statements
+
+A wake, a drain and a cancel find task rows by `workflow_exec_id`, not by
+`id`. Their guard has the same defect. The key index is
+`idx_harvest_tq_workflow`, which covers every row. The same `CASE` form
+keeps each one on that index.
+
+The fixture has 1,000,000 rows and 4 rows for each execution. The idle
+case analyzes terminal rows only. Then 40,000 live rows arrive with no new
+analyze. Each figure is a generic plan, warm, in buffers.
+
+| Statement | 5 per worker | Idle statistics |
+|---|--:|--:|
+| `queue::wake_workflow_task`, re-pend | 4 → 4 | 1,411 → 4 |
+| `queue::wake_workflow_task`, fallback | 507 → 9 | 1,235 → 9 |
+| `queue::wake_workflow_task`, due-row read | 4 → 4 | 1,220 → 4 |
+| `queue::owner_keys` | 12 → 4 | 1,221 → 4 |
+| `queue::fail_open_tasks_for_execution` | 64 → 69 | 1,462 → 60 |
+| drain of a failed or timed-out run | 69 → 69 | 1,466 → 60 |
+| `execution::shift_schedule_to_close_on_resume_query` | 1 → 5 | 1,338 → 148 |
+| in-flight count of retention and reset | 4 → 4 | 1,412 → 5 |
+| pending-row delete of a cancel | 4 → 4 | 18 → 4 |
+| parked-row read of a migration | 7 → 7 | 1,414 → 7 |
+| fork loser cancel | 2 → 2 | 2 → 2 |
+| `queue::session_has_other_live_tasks` | 2 → 4 | 2 → 4 |
+
+At 5 rows per worker, the plain fallback scans all of
+`running_worker_idx`, so it reads every `RUNNING` row in the table. With
+idle statistics, most plain statements scan a partial index of live rows.
+A write figure includes the rows that it changes.
+
+The fork cancel and the session check also key on `activity_id` and
+`session_id`. Their plain form chose its keyed index on this fixture. On a
+fixture with no activity or session rows, each one chose
+`idx_harvest_tq_live_created`. The `CASE` form costs 2 or 4 buffers on
+every fixture.
+
+The in-scope statements:
+
+- `queue`: the three wake statements, `owner_keys`, the fail and cancel of
+  open tasks, and `session_has_other_live_tasks`
+- `execution`: the deadline shift of a resume, and the pending-row delete
+  of a cancel
+- the drains of `poison_pill`, `worker` and `timeout`
+- the fork loser cancel, and the in-flight counts of `reset` and
+  `retention`
+- `shard_rebalance`: the parked-row read, the seal cancel and the signal
+  re-pend
+
+The plan test checks each raw statement and a sample of each Diesel shape.
+The source walks check every engine file for a plain by-id or
+by-execution guard.
+
 ## 🔬 Reproduce
 
 ```sh
@@ -137,5 +190,5 @@ HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
 ```
 
 The test seeds 100,000 rows, which is enough for the same plan choice. On
-the parent commit it fails, and it names each statement that leaves the
-primary key.
+the parent commit it fails, and it names each statement that leaves its
+key index.

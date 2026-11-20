@@ -4661,7 +4661,9 @@ async fn should_skip_candidate(
 
     let inflight_task_count = harvest_task_queue::table
         .filter(harvest_task_queue::workflow_exec_id.eq(Some(candidate.id)))
-        .filter(harvest_task_queue::state.eq_any(["PENDING", "RUNNING"]))
+        .filter(crate::row_guard::row_guard(
+            harvest_task_queue::state.eq_any(["PENDING", "RUNNING"]),
+        ))
         .count()
         .get_result::<i64>(conn)
         .await

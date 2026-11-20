@@ -3,6 +3,6 @@
 ["guarded_statements"]
 driver = "test_support"
 backend = ["postgres"]
-kind = ["write"]
+kind = ["read", "write"]
 tables = ["harvest_task_queue"]
 measured = "unmeasured"

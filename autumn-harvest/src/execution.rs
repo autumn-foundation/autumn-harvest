@@ -4285,8 +4285,12 @@ async fn cancel_workflow_execution_collect_mode(
                         crate::schema::harvest_task_queue::workflow_exec_id
                             .eq(Some(exec_id.as_uuid())),
                     )
-                    .filter(crate::schema::harvest_task_queue::task_type.eq("workflow"))
-                    .filter(crate::schema::harvest_task_queue::state.eq("PENDING"))
+                    .filter(crate::row_guard::row_guard(
+                        diesel::BoolExpressionMethods::and(
+                            crate::schema::harvest_task_queue::task_type.eq("workflow"),
+                            crate::schema::harvest_task_queue::state.eq("PENDING"),
+                        ),
+                    ))
                     .filter(
                         crate::schema::harvest_task_queue::scheduled_at
                             .gt(Timestamp::now().to_diesel()),
@@ -5665,15 +5669,17 @@ mod workflow_pause_recheck_tests {
 /// test is evaluated against the pre-shift deadline.
 #[must_use]
 pub const fn shift_schedule_to_close_on_resume_query() -> &'static str {
-    "UPDATE harvest_task_queue \
-     SET schedule_to_close_at = schedule_to_close_at + ($1::bigint * INTERVAL '1 microsecond'), \
-         scheduled_at = CASE \
-             WHEN state = 'PENDING' AND schedule_to_close_at <= NOW() \
-             THEN scheduled_at + ($1::bigint * INTERVAL '1 microsecond') \
-             ELSE scheduled_at END \
-     WHERE workflow_exec_id = $2 \
-     AND state IN ('PENDING', 'RUNNING') \
-     AND schedule_to_close_at IS NOT NULL"
+    concat!(
+        "UPDATE harvest_task_queue \
+         SET schedule_to_close_at = schedule_to_close_at + ($1::bigint * INTERVAL '1 microsecond'), \
+             scheduled_at = CASE \
+                 WHEN state = 'PENDING' AND schedule_to_close_at <= NOW() \
+                 THEN scheduled_at + ($1::bigint * INTERVAL '1 microsecond') \
+                 ELSE scheduled_at END \
+         WHERE workflow_exec_id = $2 AND ",
+        crate::row_guard::row_guard_sql!("state IN ('PENDING', 'RUNNING')"),
+        " AND schedule_to_close_at IS NOT NULL"
+    )
 }
 
 /// SQL to shift still-open **external** tasks' wall-clock deadline

@@ -2041,11 +2041,11 @@ async fn commit_workflow_execution_timeout(
             let _rows = diesel::update(
                 harvest_task_queue::table
                     .filter(harvest_task_queue::workflow_exec_id.eq(exec_id.as_uuid()))
-                    .filter(
+                    .filter(crate::row_guard::row_guard(
                         harvest_task_queue::state
                             .eq("PENDING")
                             .or(harvest_task_queue::state.eq("RUNNING")),
-                    ),
+                    )),
             )
             .set((
                 harvest_task_queue::state.eq("FAILED"),
@@ -7008,11 +7008,11 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
                 diesel::update(
                     harvest_task_queue::table
                         .filter(harvest_task_queue::workflow_exec_id.eq(row.id))
-                        .filter(
+                        .filter(crate::row_guard::row_guard(
                             harvest_task_queue::state
                                 .eq("PENDING")
                                 .or(harvest_task_queue::state.eq("RUNNING")),
-                        ),
+                        )),
                 )
                 .set((
                     harvest_task_queue::state.eq("FAILED"),

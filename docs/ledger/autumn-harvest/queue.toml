@@ -233,7 +233,7 @@ driver = "per_task"
 backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_task_queue"]
-measured = "unmeasured"
+measured = "docs/performance-claim-release-guard.md"
 plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["fail_task_inner"]
@@ -313,7 +313,7 @@ driver = "per_task"
 backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_task_queue"]
-measured = "unmeasured"
+measured = "docs/performance-claim-release-guard.md"
 plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["owner_scan"]
@@ -504,7 +504,7 @@ driver = "per_task"
 backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_task_queue"]
-measured = "unmeasured"
+measured = "docs/performance-claim-release-guard.md"
 plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
 ["set_local_lock_timeout"]

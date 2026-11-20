@@ -1,9 +1,9 @@
 #![cfg(feature = "db")]
-//! The by-id task row statements read the table through its primary key.
+//! The guarded task row statements read the table through their key index.
 //!
-//! Each statement in `row_guard::guarded_statements` finds one row by `id`.
-//! Its guard on `state` and `worker_id` must not let the planner choose a
-//! partial index. Two fixtures make the planner try:
+//! Each statement in `row_guard::guarded_statements` finds task rows by `id`
+//! or by `workflow_exec_id`. Its guard on `state` and `worker_id` must not
+//! let the planner choose a partial index. Two fixtures make the planner try:
 //!
 //! - Grouped: 100,000 rows, and 5 to 200 `RUNNING` rows for each of 100
 //!   workers. At 5 to 50 rows per worker, `running_worker_idx` can cost less
@@ -17,7 +17,7 @@
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a Postgres server, or let
 //! each test start a container.
 
-use autumn_harvest::row_guard::{GuardedStatement, guarded_statements};
+use autumn_harvest::row_guard::{GuardedStatement, Key, guarded_statements};
 use diesel::QueryableByName;
 use diesel::sql_types::Text;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
@@ -28,6 +28,8 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 const ROWS: i64 = 100_000;
 const WORKERS: i64 = 100;
+/// The task rows of each execution in the plan fixtures.
+const ROWS_PER_EXECUTION: i64 = 4;
 
 type DbGuard = Option<ContainerAsync<Postgres>>;
 
@@ -109,12 +111,30 @@ impl Db {
     }
 }
 
+/// The execution of task row `g`, as SQL.
+const EXECUTION_OF_ROW: &str = "md5('execution-' || (g / 4))::uuid";
+
+/// Insert one execution for each `ROWS_PER_EXECUTION` task rows of `rows`.
+async fn seed_executions(conn: &mut AsyncPgConnection, rows: i64) {
+    conn.batch_execute(&format!(
+        "INSERT INTO harvest_workflow_executions \
+             (id, workflow_name, workflow_id, shard_id, input, state) \
+         SELECT md5('execution-' || e)::uuid, 'w', 'wf-' || e, 0, '{{}}', 'RUNNING' \
+         FROM generate_series(0, {rows} / {ROWS_PER_EXECUTION}) e \
+         ON CONFLICT DO NOTHING"
+    ))
+    .await
+    .expect("seed executions");
+}
+
 /// Insert `rows` rows. The first `running` are `RUNNING`, spread over the
 /// workers. Of the rest, 2% are `PENDING`, and the others are terminal.
 async fn seed(conn: &mut AsyncPgConnection, rows: i64, running: i64) {
+    seed_executions(conn, rows).await;
     conn.batch_execute(&format!(
         "INSERT INTO harvest_task_queue \
-             (queue_name, task_type, input, state, worker_id, started_at, attempt, activity_name) \
+             (queue_name, task_type, input, state, worker_id, started_at, attempt, activity_name, \
+              workflow_exec_id) \
          SELECT 'default', \
                 CASE WHEN g % 3 = 0 THEN 'workflow' ELSE 'activity' END, \
                 '{{}}'::jsonb, \
@@ -125,7 +145,8 @@ async fn seed(conn: &mut AsyncPgConnection, rows: i64, running: i64) {
                 CASE WHEN g <= {running} THEN 'worker-' || (g % {WORKERS}) END, \
                 CASE WHEN g <= {running} THEN now() - g * INTERVAL '1 ms' END, \
                 1, \
-                CASE WHEN g % 3 = 0 THEN NULL ELSE 'activity' END \
+                CASE WHEN g % 3 = 0 THEN NULL ELSE 'activity' END, \
+                {EXECUTION_OF_ROW} \
          FROM generate_series(1, {rows}) g"
     ))
     .await
@@ -250,8 +271,8 @@ fn exempt(alias: &str) -> bool {
     alias == "recheck"
 }
 
-/// Each statement on `conn` that leaves the primary key, as a message.
-async fn primary_key_failures(conn: &mut AsyncPgConnection, fixture: &str) -> Vec<String> {
+/// Each statement on `conn` that leaves its key index, as a message.
+async fn key_index_failures(conn: &mut AsyncPgConnection, fixture: &str) -> Vec<String> {
     let mut failures = Vec::new();
     for statement in guarded_statements() {
         for (settings_name, settings) in SETTINGS {
@@ -260,12 +281,12 @@ async fn primary_key_failures(conn: &mut AsyncPgConnection, fixture: &str) -> Ve
                 let mut scans = Vec::new();
                 task_queue_scans(&plan[0]["Plan"], &mut scans);
                 let checked: Vec<_> = scans.iter().filter(|(a, _, _)| !exempt(a)).collect();
-                let on_pkey = !checked.is_empty()
+                let on_key = !checked.is_empty()
                     && checked.iter().all(|(_, node, index)| {
                         (node.starts_with("Index") || node == "Bitmap Heap Scan")
-                            && index == "harvest_task_queue_pkey"
+                            && index == statement.key.index()
                     });
-                if !on_pkey {
+                if !on_key {
                     failures.push(format!(
                         "{fixture}/{settings_name}/{cache_mode}: {} scans {checked:?}",
                         statement.name
@@ -278,7 +299,7 @@ async fn primary_key_failures(conn: &mut AsyncPgConnection, fixture: &str) -> Ve
 }
 
 #[tokio::test]
-async fn by_id_guards_use_the_primary_key_for_any_slot_count() {
+async fn guarded_statements_use_their_key_index_for_any_slot_count() {
     let (server, _guard) = setup_server().await;
     let mut db = Db::create(&server).await;
     let mut failures = Vec::new();
@@ -290,12 +311,12 @@ async fn by_id_guards_use_the_primary_key_for_any_slot_count() {
         seed(&mut db.conn, ROWS, per_worker * WORKERS).await;
         analyze(&mut db.conn).await;
         let fixture = format!("{per_worker} per worker");
-        failures.extend(primary_key_failures(&mut db.conn, &fixture).await);
+        failures.extend(key_index_failures(&mut db.conn, &fixture).await);
     }
     db.drop().await;
     assert!(
         failures.is_empty(),
-        "these by-id statements leave the primary key:\n{}",
+        "these guarded statements leave their key index:\n{}",
         failures.join("\n")
     );
 }
@@ -303,24 +324,26 @@ async fn by_id_guards_use_the_primary_key_for_any_slot_count() {
 /// The statistics come from a table with no live row. The live rows arrive
 /// after the analyze, as a load arrives after an idle period.
 #[tokio::test]
-async fn by_id_guards_use_the_primary_key_after_an_idle_analyze() {
+async fn guarded_statements_use_their_key_index_after_an_idle_analyze() {
     let (server, _guard) = setup_server().await;
     let mut db = Db::create(&server).await;
+    seed_executions(&mut db.conn, ROWS).await;
     db.conn
         .batch_execute(&format!(
-            "INSERT INTO harvest_task_queue (queue_name, task_type, input, state, attempt) \
-             SELECT 'default', 'workflow', '{{}}'::jsonb, 'COMPLETED', 1 \
-             FROM generate_series(1, {ROWS})"
+            "INSERT INTO harvest_task_queue \
+                 (queue_name, task_type, input, state, attempt, workflow_exec_id) \
+             SELECT 'default', 'workflow', '{{}}'::jsonb, 'COMPLETED', 1, {EXECUTION_OF_ROW} \
+             FROM generate_series(1, {ROWS}) g"
         ))
         .await
         .expect("seed terminal rows");
     analyze(&mut db.conn).await;
     seed(&mut db.conn, 2_000, 2_000).await;
-    let failures = primary_key_failures(&mut db.conn, "idle statistics").await;
+    let failures = key_index_failures(&mut db.conn, "idle statistics").await;
     db.drop().await;
     assert!(
         failures.is_empty(),
-        "these by-id statements leave the primary key:\n{}",
+        "these guarded statements leave their key index:\n{}",
         failures.join("\n")
     );
 }
@@ -374,30 +397,43 @@ async fn assert_truth_table(conn: &mut AsyncPgConnection) {
 
 /// Seed rows for the differential test: every mix of state, worker, kind,
 /// queue, activity, cap and strike count that a guard reads.
+///
+/// Each row has its own execution, so a by-execution statement reads one
+/// row. A row with no worker is parked. A workflow row with one strike is a
+/// mixed-signal suspension that is due later. A row with a cap has a
+/// deadline, and a row with no strike has an unconsumed signal.
 async fn seed_differential(conn: &mut AsyncPgConnection) {
     conn.batch_execute(
         "INSERT INTO harvest_queue_pauses (queue_name, reason) VALUES ('held', 'test'); \
          INSERT INTO harvest_activity_pauses (activity_name, reason) VALUES ('held', 'test'); \
-         INSERT INTO harvest_workflow_executions \
-             (id, workflow_name, workflow_id, shard_id, input, state) \
-         VALUES ('00000000-0000-0000-0000-0000000000a1', 'w', 'held', 0, '{}', 'PAUSED'), \
-                ('00000000-0000-0000-0000-0000000000a2', 'w', 'open', 0, '{}', 'RUNNING'); \
-         INSERT INTO harvest_task_queue \
-             (queue_name, task_type, input, state, worker_id, started_at, attempt, \
-              crash_strikes, activity_name, concurrency_key, concurrency_cap, \
-              workflow_exec_id) \
-         SELECT q, k, '{}'::jsonb, s, w, now(), 1, c, \
-                CASE WHEN k = 'activity' THEN a END, \
-                CASE WHEN cap THEN 'key' END, CASE WHEN cap THEN 0 END, \
-                CASE WHEN a = 'held' THEN '00000000-0000-0000-0000-0000000000a1'::uuid \
-                     ELSE '00000000-0000-0000-0000-0000000000a2'::uuid END \
+         CREATE TEMP TABLE differential_rows AS \
+         SELECT gen_random_uuid() AS e, s, w, k, q, a, c, cap \
          FROM unnest(ARRAY['RUNNING', 'PENDING', 'FAILED']) s, \
               unnest(ARRAY['worker-7', 'worker-8', NULL]) w, \
               unnest(ARRAY['workflow', 'activity']) k, \
               unnest(ARRAY['held', 'open']) q, \
               unnest(ARRAY['held', 'open']) a, \
               unnest(ARRAY[0, 1]) c, \
-              unnest(ARRAY[true, false]) cap",
+              unnest(ARRAY[true, false]) cap; \
+         INSERT INTO harvest_workflow_executions \
+             (id, workflow_name, workflow_id, shard_id, input, state) \
+         SELECT e, 'w', e::text, 0, '{}', \
+                CASE WHEN a = 'held' THEN 'PAUSED' ELSE 'RUNNING' END \
+         FROM differential_rows; \
+         INSERT INTO harvest_task_queue \
+             (queue_name, task_type, input, state, worker_id, started_at, attempt, \
+              crash_strikes, activity_name, concurrency_key, concurrency_cap, \
+              workflow_exec_id, scheduled_at, schedule_to_close_at) \
+         SELECT q, k, '{}'::jsonb, s, w, CASE WHEN w IS NOT NULL THEN now() END, 1, c, \
+                CASE WHEN k = 'activity' THEN a \
+                     WHEN c = 1 THEN 'mixed_signal_suspension' END, \
+                CASE WHEN cap THEN 'key' END, CASE WHEN cap THEN 0 END, \
+                e, \
+                CASE WHEN c = 1 THEN now() + INTERVAL '1 hour' ELSE now() END, \
+                CASE WHEN cap THEN now() + INTERVAL '1 hour' END \
+         FROM differential_rows; \
+         INSERT INTO harvest_signals (workflow_exec_id, signal_name, payload) \
+         SELECT e, 'nudge', '{}'::jsonb FROM differential_rows WHERE c = 0",
     )
     .await
     .expect("seed differential rows");
@@ -477,16 +513,26 @@ async fn each_raw_statement_changes_the_same_rows_in_both_forms() {
     let mut db = Db::create(&server).await;
     assert_truth_table(&mut db.conn).await;
     seed_differential(&mut db.conn).await;
-    let ids: Vec<Id> = diesel::sql_query("SELECT id::text AS id FROM harvest_task_queue")
+    let mut keys = Vec::new();
+    for column in ["id", "workflow_exec_id"] {
+        let ids: Vec<Id> = diesel::sql_query(format!(
+            "SELECT {column}::text AS id FROM harvest_task_queue"
+        ))
         .load(&mut db.conn)
         .await
         .expect("ids");
+        keys.push(ids);
+    }
     for statement in guarded_statements().into_iter().filter(|s| s.raw) {
+        let ids = match statement.key {
+            Key::Id => &keys[0],
+            Key::Execution | Key::Activity => &keys[1],
+        };
         let plain = plain_form(&statement.sql);
         assert_ne!(plain, statement.sql, "{} has a CASE guard", statement.name);
         assert!(!plain.contains(" THEN true END)"), "{plain}");
         let mut hits = 0;
-        for Id { id } in &ids {
+        for Id { id } in ids {
             let guarded = effect_of(&mut db.conn, &statement, &statement.sql, id).await;
             let unguarded = effect_of(&mut db.conn, &statement, &plain, id).await;
             assert_eq!(
@@ -540,28 +586,45 @@ enum Order {
 /// One concurrent writer beside one release.
 struct Case {
     name: &'static str,
-    release: &'static str,
+    release: String,
     writer: &'static str,
     order: Order,
     want: usize,
 }
 
-/// Run `sql` as the release of `case` on a new claimed row. Return the
-/// number of rows that the release changed.
+/// The raw guarded statement named `name`.
+fn guarded(name: &str) -> GuardedStatement {
+    guarded_statements()
+        .into_iter()
+        .find(|s| s.name == name && s.raw)
+        .unwrap_or_else(|| panic!("no raw guarded statement {name}"))
+}
+
+/// Run `statement` with `sql` as the release of `case` on a new claimed
+/// workflow task row. Return the number of rows that the release changed.
+///
+/// A by-id release binds the row id and `worker-7`. A by-execution release
+/// binds the execution id, and `now()` for a `timestamptz` parameter.
 async fn run_beside_writer(
     setup: &mut AsyncPgConnection,
     db_url: &str,
     case: &Case,
+    statement: &GuardedStatement,
     sql: String,
 ) -> usize {
     let id = uuid::Uuid::new_v4();
+    let execution = uuid::Uuid::new_v4();
     let queue = format!("q-{id}");
     setup
         .batch_execute(&format!(
-            "INSERT INTO harvest_task_queue \
-                 (id, queue_name, task_type, input, state, worker_id, started_at, attempt) \
-             VALUES ('{id}', '{queue}', 'activity', '{{}}'::jsonb, 'RUNNING', \
-                     'worker-7', now(), 1)"
+            "INSERT INTO harvest_workflow_executions \
+                 (id, workflow_name, workflow_id, shard_id, input, state) \
+             VALUES ('{execution}', 'w', '{execution}', 0, '{{}}', 'RUNNING'); \
+             INSERT INTO harvest_task_queue \
+                 (id, queue_name, task_type, input, state, worker_id, started_at, attempt, \
+                  workflow_exec_id) \
+             VALUES ('{id}', '{queue}', 'workflow', '{{}}'::jsonb, 'RUNNING', \
+                     'worker-7', now(), 1, '{execution}')"
         ))
         .await
         .expect("insert claimed row");
@@ -580,13 +643,23 @@ async fn run_beside_writer(
     }
 
     let mut release_conn = AsyncPgConnection::establish(db_url).await.expect("release");
+    let key = statement.key;
     let release = tokio::spawn(async move {
-        diesel::sql_query(sql)
-            .bind::<diesel::sql_types::Uuid, _>(id)
-            .bind::<Text, _>("worker-7")
+        match key {
+            Key::Id => diesel::sql_query(sql)
+                .bind::<diesel::sql_types::Uuid, _>(id)
+                .bind::<Text, _>("worker-7")
+                .execute(&mut release_conn)
+                .await
+                .expect("release"),
+            Key::Execution | Key::Activity => diesel::sql_query(
+                sql.replace("$2", "now()")
+                    .replace("$1", &format!("'{execution}'::uuid")),
+            )
             .execute(&mut release_conn)
             .await
-            .expect("release")
+            .expect("release"),
+        }
     });
     if case.order == Order::HoldsTheRow {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -619,45 +692,79 @@ async fn run_beside_writer(
 /// release still applies. A pause is seen only when it commits before the
 /// release starts. In production, `try_lock_queue_for_claim` orders a later
 /// pause after the claim.
+///
+/// The wake cases run by execution. A wake fallback that waits on a park
+/// sees the parked row, which has no worker, so it changes nothing. The
+/// wake then re-pends the parked row.
 #[tokio::test]
 async fn a_release_beside_a_completion_reclaim_or_pause_matches_the_plain_form() {
     use autumn_harvest::queue_pause::{release_claim_if_queue_paused_query, release_claim_query};
 
+    const PARK: &str = "UPDATE harvest_task_queue SET worker_id = NULL, started_at = NULL \
+                        WHERE id = $ID";
     let cases = [
         Case {
             name: "completion",
-            release: release_claim_query(),
+            release: release_claim_query().to_owned(),
             writer: "UPDATE harvest_task_queue SET state = 'COMPLETED' WHERE id = $ID",
             order: Order::HoldsTheRow,
             want: 0,
         },
         Case {
             name: "reclaim",
-            release: release_claim_query(),
+            release: release_claim_query().to_owned(),
             writer: "UPDATE harvest_task_queue SET worker_id = 'worker-8' WHERE id = $ID",
             order: Order::HoldsTheRow,
             want: 0,
         },
         Case {
             name: "heartbeat",
-            release: release_claim_query(),
+            release: release_claim_query().to_owned(),
             writer: "UPDATE harvest_task_queue SET last_heartbeat_at = now() WHERE id = $ID",
             order: Order::HoldsTheRow,
             want: 1,
         },
         Case {
             name: "pause in flight during the release",
-            release: release_claim_if_queue_paused_query(),
+            release: release_claim_if_queue_paused_query().to_owned(),
             writer: "INSERT INTO harvest_queue_pauses (queue_name, reason) VALUES ($QUEUE, 'test')",
             order: Order::CommitsLast,
             want: 0,
         },
         Case {
             name: "pause before the release starts",
-            release: release_claim_if_queue_paused_query(),
+            release: release_claim_if_queue_paused_query().to_owned(),
             writer: "INSERT INTO harvest_queue_pauses (queue_name, reason) VALUES ($QUEUE, 'test')",
             order: Order::CommitsFirst,
             want: 1,
+        },
+        Case {
+            name: "park while a wake fallback waits",
+            release: guarded("wake_fallback").sql,
+            writer: PARK,
+            order: Order::HoldsTheRow,
+            want: 0,
+        },
+        Case {
+            name: "heartbeat while a wake fallback waits",
+            release: guarded("wake_fallback").sql,
+            writer: "UPDATE harvest_task_queue SET last_heartbeat_at = now() WHERE id = $ID",
+            order: Order::HoldsTheRow,
+            want: 1,
+        },
+        Case {
+            name: "park before a wake re-pend",
+            release: guarded("wake_repend").sql,
+            writer: PARK,
+            order: Order::CommitsFirst,
+            want: 1,
+        },
+        Case {
+            name: "park after a wake re-pend",
+            release: guarded("wake_repend").sql,
+            writer: PARK,
+            order: Order::CommitsLast,
+            want: 0,
         },
     ];
 
@@ -665,8 +772,12 @@ async fn a_release_beside_a_completion_reclaim_or_pause_matches_the_plain_form()
     let db = Db::create(&server).await;
     let mut setup = AsyncPgConnection::establish(&db.url).await.expect("setup");
     for case in &cases {
-        for sql in [case.release.to_owned(), plain_form(case.release)] {
-            let changed = run_beside_writer(&mut setup, &db.url, case, sql).await;
+        let statement = guarded_statements()
+            .into_iter()
+            .find(|s| s.sql == case.release)
+            .unwrap_or_else(|| guarded("release_claim"));
+        for sql in [case.release.clone(), plain_form(&case.release)] {
+            let changed = run_beside_writer(&mut setup, &db.url, case, &statement, sql).await;
             assert_eq!(
                 changed, case.want,
                 "{}: the release changed {changed} rows",

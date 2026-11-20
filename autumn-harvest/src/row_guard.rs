@@ -7,10 +7,13 @@
 //! matches the guard, then filters on `id`. A cached generic plan keeps that
 //! choice.
 //!
+//! Statements that find task rows by `workflow_exec_id` have the same
+//! defect. Their key index is `idx_harvest_tq_workflow`.
+//!
 //! `row_guard_sql!` and `row_guard` hide such a guard from the planner.
 //! [`guarded_statements`] lists each raw statement in scope and a sample of
 //! each Diesel guard shape. A DB test checks that the generic and the custom
-//! plan of each one read the table through its primary key. See
+//! plan of each one read the table through its key index. See
 //! `docs/performance-claim-release-guard.md`.
 
 #[cfg(feature = "db")]
@@ -30,9 +33,9 @@ use diesel::sql_types::{Bool, BoolOrNullableBool};
 /// index condition. It also cannot prove a partial index predicate from
 /// it. So it finds the row through `id = $1` and the primary key.
 ///
-/// Use it only beside a primary key test, such as `id = $1`. A scan without
-/// `id` needs its index. Use it only as a top-level `AND` term. `NOT` or `OR`
-/// on a NULL result changes the rows.
+/// Use it only beside a key test: `id = $1`, or `workflow_exec_id = $1` with
+/// the execution index. A scan without a key needs its index. Use it only as
+/// a top-level `AND` term. `NOT` or `OR` on a NULL result changes the rows.
 macro_rules! row_guard_sql {
     ($guard:literal) => {
         concat!("(CASE WHEN ", $guard, " THEN true END)")
@@ -53,7 +56,33 @@ where
     diesel::dsl::case_when::<_, _, Bool>(guard, true)
 }
 
-/// One by-id statement and the types of its parameters.
+/// The column that a guarded statement finds its task rows by.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    /// `id`, through the primary key.
+    Id,
+    /// `workflow_exec_id`, through the execution index.
+    Execution,
+    /// `workflow_exec_id` and `activity_id`, through the activity index.
+    Activity,
+}
+
+#[cfg(feature = "db")]
+impl Key {
+    /// The index that a plan must read for this key.
+    #[must_use]
+    pub const fn index(self) -> &'static str {
+        match self {
+            Self::Id => "harvest_task_queue_pkey",
+            Self::Execution => "idx_harvest_tq_workflow",
+            Self::Activity => "idx_harvest_tq_activity_id",
+        }
+    }
+}
+
+/// One guarded statement and the types of its parameters.
 #[cfg(feature = "db")]
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +96,8 @@ pub struct GuardedStatement {
     /// True when `sql` is the production text. A Diesel entry is false: it
     /// has the production guard, but its other clauses are a sample.
     pub raw: bool,
+    /// The column that the statement finds its rows by.
+    pub key: Key,
 }
 
 #[cfg(feature = "db")]
@@ -77,7 +108,13 @@ impl GuardedStatement {
             sql: sql.to_owned(),
             param_types: param_types.to_vec(),
             raw: true,
+            key: Key::Id,
         }
+    }
+
+    /// The same statement, found by `key`.
+    fn by(self, key: Key) -> Self {
+        Self { key, ..self }
     }
 
     fn diesel<Q>(name: &'static str, query: &Q, param_types: &[&'static str]) -> Self
@@ -217,6 +254,46 @@ pub fn guarded_statements() -> Vec<GuardedStatement> {
         ));
     }
 
+    statements.extend([
+        GuardedStatement::raw(
+            "wake_repend",
+            queue::primary_repend_workflow_task_query(),
+            &["uuid", "timestamptz"],
+        )
+        .by(Key::Execution),
+        GuardedStatement::raw(
+            "wake_fallback",
+            queue::wake_requested_fallback_query(),
+            &["uuid"],
+        )
+        .by(Key::Execution),
+        GuardedStatement::raw(
+            "wake_already_due",
+            queue::already_due_workflow_task_query(),
+            &["uuid", "timestamptz"],
+        )
+        .by(Key::Execution),
+        GuardedStatement::raw("owner_keys", queue::OWNER_KEYS_SQL, &["uuid[]"]).by(Key::Execution),
+        GuardedStatement::raw(
+            "shift_schedule_to_close_on_resume",
+            crate::execution::shift_schedule_to_close_on_resume_query(),
+            &["bigint", "uuid"],
+        )
+        .by(Key::Execution),
+        GuardedStatement::raw(
+            "migration_staged_task",
+            crate::shard_rebalance::STAGED_TASK_SQL,
+            &["uuid"],
+        )
+        .by(Key::Execution),
+        GuardedStatement::raw(
+            "migration_signal_repend",
+            crate::shard_rebalance::SIGNAL_REPEND_SQL,
+            &["uuid"],
+        )
+        .by(Key::Execution),
+    ]);
+
     let id = uuid::Uuid::nil();
     let claim = queue::TaskClaim::new(id, "worker", 1);
 
@@ -325,92 +402,450 @@ pub fn guarded_statements() -> Vec<GuardedStatement> {
         &["text", "uuid", "uuid", "text", "boolean"],
     ));
 
+    let open = diesel::update(
+        dsl::harvest_task_queue
+            .filter(dsl::workflow_exec_id.eq(Some(id)))
+            .filter(row_guard(dsl::state.eq_any(["PENDING", "RUNNING"]))),
+    )
+    .set(dsl::state.eq("FAILED"));
+    statements.push(
+        GuardedStatement::diesel(
+            "open_tasks_guard",
+            &open,
+            &["text", "uuid", "text[]", "boolean"],
+        )
+        .by(Key::Execution),
+    );
+
+    let drain = diesel::update(
+        dsl::harvest_task_queue
+            .filter(dsl::workflow_exec_id.eq(Some(id)))
+            .filter(row_guard(
+                dsl::state.eq("PENDING").or(dsl::state.eq("RUNNING")),
+            )),
+    )
+    .set(dsl::state.eq("FAILED"));
+    statements.push(
+        GuardedStatement::diesel(
+            "drain_guard",
+            &drain,
+            &["text", "uuid", "text", "text", "boolean"],
+        )
+        .by(Key::Execution),
+    );
+
+    let loser = diesel::update(
+        dsl::harvest_task_queue
+            .filter(dsl::workflow_exec_id.eq(Some(id)))
+            .filter(dsl::activity_id.eq(Some(id)))
+            .filter(row_guard(dsl::state.eq_any(["PENDING", "RUNNING"]))),
+    )
+    .set(dsl::state.eq("CANCELLED"));
+    statements.push(
+        GuardedStatement::diesel(
+            "fork_loser_guard",
+            &loser,
+            &["text", "uuid", "uuid", "text[]", "boolean"],
+        )
+        .by(Key::Activity),
+    );
+
+    let session = diesel::select(diesel::dsl::exists(
+        dsl::harvest_task_queue
+            .filter(dsl::workflow_exec_id.eq(Some(id)))
+            .filter(dsl::session_id.eq(Some(id)))
+            .filter(dsl::id.ne(id))
+            .filter(row_guard(dsl::state.eq_any(["PENDING", "RUNNING"]))),
+    ));
+    statements.push(
+        GuardedStatement::diesel(
+            "session_guard",
+            &session,
+            &["uuid", "uuid", "uuid", "text[]", "boolean"],
+        )
+        .by(Key::Execution),
+    );
+
+    let cancel = diesel::delete(
+        dsl::harvest_task_queue
+            .filter(dsl::workflow_exec_id.eq(Some(id)))
+            .filter(row_guard(
+                dsl::task_type.eq("workflow").and(dsl::state.eq("PENDING")),
+            ))
+            .filter(dsl::scheduled_at.gt(jiff::Timestamp::UNIX_EPOCH.to_diesel())),
+    );
+    statements.push(
+        GuardedStatement::diesel(
+            "cancel_pending_guard",
+            &cancel,
+            &["uuid", "text", "text", "boolean", "timestamptz"],
+        )
+        .by(Key::Execution),
+    );
+
     statements
 }
 
 #[cfg(all(test, feature = "db"))]
 mod tests {
     use super::guarded_statements;
+    use std::path::{Path, PathBuf};
 
-    /// The engine files that hold by-id task queue statements.
-    const SOURCES: [(&str, &str); 6] = [
-        ("queue.rs", include_str!("queue.rs")),
-        ("worker.rs", include_str!("worker.rs")),
-        ("poison_pill.rs", include_str!("poison_pill.rs")),
-        ("queue_pause.rs", include_str!("queue_pause.rs")),
-        ("activity_pause.rs", include_str!("activity_pause.rs")),
-        ("execution.rs", include_str!("execution.rs")),
-    ];
-
-    /// Each Diesel chain that finds one task queue row by id hides its guard.
-    ///
-    /// The plan test checks samples of the Diesel guards. This walk checks
-    /// each call site, so a site that drops `row_guard` fails here.
-    #[test]
-    fn every_by_id_diesel_chain_hides_its_guard() {
-        let mut chains = 0;
-        for (file, source) in SOURCES {
-            let lines: Vec<&str> = source.lines().collect();
-            for (at, line) in lines.iter().enumerate() {
-                let line = line.trim();
-                let by_id = line.starts_with(".find(") || line.starts_with(".filter(dsl::id.eq(");
-                let on_queue = lines[at.saturating_sub(2)..at]
-                    .iter()
-                    .any(|l| l.trim_end().ends_with("harvest_task_queue"));
-                if !by_id || !on_queue {
-                    continue;
-                }
-                chains += 1;
-                for next in lines[at + 1..]
-                    .iter()
-                    .map(|l| l.trim())
-                    .take_while(|l| l.starts_with('.') || l.starts_with("//"))
+    /// Each engine source file that names the task queue, with its text.
+    fn engine_sources() -> Vec<(PathBuf, String)> {
+        fn walk(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+                .map(|e| {
+                    e.unwrap_or_else(|e| panic!("a directory entry: {e}"))
+                        .path()
+                })
+                .collect();
+            entries.sort();
+            for path in entries {
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs")
+                    && path.file_name().is_some_and(|n| n != "row_guard.rs")
                 {
-                    for plain in [
-                        ".filter(dsl::state",
-                        ".filter(dsl::worker_id",
-                        ".filter(claim_held",
-                    ] {
-                        assert!(
-                            !next.starts_with(plain),
-                            "{file}:{}: a by-id chain uses a plain guard: {next}",
-                            at + 1
-                        );
+                    let text = std::fs::read_to_string(&path)
+                        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+                    if text.contains("harvest_task_queue") {
+                        out.push((path, text));
                     }
                 }
             }
         }
-        assert!(chains >= 10, "the walk found only {chains} by-id chains");
+        let mut out = Vec::new();
+        walk(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut out);
+        assert!(out.len() >= 20, "the walk found only {} files", out.len());
+        out
     }
 
-    /// No raw statement tests `state` or `worker_id` plainly beside its id.
+    /// The table alias of `term` and the term without it. Leading
+    /// parentheses are removed first.
+    fn aliased(term: &str) -> (&str, &str) {
+        let term = term.trim_start_matches(['(', ' ']);
+        match term.split_once('.') {
+            Some((alias, rest))
+                if !alias.is_empty() && alias.chars().all(|c| c.is_ascii_alphanumeric()) =>
+            {
+                (alias, rest)
+            }
+            _ => ("", term),
+        }
+    }
+
+    /// `term` with its leading parentheses and table alias removed.
+    fn bare(term: &str) -> &str {
+        aliased(term).1
+    }
+
+    /// True when `term` tests a column of the `alias` table that a partial
+    /// index matches.
+    fn plain_guard(term: &str, alias: &str) -> bool {
+        let (own, term) = aliased(term);
+        own == alias
+            && ["state ", "state=", "worker_id "]
+                .iter()
+                .any(|column| term.starts_with(column))
+    }
+
+    /// Each plain guard beside a row key in `sql`, as a message.
+    ///
+    /// A key is `id = $n`, `workflow_exec_id = $n` or the `ANY` form of
+    /// either. A `task_type` test after the key is skipped. The term after
+    /// it must not test `state` or `worker_id` plainly.
+    fn plain_keyed_guards(sql: &str) -> Vec<String> {
+        let sql = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut found = Vec::new();
+        for (at, _) in sql.match_indices(" = ") {
+            let left = sql[..at].rsplit([' ', '(']).next().unwrap_or_default();
+            let (alias, column) = left.rsplit_once('.').unwrap_or(("", left));
+            if column != "id" && column != "workflow_exec_id" {
+                continue;
+            }
+            let value = &sql[at + 3..];
+            let Some(param) = value
+                .strip_prefix("ANY(")
+                .or(Some(value))
+                .and_then(|v| v.strip_prefix('$'))
+            else {
+                continue;
+            };
+            let mut rest = param.trim_start_matches(|c: char| {
+                c.is_ascii_digit()
+                    || c == ')'
+                    || c == ':'
+                    || c.is_ascii_alphabetic()
+                    || c == '['
+                    || c == ']'
+            });
+            while let Some(term) = rest.strip_prefix(" AND ") {
+                if bare(term).starts_with("task_type = '") {
+                    let close = term.find("' ").map_or(term.len(), |c| c + 1);
+                    rest = &term[close..];
+                    continue;
+                }
+                if plain_guard(term, alias) {
+                    found.push(sql[at.saturating_sub(40)..(at + 120).min(sql.len())].to_owned());
+                }
+                break;
+            }
+        }
+        found
+    }
+
+    /// Each string literal of `source`, with each continuation joined as
+    /// rustc joins it. Comments are skipped.
+    fn string_literals(source: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut chars = source.char_indices().peekable();
+        while let Some((at, c)) = chars.next() {
+            match c {
+                '/' if source[at..].starts_with("//") => {
+                    for (_, c) in chars.by_ref() {
+                        if c == '\n' {
+                            break;
+                        }
+                    }
+                }
+                '\'' if source[at..].starts_with("'\"'") => {
+                    chars.next();
+                    chars.next();
+                }
+                '"' => {
+                    let mut text = String::new();
+                    while let Some((_, c)) = chars.next() {
+                        match c {
+                            '\\' => match chars.next() {
+                                Some((_, '\n')) => {
+                                    while chars.peek().is_some_and(|(_, c)| c.is_whitespace()) {
+                                        chars.next();
+                                    }
+                                }
+                                Some((_, c)) => {
+                                    text.push('\\');
+                                    text.push(c);
+                                }
+                                None => {}
+                            },
+                            '"' => break,
+                            c => text.push(c),
+                        }
+                    }
+                    out.push(text);
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// No raw statement tests `state` or `worker_id` plainly beside its key.
     #[test]
-    fn every_by_id_raw_statement_hides_its_guard() {
-        for (file, source) in SOURCES {
-            // A string continuation drops the newline and the indent, as rustc does.
-            let mut text = String::with_capacity(source.len());
-            let mut rest = source;
-            while let Some(at) = rest.find("\\\n") {
-                text.push_str(&rest[..at]);
-                rest = rest[at + 2..].trim_start();
+    fn every_keyed_raw_statement_hides_its_guard() {
+        let mut failures = Vec::new();
+        for (path, source) in engine_sources() {
+            for literal in string_literals(&source) {
+                if !literal.contains("harvest_task_queue") {
+                    continue;
+                }
+                for at in plain_keyed_guards(&literal) {
+                    failures.push(format!("{}: {at}", path.display()));
+                }
             }
-            text.push_str(rest);
-            for plain in [
-                " id = $1 AND state",
-                " id = $1 AND worker_id",
-                " id = $1 AND task_type = 'workflow' AND state",
-                " id = ANY($1) AND state",
-            ] {
-                assert!(!text.contains(plain), "{file} has a plain guard: {plain}");
+        }
+        assert!(
+            failures.is_empty(),
+            "these raw statements have a plain guard:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// The top-level `.filter(` arguments of a Diesel chain.
+    fn filter_arguments(chain: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut rest = chain;
+        while let Some(at) = rest.find(".filter(") {
+            let body = &rest[at + ".filter(".len()..];
+            let mut depth = 0_usize;
+            let mut end = body.len();
+            for (i, c) in body.char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' if depth == 0 => {
+                        end = i;
+                        break;
+                    }
+                    ')' => depth -= 1,
+                    _ => {}
+                }
             }
+            out.push(body[..end].trim());
+            rest = &body[end..];
+        }
+        out
+    }
+
+    /// `argument` with its leading `path::` segments removed.
+    fn unpathed(argument: &str) -> &str {
+        let mut rest = argument;
+        while let Some((head, tail)) = rest.split_once("::") {
+            if head.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                rest = tail;
+            } else {
+                break;
+            }
+        }
+        rest
+    }
+
+    /// Each Diesel chain on the task queue in `source`, as one line of text.
+    ///
+    /// A chain starts at a line that ends with the table. It runs until its
+    /// parentheses close below the start, or until a `;`. The trimmed lines
+    /// join with no space, so a call split over lines reads as one call.
+    fn queue_chains(source: &str) -> Vec<(usize, String)> {
+        let lines: Vec<&str> = source.lines().collect();
+        let mut out = Vec::new();
+        for (at, line) in lines.iter().enumerate() {
+            let line = line.trim();
+            if line.starts_with("//")
+                || !(line.ends_with("harvest_task_queue")
+                    || line.ends_with("harvest_task_queue::table"))
+            {
+                continue;
+            }
+            let mut chain = String::new();
+            let mut depth = 0_i64;
+            'lines: for next in &lines[at + 1..] {
+                let next = next.trim();
+                if next.starts_with("//") {
+                    continue;
+                }
+                for c in next.chars() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        ';' if depth <= 0 => break 'lines,
+                        _ => {}
+                    }
+                    if depth < 0 {
+                        break 'lines;
+                    }
+                    chain.push(c);
+                }
+            }
+            out.push((at + 1, chain));
+        }
+        out
+    }
+
+    /// Each Diesel chain that finds task rows by a key hides its guard.
+    ///
+    /// The plan test checks samples of the Diesel guards. This walk checks
+    /// each call site, so a site that drops `row_guard` fails here.
+    #[test]
+    fn every_keyed_diesel_chain_hides_its_guard() {
+        let mut chains = 0;
+        let mut failures = Vec::new();
+        for (path, source) in engine_sources() {
+            for (line, chain) in queue_chains(&source) {
+                let arguments = filter_arguments(&chain);
+                let keyed = chain.trim_start().starts_with(".find(")
+                    || arguments.iter().any(|a| {
+                        let a = unpathed(a);
+                        a.starts_with("id.eq(") || a.starts_with("workflow_exec_id.eq(")
+                    });
+                if !keyed {
+                    continue;
+                }
+                chains += 1;
+                for argument in arguments {
+                    let argument = unpathed(argument);
+                    if ["state.", "worker_id.", "claim_held("]
+                        .iter()
+                        .any(|plain| argument.starts_with(plain))
+                    {
+                        failures.push(format!("{}:{line}: {argument}", path.display()));
+                    }
+                }
+            }
+        }
+        assert!(chains >= 20, "the walk found only {chains} keyed chains");
+        assert!(
+            failures.is_empty(),
+            "these keyed chains have a plain guard:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn the_raw_walk_finds_each_plain_guard_shape() {
+        for sql in [
+            "UPDATE harvest_task_queue SET x = 1 WHERE id = $1 AND state = 'RUNNING'",
+            "SELECT 1 FROM harvest_task_queue WHERE id = ANY($1) AND state = 'PENDING'",
+            "UPDATE harvest_task_queue SET x = 1 WHERE id = $1 AND worker_id = $2",
+            "UPDATE harvest_task_queue SET x = 1 WHERE workflow_exec_id = $1 \
+             AND task_type = 'workflow' AND state = 'RUNNING'",
+            "UPDATE harvest_task_queue t SET x = 1 WHERE t.workflow_exec_id = $1 \
+             AND t.task_type = 'workflow' AND ((t.state = 'RUNNING'))",
+            "SELECT 1 FROM harvest_task_queue WHERE workflow_exec_id = ANY($1) AND state = 'PENDING'",
+            "UPDATE harvest_task_queue SET x = 1 WHERE workflow_exec_id = $2 AND state IN ('PENDING')",
+        ] {
+            assert_eq!(plain_keyed_guards(sql).len(), 1, "{sql}");
+        }
+        for sql in [
+            "UPDATE harvest_task_queue SET x = 1 WHERE id = $1 AND (CASE WHEN state = 'RUNNING' THEN true END)",
+            "UPDATE harvest_task_queue SET x = 1 WHERE workflow_exec_id = $1 \
+             AND (CASE WHEN task_type = 'workflow' AND state = 'RUNNING' THEN true END)",
+            "UPDATE harvest_task_queue SET x = 1 WHERE queue_id = $1 AND state = 'RUNNING'",
+            "UPDATE harvest_task_queue SET x = 1 WHERE worker_id = $1 AND state = 'RUNNING'",
+            "SELECT 1 FROM harvest_task_queue t JOIN e ON e.id = t.workflow_exec_id \
+             WHERE t.id = $2 AND e.state = 'RUNNING'",
+        ] {
+            assert!(plain_keyed_guards(sql).is_empty(), "{sql}");
         }
     }
 
     #[test]
+    fn the_diesel_walk_finds_each_plain_guard_shape() {
+        let source = "
+            diesel::update(
+                dsl::harvest_task_queue
+                    .filter(dsl::workflow_exec_id.eq(Some(exec)))
+                    .filter(
+                        dsl::state
+                            .eq(\"PENDING\")
+                            .or(dsl::state.eq(\"RUNNING\")),
+                    ),
+            )
+            .set(dsl::state.eq(\"FAILED\"));
+        ";
+        let chains = queue_chains(source);
+        assert_eq!(chains.len(), 1);
+        let arguments = filter_arguments(&chains[0].1);
+        assert_eq!(arguments.len(), 2, "{arguments:?}");
+        assert!(unpathed(arguments[1]).starts_with("state."));
+        assert!(
+            !chains[0].1.contains(".set("),
+            "the chain stops at its close"
+        );
+    }
+
+    /// A `SET` clause can hold its own `CASE`, so the test reads the end
+    /// of the guard form. A Diesel guard binds its `true`.
+    #[test]
     fn every_guarded_statement_hides_its_guard() {
         for statement in guarded_statements() {
+            let end = if statement.raw {
+                " THEN true END)"
+            } else {
+                " THEN ($"
+            };
             assert!(
-                statement.sql.contains("CASE WHEN"),
+                statement.sql.contains("CASE WHEN") && statement.sql.contains(end),
                 "{} must wrap its row guard in a CASE: {}",
                 statement.name,
                 statement.sql
