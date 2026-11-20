@@ -419,10 +419,9 @@ const WORKFLOW_PANIC_MAX_ATTEMPTS: u32 = 3;
 /// # Stack
 ///
 /// A drive polls the workflow on the thread that awaits it. A debug build
-/// makes large poll frames there. The engine keeps large child futures on the
-/// heap (issue #2752). So a debug build of each agent workflow fits in 512 KiB
-/// on Linux, and in 768 KiB on Windows. Box a large future of your own
-/// workflow with [`autumn_harvest::frame::boxed`].
+/// makes large poll frames there (issue #2752). Box a large child future of
+/// your own workflow with [`autumn_harvest::frame::boxed`]. The guide
+/// `docs/sqlite-backend.md` gives the stack need.
 pub struct SqliteRuntime {
     conn: Connection,
     workflows: HashMap<String, WorkflowHandlerFn>,
@@ -3438,8 +3437,8 @@ impl SqliteRuntime {
         now: i64,
         failure_now: &(dyn Fn() -> i64 + Send + Sync),
     ) -> SqliteResult<RunState> {
-        // The cycle future holds the workflow drive. On the heap, it adds no
-        // debug frame to each caller of this drive (issue #2752).
+        // The cycle future holds the workflow drive. On the heap, it adds only
+        // a pointer to each caller frame in a debug build (issue #2752).
         let result = boxed(|| self.drive_one_cycle_inner(exec, now, failure_now)).await;
         let result = self.seal_after_error(exec, result, now, failure_now);
         // The cycle, or a seal after it, can seal other runs too, such as a

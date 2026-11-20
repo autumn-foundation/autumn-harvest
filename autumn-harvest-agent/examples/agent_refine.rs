@@ -297,9 +297,9 @@ fn show(version: Option<OverlayVersion>) -> String {
 
 /// Run the walk on the main thread.
 ///
-/// A debug build of the walk once needed almost 1 MiB of stack, so it
-/// overflowed the 1 MiB main thread of Windows. The engine now keeps large
-/// futures on the heap (issue #2752). The `stack_budget` test guards that.
+/// A debug build of the walk needed almost 1 MiB of stack before issue #2752,
+/// so it overflowed the Windows main thread. The engine keeps large futures
+/// on the heap. The `stack_budget` test guards that.
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
     walk_main().await

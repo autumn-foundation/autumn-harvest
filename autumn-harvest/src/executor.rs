@@ -2304,7 +2304,8 @@ pub(crate) async fn drive_workflow(
     tracing::Span,
     Option<crate::shard::ShardRouter>,
 ) {
-    // On the heap, the drive adds no debug frame to each caller (issue #2752).
+    // The keep future holds the context by value. On the heap, it adds only a
+    // pointer to each caller frame in a debug build (issue #2752).
     crate::frame::boxed(|| drive_workflow_keep(ctx, handler, input, span_meta, None))
         .await
         .into_tuple()
@@ -2324,7 +2325,8 @@ pub(crate) async fn drive_workflow_keep(
 ) -> DriveResult {
     let ctx = std::sync::Arc::new(ctx);
     let future = owned_handler_future(&ctx, handler, input);
-    // On the heap, the cycle adds no debug frame to each caller (issue #2752).
+    // On the heap, the cycle adds only a pointer to each caller frame in a
+    // debug build (issue #2752).
     crate::frame::boxed(|| drive_cycle(ctx, future, span_meta, None, keep)).await
 }
 

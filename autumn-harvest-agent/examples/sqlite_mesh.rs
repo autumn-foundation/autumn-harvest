@@ -362,8 +362,8 @@ impl Outcome {
 
 /// Run the mesh on the main thread.
 ///
-/// A debug build of the mesh once overflowed a 512 KiB main thread. The
-/// engine now keeps large futures on the heap (issue #2752).
+/// The engine keeps large futures on the heap (issue #2752). CI runs this
+/// example on the 1 MiB Windows main thread.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     mesh_main().await

@@ -389,18 +389,17 @@ the time that the call names.
 
 The runtime polls each workflow on the thread that awaits the drive. A debug
 build makes large poll frames, so that thread needs room. The Windows main
-thread has 1 MiB, and a durable agent op once overflowed it.
+thread has 1 MiB, and a durable agent op overflowed it before issue #2752.
 
-The engine now builds each large child future on the heap, with
-[`autumn_harvest::frame::boxed`](../autumn-harvest/src/frame.rs). A debug build
-of each agent workflow fits in 512 KiB on Linux and macOS, and in 768 KiB on
-Windows. The `stack_budget` test of `autumn-harvest-agent` holds these
-bounds in CI. An optimized build needs much less.
+The engine builds its large child futures on the heap, with
+[`autumn_harvest::frame::boxed`](../autumn-harvest/src/frame.rs). The
+`stack_budget` test of `autumn-harvest-agent` runs each agent workflow on a
+small fixed stack in Linux, macOS and Windows CI.
 
 A workflow of your own can still make large futures. If a debug build
-overflows, box the large child futures with `boxed`. Or drive the runtime
-on a thread that you spawn with a larger stack, as `autumn-harvest-cli`
-does.
+overflows, box its large child futures. The module docs of `frame` show the
+form that harvest-verify can follow. Or drive the runtime on a thread that
+you spawn with a larger stack, as `autumn-harvest-cli` does.
 
 ### Cancel and terminate
 

@@ -989,8 +989,8 @@ pub(crate) async fn run_segment(
 /// [`run_segment`] on the heap.
 ///
 /// It makes its future in its own frame, as [`autumn_harvest::frame`]
-/// explains (issue #2752). A closure would hide the future from
-/// harvest-verify, so this is a named function.
+/// explains (issue #2752). The future names a lifetime and holds `&mut`
+/// borrows, so a closure future would be a harvest-verify boundary.
 #[inline(never)]
 pub(crate) fn boxed_run_segment<'a>(
     ctx: &'a WorkflowContext,

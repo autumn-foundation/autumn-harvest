@@ -1393,7 +1393,8 @@ type SegmentEnd = (AgentState, Result<Option<(AgentStop, String)>, Refusal>);
 /// The handler closure returns this future, not the future of
 /// [`AgentRun::handle`]. harvest-verify reads a future type that names a
 /// lifetime, as `AgentRun<'_>` does, as one that can write through its
-/// fields. The future also stays unboxed, so harvest-verify can follow it.
+/// fields. The handler closure returns this future unboxed, so harvest-verify
+/// can follow it. The entity loop puts it on the heap (issue #2752).
 async fn handle_op(
     run: &AgentRun<'_>,
     state: AgentState,
@@ -1454,8 +1455,8 @@ async fn load_run(ctx: &WorkflowContext, id: Result<AgentId, String>) -> AgentRu
 /// [`load_run`] on the heap.
 ///
 /// It makes its future in its own frame, as [`autumn_harvest::frame`]
-/// explains (issue #2752). A closure would hide the future from
-/// harvest-verify, so this is a named function.
+/// explains (issue #2752). The future names a lifetime, so a closure future
+/// would be a harvest-verify boundary. A named function is not.
 #[inline(never)]
 fn boxed_load_run(
     ctx: &WorkflowContext,
@@ -1626,8 +1627,8 @@ impl AgentRun<'_> {
     /// [`reload_read`](Self::reload_read) on the heap.
     ///
     /// Each `boxed_` function makes its future in its own frame, as
-    /// [`autumn_harvest::frame`] explains (issue #2752). A closure would
-    /// hide the future from harvest-verify, so each one is a named function.
+    /// [`autumn_harvest::frame`] explains (issue #2752). Each future names a
+    /// lifetime, so a closure future would be a harvest-verify boundary.
     #[inline(never)]
     fn boxed_reload_read(
         &self,
@@ -1659,17 +1660,6 @@ impl AgentRun<'_> {
     #[inline(never)]
     fn boxed_unpark(&self, state: AgentState) -> Pin<Box<impl Future<Output = AgentState> + '_>> {
         Box::pin(self.unpark(state))
-    }
-
-    /// [`segment`](Self::segment) on the heap.
-    #[inline(never)]
-    fn boxed_segment<'s>(
-        &'s self,
-        state: AgentState,
-        input: &'s str,
-        mode: Mode<'s>,
-    ) -> Pin<Box<impl Future<Output = AgentState> + 's>> {
-        Box::pin(self.segment(state, input, mode))
     }
 
     /// [`sampled`](Self::sampled) on the heap.
@@ -2239,9 +2229,7 @@ impl AgentRun<'_> {
                 state.chain = 0;
                 let rounds = state.rounds;
                 let retry = message.clone();
-                let mut state = self
-                    .boxed_segment(state, &message.text, Mode::Attended)
-                    .await;
+                let mut state = self.segment(state, &message.text, Mode::Attended).await;
                 // A mesh budget refused the first turn, so no tool ran. The
                 // message waits for the next period, first in line.
                 if refused_untouched(&state, rounds) {
@@ -2256,8 +2244,7 @@ impl AgentRun<'_> {
                     return state;
                 }
                 state.chain = state.chain.saturating_add(1);
-                self.boxed_segment(state, WAKE_MESSAGE, Mode::Followup)
-                    .await
+                self.segment(state, WAKE_MESSAGE, Mode::Followup).await
             }
             AgentOp::Control(_) | AgentOp::Unpark => state,
         }

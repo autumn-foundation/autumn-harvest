@@ -4,9 +4,9 @@
 //! a large frame for each poll. The Windows main thread has 1 MiB of stack, so
 //! an agent op overflowed it.
 //!
-//! Each test runs one walk on a thread with a fixed stack of
-//! [`STACK_BUDGET`] bytes. An overflow aborts the process, so a child process
-//! runs the walk. The parent test checks that the child completed.
+//! Each test runs one walk on a thread with a fixed stack. An overflow aborts
+//! the process, so a child process runs the walk. The parent test checks that
+//! the child completed.
 //!
 //! Measure the need of a walk with the child alone, for example:
 //!
@@ -15,11 +15,14 @@
 //!   cargo test -p autumn-harvest-agent --features sqlite,eval \
 //!   --test stack_budget -- probe_child --exact --nocapture
 //! ```
+//!
+//! CI enables more features. They can change the need a little.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use autumn_harvest_agent::model::BoxFuture;
 use autumn_harvest_agent::refine::{
@@ -34,22 +37,24 @@ use autumn_harvest_agent::{
 };
 use autumn_harvest_sqlite::{ExecutionId, RunState, SqliteRuntime};
 
-/// The stack of the thread that runs one walk.
+/// The stack of the thread that runs a walk with a budget of `kib` KiB.
 ///
-/// The Windows main thread has 1 MiB. A Linux debug build of the deepest walk
-/// needs about 370 KiB, test frames included. Windows makes larger frames, so
-/// its budget is larger. Each budget leaves at least a quarter of that main
-/// thread free.
-const STACK_BUDGET: usize = if cfg!(windows) {
-    768 * 1024
-} else {
-    512 * 1024
-};
+/// Each budget is 1.3 to 1.4 times the measured need of its walk in a Linux
+/// debug build. So a partial regression also fails. Issue #2752 reports larger
+/// frames on Windows, so Windows gets half again. The largest budget leaves a
+/// quarter of the 1 MiB Windows main thread free.
+const fn stack_bytes(kib: usize) -> usize {
+    let kib = if cfg!(windows) { kib * 3 / 2 } else { kib };
+    kib * 1024
+}
+
+/// The time that a child gets to complete its walk.
+const CHILD_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The walk that the child runs. A parent test sets it.
 const PROBE_ENV: &str = "AGENT_STACK_PROBE";
 
-/// An optional stack size for the child, in bytes. Use it to measure a walk.
+/// The stack size of the child thread, in bytes. Also set it to measure a walk.
 const BYTES_ENV: &str = "AGENT_STACK_PROBE_BYTES";
 
 /// The line that the child prints when its walk completes.
@@ -188,16 +193,13 @@ impl Walk {
         exec
     }
 
-    /// One op of a durable agent of the kind.
-    async fn agent_op(&mut self) {
+    /// One op of a durable agent of the kind. It must answer `expected`.
+    async fn agent_op(&mut self, expected: &str) {
         let id = AgentId::new(KIND, "customer").unwrap();
         sqlite::send(&mut self.rt, &id, &AgentOp::message(TASK), Some("op")).unwrap();
         sqlite::drive(&mut self.rt, &id).await.unwrap();
         let state = sqlite::state(&self.rt, &id).await.unwrap().unwrap();
-        assert!(
-            state.last_answer.is_some(),
-            "the op gave no answer: {state:?}"
-        );
+        assert_eq!(state.last_answer.as_deref(), Some(expected), "{state:?}");
     }
 
     /// One refine run from `source`, approved at the gate.
@@ -232,31 +234,51 @@ async fn walk(name: &str) {
         "agent_loop" => {
             walk.agent_loop().await;
         }
-        "agent" => walk.agent_op().await,
+        "agent" => walk.agent_op(MISS).await,
+        // The op after the adoption reads the overlay, so it answers `PASS`.
         "agent_refine" => {
             let source = walk.agent_loop().await;
             walk.refine(source).await;
-            walk.agent_op().await;
+            walk.agent_op(PASS).await;
         }
         other => panic!("no walk named {other:?}"),
     }
 }
 
-/// Run the walk `name` in a child process. Panic when it does not complete.
-fn assert_fits(name: &str) {
-    let output = Command::new(std::env::current_exe().unwrap())
+/// Run the walk `name` in a child process, on a stack of `kib` KiB. Panic
+/// when it does not complete in time.
+fn assert_fits(name: &str, kib: usize) {
+    let bytes = stack_bytes(kib);
+    // Files take the output, so a full pipe cannot block the child.
+    let dir = tempfile::tempdir().unwrap();
+    let out_path = dir.path().join("stdout");
+    let err_path = dir.path().join("stderr");
+    let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["probe_child", "--exact", "--nocapture", "--test-threads=1"])
         .env(PROBE_ENV, name)
-        .env_remove(BYTES_ENV)
-        .output()
+        .env(BYTES_ENV, bytes.to_string())
+        .stdout(Stdio::from(std::fs::File::create(&out_path).unwrap()))
+        .stderr(Stdio::from(std::fs::File::create(&err_path).unwrap()))
+        .spawn()
         .unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let deadline = Instant::now() + CHILD_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let stdout = String::from_utf8_lossy(&std::fs::read(&out_path).unwrap()).into_owned();
+    let stderr = String::from_utf8_lossy(&std::fs::read(&err_path).unwrap()).into_owned();
     assert!(
-        output.status.success() && stdout.contains(DONE),
-        "the walk {name:?} did not complete on a stack of {STACK_BUDGET} bytes \
-         ({}):\n{stdout}\n{stderr}",
-        output.status,
+        status.is_some_and(|status| status.success()) && stdout.contains(DONE),
+        "the walk {name:?} did not complete on a stack of {bytes} bytes \
+         ({status:?}):\n{stdout}\n{stderr}",
     );
 }
 
@@ -266,9 +288,7 @@ fn probe_child() {
     let Ok(name) = std::env::var(PROBE_ENV) else {
         return;
     };
-    let bytes = std::env::var(BYTES_ENV)
-        .ok()
-        .map_or(STACK_BUDGET, |bytes| bytes.parse().unwrap());
+    let bytes: usize = std::env::var(BYTES_ENV).unwrap().parse().unwrap();
     let walker = std::thread::Builder::new()
         .name("stack-probe".to_owned())
         .stack_size(bytes)
@@ -289,15 +309,15 @@ fn probe_child() {
 
 #[test]
 fn an_agent_loop_run_fits_the_stack_budget() {
-    assert_fits("agent_loop");
+    assert_fits("agent_loop", 320);
 }
 
 #[test]
 fn a_durable_agent_op_fits_the_stack_budget() {
-    assert_fits("agent");
+    assert_fits("agent", 448);
 }
 
 #[test]
 fn the_refine_walk_fits_the_stack_budget() {
-    assert_fits("agent_refine");
+    assert_fits("agent_refine", 512);
 }

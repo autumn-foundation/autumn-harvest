@@ -536,8 +536,8 @@ where
         W: FnMut(&S) -> Option<Wake<O>>,
         C: FnMut(&mut S) -> bool,
     {
-        // On the heap, the loop adds no debug frame to the workflow that
-        // runs it (issue #2752).
+        // On the heap, the loop adds only a pointer to the frame of the
+        // workflow in a debug build (issue #2752).
         boxed(|| self.run_loop(handler, wake, take)).await
     }
 
@@ -587,8 +587,7 @@ where
         let mut requested = false;
 
         loop {
-            let step = boxed(|| next_step(ctx, &mut waiting, wake(&checkpoint.state)));
-            let message = match step.await? {
+            let message = match next_step(ctx, &mut waiting, wake(&checkpoint.state)).await? {
                 Step::Message(raw) => {
                     run.op_bytes += json_len(&raw)?;
                     serde_json::from_value::<EntityMessage<O>>(raw)
@@ -597,8 +596,8 @@ where
                 Step::Wake(op) => Ok(EntityMessage::op(op)),
             };
             match message {
-                // A handler future can be large. On the heap, it adds no
-                // debug frame to this loop or to its callers (issue #2752).
+                // A handler future can be large. On the heap, it adds only a
+                // pointer to this frame in a debug build (issue #2752).
                 Ok(EntityMessage::Op { op }) => {
                     match boxed(|| handler(checkpoint.state.clone(), op)).await {
                         Ok(next) => {

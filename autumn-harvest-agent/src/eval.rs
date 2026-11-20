@@ -1070,7 +1070,8 @@ async fn run_with_routes(
     for (name, payload) in &recording.signals {
         env = env.queue_signal(name.clone(), payload.clone());
     }
-    // On the heap, the run adds no debug frame to the probe (issue #2752).
+    // On the heap, the run adds only a pointer to the probe frame in a debug
+    // build (issue #2752).
     let outcome = boxed(|| env.run(agent_loop_info().handler, input)).await;
 
     let candidate_turns = model_turns(outcome.events())?;
