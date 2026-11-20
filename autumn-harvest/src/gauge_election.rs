@@ -231,13 +231,13 @@ mod db {
 
     use diesel::QueryableByName;
     use diesel::sql_types::{Double, Integer, Jsonb, Text};
-    use diesel_async::{AsyncPgConnection, RunQueryDsl};
+    use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
     use serde::Serialize;
     use serde::de::DeserializeOwned;
 
     use super::{GaugeElection, GaugeSampler};
     use crate::cached_stmt::CachePreparedDsl as _;
-    use crate::error::{HarvestResult, database_error};
+    use crate::error::{HarvestError, HarvestResult, database_error};
     use crate::scanner_lease::{LEASE_RELEASE_BOUND, LeaderFailures, ScannerLease, ScannerRole};
     use crate::telemetry::MetricsRecorder;
     use crate::types::ShardId;
@@ -263,6 +263,12 @@ mod db {
                          AND l.lease_until > clock_timestamp()) \
          ON CONFLICT (shard_id, sampler) DO UPDATE SET \
              sample = EXCLUDED.sample, sampled_at = EXCLUDED.sampled_at";
+
+    /// Bound on the wait for a row lock during a write.
+    ///
+    /// Another transaction can hold the row lock of a sample or of a pruned
+    /// row. Without a bound, the leader then waits, and no gauge is emitted.
+    pub(super) const WRITE_LOCK_TIMEOUT_SQL: &str = "SET LOCAL lock_timeout = '1s'";
 
     /// The row of one shard and key, when it is younger than `$3` seconds.
     pub(super) const FRESH_SQL: &str = "SELECT sample FROM harvest_gauge_samples \
@@ -290,16 +296,26 @@ mod db {
         holder: &str,
         sample: &serde_json::Value,
     ) -> HarvestResult<bool> {
-        let written = diesel::sql_query(PUBLISH_SQL)
-            .bind::<Integer, _>(shard.as_i32())
-            .bind::<Text, _>(key)
-            .bind::<Jsonb, _>(sample)
-            .bind::<Text, _>(holder)
-            .cache_prepared()
-            .execute(conn)
-            .await
-            .map_err(database_error)?;
-        Ok(written > 0)
+        // A short transaction with a bounded lock wait, as for the lease. A
+        // stuck row lock then fails the write, and the leader still emits
+        // its own read.
+        conn.transaction::<bool, HarvestError, _>(async |conn| {
+            diesel::sql_query(WRITE_LOCK_TIMEOUT_SQL)
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
+            let written = diesel::sql_query(PUBLISH_SQL)
+                .bind::<Integer, _>(shard.as_i32())
+                .bind::<Text, _>(key)
+                .bind::<Jsonb, _>(sample)
+                .bind::<Text, _>(holder)
+                .cache_prepared()
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
+            Ok(written > 0)
+        })
+        .await
     }
 
     /// The row of one shard and key, when it is younger than `max_age`.
@@ -664,6 +680,7 @@ mod db {
             assert!(PUBLISH_SQL.contains("l.holder = $4 AND l.lease_until > clock_timestamp()"));
             assert!(!PUBLISH_SQL.contains("NOW()"));
             assert!(FRESH_SQL.contains("clock_timestamp() - make_interval(secs => $3)"));
+            assert_eq!(WRITE_LOCK_TIMEOUT_SQL, "SET LOCAL lock_timeout = '1s'");
         }
     }
 }

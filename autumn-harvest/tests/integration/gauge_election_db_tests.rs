@@ -265,6 +265,47 @@ async fn a_worker_without_the_lease_writes_no_row() {
     assert_eq!(row, Some(serde_json::json!(2)));
 }
 
+/// A transaction that holds the row lock cannot stall the leader. The write
+/// gives up within its bound, and the leader still emits its own read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_locked_row_cannot_stall_the_leader() {
+    let db = database("gauge_elect_t").await;
+    let mut conn = connect(&db.url).await;
+    let key = test_key("locked");
+    publish_as(&mut conn, "a", 0, &key, &serde_json::json!(1)).await;
+
+    // Another session holds the row lock until the test ends.
+    let mut blocker = connect(&db.url).await;
+    blocker.batch_execute("BEGIN").await.expect("begin");
+    diesel::sql_query("SELECT 1 FROM harvest_gauge_samples WHERE sampler = $1 FOR UPDATE")
+        .bind::<Text, _>(&key)
+        .execute(&mut blocker)
+        .await
+        .expect("lock the row");
+
+    let started = std::time::Instant::now();
+    let written = tokio::time::timeout(
+        Duration::from_secs(10),
+        publish_gauge_sample(&mut conn, ShardId::new(0), &key, "a", &serde_json::json!(2)),
+    )
+    .await
+    .expect("the write must not wait for the lock");
+    assert!(written.is_err(), "a lock timeout is a failed write");
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    // The slot path: the leader keeps its own read.
+    let mut a = slot("a", &key, 0, LONG);
+    let reads = AtomicUsize::new(0);
+    let sampled = tokio::time::timeout(
+        Duration::from_secs(10),
+        sample(&mut a, &mut conn, &reads, 3),
+    )
+    .await
+    .expect("the sample must not wait for the lock");
+    assert_eq!(sampled, (3, ScannerRole::Leader));
+    blocker.batch_execute("ROLLBACK").await.expect("rollback");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_leader_whose_reads_fail_stands_by_for_one_ttl() {
     let db = database("gauge_elect_t").await;
