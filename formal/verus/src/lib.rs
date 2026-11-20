@@ -37,3 +37,4 @@ mod claim_recheck;
 mod claim_window;
 mod claim_batch;
 mod restore_target;
+mod set_aside;
