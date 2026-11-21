@@ -27,7 +27,7 @@ use std::time::Duration;
 use jiff::{SignedDuration, Timestamp};
 
 use crate::policy::Schedule;
-use crate::schedule_herd::{Fire, HerdForecast, forecast, forecast_shifted};
+use crate::schedule_herd::{Fire, HerdForecast, HerdSpot, forecast, forecast_shifted};
 
 /// The largest number of delays that the planner tries for one schedule.
 ///
@@ -61,13 +61,13 @@ impl StaggerPlan {
     /// The size of the largest herd before the plan, or 0 with no herd.
     #[must_use]
     pub fn peak_before(&self) -> usize {
-        self.before.peak().map_or(0, |spot| spot.size())
+        self.before.peak().map_or(0, HerdSpot::size)
     }
 
     /// The size of the largest herd after the plan, or 0 with no herd.
     #[must_use]
     pub fn peak_after(&self) -> usize {
-        self.after.peak().map_or(0, |spot| spot.size())
+        self.after.peak().map_or(0, HerdSpot::size)
     }
 }
 
@@ -195,8 +195,8 @@ fn shifted(
 /// The crowding total counts each schedule once in each spot. A lower total
 /// means fewer schedules share a bucket.
 fn score(report: &HerdForecast) -> (usize, usize) {
-    let peak = report.peak().map_or(0, |spot| spot.size());
-    let crowding = report.spots.iter().map(|spot| spot.size()).sum();
+    let peak = report.peak().map_or(0, HerdSpot::size);
+    let crowding = report.spots.iter().map(HerdSpot::size).sum();
     (peak, crowding)
 }
 
@@ -298,7 +298,7 @@ mod tests {
     fn unanchored_schedules_never_move() {
         let a = cron("0 * * * *");
         let b = cron("0 * * * *");
-        let every = Schedule::Interval(Duration::from_secs(3_600));
+        let every = Schedule::Interval(Duration::from_hours(1));
         let result = plan(
             &[
                 ("a", &a),
@@ -335,11 +335,11 @@ mod tests {
 
     #[test]
     fn a_fine_step_is_widened_to_the_candidate_bound() {
-        let delays = candidate_delays(Duration::from_secs(1), Duration::from_secs(86_400));
+        let delays = candidate_delays(Duration::from_secs(1), Duration::from_hours(24));
         let bound = usize::try_from(MAX_CANDIDATE_DELAYS).unwrap();
         assert_eq!(delays.len(), bound + 1);
         assert_eq!(delays.first(), Some(&Duration::ZERO));
-        assert_eq!(delays.last(), Some(&Duration::from_secs(86_400)));
+        assert_eq!(delays.last(), Some(&Duration::from_hours(24)));
     }
 
     #[test]
