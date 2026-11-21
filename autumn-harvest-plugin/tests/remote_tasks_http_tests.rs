@@ -228,14 +228,19 @@ async fn a_client_error_status_is_not_retryable() {
     assert!(!err.retryable);
 }
 
-/// A loopback URL with no listener: bind a port, then free it.
-async fn closed_port_url() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
+/// A loopback URL that refuses each connection.
+///
+/// The socket is bound but does not listen, so the kernel refuses each
+/// connection. The caller keeps the socket alive to hold the port. A freed port
+/// is not safe. A parallel test can bind it, and the request then reaches the
+/// stub of that test.
+fn refusing_url() -> (String, tokio::net::TcpSocket) {
+    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+    socket
+        .bind("127.0.0.1:0".parse().expect("addr"))
         .expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    drop(listener);
-    format!("http://{addr}/rpc")
+    let addr = socket.local_addr().expect("addr");
+    (format!("http://{addr}/rpc"), socket)
 }
 
 /// Sends `status` with a body shorter than its `Content-Length`, then closes.
@@ -282,7 +287,7 @@ async fn a_body_read_failure_follows_the_status() {
 
 #[tokio::test]
 async fn an_unreachable_server_is_retryable() {
-    let url = closed_port_url().await;
+    let (url, _held) = refusing_url();
     let client = HttpRemoteTasks::new().server("reports", RemoteServer::mcp(&url));
     let err = client
         .start(&request(RemoteProtocol::Mcp, "export"), "k")
@@ -394,7 +399,7 @@ async fn a_redirect_to_another_origin_is_refused() {
 
 #[tokio::test]
 async fn an_unknown_server_or_a_protocol_mismatch_is_not_retryable() {
-    let url = closed_port_url().await;
+    let (url, _held) = refusing_url();
     let client = HttpRemoteTasks::new().server("reports", RemoteServer::a2a(&url));
     let mut unknown = request(RemoteProtocol::Mcp, "export");
     unknown.server = "other".into();
