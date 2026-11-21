@@ -27,7 +27,15 @@ BEGIN
       INTO existing_def, existing_valid
       FROM pg_index i
      WHERE i.indexrelid = to_regclass('idx_harvest_mutex_waiters_waiter');
-    IF existing_def IS NULL THEN
+    IF existing_def IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM pg_index i
+         WHERE i.indexrelid = to_regclass('idx_harvest_mutex_waiters_waiter')
+           AND i.indrelid = 'harvest_mutex_waiters'::regclass
+    ) THEN
+        RAISE EXCEPTION
+            'idx_harvest_mutex_waiters_waiter already exists on another table -- rename or drop it before retrying this migration: %',
+            existing_def;
+    ELSIF existing_def IS NULL THEN
         CREATE INDEX idx_harvest_mutex_waiters_waiter
             ON harvest_mutex_waiters (waiter_exec_id);
     ELSIF regexp_replace(existing_def, '^CREATE INDEX \S+ ON (ONLY )?\S+ ', '') <>
