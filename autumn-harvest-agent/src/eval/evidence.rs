@@ -801,7 +801,6 @@ fn render_diff(id: &str, evaluation: &Evaluation) -> String {
     out
 }
 
-/// The text of a verdict.
 fn verdict_text(verdict: Verdict) -> String {
     match verdict {
         Verdict::Same => "same".to_owned(),
@@ -851,7 +850,6 @@ fn push_decision(out: &mut String, decision: &TurnDecision) {
     let _ = write!(out, "Stop: `{}`.\n\n", name_of(&decision.stop));
 }
 
-/// Write how a run ended.
 fn push_end(out: &mut String, end: &RunEnd) {
     match end {
         RunEnd::Completed(report) => {
@@ -1083,7 +1081,7 @@ mod tests {
         vec![
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::to_value(crate::AgentTask::new("hello")).unwrap(),
-                timestamp: chrono::Utc::now(),
+                timestamp: autumn_harvest::time::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -1290,7 +1288,7 @@ mod tests {
         let history = [
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::to_value(task).unwrap(),
-                timestamp: chrono::Utc::now(),
+                timestamp: autumn_harvest::time::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,

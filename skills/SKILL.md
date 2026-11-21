@@ -15,7 +15,7 @@ description: >
 # autumn-harvest — Durable Workflow Engine for Rust
 
 **Repository**: https://github.com/autumn-foundation/autumn-harvest
-**Version**: 0.10.0 | **Edition**: 2024 | **MSRV**: 1.97.0
+**Version**: 0.11.0 | **Edition**: 2024 | **MSRV**: 1.97.0
 **Author**: autumn-foundation
 
 autumn-harvest is a Postgres-backed durable workflow engine — Temporal-style semantics
@@ -64,10 +64,10 @@ non-web or other-framework contexts.
 
 ```toml
 [dependencies]
-autumn-harvest = { version = "0.10", features = ["db"] }
-autumn-harvest-plugin = "0.10"
-autumn-web = { version = "0.10", features = ["ws"] }
-# ... plus standard deps (serde_json, chrono, uuid, tokio, tracing, etc.)
+autumn-harvest = { version = "0.11", features = ["db"] }
+autumn-harvest-plugin = "0.11"
+autumn-web = { version = "0.11", features = ["ws"] }
+# ... plus standard deps (serde_json, jiff, uuid, tokio, tracing, etc.)
 ```
 
 The `db` feature (default) pulls Diesel + diesel-async. Requirements: Postgres 12+. CI runs Harvest's own DB suites on Postgres 16 and does not test 12 to 15.
@@ -121,7 +121,7 @@ Because workflows replay from history, they must be deterministic:
 - **Do**: Use `ctx.timer()` instead of `tokio::time::sleep`
 - **Do**: Use `ctx.wait_for_signal()` for external events
 - **Do**: Use `ctx.spawn_child_workflow_raw()` or the typed `ctx.spawn_child_workflow()` for sub-orchestrations
-- **Don't**: Call `Utc::now()`, `rand::random()`, or do I/O directly in workflows
+- **Don't**: Call `jiff::Timestamp::now()`, `chrono::Utc::now()`, `rand::random()`, or do I/O directly in workflows (read time with `ctx.now()` or `ctx.system_now()`)
 - **Don't**: Use `tokio::spawn` or other non-deterministic operations
 
 ## Defining Activities
@@ -265,9 +265,15 @@ async fn weekly_digest(ctx: &WorkflowContext, user_id: i64) -> HarvestResult<()>
 
 ## Integrating with autumn-web
 
-Harvest 0.10 needs `autumn-web` 0.10. A leftover `autumn-web = "0.9"` builds a
+Harvest 0.11 needs `autumn-web` 0.11. A leftover `autumn-web = "0.10"` builds a
 second copy whose `Plugin` trait `HarvestPlugin` does not implement.
 `cargo tree -i autumn-web` must show one version.
+
+Harvest 0.11 runs its worker, scheduler, retention janitor and batch executor
+as Autumn background tasks, placed by the process role (0.11.0). A
+`[roles.<name>]` preset places them through the capabilities
+`harvest.worker`, `harvest.scheduler` and `harvest.maintenance`. Dates and
+times in the public API are `jiff` types, not `chrono` types (0.11.0).
 
 An `AUTUMN_ROLE=web` replica runs no Harvest worker, scheduler or retention
 janitor (0.10.0). Run `worker` replicas, or set `worker_enabled` and
@@ -280,8 +286,9 @@ you deploy. See `docs/upgrading/0.7.0.md` for every 0.7.0 default change.
 Under the `prod` profile, `autumn-web` refuses unknown top-level config
 tables. `HarvestPlugin` declares `[harvest]`, so that table is accepted. See
 `docs/upgrading/0.8.0.md` for the 0.8.0 changes,
-`docs/upgrading/0.9.0.md` for the 0.9.0 changes, and
-`docs/upgrading/0.10.0.md` for the 0.10.0 changes.
+`docs/upgrading/0.9.0.md` for the 0.9.0 changes,
+`docs/upgrading/0.10.0.md` for the 0.10.0 changes, and
+`docs/upgrading/0.11.0.md` for the 0.11.0 changes.
 
 ### Building the HarvestPlugin
 

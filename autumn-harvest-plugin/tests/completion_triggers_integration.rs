@@ -10,6 +10,7 @@
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
 use autumn_harvest::table_split::Ext;
+use jiff_diesel::ToDiesel;
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -464,7 +465,6 @@ async fn test_trigger_evaluations_same_shard() {
     )
     .await;
 
-    // Start a source workflow
     let source_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
     start_or_load_workflow_execution(
         &mut conn,
@@ -528,18 +528,16 @@ async fn test_trigger_evaluations_same_shard() {
         .unwrap();
     assert_eq!(exec.state, "RUNNING");
 
-    // Transition it to COMPLETED with output
     diesel::update(harvest_workflow_executions::table.find(source_exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
             harvest_workflow_executions::output.eq(Some(json!({"result": "done"}))),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await
         .unwrap();
 
-    // Evaluate trigger
     evaluate_triggers_for_execution(&mut conn, source_exec_id, TerminalState::Completed, None)
         .await
         .unwrap();
@@ -787,7 +785,7 @@ async fn test_trigger_input_mapping_static_and_projection() {
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
             harvest_workflow_executions::output.eq(Some(json!({"ignored": true}))),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -888,7 +886,7 @@ async fn test_trigger_input_mapping_static_and_projection() {
                     }
                 }
             }))),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -921,11 +919,11 @@ async fn test_trigger_input_mapping_static_and_projection() {
 /// `GET /workflows/{id}` on the source. The `Outcome { projection: None }`
 /// mapping assembles the envelope purely from the recorded execution row.
 ///
-/// AC5 (inline/outbox parity) holds here by construction: this is a same-shard
-/// fire, and the identical `target_input` value that lands in the target
-/// execution row is the same one that would populate a cross-shard outbox row
-/// / `DeferredTriggerStart` — the envelope is assembled once at the single
-/// inline mapping site and flows to both paths verbatim.
+/// AC5 (inline/outbox parity) holds here by construction. This is a same-shard
+/// fire. The `target_input` in the target execution row is the same value a
+/// cross-shard outbox row / `DeferredTriggerStart` would carry. The single
+/// inline mapping site assembles the envelope once, and both paths copy it
+/// verbatim.
 #[tokio::test]
 async fn test_outcome_mapping_delivers_failure_cause_to_target() {
     let _lock = TEST_MUTEX
@@ -1011,7 +1009,7 @@ async fn test_outcome_mapping_delivers_failure_cause_to_target() {
             harvest_workflow_executions::state.eq("FAILED"),
             harvest_workflow_executions::output.eq(None::<Value>),
             harvest_workflow_executions::error.eq(Some("payment declined: insufficient funds")),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -1091,9 +1089,9 @@ async fn test_create_trigger_with_outcome_mapping_round_trips() {
 }
 
 /// Issue #748 COMPLETED→output positive branch: a target routed off a
-/// successful source receives the terminal-outcome envelope carrying the
-/// source's recorded output (the `execution.output.as_ref()` arm, gated on
-/// `state == Completed`). This is the complement to
+/// successful source receives the terminal-outcome envelope with the source's
+/// recorded output. That is the `execution.output.as_ref()` arm, gated on
+/// `state == Completed`. This is the complement to
 /// `test_outcome_mapping_delivers_failure_cause_to_target`, which exercises
 /// only the FAILED → `None` output branch.
 #[tokio::test]
@@ -1182,7 +1180,7 @@ async fn test_outcome_mapping_delivers_output_on_completed_source() {
             harvest_workflow_executions::state.eq("COMPLETED"),
             harvest_workflow_executions::output.eq(Some(source_output.clone())),
             harvest_workflow_executions::error.eq(None::<String>),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -1243,7 +1241,6 @@ async fn test_trigger_state_matching_and_deduplication() {
     )
     .await;
 
-    // Start source workflow
     let source_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
     start_or_load_workflow_execution(
         &mut conn,
@@ -1302,7 +1299,7 @@ async fn test_trigger_state_matching_and_deduplication() {
     diesel::update(harvest_workflow_executions::table.find(source_exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -1371,13 +1368,11 @@ async fn test_trigger_cross_shard() {
     let pool0 = build_pool(&shard0_url);
     let pool1 = build_pool(&shard1_url);
 
-    // Setup sharded database pool and router
     let mut pools = BTreeMap::new();
     pools.insert(ShardId::new(0), pool0.clone());
     pools.insert(ShardId::new(1), pool1.clone());
     let sharded_pool = ShardedDbPool::from_map(pools, ShardId::new(0));
 
-    // Install router
     let router = ShardRouter::new(
         vec![ShardId::new(0), ShardId::new(1)],
         vec![ShardId::new(0), ShardId::new(1)],
@@ -1498,7 +1493,7 @@ async fn test_trigger_cross_shard() {
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
             harvest_workflow_executions::output.eq(Some(json!({"status": "ok"}))),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn0)
         .await
@@ -1531,7 +1526,6 @@ async fn test_completion_trigger_via_worker_run() {
     let app = build_app(&pool);
     let mut conn = pool.get().await.unwrap();
 
-    // Setup trigger
     let trigger_id = uuid::Uuid::new_v4();
     let (status, res) = post_json(
         &app,
@@ -1552,7 +1546,6 @@ async fn test_completion_trigger_via_worker_run() {
         res
     );
 
-    // Start source workflow execution
     let source_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
     start_or_load_workflow_execution(
         &mut conn,
@@ -1689,7 +1682,6 @@ async fn test_trigger_with_custom_queue() {
     )
     .await;
 
-    // Start source workflow
     let source_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
     start_or_load_workflow_execution(
         &mut conn,
@@ -1744,17 +1736,15 @@ async fn test_trigger_with_custom_queue() {
     .await
     .unwrap();
 
-    // Transition source to COMPLETED
     diesel::update(harvest_workflow_executions::table.find(source_exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await
         .unwrap();
 
-    // Evaluate trigger
     let deferred =
         evaluate_triggers_for_execution(&mut conn, source_exec_id, TerminalState::Completed, None)
             .await
@@ -1880,7 +1870,6 @@ async fn test_trigger_outbox_retry_and_sweep() {
         }
     }
 
-    // Register trigger
     post_json(
         &app,
         "/admin/completion-triggers",
@@ -1949,12 +1938,11 @@ async fn test_trigger_outbox_retry_and_sweep() {
     .await
     .unwrap();
 
-    // Complete source workflow
     diesel::update(harvest_workflow_executions::table.find(source_exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
             harvest_workflow_executions::output.eq(Some(json!({"out": "yes"}))),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn0)
         .await
@@ -2003,7 +1991,7 @@ async fn test_trigger_outbox_retry_and_sweep() {
         .is_some();
     assert!(outbox_still_exists);
 
-    // Issue #1227 Finding 4 (PR #1386): a missing target-shard pool now stamps
+    // Issue #1227 (PR #1386): a missing target-shard pool now stamps
     // `next_attempt_at` with a backoff (`OUTBOX_RELAY_FAILURE_BACKOFF`). So a
     // durably-unreachable shard cannot dominate every claim batch forever. The
     // failed sweep just stamped the row above. So the very next sweep call, with
@@ -2016,7 +2004,10 @@ async fn test_trigger_outbox_retry_and_sweep() {
         outbox_dsl::harvest_completion_trigger_outbox
             .filter(outbox_dsl::source_exec_id.eq(source_exec_id.as_uuid())),
     )
-    .set(outbox_dsl::next_attempt_at.eq(chrono::Utc::now() - chrono::Duration::seconds(1)))
+    .set(
+        outbox_dsl::next_attempt_at
+            .eq((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)).to_diesel()),
+    )
     .execute(&mut conn0)
     .await
     .unwrap();
@@ -2208,7 +2199,7 @@ async fn test_trigger_cross_shard_queue_preservation() {
     diesel::update(harvest_workflow_executions::table.find(source_exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn1)
         .await
@@ -2405,20 +2396,17 @@ async fn test_exact_pool_routing_cross_shard() {
     let pool0 = build_pool(&shard0_url);
     let pool1 = build_pool(&shard1_url);
 
-    // Setup sharded database pool and router
     let mut pools = BTreeMap::new();
     pools.insert(ShardId::new(0), pool0.clone());
     pools.insert(ShardId::new(1), pool1.clone());
     let sharded_pool = ShardedDbPool::from_map(pools, ShardId::new(0));
 
-    // Install router
     let router = ShardRouter::new(
         vec![ShardId::new(0), ShardId::new(1)],
         vec![ShardId::new(0), ShardId::new(1)],
         ShardId::new(0),
     );
 
-    // Set globally
     if let Ok(mut lock) = autumn_harvest::shard::GLOBAL_SHARDED_POOL.write() {
         *lock = Some(sharded_pool.clone());
     }
@@ -2490,7 +2478,8 @@ async fn test_exact_pool_routing_cross_shard() {
     assert_eq!(outbox_rows.len(), 1);
     assert_eq!(outbox_rows[0].target_shard, 1);
 
-    // Now, run the outbox sweep, but we mock the sharded_pool to ONLY have Shard 0 (e.g. simulating a worker that does not configure Shard 1 pool)
+    // Run the outbox sweep with a sharded_pool that has ONLY Shard 0. This
+    // simulates a worker with no Shard 1 pool configured.
     let mut incomplete_pools = BTreeMap::new();
     incomplete_pools.insert(ShardId::new(0), pool0.clone());
     let incomplete_sharded_pool = Some(ShardedDbPool::from_map(incomplete_pools, ShardId::new(0)));
@@ -2710,7 +2699,7 @@ async fn test_trigger_evaluations_schema_validation() {
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
             harvest_workflow_executions::output.eq(Some(json!({"email": "test@example.com"}))),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -2800,7 +2789,7 @@ async fn test_trigger_evaluations_schema_validation() {
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
             harvest_workflow_executions::output.eq(Some(json!({"username": "not_an_email"}))),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -2831,10 +2820,9 @@ async fn test_trigger_evaluations_schema_validation() {
 
 /// AC #6 (issue #517): a per-trigger fire counter/metric
 /// (`harvest.completion_trigger.fires{trigger, outcome}`) is emitted so
-/// operators can confirm wiring. This drives the completion path twice and
-/// asserts the recorder observes `started` on the first evaluation and
-/// `deduped` on the (idempotent) second evaluation, both tagged with the
-/// trigger id.
+/// operators can confirm wiring. This drives the completion path twice. The
+/// recorder must observe `started` on the first evaluation and `deduped` on
+/// the idempotent second one, both tagged with the trigger id.
 #[tokio::test]
 async fn test_trigger_emits_fire_metric_outcomes() {
     // Minimal capturing MetricsRecorder — records only the completion-trigger
@@ -2932,7 +2920,7 @@ async fn test_trigger_emits_fire_metric_outcomes() {
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
             harvest_workflow_executions::output.eq(Some(json!({"result": "done"}))),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -3068,7 +3056,7 @@ async fn start_and_complete_source(
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
             harvest_workflow_executions::output.eq(Some(output)),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(conn)
         .await
@@ -3107,9 +3095,9 @@ async fn target_exec_count(
 }
 
 /// AC1/AC3/AC4/AC5 (issue #810): a guarded trigger fires when the condition
-/// is met, skips (recorded + metered, exactly-once) when unmet or the path is
-/// missing, and a co-registered unconditional trigger keeps byte-identical
-/// legacy behavior throughout.
+/// is met. It skips (recorded + metered, exactly-once) when the condition is
+/// unmet or the path is missing. A co-registered unconditional trigger keeps
+/// byte-identical legacy behavior throughout.
 #[tokio::test]
 async fn test_condition_gate_fire_skip_and_exactly_once() {
     let _lock = TEST_MUTEX
@@ -3256,9 +3244,9 @@ async fn test_condition_gate_fire_skip_and_exactly_once() {
     );
 
     // ── Skip-then-loosen: a `condition_unmet` resolution is FINAL (AC5). ───
-    // Loosening the condition to one B's output would now satisfy and
-    // redelivering the terminal must never late-fire — the resolved-skip row
-    // dedupes exactly like a fire.
+    // A looser condition that one B's output now satisfies must never
+    // late-fire on a terminal redelivery. The resolved-skip row dedupes
+    // exactly like a fire.
     {
         use autumn_harvest::schema::harvest_completion_triggers::dsl as triggers_dsl;
         diesel::update(triggers_dsl::harvest_completion_triggers.find(guarded_id))
@@ -3293,16 +3281,17 @@ async fn test_condition_gate_fire_skip_and_exactly_once() {
 }
 
 /// issue #810 fail-closed contract: an unparseable stored condition never
-/// fires the target — the skip increments the counter with the distinct
-/// `condition_invalid` reason and the terminal commit never errors. No fires
-/// row is written (mirroring the `validation_failed` precedent), so the pair
-/// is left *unresolved* rather than durably suppressed: a later re-entry into
-/// evaluation re-evaluates it and can still fire once the condition is
-/// repaired — a mixed-version deploy window can never durably resolve the
-/// pair. Note the honest recovery contract (PR #972 review): production has
-/// no scanner that re-visits unresolved pairs, so such a re-entry is NOT
-/// guaranteed — this test invokes evaluation again by hand to pin that a
-/// re-entry, when one happens, is never wedged by the earlier skip.
+/// fires the target. The skip counts the distinct `condition_invalid` reason,
+/// and the terminal commit never errors. No fires row is written, as in the
+/// `validation_failed` precedent. So the pair stays *unresolved*, not durably
+/// suppressed. A later evaluation can still fire it once the condition is
+/// repaired. So a mixed-version deploy window can never durably resolve the
+/// pair.
+///
+/// The recovery contract (PR #972): production has no scanner that revisits
+/// unresolved pairs, so a re-entry is NOT guaranteed. This test re-runs
+/// evaluation by hand. It pins that a re-entry is never wedged by the
+/// earlier skip.
 #[tokio::test]
 async fn test_invalid_stored_condition_fails_closed() {
     let _lock = TEST_MUTEX
@@ -3357,9 +3346,9 @@ async fn test_invalid_stored_condition_fails_closed() {
         vec![(trigger_id.to_string(), "condition_invalid".to_string())]
     );
 
-    // Manual re-entry after the operator repairs the condition (or the fleet
-    // is upgraded to a build that understands it): the pair is still
-    // re-evaluable and fires normally — never wedged by the earlier skip.
+    // Manual re-entry after the operator repairs the condition, or after an
+    // upgrade to a build that understands it. The pair is still re-evaluable
+    // and fires normally — never wedged by the earlier skip.
     // (Production offers no guaranteed re-entry for an already-terminal
     // execution; this pins the *can still fire* half of the contract.)
     {
@@ -3388,11 +3377,11 @@ async fn test_invalid_stored_condition_fails_closed() {
 }
 
 /// issue #810 registration surface: invalid condition JSON is rejected with a
-/// 400 JSON error — unknown operator, over-cap, and malformed-path all via the
-/// handler's explicit `decode_trigger_condition` (the field rides the request
-/// as raw JSON precisely so axum's typed Json extractor can't surface an
-/// unknown operator as a 422 plain-text rejection) — never silently dropped;
-/// a valid condition round-trips through GET.
+/// 400 JSON error, never silently dropped. An unknown operator, an over-cap
+/// condition and a malformed path all go through the handler's explicit
+/// `decode_trigger_condition`. The field rides the request as raw JSON. So
+/// axum's typed Json extractor cannot surface an unknown operator as a 422
+/// plain-text rejection. A valid condition round-trips through GET.
 #[tokio::test]
 async fn test_condition_registration_rejects_invalid_with_400() {
     let _lock = TEST_MUTEX
@@ -3466,9 +3455,9 @@ async fn test_condition_registration_rejects_invalid_with_400() {
     assert_eq!(list.as_array().unwrap().len(), 1);
     assert_eq!(list[0]["condition"]["data"]["path"], "region");
 
-    // Full-replacement upsert semantics: re-POSTing the same trigger id
-    // WITHOUT a `condition` clears the stored guard (the trigger reverts to
-    // unconditional) — pinned so the documented footgun stays documented-true.
+    // Full-replacement upsert: re-POSTing the same trigger id WITHOUT a
+    // `condition` clears the stored guard, so the trigger is unconditional.
+    // This pin keeps the documented footgun true.
     let trigger_id = created["id"].as_str().unwrap().to_string();
     let (status, replaced) = post_json(
         &app,

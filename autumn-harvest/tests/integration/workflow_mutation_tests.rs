@@ -8,7 +8,7 @@
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::types::{ExecutionId, UpdateId};
-use chrono::Utc;
+use jiff::Timestamp;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -16,7 +16,7 @@ fn make_admitted_history(update_id: UpdateId, name: &str) -> Vec<WorkflowEvent> 
     vec![
         WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -25,7 +25,7 @@ fn make_admitted_history(update_id: UpdateId, name: &str) -> Vec<WorkflowEvent> 
             update_id,
             name: name.to_string(),
             input: serde_json::json!({"amount": 100}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
         },
     ]
 }
@@ -57,7 +57,7 @@ fn update_admitted_round_trips_serde() {
         update_id: id,
         name: "approve".to_string(),
         input: serde_json::json!({"amount": 50}),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
     };
     let json = serde_json::to_string(&event).expect("serialize");
     let back: WorkflowEvent = serde_json::from_str(&json).expect("deserialize");
@@ -102,7 +102,7 @@ fn update_event_type_names_are_stable() {
             update_id: id,
             name: "x".to_string(),
             input: serde_json::Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
         }
         .type_name(),
         "UpdateAdmitted"
@@ -325,8 +325,9 @@ async fn execute_admitted_update_replays_completed_result_without_rerunning() {
     assert!(result.is_ok());
     // Should get the recorded output, not the handler's output
     assert_eq!(result.unwrap()["approved"], serde_json::json!(true));
-    // handler_ran stays false because the closure is a different one; the key assertion
-    // is that the returned value matches the recorded history, not the live handler.
+    // `handler_ran` stays false because the closure is a different one. The key
+    // assertion is that the value matches the recorded history, not the live
+    // handler.
     let _ = handler_ran; // suppress unused warning
 }
 
@@ -362,7 +363,7 @@ fn history_matcher_finds_update_completed() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: serde_json::Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -371,7 +372,7 @@ fn history_matcher_finds_update_completed() {
             update_id,
             name: "approve".to_string(),
             input: serde_json::json!({}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
         },
         WorkflowEvent::UpdateCompleted {
             update_id,
@@ -398,7 +399,7 @@ fn history_matcher_finds_update_failed() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: serde_json::Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -407,7 +408,7 @@ fn history_matcher_finds_update_failed() {
             update_id,
             name: "approve".to_string(),
             input: serde_json::json!({}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
         },
         WorkflowEvent::UpdateFailed {
             update_id,
@@ -434,7 +435,7 @@ fn history_matcher_returns_no_match_for_admitted_without_completion() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: serde_json::Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -443,7 +444,7 @@ fn history_matcher_returns_no_match_for_admitted_without_completion() {
             update_id,
             name: "approve".to_string(),
             input: serde_json::json!({}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
         },
         // No UpdateCompleted or UpdateFailed
     ];
@@ -465,7 +466,7 @@ fn history_matcher_returns_no_match_for_unknown_update_id() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: serde_json::Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -497,7 +498,7 @@ fn update_events_do_not_break_activity_replay() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: serde_json::Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -513,7 +514,7 @@ fn update_events_do_not_break_activity_replay() {
             update_id,
             name: "query_status".to_string(),
             input: serde_json::json!({}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
         },
         WorkflowEvent::UpdateCompleted {
             update_id,
@@ -545,7 +546,7 @@ fn drain_admitted_updates_returns_pending_update() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: serde_json::Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -554,7 +555,7 @@ fn drain_admitted_updates_returns_pending_update() {
             update_id,
             name: "approve".to_string(),
             input: serde_json::json!({"amount": 10}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
         },
         // No completion — this update is pending
     ];
@@ -575,7 +576,7 @@ fn drain_admitted_updates_excludes_already_completed() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: serde_json::Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -584,7 +585,7 @@ fn drain_admitted_updates_excludes_already_completed() {
             update_id: completed_id,
             name: "step_one".to_string(),
             input: serde_json::json!({}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
         },
         WorkflowEvent::UpdateCompleted {
             update_id: completed_id,
@@ -594,7 +595,7 @@ fn drain_admitted_updates_excludes_already_completed() {
             update_id: pending_id,
             name: "step_two".to_string(),
             input: serde_json::json!({}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
         },
         // step_two has no completion — it is pending
     ];

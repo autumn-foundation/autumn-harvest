@@ -72,8 +72,6 @@ const QUEUE_B: &str = "tenant-b";
 const SHARED: ShardId = ShardId::new(0);
 const CELL_A: ShardId = ShardId::new(1);
 
-// ── Harness ───────────────────────────────────────────────────────────────
-
 /// Create one fresh, migrated database per shard.
 async fn setup_shard_databases(
     shards: &[ShardId],
@@ -527,8 +525,6 @@ async fn probe_tenant_b(
     eprintln!("tenant B worst schedule-to-start: {worst:?} (bound {BOUND:?})");
     worst
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────
 
 /// The issue #1837 acceptance test.
 ///

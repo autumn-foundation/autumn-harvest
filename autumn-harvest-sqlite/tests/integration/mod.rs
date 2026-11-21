@@ -1,10 +1,9 @@
 #![allow(dead_code)]
 
 // Single integration-test binary for `autumn-harvest-sqlite`. Cargo compiles
-// every top-level `tests/*.rs` into its own binary (a full crate+deps link
-// each); collapsing the suite into one `[[test]]` target with the per-area
-// files as `mod`s cuts CI compile time and disk. Mirrors the core
-// `autumn-harvest` crate's `tests/integration/mod.rs` convention.
+// every top-level `tests/*.rs` into its own binary, each a full crate+deps link.
+// One `[[test]]` target with the per-area files as `mod`s cuts CI compile time
+// and disk. It mirrors the core crate's `tests/integration/mod.rs` convention.
 
 mod activity_context;
 mod activity_info_features;
@@ -19,20 +18,25 @@ mod cross_backend;
 mod docs_start_contract;
 mod drive_clock_refresh;
 mod durability;
+mod entity_checkpoint_request;
 mod execution_timeout;
+mod external_activities;
 mod fleet_fault_isolation;
 mod freeze_activity_defaults;
 mod history_caps;
 mod history_page;
 mod llm_ledger;
 mod local_activities;
+mod next_wake_at;
 mod operator_reads;
 mod overlay_log;
+mod overlay_log_connector;
 mod payload_caps;
 mod payload_depth;
 mod portable_activity;
 mod portable_fixture;
 mod race_activities;
+mod race_buffered_signal;
 mod race_fairness;
 mod reopen_consistency;
 mod retention;

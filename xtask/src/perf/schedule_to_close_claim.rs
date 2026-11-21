@@ -1,4 +1,5 @@
-//! `cargo xtask perf schedule-to-close-claim`: the port of `autumn-harvest/scripts/schedule_to_close_claim_perf_repro.sh`.
+//! `cargo xtask perf schedule-to-close-claim`: the port of
+//! `autumn-harvest/scripts/schedule_to_close_claim_perf_repro.sh`.
 //!
 //! The reproduction harness for the `schedule_to_close_at` claim-predicate
 //! measurement (issue #378, Ledger perf pass).

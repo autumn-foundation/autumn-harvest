@@ -232,12 +232,26 @@ source:StdRng::from_entropy@StdRng
 source:SystemTime::elapsed
 source:Thread::name@Thread
 source:ThreadId::as_u64@ThreadId
+# ADR 0018: the jiff clock and host-zone reads. No corpus workflow reads the
+# jiff clock, as none reads `Utc::now`. The corpus MIR spells the type
+# `autumn_harvest::time::Timestamp`. The matcher test
+# `a_jiff_clock_read_is_a_source_before_the_trusted_crate` proves that this
+# spelling and the `jiff::` spellings classify as a source.
+source:TimeZone::system@TimeZone
+source:TimeZone::try_system@TimeZone
+source:Timestamp::now@Timestamp
 source:Utc::now@Utc
 source:Utc::today@Utc
 source:Uuid::new_v1@Uuid
 source:Uuid::new_v4@Uuid
 source:Uuid::now_v6@Uuid
 source:Uuid::now_v7@Uuid
+# ADR 0018: see `Timestamp::now@Timestamp` above.
+source:ZonedDateTime::now@ZonedDateTime
+# The agent loop reads this cap check only inside the closure of
+# `side_effect`, which the analyzer treats as opaque. No corpus workflow calls
+# it outside such a closure, so the row has no witness.
+source:activity_input_fits@WorkflowContext
 source:args
 source:args_os
 source:available_parallelism

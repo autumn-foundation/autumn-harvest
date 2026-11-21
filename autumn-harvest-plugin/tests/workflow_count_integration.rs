@@ -1,11 +1,12 @@
 //! Integration tests for `GET /workflows/count` (issue #544).
 //!
-//! Seeds workflow executions across states and workflow types and asserts the
-//! endpoint groups by `state`/`workflow_name` with a real per-shard SQL
-//! `GROUP BY`, applies filters before grouping, caps cardinality with an
-//! `other` rollup, merges across shards, and degrades gracefully (never a
-//! 500) when a shard is unreachable.
+//! The suite seeds executions across states and workflow types. The endpoint
+//! groups by `state`/`workflow_name` with a real per-shard SQL `GROUP BY`. It
+//! applies filters before grouping and caps cardinality with an `other` rollup.
+//! It merges across shards and degrades gracefully (never a 500) when a shard is
+//! unreachable.
 
+use jiff_diesel::ToDiesel;
 use std::collections::BTreeMap;
 
 use autumn_harvest::models::NewWorkflowExecution;
@@ -17,11 +18,11 @@ use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{DateTime, Duration, Utc};
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use jiff::{SignedDuration, Timestamp};
 use serde_json::Value;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -144,7 +145,7 @@ async fn seed_execution(
     shard: i32,
     workflow_name: &str,
     state: &str,
-    started_at: DateTime<Utc>,
+    started_at: Timestamp,
 ) -> Uuid {
     use autumn_harvest::schema::harvest_workflow_executions::dsl;
 
@@ -200,13 +201,13 @@ async fn seed_execution(
     let completed_at = if state == "RUNNING" {
         None
     } else {
-        Some(started_at + Duration::seconds(5))
+        Some(started_at + SignedDuration::from_secs(5))
     };
     diesel::update(dsl::harvest_workflow_executions.filter(dsl::id.eq(exec_id.as_uuid())))
         .set((
             dsl::state.eq(state),
-            dsl::started_at.eq(started_at),
-            dsl::completed_at.eq(completed_at),
+            dsl::started_at.eq(started_at.to_diesel()),
+            dsl::completed_at.eq(completed_at.to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -230,7 +231,7 @@ async fn empty_fleet_returns_complete_zero_total() {
 async fn default_group_by_is_state() {
     let (url, _c) = setup_single_shard().await;
     let app = single_app(&url);
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     seed_execution(&url, 0, "onboarding", "RUNNING", now).await;
     seed_execution(&url, 0, "onboarding", "RUNNING", now).await;
@@ -255,7 +256,7 @@ async fn default_group_by_is_state() {
 async fn group_by_state_and_workflow_name() {
     let (url, _c) = setup_single_shard().await;
     let app = single_app(&url);
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     seed_execution(&url, 0, "onboarding", "RUNNING", now).await;
     seed_execution(&url, 0, "onboarding", "RUNNING", now).await;
@@ -283,7 +284,7 @@ async fn group_by_state_and_workflow_name() {
 async fn filters_apply_before_grouping() {
     let (url, _c) = setup_single_shard().await;
     let app = single_app(&url);
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     seed_execution(&url, 0, "onboarding", "RUNNING", now).await;
     seed_execution(&url, 0, "billing", "RUNNING", now).await;
@@ -304,7 +305,7 @@ async fn filters_apply_before_grouping() {
 async fn state_filter_narrows_before_grouping() {
     let (url, _c) = setup_single_shard().await;
     let app = single_app(&url);
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     seed_execution(&url, 0, "onboarding", "RUNNING", now).await;
     seed_execution(&url, 0, "onboarding", "FAILED", now).await;
@@ -319,20 +320,42 @@ async fn state_filter_narrows_before_grouping() {
 async fn started_after_and_before_bound_the_window() {
     let (url, _c) = setup_single_shard().await;
     let app = single_app(&url);
-    let base = Utc::now() - Duration::hours(3);
+    let base = Timestamp::now() - SignedDuration::from_hours(3);
 
     seed_execution(&url, 0, "onboarding", "RUNNING", base).await;
-    seed_execution(&url, 0, "onboarding", "RUNNING", base + Duration::hours(1)).await;
-    seed_execution(&url, 0, "onboarding", "RUNNING", base + Duration::hours(2)).await;
+    seed_execution(
+        &url,
+        0,
+        "onboarding",
+        "RUNNING",
+        base + SignedDuration::from_hours(1),
+    )
+    .await;
+    seed_execution(
+        &url,
+        0,
+        "onboarding",
+        "RUNNING",
+        base + SignedDuration::from_hours(2),
+    )
+    .await;
 
-    let after = base + Duration::minutes(30);
-    let before = base + Duration::hours(1) + Duration::minutes(30);
+    let after = base + SignedDuration::from_mins(30);
+    let before = base + SignedDuration::from_hours(1) + SignedDuration::from_mins(30);
     let (status, body) = get_json(
         &app,
         &format!(
             "/workflows/count?started_after={}&started_before={}",
-            after.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            before.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(
+                after,
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            ),
+            autumn_harvest::time::rfc3339_opts(
+                before,
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            )
         ),
     )
     .await;
@@ -360,7 +383,7 @@ async fn invalid_state_filter_is_bad_request() {
 async fn bounded_cardinality_rolls_long_tail_into_other() {
     let (url, _c) = setup_single_shard().await;
     let app = single_app(&url);
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     for i in 0..5 {
         seed_execution(&url, 0, &format!("wf_{i}"), "RUNNING", now).await;
@@ -389,7 +412,7 @@ async fn bounded_cardinality_rolls_long_tail_into_other() {
 async fn merges_across_shards() {
     let ((url0, url1), _c) = setup_two_shards().await;
     let app = build_app(two_shard_storage(&url0, &url1));
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     seed_execution(&url0, 0, "onboarding", "RUNNING", now).await;
     seed_execution(&url1, 1, "onboarding", "RUNNING", now).await;
@@ -407,7 +430,7 @@ async fn merges_across_shards() {
 #[tokio::test]
 async fn one_shard_down_is_partial_not_500() {
     let ((url0, url1), _c) = setup_two_shards().await;
-    seed_execution(&url0, 0, "onboarding", "RUNNING", Utc::now()).await;
+    seed_execution(&url0, 0, "onboarding", "RUNNING", Timestamp::now()).await;
 
     // Point shard 1 at a database that does not exist so its pool fails.
     let mut pools = BTreeMap::new();

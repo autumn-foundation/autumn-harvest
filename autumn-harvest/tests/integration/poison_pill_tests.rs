@@ -7,8 +7,8 @@
 //! Postgres container:
 //!
 //! - An orphan under the threshold is re-queued with an incremented strike.
-//! - An orphan that reaches the threshold is quarantined to the DLQ, its queue
-//!   row is FAILED, its owning workflow is failed terminally, and the
+//! - An orphan that reaches the threshold is quarantined to the DLQ. Its queue
+//!   row is FAILED and its owning workflow fails terminally. The
 //!   `harvest.task.quarantined` metric is emitted.
 //! - A task whose worker is still heartbeating is never reclaimed.
 //! - A threshold of 0 disables quarantine (legacy requeue-forever behaviour).
@@ -24,6 +24,8 @@ use autumn_harvest::telemetry::MetricsRecorder;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
+use jiff_diesel::ToDiesel;
+
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
 use testcontainers::ContainerAsync;
@@ -148,10 +150,10 @@ async fn insert_running_task_of_type(
     workflow_exec_id: Option<Uuid>,
     worker_id: &str,
     task_type: &str,
-    age: chrono::Duration,
+    age: jiff::SignedDuration,
 ) -> Uuid {
     let id = Uuid::new_v4();
-    let started_at = chrono::Utc::now() - age;
+    let started_at = jiff::Timestamp::now() - age;
     diesel::sql_query(
         "INSERT INTO harvest_task_queue \
          (id, queue_name, task_type, workflow_exec_id, input, state, worker_id, \
@@ -162,7 +164,7 @@ async fn insert_running_task_of_type(
     .bind::<diesel::sql_types::Text, _>(task_type)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Uuid>, _>(workflow_exec_id)
     .bind::<diesel::sql_types::Text, _>(worker_id)
-    .bind::<diesel::sql_types::Timestamptz, _>(started_at)
+    .bind::<diesel::sql_types::Timestamptz, _>(started_at.to_diesel())
     .execute(conn)
     .await
     .expect("insert running task");
@@ -230,11 +232,12 @@ async fn task_state(conn: &mut AsyncPgConnection, task_id: Uuid) -> (String, i32
 async fn task_last_heartbeat(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
-) -> Option<chrono::DateTime<chrono::Utc>> {
+) -> Option<jiff::Timestamp> {
     #[derive(QueryableByName)]
     struct Row {
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-        last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
+        #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+        last_heartbeat_at: Option<jiff::Timestamp>,
     }
     let row: Row =
         diesel::sql_query("SELECT last_heartbeat_at FROM harvest_task_queue WHERE id = $1")
@@ -481,7 +484,7 @@ async fn clean_reschedule_resets_crash_streak() {
 
     // A clean continuation (suspension / retryable-error reschedule) must reset
     // the streak so the threshold measures *consecutive* crashes.
-    autumn_harvest::queue::reschedule_task(&mut conn, task_id, chrono::Utc::now())
+    autumn_harvest::queue::reschedule_task(&mut conn, task_id, jiff::Timestamp::now())
         .await
         .expect("reschedule");
 
@@ -613,7 +616,7 @@ async fn stuck_workflow_task_on_live_worker_is_not_reclaimed_without_backstop() 
         Some(exec_id),
         "live-worker-stuck",
         "workflow",
-        chrono::Duration::hours(1),
+        jiff::SignedDuration::from_hours(1),
     )
     .await;
     insert_live_worker(&mut conn, "live-worker-stuck").await;
@@ -650,7 +653,7 @@ async fn stuck_workflow_task_on_live_worker_is_requeued_by_backstop() {
         Some(exec_id),
         "live-worker-stuck-2",
         "workflow",
-        chrono::Duration::hours(1),
+        jiff::SignedDuration::from_hours(1),
     )
     .await;
     insert_live_worker(&mut conn, "live-worker-stuck-2").await;
@@ -692,7 +695,7 @@ async fn activity_task_is_excluded_from_the_stuck_running_backstop() {
         Some(exec_id),
         "live-worker-activity",
         "activity",
-        chrono::Duration::hours(1),
+        jiff::SignedDuration::from_hours(1),
     )
     .await;
     insert_live_worker(&mut conn, "live-worker-activity").await;
@@ -729,7 +732,7 @@ async fn workflow_task_under_the_stuck_running_threshold_is_left_alone() {
         Some(exec_id),
         "live-worker-fresh",
         "workflow",
-        chrono::Duration::seconds(5),
+        jiff::SignedDuration::from_secs(5),
     )
     .await;
     insert_live_worker(&mut conn, "live-worker-fresh").await;
@@ -769,7 +772,7 @@ async fn dead_worker_stuck_workflow_task_goes_through_the_crash_strike_path_only
         Some(exec_id),
         "dead-worker-stuck",
         "workflow",
-        chrono::Duration::hours(1),
+        jiff::SignedDuration::from_hours(1),
     )
     .await;
     // No `insert_live_worker` call: this worker is dead, not merely absent
@@ -1116,7 +1119,7 @@ async fn held_row_is_not_requeued_by_the_stuck_running_pass() {
         Some(exec_id),
         "held-worker",
         "workflow",
-        chrono::Duration::hours(1),
+        jiff::SignedDuration::from_hours(1),
     )
     .await;
     diesel::sql_query("UPDATE harvest_task_queue SET crash_strikes = 2 WHERE id = $1")
@@ -1364,7 +1367,7 @@ async fn locked_orphan_does_not_stall_the_quarantine_of_other_orphans() {
 async fn locked_stuck_task_does_not_stall_the_stuck_running_backstop() {
     let (mut conn, container) = setup_db().await;
     let exec_id = insert_running_workflow(&mut conn, "wf-locked-stuck").await;
-    let age = chrono::Duration::hours(1);
+    let age = jiff::SignedDuration::from_hours(1);
     let locked =
         insert_running_task_of_type(&mut conn, Some(exec_id), "live-worker-l", "workflow", age)
             .await;

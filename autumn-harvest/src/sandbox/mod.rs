@@ -42,7 +42,11 @@ pub mod error;
 pub mod exec;
 #[cfg(target_os = "linux")]
 pub mod firecracker;
+#[cfg(target_os = "linux")]
+pub mod fs_isolation;
 pub mod guest;
+#[cfg(all(test, target_os = "linux"))]
+mod isolation_gate;
 pub mod outcome;
 pub mod policy;
 #[cfg(target_os = "linux")]

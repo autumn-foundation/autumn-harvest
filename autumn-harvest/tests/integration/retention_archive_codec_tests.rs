@@ -12,6 +12,7 @@
 //! Set `HARVEST_TEST_DATABASE_URL` to use a migrated Postgres. Otherwise a
 //! testcontainers Postgres starts.
 
+use jiff_diesel::ToDiesel;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -30,10 +31,10 @@ use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::telemetry::NoOpMetrics;
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::DbPool;
-use chrono::Utc;
 use diesel::sql_types::{Text, Timestamptz};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -84,7 +85,7 @@ struct IdRow {
 
 /// Insert a COMPLETED execution that finished two days ago.
 async fn insert_completed(conn: &mut AsyncPgConnection) -> ExecutionId {
-    let two_days_ago = Utc::now() - chrono::Duration::days(2);
+    let two_days_ago = Timestamp::now() - autumn_harvest::time::days(2);
     let id = diesel::sql_query(
         "INSERT INTO harvest_workflow_executions
             (workflow_name, workflow_id, shard_id, state, input, started_at, completed_at)
@@ -93,7 +94,7 @@ async fn insert_completed(conn: &mut AsyncPgConnection) -> ExecutionId {
     )
     .bind::<Text, _>("codec_wf")
     .bind::<Text, _>("codec-1")
-    .bind::<Timestamptz, _>(two_days_ago)
+    .bind::<Timestamptz, _>(two_days_ago.to_diesel())
     .get_result::<IdRow>(conn)
     .await
     .expect("insert execution")
@@ -115,7 +116,7 @@ fn history(input_blob: &str) -> Vec<WorkflowEvent> {
     vec![
         WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({ "secret": MARKER, "blob": input_blob }),
-            timestamp: Utc::now() - chrono::Duration::days(2),
+            timestamp: Timestamp::now() - autumn_harvest::time::days(2),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,

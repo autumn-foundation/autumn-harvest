@@ -4,6 +4,7 @@
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
 use autumn_harvest::table_split::SetExt;
+use jiff_diesel::ToDiesel;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,10 +34,10 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -95,6 +96,7 @@ fn build_reset_worker(registry: Arc<HandlerRegistry>) -> Arc<Worker> {
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
                 codec_rotation_batch_size: 0,
                 scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
@@ -105,6 +107,8 @@ fn build_reset_worker(registry: Arc<HandlerRegistry>) -> Arc<Worker> {
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
                 max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
+                claim_slots_per_shard: None,
+                claim_batch_max: None,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -172,11 +176,11 @@ async fn seed_execution(
     conn: &mut AsyncPgConnection,
     workflow_id: &str,
 ) -> (ExecutionId, Vec<WorkflowEvent>) {
-    // Deliberately a NON-default shard (issue #697 AC4): the reset fork must
-    // inherit the *source's* shard, so seeding on shard 0 -- which is this
-    // fixture's default shard -- would let a "always use default_shard"
-    // regression pass. Only the encoded shard changes; the row is still written
-    // through the single test pool, which every shard id resolves to here.
+    // Deliberately a NON-default shard (issue #697 AC4). The reset fork must
+    // inherit the shard of the source. Shard 0 is the default shard of this
+    // fixture, so a seed there lets an "always use default_shard" regression
+    // pass. Only the encoded shard changes. Every shard id resolves to the
+    // single test pool here.
     let exec_id = ExecutionId::new_for_shard(ShardId::new(4));
     start_or_load_workflow_execution(
         conn,
@@ -578,7 +582,7 @@ async fn reset_on_terminal_source_returns_conflict() {
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -600,10 +604,10 @@ async fn reset_on_terminal_source_returns_conflict() {
     assert!(body["message"].as_str().unwrap().contains("terminal"));
 }
 
-/// Regression test (code-review fix, issue #603): resetting a currently
-/// ND-blocked execution (the documented escalation path) must strip the six
-/// replay-non-determinism diagnostic keys from the fork's `search_attrs`
-/// while preserving unrelated business attributes.
+/// Regression test for issue #603: a reset of an ND-blocked execution strips
+/// the six replay-non-determinism diagnostic keys from the fork's `search_attrs`.
+/// It keeps unrelated business attributes. That reset is the documented
+/// escalation path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reset_strips_stale_nd_diagnostic_search_attrs_from_fork() {
     let (url, _container) = setup_database().await;
@@ -620,7 +624,7 @@ async fn reset_strips_stale_nd_diagnostic_search_attrs_from_fork() {
     // business attribute the fork must keep.
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
-            harvest_workflow_executions::nd_blocked_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::nd_blocked_at.eq(Some(Timestamp::now()).to_diesel()),
             SetExt(harvest_workflow_executions_ext::nd_block_reason.eq(Some(
                 "non-deterministic replay: activity mismatch".to_string(),
             ))),
@@ -704,7 +708,7 @@ async fn seed_terminal_execution(
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq(state),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
         ))
         .execute(conn)
         .await

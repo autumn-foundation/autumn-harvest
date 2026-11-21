@@ -35,9 +35,9 @@ use autumn_harvest_plugin::runner::HarvestRunnerResources;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::Utc;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -201,7 +201,7 @@ async fn seed_orphan(database_url: &str, workflow_name: &str) {
         .expect("insert execution");
     let events = vec![WorkflowEvent::WorkflowStarted {
         input: json!({}),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,

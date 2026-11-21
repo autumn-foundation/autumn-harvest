@@ -23,7 +23,7 @@ use autumn_harvest::upgrade_check::{
     EncodedHistory, FindingKind, PendingSignal, RunVerdict, STRUCTURE_FORMAT, StructureManifest,
     UpgradeCheck, UpgradeReport, Verdict,
 };
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 pub const ORDER: &str = "order";
@@ -58,7 +58,7 @@ pub fn order_wf(ctx: &WorkflowContext, _input: Value) -> WfFuture<'_> {
 pub fn started() -> WorkflowEvent {
     WorkflowEvent::WorkflowStarted {
         input: json!({}),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -319,7 +319,7 @@ async fn a_recorded_update_that_breaks_the_schema_is_pinned() {
         update_id,
         name: "rush".into(),
         input: json!({ "days": "one" }),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
     });
     events.push(WorkflowEvent::UpdateCompleted {
         update_id,
@@ -629,7 +629,7 @@ async fn an_open_update_with_no_candidate_schema_is_unchecked() {
         update_id: UpdateId::new(),
         name: "rush".into(),
         input: json!({ "days": 1 }),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
     });
     let run = unchanged_check()
         .updates(vec![rush_update()])
@@ -1199,8 +1199,8 @@ async fn an_encoded_history_keeps_its_run_metadata() {
     // With its timeout, `ctx.deadline()` is set, and the run takes the
     // checkpoint branch that the recorded `reserve` does not match.
     let history = EncodedHistory {
-        execution_timeout: Some(chrono::Duration::hours(1)),
-        deadline_at: Some(Utc::now() + chrono::Duration::hours(1)),
+        execution_timeout: Some(jiff::SignedDuration::from_hours(1)),
+        deadline_at: Some(Timestamp::now() + jiff::SignedDuration::from_hours(1)),
         ..encoded(&codecs, &reserving())
     };
     let run = check_of(order_by_deadline_wf).check_encoded(history).await;

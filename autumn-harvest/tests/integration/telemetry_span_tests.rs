@@ -2,9 +2,9 @@
 
 //! Integration tests for ADR-0001 OpenTelemetry span emission (issue #136).
 //!
-//! Verifies that all 8 named span kinds are emitted when a workflow with
-//! two activities, one signal, one timer, and one child workflow runs to
-//! completion.  Uses a real Postgres container via testcontainers so that
+//! A workflow with two activities, one signal, one timer and one child
+//! workflow runs to completion. All 8 named span kinds must be emitted.
+//! Uses a real Postgres container via testcontainers so that
 //! the worker-side spans (activity.schedule, signal.deliver, timer.fire,
 //! `child_workflow.start`) are also exercised.
 //!
@@ -310,7 +310,6 @@ fn all_adr_0001_span_kinds_are_emitted() {
 
             let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
 
-            // Start workflow execution.
             let mut conn = AsyncPgConnection::establish(&db_url)
                 .await
                 .expect("connect");
@@ -369,12 +368,13 @@ fn all_adr_0001_span_kinds_are_emitted() {
             .expect("start workflow");
             drop(conn);
 
-            // Spawn worker.
             let registry = build_registry();
             let pool = build_pool(&db_url);
             let worker = Arc::new(
                 Worker::new(
                     WorkerRuntimeConfig {
+                        gauge_sample_interval:
+                            autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
                         codec_rotation_batch_size: 0,
                         scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                         dr: autumn_harvest::replication::DrConfig::default(),
@@ -385,6 +385,8 @@ fn all_adr_0001_span_kinds_are_emitted() {
                         max_concurrent_activities: 4,
                         max_concurrent_claims:
                             autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
+                        claim_slots_per_shard: None,
+                        claim_batch_max: None,
                         poll_interval: Duration::from_millis(25),
                         shutdown_timeout: Duration::from_secs(2),
                         cancellation_grace_period: Duration::from_secs(1),
@@ -485,7 +487,7 @@ fn replay_span_has_replay_true_and_no_activity_execute_span() {
     use autumn_harvest::event::WorkflowEvent;
     use autumn_harvest::executor::run_workflow_strict;
     use autumn_harvest::types::ActivityExecId;
-    use chrono::Utc;
+    use jiff::Timestamp;
     use std::collections::HashMap;
 
     #[allow(clippy::type_complexity)]
@@ -547,7 +549,7 @@ fn replay_span_has_replay_true_and_no_activity_execute_span() {
                 let history = vec![
                     WorkflowEvent::WorkflowStarted {
                         input: Value::Null,
-                        timestamp: Utc::now(),
+                        timestamp: Timestamp::now(),
                         last_completion_result: None,
                         last_error: None,
                         scheduled_time: None,

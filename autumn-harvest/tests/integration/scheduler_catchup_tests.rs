@@ -12,15 +12,17 @@ use std::sync::Arc;
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::policy::{CatchupPolicy, Schedule, WorkflowSchedule};
 use autumn_harvest::schema::harvest_schedules;
+use autumn_harvest::time::sql::SqlTimestamp;
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::{DagCatalog, SchedulerMonitor, WorkflowContext, tick_once};
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -160,7 +162,7 @@ async fn insert_catchup_schedule(
     overdue_secs: i64,
 ) -> Uuid {
     use autumn_harvest::schema::harvest_schedules::dsl;
-    let now = Utc::now();
+    let now = Timestamp::now();
     let id = Uuid::new_v4();
     diesel::insert_into(harvest_schedules::table)
         .values((
@@ -171,7 +173,7 @@ async fn insert_catchup_schedule(
             dsl::catchup.eq(catchup_bool),
             dsl::max_active_runs.eq(200),
             dsl::is_paused.eq(false),
-            dsl::next_run_at.eq(now - chrono::Duration::seconds(overdue_secs)),
+            dsl::next_run_at.eq((now - jiff::SignedDuration::from_secs(overdue_secs)).to_diesel()),
             dsl::jitter_secs.eq(0_i64),
             dsl::overlap_policy.eq("allow"),
             dsl::buffered_runs.eq(serde_json::json!([])),
@@ -237,7 +239,7 @@ async fn most_recent_policy_fires_one_and_records_drops() {
     assert_eq!(exec_count, 1, "MostRecent: exactly 1 execution must fire");
 
     // `last_catchup_dropped` must be > 0 (missed - 1).
-    let (dropped, last_catchup_at): (i32, Option<chrono::DateTime<Utc>>) = harvest_schedules::table
+    let (dropped, last_catchup_at): (i32, Option<SqlTimestamp>) = harvest_schedules::table
         .find(sched_id)
         .select((
             harvest_schedules::dsl::last_catchup_dropped,
@@ -268,7 +270,7 @@ async fn most_recent_policy_fires_one_and_records_drops() {
     .await
     .expect("second tick_once must succeed");
 
-    let (dropped_after, last_catchup_at_after): (i32, Option<chrono::DateTime<Utc>>) =
+    let (dropped_after, last_catchup_at_after): (i32, Option<SqlTimestamp>) =
         harvest_schedules::table
             .find(sched_id)
             .select((
@@ -398,9 +400,10 @@ async fn legacy_catchup_true_fires_all_slots_compat() {
     );
 }
 
-/// `Window` policy: 1-hour window on a schedule overdue by 2 hours on a
-/// 60-second interval → ~120 missed slots; only the ~60 within the last hour
-/// should fire, the rest are dropped.
+/// `Window` policy: 1-hour window on a 60-second schedule overdue by 2 hours.
+///
+/// That is ~120 missed slots. Only the ~60 within the last hour fire; the rest
+/// are dropped.
 #[tokio::test]
 async fn window_policy_fires_only_in_window_slots() {
     let (mut conn, url, _c) = setup_db().await;
@@ -450,7 +453,7 @@ async fn window_policy_fires_only_in_window_slots() {
         "Window(1h): expected roughly 60 executions in window, got {exec_count}"
     );
 
-    let (dropped, last_catchup_at): (i32, Option<chrono::DateTime<Utc>>) = harvest_schedules::table
+    let (dropped, last_catchup_at): (i32, Option<SqlTimestamp>) = harvest_schedules::table
         .find(sched_id)
         .select((
             harvest_schedules::dsl::last_catchup_dropped,

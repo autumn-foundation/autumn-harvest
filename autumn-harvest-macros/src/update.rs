@@ -90,7 +90,6 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             .to_compile_error();
     }
 
-    // First parameter must be ctx: &WorkflowContext.
     if !crate::attr_util::first_param_is_ctx_type(&func.sig.inputs, "WorkflowContext") {
         return syn::Error::new_spanned(
             &func.sig,
@@ -99,7 +98,6 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error();
     }
 
-    // Return type must be Result<T, E>.
     if !crate::attr_util::returns_result(&func.sig.output) {
         return syn::Error::new_spanned(
             &func.sig.output,
@@ -173,40 +171,39 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // `update_with_start` resolves the same three run defaults as the typed
     // `start` stub (issues #2387, #2406 and #2511). An option of the call wins
     // over an operator override, which wins over the declared value. See
-    // `optional_chrono_duration_tokens`'s doc comment for the clone class this
+    // `optional_duration_tokens`'s doc comment for the clone class this
     // and `workflow.rs`'s two typed stubs share.
-    let update_with_start_execution_timeout_tokens =
-        crate::attr_util::optional_chrono_duration_tokens(
-            "execution_timeout",
-            &quote! {
-                opts.execution_timeout
-                    .or(client.apply_run_defaults(info.name, info.execution_timeout, info.sla).0)
-            },
-        );
+    let update_with_start_execution_timeout_tokens = crate::attr_util::optional_duration_tokens(
+        "execution_timeout",
+        &quote! {
+            opts.execution_timeout
+                .or(client.apply_run_defaults(info.name, info.execution_timeout, info.sla).0)
+        },
+    );
     let update_with_start_max_execution_timeout_ceiling_tokens =
-        crate::attr_util::optional_chrono_duration_tokens(
+        crate::attr_util::optional_duration_tokens(
             "max_execution_timeout_ceiling",
             &quote! { client.max_workflow_execution_timeout() },
         );
     let update_with_start_chain_execution_timeout_tokens =
-        crate::attr_util::optional_chrono_duration_tokens(
+        crate::attr_util::optional_duration_tokens(
             "chain_execution_timeout",
             &quote! { client.apply_chain_run_default(info.name, info.chain_execution_timeout) },
         );
     let update_with_start_max_workflow_chain_timeout_ceiling_tokens =
-        crate::attr_util::optional_chrono_duration_tokens(
+        crate::attr_util::optional_duration_tokens(
             "max_workflow_chain_timeout_ceiling",
             &quote! { client.max_workflow_chain_timeout() },
         );
-    // The three typed-stub methods are identical whether `#stub_ident` is
-    // implemented directly (same-module case) or inside a private mod that
-    // re-imports it (nested-module case, needed so the `impl` sees the type
-    // through a `use` rather than an unresolvable relative path). Splicing
-    // one `method_defs` block into both `impl_block` arms keeps them in
-    // lockstep by construction; hand-duplicating this block previously let
-    // the chain-timeout-cap fields land in only one copy (commit 896978eb,
-    // issue #617), caught by a compile error rather than a test. Mirrors the
-    // same hoist already done for `#[signal]` in signal.rs.
+    // The three typed-stub methods are identical in both cases. In the
+    // same-module case `#stub_ident` is implemented directly. In the
+    // nested-module case a private mod re-imports it, so the `impl` sees the
+    // type through a `use`, not an unresolvable relative path. One
+    // `method_defs` block spliced into both `impl_block` arms keeps them in
+    // lockstep by construction. A hand-duplicated block previously let the
+    // chain-timeout-cap fields land in only one copy (commit 896978eb, issue
+    // #617). A compile error caught it, not a test. `#[signal]` in signal.rs
+    // has the same hoist.
     let method_defs = quote! {
         /// Execute this typed update handler in-process with a default 30-second timeout.
         pub async fn #method_name(
@@ -268,8 +265,8 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let workflow_id = workflow_id.into();
             let update_args = #serialize_payload;
             // Issue #499: a debounced workflow cannot be started through the
-            // typed client (it can't route to the debounce-key shard or admit
-            // through the gate); debounce admission is HTTP-only. Same
+            // typed client. It cannot route to the debounce-key shard or admit
+            // through the gate, so debounce admission is HTTP-only. Same
             // rationale covers the sibling throttle and batch checks
             // `reject_if_admission_may_defer` also runs. Reject early.
             Self::info().reject_if_admission_may_defer(&start_input)?;
@@ -335,7 +332,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 context_headers: opts.context_headers,
                 sla: opts.sla
                     .or(client.apply_run_defaults(info.name, info.execution_timeout, info.sla).1)
-                    .and_then(|d| ::autumn_harvest::chrono::Duration::from_std(d).ok()),
+                    .and_then(::autumn_harvest::time::from_std_bounded),
                 workflow_retry_policy: Self::info().retry_policy
                     .and_then(|p| ::autumn_harvest::serde_json::to_value(&p).ok()),
                 max_workflow_attempts_ceiling: client.max_workflow_attempts(),
@@ -433,27 +430,27 @@ fn build_update_dispatch(fn_name: &syn::Ident, param_names: &[&syn::Ident]) -> T
 //
 // `update_macro` generates the same three typed-stub methods twice: once for
 // the same-module case (`path_tokens.is_empty()`) and once wrapped in a
-// private `mod` for the nested-module case. The two copies are hand-kept in
-// sync; commit 896978eb (issue #617) shipped a diff that updated the first
-// copy's `UpdateWithStartParams` literal and initially missed the second,
-// caught only by `cargo clippy --all-features --tests` failing to compile
-// (a struct-literal missing-field error), not by any test. These tests pin
-// the two branches to token-identical method bodies (module wrapper and doc
-// comments aside) so a future one-sided edit fails a fast `cargo test
-// -p autumn-harvest-macros` instead of waiting for a full clippy run.
+// private `mod` for the nested-module case. Both copies splice one shared
+// `method_defs` block. When the copies were hand-kept, commit 896978eb (issue
+// #617) updated the first copy's `UpdateWithStartParams` literal and initially
+// missed the second. Only `cargo clippy --all-features --tests` caught it, as a
+// struct-literal missing-field error. No test caught it. These tests pin the
+// two branches to token-identical method bodies, apart from the module wrapper
+// and doc comments. So a return to one-sided copies fails a fast `cargo test
+// -p autumn-harvest-macros`, not a full clippy run.
 #[cfg(test)]
 mod same_module_vs_nested_module_parity_tests {
     use super::update_macro;
     use quote::quote;
 
-    /// Removes `# [doc = r"..."]` attribute tokens (the `///` doc comments on
-    /// `#method_name_uws` are deliberately fuller in the same-module branch;
-    /// everything else must match). `quote!`'s fallback (non-bridged, i.e.
-    /// `cargo test`) `Display` renders doc comments as *raw* string literals
-    /// (`r"..."`), and the doc text can itself contain `]` (e.g. markdown
-    /// links like `[UpdateWithStartOutcome]`), so the closing quote is found
-    /// by scanning the string content rather than by a naive search for the
-    /// next `]`.
+    /// Removes `# [doc = r"..."]` attribute tokens.
+    ///
+    /// The parity check ignores `///` doc comments. Everything else must
+    /// match. `quote!`'s fallback (non-bridged, i.e. `cargo test`) `Display`
+    /// renders doc comments as *raw* string literals (`r"..."`). The doc text
+    /// can itself contain `]`, as in markdown links like
+    /// `[UpdateWithStartOutcome]`. So this scans the string content for the
+    /// closing quote, not for the next `]`.
     fn strip_docs(s: &str) -> String {
         const PREFIX: &str = "# [doc = r\"";
         let mut out = String::new();
@@ -482,18 +479,19 @@ mod same_module_vs_nested_module_parity_tests {
         out
     }
 
-    /// Collapses every run of whitespace to a single space. `quote!`'s
-    /// fallback `Display` reproduces string-literal *source spelling*
-    /// verbatim rather than the resolved value (verified empirically: a
-    /// `"a \<newline>   b"` continuation literal round-trips with the
-    /// original newline and indentation still embedded), so a debounce/batch
-    /// rejection message written at two different nesting depths in the two
-    /// branches otherwise looks like a content difference when it is really
-    /// only a difference in how many leading spaces preceded it in
-    /// `update.rs`'s own source -- irrelevant once real `rustc` resolves the
-    /// `\`-continuation the same way for both. Real content differences
-    /// (an added/removed field, a different call) still show up as
-    /// different words, which whitespace collapsing does not hide.
+    /// Collapses every run of whitespace to a single space.
+    ///
+    /// `quote!`'s fallback `Display` reproduces string-literal *source
+    /// spelling* verbatim, not the resolved value. A `"a \<newline>   b"`
+    /// continuation literal round-trips with the original newline and
+    /// indentation still embedded (verified empirically). Both branches splice
+    /// one `method_defs` block, so today their literals match. Two hand-kept
+    /// copies would write a rejection message at different nesting depths.
+    /// Without collapsing, the leading spaces in `update.rs`'s own source would
+    /// then look like a content difference. Real `rustc` resolves the
+    /// `\`-continuation the same way for both. Real content differences (an
+    /// added or removed field, a different call) still show up as different
+    /// words.
     fn normalize_whitespace(s: &str) -> String {
         s.split_whitespace().collect::<Vec<_>>().join(" ")
     }

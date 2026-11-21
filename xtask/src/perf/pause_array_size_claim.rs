@@ -1,4 +1,5 @@
-//! `cargo xtask perf pause-array-size-claim`: the port of `autumn-harvest/scripts/pause_array_size_claim_perf_repro.sh`.
+//! `cargo xtask perf pause-array-size-claim`: the port of
+//! `autumn-harvest/scripts/pause_array_size_claim_perf_repro.sh`.
 //!
 //! The reproduction harness for the pause-array-size finding (issue #1215).
 //! `docs/performance.md` documents it.
@@ -13,9 +14,10 @@
 //! The test sweeps the array size over 0, 1, 20 and 199 ballast pause rows.
 //! The ballast has 0% selectivity, so a change in which rows are eligible
 //! cannot explain the effect. The sweep covers three shapes. The first is
-//! `paused_activities` (#807), which is unconditional. The other two are `paused_queues` (#619). One binds it to the own queues of a
-//! typical worker. The other binds it to an atypical worker whose own bind is
-//! itself wide.
+//! `paused_activities` (#807), which is unconditional. The other two are
+//! `paused_queues` (#619). One binds it to the own queues of a typical
+//! worker. The other binds it to an atypical worker whose own bind is itself
+//! wide.
 //!
 //! Usage, with or without `HARVEST_TEST_DATABASE_URL`:
 //!

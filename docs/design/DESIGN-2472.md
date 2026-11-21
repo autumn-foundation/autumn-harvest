@@ -188,7 +188,9 @@ This issue adds two things:
 
 - A closed tenant runs no timer, retry or activity until it opens again.
   The next open resumes its runs.
-- A fleet restore does not roll back the tenant's Harvest file.
-- Fleet replication does not ship Harvest files.
+- A fleet restore does not roll back the tenant's Harvest file. Issue
+  #2649 closes this limit. See `docs/design/DESIGN-2649.md`.
+- Fleet replication does not ship Harvest files. Issue #2649 closes this
+  limit too.
 - A failed Harvest open refuses the open of its tenant database.
 - The transactional outbox is not available on a SQLite app (#2470).

@@ -84,8 +84,8 @@ impl AnswerCheck {
 pub struct CheckRequest {
     /// The check of the task.
     pub check: AnswerCheck,
-    /// The tenant that the task declares. Only SQLite reads it, because it
-    /// keeps no run tenant.
+    /// The tenant that the task declares. Only a backend that keeps no run
+    /// tenant reads it, such as SQLite.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
 }
@@ -180,8 +180,13 @@ pub async fn agent_answer_check(
     request: CheckRequest,
 ) -> Result<CheckAdmission, String> {
     let harness = crate::workflow::harness(ctx)?;
-    // A failed tenant read fails closed. A retry reads it again.
-    let tenant = ctx.run_tenant().await.map_err(|err| err.to_string())?;
+    // A failed tenant read fails closed. A retry reads it again. A backend
+    // with no run tenant applies the task tenant, as the SQLite closure does.
+    let tenant = if ctx.keeps_run_tenant() {
+        ctx.run_tenant().await.map_err(|err| err.to_string())?
+    } else {
+        request.tenant.clone()
+    };
     admission(harness, &request, tenant.as_deref()).await
 }
 

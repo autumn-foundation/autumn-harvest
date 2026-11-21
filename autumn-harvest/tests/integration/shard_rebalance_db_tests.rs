@@ -68,12 +68,14 @@ use autumn_harvest::shard_rebalance::{
     set_legal_hold_forwarded, stage_copy, verify_target_copy,
 };
 use autumn_harvest::stall_diagnosis;
+use jiff_diesel::ToDiesel;
+
 use autumn_harvest::store;
 use autumn_harvest::types::{ExecutionId, ShardId};
 
-use chrono::{Duration, Utc};
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
@@ -121,10 +123,11 @@ async fn setup_two_shards() -> TwoShards {
     }
 }
 
-/// Three isolated databases, for the cases that need an INTERMEDIATE residence:
-/// after A → B → C the forwarding pointer is collapsed past B, so B is only
-/// reachable through the durable residence history. Two shards cannot express
-/// that — a second hop there lands back on the origin.
+/// Three isolated databases, for the cases that need an INTERMEDIATE residence.
+///
+/// After A → B → C, the forwarding pointer is collapsed past B. So only the
+/// durable residence history reaches B. Two shards cannot express that: a
+/// second hop there lands back on the origin.
 struct ThreeShards {
     pool: ShardedDbPool,
     urls: Vec<String>,
@@ -246,9 +249,10 @@ async fn insert_execution(
     .await
 }
 
-/// Insert a `RUNNING` root execution under a caller-chosen `ExecutionId`, so a
-/// test can mint an id whose shard bits deliberately disagree with the shard
-/// the row physically lives on.
+/// Insert a `RUNNING` root execution under a caller-chosen `ExecutionId`.
+///
+/// A test can then mint an id whose shard bits deliberately disagree with the
+/// shard the row physically lives on.
 async fn insert_execution_with_id(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
@@ -306,7 +310,7 @@ async fn insert_execution_with_id(
 fn started(input: Value) -> WorkflowEvent {
     WorkflowEvent::WorkflowStarted {
         input,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -345,14 +349,14 @@ async fn append_more(conn: &mut AsyncPgConnection, exec_id: ExecutionId, events:
 /// A durable timer parked in the future, plus the PENDING workflow task row that
 /// is how a timer-parked execution actually waits.
 async fn park_on_timer(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
-    let fires_at = Utc::now() + Duration::days(7);
+    let fires_at = Timestamp::now() + autumn_harvest::time::days(7);
     diesel::sql_query(
         "INSERT INTO harvest_timers (id, workflow_exec_id, timer_id, fires_at, fired) \
          VALUES ($1, $2, 'wake', $3, FALSE)",
     )
     .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
     .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-    .bind::<diesel::sql_types::Timestamptz, _>(fires_at)
+    .bind::<diesel::sql_types::Timestamptz, _>(fires_at.to_diesel())
     .execute(conn)
     .await
     .expect("insert timer");
@@ -365,7 +369,7 @@ async fn park_on_timer(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
     )
     .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
     .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-    .bind::<diesel::sql_types::Timestamptz, _>(fires_at)
+    .bind::<diesel::sql_types::Timestamptz, _>(fires_at.to_diesel())
     .execute(conn)
     .await
     .expect("insert parked workflow task");
@@ -427,12 +431,21 @@ struct StagedPayload {
 #[derive(Debug, diesel::QueryableByName)]
 #[allow(clippy::struct_field_names)] // all three genuinely are timestamps
 struct TaskProvenance {
-    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    scheduled_at: chrono::DateTime<Utc>,
-    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    created_at: chrono::DateTime<Utc>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    timer_fires_at: Option<chrono::DateTime<Utc>>,
+    #[diesel(
+        sql_type = diesel::sql_types::Timestamptz,
+        deserialize_as = autumn_harvest::time::sql::SqlTimestamp
+    )]
+    scheduled_at: jiff::Timestamp,
+    #[diesel(
+        sql_type = diesel::sql_types::Timestamptz,
+        deserialize_as = autumn_harvest::time::sql::SqlTimestamp
+    )]
+    created_at: jiff::Timestamp,
+    #[diesel(
+        sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>,
+        deserialize_as = autumn_harvest::time::sql::NullableTimestamp
+    )]
+    timer_fires_at: Option<jiff::Timestamp>,
 }
 
 #[derive(diesel::QueryableByName)]
@@ -488,7 +501,8 @@ async fn forward_of(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Optio
 #[derive(diesel::QueryableByName)]
 struct ScalarTimestamp {
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    value: Option<chrono::DateTime<Utc>>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+    value: Option<jiff::Timestamp>,
 }
 
 /// `harvest_workflow_executions.legal_hold_set_at`, `NULL` when no hold is
@@ -496,7 +510,7 @@ struct ScalarTimestamp {
 async fn legal_hold_set_at_of(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
-) -> Option<chrono::DateTime<Utc>> {
+) -> Option<jiff::Timestamp> {
     let row: Option<ScalarTimestamp> = diesel::sql_query(
         "SELECT legal_hold_set_at AS value FROM harvest_workflow_executions WHERE id = $1",
     )
@@ -548,9 +562,10 @@ async fn claimable_tasks(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> 
     .await
 }
 
-/// The invariant the whole design exists to hold: a run is authoritative — i.e.
-/// has a non-terminal execution row AND a claimable task row — on at most one
-/// shard, and after a completed migration on exactly one.
+/// The invariant the design exists to hold: a run is authoritative on at most
+/// one shard, and on exactly one after a migration completes.
+///
+/// Authoritative means a non-terminal execution row AND a claimable task row.
 async fn authoritative_shards(shards: &TwoShards, exec_id: ExecutionId) -> Vec<ShardId> {
     let mut out = Vec::new();
     for (shard, url) in [(SOURCE, &shards.source_url), (TARGET, &shards.target_url)] {
@@ -691,8 +706,8 @@ async fn the_llm_ledger_moves_with_the_run() {
     // The sealed source keeps its copy, but only the target reports it.
     let query = autumn_harvest::usage::UsageQuery {
         group_by: autumn_harvest::usage::UsageGroupBy::WorkflowName,
-        from: Utc::now() - Duration::hours(1),
-        to: Utc::now() + Duration::hours(1),
+        from: Timestamp::now() - SignedDuration::from_hours(1),
+        to: Timestamp::now() + SignedDuration::from_hours(1),
     };
     let llm_calls = |rows: Vec<autumn_harvest::usage::UsageShardRow>| {
         rows.iter()
@@ -710,6 +725,62 @@ async fn the_llm_ledger_moves_with_the_run() {
             .expect("usage on the target");
     assert_eq!(llm_calls(on_source), 0, "the sealed source reports nothing");
     assert_eq!(llm_calls(on_target), 1, "the target reports the call once");
+}
+
+/// An unresolved outbox request moves with the run. The target trigger adds
+/// its pending row, and the cutover removes the row of the sealed source.
+#[tokio::test]
+async fn an_unresolved_outbox_request_moves_with_the_run() {
+    let shards = setup_two_shards().await;
+    let mut source = shards.source().await;
+    let exec_id = insert_execution(&mut source, "entity_flow", "entity-outbox").await;
+    append_history(
+        &mut source,
+        exec_id,
+        &[
+            started(json!({"seed": 1})),
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id: autumn_harvest::types::ExternalSignalId::new(),
+                target: autumn_harvest::types::ExternalTarget::WorkflowId {
+                    workflow_name: "elsewhere".to_string(),
+                    workflow_id: "nobody".to_string(),
+                },
+                signal_name: "ping".to_string(),
+                payload: json!({}),
+                idempotency_key: None,
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: autumn_harvest::types::TimerId::new("wake"),
+                duration_secs: 604_800,
+            },
+        ],
+    )
+    .await;
+    park_on_timer(&mut source, exec_id).await;
+    let pending = "SELECT count(*)::BIGINT AS value FROM harvest_external_outbox_pending \
+                    WHERE workflow_exec_id = $1";
+    assert_eq!(count(&mut source, pending, exec_id).await, 1);
+
+    let outcome = migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
+        .await
+        .expect("migration must not error");
+    assert!(
+        matches!(outcome, MigrationOutcome::Migrated { .. }),
+        "expected a completed migration, got {outcome:?}"
+    );
+
+    let mut target = shards.target().await;
+    assert_eq!(
+        count(&mut target, pending, exec_id).await,
+        1,
+        "the target claims the request"
+    );
+    let mut source = shards.source().await;
+    assert_eq!(
+        count(&mut source, pending, exec_id).await,
+        0,
+        "the sealed source keeps no outbox row"
+    );
 }
 
 /// Issue #1974: a decision between verification and cutover can store
@@ -1354,10 +1425,10 @@ async fn the_sealed_source_keeps_the_business_key_slot_so_no_duplicate_can_start
     //
     // A reset forks a successor on the SAME shard, so its source must release
     // `(workflow_name, workflow_id)` or the successor could not be inserted. A
-    // migration puts the copy on a DIFFERENT database, whose index is its own —
-    // so nothing needs releasing, and releasing would let a later start of the
-    // same business key (which still hashes back to the source shard) create a
-    // SECOND live run alongside the migrated one.
+    // migration puts the copy on a DIFFERENT database, whose index is its own.
+    // So nothing needs releasing. Releasing would let a later start of the same
+    // business key create a SECOND live run alongside the migrated one. That
+    // key still hashes back to the source shard.
     let shards = setup_two_shards().await;
     let exec_id = quiescent_fixture(&shards, "entity-unique").await;
     migrate_execution(&shards.pool, exec_id, SOURCE, TARGET, &codecs())
@@ -1595,9 +1666,9 @@ async fn activation_repend_does_not_misattribute_a_stale_timer_to_the_new_signal
     // `staged_task` JSONB captured on the source at stage time, so that
     // payload is rewritten instead. Neither touches the event history
     // verification already checked byte-for-byte.
-    let fires_at = Utc::now() - Duration::hours(2);
+    let fires_at = Timestamp::now() - SignedDuration::from_hours(2);
     diesel::sql_query("UPDATE harvest_timers SET fires_at = $1 WHERE workflow_exec_id = $2")
-        .bind::<diesel::sql_types::Timestamptz, _>(fires_at)
+        .bind::<diesel::sql_types::Timestamptz, _>(fires_at.to_diesel())
         .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
         .execute(&mut target)
         .await
@@ -1614,7 +1685,7 @@ async fn activation_repend_does_not_misattribute_a_stale_timer_to_the_new_signal
         .staged_task
         .expect("a timer-parked execution stages a workflow task row");
     payload["scheduled_at"] = json!(fires_at);
-    payload["created_at"] = json!(fires_at - Duration::hours(1));
+    payload["created_at"] = json!(fires_at - SignedDuration::from_hours(1));
     payload["timer_fires_at"] = json!(fires_at);
     diesel::sql_query(
         "UPDATE harvest_shard_migrations SET staged_task = $1 WHERE execution_id = $2",
@@ -1656,7 +1727,7 @@ async fn activation_repend_does_not_misattribute_a_stale_timer_to_the_new_signal
         "the signal wake must clear the stale timer marker: {row:?}",
     );
     assert!(
-        (row.created_at - row.scheduled_at).num_seconds().abs() < 2,
+        (row.created_at - row.scheduled_at).as_secs().abs() < 2,
         "created_at must be refreshed alongside scheduled_at (issue #1191 \
          fingerprint), so a later saturated-dispatch delay cannot be \
          misread as this stale timer's own wake: {row:?}",
@@ -1680,7 +1751,7 @@ async fn activation_repend_does_not_misattribute_a_stale_timer_to_the_new_signal
         workflow_task: Some(facts),
         ..Default::default()
     };
-    let verdict = stall_diagnosis::classify_execution(&inputs, Utc::now())
+    let verdict = stall_diagnosis::classify_execution(&inputs, Timestamp::now())
         .expect("non-terminal execution must yield a verdict");
     assert_ne!(
         verdict.kind(),
@@ -1831,12 +1902,12 @@ async fn the_sql_cutover_predicate_agrees_with_the_pure_predicate() {
 
 #[tokio::test]
 async fn every_id_holder_class_still_resolves_after_migration() {
-    // The acceptance bar is structural rather than enumerated: the ExecutionId
+    // The acceptance bar is structural rather than enumerated. The ExecutionId
     // is never re-minted, so an id captured by ANY holder is the same 16 bytes
-    // afterwards. This test captures ids the way each holder class does — a
+    // afterwards. This test captures ids the way each holder class does: a
     // parent's recorded `child_id`, a stored handle, an external signal target,
-    // a webhook's stored reference — and asserts they all resolve to the run's
-    // new home through the same resolution the engine uses.
+    // a webhook's stored reference. It asserts that they all resolve to the
+    // run's new home through the same resolution the engine uses.
     let shards = setup_two_shards().await;
     let exec_id = quiescent_fixture(&shards, "entity-ids").await;
 
@@ -1997,13 +2068,13 @@ async fn a_twice_migrated_run_resolves_through_the_chain_and_collapses_it() {
         TARGET
     );
 
-    // Now forge the pathological case a real deployment must survive: the
+    // Now forge the pathological case a real deployment must survive. The
     // target is sealed and points BACK at the source, whose own pointer still
-    // points here. SOURCE -> TARGET -> SOURCE -> ... is a cycle, and a routing
-    // call must fail closed on it rather than spin forever.
+    // points here. SOURCE -> TARGET -> SOURCE -> ... is a cycle. A routing call
+    // must fail closed on it rather than spin forever.
     //
-    // Two shards is enough to build it precisely because the pointer, not the
-    // execution state, is what resolution follows.
+    // Two shards are enough to build it, because resolution follows the
+    // pointer, not the execution state.
     let mut target = shards.target().await;
     diesel::sql_query(
         "UPDATE harvest_workflow_executions \
@@ -2027,9 +2098,9 @@ async fn a_twice_migrated_run_resolves_through_the_chain_and_collapses_it() {
 
 #[tokio::test]
 async fn a_sealed_source_keeps_forwarding_after_an_operator_force_terminates_it() {
-    // `terminate_workflow_execution` carries no state precondition by design —
-    // it is an operator override. Applied to a sealed source it overwrites
-    // `MIGRATED`, and if resolution keyed on the STATE the run would silently
+    // `terminate_workflow_execution` carries no state precondition by design.
+    // It is an operator override. Applied to a sealed source, it overwrites
+    // `MIGRATED`. If resolution keyed on the STATE, the run would silently
     // become unreachable by every id anyone had captured. Resolution keys on
     // the POINTER instead, so the override costs nothing.
     let shards = setup_two_shards().await;
@@ -2116,7 +2187,7 @@ async fn signal_idempotency_keys_and_timers_survive_the_copy() {
     let exec_id = quiescent_fixture(&shards, "entity-dedupe").await;
 
     // A consumed signal carrying an idempotency key. Quiescence forbids an
-    // UNconsumed one, but the key's dedupe scope must still move or a webhook
+    // UNconsumed one. But the key's dedupe scope must still move, or a webhook
     // retry after the migration would be delivered a second time.
     {
         let mut source = shards.source().await;
@@ -2177,10 +2248,10 @@ async fn signal_idempotency_keys_and_timers_survive_the_copy() {
 
 #[tokio::test]
 async fn a_crash_at_every_phase_leaves_exactly_one_authoritative_shard() {
-    // The kill-point contract, driven for real: run the migration up to each
-    // phase boundary, stop dead (as a process crash would), and assert the run
-    // is authoritative on exactly one shard — never zero after the resume sweep,
-    // never two at any point.
+    // The kill-point contract, driven for real. Run the migration up to each
+    // phase boundary and stop dead, as a process crash would. Then assert the
+    // run is authoritative on exactly one shard: never zero after the resume
+    // sweep, never two at any point.
     let shards = setup_two_shards().await;
 
     for kill_after in ["begin", "stage", "verify", "cutover"] {
@@ -2633,14 +2704,13 @@ async fn a_signal_parked_execution_migrates_with_its_parked_task_row() {
     assert_eq!(parked, 1);
 }
 
-// ── Codex round 1: the two copies of a rebalanced run ────────────────────────
+// ── The two copies of a rebalanced run ───────────────────────────────────────
 //
-// A rebalance seals the source rather than deleting it, so for as long as the
-// source shard's retention has not collected the row an execution's bytes exist
-// in two databases. Every operation that reasons about "the execution" has to
-// pick the right one — or, for erasure, both. These two tests pin the two
-// places where picking the wrong one is a correctness failure rather than a
-// latency cost.
+// A rebalance seals the source rather than deleting it. So an execution's
+// bytes exist in two databases until the source shard's retention collects
+// the row. Every operation that reasons about "the execution" has to pick the
+// right one, or both for erasure. These two tests pin the two places where
+// picking the wrong one is a correctness failure, not a latency cost.
 
 #[tokio::test]
 async fn erasing_a_migrated_execution_scrubs_the_sealed_source_copy_too() {
@@ -2712,10 +2782,11 @@ async fn a_batch_signal_reaches_the_migrated_copy_not_the_sealed_source() {
         .await
         .expect("migrate");
 
-    // The batch's all-shard scan finds the live RUNNING copy on the target. Its
-    // id, though, still encodes SOURCE — the identity is deliberately never
-    // re-minted — so an origin-only pool lookup would dispatch the signal into
-    // the sealed source, where the row reads as MIGRATED and the send fails.
+    // The batch's all-shard scan finds the live RUNNING copy on the target.
+    // Its id, though, still encodes SOURCE, because the identity is
+    // deliberately never re-minted. So an origin-only pool lookup would
+    // dispatch the signal into the sealed source. There the row reads as
+    // MIGRATED, and the send fails.
     let mut target = shards.target().await;
     let job_id = submit_batch_job(
         &mut target,
@@ -2790,17 +2861,18 @@ async fn payload_bearing_events(conn: &mut AsyncPgConnection, exec_id: Execution
     .await
 }
 
-// ── Codex round 2: verification is a snapshot, and pointers are collapsed ────
+// ── Verification is a snapshot, and pointers are collapsed ───────────────────
 
 #[tokio::test]
 async fn a_cutover_refuses_a_source_whose_history_advanced_since_verification() {
     // The window the quiescence re-check alone does not close. Between
-    // verification and the cutover — instant in the end-to-end path, but hours
-    // on a resume after a crash at VERIFIED — the run can legitimately wake,
-    // execute a whole decision cycle, append events, and park again. It is
-    // quiescent once more, so every predicate in the cutover's WHERE passes.
-    // Sealing then hands authority to a copy that predates that cycle: not a
-    // lost wake but lost PROGRESS, and invisible afterwards.
+    // verification and the cutover, the run can legitimately wake, execute a
+    // whole decision cycle, append events, and park again. That window is
+    // instant in the end-to-end path, but hours on a resume after a crash at
+    // VERIFIED. The run is quiescent once more, so every predicate in the
+    // cutover's WHERE passes. Sealing then hands authority to a copy that
+    // predates that cycle. That is not a lost wake but lost PROGRESS, and it
+    // is invisible afterwards.
     let shards = setup_two_shards().await;
     let exec_id = quiescent_fixture(&shards, "entity-advanced").await;
     let (mut source, mut target) = (shards.source().await, shards.target().await);
@@ -2832,9 +2904,9 @@ async fn a_cutover_refuses_a_source_whose_history_advanced_since_verification() 
         ],
     )
     .await;
-    // Re-park the SAME task row on a fresh timer, which is what the engine
-    // does: a second row would itself be a quiescence blocker and would not
-    // model a woken-and-re-parked run at all.
+    // Re-park the SAME task row on a fresh timer, as the engine does. A second
+    // row would itself be a quiescence blocker. It would not model a
+    // woken-and-re-parked run at all.
     diesel::sql_query(
         "UPDATE harvest_timers SET fired = TRUE WHERE workflow_exec_id = $1 AND timer_id = 'wake'",
     )
@@ -2888,10 +2960,10 @@ async fn a_cutover_refuses_a_source_whose_history_advanced_since_verification() 
     );
     assert_eq!(authoritative_shards(&shards, exec_id).await, vec![SOURCE]);
 
-    // And the refusal is not a wedge. A resume sweep settles the record — it
-    // declines the cutover for the same reason and aborts — leaving exactly one
-    // authoritative shard and nothing for an operator to clean up by hand. The
-    // run is simply migrated later, from its current history.
+    // And the refusal is not a wedge. A resume sweep settles the record: it
+    // declines the cutover for the same reason and aborts. That leaves exactly
+    // one authoritative shard and nothing for an operator to clean up by hand.
+    // The run is simply migrated later, from its current history.
     resume_incomplete_migrations(&shards.pool, SOURCE, 10, "tester", &codecs())
         .await
         .expect("resume");
@@ -2980,17 +3052,17 @@ async fn erasing_a_twice_migrated_run_scrubs_the_intermediate_shard_too() {
     );
 }
 
-// ── Codex round 3: the residence history outliving the row it lived on ───────
+// ── The residence history outliving the row it lived on ──────────────────────
 
 #[tokio::test]
 async fn erasure_still_reaches_the_source_after_target_retention_summarised_the_run() {
     // The live shard's retention janitor eventually deletes a terminal run's
     // execution row and keeps only a compact `harvest_execution_summaries` row.
-    // The sealed source copies are NOT collected with it — retention
-    // deliberately never purges a `MIGRATED` row, because that would destroy
-    // the forwarding pointer — so their payloads are still sitting there. A
-    // residence lookup that read "never migrated" from the execution row's
-    // absence would report a clean erasure over exactly those copies.
+    // The sealed source copies are NOT collected with it, so their payloads
+    // are still there. Retention deliberately never purges a `MIGRATED` row,
+    // because that would destroy the forwarding pointer. A residence lookup
+    // that read "never migrated" from the execution row's absence would report
+    // a clean erasure over exactly those copies.
     let shards = setup_two_shards().await;
     let exec_id = quiescent_fixture(&shards, "gdpr-summarised").await;
 
@@ -3047,12 +3119,12 @@ async fn erasure_still_reaches_the_source_after_target_retention_summarised_the_
 #[tokio::test]
 async fn the_caller_residence_is_read_from_the_held_row_not_decoded_from_its_id() {
     // The outbox sweeps decide whether a delivery target resolves to the same
-    // POOL they are already transacting on. `ExecutionId` encodes where a run
-    // originated, so a caller that has itself been rebalanced would compare its
-    // origin against the target's residence and call two connections to the
-    // same database "cross-pool" — taking the branch that checks out a second
-    // connection from the pool already driving the transaction, and
-    // self-deadlocking a pool of the supported minimum size one.
+    // POOL they already transact on. `ExecutionId` encodes where a run
+    // originated. A caller that was itself rebalanced would compare its origin
+    // against the target's residence. It would call two connections to the
+    // same database "cross-pool" and take the branch that checks out a second
+    // connection. That connection comes from the pool already driving the
+    // transaction, so a pool of the supported minimum size one self-deadlocks.
     let shards = setup_two_shards().await;
     let exec_id = quiescent_fixture(&shards, "entity-caller").await;
 
@@ -3066,8 +3138,8 @@ async fn the_caller_residence_is_read_from_the_held_row_not_decoded_from_its_id(
         .await
         .expect("migrate");
 
-    // The id still encodes SOURCE — the identity is never re-minted — but the
-    // run now lives on TARGET, and the connection that holds it says so.
+    // The id still encodes SOURCE, because the identity is never re-minted.
+    // But the run now lives on TARGET, and the connection that holds it says so.
     assert_eq!(exec_id.shard(), SOURCE);
     let mut target = shards.target().await;
     assert_eq!(
@@ -3076,9 +3148,9 @@ async fn the_caller_residence_is_read_from_the_held_row_not_decoded_from_its_id(
         "the held row's shard_id follows the run across a migration"
     );
 
-    // A connection that does not hold the row at all answers None, so the
-    // caller falls back to the id's encoded shard (the pre-#964 behaviour)
-    // rather than to a wrong shard.
+    // A connection that does not hold the row at all answers None. So the
+    // caller falls back to the id's encoded shard (the pre-#964 behaviour),
+    // not to a wrong shard.
     let mut other = shards.source().await;
     assert_eq!(
         autumn_harvest::shard_rebalance::shard_of_held_row(&mut other, ExecutionId::new()).await,
@@ -3128,17 +3200,17 @@ async fn conn_for_execution_forwarded_with_shard_names_the_connection_it_returns
     );
 }
 
-// ── Codex round 4 ───────────────────────────────────────────────────────────
+// ── A terminate-and-replace start over a rebalanced prior ───────────────────
 
 #[tokio::test]
 async fn a_terminate_existing_start_refuses_a_rebalanced_prior_instead_of_replacing_it() {
     // `MIGRATED` counts as an active conflict because the run is still live,
     // just elsewhere. The terminate-and-replace branch cannot honour that from
-    // here: its `inline_cancel` matches only RUNNING/PAUSED so it no-ops
-    // against the seal, and `replace_execution` would then seal the row
-    // CONTINUED_AS_NEW — which is excluded from the active-uniqueness index —
-    // and insert a fresh run, releasing the business key while the real run
-    // keeps executing on its target shard. Two live runs for one key.
+    // here. Its `inline_cancel` matches only RUNNING/PAUSED, so it no-ops
+    // against the seal. `replace_execution` would then seal the row
+    // CONTINUED_AS_NEW, which the active-uniqueness index excludes. It would
+    // insert a fresh run and release the business key while the real run keeps
+    // executing on its target shard. Two live runs for one key.
     let shards = setup_two_shards().await;
     let exec_id = quiescent_fixture(&shards, "terminate-me").await;
 
@@ -4628,7 +4700,7 @@ fn allow_duplicate_failed_only_start<'a>(
 
 #[tokio::test]
 async fn a_concurrent_plain_start_cannot_land_inside_a_reconciled_seal_admission() {
-    // Codex review, comment 4053489196 (follow-up to c52d895). The prior
+    // Issue #1317 (PR #1596), a follow-up to c52d895. The prior
     // fix made `AllowDuplicateFailedOnly` check for a current occupant
     // before trusting a reconciled seal. That check is a `SELECT ... FOR
     // UPDATE`, which locks nothing when it finds no row. Two concurrent
@@ -5115,7 +5187,7 @@ fn fleet_gate_cache(
         reason: reason.to_string(),
         message: None,
         created_by: "test".to_string(),
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         expires_at: None,
     }]);
     cache
@@ -5177,11 +5249,11 @@ async fn an_armed_gate_still_applies_over_a_sole_reconciled_seal() {
 
 #[tokio::test]
 async fn a_business_key_target_resolves_through_the_seal_to_the_live_copy() {
-    // A `WorkflowId` target hashes to a fixed shard, and that shard is exactly
-    // where the seal sits — the migration deliberately keeps `MIGRATED` inside
-    // the active-uniqueness index, so the business key never moves. Routing by
-    // the hash alone therefore delivers to the seal: the cancel outbox reads it
-    // as terminal and reports success for a workflow that keeps running.
+    // A `WorkflowId` target hashes to a fixed shard, and the seal sits exactly
+    // there. The migration deliberately keeps `MIGRATED` inside the
+    // active-uniqueness index, so the business key never moves. Routing by the
+    // hash alone therefore delivers to the seal. The cancel outbox reads it as
+    // terminal and reports success for a workflow that keeps running.
     let shards = setup_two_shards().await;
     let exec_id = quiescent_fixture(&shards, "by-key").await;
 
@@ -5256,9 +5328,9 @@ async fn a_business_key_target_no_longer_resolves_through_a_reconciled_seal() {
 async fn a_reverse_migration_keeps_the_live_shard_last_in_the_residence_chain() {
     // A → B → A is supported precisely so a drain can be undone. The stored
     // history is then [A, B] and the run is live on A, so the raw chain is
-    // [A, B, A]. A first-occurrence dedup collapses that to [A, B] and leaves
-    // the SEALED copy in the final position — which every consumer reads as the
-    // live residence, so the erase would gate on the wrong copy.
+    // [A, B, A]. A first-occurrence dedup collapses that to [A, B]. It leaves
+    // the SEALED copy in the final position, which every consumer reads as the
+    // live residence. So the erase would gate on the wrong copy.
     let shards = setup_two_shards().await;
     let exec_id = quiescent_fixture(&shards, "there-and-back").await;
 
@@ -5284,8 +5356,8 @@ async fn a_reverse_migration_keeps_the_live_shard_last_in_the_residence_chain() 
     );
 }
 
-/// A `TerminateExisting` start for `(workflow_name, workflow_id)` — the policy
-/// that, before the round-4 fix, would seal a rebalanced prior
+/// A `TerminateExisting` start for `(workflow_name, workflow_id)`. Without the
+/// active-conflict refusal, this policy would seal a rebalanced prior
 /// `CONTINUED_AS_NEW` and start a second live run for the same business key.
 fn terminate_existing_start<'a>(
     workflow_name: &'a str,
@@ -5338,15 +5410,15 @@ fn terminate_existing_start<'a>(
     }
 }
 
-// ── Codex round 5 ───────────────────────────────────────────────────────────
+// ── Reverse migrations, refused sources and shard fallback ──────────────────
 
 #[tokio::test]
 async fn a_reverse_migration_keeps_the_origin_seal_resolvable_throughout() {
-    // A → B → A stages onto a shard this run has lived on before, so the row
-    // staging replaces is A's own forwarding seal. Losing it during staging
-    // strands every id that routes to A at an inert copy; losing it on abort
-    // leaves the execution with no row on its origin shard at all — an id that
-    // resolves nowhere, the one outcome this design must never produce.
+    // A → B → A stages onto a shard this run has lived on before. So the row
+    // that staging replaces is A's own forwarding seal. Losing it during
+    // staging strands every id that routes to A at an inert copy. Losing it on
+    // abort leaves the execution with no row on its origin shard at all. That
+    // id resolves nowhere, the one outcome this design must never produce.
     let shards = setup_two_shards().await;
     let exec_id = quiescent_fixture(&shards, "there-and-back-seal").await;
 
@@ -5408,10 +5480,10 @@ async fn a_reverse_migration_keeps_the_origin_seal_resolvable_throughout() {
 
 #[tokio::test]
 async fn a_completed_reverse_migration_clears_the_carried_pointer() {
-    // The staged copy deliberately carries the target's old seal so ids resolve
-    // during staging. Activation must clear it: a live row still pointing at
-    // the shard it came from is a forwarding cycle, and `read_forward` matches
-    // on the pointer rather than the state, so being RUNNING would not save it.
+    // The staged copy deliberately carries the target's old seal, so ids
+    // resolve during staging. Activation must clear it. A live row still
+    // pointing at the shard it came from is a forwarding cycle. `read_forward`
+    // matches on the pointer, not the state, so being RUNNING would not save it.
     let shards = setup_two_shards().await;
     let exec_id = quiescent_fixture(&shards, "there-and-back-clear").await;
 
@@ -5440,8 +5512,9 @@ async fn a_completed_reverse_migration_clears_the_carried_pointer() {
 
 #[tokio::test]
 async fn a_schedule_attributed_execution_is_refused_by_the_sql_predicate_too() {
-    // The pure predicate names the blocker; the cutover's SQL must agree, or an
-    // execution the candidate scan skips could still be cut over by a resume.
+    // The pure predicate names the blocker, and the cutover's SQL must agree.
+    // Otherwise a resume could still cut over an execution the candidate scan
+    // skips.
     let shards = setup_two_shards().await;
     let exec_id = quiescent_fixture(&shards, "scheduled-run").await;
 
@@ -5586,8 +5659,8 @@ async fn the_source_of_a_reset_fork_is_refused_too() {
 #[tokio::test]
 async fn cancelling_a_sealed_source_is_left_pending_not_reported_delivered() {
     // The cancel outbox maps a terminal-state error to `ExternalCancelDelivered`
-    // and never retries. A rebalanced seal is not terminal — the run is alive
-    // elsewhere — so answering "already terminal" there would record a delivered
+    // and never retries. A rebalanced seal is not terminal: the run is alive
+    // elsewhere. Answering "already terminal" there would record a delivered
     // cancellation for a workflow that goes on running. It must be retryable.
     let shards = setup_two_shards().await;
     let exec_id = quiescent_fixture(&shards, "cancel-the-seal").await;
@@ -5621,27 +5694,27 @@ async fn cancelling_a_sealed_source_is_left_pending_not_reported_delivered() {
 /// A single-pool deployment must still reach its own executions, whatever the
 /// shard bits in their ids say.
 ///
-/// `ShardedDbPool::single` -- the shape of every pre-sharding deployment, and of
-/// the plugin's own test harness -- registers exactly one pool, at `ShardId(0)`.
-/// An `ExecutionId` minted while a different shard was configured (or by any
-/// caller that encodes one) then names a shard for which `exact_pool_for`
-/// returns `None`. Resolving the run's own residence through the exact lookup
-/// therefore answered `ShardUnavailable` for a row sitting in the only database
-/// there is, and the erase path surfaced that as a 503 -- including for an
-/// execution under a legal hold, which must answer 409 and never a transport
-/// error that invites a retry.
+/// `ShardedDbPool::single` registers exactly one pool, at `ShardId(0)`. It is
+/// the shape of every pre-sharding deployment, and of the plugin's own test
+/// harness. An `ExecutionId` minted while a different shard was configured (or
+/// by any caller that encodes one) then names a shard for which
+/// `exact_pool_for` returns `None`. Resolving the run's own residence through
+/// the exact lookup therefore answered `ShardUnavailable` for a row in the
+/// only database there is. The erase path surfaced that as a 503. That
+/// included an execution under a legal hold, which must answer 409, never a
+/// transport error that invites a retry.
 ///
-/// The live residence resolves through `pool_for`'s default fallback instead,
-/// which is how every other read path in the engine reaches a run's database.
-/// Safe because the lookup is keyed by execution id: a fallback landing on the
-/// wrong database finds no row, never another run's data.
+/// The live residence resolves through `pool_for`'s default fallback instead.
+/// Every other read path in the engine reaches a run's database that way. It
+/// is safe because the lookup is keyed by execution id: a fallback landing on
+/// the wrong database finds no row, never another run's data.
 ///
 /// The RESOLVED shard also names the fallback, not the id's decoded origin
 /// (issue #1317 review). A caller trusting this value for a follow-up
-/// connection -- SSE listen, best-effort audit attribution -- must reach
-/// the row's actual database. Otherwise it names a shard with no pool at
-/// all. Prior residences keep
-/// the exact form and are covered by the retired/unreachable tests above.
+/// connection (SSE listen, best-effort audit attribution) must reach the
+/// row's actual database. Otherwise it names a shard with no pool at all.
+/// Prior residences keep the exact form, and the retired/unreachable tests
+/// above cover them.
 #[tokio::test]
 async fn single_pool_resolves_an_execution_whose_id_encodes_another_shard() {
     let (url, _guard) = setup_isolated_db().await;
@@ -5736,13 +5809,13 @@ async fn conn_for_execution_forwarded_with_shard_reports_the_actual_fallback_sha
 ///
 /// `routed_shard_for_execution` applies an operator-declared `A -> B` forward
 /// and returns **B**. The single-pool fallback that lets an ordinary id reach
-/// its own row (see `checkout_entry`) must not apply to that B: the operator
-/// has asserted A is gone and its ids now live on B, so answering from the
-/// default shard reads an unrelated database and returns a confident "not
-/// found" for every A-origin execution -- silently, which is the part that
-/// makes it worse than an error.
+/// its own row (see `checkout_entry`) must not apply to that B. The operator
+/// has asserted that A is gone and its ids now live on B. So an answer from
+/// the default shard reads an unrelated database. It returns a confident "not
+/// found" for every A-origin execution, silently. The silence makes it worse
+/// than an error.
 ///
-/// Pins the distinction the fallback turns on: tolerate a missing pool for an
+/// Pins the distinction the fallback turns on. Tolerate a missing pool for an
 /// id resolving to its OWN encoded shard, never for one routing has forwarded.
 #[tokio::test]
 async fn a_declared_retired_forward_requires_its_successor_pool() {
@@ -6345,7 +6418,7 @@ async fn a_hold_placed_after_verification_refuses_the_cutover() {
         "litigation hold",
         None,
         "compliance-bot",
-        Utc::now(),
+        Timestamp::now(),
     )
     .await
     .expect("place a hold after the copy was verified");
@@ -6406,7 +6479,7 @@ async fn a_hold_released_after_verification_also_refuses_the_cutover() {
         "under review",
         None,
         "compliance-bot",
-        Utc::now(),
+        Timestamp::now(),
     )
     .await
     .expect("place a hold before staging begins");
@@ -6421,7 +6494,7 @@ async fn a_hold_released_after_verification_also_refuses_the_cutover() {
         .await
         .expect("verify");
 
-    autumn_harvest::release_legal_hold(&mut source, exec_id, Utc::now())
+    autumn_harvest::release_legal_hold(&mut source, exec_id, Timestamp::now())
         .await
         .expect("release the hold after verification");
 
@@ -6461,7 +6534,7 @@ async fn a_hold_placed_between_staging_and_verification_fails_verification() {
         "hold arrived mid-staging",
         None,
         "compliance-bot",
-        Utc::now(),
+        Timestamp::now(),
     )
     .await
     .expect("place a hold after staging but before verification");
@@ -6672,7 +6745,8 @@ struct HoldMarkerRow {
     #[diesel(sql_type = diesel::sql_types::Bool)]
     legal_hold_verified: bool,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    verified_legal_hold_set_at: Option<chrono::DateTime<Utc>>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+    verified_legal_hold_set_at: Option<jiff::Timestamp>,
 }
 
 #[tokio::test]
@@ -6771,7 +6845,7 @@ async fn a_declined_cutover_reports_legal_hold_drift_not_a_wake() {
         "placed after verification",
         None,
         "compliance-bot",
-        Utc::now(),
+        Timestamp::now(),
     )
     .await
     .expect("place a hold after the copy was verified");
@@ -6880,7 +6954,7 @@ async fn set_legal_hold_refuses_a_row_sealed_after_it_resolved_but_before_its_lo
         "queued behind cutover",
         None,
         "compliance-bot",
-        Utc::now(),
+        Timestamp::now(),
     )
     .await;
 
@@ -6921,7 +6995,7 @@ async fn release_legal_hold_refuses_a_sealed_row_instead_of_clearing_it() {
         "under review",
         None,
         "compliance-bot",
-        Utc::now(),
+        Timestamp::now(),
     )
     .await
     .expect("place a hold before migrating");
@@ -6931,7 +7005,7 @@ async fn release_legal_hold_refuses_a_sealed_row_instead_of_clearing_it() {
         .expect("migration must succeed");
 
     let mut source = shards.source().await;
-    let result = autumn_harvest::release_legal_hold(&mut source, exec_id, Utc::now()).await;
+    let result = autumn_harvest::release_legal_hold(&mut source, exec_id, Timestamp::now()).await;
 
     match result {
         Err(HarvestError::ShardUnavailable { shard_id, reason }) => {
@@ -6969,7 +7043,7 @@ async fn set_legal_hold_forwarded_lands_the_hold_on_the_live_copy_after_a_cutove
         "compliance review",
         None,
         "compliance-bot",
-        Utc::now(),
+        Timestamp::now(),
     )
     .await
     .expect("the forwarded write must follow the seal to the live copy");
@@ -7000,7 +7074,7 @@ async fn release_legal_hold_forwarded_clears_the_hold_on_the_live_copy_after_a_c
         "under review",
         None,
         "compliance-bot",
-        Utc::now(),
+        Timestamp::now(),
     )
     .await
     .expect("place a hold before migrating");
@@ -7009,7 +7083,7 @@ async fn release_legal_hold_forwarded_clears_the_hold_on_the_live_copy_after_a_c
         .await
         .expect("migration must succeed");
 
-    let (outcome, shard) = release_legal_hold_forwarded(&shards.pool, exec_id, Utc::now())
+    let (outcome, shard) = release_legal_hold_forwarded(&shards.pool, exec_id, Timestamp::now())
         .await
         .expect("the forwarded release must follow the seal to the live copy");
     assert!(outcome.released);
@@ -7122,7 +7196,7 @@ async fn set_legal_hold_forwarded_recovers_from_a_seal_mid_flight() {
                 "recovers from a mid-flight seal",
                 None,
                 "compliance-bot",
-                Utc::now(),
+                Timestamp::now(),
             )
             .await
         })
@@ -7155,7 +7229,7 @@ async fn release_legal_hold_forwarded_recovers_from_a_seal_mid_flight() {
         "under review",
         None,
         "compliance-bot",
-        Utc::now(),
+        Timestamp::now(),
     )
     .await
     .expect("place a hold before staging");
@@ -7173,7 +7247,9 @@ async fn release_legal_hold_forwarded_recovers_from_a_seal_mid_flight() {
 
     let pool = shards.pool.clone();
     let write_task = seal_mid_flight(&shards, exec_id, || {
-        tokio::spawn(async move { release_legal_hold_forwarded(&pool, exec_id, Utc::now()).await })
+        tokio::spawn(
+            async move { release_legal_hold_forwarded(&pool, exec_id, Timestamp::now()).await },
+        )
     })
     .await;
 
@@ -7338,7 +7414,7 @@ async fn a_migrated_cancel_target_s_unfinished_handler_check_reuses_the_held_con
                 update_id,
                 name: "approve".to_string(),
                 input: Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
             },
         ],
     )
@@ -9192,7 +9268,8 @@ async fn a_fenced_scanner_writes_nothing_on_a_shard_it_lost() {
     #[derive(diesel::QueryableByName)]
     struct Stamp {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        updated_at: chrono::DateTime<Utc>,
+        #[diesel(deserialize_as = autumn_harvest::time::sql::SqlTimestamp)]
+        updated_at: jiff::Timestamp,
     }
 
     const FROM: ShardId = ShardId::new(40);
@@ -9253,7 +9330,7 @@ async fn a_fenced_scanner_writes_nothing_on_a_shard_it_lost() {
     );
     age_migration(&mut source, exec_id, 7200).await;
 
-    let stamp = async |conn: &mut AsyncPgConnection| -> chrono::DateTime<Utc> {
+    let stamp = async |conn: &mut AsyncPgConnection| -> jiff::Timestamp {
         diesel::sql_query("SELECT updated_at FROM harvest_shard_migrations WHERE execution_id = $1")
             .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
             .get_result::<Stamp>(conn)

@@ -33,10 +33,10 @@ use autumn_harvest::types::{ActivityExecId, ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{RetryPolicy, WorkflowContext, store};
 
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -143,7 +143,7 @@ async fn seed_execution(
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -163,8 +163,8 @@ struct Timeouts {
     schedule_to_close: Option<Duration>,
 }
 
-fn chrono_duration(duration: Duration) -> chrono::Duration {
-    chrono::Duration::from_std(duration).expect("duration in range")
+fn chrono_duration(duration: Duration) -> jiff::SignedDuration {
+    jiff::SignedDuration::try_from(duration).expect("duration in range")
 }
 
 /// Schedule `activity` in the history of a new execution and enqueue its
@@ -203,8 +203,8 @@ async fn seed_activity(
     params.heartbeat_timeout = timeouts.heartbeat.map(chrono_duration);
     params.schedule_to_close_at = timeouts
         .schedule_to_close
-        .map(|deadline| Utc::now() + chrono_duration(deadline));
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+        .map(|deadline| Timestamp::now() + chrono_duration(deadline));
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     let task_id = queue::enqueue(conn, &params)
         .await
         .expect("enqueue activity");
@@ -620,7 +620,7 @@ async fn stale_scan_snapshot_leaves_a_later_claim_alone() {
     let deferred = queue::defer_claimed_retry_for_budget(
         &mut conn,
         &queue::TaskClaim::of(&first).expect("claimed"),
-        chrono::Duration::zero(),
+        jiff::SignedDuration::ZERO,
     )
     .await
     .expect("defer");
@@ -671,7 +671,7 @@ async fn schedule_to_close_after_a_new_claim(
     let deferred = queue::defer_claimed_retry_for_budget(
         conn,
         &queue::TaskClaim::of(&first).expect("claimed"),
-        chrono::Duration::zero(),
+        jiff::SignedDuration::ZERO,
     )
     .await
     .expect("defer");
@@ -1505,7 +1505,7 @@ async fn terminal_task_gc_keeps_a_row_with_an_outstanding_timeout_record() {
         "completed_at = NOW() - INTERVAL '2 hours'",
     )
     .await;
-    let cutoff = Utc::now() - chrono::Duration::hours(1);
+    let cutoff = Timestamp::now() - jiff::SignedDuration::from_hours(1);
     queue::sweep_terminal_tasks(&mut conn, cutoff, 1000, false)
         .await
         .expect("sweep");
@@ -1676,6 +1676,7 @@ fn build_worker(queue: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
                 codec_rotation_batch_size: 0,
                 dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: format!("{queue}-worker"),
@@ -1684,6 +1685,8 @@ fn build_worker(queue: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
                 max_concurrent_workflows: 4,
                 max_concurrent_activities: 4,
                 max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
+                claim_slots_per_shard: None,
+                claim_batch_max: None,
                 poll_interval: Duration::from_millis(10),
                 shutdown_timeout: Duration::from_secs(5),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -1724,7 +1727,7 @@ async fn seed_workflow(conn: &mut AsyncPgConnection, queue: &str, activity: &str
     let exec_id = seed_execution(conn, queue, input.clone()).await;
     let mut params = EnqueueParams::new(queue, TaskType::Workflow, input);
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     queue::enqueue(conn, &params)
         .await
         .expect("enqueue workflow task");

@@ -266,6 +266,12 @@ impl HarvestSqlite {
         .await
     }
 
+    /// Wait until the driver is idle: a pass after this call made no
+    /// progress. A wake sweep runs a woken tenant with it.
+    pub(crate) async fn settle(&self) -> Result<(), HarvestSqliteError> {
+        self.call(|reply| Command::Settle { reply }).await
+    }
+
     /// Run `read` on the read-only connection, off the async runtime.
     pub(crate) async fn read<T: Send + 'static>(
         &self,

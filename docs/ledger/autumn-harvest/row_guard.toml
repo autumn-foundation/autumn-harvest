@@ -1,0 +1,8 @@
+# Ledger profiles for `autumn-harvest/src/row_guard.rs`. See `docs/ledger/README.md`.
+
+["guarded_statements"]
+driver = "test_support"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_task_queue"]
+measured = "unmeasured"

@@ -3,8 +3,8 @@
 //! **Boundary.** `indirect-call`.
 //!
 //! `helpers::picker(drift)` returns a `fn(&[u32]) -> u32`. At the call site MIR
-//! emits `_0 = move _1(move _2)` — the callee operand is a *local*, not a path,
-//! so there is no callee name to resolve and no body to summarize. One of the
+//! emits `_0 = move _1(move _2)`. The callee operand is a *local*, not a path.
+//! So there is no callee name to resolve and no body to summarize. One of the
 //! two possible targets reads the wall clock; the other does not.
 //!
 //! Unlike `dyn` dispatch there is not even a trait to enumerate implementors of,

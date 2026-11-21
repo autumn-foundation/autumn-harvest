@@ -4,10 +4,9 @@
 //!
 //! ## The problem
 //!
-//! A child workflow that fails hands the parent only a `String`. To decide
-//! whether to compensate, retry, or escalate, the parent has to *substring-match*
-//! the message text — brittle, and it breaks the instant the child reworders its
-//! error.
+//! A child workflow that fails hands the parent only a `String`. The parent
+//! must *substring-match* the message text to compensate, retry, or escalate.
+//! That is brittle, and it breaks the instant the child rewords its error.
 //!
 //! ## The solution: `WorkflowFailure`
 //!
@@ -130,9 +129,10 @@ fn main() {
     println!("the parent branches on err.workflow_error_type() instead of scraping the message.");
 }
 
-// Gated on `testing` as well as `test` so the example still builds under
-// `--no-default-features` (which CI exercises), while `autumn_harvest::testing`
-// is only available to external consumers when the `testing` feature is on.
+// Gated on the `testing` feature as well as `test`. The example must keep
+// building under `--no-default-features`, which CI exercises.
+// `autumn_harvest::testing` exists for an external consumer only when the
+// `testing` feature is on.
 #[cfg(all(test, feature = "testing"))]
 mod tests {
     use super::*;

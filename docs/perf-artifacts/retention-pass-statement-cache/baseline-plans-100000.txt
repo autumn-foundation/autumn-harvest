@@ -1,0 +1,384 @@
+Pager usage is off.
+PREPARE
+PREPARE
+PREPARE
+PREPARE
+PREPARE
+################ custom plans (the engine today)
+SET
+== active_child, the busiest parent
+                                                                QUERY PLAN                                                                 
+-------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=50.18..50.19 rows=1 width=8) (actual rows=1 loops=1)
+   Output: count(*)
+   Buffers: shared hit=28
+   ->  Bitmap Heap Scan on public.harvest_workflow_executions  (cost=4.38..50.18 rows=1 width=0) (actual rows=1 loops=1)
+         Recheck Cond: (harvest_workflow_executions.parent_id = '939c792d-8ed9-9c12-49c5-764386cebaba'::uuid)
+         Filter: (harvest_workflow_executions.state <> ALL ('{COMPLETED,FAILED,CANCELLED,TIMED_OUT,CONTINUED_AS_NEW,TERMINATED}'::text[]))
+         Rows Removed by Filter: 25
+         Heap Blocks: exact=26
+         Buffers: shared hit=28
+         ->  Bitmap Index Scan on idx_harvest_we_parent_id  (cost=0.00..4.38 rows=12 width=0) (actual rows=26 loops=1)
+               Index Cond: (harvest_workflow_executions.parent_id = '939c792d-8ed9-9c12-49c5-764386cebaba'::uuid)
+               Buffers: shared hit=2
+ Settings: plan_cache_mode = 'force_custom_plan'
+ Query Identifier: -1142160237072261476
+ Planning:
+   Buffers: shared hit=23
+(16 rows)
+
+== active_child, a leaf
+                                                                QUERY PLAN                                                                 
+-------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=50.18..50.19 rows=1 width=8) (actual rows=1 loops=1)
+   Output: count(*)
+   Buffers: shared hit=2
+   ->  Bitmap Heap Scan on public.harvest_workflow_executions  (cost=4.38..50.18 rows=1 width=0) (actual rows=0 loops=1)
+         Recheck Cond: (harvest_workflow_executions.parent_id = '000dd2ef-aa88-f109-07cc-ef4ac8dec1a4'::uuid)
+         Filter: (harvest_workflow_executions.state <> ALL ('{COMPLETED,FAILED,CANCELLED,TIMED_OUT,CONTINUED_AS_NEW,TERMINATED}'::text[]))
+         Buffers: shared hit=2
+         ->  Bitmap Index Scan on idx_harvest_we_parent_id  (cost=0.00..4.38 rows=12 width=0) (actual rows=0 loops=1)
+               Index Cond: (harvest_workflow_executions.parent_id = '000dd2ef-aa88-f109-07cc-ef4ac8dec1a4'::uuid)
+               Buffers: shared hit=2
+ Settings: plan_cache_mode = 'force_custom_plan'
+ Query Identifier: -1142160237072261476
+ Planning:
+   Buffers: shared hit=20
+(14 rows)
+
+== open_forks, the most forked run
+                                                                                 QUERY PLAN                                                                                  
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop  (cost=209.35..323.04 rows=1 width=16) (actual rows=0 loops=1)
+   Output: f.id
+   Inner Unique: true
+   Buffers: shared hit=159
+   CTE descendant
+     ->  Recursive Union  (cost=0.27..208.94 rows=11 width=20) (actual rows=2 loops=1)
+           Buffers: shared hit=151
+           ->  Index Scan using idx_harvest_we_fork_source on public.harvest_workflow_executions f_1  (cost=0.27..8.29 rows=1 width=20) (actual rows=2 loops=1)
+                 Output: f_1.id, 1
+                 Index Cond: (f_1.start_source_ref = '24b5eeb7-df9f-40c5-2bc3-cdb10162437c'::text)
+                 Buffers: shared hit=4
+           ->  Hash Join  (cost=0.41..20.05 rows=1 width=20) (actual rows=0 loops=1)
+                 Output: f_2.id, (d_1.depth + 1)
+                 Hash Cond: (f_2.start_source_ref = (d_1.id)::text)
+                 Buffers: shared hit=147
+                 ->  Index Scan using idx_harvest_wfx_start_source on public.harvest_workflow_executions f_2  (cost=0.14..18.82 rows=153 width=53) (actual rows=193 loops=1)
+                       Output: f_2.id, f_2.start_source_ref
+                       Index Cond: (f_2.start_source = 'fork'::text)
+                       Buffers: shared hit=147
+                 ->  Hash  (cost=0.22..0.22 rows=3 width=20) (actual rows=2 loops=1)
+                       Output: d_1.depth, d_1.id
+                       Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                       ->  WorkTable Scan on descendant d_1  (cost=0.00..0.22 rows=3 width=20) (actual rows=2 loops=1)
+                             Output: d_1.depth, d_1.id
+                             Filter: (d_1.depth < 65)
+   ->  CTE Scan on descendant d  (cost=0.00..0.22 rows=11 width=16) (actual rows=2 loops=1)
+         Output: d.id, d.depth
+         Buffers: shared hit=151
+   ->  Index Scan using harvest_workflow_executions_pkey on public.harvest_workflow_executions f  (cost=0.42..10.35 rows=1 width=16) (actual rows=0 loops=2)
+         Output: f.id
+         Index Cond: (f.id = d.id)
+         Filter: ((f.state = ANY ('{RUNNING,PAUSED,MIGRATING,MIGRATED}'::text[])) OR ((f.state = 'FAILED'::text) AND (SubPlan 2)))
+         Rows Removed by Filter: 1
+         Buffers: shared hit=8
+         SubPlan 2
+           ->  Seq Scan on public.harvest_dead_letters dl  (cost=0.00..3.82 rows=2 width=0) (never executed)
+                 Filter: ((dl.workflow_exec_id = f.id) AND (upper(dl.task_type) <> 'CALLBACK'::text))
+ Settings: plan_cache_mode = 'force_custom_plan'
+ Query Identifier: -3272940027876814298
+ Planning:
+   Buffers: shared hit=197
+(41 rows)
+
+== open_forks, a leaf
+                                                                                QUERY PLAN                                                                                 
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop  (cost=209.35..323.04 rows=1 width=16) (actual rows=0 loops=1)
+   Output: f.id
+   Inner Unique: true
+   Buffers: shared hit=4
+   CTE descendant
+     ->  Recursive Union  (cost=0.27..208.94 rows=11 width=20) (actual rows=0 loops=1)
+           Buffers: shared hit=4
+           ->  Index Scan using idx_harvest_we_fork_source on public.harvest_workflow_executions f_1  (cost=0.27..8.29 rows=1 width=20) (actual rows=0 loops=1)
+                 Output: f_1.id, 1
+                 Index Cond: (f_1.start_source_ref = '000dd2ef-aa88-f109-07cc-ef4ac8dec1a4'::text)
+                 Buffers: shared hit=2
+           ->  Hash Join  (cost=0.41..20.05 rows=1 width=20) (actual rows=0 loops=1)
+                 Output: f_2.id, (d_1.depth + 1)
+                 Hash Cond: (f_2.start_source_ref = (d_1.id)::text)
+                 Buffers: shared hit=2
+                 ->  Index Scan using idx_harvest_wfx_start_source on public.harvest_workflow_executions f_2  (cost=0.14..18.82 rows=153 width=53) (actual rows=1 loops=1)
+                       Output: f_2.id, f_2.start_source_ref
+                       Index Cond: (f_2.start_source = 'fork'::text)
+                       Buffers: shared hit=2
+                 ->  Hash  (cost=0.22..0.22 rows=3 width=20) (actual rows=0 loops=1)
+                       Output: d_1.depth, d_1.id
+                       Buckets: 1024  Batches: 1  Memory Usage: 8kB
+                       ->  WorkTable Scan on descendant d_1  (cost=0.00..0.22 rows=3 width=20) (actual rows=0 loops=1)
+                             Output: d_1.depth, d_1.id
+                             Filter: (d_1.depth < 65)
+   ->  CTE Scan on descendant d  (cost=0.00..0.22 rows=11 width=16) (actual rows=0 loops=1)
+         Output: d.id, d.depth
+         Buffers: shared hit=4
+   ->  Index Scan using harvest_workflow_executions_pkey on public.harvest_workflow_executions f  (cost=0.42..10.35 rows=1 width=16) (never executed)
+         Output: f.id
+         Index Cond: (f.id = d.id)
+         Filter: ((f.state = ANY ('{RUNNING,PAUSED,MIGRATING,MIGRATED}'::text[])) OR ((f.state = 'FAILED'::text) AND (SubPlan 2)))
+         SubPlan 2
+           ->  Seq Scan on public.harvest_dead_letters dl  (cost=0.00..3.82 rows=2 width=0) (never executed)
+                 Filter: ((dl.workflow_exec_id = f.id) AND (upper(dl.task_type) <> 'CALLBACK'::text))
+ Settings: plan_cache_mode = 'force_custom_plan'
+ Query Identifier: -3272940027876814298
+ Planning:
+   Buffers: shared hit=64
+(39 rows)
+
+== chain_link, the longest chain
+                                                                                                                                                                                                  QUERY PLAN                                                                                                                                                                                                  
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=8.45..8.46 rows=1 width=8) (actual rows=1 loops=1)
+   Output: count(*)
+   Buffers: shared hit=5
+   ->  Index Scan using idx_harvest_wfx_workflow_identity on public.harvest_workflow_executions  (cost=0.42..8.45 rows=1 width=0) (actual rows=1 loops=1)
+         Index Cond: ((harvest_workflow_executions.workflow_name = 'wf_6'::text) AND (harvest_workflow_executions.workflow_id = 'chain-5407'::text))
+         Filter: ((harvest_workflow_executions.id <> '01ce7a38-afba-a96d-b48b-49a82ff822fa'::uuid) AND ((harvest_workflow_executions.state <> ALL ('{COMPLETED,FAILED,CANCELLED,TIMED_OUT,CONTINUED_AS_NEW,TERMINATED,MIGRATED}'::text[])) OR (harvest_workflow_executions.completed_at IS NULL) OR (harvest_workflow_executions.completed_at >= '2026-11-06 17:32:04.623597+00'::timestamp with time zone)))
+         Rows Removed by Filter: 8
+         Buffers: shared hit=5
+ Settings: plan_cache_mode = 'force_custom_plan'
+ Query Identifier: 7921401505651544605
+ Planning:
+   Buffers: shared hit=50
+(12 rows)
+
+BEGIN
+== hold_for_update, a leaf
+                                                                                                         QUERY PLAN                                                                                                          
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.42..8.45 rows=1 width=244) (actual rows=1 loops=1)
+   Output: legal_hold_set_at, legal_hold_until, workflow_name, workflow_id, state, started_at, completed_at, shard_id, output, error, search_attrs, parent_id, migrated_from_shards, staging_vacated_state, ctid
+   Buffers: shared hit=6
+   ->  LockRows  (cost=0.42..8.45 rows=1 width=244) (actual rows=1 loops=1)
+         Output: legal_hold_set_at, legal_hold_until, workflow_name, workflow_id, state, started_at, completed_at, shard_id, output, error, search_attrs, parent_id, migrated_from_shards, staging_vacated_state, ctid
+         Buffers: shared hit=6
+         ->  Index Scan using harvest_workflow_executions_pkey on public.harvest_workflow_executions  (cost=0.42..8.44 rows=1 width=244) (actual rows=1 loops=1)
+               Output: legal_hold_set_at, legal_hold_until, workflow_name, workflow_id, state, started_at, completed_at, shard_id, output, error, search_attrs, parent_id, migrated_from_shards, staging_vacated_state, ctid
+               Index Cond: (harvest_workflow_executions.id = '000dd2ef-aa88-f109-07cc-ef4ac8dec1a4'::uuid)
+               Buffers: shared hit=4
+ Settings: plan_cache_mode = 'force_custom_plan'
+ Query Identifier: -4506470428086055906
+ Planning:
+   Buffers: shared hit=53
+(14 rows)
+
+== null_parent, the busiest parent
+                                                                QUERY PLAN                                                                
+------------------------------------------------------------------------------------------------------------------------------------------
+ Update on public.harvest_workflow_executions  (cost=4.38..50.19 rows=0 width=0) (actual rows=0 loops=1)
+   Buffers: shared hit=725
+   ->  Bitmap Heap Scan on public.harvest_workflow_executions  (cost=4.38..50.19 rows=12 width=22) (actual rows=25 loops=1)
+         Output: NULL::uuid, ctid
+         Recheck Cond: (harvest_workflow_executions.parent_id = '939c792d-8ed9-9c12-49c5-764386cebaba'::uuid)
+         Filter: (harvest_workflow_executions.state = ANY ('{COMPLETED,FAILED,CANCELLED,TIMED_OUT,CONTINUED_AS_NEW,TERMINATED}'::text[]))
+         Rows Removed by Filter: 1
+         Heap Blocks: exact=26
+         Buffers: shared hit=28
+         ->  Bitmap Index Scan on idx_harvest_we_parent_id  (cost=0.00..4.38 rows=12 width=0) (actual rows=26 loops=1)
+               Index Cond: (harvest_workflow_executions.parent_id = '939c792d-8ed9-9c12-49c5-764386cebaba'::uuid)
+               Buffers: shared hit=2
+ Settings: plan_cache_mode = 'force_custom_plan'
+ Query Identifier: -2156212759884231345
+ Planning:
+   Buffers: shared hit=20
+(16 rows)
+
+ROLLBACK
+################ generic plans (a cached statement after five runs)
+SET
+== active_child, the busiest parent
+                                                                QUERY PLAN                                                                 
+-------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=50.18..50.19 rows=1 width=8) (actual rows=1 loops=1)
+   Output: count(*)
+   Buffers: shared hit=28
+   ->  Bitmap Heap Scan on public.harvest_workflow_executions  (cost=4.38..50.18 rows=1 width=0) (actual rows=1 loops=1)
+         Recheck Cond: (harvest_workflow_executions.parent_id = $1)
+         Filter: (harvest_workflow_executions.state <> ALL ('{COMPLETED,FAILED,CANCELLED,TIMED_OUT,CONTINUED_AS_NEW,TERMINATED}'::text[]))
+         Rows Removed by Filter: 25
+         Heap Blocks: exact=26
+         Buffers: shared hit=28
+         ->  Bitmap Index Scan on idx_harvest_we_parent_id  (cost=0.00..4.38 rows=12 width=0) (actual rows=26 loops=1)
+               Index Cond: (harvest_workflow_executions.parent_id = $1)
+               Buffers: shared hit=2
+ Settings: plan_cache_mode = 'force_generic_plan'
+ Query Identifier: -1142160237072261476
+ Planning:
+   Buffers: shared hit=20
+(16 rows)
+
+== active_child, a leaf
+                                                                QUERY PLAN                                                                 
+-------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=50.18..50.19 rows=1 width=8) (actual rows=1 loops=1)
+   Output: count(*)
+   Buffers: shared hit=2
+   ->  Bitmap Heap Scan on public.harvest_workflow_executions  (cost=4.38..50.18 rows=1 width=0) (actual rows=0 loops=1)
+         Recheck Cond: (harvest_workflow_executions.parent_id = $1)
+         Filter: (harvest_workflow_executions.state <> ALL ('{COMPLETED,FAILED,CANCELLED,TIMED_OUT,CONTINUED_AS_NEW,TERMINATED}'::text[]))
+         Buffers: shared hit=2
+         ->  Bitmap Index Scan on idx_harvest_we_parent_id  (cost=0.00..4.38 rows=12 width=0) (actual rows=0 loops=1)
+               Index Cond: (harvest_workflow_executions.parent_id = $1)
+               Buffers: shared hit=2
+ Settings: plan_cache_mode = 'force_generic_plan'
+ Query Identifier: -1142160237072261476
+(12 rows)
+
+== open_forks, the most forked run
+                                                                                 QUERY PLAN                                                                                  
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop  (cost=209.35..323.04 rows=1 width=16) (actual rows=0 loops=1)
+   Output: f.id
+   Inner Unique: true
+   Buffers: shared hit=159
+   CTE descendant
+     ->  Recursive Union  (cost=0.27..208.94 rows=11 width=20) (actual rows=2 loops=1)
+           Buffers: shared hit=151
+           ->  Index Scan using idx_harvest_we_fork_source on public.harvest_workflow_executions f_1  (cost=0.27..8.29 rows=1 width=20) (actual rows=2 loops=1)
+                 Output: f_1.id, 1
+                 Index Cond: (f_1.start_source_ref = $1)
+                 Buffers: shared hit=4
+           ->  Hash Join  (cost=0.41..20.05 rows=1 width=20) (actual rows=0 loops=1)
+                 Output: f_2.id, (d_1.depth + 1)
+                 Hash Cond: (f_2.start_source_ref = (d_1.id)::text)
+                 Buffers: shared hit=147
+                 ->  Index Scan using idx_harvest_wfx_start_source on public.harvest_workflow_executions f_2  (cost=0.14..18.82 rows=153 width=53) (actual rows=193 loops=1)
+                       Output: f_2.id, f_2.start_source_ref
+                       Index Cond: (f_2.start_source = 'fork'::text)
+                       Buffers: shared hit=147
+                 ->  Hash  (cost=0.22..0.22 rows=3 width=20) (actual rows=2 loops=1)
+                       Output: d_1.depth, d_1.id
+                       Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                       ->  WorkTable Scan on descendant d_1  (cost=0.00..0.22 rows=3 width=20) (actual rows=2 loops=1)
+                             Output: d_1.depth, d_1.id
+                             Filter: (d_1.depth < 65)
+   ->  CTE Scan on descendant d  (cost=0.00..0.22 rows=11 width=16) (actual rows=2 loops=1)
+         Output: d.id, d.depth
+         Buffers: shared hit=151
+   ->  Index Scan using harvest_workflow_executions_pkey on public.harvest_workflow_executions f  (cost=0.42..10.35 rows=1 width=16) (actual rows=0 loops=2)
+         Output: f.id
+         Index Cond: (f.id = d.id)
+         Filter: ((f.state = ANY ('{RUNNING,PAUSED,MIGRATING,MIGRATED}'::text[])) OR ((f.state = 'FAILED'::text) AND (SubPlan 2)))
+         Rows Removed by Filter: 1
+         Buffers: shared hit=8
+         SubPlan 2
+           ->  Seq Scan on public.harvest_dead_letters dl  (cost=0.00..3.82 rows=2 width=0) (never executed)
+                 Filter: ((dl.workflow_exec_id = f.id) AND (upper(dl.task_type) <> 'CALLBACK'::text))
+ Settings: plan_cache_mode = 'force_generic_plan'
+ Query Identifier: -3272940027876814298
+ Planning:
+   Buffers: shared hit=64
+(41 rows)
+
+== open_forks, a leaf
+                                                                                QUERY PLAN                                                                                 
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop  (cost=209.35..323.04 rows=1 width=16) (actual rows=0 loops=1)
+   Output: f.id
+   Inner Unique: true
+   Buffers: shared hit=4
+   CTE descendant
+     ->  Recursive Union  (cost=0.27..208.94 rows=11 width=20) (actual rows=0 loops=1)
+           Buffers: shared hit=4
+           ->  Index Scan using idx_harvest_we_fork_source on public.harvest_workflow_executions f_1  (cost=0.27..8.29 rows=1 width=20) (actual rows=0 loops=1)
+                 Output: f_1.id, 1
+                 Index Cond: (f_1.start_source_ref = $1)
+                 Buffers: shared hit=2
+           ->  Hash Join  (cost=0.41..20.05 rows=1 width=20) (actual rows=0 loops=1)
+                 Output: f_2.id, (d_1.depth + 1)
+                 Hash Cond: (f_2.start_source_ref = (d_1.id)::text)
+                 Buffers: shared hit=2
+                 ->  Index Scan using idx_harvest_wfx_start_source on public.harvest_workflow_executions f_2  (cost=0.14..18.82 rows=153 width=53) (actual rows=1 loops=1)
+                       Output: f_2.id, f_2.start_source_ref
+                       Index Cond: (f_2.start_source = 'fork'::text)
+                       Buffers: shared hit=2
+                 ->  Hash  (cost=0.22..0.22 rows=3 width=20) (actual rows=0 loops=1)
+                       Output: d_1.depth, d_1.id
+                       Buckets: 1024  Batches: 1  Memory Usage: 8kB
+                       ->  WorkTable Scan on descendant d_1  (cost=0.00..0.22 rows=3 width=20) (actual rows=0 loops=1)
+                             Output: d_1.depth, d_1.id
+                             Filter: (d_1.depth < 65)
+   ->  CTE Scan on descendant d  (cost=0.00..0.22 rows=11 width=16) (actual rows=0 loops=1)
+         Output: d.id, d.depth
+         Buffers: shared hit=4
+   ->  Index Scan using harvest_workflow_executions_pkey on public.harvest_workflow_executions f  (cost=0.42..10.35 rows=1 width=16) (never executed)
+         Output: f.id
+         Index Cond: (f.id = d.id)
+         Filter: ((f.state = ANY ('{RUNNING,PAUSED,MIGRATING,MIGRATED}'::text[])) OR ((f.state = 'FAILED'::text) AND (SubPlan 2)))
+         SubPlan 2
+           ->  Seq Scan on public.harvest_dead_letters dl  (cost=0.00..3.82 rows=2 width=0) (never executed)
+                 Filter: ((dl.workflow_exec_id = f.id) AND (upper(dl.task_type) <> 'CALLBACK'::text))
+ Settings: plan_cache_mode = 'force_generic_plan'
+ Query Identifier: -3272940027876814298
+(37 rows)
+
+== chain_link, the longest chain
+                                                                                                                                                 QUERY PLAN                                                                                                                                                  
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=8.45..8.46 rows=1 width=8) (actual rows=1 loops=1)
+   Output: count(*)
+   Buffers: shared hit=5
+   ->  Index Scan using idx_harvest_wfx_workflow_identity on public.harvest_workflow_executions  (cost=0.42..8.45 rows=1 width=0) (actual rows=1 loops=1)
+         Index Cond: ((harvest_workflow_executions.workflow_name = $1) AND (harvest_workflow_executions.workflow_id = $2))
+         Filter: ((harvest_workflow_executions.id <> $3) AND ((harvest_workflow_executions.state <> ALL ('{COMPLETED,FAILED,CANCELLED,TIMED_OUT,CONTINUED_AS_NEW,TERMINATED,MIGRATED}'::text[])) OR (harvest_workflow_executions.completed_at IS NULL) OR (harvest_workflow_executions.completed_at >= $4)))
+         Rows Removed by Filter: 8
+         Buffers: shared hit=5
+ Settings: plan_cache_mode = 'force_generic_plan'
+ Query Identifier: 7921401505651544605
+ Planning:
+   Buffers: shared hit=20
+(12 rows)
+
+BEGIN
+== hold_for_update, a leaf
+                                                                                                         QUERY PLAN                                                                                                          
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.42..8.45 rows=1 width=244) (actual rows=1 loops=1)
+   Output: legal_hold_set_at, legal_hold_until, workflow_name, workflow_id, state, started_at, completed_at, shard_id, output, error, search_attrs, parent_id, migrated_from_shards, staging_vacated_state, ctid
+   Buffers: shared hit=6
+   ->  LockRows  (cost=0.42..8.45 rows=1 width=244) (actual rows=1 loops=1)
+         Output: legal_hold_set_at, legal_hold_until, workflow_name, workflow_id, state, started_at, completed_at, shard_id, output, error, search_attrs, parent_id, migrated_from_shards, staging_vacated_state, ctid
+         Buffers: shared hit=6
+         ->  Index Scan using harvest_workflow_executions_pkey on public.harvest_workflow_executions  (cost=0.42..8.44 rows=1 width=244) (actual rows=1 loops=1)
+               Output: legal_hold_set_at, legal_hold_until, workflow_name, workflow_id, state, started_at, completed_at, shard_id, output, error, search_attrs, parent_id, migrated_from_shards, staging_vacated_state, ctid
+               Index Cond: (harvest_workflow_executions.id = $1)
+               Buffers: shared hit=4
+ Settings: plan_cache_mode = 'force_generic_plan'
+ Query Identifier: -4506470428086055906
+ Planning:
+   Buffers: shared hit=20
+(14 rows)
+
+== null_parent, the busiest parent
+                                                        QUERY PLAN                                                         
+---------------------------------------------------------------------------------------------------------------------------
+ Update on public.harvest_workflow_executions  (cost=4.38..50.24 rows=0 width=0) (actual rows=0 loops=1)
+   Buffers: shared hit=699
+   ->  Bitmap Heap Scan on public.harvest_workflow_executions  (cost=4.38..50.24 rows=9 width=22) (actual rows=25 loops=1)
+         Output: $1, ctid
+         Recheck Cond: (harvest_workflow_executions.parent_id = $2)
+         Filter: (harvest_workflow_executions.state = ANY ($3))
+         Rows Removed by Filter: 1
+         Heap Blocks: exact=26
+         Buffers: shared hit=28
+         ->  Bitmap Index Scan on idx_harvest_we_parent_id  (cost=0.00..4.38 rows=12 width=0) (actual rows=26 loops=1)
+               Index Cond: (harvest_workflow_executions.parent_id = $2)
+               Buffers: shared hit=2
+ Settings: plan_cache_mode = 'force_generic_plan'
+ Query Identifier: -2156212759884231345
+ Planning:
+   Buffers: shared hit=20
+(16 rows)
+
+ROLLBACK

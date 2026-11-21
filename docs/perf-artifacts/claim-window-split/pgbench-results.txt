@@ -1,0 +1,13 @@
+# pgbench, 1 client, 5 s each, -M prepared, probe DB with 24 pending
+# workflow rows. Statement latency of the claim line in ms. Interleaved.
+1 claim stmt_ms=0.941
+1 claimA_hold stmt_ms=0.708
+1 claimA_nohold stmt_ms=0.668
+2 claim stmt_ms=0.955
+2 claimA_hold stmt_ms=0.717
+2 claimA_nohold stmt_ms=0.672
+3 claim stmt_ms=0.930
+3 claimA_hold stmt_ms=0.726
+3 claimA_nohold stmt_ms=0.647
+# perf of the full claim loop alone: standard_ExecutorStart 14.68%,
+# standard_ExecutorRun 14.95%, standard_ExecutorEnd 2.29% of all samples.

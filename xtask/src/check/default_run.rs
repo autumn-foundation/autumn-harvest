@@ -87,24 +87,12 @@ fn python_str_list(items: &[&str]) -> String {
 ///
 /// Python quotes with `'`, unless the text holds a `'` and no `"`.
 fn python_str_repr(text: &str) -> String {
-    let quote = if text.contains('\'') && !text.contains('"') {
-        '"'
-    } else {
-        '\''
-    };
+    let quote = crate::py_repr::repr_quote(text);
     let mut out = String::new();
     out.push(quote);
     for c in text.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c == quote => {
-                out.push('\\');
-                out.push(c);
-            }
-            c => out.push(c),
+        if !crate::py_repr::push_common_repr_escape(&mut out, c, quote) {
+            out.push(c);
         }
     }
     out.push(quote);
@@ -213,5 +201,18 @@ mod tests {
         assert_eq!(python_str_repr("a"), "'a'");
         assert_eq!(python_str_repr("it's"), "\"it's\"");
         assert_eq!(python_str_repr("a'b\"c"), "'a\\'b\"c'");
+    }
+
+    #[test]
+    fn python_repr_escapes_newline_cr_tab_and_a_bare_backslash() {
+        assert_eq!(python_str_repr("a\nb"), "'a\\nb'");
+        assert_eq!(python_str_repr("a\rb"), "'a\\rb'");
+        assert_eq!(python_str_repr("a\tb"), "'a\\tb'");
+        assert_eq!(python_str_repr("a\\b"), "'a\\\\b'");
+    }
+
+    #[test]
+    fn python_repr_passes_other_control_characters_through_unescaped() {
+        assert_eq!(python_str_repr("a\u{7}b"), "'a\u{7}b'");
     }
 }

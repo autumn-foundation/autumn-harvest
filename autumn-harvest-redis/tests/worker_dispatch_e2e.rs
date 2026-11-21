@@ -71,10 +71,10 @@ use autumn_harvest::{Priority, StartSource, StartWorkflowParams, WorkflowContext
 use autumn_harvest_redis::{RedisDispatch, RedisDispatchConfig};
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use diesel::prelude::QueryableByName;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use redis::AsyncCommands;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, ImageExt};
@@ -530,7 +530,8 @@ struct UuidRow {
 #[derive(QueryableByName)]
 struct TimeRow {
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    value: DateTime<Utc>,
+    #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+    value: Timestamp,
 }
 
 async fn connect(url: &str) -> AsyncPgConnection {
@@ -575,7 +576,7 @@ async fn side_effect_count(conn: &mut AsyncPgConnection, run_id: &str) -> i64 {
     .value
 }
 
-async fn side_effect_times(conn: &mut AsyncPgConnection, run_id: &str) -> Vec<DateTime<Utc>> {
+async fn side_effect_times(conn: &mut AsyncPgConnection, run_id: &str) -> Vec<Timestamp> {
     diesel::sql_query(
         "SELECT noted_at AS value FROM harvest_redis_e2e_side_effects
          WHERE run_id = $1 ORDER BY id",
@@ -1057,7 +1058,7 @@ async fn activity_retry_delay_is_honoured() {
     assert_eq!(times.len(), 2, "the activity must run twice");
     let gap = times[1] - times[0];
     assert!(
-        gap >= chrono::Duration::milliseconds(1800),
+        gap >= jiff::SignedDuration::from_millis(1800),
         "the second attempt must respect the two second retry delay, gap was {gap}"
     );
     counters.assert_the_channel_carried_the_run();
@@ -1097,7 +1098,7 @@ async fn duplicate_reference_for_a_completed_row_is_acked_without_rerun() {
         .publish(&[DispatchHint {
             task_id,
             queue_name: QUEUE.to_string(),
-            scheduled_at: Utc::now(),
+            scheduled_at: Timestamp::now(),
             priority: 0,
             shard: None,
             kind: Some(autumn_harvest::dispatch::DispatchKind::Workflow),

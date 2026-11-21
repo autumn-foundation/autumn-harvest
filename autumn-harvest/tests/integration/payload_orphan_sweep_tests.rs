@@ -42,9 +42,9 @@ use autumn_harvest::store;
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::DbPool;
-use chrono::{DateTime, Utc};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -59,7 +59,7 @@ use uuid::Uuid;
 const PAGE_SIZE: usize = 2;
 const GRACE: Duration = Duration::from_hours(1);
 
-type Blobs = HashMap<String, (Vec<u8>, DateTime<Utc>)>;
+type Blobs = HashMap<String, (Vec<u8>, Timestamp)>;
 
 /// A store that lists. Keys are content-addressed, and `put` refreshes the
 /// creation time, as the `list` contract requires.
@@ -104,7 +104,7 @@ impl ListingStore {
 
     /// Add a blob that is `age` old.
     fn add_aged(&self, key: &str, age: Duration) {
-        let created = Utc::now() - chrono::Duration::from_std(age).unwrap();
+        let created = Timestamp::now() - jiff::SignedDuration::try_from(age).unwrap();
         self.blobs
             .lock()
             .unwrap()
@@ -113,7 +113,7 @@ impl ListingStore {
 
     /// Move every blob back in time.
     fn age_all(&self, age: Duration) {
-        let created = Utc::now() - chrono::Duration::from_std(age).unwrap();
+        let created = Timestamp::now() - jiff::SignedDuration::try_from(age).unwrap();
         for entry in self.blobs.lock().unwrap().values_mut() {
             entry.1 = created;
         }
@@ -156,7 +156,7 @@ impl PayloadStore for ListingStore {
         self.blobs
             .lock()
             .unwrap()
-            .insert(key.clone(), (bytes.to_vec(), Utc::now()));
+            .insert(key.clone(), (bytes.to_vec(), Timestamp::now()));
         Box::pin(async move { Ok(key) })
     }
 
@@ -181,7 +181,7 @@ impl PayloadStore for ListingStore {
     fn delete_if_older(
         &self,
         key: &str,
-        created_before: DateTime<Utc>,
+        created_before: Timestamp,
     ) -> Option<PayloadStoreFuture<'_, bool>> {
         if !AtomicBool::load(&self.conditional, Ordering::SeqCst) {
             return None;
@@ -209,7 +209,7 @@ impl PayloadStore for ListingStore {
     fn list(
         &self,
         prefix: &str,
-        created_before: DateTime<Utc>,
+        created_before: Timestamp,
         cursor: Option<&str>,
     ) -> Option<PayloadStoreFuture<'_, BlobPage>> {
         self.list_calls.fetch_add(1, Ordering::SeqCst);
@@ -238,7 +238,7 @@ impl PayloadStore for ListingStore {
         if let Some(key) = self.reput_after_list.lock().unwrap().take()
             && let Some(entry) = self.blobs.lock().unwrap().get_mut(&key)
         {
-            entry.1 = Utc::now();
+            entry.1 = Timestamp::now();
         }
         let more = found.len() > PAGE_SIZE;
         found.truncate(PAGE_SIZE);
@@ -448,7 +448,7 @@ async fn blob_of_a_rolled_back_append_is_swept_after_the_grace_period() {
     // after the upload. The transaction rolls back and leaves the blob.
     let events = vec![WorkflowEvent::WorkflowStarted {
         input: serde_json::json!({ "blob": "Q".repeat(4096) }),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,

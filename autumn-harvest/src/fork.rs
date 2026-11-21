@@ -22,6 +22,7 @@
 //! sends no completion callback and fires no completion trigger (issue #2378).
 
 use crate::schema::harvest_workflow_executions_ext;
+use jiff_diesel::ToDiesel;
 use std::collections::{HashMap, HashSet};
 
 use diesel::prelude::*;
@@ -31,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::cached_stmt::CachePreparedDsl as _;
 use crate::context::WorkflowCommand;
 use crate::error::{HarvestError, HarvestResult, database_error};
 pub use crate::event::ForkEffects;
@@ -891,8 +893,11 @@ pub(crate) async fn is_pinned_by_recorded_fork(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
 ) -> HarvestResult<bool> {
+    // The retention gate runs this read twice per candidate. The text is
+    // constant, so it stays prepared.
     let open: Vec<Uuid> = diesel::sql_query(OPEN_FORK_DESCENDANTS_SQL)
         .bind::<diesel::sql_types::Text, _>(exec_id.to_string())
+        .cache_prepared()
         .load::<ForkIdRow>(conn)
         .await
         .map_err(database_error)?
@@ -2300,7 +2305,9 @@ pub(crate) async fn serve_recorded_activities(
             harvest_task_queue::table
                 .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
                 .filter(harvest_task_queue::activity_id.eq(Some(activity_id.as_uuid())))
-                .filter(harvest_task_queue::state.eq_any(["PENDING", "RUNNING"])),
+                .filter(crate::row_guard::row_guard(
+                    harvest_task_queue::state.eq_any(["PENDING", "RUNNING"]),
+                )),
         )
         .set((
             harvest_task_queue::state.eq("CANCELLED"),
@@ -2311,7 +2318,7 @@ pub(crate) async fn serve_recorded_activities(
             } else {
                 FORK_HOLD_ERROR
             })),
-            harvest_task_queue::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_task_queue::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(conn)
         .await
@@ -2371,7 +2378,7 @@ mod tests {
     fn started(input: Value) -> WorkflowEvent {
         WorkflowEvent::WorkflowStarted {
             input,
-            timestamp: chrono::Utc::now(),
+            timestamp: jiff::Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -3124,7 +3131,7 @@ mod tests {
             WorkflowEvent::MutexGranted {
                 key: "acct-1".to_string(),
                 lock_seq: 1,
-                acquired_at: chrono::Utc::now(),
+                acquired_at: jiff::Timestamp::now(),
             },
         ];
         let error = validate_fork(&events, 1, &WorkflowForkRequest::default()).unwrap_err();

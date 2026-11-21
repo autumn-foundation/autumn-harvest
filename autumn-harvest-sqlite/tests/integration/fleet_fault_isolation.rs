@@ -15,7 +15,7 @@
 //! "repeat until quiescent". A multi-cycle execution then needed several
 //! external `run_until_idle()` calls to finish, instead of one.
 //!
-//! A follow-up review of the #1555 fix (Codex P1) found that a naive
+//! A later review of the #1555 fix found that a naive
 //! "keep looping" fix re-drives a broken execution on EVERY internal pass.
 //! For a WORKFLOW-handler panic, each re-drive strikes the bounded panic
 //! budget (`WORKFLOW_PANIC_MAX_ATTEMPTS`). A persistently-panicking
@@ -25,23 +25,26 @@
 
 // The `#[workflow]` macro references its input param through expansion.
 #![allow(clippy::used_underscore_binding)]
-// `healthy_wf` holds no `.await` — it completes in one synchronous cycle by
-// design, so it lands past the broken execution in the very same pass.
+// `healthy_wf` holds no `.await`. It completes in one synchronous cycle by
+// design, so it lands past the broken execution in the same pass.
 #![allow(clippy::unused_async)]
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use autumn_harvest::prelude::*;
 use autumn_harvest_sqlite::{ExecutionOutcome, SqliteError, SqliteRuntime};
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::json;
 
-// Reaches `WorkflowCommand::ScheduleExternalActivity` through ordinary dynamic
-// control flow — not a statically-declared `#[workflow(...)]` feature, so
-// `register_workflow`'s static audit cannot catch it up front.
+/// The stable token that names a rejected worker-session acquire.
+const SESSION_ACQUIRE: &str = "ScheduleActivity.schedule_to_start_override";
+
+// This workflow reaches a worker-session acquire through ordinary control
+// flow. No `#[workflow(...)]` attribute declares it, so the static audit of
+// `register_workflow` cannot catch it first.
 #[workflow]
 async fn broken_wf(ctx: &WorkflowContext, _target: ExecutionId) -> Result<(), String> {
-    ctx.execute_activity_external("external", json!({}), "default", 60)
+    ctx.create_session(SessionOptions::new("gpu"))
         .await
         .map(drop)
         .map_err(|e| e.to_string())
@@ -78,7 +81,7 @@ fn increment_activity() -> autumn_harvest_sqlite::ActivitySpec {
 /// Errors on a LATER pass, not the first. Cycle 1 schedules a real activity
 /// (progress, no error). Only once that activity resolves does cycle 2 reach a
 /// cross-type continue-as-new, a DIFFERENT unsupported command than
-/// `broken_wf`'s `ScheduleExternalActivity`.
+/// `broken_wf`'s worker-session acquire.
 #[workflow]
 async fn broken_after_one_cycle_wf(
     ctx: &WorkflowContext,
@@ -101,7 +104,7 @@ static COUNTING_BROKEN_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
 #[workflow]
 async fn counting_broken_wf(ctx: &WorkflowContext, _target: ExecutionId) -> Result<(), String> {
     COUNTING_BROKEN_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
-    ctx.execute_activity_external("external", json!({}), "default", 60)
+    ctx.create_session(SessionOptions::new("gpu"))
         .await
         .map(drop)
         .map_err(|e| e.to_string())
@@ -179,7 +182,7 @@ async fn poll_once_drives_the_rest_of_the_fleet_past_an_unsupported_command() {
     match err {
         SqliteError::Unsupported(msg) => {
             assert!(
-                msg.contains("ScheduleExternalActivity"),
+                msg.starts_with(SESSION_ACQUIRE),
                 "the surfaced error must name the offending command; got: {msg}"
             );
         }
@@ -237,7 +240,7 @@ async fn poll_once_as_of_drives_the_rest_of_the_fleet_past_an_unsupported_comman
     let healthy_after = start_healthy_after(&mut rt, broken);
 
     let err = rt
-        .poll_once_as_of(Utc::now())
+        .poll_once_as_of(Timestamp::now())
         .await
         .expect_err("the broken execution's command must still be rejected loudly");
     assert!(
@@ -354,7 +357,7 @@ async fn run_until_idle_keeps_the_first_error_seen_across_passes_not_a_later_one
     match err {
         SqliteError::Unsupported(msg) => {
             assert!(
-                msg.contains("ScheduleExternalActivity"),
+                msg.starts_with(SESSION_ACQUIRE),
                 "run_until_idle must keep pass 1's error (broken_wf's), not \
                  pass 2's different error (ContinueAsNew.new_workflow_type); \
                  got: {msg}"
@@ -399,7 +402,7 @@ async fn four_step_wf(ctx: &WorkflowContext, start: i64) -> Result<i64, String> 
     Ok(step4.as_i64().unwrap_or_default())
 }
 
-/// Codex P1 follow-up on the #1555 fix. A single `run_until_idle()` call
+/// A follow-up on the #1555 fix. A single `run_until_idle()` call
 /// must strike a persistently-panicking execution AT MOST ONCE, even while
 /// an unrelated execution needs many more internal passes to converge.
 /// Re-striking it every pass would exhaust
@@ -484,4 +487,59 @@ async fn run_until_idle_converges_past_a_persistently_broken_running_execution()
         rt.outcome(healthy_after).unwrap(),
         ExecutionOutcome::Completed(ref v) if v.as_i64() == Some(12)
     ));
+}
+
+/// `poll_once_reporting` keeps the progress of a pass apart from its first
+/// error. A driver then does not read a pass that moved a healthy run as
+/// idle only because another run failed.
+#[tokio::test]
+async fn poll_once_reporting_keeps_progress_beside_the_error() {
+    let (mut rt, broken) = runtime_with_headroom(|rt| {
+        rt.register_workflow(&broken_wf_info());
+        rt.register_workflow(&healthy_wf_info());
+        rt.start_workflow("broken_wf", json!(ExecutionId::new()))
+            .unwrap()
+    });
+    let healthy_after = start_healthy_after(&mut rt, broken);
+
+    let pass = rt.poll_once_reporting().await.expect("the pass runs");
+    assert!(pass.progressed, "the healthy run moved in this pass");
+    assert!(
+        matches!(pass.error, Some(SqliteError::Unsupported(_))),
+        "{:?}",
+        pass.error
+    );
+    assert!(matches!(
+        rt.outcome(healthy_after).unwrap(),
+        ExecutionOutcome::Completed(_)
+    ));
+}
+
+/// A run that the error path seals `FAILED` changed state, so its pass
+/// counts as progress. A parent that waits for it can then move. A driver
+/// that settles on an idle pass must not stop before that.
+#[tokio::test]
+async fn a_run_sealed_by_its_error_counts_as_progress() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&broken_wf_info());
+    let broken = rt
+        .start_workflow("broken_wf", json!(ExecutionId::new()))
+        .unwrap();
+
+    let pass = rt.poll_once_reporting().await.expect("the pass runs");
+    assert!(
+        matches!(pass.error, Some(SqliteError::Unsupported(_))),
+        "{:?}",
+        pass.error
+    );
+    assert!(pass.progressed, "the seal moved the run to FAILED");
+    assert!(matches!(
+        rt.outcome(broken).unwrap(),
+        ExecutionOutcome::Failed(_)
+    ));
+
+    // Nothing is left to drive.
+    let pass = rt.poll_once_reporting().await.expect("the pass runs");
+    assert!(!pass.progressed);
+    assert!(pass.error.is_none(), "{:?}", pass.error);
 }

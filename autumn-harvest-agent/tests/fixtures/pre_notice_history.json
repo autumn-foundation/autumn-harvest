@@ -1,0 +1,936 @@
+{
+  "agent": {
+    "events": [
+      {
+        "data": {
+          "input": {},
+          "timestamp": "2026-11-08T14:09:03.456Z"
+        },
+        "type": "WorkflowStarted"
+      },
+      {
+        "data": {
+          "payload": {
+            "kind": "op",
+            "op": {
+              "text": "save it",
+              "type": "user_message"
+            }
+          },
+          "signal_name": "harvest.entity.op"
+        },
+        "type": "SignalReceived"
+      },
+      {
+        "data": {
+          "activity_id": "881c3cc2-e6d7-49fd-bbfa-fb9499a4bf5e",
+          "input": "support",
+          "name": "agent_profile",
+          "queue": "default"
+        },
+        "type": "ActivityScheduled"
+      },
+      {
+        "data": {
+          "activity_id": "881c3cc2-e6d7-49fd-bbfa-fb9499a4bf5e",
+          "output": {
+            "approval_timeout_secs": 3600,
+            "deliver": false,
+            "kind": "support",
+            "loop_guard": {
+              "stop_after": 5,
+              "warn_after": 3,
+              "window": 30
+            },
+            "max_steps": 8,
+            "memory": "none",
+            "read_only": false,
+            "window": 200
+          }
+        },
+        "type": "ActivityCompleted"
+      },
+      {
+        "data": {
+          "kind": "EntityState",
+          "name": "harvest.entity.state",
+          "value": {
+            "state": {
+              "chain": 0,
+              "failures": 0,
+              "flow_labels": [],
+              "followup_due_ms": null,
+              "heartbeat": {
+                "mode": "profile"
+              },
+              "held": [],
+              "inbound": {
+                "senders": {},
+                "taken": 0
+              },
+              "incarnation": "",
+              "last_active_ms": null,
+              "last_answer": null,
+              "last_error": null,
+              "last_stop": null,
+              "next_heartbeat_ms": null,
+              "outbound_seq": {},
+              "rounds": 0,
+              "segments": 0,
+              "status": {
+                "status": "open"
+              },
+              "steer": {
+                "ran": [],
+                "steered": []
+              },
+              "ticks": 0,
+              "tokens_used": 0,
+              "transcript": []
+            },
+            "stats": {
+              "applied": 0,
+              "checkpoints": 0,
+              "failed": 0,
+              "last_error": null
+            }
+          }
+        },
+        "type": "SideEffectRecorded"
+      },
+      {
+        "data": {
+          "kind": "Uuid",
+          "value": "01a1bb7d-c1e7-7726-803f-077fbe2dea1d"
+        },
+        "type": "SideEffectRecorded"
+      },
+      {
+        "data": {
+          "kind": "Now",
+          "value": 1794146943462
+        },
+        "type": "SideEffectRecorded"
+      },
+      {
+        "data": {
+          "details": 2,
+          "name": "race:1"
+        },
+        "type": "MarkerRecorded"
+      },
+      {
+        "data": {
+          "activity_id": "e4cef1b6-87ff-459e-b726-0ced6dc4e2e6",
+          "input": {
+            "interruptible": true,
+            "max_output_tokens": null,
+            "max_steps": 8,
+            "messages": [
+              {
+                "content": [
+                  {
+                    "text": "save it"
+                  }
+                ],
+                "role": "user"
+              }
+            ],
+            "remember": true,
+            "run_id": "01a1bb7d-c1e7-7726-803f-077fbe2dea1d:s0",
+            "session_id": "support/acct-1",
+            "steps_used": 0,
+            "usage": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 0,
+              "output_tokens": 0
+            }
+          },
+          "name": "agent_model_turn",
+          "queue": "default"
+        },
+        "type": "ActivityScheduled"
+      },
+      {
+        "data": {
+          "activity_id": "e4cef1b6-87ff-459e-b726-0ced6dc4e2e6",
+          "output": {
+            "content": [
+              {
+                "tool_call": {
+                  "arguments": {
+                    "n": 2
+                  },
+                  "id": "w2",
+                  "name": "write"
+                }
+              }
+            ],
+            "decisions": [
+              {
+                "decision": "require_approval",
+                "reason": "write needs approval before it runs"
+              }
+            ],
+            "interruptible": [
+              false
+            ],
+            "stop": "tool_use",
+            "usage": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 1,
+              "output_tokens": 0
+            }
+          }
+        },
+        "type": "ActivityCompleted"
+      },
+      {
+        "data": {
+          "details": 0,
+          "name": "race_winner:1"
+        },
+        "type": "MarkerRecorded"
+      },
+      {
+        "data": {
+          "details": 3,
+          "name": "race:2"
+        },
+        "type": "MarkerRecorded"
+      },
+      {
+        "data": {
+          "duration_secs": 3600,
+          "timer_id": "__race:2:2"
+        },
+        "type": "TimerStarted"
+      },
+      {
+        "data": {
+          "payload": {
+            "verdict": "approve"
+          },
+          "signal_name": "tool_approval:0:0:w2"
+        },
+        "type": "SignalReceived"
+      },
+      {
+        "data": {
+          "details": 0,
+          "name": "race_winner:2"
+        },
+        "type": "MarkerRecorded"
+      },
+      {
+        "data": {
+          "activity_id": "71b15831-2d4a-4516-98b4-dfc02cf1eead",
+          "input": {
+            "call": {
+              "arguments": {
+                "n": 2
+              },
+              "id": "w2",
+              "name": "write"
+            },
+            "run_id": "01a1bb7d-c1e7-7726-803f-077fbe2dea1d:s0",
+            "session_id": "support/acct-1",
+            "step": 0
+          },
+          "name": "agent_tool_call",
+          "queue": "default"
+        },
+        "type": "ActivityScheduled"
+      },
+      {
+        "data": {
+          "activity_id": "71b15831-2d4a-4516-98b4-dfc02cf1eead",
+          "output": {
+            "content": "{\"echo\":{\"n\":2}}",
+            "is_error": false
+          }
+        },
+        "type": "ActivityCompleted"
+      },
+      {
+        "data": {
+          "details": 2,
+          "name": "race:3"
+        },
+        "type": "MarkerRecorded"
+      },
+      {
+        "data": {
+          "activity_id": "70ee0fe3-5579-47ac-8c00-8dfb19363fe3",
+          "input": {
+            "interruptible": true,
+            "max_output_tokens": null,
+            "max_steps": 8,
+            "messages": [
+              {
+                "content": [
+                  {
+                    "tool_call": {
+                      "arguments": {
+                        "n": 2
+                      },
+                      "id": "w2",
+                      "name": "write"
+                    }
+                  }
+                ],
+                "role": "assistant"
+              },
+              {
+                "content": [
+                  {
+                    "tool_result": {
+                      "content": "{\"echo\":{\"n\":2}}",
+                      "tool_call_id": "w2"
+                    }
+                  }
+                ],
+                "role": "tool"
+              }
+            ],
+            "prefix": {
+              "digest": "810b5275ec524c75cc88ea9f0b4e05e2039ab5f7ee03b0dc900795093e04ca44",
+              "len": 1
+            },
+            "remember": true,
+            "run_id": "01a1bb7d-c1e7-7726-803f-077fbe2dea1d:s0",
+            "session_id": "support/acct-1",
+            "steps_used": 1,
+            "usage": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 1,
+              "output_tokens": 0
+            }
+          },
+          "name": "agent_model_turn",
+          "queue": "default"
+        },
+        "type": "ActivityScheduled"
+      },
+      {
+        "data": {
+          "activity_id": "70ee0fe3-5579-47ac-8c00-8dfb19363fe3",
+          "output": {
+            "content": [
+              {
+                "text": "written"
+              }
+            ],
+            "decisions": [],
+            "stop": "end_turn",
+            "usage": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 1,
+              "output_tokens": 0
+            }
+          }
+        },
+        "type": "ActivityCompleted"
+      },
+      {
+        "data": {
+          "details": 0,
+          "name": "race_winner:3"
+        },
+        "type": "MarkerRecorded"
+      },
+      {
+        "data": {
+          "kind": "EntityState",
+          "name": "harvest.entity.state",
+          "value": {
+            "state": {
+              "chain": 0,
+              "failures": 0,
+              "flow_labels": [],
+              "followup_due_ms": null,
+              "heartbeat": {
+                "mode": "profile"
+              },
+              "held": [],
+              "inbound": {
+                "senders": {},
+                "taken": 0
+              },
+              "incarnation": "01a1bb7d-c1e7-7726-803f-077fbe2dea1d",
+              "last_active_ms": 1794146943462,
+              "last_answer": "written",
+              "last_error": null,
+              "last_stop": "completed",
+              "next_heartbeat_ms": null,
+              "outbound_seq": {},
+              "rounds": 1,
+              "segments": 1,
+              "sent": {
+                "digest": "52acafaa8f72862910653d2dcf7323ce9485cf9b739fed74d4b2e0631be265b6",
+                "len": 3
+              },
+              "status": {
+                "status": "open"
+              },
+              "steer": {
+                "ran": [],
+                "steered": []
+              },
+              "ticks": 0,
+              "tokens_used": 2,
+              "transcript": [
+                {
+                  "content": [
+                    {
+                      "text": "save it"
+                    }
+                  ],
+                  "role": "user"
+                },
+                {
+                  "content": [
+                    {
+                      "tool_call": {
+                        "arguments": {
+                          "n": 2
+                        },
+                        "id": "w2",
+                        "name": "write"
+                      }
+                    }
+                  ],
+                  "role": "assistant"
+                },
+                {
+                  "content": [
+                    {
+                      "tool_result": {
+                        "content": "{\"echo\":{\"n\":2}}",
+                        "tool_call_id": "w2"
+                      }
+                    }
+                  ],
+                  "role": "tool"
+                },
+                {
+                  "content": [
+                    {
+                      "text": "written"
+                    }
+                  ],
+                  "role": "assistant"
+                }
+              ]
+            },
+            "stats": {
+              "applied": 1,
+              "checkpoints": 0,
+              "failed": 0,
+              "last_error": null
+            }
+          }
+        },
+        "type": "SideEffectRecorded"
+      },
+      {
+        "data": {
+          "kind": "Custom",
+          "name": "harvest.entity.checkpoint",
+          "value": false
+        },
+        "type": "SideEffectRecorded"
+      },
+      {
+        "data": {
+          "payload": {
+            "kind": "delete"
+          },
+          "signal_name": "harvest.entity.op"
+        },
+        "type": "SignalReceived"
+      },
+      {
+        "data": {
+          "kind": "EntityState",
+          "name": "harvest.entity.deleted",
+          "value": {
+            "state": {
+              "chain": 0,
+              "failures": 0,
+              "flow_labels": [],
+              "followup_due_ms": null,
+              "heartbeat": {
+                "mode": "profile"
+              },
+              "held": [],
+              "inbound": {
+                "senders": {},
+                "taken": 0
+              },
+              "incarnation": "01a1bb7d-c1e7-7726-803f-077fbe2dea1d",
+              "last_active_ms": 1794146943462,
+              "last_answer": "written",
+              "last_error": null,
+              "last_stop": "completed",
+              "next_heartbeat_ms": null,
+              "outbound_seq": {},
+              "rounds": 1,
+              "segments": 1,
+              "sent": {
+                "digest": "52acafaa8f72862910653d2dcf7323ce9485cf9b739fed74d4b2e0631be265b6",
+                "len": 3
+              },
+              "status": {
+                "status": "open"
+              },
+              "steer": {
+                "ran": [],
+                "steered": []
+              },
+              "ticks": 0,
+              "tokens_used": 2,
+              "transcript": [
+                {
+                  "content": [
+                    {
+                      "text": "save it"
+                    }
+                  ],
+                  "role": "user"
+                },
+                {
+                  "content": [
+                    {
+                      "tool_call": {
+                        "arguments": {
+                          "n": 2
+                        },
+                        "id": "w2",
+                        "name": "write"
+                      }
+                    }
+                  ],
+                  "role": "assistant"
+                },
+                {
+                  "content": [
+                    {
+                      "tool_result": {
+                        "content": "{\"echo\":{\"n\":2}}",
+                        "tool_call_id": "w2"
+                      }
+                    }
+                  ],
+                  "role": "tool"
+                },
+                {
+                  "content": [
+                    {
+                      "text": "written"
+                    }
+                  ],
+                  "role": "assistant"
+                }
+              ]
+            },
+            "stats": {
+              "applied": 1,
+              "checkpoints": 0,
+              "failed": 0,
+              "last_error": null
+            }
+          }
+        },
+        "type": "SideEffectRecorded"
+      },
+      {
+        "data": {
+          "output": {
+            "chain": 0,
+            "failures": 0,
+            "flow_labels": [],
+            "followup_due_ms": null,
+            "heartbeat": {
+              "mode": "profile"
+            },
+            "held": [],
+            "inbound": {
+              "senders": {},
+              "taken": 0
+            },
+            "incarnation": "01a1bb7d-c1e7-7726-803f-077fbe2dea1d",
+            "last_active_ms": 1794146943462,
+            "last_answer": "written",
+            "last_error": null,
+            "last_stop": "completed",
+            "next_heartbeat_ms": null,
+            "outbound_seq": {},
+            "rounds": 1,
+            "segments": 1,
+            "sent": {
+              "digest": "52acafaa8f72862910653d2dcf7323ce9485cf9b739fed74d4b2e0631be265b6",
+              "len": 3
+            },
+            "status": {
+              "status": "open"
+            },
+            "steer": {
+              "ran": [],
+              "steered": []
+            },
+            "ticks": 0,
+            "tokens_used": 2,
+            "transcript": [
+              {
+                "content": [
+                  {
+                    "text": "save it"
+                  }
+                ],
+                "role": "user"
+              },
+              {
+                "content": [
+                  {
+                    "tool_call": {
+                      "arguments": {
+                        "n": 2
+                      },
+                      "id": "w2",
+                      "name": "write"
+                    }
+                  }
+                ],
+                "role": "assistant"
+              },
+              {
+                "content": [
+                  {
+                    "tool_result": {
+                      "content": "{\"echo\":{\"n\":2}}",
+                      "tool_call_id": "w2"
+                    }
+                  }
+                ],
+                "role": "tool"
+              },
+              {
+                "content": [
+                  {
+                    "text": "written"
+                  }
+                ],
+                "role": "assistant"
+              }
+            ]
+          }
+        },
+        "type": "WorkflowCompleted"
+      }
+    ],
+    "execution_id": "ffff73d9-be1e-47bf-a51f-f71607e202e4",
+    "workflow_id": "support/acct-1"
+  },
+  "agent_loop": {
+    "events": [
+      {
+        "data": {
+          "input": {
+            "approval_timeout_secs": 3600,
+            "deliver": false,
+            "followups": null,
+            "history": [],
+            "input": "save it",
+            "loop_guard": {
+              "stop_after": 5,
+              "warn_after": 3,
+              "window": 30
+            },
+            "max_output_tokens": null,
+            "max_request_bytes": null,
+            "max_steps": 8,
+            "max_total_tokens": null,
+            "memory_scope": null,
+            "read_only": false,
+            "run_id_source": "execution_id",
+            "session_id": null,
+            "system": null,
+            "transcript_delta": true,
+            "unattended": false,
+            "unattended_memory_writes": false,
+            "whole_request_budget": true
+          },
+          "timestamp": "2026-11-08T14:09:03.432Z"
+        },
+        "type": "WorkflowStarted"
+      },
+      {
+        "data": {
+          "details": 1,
+          "name": "patch:agent_final_turn_rules"
+        },
+        "type": "MarkerRecorded"
+      },
+      {
+        "data": {
+          "details": 1,
+          "name": "patch:agent.transcript-delta"
+        },
+        "type": "MarkerRecorded"
+      },
+      {
+        "data": {
+          "activity_id": "d5cf3251-0278-434f-88d9-330c20549ac7",
+          "input": {
+            "max_output_tokens": null,
+            "max_steps": 8,
+            "messages": [
+              {
+                "content": [
+                  {
+                    "text": "save it"
+                  }
+                ],
+                "role": "user"
+              }
+            ],
+            "remember": true,
+            "run_id": "ffff5f57-1cdd-471a-a795-33e4fe7dda95",
+            "session_id": null,
+            "steps_used": 0,
+            "usage": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 0,
+              "output_tokens": 0
+            }
+          },
+          "name": "agent_model_turn",
+          "queue": "default"
+        },
+        "type": "ActivityScheduled"
+      },
+      {
+        "data": {
+          "activity_id": "d5cf3251-0278-434f-88d9-330c20549ac7",
+          "output": {
+            "content": [
+              {
+                "tool_call": {
+                  "arguments": {
+                    "n": 1
+                  },
+                  "id": "w1",
+                  "name": "write"
+                }
+              }
+            ],
+            "decisions": [
+              {
+                "decision": "require_approval",
+                "reason": "write needs approval before it runs"
+              }
+            ],
+            "stop": "tool_use",
+            "usage": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 1,
+              "output_tokens": 0
+            }
+          }
+        },
+        "type": "ActivityCompleted"
+      },
+      {
+        "data": {
+          "duration_secs": 3600,
+          "timer_id": "__signal_timeout:1:tool_approval:0:0:w1"
+        },
+        "type": "TimerStarted"
+      },
+      {
+        "data": {
+          "payload": {
+            "verdict": "approve"
+          },
+          "signal_name": "tool_approval:0:0:w1"
+        },
+        "type": "SignalReceived"
+      },
+      {
+        "data": {
+          "activity_id": "bd136431-4ff0-448d-8a83-09de7964a42d",
+          "input": {
+            "call": {
+              "arguments": {
+                "n": 1
+              },
+              "id": "w1",
+              "name": "write"
+            },
+            "run_id": "ffff5f57-1cdd-471a-a795-33e4fe7dda95",
+            "session_id": null,
+            "step": 0
+          },
+          "name": "agent_tool_call",
+          "queue": "default"
+        },
+        "type": "ActivityScheduled"
+      },
+      {
+        "data": {
+          "activity_id": "bd136431-4ff0-448d-8a83-09de7964a42d",
+          "output": {
+            "content": "{\"echo\":{\"n\":1}}",
+            "is_error": false
+          }
+        },
+        "type": "ActivityCompleted"
+      },
+      {
+        "data": {
+          "activity_id": "12aaa1f3-7506-454f-b6ab-7b0a8069be3b",
+          "input": {
+            "max_output_tokens": null,
+            "max_steps": 8,
+            "messages": [
+              {
+                "content": [
+                  {
+                    "tool_call": {
+                      "arguments": {
+                        "n": 1
+                      },
+                      "id": "w1",
+                      "name": "write"
+                    }
+                  }
+                ],
+                "role": "assistant"
+              },
+              {
+                "content": [
+                  {
+                    "tool_result": {
+                      "content": "{\"echo\":{\"n\":1}}",
+                      "tool_call_id": "w1"
+                    }
+                  }
+                ],
+                "role": "tool"
+              }
+            ],
+            "prefix": {
+              "digest": "810b5275ec524c75cc88ea9f0b4e05e2039ab5f7ee03b0dc900795093e04ca44",
+              "len": 1
+            },
+            "remember": true,
+            "run_id": "ffff5f57-1cdd-471a-a795-33e4fe7dda95",
+            "session_id": null,
+            "steps_used": 1,
+            "usage": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 1,
+              "output_tokens": 0
+            }
+          },
+          "name": "agent_model_turn",
+          "queue": "default"
+        },
+        "type": "ActivityScheduled"
+      },
+      {
+        "data": {
+          "activity_id": "12aaa1f3-7506-454f-b6ab-7b0a8069be3b",
+          "output": {
+            "content": [
+              {
+                "text": "written"
+              }
+            ],
+            "decisions": [],
+            "stop": "end_turn",
+            "usage": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 1,
+              "output_tokens": 0
+            }
+          }
+        },
+        "type": "ActivityCompleted"
+      },
+      {
+        "data": {
+          "output": {
+            "followup_dropped": false,
+            "followups": 0,
+            "messages": [
+              {
+                "content": [
+                  {
+                    "text": "save it"
+                  }
+                ],
+                "role": "user"
+              },
+              {
+                "content": [
+                  {
+                    "tool_call": {
+                      "arguments": {
+                        "n": 1
+                      },
+                      "id": "w1",
+                      "name": "write"
+                    }
+                  }
+                ],
+                "role": "assistant"
+              },
+              {
+                "content": [
+                  {
+                    "tool_result": {
+                      "content": "{\"echo\":{\"n\":1}}",
+                      "tool_call_id": "w1"
+                    }
+                  }
+                ],
+                "role": "tool"
+              },
+              {
+                "content": [
+                  {
+                    "text": "written"
+                  }
+                ],
+                "role": "assistant"
+              }
+            ],
+            "run_id": "ffff5f57-1cdd-471a-a795-33e4fe7dda95",
+            "steps_used": 1,
+            "stop": "completed",
+            "text": "written",
+            "tool_calls": 1,
+            "usage": {
+              "cache_read_tokens": 0,
+              "cache_write_tokens": 0,
+              "input_tokens": 2,
+              "output_tokens": 0
+            }
+          }
+        },
+        "type": "WorkflowCompleted"
+      }
+    ],
+    "execution_id": "ffff5f57-1cdd-471a-a795-33e4fe7dda95"
+  }
+}

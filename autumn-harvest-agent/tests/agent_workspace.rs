@@ -9,22 +9,23 @@
 mod common;
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use autumn_harvest::aead_codec::{AeadCodec, DataKey};
-use autumn_harvest::chrono::{DateTime, Utc};
 use autumn_harvest::payload_codec::PayloadCodecs;
 use autumn_harvest_agent::flow::labels;
+use autumn_harvest_agent::mesh::DELEGATE_TOOL;
 use autumn_harvest_agent::{
     AgentError, AgentHarness, AgentHeartbeat, AgentId, AgentOp, AgentProfile, AgentState,
-    BoxFuture, ChatRole, ContentPart, Control, DirWorkspaceBlobs, ErrorKind, FlowRules, FnTool,
-    InMemoryWorkspaceBlobs, Rule, Tool, ToolEffect, WorkspaceBlobs, WorkspaceMount, WorkspaceStore,
-    sqlite,
+    BoxFuture, ChatRequest, ChatRole, ContentPart, Control, DirWorkspaceBlobs, ErrorKind,
+    FlowRules, FnTool, InMemoryWorkspaceBlobs, Mandate, Peer, Rule, Tool, ToolCall,
+    ToolCallRequest, ToolEffect, WorkspaceBlobs, WorkspaceMount, WorkspaceStore, sqlite,
 };
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
-use common::{ScriptedModel, answer, calls, runtime};
+use common::{ScriptedModel, TryFnModel, answer, calls, runtime};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::json;
 
 fn fresh_db() -> (tempfile::TempDir, PathBuf) {
@@ -39,7 +40,7 @@ fn state(rt: &SqliteRuntime, agent: &AgentId) -> impl Future<Output = AgentState
 }
 
 /// Drive the agent at the drive clock `at`, through each checkpoint.
-async fn drive_at(rt: &mut SqliteRuntime, agent: &AgentId, at: DateTime<Utc>) -> RunState {
+async fn drive_at(rt: &mut SqliteRuntime, agent: &AgentId, at: Timestamp) -> RunState {
     let mut exec = sqlite::current_run(rt, agent).unwrap().unwrap();
     loop {
         match rt.run_until_blocked_as_of(exec, at).await.unwrap() {
@@ -53,10 +54,10 @@ async fn drive_at(rt: &mut SqliteRuntime, agent: &AgentId, at: DateTime<Utc>) ->
 /// each retry backoff end.
 async fn say(rt: &mut SqliteRuntime, agent: &AgentId, text: &str) -> AgentState {
     sqlite::send(rt, agent, &AgentOp::message(text), None).unwrap();
-    let mut at = Utc::now();
+    let mut at = Timestamp::now();
     for _ in 0..5 {
         drive_at(rt, agent, at).await;
-        at += chrono::Duration::minutes(5);
+        at += SignedDuration::from_mins(5);
     }
     state(rt, agent).await
 }
@@ -394,7 +395,8 @@ async fn a_read_only_tick_runs_a_workspace_tool_but_keeps_the_head() {
     let model = ScriptedModel::new(vec![
         write("w1", "notes.txt", "the first draft"),
         answer("saved", 1),
-        // A tick is read-only. Its write runs, but the head stays.
+        // A tick is read-only. Its write runs, the tool call returns an error,
+        // and the head stays (issue #2692).
         write("w2", "notes.txt", "a draft from a tick"),
         answer("HEARTBEAT_OK", 1),
         read("r3", "notes.txt"),
@@ -409,7 +411,7 @@ async fn a_read_only_tick_runs_a_workspace_tool_but_keeps_the_head() {
         .workspace(memory_store())
         .agent(profile);
     let mut rt = runtime(&db, harness);
-    let start = Utc::now();
+    let start = Timestamp::now();
     sqlite::send(&mut rt, &agent, &AgentOp::message("write it"), None).unwrap();
     drive_at(&mut rt, &agent, start).await;
     let head = state(&rt, &agent)
@@ -417,14 +419,14 @@ async fn a_read_only_tick_runs_a_workspace_tool_but_keeps_the_head() {
         .workspace
         .expect("the op saved a snapshot");
 
-    drive_at(&mut rt, &agent, start + chrono::Duration::seconds(90)).await;
+    drive_at(&mut rt, &agent, start + SignedDuration::from_secs(90)).await;
     let ticked = state(&rt, &agent).await;
     assert_eq!(ticked.ticks, 1);
     assert_eq!(runs.load(Ordering::SeqCst), 2, "the tick ran the tool");
     assert_eq!(ticked.workspace, Some(head), "the tick keeps the head");
 
     sqlite::send(&mut rt, &agent, &AgentOp::message("read it"), None).unwrap();
-    drive_at(&mut rt, &agent, start + chrono::Duration::seconds(100)).await;
+    drive_at(&mut rt, &agent, start + SignedDuration::from_secs(100)).await;
     let results = tool_results(&state(&rt, &agent).await);
     assert!(
         results
@@ -529,9 +531,9 @@ async fn a_reset_in_a_new_life_deletes_the_keys_of_an_old_life_on_a_fast_clock()
     let runs = Arc::new(AtomicUsize::new(0));
     let model = ScriptedModel::new(vec![write("w1", "a.txt", "old"), answer("written", 1)]);
     let mut rt = runtime(&db, harness(model, store, &runs));
-    let now = Utc::now();
+    let now = Timestamp::now();
     // The first life runs on a clock that is an hour fast.
-    let fast = now + chrono::Duration::hours(1);
+    let fast = now + SignedDuration::from_hours(1);
     sqlite::send(&mut rt, &agent, &AgentOp::message("write it"), None).unwrap();
     drive_at(&mut rt, &agent, fast).await;
     let scope = WorkspaceMount::agent_scope(agent.as_str());
@@ -557,4 +559,194 @@ async fn a_reset_in_a_new_life_deletes_the_keys_of_an_old_life_on_a_fast_clock()
         Vec::<String>::new(),
         "the reset deleted the key of the first life"
     );
+}
+
+/// The text of each user message of `request`.
+fn user_texts(request: &ChatRequest) -> Vec<String> {
+    request
+        .messages
+        .iter()
+        .filter(|m| m.role == ChatRole::User)
+        .flat_map(|m| &m.content)
+        .filter_map(|part| match part {
+            ContentPart::Text(text) => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The count of tool results in `request`.
+fn result_count(request: &ChatRequest) -> usize {
+    request
+        .messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter(|part| matches!(part, ContentPart::ToolResult { .. }))
+        .count()
+}
+
+/// Run the agent `coder`, which has a workspace. It calls `probe`, then
+/// delegates `asks` tasks to `helper` in one turn. Each helper calls
+/// `probe`. Returns whether each `probe` call saw a workspace, in order.
+async fn probe_mounts(asks: &[&str], parallel: u32) -> Vec<bool> {
+    let (_dir, db) = fresh_db();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let probe = {
+        let seen = seen.clone();
+        FnTool::with_context(
+            "probe",
+            "Tell whether a workspace is mounted.",
+            json!({"type": "object"}),
+            move |_input, ctx| {
+                seen.lock().unwrap().push(ctx.workspace.is_some());
+                async move { Ok(json!({})) }
+            },
+        )
+        .effect(ToolEffect::ReadOnly)
+        .uses_workspace()
+        .shared()
+    };
+    let tasks: Vec<String> = asks.iter().map(|ask| (*ask).to_owned()).collect();
+    // Each agent answers by the state of its own request, so the order of
+    // concurrent children does not matter.
+    let model = TryFnModel::new(move |request| {
+        let child = user_texts(request).iter().any(|text| tasks.contains(text));
+        match (child, result_count(request)) {
+            (_, 0) => calls(&[("p1", "probe", json!({}))], 1),
+            (true, _) => answer("child done", 1),
+            (false, 1) => {
+                let delegations: Vec<(String, &str, serde_json::Value)> = tasks
+                    .iter()
+                    .enumerate()
+                    .map(|(n, task)| {
+                        let call = json!({"agent": "helper", "task": task});
+                        (format!("d{n}"), DELEGATE_TOOL, call)
+                    })
+                    .collect();
+                let list: Vec<(&str, &str, serde_json::Value)> = delegations
+                    .iter()
+                    .map(|(id, name, call)| (id.as_str(), *name, call.clone()))
+                    .collect();
+                calls(&list, 1)
+            }
+            (false, _) => answer("done", 1),
+        }
+    });
+    let store = WorkspaceStore::new(
+        Arc::new(InMemoryWorkspaceBlobs::default()),
+        PayloadCodecs::default(),
+    );
+    let harness = AgentHarness::new(model)
+        .tool(probe)
+        .workspace(store)
+        .peer(Peer::new("helper", "Helps.").tools(["probe"]))
+        .agent(
+            AgentProfile::new("coder")
+                .workspace()
+                .parallel_children(parallel)
+                .mandate(Mandate::new("coder").peers(["helper"])),
+        );
+    let mut rt = runtime(&db, harness);
+    let agent = AgentId::new("coder", "ada").unwrap();
+
+    let ended = say(&mut rt, &agent, "go").await;
+
+    assert_eq!(ended.last_answer.as_deref(), Some("done"));
+    seen.lock().unwrap().clone()
+}
+
+// Issue #2485: an inline child has no workspace. A workspace tool in the
+// child sees none. The parent sees its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_inline_child_gets_no_workspace() {
+    assert_eq!(probe_mounts(&["probe it"], 0).await, [true, false]);
+}
+
+// Issue #2485: a fan-out child run has no workspace, so siblings never race
+// on one head. `child_task` sets it, because the child run mounts the
+// workspace of its task.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fan_out_child_gets_no_workspace() {
+    let seen = probe_mounts(&["probe a", "probe b"], 2).await;
+    assert_eq!(seen, [true, false, false]);
+}
+
+/// A tool-call request for `name` on the mount of a fresh scope.
+fn workspace_request(name: &str, path: &str, read_only: bool) -> ToolCallRequest {
+    ToolCallRequest {
+        run_id: "run-1".to_owned(),
+        session_id: None,
+        step: 0,
+        call: ToolCall {
+            id: "c1".to_owned(),
+            name: name.to_owned(),
+            arguments: json!({"path": path, "text": "a note"}),
+        },
+        memory_scope: None,
+        read_only,
+        allowed_tools: None,
+        labels: None,
+        flow_labels: std::collections::BTreeSet::new(),
+        workspace: Some(WorkspaceMount {
+            scope: "agent:coder/ro".to_owned(),
+            head: None,
+            generation: 1,
+        }),
+        skill: None,
+        allowed_effects: None,
+        probe_effects: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_only_call_that_changes_the_workspace_is_an_error() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let harness = AgentHarness::new(ScriptedModel::new(Vec::new()))
+        .tool(write_tool(runs.clone()))
+        .workspace(memory_store());
+
+    let outcome = harness
+        .tool_call(workspace_request("write_file", "notes.txt", true))
+        .await
+        .unwrap();
+
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the tool ran");
+    assert!(outcome.is_error, "got {}", outcome.content);
+    assert!(
+        outcome.content.contains("cannot change the workspace"),
+        "got {}",
+        outcome.content
+    );
+    assert_eq!(outcome.workspace, None, "no head moves");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attended_call_that_changes_the_workspace_still_saves() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let harness = AgentHarness::new(ScriptedModel::new(Vec::new()))
+        .tool(write_tool(runs))
+        .workspace(memory_store());
+
+    let outcome = harness
+        .tool_call(workspace_request("write_file", "notes.txt", false))
+        .await
+        .unwrap();
+
+    assert!(!outcome.is_error, "got {}", outcome.content);
+    assert!(outcome.workspace.is_some(), "the head moves");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_only_call_that_only_reads_the_workspace_succeeds() {
+    let harness = AgentHarness::new(ScriptedModel::new(Vec::new()))
+        .tool(read_tool())
+        .workspace(memory_store());
+
+    let outcome = harness
+        .tool_call(workspace_request("read_file", "notes.txt", true))
+        .await
+        .unwrap();
+
+    assert!(!outcome.is_error, "got {}", outcome.content);
+    assert_eq!(outcome.workspace, None);
 }

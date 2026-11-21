@@ -20,14 +20,15 @@
 //!     section naming the awaited-but-unsent signal (the side tables alone
 //!     cannot show it).
 //!
-//! Dual-mode: uses a running Postgres from `HARVEST_TEST_DATABASE_URL` (as an
-//! admin URL onto which a fresh database is created and migrated) when set — no
-//! Docker required — else boots a fresh testcontainers Postgres. Docker is not
-//! available in every sandbox, so this suite is compile-checked there and run
-//! Docker-backed in CI (matching the #543/#544/#601 precedent).
+//! Dual-mode: uses a running Postgres from `HARVEST_TEST_DATABASE_URL` when set,
+//! with no Docker. That URL is an admin URL, and a fresh database is created and
+//! migrated on it. Otherwise it boots a fresh testcontainers Postgres. Docker is
+//! not available in every sandbox, so this suite is compile-checked there and
+//! run Docker-backed in CI (matching the #543/#544/#601 precedent).
 
 #![allow(clippy::too_many_lines)]
 
+use jiff_diesel::ToDiesel;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -48,7 +49,6 @@ use autumn_harvest_plugin::ui::harvest_ui_router;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{TimeZone, Utc};
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
@@ -123,10 +123,12 @@ fn panics_workflow<'a>(
 }
 
 /// Calls `ctx.system_now()` (a deterministic primitive) then parks
-/// command-lessly. Replayed over a history whose recorded side effect has the
-/// WRONG kind, the primitive records a deferred non-determinism error — the
-/// drive still suspends, and the endpoint must degrade rather than serve a
-/// wait-set derived from diverged code.
+/// command-lessly.
+///
+/// A replay can see a recorded side effect of the WRONG kind. The primitive
+/// then records a deferred non-determinism error, but the drive still
+/// suspends. The endpoint must degrade, not serve a wait-set derived from
+/// diverged code.
 fn diverged_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -334,7 +336,7 @@ async fn seed_execution(
 fn started_event(input: Value) -> WorkflowEvent {
     WorkflowEvent::WorkflowStarted {
         input,
-        timestamp: Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap(),
+        timestamp: autumn_harvest::time::utc_ymd_hms(2026, 7, 1, 12, 0, 0).unwrap(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -414,7 +416,7 @@ async fn parked_activity_reports_name_id_since_and_task_row_deadline() {
     .await;
 
     // Task row carrying the cross-retry deadline (#378).
-    let deadline = Utc.with_ymd_and_hms(2026, 7, 1, 13, 0, 0).unwrap();
+    let deadline = autumn_harvest::time::utc_ymd_hms(2026, 7, 1, 13, 0, 0).unwrap();
     {
         let mut conn = pool.get().await.expect("pooled conn");
         diesel::sql_query(
@@ -427,7 +429,7 @@ async fn parked_activity_reports_name_id_since_and_task_row_deadline() {
         .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
         .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
         .bind::<diesel::sql_types::Uuid, _>(activity_id.as_uuid())
-        .bind::<diesel::sql_types::Timestamptz, _>(deadline)
+        .bind::<diesel::sql_types::Timestamptz, _>(deadline.to_diesel())
         .execute(&mut conn)
         .await
         .expect("seed task row");
@@ -462,7 +464,9 @@ async fn parked_activity_reports_name_id_since_and_task_row_deadline() {
         )
         .bind::<diesel::sql_types::Uuid, _>(activity_id.as_uuid())
         .bind::<diesel::sql_types::Timestamptz, _>(
-            Utc.with_ymd_and_hms(2026, 7, 1, 12, 30, 0).unwrap(),
+            autumn_harvest::time::utc_ymd_hms(2026, 7, 1, 12, 30, 0)
+                .unwrap()
+                .to_diesel(),
         )
         .execute(&mut conn)
         .await
@@ -620,8 +624,8 @@ async fn unregistered_handler_degrades_to_history_only_scan() {
     .await;
 
     // A genuine unfired durable timer has BOTH the `TimerStarted` event AND a
-    // live `harvest_timers` row — that live row is what makes it fire-eligible
-    // and keeps it past the endpoint's dormant-arm filter (issue #768).
+    // live `harvest_timers` row. That live row makes it fire-eligible and keeps
+    // it past the dormant-arm filter of the endpoint (issue #768).
     {
         let mut conn = pool.get().await.expect("pooled conn");
         diesel::sql_query(
@@ -650,10 +654,10 @@ async fn unregistered_handler_degrades_to_history_only_scan() {
 
 /// A cancellable `ctx.start_timer` arm (issue #768) records a `TimerStarted`
 /// event but inserts NO `harvest_timers` row and cannot fire until
-/// `await_fire()`. In the history-only fallback the endpoint filters such
-/// dormant arms via the live `harvest_timers` table, so a workflow merely
-/// holding an idle/debounce timer while parked reports only the fire-eligible
-/// timer, never the dormant arm.
+/// `await_fire()`. In the history-only fallback, the endpoint filters such
+/// dormant arms via the live `harvest_timers` table. So a parked workflow that
+/// merely holds an idle/debounce timer reports only the fire-eligible timer,
+/// never the dormant arm.
 #[tokio::test]
 async fn history_only_drops_dormant_cancellable_timer_arm() {
     let (url, _guard) = setup_database().await;
@@ -745,9 +749,9 @@ async fn report_is_read_only_zero_writes() {
     )
     .await;
 
-    // Seed side-table rows too (test review T4): the deadline-enrichment query
-    // reads harvest_task_queue, and a mutation of ANY side table would violate
-    // the read-only contract even if the execution row survived.
+    // Seed side-table rows too. The deadline-enrichment query reads
+    // harvest_task_queue. A mutation of ANY side table would violate the
+    // read-only contract, even if the execution row survived.
     {
         let mut conn = pool.get().await.expect("pooled conn");
         diesel::sql_query(
@@ -825,10 +829,11 @@ async fn report_is_read_only_zero_writes() {
     );
 }
 
-/// Unknown execution → 404; malformed id → 400. (The unauthenticated 401
-/// posture is pinned by the no-DB `security.rs` test
-/// `eris_unauthenticated_awaitables_is_blocked` — this harness runs behind an
-/// embedder admin-auth boundary, which makes the per-route gate a no-op.)
+/// Unknown execution → 404; malformed id → 400.
+///
+/// The no-DB `security.rs` test `eris_unauthenticated_awaitables_is_blocked`
+/// pins the unauthenticated 401 posture. This harness runs behind an embedder
+/// admin-auth boundary, which makes the per-route gate a no-op.
 #[tokio::test]
 async fn error_statuses_are_stable() {
     let (url, _guard) = setup_database().await;
@@ -843,9 +848,10 @@ async fn error_statuses_are_stable() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
-/// The Vantage UI blocked-on panel is re-sourced from the same report: a
-/// parked signal wait — invisible to every side table — is rendered with the
-/// awaited signal's name.
+/// The Vantage UI blocked-on panel is re-sourced from the same report.
+///
+/// A parked signal wait is invisible to every side table. The panel renders
+/// it with the name of the awaited signal.
 #[tokio::test]
 async fn ui_blocked_on_panel_shows_awaited_unsent_signal() {
     let (url, _guard) = setup_database().await;

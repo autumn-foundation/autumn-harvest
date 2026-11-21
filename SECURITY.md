@@ -42,7 +42,9 @@ advisory.
 
 The project has not reached version 1.0. Security fixes go into the newest minor
 release only. Older minor releases get no fixes. Upgrade to the newest release
-to get a fix.
+to get a fix. The
+[support window](docs/upgrading/README.md#support-window) gives the full
+policy.
 
 ## Scope
 

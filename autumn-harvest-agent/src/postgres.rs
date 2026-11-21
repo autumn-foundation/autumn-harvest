@@ -38,6 +38,7 @@ use autumn_harvest::signal::{
     ByIdSignalOutcome, resolve_and_signal_by_workflow_id_with_codecs,
     send_signal_idempotent_with_codecs,
 };
+use autumn_harvest::time::Timestamp;
 use autumn_harvest::types::StartProvenance;
 use autumn_harvest::worker::DbPool;
 use autumn_harvest::{ExecutionId, ShardId, WorkflowIdReusePolicy, WorkflowResultState};
@@ -56,8 +57,7 @@ use crate::heartbeat::{HEARTBEAT_WORKFLOW_NAME, HeartbeatTask};
 use crate::mesh_control::{MESH_ATTR, MeshPause, MeshSpend, Spend};
 use crate::model::BoxFuture;
 use crate::types::AgentTask;
-use crate::workflow::{WORKFLOW_NAME, activities, workflows};
-use autumn_harvest::chrono::{DateTime, Utc};
+use crate::workflow::WORKFLOW_NAME;
 
 /// The queue of a new run when the caller names none.
 pub const DEFAULT_QUEUE: &str = "default";
@@ -199,7 +199,6 @@ impl PostgresAgents {
             .filter_map(|(_pool, shards)| shards.first().copied())
     }
 
-    /// A connection to the database of `shard`.
     async fn conn(&self, shard: ShardId) -> HarvestResult<autumn_harvest::pool::PooledConn> {
         autumn_harvest::pool::acquire_within_pool_bound(self.pool_for(shard)).await
     }
@@ -222,15 +221,11 @@ impl PostgresAgents {
 /// Register the agent workflows, their activities and `harness` on a worker
 /// builder.
 ///
-/// It is the Postgres form of `sqlite::register`. The activities read
-/// the harness with `ActivityContext::state`, so a worker with no harness
-/// fails each call as `AgentHarnessMissing`.
+/// It is the Postgres form of `sqlite::register`. It calls the neutral
+/// [`register`](crate::register), so the two registrations cannot drift.
 #[must_use]
 pub fn register(builder: HarvestBuilder, harness: AgentHarness) -> HarvestBuilder {
-    builder
-        .workflows(workflows())
-        .activities(activities())
-        .state(harness)
+    crate::register(builder, harness)
 }
 
 /// Start one agent run. Returns its execution id.
@@ -322,6 +317,28 @@ pub async fn decide(
     let mut conn = pg.conn(pg.shard_of(exec).await?).await?;
     let payload = serde_json::to_value(approval)?;
     send_signal_idempotent_with_codecs(&mut conn, exec, signal, payload, None, &pg.codecs).await?;
+    Ok(())
+}
+
+/// Send a decision of a person to the adoption gate of the refine run
+/// `exec`.
+///
+/// The gate drops a decision that arrives before its wait opens. List the
+/// runs with `refine_status = waiting_approval` first.
+///
+/// # Errors
+///
+/// Returns an error when the run does not exist or has ended, or when the
+/// engine cannot record the signal.
+pub async fn decide_refine(
+    pg: &PostgresAgents,
+    exec: ExecutionId,
+    decision: &crate::refine::RefineDecision,
+) -> HarvestResult<()> {
+    let mut conn = pg.conn(pg.shard_of(exec).await?).await?;
+    let payload = serde_json::to_value(decision)?;
+    let signal = crate::refine::refine_approval_signal(exec);
+    send_signal_idempotent_with_codecs(&mut conn, exec, &signal, payload, None, &pg.codecs).await?;
     Ok(())
 }
 
@@ -446,7 +463,7 @@ async fn live_run(
     pg: &PostgresAgents,
     id: &AgentId,
 ) -> HarvestResult<Option<(ShardId, ExecutionId)>> {
-    let mut best: Option<(DateTime<Utc>, ShardId, ExecutionId)> = None;
+    let mut best: Option<(Timestamp, ShardId, ExecutionId)> = None;
     for shard in pg.group_shards() {
         let mut conn = pg.conn(shard).await?;
         let found =
@@ -699,7 +716,7 @@ pub async fn pending_approvals(
     exec: ExecutionId,
 ) -> HarvestResult<Vec<String>> {
     let mut conn = pg.conn(pg.shard_of(exec).await?).await?;
-    let queued = autumn_harvest::signal::load_pending_signals(&mut conn, exec).await?;
+    let queued = autumn_harvest::signal::load_pending_signals(&conn, exec).await?;
     let history =
         autumn_harvest::store::load_history_with_codecs(&mut conn, exec, &pg.codecs).await?;
     let mut open = open_approval_waits(&history.events);
@@ -758,7 +775,7 @@ impl LedgerSpend {
         Self { pg }
     }
 
-    async fn read(&self, mesh: &str, since: DateTime<Utc>) -> HarvestResult<Spend> {
+    async fn read(&self, mesh: &str, since: Timestamp) -> HarvestResult<Spend> {
         let attrs = serde_json::json!({ MESH_ATTR: mesh });
         let mut spend = Spend::default();
         for shard in self.pg.group_shards() {
@@ -779,7 +796,7 @@ impl MeshSpend for LedgerSpend {
     fn spent<'a>(
         &'a self,
         mesh: &'a str,
-        since: DateTime<Utc>,
+        since: Timestamp,
     ) -> BoxFuture<'a, Result<Spend, AgentError>> {
         Box::pin(async move {
             self.read(mesh, since)
@@ -851,7 +868,7 @@ impl Directory {
             };
             let found = LastPass {
                 running: state == "RUNNING",
-                started_ms: started_at.timestamp_millis(),
+                started_ms: started_at.as_millisecond(),
             };
             last = Some(match last {
                 Some(seen)
@@ -910,34 +927,8 @@ impl AgentDirectory for Directory {
 /// Returns a list or a send error. Agents that got the pause before it stay
 /// paused.
 pub async fn pause_mesh(pg: &PostgresAgents, mesh: &str, reason: &str) -> HarvestResult<MeshPause> {
-    let at_ms = Utc::now().timestamp_millis();
-    let attrs = serde_json::json!({ MESH_ATTR: mesh });
-    let mut targets = Vec::new();
-    for shard in pg.group_shards() {
-        let mut conn = pg.conn(shard).await?;
-        let mut after = None;
-        loop {
-            let page = list_running_with_search_attrs(
-                &mut conn,
-                AGENT_WORKFLOW_NAME,
-                &attrs,
-                after,
-                SCAN_PAGE,
-            )
-            .await?;
-            let full = page.len() >= SCAN_PAGE as usize;
-            after = page.last().map(|(exec, _id)| *exec);
-            targets.extend(
-                page.into_iter()
-                    .filter_map(|(_exec, id)| AgentId::parse(&id).ok()),
-            );
-            if !full {
-                break;
-            }
-        }
-    }
-    targets.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-    targets.dedup();
+    let at_ms = Timestamp::now().as_millisecond();
+    let targets = running_agents(pg, &serde_json::json!({ MESH_ATTR: mesh })).await?;
     let key = format!("pause-mesh:{mesh}:{at_ms}");
     let pause = AgentOp::Control(Control::Pause {
         reason: Some(reason.to_owned()),
@@ -962,6 +953,64 @@ pub async fn pause_mesh(pg: &PostgresAgents, mesh: &str, reason: &str) -> Harves
         "a mesh was paused"
     );
     Ok(record)
+}
+
+/// The running agents whose search attributes hold `attrs`, over every
+/// shard of the group. They are sorted by id, with no repeats.
+async fn running_agents(pg: &PostgresAgents, attrs: &Value) -> HarvestResult<Vec<AgentId>> {
+    let mut targets = Vec::new();
+    for shard in pg.group_shards() {
+        let mut conn = pg.conn(shard).await?;
+        let mut after = None;
+        loop {
+            let page = list_running_with_search_attrs(
+                &mut conn,
+                AGENT_WORKFLOW_NAME,
+                attrs,
+                after,
+                SCAN_PAGE,
+            )
+            .await?;
+            let full = page.len() >= SCAN_PAGE as usize;
+            after = page.last().map(|(exec, _id)| *exec);
+            targets.extend(
+                page.into_iter()
+                    .filter_map(|(_exec, id)| AgentId::parse(&id).ok()),
+            );
+            if !full {
+                break;
+            }
+        }
+    }
+    targets.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    targets.dedup();
+    Ok(targets)
+}
+
+/// Send `Control::ReloadProfile` to each running agent of `kind`. Returns
+/// the agents, sorted by id.
+///
+/// Deploy the new harness first. The reload reads the profile when a worker
+/// runs the op. The op goes to the live run only, so an agent with no live
+/// run stays ended. Each call uses its own idempotency key.
+///
+/// The filter is the search attribute `agent_kind`. Each op of an agent sets
+/// it, so a new agent that has run no op yet is not listed. Send it the op
+/// with [`send`].
+///
+/// # Errors
+///
+/// Returns a list or a send error. Agents that got the op before it keep
+/// it.
+pub async fn reload_profiles(pg: &PostgresAgents, kind: &str) -> HarvestResult<Vec<AgentId>> {
+    let at_ms = Timestamp::now().as_millisecond();
+    let targets = running_agents(pg, &serde_json::json!({ "agent_kind": kind })).await?;
+    let key = format!("{ENTITY_OP_SIGNAL}:reload-profiles:{kind}:{at_ms}");
+    let payload = Agent::payload(&AgentOp::Control(Control::ReloadProfile));
+    for id in &targets {
+        signal_live(pg, id, ENTITY_OP_SIGNAL, payload.clone(), Some(&key)).await?;
+    }
+    Ok(targets)
 }
 
 /// Send an interrupt to the live run of `id`. A run that ended takes none.
@@ -1051,39 +1100,163 @@ impl crate::eval::LiveProbeHost for PostgresAgents {
         source: ExecutionId,
         input: Value,
     ) -> BoxFuture<'_, Result<crate::eval::ProbeFork, crate::eval::EvalError>> {
-        use autumn_harvest::fork::{ForkEffects, WorkflowForkError, WorkflowForkRequest};
+        Box::pin(self.probe_fork(source, input, None))
+    }
+
+    fn find_fork(
+        &self,
+        source: ExecutionId,
+        key: &str,
+    ) -> BoxFuture<'_, Result<Option<crate::eval::ProbeFork>, crate::eval::EvalError>> {
+        let key = key.to_owned();
         Box::pin(async move {
             let host = |err: HarvestError| crate::eval::EvalError::Fork(err.to_string());
-            let mut conn = self
-                .conn(self.shard_of(source).await.map_err(host)?)
+            // A fork lands on the shard of its source.
+            let shard = self.shard_of(source).await.map_err(host)?;
+            let fork_id = keyed_fork_id(&key, shard, global_router().as_ref());
+            let mut conn = self.conn(shard).await.map_err(host)?;
+            let found = resolve_execution_id_by_workflow_id(&mut conn, WORKFLOW_NAME, &fork_id)
                 .await
                 .map_err(host)?;
-            let request = WorkflowForkRequest {
-                reason: crate::eval::PROBE_FORK_REASON.to_owned(),
-                operator_id: crate::eval::PROBE_FORK_OPERATOR.to_owned(),
-                effects: ForkEffects::LiveQuiet,
-                input: Some(input),
-                ..WorkflowForkRequest::default()
+            // A terminated run frees its id, so it is no fork of this key.
+            let Some(run) = found.filter(|run| run.state != "TERMINATED") else {
+                return Ok(None);
             };
-            let fork = autumn_harvest::fork::fork_workflow_execution_with_codecs(
+            // A rebalance moves the fork. The probe then cannot wait for it
+            // here, so it reports the move.
+            if is_migration_copy(&run.state) {
+                return Err(crate::eval::EvalError::Fork(format!(
+                    "the probe fork {fork_id} moved to another shard"
+                )));
+            }
+            let history = autumn_harvest::store::load_history_inflated(
                 &mut conn,
-                source,
-                request,
+                run.exec_id,
                 &self.codecs,
                 self.offloader.as_deref(),
             )
             .await
-            .map_err(|err| match err {
-                WorkflowForkError::ErasedSource { .. } => crate::eval::EvalError::ErasedSource,
-                other => crate::eval::EvalError::Fork(other.to_string()),
-            })?;
-            Ok(crate::eval::ProbeFork {
-                exec_id: fork.new_exec_id,
-                workflow_id: fork.workflow_id,
-                forked_from_exec_id: fork.forked_from_exec_id,
-            })
+            .map_err(host)?;
+            let marker = autumn_harvest::fork::fork_marker(&history.events);
+            // A probe forks with quiet live effects. Any other run that holds
+            // the id is not a probe fork, so the probe does not wait for it.
+            let Some((forked_from_exec_id, autumn_harvest::fork::ForkEffects::LiveQuiet)) = marker
+            else {
+                return Err(crate::eval::EvalError::Fork(format!(
+                    "the run {} holds the fork id {fork_id}, but it is not a probe fork",
+                    run.exec_id
+                )));
+            };
+            Ok(Some(crate::eval::ProbeFork {
+                exec_id: run.exec_id,
+                workflow_id: fork_id,
+                forked_from_exec_id,
+            }))
         })
     }
+
+    fn fork_live_as(
+        &self,
+        source: ExecutionId,
+        input: Value,
+        key: &str,
+    ) -> BoxFuture<'_, Result<crate::eval::ProbeFork, crate::eval::EvalError>> {
+        let key = key.to_owned();
+        Box::pin(async move {
+            let shard = self
+                .shard_of(source)
+                .await
+                .map_err(|err| crate::eval::EvalError::Fork(err.to_string()))?;
+            let fork_id = keyed_fork_id(&key, shard, global_router().as_ref());
+            self.probe_fork(source, input, Some(fork_id)).await
+        })
+    }
+}
+
+#[cfg(feature = "eval")]
+impl PostgresAgents {
+    /// Fork `source` for a live probe, under `workflow_id` or a derived id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvalError::ForkIdInUse`](crate::eval::EvalError::ForkIdInUse)
+    /// when another run holds `workflow_id`.
+    async fn probe_fork(
+        &self,
+        source: ExecutionId,
+        input: Value,
+        workflow_id: Option<String>,
+    ) -> Result<crate::eval::ProbeFork, crate::eval::EvalError> {
+        use autumn_harvest::fork::{ForkEffects, WorkflowForkError, WorkflowForkRequest};
+        let host = |err: HarvestError| crate::eval::EvalError::Fork(err.to_string());
+        let mut conn = self
+            .conn(self.shard_of(source).await.map_err(host)?)
+            .await
+            .map_err(host)?;
+        let request = WorkflowForkRequest {
+            reason: crate::eval::PROBE_FORK_REASON.to_owned(),
+            operator_id: crate::eval::PROBE_FORK_OPERATOR.to_owned(),
+            effects: ForkEffects::LiveQuiet,
+            input: Some(input),
+            workflow_id,
+            ..WorkflowForkRequest::default()
+        };
+        let fork = autumn_harvest::fork::fork_workflow_execution_with_codecs(
+            &mut conn,
+            source,
+            request,
+            &self.codecs,
+            self.offloader.as_deref(),
+        )
+        .await
+        .map_err(|err| match err {
+            WorkflowForkError::ErasedSource { .. } => crate::eval::EvalError::ErasedSource,
+            WorkflowForkError::WorkflowIdInUse { workflow_id } => {
+                crate::eval::EvalError::ForkIdInUse(workflow_id)
+            }
+            other => crate::eval::EvalError::Fork(other.to_string()),
+        })?;
+        Ok(crate::eval::ProbeFork {
+            exec_id: fork.new_exec_id,
+            workflow_id: fork.workflow_id,
+            forked_from_exec_id: fork.forked_from_exec_id,
+        })
+    }
+}
+
+/// The most suffixes that [`keyed_fork_id`] tries. With `N` shards, a
+/// suffix fits after about `N` tries.
+#[cfg(feature = "eval")]
+const FORK_ID_TRIES: u32 = 10_000;
+
+/// The process shard router that the fork checks, if one is set.
+#[cfg(feature = "eval")]
+fn global_router() -> Option<ShardRouter> {
+    autumn_harvest::shard::GLOBAL_SHARD_ROUTER
+        .read()
+        .ok()
+        .and_then(|guard| guard.as_ref().cloned())
+}
+
+/// The workflow id of the keyed probe fork of `key`, on the source shard
+/// `shard`.
+///
+/// A fork lands on the shard of its source. The fork refuses a chosen id
+/// that `router` sends to another shard, because a by-id call would go
+/// there. So the id takes the first suffix that `router` sends to `shard`.
+/// The result depends only on its inputs, so each retry gets the same id
+/// while the writable shards stay the same. With no router, or a shard that
+/// takes no new run, it is `eval::probe_fork_id(key)`.
+#[cfg(feature = "eval")]
+fn keyed_fork_id(key: &str, shard: ShardId, router: Option<&ShardRouter>) -> String {
+    let base = crate::eval::probe_fork_id(key);
+    let Some(router) = router.filter(|router| router.accepts_unpinned(shard)) else {
+        return base;
+    };
+    std::iter::once(base.clone())
+        .chain((1..FORK_ID_TRIES).map(|n| format!("{base}-{n}")))
+        .find(|id| router.pick_for_new_workflow(WORKFLOW_NAME, id) == shard)
+        .unwrap_or(base)
 }
 
 /// How long a live re-probe of a refine run waits for its fork (issue
@@ -1200,15 +1373,31 @@ impl crate::refine::RefineSources for Sources {
         use crate::refine::{LiveEnd, LiveProbeError};
         Box::pin(async move {
             let effects: Vec<_> = request.effects.iter().copied().collect();
-            let probe = crate::eval::live_probe_with(
-                &self.pg,
-                request.harness,
-                request.source,
-                request.overlay,
-                &effects,
-                Some(request.ceilings),
-            )
-            .await
+            let probe = match request.fork_key {
+                Some(key) => {
+                    crate::eval::live_probe_keyed(
+                        &self.pg,
+                        request.harness,
+                        request.source,
+                        request.overlay,
+                        &effects,
+                        Some(request.ceilings),
+                        key,
+                    )
+                    .await
+                }
+                None => {
+                    crate::eval::live_probe_with(
+                        &self.pg,
+                        request.harness,
+                        request.source,
+                        request.overlay,
+                        &effects,
+                        Some(request.ceilings),
+                    )
+                    .await
+                }
+            }
             .map_err(|err| LiveProbeError::Failed(err.to_string()))?;
             let state = match self.wait_end(probe.exec_id).await {
                 Ok(state) => state,
@@ -1278,6 +1467,23 @@ mod tests {
             timer_id: TimerId::new(id),
             duration_secs: 60,
         }
+    }
+
+    #[cfg(feature = "eval")]
+    #[test]
+    fn a_keyed_fork_id_routes_to_the_source_shard_and_is_stable() {
+        let shards: Vec<ShardId> = (0..4).map(ShardId::new).collect();
+        let router = ShardRouter::new(shards.clone(), shards, ShardId::new(0));
+        for shard in (0..4).map(ShardId::new) {
+            for key in ["k-1", "k-2", "k-3"] {
+                let id = keyed_fork_id(key, shard, Some(&router));
+                assert!(id.starts_with(&crate::eval::probe_fork_id(key)), "{id}");
+                assert_eq!(router.pick_for_new_workflow(WORKFLOW_NAME, &id), shard);
+                assert_eq!(id, keyed_fork_id(key, shard, Some(&router)), "a retry");
+            }
+        }
+        let alone = keyed_fork_id("k-1", ShardId::new(0), None);
+        assert_eq!(alone, crate::eval::probe_fork_id("k-1"));
     }
 
     #[test]

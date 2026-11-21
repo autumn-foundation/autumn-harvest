@@ -2,18 +2,19 @@
 //!
 //! Tests run against a real Postgres instance (testcontainers) and exercise:
 //!   (1) 404 for an unknown execution id.
-//!   (2) 200 with reconstructed steps for a COMPLETED execution whose seeded
-//!       history carries an activity (scheduled/started/completed) plus a timer;
-//!       the activity's wait/exec split is present and `slowest_step` is non-null.
+//!   (2) 200 with reconstructed steps for a COMPLETED execution. Its seeded
+//!       history carries an activity (scheduled/started/completed) and a timer.
+//!       The activity's wait/exec split is present and `slowest_step` is non-null.
 //!   (3) A RUNNING (non-terminal) execution → the open step reports outcome
 //!       "pending" with a null `ended_at`.
 //!   (4) 400 for a malformed execution id.
 //!
-//! The core duration math is unit-tested in `autumn-harvest/src/timeline.rs`;
-//! these tests verify the HTTP wiring (routing, 404/400, shape).
+//! Unit tests in `autumn-harvest/src/timeline.rs` cover the core duration math.
+//! These tests verify the HTTP wiring (routing, 404/400, shape).
 
 #![allow(clippy::too_many_lines)]
 
+use jiff_diesel::ToDiesel;
 use std::sync::Arc;
 
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
@@ -31,10 +32,10 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{DateTime, Duration, Utc};
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -49,9 +50,9 @@ mod wire_contract;
 // `timeline_classic_dag_run_returns_404` inserts a classic DAG run row directly
 // into `harvest_dag_runs`, but migration 20260514000000_drop_harvest_dag_runs
 // (included in the full bundle) drops that table. This hand-rolled subset
-// intentionally applies the initial migration (which creates harvest_dag_runs)
-// WITHOUT the later drop, so the table remains available for the classic-DAG
-// timeline 404 assertion.
+// applies the initial migration, which creates harvest_dag_runs, WITHOUT the
+// later drop. So the table stays available for the classic-DAG timeline 404
+// assertion.
 const INIT_SQL: &str = concat!(
     include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql"),
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS legal_hold_set_at TIMESTAMPTZ NULL;\n",
@@ -71,10 +72,10 @@ const INIT_SQL: &str = concat!(
     // issue #964: shard-rebalancing forwarding columns (read back by
     // WorkflowExecution::as_select()). Added inline rather than by including
     // the migration, which also alters `harvest_execution_summaries` -- a table
-    // this bundle never creates. Without them every seed in this suite fails
+    // this bundle never creates. Without them, every seed in this suite fails
     // with `column harvest_workflow_executions.migrated_to_shard does not
-    // exist`, and the not-found routes answer 503 instead of 404 because the
-    // lookup errors before it can miss.
+    // exist`. The not-found routes then answer 503, not 404, because the lookup
+    // errors before it can miss.
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_to_shard INTEGER NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_at TIMESTAMPTZ NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_from_shards JSONB NULL;\n",
@@ -382,19 +383,19 @@ async fn seed_running(conn: &mut AsyncPgConnection, workflow_id: &str) -> Execut
 
 /// Anchor the execution's `started_at` to a fixed instant so timeline durations
 /// are deterministic relative to the events we seed below.
-async fn set_started_at(conn: &mut AsyncPgConnection, exec_id: ExecutionId, at: DateTime<Utc>) {
+async fn set_started_at(conn: &mut AsyncPgConnection, exec_id: ExecutionId, at: Timestamp) {
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-        .set(harvest_workflow_executions::started_at.eq(at))
+        .set(harvest_workflow_executions::started_at.eq(at.to_diesel()))
         .execute(conn)
         .await
         .unwrap();
 }
 
-async fn mark_completed(conn: &mut AsyncPgConnection, exec_id: ExecutionId, at: DateTime<Utc>) {
+async fn mark_completed(conn: &mut AsyncPgConnection, exec_id: ExecutionId, at: Timestamp) {
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
-            harvest_workflow_executions::completed_at.eq(Some(at)),
+            harvest_workflow_executions::completed_at.eq(Some(at).to_diesel()),
             harvest_workflow_executions::output.eq(Some(json!({"ok": true}))),
         ))
         .execute(conn)
@@ -402,15 +403,15 @@ async fn mark_completed(conn: &mut AsyncPgConnection, exec_id: ExecutionId, at: 
         .unwrap();
 }
 
-/// Insert one event row with an explicit `event_id` and `timestamp` so we control
-/// the reconstructed step durations (the engine's own `append_events` stamps the
-/// row with `NOW()`, which we deliberately bypass here).
+/// Insert one event row with an explicit `event_id` and `timestamp`, so the test
+/// controls the reconstructed step durations. It bypasses `append_events`, which
+/// stamps the row with `NOW()`.
 async fn insert_event(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     event_id: i32,
     event: &WorkflowEvent,
-    at: DateTime<Utc>,
+    at: Timestamp,
 ) {
     let data = serde_json::to_value(event).expect("event serializes");
     let event_type = data
@@ -424,7 +425,7 @@ async fn insert_event(
             harvest_events::event_id.eq(event_id),
             harvest_events::event_type.eq(event_type),
             harvest_events::event_data.eq(data),
-            harvest_events::timestamp.eq(at),
+            harvest_events::timestamp.eq(at.to_diesel()),
         ))
         .execute(conn)
         .await
@@ -471,9 +472,9 @@ async fn timeline_malformed_id_returns_400() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
-/// (2) A COMPLETED execution whose history carries an activity (with a start
-/// event, so the wait/exec split is present) and a timer → 200 with the
-/// reconstructed steps and a non-null `slowest_step`.
+/// (2) A COMPLETED execution with an activity and a timer in its history → 200
+/// with the reconstructed steps and a non-null `slowest_step`. The activity has
+/// a start event, so the wait/exec split is present.
 #[tokio::test]
 async fn timeline_completed_reconstructs_steps_with_split_and_slowest() {
     let (url, _container) = setup_database().await;
@@ -481,7 +482,7 @@ async fn timeline_completed_reconstructs_steps_with_split_and_slowest() {
     let app = build_app(&pool);
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
 
-    let t0 = Utc::now() - Duration::seconds(60);
+    let t0 = Timestamp::now() - SignedDuration::from_secs(60);
     let exec_id = seed_running(&mut conn, "completed-timeline").await;
     set_started_at(&mut conn, exec_id, t0).await;
 
@@ -502,7 +503,7 @@ async fn timeline_completed_reconstructs_steps_with_split_and_slowest() {
             input: Value::Null,
             queue: "default".into(),
         },
-        t0 + Duration::seconds(10),
+        t0 + SignedDuration::from_secs(10),
     )
     .await;
     next += 1;
@@ -514,7 +515,7 @@ async fn timeline_completed_reconstructs_steps_with_split_and_slowest() {
             activity_id: a1,
             worker_id: WorkerId::new("w-1"),
         },
-        t0 + Duration::seconds(12),
+        t0 + SignedDuration::from_secs(12),
     )
     .await;
     next += 1;
@@ -526,7 +527,7 @@ async fn timeline_completed_reconstructs_steps_with_split_and_slowest() {
             activity_id: a1,
             output: Value::Null,
         },
-        t0 + Duration::seconds(20),
+        t0 + SignedDuration::from_secs(20),
     )
     .await;
     next += 1;
@@ -539,7 +540,7 @@ async fn timeline_completed_reconstructs_steps_with_split_and_slowest() {
             timer_id: t1.clone(),
             duration_secs: 30,
         },
-        t0 + Duration::seconds(15),
+        t0 + SignedDuration::from_secs(15),
     )
     .await;
     next += 1;
@@ -548,11 +549,11 @@ async fn timeline_completed_reconstructs_steps_with_split_and_slowest() {
         exec_id,
         next,
         &WorkflowEvent::TimerFired { timer_id: t1 },
-        t0 + Duration::seconds(45),
+        t0 + SignedDuration::from_secs(45),
     )
     .await;
 
-    mark_completed(&mut conn, exec_id, t0 + Duration::seconds(50)).await;
+    mark_completed(&mut conn, exec_id, t0 + SignedDuration::from_secs(50)).await;
 
     let (status, body) = get_json(&app, &format!("/workflows/{exec_id}/timeline")).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -608,7 +609,7 @@ async fn timeline_running_open_step_is_pending() {
     let app = build_app(&pool);
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
 
-    let t0 = Utc::now() - Duration::seconds(30);
+    let t0 = Timestamp::now() - SignedDuration::from_secs(30);
     let exec_id = seed_running(&mut conn, "running-timeline").await;
     set_started_at(&mut conn, exec_id, t0).await;
 
@@ -624,7 +625,7 @@ async fn timeline_running_open_step_is_pending() {
             input: Value::Null,
             queue: "default".into(),
         },
-        t0 + Duration::seconds(5),
+        t0 + SignedDuration::from_secs(5),
     )
     .await;
     next += 1;
@@ -637,7 +638,7 @@ async fn timeline_running_open_step_is_pending() {
             activity_id: a1,
             worker_id: WorkerId::new("w-1"),
         },
-        t0 + Duration::seconds(6),
+        t0 + SignedDuration::from_secs(6),
     )
     .await;
 
@@ -657,9 +658,9 @@ async fn timeline_running_open_step_is_pending() {
     );
 }
 
-/// (5) AC6: a **classic** DAG run lives only in `harvest_dag_runs` and has NO
-/// matching `harvest_workflow_executions` row — classic DAGs are not on the
-/// standard execution path — so its timeline returns `404` with the explanatory
+/// (5) AC6: a **classic** DAG run lives only in `harvest_dag_runs`. It has NO
+/// matching `harvest_workflow_executions` row, because classic DAGs are off the
+/// standard execution path. So its timeline returns `404` with the explanatory
 /// message. This makes the AC6 promise falsifiable beyond a random unknown UUID.
 #[tokio::test]
 async fn timeline_classic_dag_run_returns_404() {
@@ -691,12 +692,11 @@ async fn timeline_classic_dag_run_returns_404() {
     );
 }
 
-/// (6) AC6/L1: a **unified** DAG run lowers onto the standard execution path — it
+/// (6) AC6/L1: a **unified** DAG run lowers onto the standard execution path. It
 /// IS a `harvest_workflow_executions` row with an ordinary
-/// `ActivityScheduled`/`ActivityStarted`/`ActivityCompleted` history — so its
-/// timeline reconstructs exactly like a plain workflow run and returns `200`.
-/// This is behaviorally identical to a plain workflow execution, which is the
-/// point: the route serves unified DAGs with no special-casing.
+/// `ActivityScheduled`/`ActivityStarted`/`ActivityCompleted` history. So its
+/// timeline reconstructs like a plain workflow run and returns `200`. The route
+/// serves unified DAGs with no special-casing.
 #[tokio::test]
 async fn timeline_unified_dag_run_reconstructs_like_a_workflow() {
     let (url, _container) = setup_database().await;
@@ -704,7 +704,7 @@ async fn timeline_unified_dag_run_reconstructs_like_a_workflow() {
     let app = build_app(&pool);
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
 
-    let t0 = Utc::now() - Duration::seconds(30);
+    let t0 = Timestamp::now() - SignedDuration::from_secs(30);
     // A unified DAG start creates a normal execution row (same as a workflow).
     let exec_id = seed_running(&mut conn, "unified-dag-run").await;
     set_started_at(&mut conn, exec_id, t0).await;
@@ -723,7 +723,7 @@ async fn timeline_unified_dag_run_reconstructs_like_a_workflow() {
             input: Value::Null,
             queue: "default".into(),
         },
-        t0 + Duration::seconds(2),
+        t0 + SignedDuration::from_secs(2),
     )
     .await;
     next += 1;
@@ -735,7 +735,7 @@ async fn timeline_unified_dag_run_reconstructs_like_a_workflow() {
             activity_id: a1,
             worker_id: WorkerId::new("w-1"),
         },
-        t0 + Duration::seconds(3),
+        t0 + SignedDuration::from_secs(3),
     )
     .await;
     next += 1;
@@ -747,11 +747,11 @@ async fn timeline_unified_dag_run_reconstructs_like_a_workflow() {
             activity_id: a1,
             output: Value::Null,
         },
-        t0 + Duration::seconds(9),
+        t0 + SignedDuration::from_secs(9),
     )
     .await;
 
-    mark_completed(&mut conn, exec_id, t0 + Duration::seconds(10)).await;
+    mark_completed(&mut conn, exec_id, t0 + SignedDuration::from_secs(10)).await;
 
     let (status, body) = get_json(&app, &format!("/workflows/{exec_id}/timeline")).await;
     assert_eq!(status, StatusCode::OK, "unified DAG is a workflow: {body}");

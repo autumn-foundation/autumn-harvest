@@ -4,9 +4,11 @@
 //! The Postgres scheduler and the `SQLite` backend both call these
 //! functions, so both compute the same slots. Nothing here needs a database.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
 
 use crate::policy::{Schedule, parse_cron};
+use crate::time::cron::CronZoned;
 
 /// A schedule prepared for repeated slot lookups.
 ///
@@ -18,8 +20,8 @@ pub struct SlotWalker {
 
 enum WalkerKind {
     Cron(croner::Cron),
-    CronInTimezone(croner::Cron, chrono_tz::Tz),
-    Interval(chrono::Duration),
+    CronInTimezone(croner::Cron, TimeZone),
+    Interval(jiff::SignedDuration),
     Never,
 }
 
@@ -31,18 +33,18 @@ impl SlotWalker {
             Schedule::Cron(expr) => parse_cron(expr).ok().map(WalkerKind::Cron),
             Schedule::CronInTimezone { expr, tz } => {
                 // An unknown zone never fires. Validation rejects it earlier.
-                tz.parse::<chrono_tz::Tz>().ok().and_then(|tz| {
+                crate::time::zone(tz).and_then(|tz| {
                     parse_cron(expr)
                         .ok()
                         .map(|cron| WalkerKind::CronInTimezone(cron, tz))
                 })
             }
-            Schedule::Interval(interval) => chrono::Duration::from_std(*interval)
+            Schedule::Interval(interval) => jiff::SignedDuration::try_from(*interval)
                 .ok()
                 // A zero period returns `reference` again. A catch-up walk then
                 // loops forever (issue #484). So a period that does not advance
                 // has no next slot. `validate_schedule` also rejects it.
-                .filter(|duration| *duration > chrono::Duration::zero())
+                .filter(|duration| *duration > jiff::SignedDuration::ZERO)
                 .map(WalkerKind::Interval),
             Schedule::Manual => None,
         };
@@ -53,11 +55,14 @@ impl SlotWalker {
 
     /// The first slot strictly after `reference`.
     #[must_use]
-    pub fn next_after(&self, reference: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    pub fn next_after(&self, reference: Timestamp) -> Option<Timestamp> {
         match &self.kind {
-            WalkerKind::Cron(cron) => cron.find_next_occurrence(&reference, false).ok(),
+            WalkerKind::Cron(cron) => cron
+                .find_next_occurrence(&CronZoned::utc(reference), false)
+                .ok()
+                .map(|next| next.timestamp()),
             WalkerKind::CronInTimezone(cron, tz) => {
-                let local_ref = reference.with_timezone(tz);
+                let local_ref = CronZoned::new(reference, tz.clone());
                 let candidate = cron.find_next_occurrence(&local_ref, false).ok()?;
                 // Spring forward: a match in the skipped hour, such as 02:30,
                 // resolves to the first valid second after the gap. That instant
@@ -68,11 +73,11 @@ impl SlotWalker {
                 // Fall back: the strict first search already moves past the first
                 // occurrence of the repeated hour, so the hour fires once.
                 let local_next = cron.find_next_occurrence(&candidate, true).ok()?;
-                Some(local_next.with_timezone(&Utc))
+                Some(local_next.timestamp())
             }
-            // A sum past the last date that chrono holds also means no next
+            // A sum past the last date that jiff holds also means no next
             // run (issue #2048).
-            WalkerKind::Interval(duration) => reference.checked_add_signed(*duration),
+            WalkerKind::Interval(duration) => reference.checked_add(*duration).ok(),
             WalkerKind::Never => None,
         }
     }
@@ -82,9 +87,9 @@ impl SlotWalker {
 ///
 /// Returns `None` for [`Schedule::Manual`] and for a spec that does not
 /// parse. Also returns `None` for an interval that does not advance, or that
-/// passes the last date that `chrono` holds.
+/// passes the last date that jiff holds.
 #[must_use]
-pub fn next_fire_after(schedule: &Schedule, reference: DateTime<Utc>) -> Option<DateTime<Utc>> {
+pub fn next_fire_after(schedule: &Schedule, reference: Timestamp) -> Option<Timestamp> {
     SlotWalker::new(schedule).next_after(reference)
 }
 
@@ -96,9 +101,9 @@ pub fn next_fire_after(schedule: &Schedule, reference: DateTime<Utc>) -> Option<
 #[must_use]
 pub fn next_slot_after_fire(
     schedule: &Schedule,
-    fired: DateTime<Utc>,
-    now: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
+    fired: Timestamp,
+    now: Timestamp,
+) -> Option<Timestamp> {
     next_fire_after(schedule, fired)
         .filter(|&next| next > now)
         .or_else(|| next_fire_after(schedule, now))
@@ -108,13 +113,13 @@ pub fn next_slot_after_fire(
 mod tests {
     use std::time::Duration;
 
-    use chrono::{DateTime, Utc};
+    use jiff::Timestamp;
 
     use super::{next_fire_after, next_slot_after_fire};
     use crate::policy::Schedule;
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        DateTime::from_timestamp(secs, 0).unwrap()
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::from_second(secs).unwrap()
     }
 
     #[test]
@@ -143,7 +148,7 @@ mod tests {
     /// and a parse failure here stops that schedule with no error.
     #[test]
     fn a_stored_step_without_a_range_still_fires() {
-        let reference: DateTime<Utc> = "2026-03-01T00:01:00Z".parse().expect("timestamp");
+        let reference: Timestamp = "2026-03-01T00:01:00Z".parse().expect("timestamp");
         for (expr, expected) in [
             ("0/10 * * * *", "2026-03-01T00:10:00Z"),
             ("5/5 * * * *", "2026-03-01T00:05:00Z"),
@@ -170,7 +175,7 @@ mod tests {
             expr: expr.to_string(),
             tz: "America/New_York".to_string(),
         };
-        let at = |text: &str| -> DateTime<Utc> { text.parse().expect("timestamp") };
+        let at = |text: &str| -> Timestamp { text.parse().expect("timestamp") };
 
         // 01:00:01 EST is in the second pass of the repeated hour.
         let second_pass = at("2026-11-01T06:00:01Z");

@@ -1,13 +1,15 @@
 //! Integration tests for `GET /admin/usage` (issue #596).
 //!
 //! Seeds workflow executions and hand-inserted `harvest_events` rows with
-//! explicit timestamps, and asserts the endpoint aggregates workflow starts,
-//! terminal outcomes, activity executions/failures, and activity
-//! compute-seconds correctly, honors both `group_by` modes (including the
-//! `"(unattributed)"` bucket), enforces the window ceiling, merges across
-//! shards, and degrades gracefully (never a 500) when a shard is
-//! unreachable.
+//! explicit timestamps. The tests assert that the endpoint:
+//!
+//! - aggregates workflow starts, terminal outcomes, activity
+//!   executions/failures and activity compute-seconds correctly;
+//! - honors both `group_by` modes, including the `"(unattributed)"` bucket;
+//! - enforces the window ceiling and merges across shards;
+//! - degrades gracefully (never a 500) when a shard is unreachable.
 
+use jiff_diesel::ToDiesel;
 use std::collections::BTreeMap;
 
 use autumn_harvest::models::{NewHarvestEvent, NewWorkflowExecution};
@@ -19,11 +21,11 @@ use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{DateTime, Duration, Utc};
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use jiff::{SignedDuration, Timestamp};
 use serde_json::Value;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -153,8 +155,8 @@ async fn seed_execution(
     shard: i32,
     workflow_name: &str,
     state: &str,
-    started_at: DateTime<Utc>,
-    completed_at: Option<DateTime<Utc>>,
+    started_at: Timestamp,
+    completed_at: Option<Timestamp>,
     search_attrs: Option<Value>,
 ) -> Uuid {
     use autumn_harvest::schema::harvest_workflow_executions::dsl;
@@ -211,8 +213,8 @@ async fn seed_execution(
     diesel::update(dsl::harvest_workflow_executions.filter(dsl::id.eq(exec_id.as_uuid())))
         .set((
             dsl::state.eq(state),
-            dsl::started_at.eq(started_at),
-            dsl::completed_at.eq(completed_at),
+            dsl::started_at.eq(started_at.to_diesel()),
+            dsl::completed_at.eq(completed_at.to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -229,7 +231,7 @@ async fn seed_activity_event(
     event_id: i32,
     event_type: &str,
     activity_id: Uuid,
-    timestamp: DateTime<Utc>,
+    timestamp: Timestamp,
 ) {
     use autumn_harvest::schema::harvest_events::dsl;
 
@@ -257,7 +259,7 @@ async fn seed_activity_event(
                 .filter(dsl::workflow_exec_id.eq(exec_id))
                 .filter(dsl::event_id.eq(event_id)),
         )
-        .set(dsl::timestamp.eq(timestamp))
+        .set(dsl::timestamp.eq(timestamp.to_diesel()))
         .execute(c)
         .await
     })
@@ -269,13 +271,21 @@ async fn seed_activity_event(
 async fn empty_fleet_returns_complete_zero_groups() {
     let (url, _c) = setup_single_shard().await;
     let app = single_app(&url);
-    let now = Utc::now();
+    let now = Timestamp::now();
     let (status, body) = get_json(
         &app,
         &format!(
             "/admin/usage?from={}&to={}",
-            (now - Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(
+                now - SignedDuration::from_hours(1),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            ),
+            autumn_harvest::time::rfc3339_opts(
+                now,
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            )
         ),
     )
     .await;
@@ -320,7 +330,7 @@ async fn seed_terminal_event(
     exec_id: Uuid,
     event_id: i32,
     event_type: &str,
-    timestamp: DateTime<Utc>,
+    timestamp: Timestamp,
 ) {
     use autumn_harvest::schema::harvest_events::dsl;
 
@@ -348,7 +358,7 @@ async fn seed_terminal_event(
                 .filter(dsl::workflow_exec_id.eq(exec_id))
                 .filter(dsl::event_id.eq(event_id)),
         )
-        .set(dsl::timestamp.eq(timestamp))
+        .set(dsl::timestamp.eq(timestamp.to_diesel()))
         .execute(c)
         .await
     })
@@ -360,7 +370,7 @@ async fn seed_terminal_event(
 async fn default_group_by_is_workflow_name_and_counts_starts() {
     let (url, _c) = setup_single_shard().await;
     let app = single_app(&url);
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     seed_execution(&url, 0, "onboarding", "RUNNING", now, None, None).await;
     seed_execution(&url, 0, "onboarding", "RUNNING", now, None, None).await;
@@ -370,8 +380,16 @@ async fn default_group_by_is_workflow_name_and_counts_starts() {
         &app,
         &format!(
             "/admin/usage?from={}&to={}",
-            (now - Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            (now + Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(
+                now - SignedDuration::from_hours(1),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            ),
+            autumn_harvest::time::rfc3339_opts(
+                now + SignedDuration::from_hours(1),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            )
         ),
     )
     .await;
@@ -386,8 +404,8 @@ async fn default_group_by_is_workflow_name_and_counts_starts() {
 async fn terminal_outcomes_counted_by_durable_terminal_events() {
     let (url, _c) = setup_single_shard().await;
     let app = single_app(&url);
-    let now = Utc::now();
-    let started = now - Duration::hours(2);
+    let now = Timestamp::now();
+    let started = now - SignedDuration::from_hours(2);
 
     let completed_id =
         seed_execution(&url, 0, "onboarding", "COMPLETED", started, Some(now), None).await;
@@ -408,8 +426,16 @@ async fn terminal_outcomes_counted_by_durable_terminal_events() {
         &app,
         &format!(
             "/admin/usage?from={}&to={}",
-            (now - Duration::minutes(30)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            (now + Duration::minutes(30)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(
+                now - SignedDuration::from_mins(30),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            ),
+            autumn_harvest::time::rfc3339_opts(
+                now + SignedDuration::from_mins(30),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            )
         ),
     )
     .await;
@@ -427,23 +453,23 @@ async fn terminal_outcomes_counted_by_durable_terminal_events() {
 
 #[tokio::test]
 async fn redriven_failure_still_counted_in_the_window_it_occurred() {
-    // Locks in the PR #895 review fix: usage-report terminal outcomes are
+    // Locks in the PR #895 fix: usage-report terminal outcomes are
     // immutable historical facts derived from durable events, not mutable
     // row-state snapshots. A DLQ redrive (reactivate_failed_execution)
-    // clears a FAILED row's state/completed_at but never rewrites or
-    // removes the original WorkflowFailed event, so a report re-run for
-    // the window the failure actually occurred in must still show it.
+    // clears a FAILED row's state/completed_at. It never rewrites or removes
+    // the original WorkflowFailed event. So a report re-run over the window of
+    // the failure must still show it.
     let (url, _c) = setup_single_shard().await;
     let app = single_app(&url);
-    let now = Utc::now();
-    let started = now - Duration::hours(2);
+    let now = Timestamp::now();
+    let started = now - SignedDuration::from_hours(2);
 
     let exec_id = seed_execution(&url, 0, "onboarding", "FAILED", started, Some(now), None).await;
     seed_terminal_event(&url, exec_id, 1, "WorkflowFailed", now).await;
 
-    // Simulate a redrive: the row flips back to RUNNING and completed_at is
-    // cleared, mirroring exactly what reactivate_failed_execution does to
-    // the row, without touching the already-recorded WorkflowFailed event.
+    // Simulate a redrive as reactivate_failed_execution does it: the row flips
+    // back to RUNNING and completed_at is cleared. The recorded WorkflowFailed
+    // event stays untouched.
     {
         use autumn_harvest::schema::harvest_workflow_executions::dsl;
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
@@ -452,7 +478,7 @@ async fn redriven_failure_still_counted_in_the_window_it_occurred() {
         diesel::update(dsl::harvest_workflow_executions.filter(dsl::id.eq(exec_id)))
             .set((
                 dsl::state.eq("RUNNING"),
-                dsl::completed_at.eq(None::<DateTime<Utc>>),
+                dsl::completed_at.eq(None::<jiff_diesel::Timestamp>),
             ))
             .execute(&mut conn)
             .await
@@ -463,8 +489,16 @@ async fn redriven_failure_still_counted_in_the_window_it_occurred() {
         &app,
         &format!(
             "/admin/usage?from={}&to={}",
-            (now - Duration::minutes(30)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            (now + Duration::minutes(30)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(
+                now - SignedDuration::from_mins(30),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            ),
+            autumn_harvest::time::rfc3339_opts(
+                now + SignedDuration::from_mins(30),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            )
         ),
     )
     .await;
@@ -485,8 +519,8 @@ async fn terminated_execution_reusing_workflow_cancelled_event_is_not_counted_as
     // `cancelled` counter must not conflate the two.
     let (url, _c) = setup_single_shard().await;
     let app = single_app(&url);
-    let now = Utc::now();
-    let started = now - Duration::hours(2);
+    let now = Timestamp::now();
+    let started = now - SignedDuration::from_hours(2);
 
     let exec_id = seed_execution(
         &url,
@@ -504,8 +538,16 @@ async fn terminated_execution_reusing_workflow_cancelled_event_is_not_counted_as
         &app,
         &format!(
             "/admin/usage?from={}&to={}",
-            (now - Duration::minutes(30)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            (now + Duration::minutes(30)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(
+                now - SignedDuration::from_mins(30),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            ),
+            autumn_harvest::time::rfc3339_opts(
+                now + SignedDuration::from_mins(30),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            )
         ),
     )
     .await;
@@ -518,17 +560,16 @@ async fn terminated_execution_reusing_workflow_cancelled_event_is_not_counted_as
 
 #[tokio::test]
 async fn reset_terminated_cancelled_execution_still_counted_as_cancelled() {
-    // PR #895 review (chatgpt-codex-connector): a DAG retry/reset with
-    // allow_terminal_source can seal a CANCELLED source execution to
-    // TERMINATED (reset.rs's sealable_states). Because that reset also
-    // appends WorkflowResetTerminated on the source execution -- unlike a
-    // genuine terminate, which never does -- the cancelled counter must
-    // keep counting the original WorkflowCancelled event instead of losing
-    // it once the row moves off CANCELLED.
+    // PR #895: a DAG retry/reset with allow_terminal_source can seal a
+    // CANCELLED source execution to TERMINATED (reset.rs's sealable_states).
+    // That reset also appends WorkflowResetTerminated on the source execution.
+    // A genuine terminate never does. So the cancelled counter must keep
+    // counting the original WorkflowCancelled event after the row leaves
+    // CANCELLED.
     let (url, _c) = setup_single_shard().await;
     let app = single_app(&url);
-    let now = Utc::now();
-    let started = now - Duration::hours(2);
+    let now = Timestamp::now();
+    let started = now - SignedDuration::from_hours(2);
 
     let exec_id = seed_execution(
         &url,
@@ -546,7 +587,7 @@ async fn reset_terminated_cancelled_execution_still_counted_as_cancelled() {
         exec_id,
         2,
         "WorkflowResetTerminated",
-        now + Duration::minutes(5),
+        now + SignedDuration::from_mins(5),
     )
     .await;
 
@@ -554,8 +595,16 @@ async fn reset_terminated_cancelled_execution_still_counted_as_cancelled() {
         &app,
         &format!(
             "/admin/usage?from={}&to={}",
-            (now - Duration::minutes(30)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            (now + Duration::minutes(30)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(
+                now - SignedDuration::from_mins(30),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            ),
+            autumn_harvest::time::rfc3339_opts(
+                now + SignedDuration::from_mins(30),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            )
         ),
     )
     .await;
@@ -570,15 +619,15 @@ async fn reset_terminated_cancelled_execution_still_counted_as_cancelled() {
 
 #[tokio::test]
 async fn external_activity_timeout_without_a_start_is_not_counted_as_failed() {
-    // PR #895 review (chatgpt-codex-connector): enforce_external_task_timeouts
-    // appends ActivityTimedOut for external activities that never emit
-    // ActivityStarted (they're dispatched via ActivityAwaitingExternal, never
-    // claimed by a worker). activity_executions_failed must require a
-    // matching start, same as activity_compute_seconds already does.
+    // PR #895: enforce_external_task_timeouts appends ActivityTimedOut for
+    // external activities that never emit ActivityStarted. They are dispatched
+    // via ActivityAwaitingExternal, and no worker claims them.
+    // activity_executions_failed must require a matching start, as
+    // activity_compute_seconds already does.
     let (url, _c) = setup_single_shard().await;
     let app = single_app(&url);
-    let now = Utc::now();
-    let started = now - Duration::hours(1);
+    let now = Timestamp::now();
+    let started = now - SignedDuration::from_hours(1);
 
     let exec_id = seed_execution(&url, 0, "onboarding", "RUNNING", started, None, None).await;
     let activity_id = Uuid::new_v4();
@@ -588,7 +637,7 @@ async fn external_activity_timeout_without_a_start_is_not_counted_as_failed() {
         1,
         "ActivityTimedOut",
         activity_id,
-        started + Duration::minutes(10),
+        started + SignedDuration::from_mins(10),
     )
     .await;
 
@@ -596,8 +645,16 @@ async fn external_activity_timeout_without_a_start_is_not_counted_as_failed() {
         &app,
         &format!(
             "/admin/usage?from={}&to={}",
-            (started - Duration::minutes(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            (now + Duration::minutes(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(
+                started - SignedDuration::from_mins(1),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            ),
+            autumn_harvest::time::rfc3339_opts(
+                now + SignedDuration::from_mins(1),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            )
         ),
     )
     .await;
@@ -615,7 +672,7 @@ async fn external_activity_timeout_without_a_start_is_not_counted_as_failed() {
 async fn search_attr_group_by_buckets_missing_key_as_unattributed() {
     let (url, _c) = setup_single_shard().await;
     let app = single_app(&url);
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     seed_execution(
         &url,
@@ -643,8 +700,16 @@ async fn search_attr_group_by_buckets_missing_key_as_unattributed() {
         &app,
         &format!(
             "/admin/usage?from={}&to={}&group_by=search_attr:tenant_id",
-            (now - Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            (now + Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(
+                now - SignedDuration::from_hours(1),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            ),
+            autumn_harvest::time::rfc3339_opts(
+                now + SignedDuration::from_hours(1),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            )
         ),
     )
     .await;
@@ -663,15 +728,15 @@ async fn search_attr_group_by_buckets_missing_key_as_unattributed() {
 async fn retried_activity_counts_two_executions_one_failure_final_attempt_compute() {
     let (url, _c) = setup_single_shard().await;
     let app = single_app(&url);
-    let now = Utc::now();
-    let started = now - Duration::hours(1);
+    let now = Timestamp::now();
+    let started = now - SignedDuration::from_hours(1);
 
     let exec_id = seed_execution(&url, 0, "onboarding", "RUNNING", started, None, None).await;
     let activity_id = Uuid::new_v4();
 
     // Attempt 1: starts, then fails without a terminal event (mid-retry —
     // the engine does not append ActivityFailed for a non-final attempt).
-    let attempt1_start = started + Duration::minutes(1);
+    let attempt1_start = started + SignedDuration::from_mins(1);
     seed_activity_event(
         &url,
         exec_id,
@@ -684,8 +749,8 @@ async fn retried_activity_counts_two_executions_one_failure_final_attempt_comput
 
     // Attempt 2 (final, retries exhausted): starts, then a terminal
     // ActivityFailed 10 seconds later.
-    let attempt2_start = started + Duration::minutes(5);
-    let attempt2_terminal = attempt2_start + Duration::seconds(10);
+    let attempt2_start = started + SignedDuration::from_mins(5);
+    let attempt2_terminal = attempt2_start + SignedDuration::from_secs(10);
     seed_activity_event(
         &url,
         exec_id,
@@ -709,8 +774,16 @@ async fn retried_activity_counts_two_executions_one_failure_final_attempt_comput
         &app,
         &format!(
             "/admin/usage?from={}&to={}",
-            (started - Duration::minutes(5)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            (now + Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(
+                started - SignedDuration::from_mins(5),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            ),
+            autumn_harvest::time::rfc3339_opts(
+                now + SignedDuration::from_hours(1),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            )
         ),
     )
     .await;
@@ -736,13 +809,13 @@ async fn retried_activity_counts_two_executions_one_failure_final_attempt_comput
 async fn completed_activity_contributes_compute_seconds_but_not_failure_count() {
     let (url, _c) = setup_single_shard().await;
     let app = single_app(&url);
-    let now = Utc::now();
-    let started = now - Duration::hours(1);
+    let now = Timestamp::now();
+    let started = now - SignedDuration::from_hours(1);
 
     let exec_id = seed_execution(&url, 0, "onboarding", "RUNNING", started, None, None).await;
     let activity_id = Uuid::new_v4();
-    let start_ts = started + Duration::minutes(1);
-    let terminal_ts = start_ts + Duration::seconds(5);
+    let start_ts = started + SignedDuration::from_mins(1);
+    let terminal_ts = start_ts + SignedDuration::from_secs(5);
     seed_activity_event(&url, exec_id, 1, "ActivityStarted", activity_id, start_ts).await;
     seed_activity_event(
         &url,
@@ -758,8 +831,16 @@ async fn completed_activity_contributes_compute_seconds_but_not_failure_count() 
         &app,
         &format!(
             "/admin/usage?from={}&to={}",
-            (started - Duration::minutes(5)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            (now + Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(
+                started - SignedDuration::from_mins(5),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            ),
+            autumn_harvest::time::rfc3339_opts(
+                now + SignedDuration::from_hours(1),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            )
         ),
     )
     .await;
@@ -776,7 +857,7 @@ async fn completed_activity_contributes_compute_seconds_but_not_failure_count() 
 async fn merges_across_shards() {
     let ((url0, url1), _c) = setup_two_shards().await;
     let app = build_app(two_shard_storage(&url0, &url1));
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     seed_execution(&url0, 0, "onboarding", "RUNNING", now, None, None).await;
     seed_execution(&url1, 1, "onboarding", "RUNNING", now, None, None).await;
@@ -785,8 +866,16 @@ async fn merges_across_shards() {
         &app,
         &format!(
             "/admin/usage?from={}&to={}",
-            (now - Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            (now + Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(
+                now - SignedDuration::from_hours(1),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            ),
+            autumn_harvest::time::rfc3339_opts(
+                now + SignedDuration::from_hours(1),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            )
         ),
     )
     .await;
@@ -803,7 +892,7 @@ async fn merges_across_shards() {
 #[tokio::test]
 async fn one_shard_down_is_partial_not_500() {
     let ((url0, url1), _c) = setup_two_shards().await;
-    let now = Utc::now();
+    let now = Timestamp::now();
     seed_execution(&url0, 0, "onboarding", "RUNNING", now, None, None).await;
 
     // Point shard 1 at a database that does not exist so its pool fails.
@@ -820,8 +909,16 @@ async fn one_shard_down_is_partial_not_500() {
         &app_partial,
         &format!(
             "/admin/usage?from={}&to={}",
-            (now - Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            (now + Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(
+                now - SignedDuration::from_hours(1),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            ),
+            autumn_harvest::time::rfc3339_opts(
+                now + SignedDuration::from_hours(1),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            )
         ),
     )
     .await;
@@ -841,15 +938,14 @@ async fn one_shard_down_is_partial_not_500() {
 
 #[tokio::test]
 async fn search_attr_value_literally_unattributed_merges_with_missing_key() {
-    // Locks in the documented limitation (issue #596 F1): an execution whose
-    // search_attrs value for the requested key literally equals the
-    // "(unattributed)" sentinel is indistinguishable from an execution that
-    // lacks the key entirely — both merge into the same group. This is an
-    // accepted, documented limitation, not a defect (see the module doc in
+    // Locks in the documented limitation (issue #596). A search_attrs value
+    // that literally equals the "(unattributed)" sentinel looks the same as a
+    // missing key. Both merge into the same group. This is an accepted,
+    // documented limitation, not a defect (see the module doc in
     // autumn-harvest/src/usage.rs).
     let (url, _c) = setup_single_shard().await;
     let app = single_app(&url);
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     seed_execution(&url, 0, "onboarding", "RUNNING", now, None, None).await;
     seed_execution(
@@ -867,8 +963,16 @@ async fn search_attr_value_literally_unattributed_merges_with_missing_key() {
         &app,
         &format!(
             "/admin/usage?from={}&to={}&group_by=search_attr:tenant_id",
-            (now - Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            (now + Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(
+                now - SignedDuration::from_hours(1),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            ),
+            autumn_harvest::time::rfc3339_opts(
+                now + SignedDuration::from_hours(1),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            )
         ),
     )
     .await;
@@ -889,7 +993,7 @@ async fn search_attr_value_literally_unattributed_merges_with_missing_key() {
 #[tokio::test]
 async fn group_count_over_cap_is_413_naming_the_cap() {
     let (url, _c) = setup_single_shard().await;
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     for i in 0..3 {
         seed_execution(&url, 0, &format!("wf_{i}"), "RUNNING", now, None, None).await;
@@ -900,8 +1004,16 @@ async fn group_count_over_cap_is_413_naming_the_cap() {
         &app,
         &format!(
             "/admin/usage?from={}&to={}",
-            (now - Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            (now + Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(
+                now - SignedDuration::from_hours(1),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            ),
+            autumn_harvest::time::rfc3339_opts(
+                now + SignedDuration::from_hours(1),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            )
         ),
     )
     .await;
@@ -916,14 +1028,13 @@ async fn group_count_over_cap_is_413_naming_the_cap() {
 
 #[tokio::test]
 async fn group_count_far_over_cap_is_still_413_via_bounded_shard_query() {
-    // PR #895 review (chatgpt-codex-connector): the 413 cap must bound the
-    // shard query itself (a LIMIT), not just the merged response -- a
-    // single shard with far more distinct groups than the cap must not
-    // materialize them all before the check runs. Seeds well more than
-    // cap+1 groups on one shard and confirms the report still fails loudly
-    // rather than silently succeeding or hanging.
+    // PR #895: the 413 cap must bound the shard query itself with a LIMIT,
+    // not just the merged response. A shard with far more distinct groups
+    // than the cap must not materialize them all before the check runs.
+    // Seeds well over cap+1 groups on one shard. The report must still fail
+    // loudly, not succeed silently or hang.
     let (url, _c) = setup_single_shard().await;
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     for i in 0..10 {
         seed_execution(&url, 0, &format!("wf_{i}"), "RUNNING", now, None, None).await;
@@ -934,8 +1045,16 @@ async fn group_count_far_over_cap_is_still_413_via_bounded_shard_query() {
         &app,
         &format!(
             "/admin/usage?from={}&to={}",
-            (now - Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            (now + Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            autumn_harvest::time::rfc3339_opts(
+                now - SignedDuration::from_hours(1),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            ),
+            autumn_harvest::time::rfc3339_opts(
+                now + SignedDuration::from_hours(1),
+                autumn_harvest::time::SecondsFormat::Secs,
+                true
+            )
         ),
     )
     .await;

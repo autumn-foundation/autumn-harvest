@@ -13,6 +13,7 @@
 
 use autumn_harvest::schema::{harvest_task_queue_ext, harvest_workflow_executions_ext};
 use autumn_harvest::table_split::SetExt;
+use jiff_diesel::ToDiesel;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
@@ -33,9 +34,9 @@ use autumn_harvest::store;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker};
 use autumn_harvest::{ExecutionId, ShardId};
 
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -278,7 +279,7 @@ async fn seed_run_with(
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result,
             last_error: None,
             scheduled_time: None,
@@ -291,7 +292,7 @@ async fn seed_run_with(
     .expect("append WorkflowStarted");
     let mut params = EnqueueParams::new(queue, TaskType::Workflow, input.clone());
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     queue::enqueue(conn, &params)
         .await
         .expect("enqueue workflow task");
@@ -2076,7 +2077,7 @@ async fn an_admission_gate_refuses_a_fork() {
         reason: "incident".to_string(),
         message: None,
         created_by: "test".to_string(),
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         expires_at: None,
     }]);
     set_global_admission_gate_cache(Some(cache));
@@ -2589,7 +2590,7 @@ async fn age_into_tenant(conn: &mut AsyncPgConnection, exec: ExecutionId, tenant
         .set((
             harvest_workflow_executions::tenant.eq(Some(tenant)),
             harvest_workflow_executions::completed_at
-                .eq(Some(Utc::now() - chrono::Duration::days(30))),
+                .eq(Some(Timestamp::now() - autumn_harvest::time::days(30)).to_diesel()),
         ))
         .execute(conn)
         .await

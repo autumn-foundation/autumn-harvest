@@ -5,12 +5,12 @@
 //! into the `ScheduleActivity` input, so a replay on another worker process
 //! records a different command.
 //!
-//! **Launder.** DET005 *does* know `process::id(` — but it is classified
+//! **Launder.** DET005 *does* know `process::id(`. But it is classified
 //! `DetSeverity::Warning`, so it never counts as a hard blocker even when it
-//! fires, and it cannot fire here anyway: it resolves one hop, same file and
-//! same module, and `origin_tag` is one crate away with the actual call a crate
-//! beyond that. There is **no HVG twin at all** — HVG001–HVG011 contains no
-//! process-id rule — so the compile-time layer is silent by construction.
+//! fires. It cannot fire here anyway: it resolves one hop, same file and same
+//! module. `origin_tag` is one crate away, and the actual call is a crate
+//! beyond that. There is **no HVG twin at all**: HVG001–HVG011 contains no
+//! process-id rule. So the compile-time layer is silent by construction.
 //!
 //! **Expected trace hops.** `wf_process_id_payload` ⇒
 //! `harvest_verify_corpus_helpers::origin_tag` ⇒

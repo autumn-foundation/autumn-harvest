@@ -1,6 +1,7 @@
 //! The recorded profile read of a durable agent (issue #2372).
 //!
-//! A run reads its profile once, through the activity `agent_profile`. With
+//! A run reads its profile once, through the activity `agent_profile`. A
+//! `Control::ReloadProfile` reads it again, then ends the run. With
 //! an overlay store, each op also reads the active overlay, through the
 //! activity `agent_profile_overlay`. History records both results, so a
 //! replay never reads the store. The design is in
@@ -73,6 +74,19 @@ pub(crate) fn op_profile<P, V, E>(
         None => Ok((base, None)),
         Some((version, Ok(applied))) => Ok((applied, Some(version))),
         Some((version, Err(err))) => Err((version, err)),
+    }
+}
+
+/// The profile of the rest of a reload op, and the error of a failed read.
+///
+/// A good read replaces `current`, and the run then ends at a checkpoint. A
+/// failed read keeps `current`, so a failed reload never drops a working
+/// profile. The caller records the error.
+/// `formal/verus/src/agent_profile_read.rs` proves it.
+pub(crate) fn reloaded<R, E>(current: R, read: Result<R, E>) -> (R, Option<E>) {
+    match read {
+        Ok(next) => (next, None),
+        Err(err) => (current, Some(err)),
     }
 }
 
@@ -428,7 +442,30 @@ mod tests {
         assert_eq!(read.profile, run);
     }
 
+    #[test]
+    fn a_good_reload_replaces_the_run() {
+        assert_eq!(reloaded("old", Ok::<_, &str>("new")), ("new", None));
+    }
+
+    #[test]
+    fn a_failed_reload_keeps_the_run_and_names_the_error() {
+        assert_eq!(reloaded("old", Err("gone")), ("old", Some("gone")));
+    }
+
     proptest! {
+        /// The reload kernel agrees with the Verus spec on every input.
+        #[test]
+        fn the_reload_kernel_never_drops_the_run(
+            current in any::<u8>(),
+            read in any::<Result<u8, u8>>(),
+        ) {
+            let out = reloaded(current, read);
+            match read {
+                Ok(next) => prop_assert_eq!(out, (next, None)),
+                Err(err) => prop_assert_eq!(out, (current, Some(err))),
+            }
+        }
+
         /// The engine kernel agrees with the Verus spec on every input.
         #[test]
         fn the_kernel_never_runs_bare_under_a_version(

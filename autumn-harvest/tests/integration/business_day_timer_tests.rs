@@ -4,23 +4,23 @@
 //! Two complementary proofs, driven through a **real** `Worker` against Postgres:
 //!
 //! * `worker_arms_business_day_timer_in_one_decision_cycle` — the falsifiable
-//!   correctness AC. Sat/Sun plus two holidays (placed on the next two
-//!   *weekdays* after the worker's own real anchor, so they genuinely enter the
-//!   resolution window on whichever weekday CI runs) must arm a durable timer
-//!   whose `harvest_timers.fires_at` lands on the resolved instant computed by
-//!   an **independent** reference implementation, skipping the weekend and the
-//!   holidays. Also asserts the ONE-DECISION-CYCLE property: exactly one
-//!   `TimerStarted` and exactly one `SideEffectRecorded` in history. Note this
-//!   is a *necessary*, not sufficient, condition — a split batch would still
-//!   record one of each, just across two cycles; the sufficient proof is the
+//!   correctness AC. The calendar excludes Sat/Sun and two holidays. The
+//!   holidays are the next two *weekdays* after the worker's real anchor, so
+//!   they enter the resolution window on any weekday CI runs. The worker must
+//!   arm a durable timer whose `harvest_timers.fires_at` skips the weekend and
+//!   the holidays. An **independent** reference implementation computes the
+//!   expected instant. The test also asserts the ONE-DECISION-CYCLE property:
+//!   exactly one `TimerStarted` and one `SideEffectRecorded` in history. That
+//!   is a *necessary*, not sufficient, condition. A split batch still records
+//!   one of each, across two cycles. The sufficient proof is the
 //!   `extract_started_timer_for_suspension_accepts_freeze_plus_timer` unit test
-//!   in `worker.rs`, whose allow-list is what makes the single batch legal
-//!   (deleting `RecordSideEffect` from it makes both tests here fail).
+//!   in `worker.rs`. Its allow-list makes the single batch legal. Deleting
+//!   `RecordSideEffect` from it makes both tests here fail.
 //!
 //! * `business_day_calendar_loaded_from_db_resolves` — the registration path an
-//!   embedder actually uses: holidays live in `harvest_calendar_exclusions`, are
-//!   loaded with the existing `load_exclusions_for_calendar`, and are handed to
-//!   the worker as a `BusinessCalendars` snapshot in shared state.
+//!   embedder uses. Holidays live in `harvest_calendar_exclusions`. The test
+//!   loads them with `load_exclusions_for_calendar` and hands them to the
+//!   worker as a `BusinessCalendars` snapshot in shared state.
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
 //! against it directly; otherwise a fresh testcontainers Postgres is booted with
@@ -43,10 +43,11 @@ use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics, TelemetryConfig};
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 
-use chrono::{DateTime, NaiveDate, Utc};
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
+use jiff::civil::Weekday;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -148,6 +149,7 @@ fn build_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> 
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
                 codec_rotation_batch_size: 0,
                 scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
@@ -157,6 +159,8 @@ fn build_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> 
                 max_concurrent_workflows: 2,
                 max_concurrent_activities: 2,
                 max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
+                claim_slots_per_shard: None,
+                claim_batch_max: None,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -219,7 +223,7 @@ fn sla_flow_handler(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'
             .timer_business_days("sla", n, &calendar)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(serde_json::json!(deadline.to_rfc3339()))
+        Ok(serde_json::json!(autumn_harvest::time::rfc3339(deadline)))
     })
 }
 
@@ -278,7 +282,7 @@ async fn seed_workflow(conn: &mut AsyncPgConnection, input: serde_json::Value) -
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -290,7 +294,7 @@ async fn seed_workflow(conn: &mut AsyncPgConnection, input: serde_json::Value) -
 
     let mut params = EnqueueParams::new("default", TaskType::Workflow, input);
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     queue::enqueue(conn, &params)
         .await
         .expect("enqueue workflow task");
@@ -316,12 +320,12 @@ async fn load_execution(url: &str, exec_id: ExecutionId) -> WorkflowExecution {
         .expect("reload workflow execution")
 }
 
-/// Read the durable timer row's absolute fire instant.
-async fn timer_fires_at(url: &str, exec_id: ExecutionId) -> DateTime<Utc> {
+async fn timer_fires_at(url: &str, exec_id: ExecutionId) -> Timestamp {
     #[derive(QueryableByName)]
     struct Row {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        fires_at: DateTime<Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        fires_at: Timestamp,
     }
     let mut conn = connect(url).await;
     let rows: Vec<Row> = diesel::sql_query(
@@ -356,33 +360,30 @@ async fn wait_for_timer_started(url: &str, exec_id: ExecutionId, timeout: Durati
     .unwrap_or_else(|_| panic!("timer was never armed within {timeout:?}"));
 }
 
-const fn day(y: i32, m: u32, d: u32) -> NaiveDate {
-    NaiveDate::from_ymd_opt(y, m, d).expect("valid date")
+const fn day(y: i16, m: i8, d: i8) -> jiff::civil::Date {
+    jiff::civil::date(y, m, d)
 }
 
 /// The next `count` **weekdays** strictly after `from`.
 ///
-/// Holidays for these tests must be placed relative to the worker's real anchor
-/// (a fixed past date would never enter the resolution window and every
-/// holiday-skip assertion would pass vacuously) — but they must also land on
-/// days that are business days *without* them, or they contribute nothing. Naive
-/// `today + 1 day` / `today + 2 days` fails exactly that on a Friday, where both
-/// land on the weekend and the falsifiability assertion (`deadline >
-/// weekends_only`) becomes unsatisfiable. Walking forward over weekdays makes
-/// the fixture correct on all seven anchors.
+/// Holidays for these tests must sit relative to the worker's real anchor. A
+/// fixed past date never enters the resolution window, so every holiday-skip
+/// assertion would pass vacuously. They must also land on days that are
+/// business days *without* them, or they contribute nothing. Naive
+/// `today + 1 day` / `today + 2 days` fails that on a Friday: both land on the
+/// weekend. The falsifiability assertion (`deadline > weekends_only`) then
+/// becomes unsatisfiable. Walking forward over weekdays makes the fixture
+/// correct on all seven anchors.
 ///
-/// Weekday-only by construction — deliberately independent of
-/// `calendar::is_business_day` so the fixture cannot be co-broken with the
-/// production predicate it is meant to exercise.
-fn next_weekdays_after(from: NaiveDate, count: usize) -> Vec<NaiveDate> {
+/// Weekday-only by construction. It is independent of
+/// `calendar::is_business_day`, so a broken production predicate cannot also
+/// break the fixture.
+fn next_weekdays_after(from: jiff::civil::Date, count: usize) -> Vec<jiff::civil::Date> {
     let mut out = Vec::with_capacity(count);
     let mut cursor = from;
     while out.len() < count {
-        cursor = cursor.succ_opt().expect("date in range");
-        if !matches!(
-            chrono::Datelike::weekday(&cursor),
-            chrono::Weekday::Sat | chrono::Weekday::Sun
-        ) {
+        cursor = cursor.tomorrow().expect("date in range");
+        if !matches!(cursor.weekday(), Weekday::Saturday | Weekday::Sunday) {
             out.push(cursor);
         }
     }
@@ -393,35 +394,31 @@ fn next_weekdays_after(from: NaiveDate, count: usize) -> Vec<NaiveDate> {
 /// written differently from `calendar::add_business_days` (candidate-date scan
 /// rather than a cursor loop) so the integration assertion is not circular.
 ///
-/// Contract mirrored: Sat/Sun are never business days, `holidays` are never
-/// business days, `n = 0` means "the anchor if it is a business instant, else
-/// the next business instant", and the anchor's time-of-day is preserved.
+/// Contract mirrored: Sat/Sun and `holidays` are never business days. `n = 0`
+/// means "the anchor if it is a business instant, else the next business
+/// instant". The anchor's time-of-day is preserved.
 fn reference_business_deadline(
-    anchor: DateTime<Utc>,
+    anchor: Timestamp,
     n: u32,
-    holidays: &[NaiveDate],
-) -> DateTime<Utc> {
-    use chrono::{Datelike, Weekday};
-
-    let is_business = |d: NaiveDate| {
-        !matches!(d.weekday(), Weekday::Sat | Weekday::Sun) && !holidays.contains(&d)
+    holidays: &[jiff::civil::Date],
+) -> Timestamp {
+    let is_business = |d: jiff::civil::Date| {
+        !matches!(d.weekday(), Weekday::Saturday | Weekday::Sunday) && !holidays.contains(&d)
     };
 
-    let start = anchor.date_naive();
+    let start = autumn_harvest::time::utc_date(anchor);
     // Candidate dates, in order, starting at the anchor's own date.
     let mut business_days_seen = 0_u32;
     for offset in 0..3_650_i64 {
-        let candidate = start + chrono::Duration::days(offset);
+        let candidate = start + autumn_harvest::time::days(offset);
         if !is_business(candidate) {
             continue;
         }
         // The anchor's own date counts as business day 0.
         if business_days_seen == n {
-            return candidate
-                .and_time(anchor.time())
-                .and_local_timezone(Utc)
-                .single()
-                .expect("UTC has no ambiguous local times");
+            let time = autumn_harvest::time::utc_datetime(anchor).time();
+            return autumn_harvest::time::from_utc_datetime(candidate.to_datetime(time))
+                .expect("the deadline is inside the jiff range");
         }
         business_days_seen += 1;
     }
@@ -435,11 +432,10 @@ fn reference_business_deadline(
 /// The issue's falsifiable correctness AC.
 ///
 /// The worker anchors on its own real clock, so the fixture cannot use a fixed
-/// date (a past anchor never enters the resolution window and every skip
-/// assertion passes vacuously). Instead the calendar excludes the **next two
-/// weekdays** after the anchor, guaranteeing both holidays bite on whichever
-/// weekday CI runs. `timer_business_days(_, 2, cal)` must step over the weekend
-/// and both holidays.
+/// date. A past anchor never enters the resolution window, and every skip
+/// assertion passes vacuously. Instead the calendar excludes the **next two
+/// weekdays** after the anchor, so both holidays bite on any weekday CI runs.
+/// `timer_business_days(_, 2, cal)` must skip the weekend and both holidays.
 ///
 /// **Falsifiability.** The expected value comes from `reference_business_deadline`
 /// — an independent reimplementation (candidate-date scan, not the production
@@ -448,23 +444,18 @@ fn reference_business_deadline(
 /// so a silently-broken holiday skip cannot pass. Deleting the holiday check
 /// from `calendar::is_business_day` fails this test (mutant-verified).
 ///
-/// The `harvest_timers.fires_at` row is asserted against the frozen deadline
-/// with a small tolerance: `fires_at` is anchored to the **Postgres** clock at
-/// persist time while the freeze anchors on the worker's clock, so the two are
-/// the same instant only up to worker↔DB skew plus the persist latency.
+/// The `harvest_timers.fires_at` row must match the frozen deadline within a
+/// small tolerance. `fires_at` anchors to the **Postgres** clock at persist
+/// time, and the freeze anchors on the worker's clock. They agree only up to
+/// worker↔DB skew plus the persist latency.
 #[tokio::test]
 async fn worker_arms_business_day_timer_in_one_decision_cycle() {
     let (url, _container) = setup_db().await;
     let pool = build_pool(&url);
     let mut conn = connect(&url).await;
 
-    // The worker anchors on its own real clock, so the holidays must be placed
-    // RELATIVE to now or they never enter the resolution window and the
-    // holiday-skip assertion below would pass vacuously. They must also land on
-    // WEEKDAYS -- blocking `today+1`/`today+2` verbatim puts both on the weekend
-    // when the suite runs on a Friday, where they change nothing and the
-    // falsifiability assertion below becomes unsatisfiable.
-    let today = Utc::now().date_naive();
+    // Holidays sit RELATIVE to now and on WEEKDAYS (see `next_weekdays_after`).
+    let today = autumn_harvest::time::utc_date(Timestamp::now());
     let holidays = next_weekdays_after(today, 2);
 
     let calendars = BusinessCalendars::new().with_calendar("biz", holidays.clone());
@@ -526,9 +517,9 @@ async fn worker_arms_business_day_timer_in_one_decision_cycle() {
     // --- FALSIFIABLE CORRECTNESS, TO THE EXACT INSTANT --------------------
     let frozen = &side_effects[0].1;
     assert_eq!(frozen["outcome"], "resolved", "frozen record: {frozen}");
-    let anchor: DateTime<Utc> =
+    let anchor: Timestamp =
         serde_json::from_value(frozen["anchor"].clone()).expect("frozen anchor deserializes");
-    let deadline: DateTime<Utc> =
+    let deadline: Timestamp =
         serde_json::from_value(frozen["deadline"].clone()).expect("frozen deadline deserializes");
 
     // The anchor is "now" (the worker's real clock), so assert the resolution
@@ -553,16 +544,13 @@ async fn worker_arms_business_day_timer_in_one_decision_cycle() {
     );
 
     // And the resolved date must not itself be a holiday or a weekend.
-    let landed = deadline.date_naive();
+    let landed = autumn_harvest::time::utc_date(deadline);
     assert!(
         !holidays.contains(&landed),
         "resolved deadline landed ON a holiday: {landed}"
     );
     assert!(
-        !matches!(
-            chrono::Datelike::weekday(&landed),
-            chrono::Weekday::Sat | chrono::Weekday::Sun
-        ),
+        !matches!(landed.weekday(), Weekday::Saturday | Weekday::Sunday),
         "resolved deadline landed on a weekend: {landed}"
     );
 
@@ -571,7 +559,7 @@ async fn worker_arms_business_day_timer_in_one_decision_cycle() {
     // differ by the sub-second time it took the worker to persist, so allow a
     // small tolerance.
     let fires_at = timer_fires_at(&url, exec_id).await;
-    let skew = (fires_at - deadline).num_seconds().abs();
+    let skew = (fires_at - deadline).as_secs().abs();
     assert!(
         skew <= 5,
         "harvest_timers.fires_at ({fires_at}) must land on the resolved deadline \
@@ -596,11 +584,8 @@ async fn business_day_calendar_loaded_from_db_resolves() {
     // HARVEST_TEST_DATABASE_URL points at a reused database.
     let cal_name = format!("biz-{}", Uuid::new_v4());
 
-    // Holidays are placed relative to now so they genuinely enter the resolution
-    // window (a fixed past date would make the assertions vacuous), and on
-    // weekdays so they actually bite on every anchor weekday (see
-    // `next_weekdays_after`).
-    let today = Utc::now().date_naive();
+    // Holidays sit relative to now and on weekdays (see `next_weekdays_after`).
+    let today = autumn_harvest::time::utc_date(Timestamp::now());
     let holidays = next_weekdays_after(today, 2);
 
     // Seed a calendar + exclusions through the shipped DB helpers.
@@ -665,9 +650,9 @@ async fn business_day_calendar_loaded_from_db_resolves() {
 
     // The DB-sourced holidays must actually have been applied: resolving the
     // same anchor with no holidays must give a strictly earlier deadline.
-    let anchor: DateTime<Utc> =
+    let anchor: Timestamp =
         serde_json::from_value(frozen["anchor"].clone()).expect("frozen anchor deserializes");
-    let deadline: DateTime<Utc> =
+    let deadline: Timestamp =
         serde_json::from_value(frozen["deadline"].clone()).expect("frozen deadline deserializes");
     assert_eq!(
         deadline,

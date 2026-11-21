@@ -7,6 +7,7 @@
 //! [`draw_plan`] and [`wave_end`] hold the integer part.
 //! [`admit_answer_check`] admits the answer check of a run (issue #2442).
 //! [`answer_retry_cap`] and [`retry_after_reject`] hold its integer part.
+//! [`beam_draws`] and [`beam_slots`] bound a beam run.
 //! `formal/verus/src/agent_sampling.rs` proves them.
 
 use std::collections::BTreeSet;
@@ -14,6 +15,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use super::policy::{MAX_ANSWER_RETRIES, SamplingPolicy, ScorerId, ScorerRef, Scorers, Strategy};
+use super::sample::Tier;
 use crate::answer_check::AnswerCheck;
 use crate::tool::ToolEffect;
 use crate::types::MAX_PARALLEL_CHILDREN;
@@ -71,10 +73,61 @@ pub enum Refusal {
     },
     /// The profile of the kind belongs to another tenant (issue #2442).
     OtherTenant,
+    /// A sweep has no item.
+    NoItems,
+    /// A sweep has more items than [`MAX_SWEEP_ITEMS`](super::MAX_SWEEP_ITEMS).
+    TooManyItems {
+        /// The items of the sweep.
+        asked: u32,
+        /// The cap.
+        max: u32,
+    },
+    /// One item of a sweep is larger than
+    /// [`MAX_SWEEP_ITEM_BYTES`](super::MAX_SWEEP_ITEM_BYTES).
+    ItemTooLarge {
+        /// The index of the item.
+        item: u32,
+        /// The cap, in bytes.
+        max: u64,
+    },
+    /// The strategy needs a scorer, and the run names none.
+    NoScorer {
+        /// The strategy that the run asked for.
+        strategy: Strategy,
+    },
+    /// A vote names a scorer. A vote uses no scorer.
+    ScorerNotUsed,
+    /// The answer key of a vote is not valid.
+    InvalidAnswerKey,
+    /// The harness has no app key function with the id of the vote.
+    UnknownAnswerKey {
+        /// The id, cut to 64 bytes.
+        key: String,
+    },
+    /// A cascade tier names a model outside `cascade_models`.
+    TierModelNotAllowed {
+        /// The model that the tier names.
+        model: String,
+    },
+    /// The mandate of the profile does not allow the model of a cascade
+    /// tier. The run skips the tier, and it does not fail.
+    NotPermitted,
+    /// `agent_draws` cannot run the strategy. Only `agent_sample` runs it.
+    SampleOnly {
+        /// The strategy that the run asked for.
+        strategy: Strategy,
+    },
     /// The kind is not a valid agent kind.
     InvalidKind,
     /// No agent profile has the kind, so no task can be built.
     UnknownKind,
+    /// The mandate of the run refuses the draws. Each draw counts against
+    /// `max_draws` and against the fan-out of the mandate.
+    Mandate {
+        /// The refusal of the mandate: `draws_exceeded` or
+        /// `fan_out_exhausted`.
+        mandate: crate::mesh::Refusal,
+    },
 }
 
 /// The prefix of the error of a refused run.
@@ -94,8 +147,19 @@ impl Refusal {
             Self::TooManyAnswerRetries { .. } => "too_many_answer_retries",
             Self::UnknownScorer { .. } => "unknown_scorer",
             Self::OtherTenant => "other_tenant",
+            Self::NoItems => "no_items",
+            Self::TooManyItems { .. } => "too_many_items",
+            Self::ItemTooLarge { .. } => "item_too_large",
+            Self::NoScorer { .. } => "no_scorer",
+            Self::ScorerNotUsed => "scorer_not_used",
+            Self::InvalidAnswerKey => "invalid_answer_key",
+            Self::UnknownAnswerKey { .. } => "unknown_answer_key",
+            Self::TierModelNotAllowed { .. } => "tier_model_not_allowed",
+            Self::NotPermitted => "not_permitted",
+            Self::SampleOnly { .. } => "sample_only",
             Self::InvalidKind => "invalid_kind",
             Self::UnknownKind => "unknown_kind",
+            Self::Mandate { mandate } => mandate.code(),
         }
     }
 
@@ -138,8 +202,38 @@ impl std::fmt::Display for Refusal {
             ),
             Self::UnknownScorer { scorer } => write!(f, "the harness has no scorer {scorer}"),
             Self::OtherTenant => f.write_str("the profile of the kind belongs to another tenant"),
+            Self::NoItems => f.write_str("the sweep has no item"),
+            Self::TooManyItems { asked, max } => {
+                write!(f, "the sweep has {asked} items; the cap is {max}")
+            }
+            Self::ItemTooLarge { item, max } => {
+                write!(f, "item {item} is larger than {max} bytes")
+            }
+            Self::NoScorer { strategy } => write!(f, "{strategy} needs a scorer"),
+            Self::ScorerNotUsed => f.write_str("a vote uses no scorer"),
+            Self::InvalidAnswerKey => f.write_str("the answer key of the vote is not valid"),
+            Self::UnknownAnswerKey { key } => {
+                write!(f, "the harness has no answer key function {key}")
+            }
+            Self::TierModelNotAllowed { model } => write!(
+                f,
+                "the policy of this kind does not allow the tier model {model:?}"
+            ),
+            Self::NotPermitted => {
+                f.write_str("the mandate of this kind does not allow the model of the tier")
+            }
+            Self::SampleOnly { strategy } => {
+                write!(f, "only agent_sample runs {strategy}")
+            }
             Self::InvalidKind => f.write_str("the kind is not a valid agent kind"),
             Self::UnknownKind => f.write_str("no agent profile has the kind"),
+            Self::Mandate { mandate } => {
+                write!(
+                    f,
+                    "the mandate of the run refuses the draws ({})",
+                    mandate.code()
+                )
+            }
         }
     }
 }
@@ -323,6 +417,133 @@ pub const fn sample_step(
     SampleStep::Wave { width }
 }
 
+/// The concurrency of a sweep. See [`sweep_plan`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepPlan {
+    /// Run at most `items` items at the same time, each with at most
+    /// `draws` draws at the same time.
+    Run {
+        /// The items at the same time.
+        items: u32,
+        /// The draws of one item at the same time.
+        draws: u32,
+    },
+    /// The sweep asks for more items at the same time than the cap.
+    TooManyConcurrent,
+}
+
+/// The concurrency of a sweep under the policy cap `max_concurrent`.
+///
+/// `asked` is the item concurrency that the sweep asks for, or 0 for the
+/// cap. `wide` is the most draws that one item can run at the same time.
+/// The items and their draws share the cap, so `items * draws` is never
+/// above the cap. Both are at least 1.
+///
+/// `formal/verus/src/agent_sweep.rs` proves it.
+#[must_use]
+pub const fn sweep_plan(max_concurrent: u32, asked: u32, wide: u32) -> SweepPlan {
+    let mut cap = max_concurrent;
+    if cap > MAX_PARALLEL_CHILDREN {
+        cap = MAX_PARALLEL_CHILDREN;
+    }
+    if cap == 0 {
+        cap = 1;
+    }
+    if asked > cap {
+        return SweepPlan::TooManyConcurrent;
+    }
+    let items = if asked == 0 { cap } else { asked };
+    let mut draws = cap / items;
+    if draws > wide {
+        draws = wide;
+    }
+    if draws == 0 {
+        draws = 1;
+    }
+    SweepPlan::Run { items, draws }
+}
+
+/// The next step of a cascade run. See [`cascade_step`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CascadeStep {
+    /// Ask the tier `tier`.
+    Run {
+        /// The index of the tier.
+        tier: usize,
+    },
+    /// No tier that the mandate allows is left.
+    Done,
+    /// A tier is left, but the token budget is spent.
+    BudgetExceeded,
+}
+
+/// The next step of a cascade run whose next tier is `next`.
+///
+/// `allowed[i]` says whether the mandate allows the model of tier `i`. The
+/// step is the first allowed tier at or after `next`. The run skips each
+/// tier between them. `budgeted` says whether the run has a token budget,
+/// and `tokens_left` holds the rest of it.
+///
+/// `formal/verus/src/agent_sampling.rs` proves it.
+#[must_use]
+pub const fn cascade_step(
+    allowed: &[bool],
+    next: usize,
+    budgeted: bool,
+    tokens_left: u32,
+) -> CascadeStep {
+    let mut tier = next;
+    while tier < allowed.len() && !allowed[tier] {
+        tier += 1;
+    }
+    if tier >= allowed.len() {
+        return CascadeStep::Done;
+    }
+    if budgeted && tokens_left == 0 {
+        return CascadeStep::BudgetExceeded;
+    }
+    CascadeStep::Run { tier }
+}
+
+/// Refuse the first tier whose model is outside `cascade_models`.
+///
+/// It runs before the first model call. The refusal cuts a long model
+/// name.
+///
+/// # Errors
+///
+/// Returns [`Refusal::TierModelNotAllowed`].
+pub fn admit_tiers(policy: &SamplingPolicy, tiers: &[Tier]) -> Result<(), Refusal> {
+    tiers
+        .iter()
+        .find(|tier| !policy.cascade_models.contains(&tier.model))
+        .map_or(Ok(()), |tier| {
+            Err(Refusal::TierModelNotAllowed {
+                model: crate::harness::truncate(&tier.model, crate::mesh::MAX_ITEM_LEN),
+            })
+        })
+}
+
+/// The draws of a beam run: `width × expansion × max_rounds`.
+///
+/// The product saturates at `u32::MAX`, so an overflow asks for more than
+/// any policy allows. Each round expands at most `width` beams.
+///
+/// `formal/verus/src/agent_sampling.rs` proves it.
+#[must_use]
+pub const fn beam_draws(width: u32, expansion: u32, max_rounds: u32) -> u32 {
+    width.saturating_mul(expansion).saturating_mul(max_rounds)
+}
+
+/// The beams that a beam round may keep: `width` less the beams that are
+/// complete, and never below 0.
+///
+/// `formal/verus/src/agent_sampling.rs` proves it.
+#[must_use]
+pub const fn beam_slots(width: u32, complete: u32) -> u32 {
+    width.saturating_sub(complete)
+}
+
 /// Compare `ask` with `policy`.
 ///
 /// The checks go in order: the strategy, the draw count, the concurrency,
@@ -337,28 +558,54 @@ pub fn admit(policy: &SamplingPolicy, ask: &Ask<'_>) -> Result<Admission, Refusa
             strategy: ask.strategy,
         });
     }
+    admit_draws(policy, ask.draws, ask.concurrency, ask.scorer)
+}
+
+/// Compare a single draw with `policy`.
+///
+/// The default policy makes each run a single draw, so the policy needs no
+/// strategy for it. The concurrency and the scorer checks still apply.
+///
+/// # Errors
+///
+/// Returns the first [`Refusal`].
+pub(super) fn admit_single(
+    policy: &SamplingPolicy,
+    concurrency: u32,
+    scorer: Option<&ScorerRef>,
+) -> Result<Admission, Refusal> {
+    admit_draws(policy, 1, concurrency, scorer)
+}
+
+/// The checks of [`admit`] after the strategy check.
+fn admit_draws(
+    policy: &SamplingPolicy,
+    asked_draws: u32,
+    asked_concurrency: u32,
+    scorer: Option<&ScorerRef>,
+) -> Result<Admission, Refusal> {
     let (draws, concurrency) = match draw_plan(
         policy.max_draws,
         policy.max_concurrent_draws,
-        ask.draws,
-        ask.concurrency,
+        asked_draws,
+        asked_concurrency,
     ) {
         DrawPlan::Run { draws, concurrency } => (draws, concurrency),
         DrawPlan::NoDraws => return Err(Refusal::NoDraws),
         DrawPlan::TooManyDraws => {
             return Err(Refusal::TooManyDraws {
-                asked: ask.draws,
+                asked: asked_draws,
                 max: policy.max_draws,
             });
         }
         DrawPlan::TooManyConcurrent => {
             return Err(Refusal::TooManyConcurrentDraws {
-                asked: ask.concurrency,
+                asked: asked_concurrency,
                 max: policy.max_concurrent_draws.min(MAX_PARALLEL_CHILDREN),
             });
         }
     };
-    if let Some(scorer) = ask.scorer {
+    if let Some(scorer) = scorer {
         check_scorer(policy, scorer)?;
     }
     Ok(Admission {
@@ -413,6 +660,36 @@ mod tests {
             draws,
             concurrency: 0,
             scorer: None,
+        }
+    }
+
+    #[test]
+    fn a_sweep_plan_shares_the_cap() {
+        assert_eq!(sweep_plan(4, 2, 3), SweepPlan::Run { items: 2, draws: 2 });
+        assert_eq!(sweep_plan(4, 0, 3), SweepPlan::Run { items: 4, draws: 1 });
+        assert_eq!(sweep_plan(8, 3, 1), SweepPlan::Run { items: 3, draws: 1 });
+        assert_eq!(sweep_plan(2, 3, 1), SweepPlan::TooManyConcurrent);
+        assert_eq!(sweep_plan(0, 0, 0), SweepPlan::Run { items: 1, draws: 1 });
+    }
+
+    proptest! {
+        #[test]
+        fn a_sweep_plan_never_passes_the_cap(
+            max_concurrent in 0_u32..64,
+            asked in 0_u32..64,
+            wide in 0_u32..300,
+        ) {
+            let cap = max_concurrent.clamp(1, MAX_PARALLEL_CHILDREN);
+            match sweep_plan(max_concurrent, asked, wide) {
+                SweepPlan::Run { items, draws } => {
+                    prop_assert!(asked <= cap);
+                    prop_assert!(items >= 1 && draws >= 1);
+                    prop_assert!(items * draws <= cap);
+                    prop_assert!(draws <= wide.max(1));
+                    prop_assert!(asked == 0 || items == asked);
+                }
+                SweepPlan::TooManyConcurrent => prop_assert!(asked > cap),
+            }
         }
     }
 
@@ -537,6 +814,19 @@ mod tests {
             text,
             "sampling refused (too_many_draws): the run asks for 5 draws; the policy allows 4"
         );
+        let mandate = Refusal::Mandate {
+            mandate: crate::mesh::Refusal::DrawsExceeded,
+        };
+        assert_eq!(mandate.code(), "draws_exceeded");
+        assert_eq!(
+            serde_json::to_value(&mandate).unwrap(),
+            serde_json::json!({"refusal": "mandate", "mandate": "draws_exceeded"})
+        );
+        assert!(
+            mandate
+                .error_text()
+                .starts_with("sampling refused (draws_exceeded)")
+        );
     }
 
     fn check(retries: u32) -> AnswerCheck {
@@ -612,6 +902,127 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_cascade_step_skips_each_forbidden_tier() {
+        let allowed = [false, true, false, true];
+        assert_eq!(
+            cascade_step(&allowed, 0, false, 0),
+            CascadeStep::Run { tier: 1 }
+        );
+        assert_eq!(
+            cascade_step(&allowed, 2, false, 0),
+            CascadeStep::Run { tier: 3 }
+        );
+        assert_eq!(cascade_step(&allowed, 4, false, 0), CascadeStep::Done);
+        assert_eq!(cascade_step(&allowed, 9, false, 0), CascadeStep::Done);
+        assert_eq!(cascade_step(&[false, false], 0, true, 0), CascadeStep::Done);
+        assert_eq!(
+            cascade_step(&allowed, 0, true, 0),
+            CascadeStep::BudgetExceeded
+        );
+        assert_eq!(
+            cascade_step(&allowed, 0, true, 1),
+            CascadeStep::Run { tier: 1 }
+        );
+        assert_eq!(cascade_step(&[], 0, false, 0), CascadeStep::Done);
+    }
+
+    #[test]
+    fn each_tier_model_must_be_in_the_policy() {
+        let tiers = [
+            Tier::new("cheap", crate::FiniteF64::ONE),
+            Tier::new("strong", crate::FiniteF64::ONE),
+        ];
+        let mut policy = SamplingPolicy::default();
+        assert_eq!(
+            admit_tiers(&policy, &tiers),
+            Err(Refusal::TierModelNotAllowed {
+                model: "cheap".to_owned()
+            })
+        );
+        policy.cascade_models.insert("cheap".to_owned());
+        assert_eq!(
+            admit_tiers(&policy, &tiers),
+            Err(Refusal::TierModelNotAllowed {
+                model: "strong".to_owned()
+            })
+        );
+        policy.cascade_models.insert("strong".to_owned());
+        assert_eq!(admit_tiers(&policy, &tiers), Ok(()));
+        let long = Tier::new("m".repeat(10_000), crate::FiniteF64::ONE);
+        let Err(Refusal::TierModelNotAllowed { model }) = admit_tiers(&policy, &[long]) else {
+            panic!("a long model is refused");
+        };
+        assert!(model.len() < 1_000, "the error cuts the model");
+        assert_eq!(
+            Refusal::TierModelNotAllowed {
+                model: "x".to_owned()
+            }
+            .error_text(),
+            "sampling refused (tier_model_not_allowed): the policy of this kind does not allow the tier model \"x\""
+        );
+        assert_eq!(Refusal::NotPermitted.code(), "not_permitted");
+    }
+
+    proptest! {
+        #[test]
+        fn a_cascade_step_never_runs_a_forbidden_tier(
+            allowed in proptest::collection::vec(proptest::bool::ANY, 0..12),
+            next in 0_usize..14,
+            budgeted: bool,
+            tokens_left in 0_u32..3,
+        ) {
+            let first = (next..allowed.len()).find(|&i| allowed[i]);
+            match cascade_step(&allowed, next, budgeted, tokens_left) {
+                CascadeStep::Run { tier } => {
+                    prop_assert_eq!(Some(tier), first);
+                    prop_assert!(!(budgeted && tokens_left == 0));
+                }
+                CascadeStep::Done => prop_assert_eq!(first, None),
+                CascadeStep::BudgetExceeded => {
+                    prop_assert!(first.is_some() && budgeted && tokens_left == 0);
+                }
+            }
+            // A loop that moves past each tier runs each allowed tier once.
+            let mut ran = Vec::new();
+            let mut at = 0;
+            while let CascadeStep::Run { tier } = cascade_step(&allowed, at, false, 0) {
+                ran.push(tier);
+                at = tier + 1;
+            }
+            let expected: Vec<usize> = (0..allowed.len()).filter(|&i| allowed[i]).collect();
+            prop_assert_eq!(ran, expected);
+        }
+    }
+
+    #[test]
+    fn the_beam_draws_are_the_saturated_product() {
+        assert_eq!(beam_draws(2, 2, 3), 12);
+        assert_eq!(beam_draws(0, 2, 3), 0);
+        assert_eq!(beam_draws(2, 0, 3), 0);
+        assert_eq!(beam_draws(2, 2, 0), 0);
+        assert_eq!(beam_draws(u32::MAX, 2, 1), u32::MAX);
+        assert_eq!(beam_draws(65_536, 65_536, 2), u32::MAX);
+    }
+
+    #[test]
+    fn the_beam_slots_are_the_width_less_the_complete_beams() {
+        assert_eq!(beam_slots(2, 0), 2);
+        assert_eq!(beam_slots(2, 1), 1);
+        assert_eq!(beam_slots(2, 2), 0);
+        assert_eq!(beam_slots(2, 5), 0);
+    }
+
+    #[test]
+    fn a_beam_over_max_draws_is_refused() {
+        let policy = allowing(Strategy::Beam, 11, 4);
+        assert_eq!(
+            admit(&policy, &ask(Strategy::Beam, beam_draws(2, 2, 3))),
+            Err(Refusal::TooManyDraws { asked: 12, max: 11 })
+        );
+        assert!(admit(&policy, &ask(Strategy::Beam, beam_draws(2, 2, 2))).is_ok());
+    }
+
     proptest! {
         #[test]
         fn a_sample_step_never_passes_a_bound(
@@ -668,6 +1079,34 @@ mod tests {
                 }
                 prop_assert_eq!(seen, run);
             }
+        }
+
+        #[test]
+        fn a_model_beam_never_runs_more_steps_than_its_draws(
+            width in 0_u32..=6,
+            expansion in 0_u32..=6,
+            rounds in 0_u32..=6,
+            completes in proptest::collection::vec(0_u32..=6, 0..=6),
+        ) {
+            // A model of the loop of `run_beam`. Each round expands at most
+            // the open slots. The draws bound each schedule that the
+            // completions allow. `keep_beams` has its own unit test.
+            let mut complete = 0_u32;
+            let mut live = 1_u32;
+            let mut steps = 0_u32;
+            for round in 0..rounds {
+                let slots = beam_slots(width, complete);
+                if slots == 0 || live == 0 {
+                    break;
+                }
+                prop_assert!(live <= width.max(1));
+                steps += live * expansion;
+                let kept = slots.min(live * expansion);
+                let done = completes.get(round as usize).copied().unwrap_or(0).min(kept);
+                complete += done;
+                live = kept - done;
+            }
+            prop_assert!(steps <= beam_draws(width, expansion, rounds));
         }
 
         #[test]

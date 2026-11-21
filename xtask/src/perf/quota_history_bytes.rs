@@ -1,4 +1,5 @@
-//! `cargo xtask perf quota-history-bytes`: the port of `autumn-harvest/scripts/quota_history_bytes_perf_repro.sh`.
+//! `cargo xtask perf quota-history-bytes`: the port of
+//! `autumn-harvest/scripts/quota_history_bytes_perf_repro.sh`.
 //!
 //! The reproduction harness for the quota `history_bytes` admission-check
 //! measurement (issue #946 AC7, Ledger perf pass).

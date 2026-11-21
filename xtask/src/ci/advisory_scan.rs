@@ -216,17 +216,24 @@ fn run_cargo_deny(log: &Path) -> Result<u8> {
 }
 
 /// Maps a child exit status to an exit code, as a POSIX shell does.
+///
+/// Clone-class note: this function, `gh_output`, `gh_status`,
+/// `open_issue_titled`, and `issue_number_titled` below repeat verbatim, or
+/// near-verbatim, in [`crate::ci::chaos_watchdog`]. Apply a change in the
+/// `gh` pagination, the pull-request exclusion filter, or the exit-code
+/// mapping to both modules.
+///
+/// Two instances only. Neither module has a commit past its creation in PR
+/// #2574, so neither has a co-change or a missed-fix to cite. The
+/// duplication predates the port. `.github/ci/advisory-scan.sh` (issue
+/// #1826, PR #1928) and `.github/ci/chaos-watchdog.sh` (issue #1790, PR
+/// #1841) hand-rolled the same `gh api --paginate` and issue-lookup
+/// convention independently, months apart. PR #2574 then hand-translated
+/// each script into its own Rust module, rather than factoring one shared
+/// module. The merge-evidence bar (rule of three, or a missed-fix) is not
+/// met yet. See the note on `chaos_watchdog::exit_code`.
 fn exit_code(status: ExitStatus) -> u8 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(signal) = status.signal() {
-            return u8::try_from(128 + signal).unwrap_or(u8::MAX);
-        }
-    }
-    status.code().map_or(1, |code| {
-        u8::try_from(code.rem_euclid(256)).unwrap_or(u8::MAX)
-    })
+    crate::perf::support::status_code(status)
 }
 
 /// Runs `gh` with `args` and returns its stdout.
@@ -398,6 +405,27 @@ fn finding_body(status: u8, run_url: &str, ids: &str, log: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exit_code_passes_through_a_normal_status() {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 42")
+            .status()
+            .unwrap();
+        assert_eq!(exit_code(status), 42);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_code_maps_a_signal_to_128_plus_signal() {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("kill -9 $$")
+            .status()
+            .unwrap();
+        assert_eq!(exit_code(status), 137);
+    }
 
     const LISTING: &str = r#"[{"number":5,"title":"Other"}]
 [{"number":9,"title":"Advisory scan: cargo deny check advisories failed","pull_request":{}},

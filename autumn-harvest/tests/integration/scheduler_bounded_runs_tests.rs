@@ -5,19 +5,21 @@
 //! correctly terminate schedules after the configured boundary, and that skipped
 //! firings (overlap policy, calendar) do NOT consume the `max_runs` budget.
 
+use autumn_harvest::time::sql::SqlTimestamp;
+use jiff_diesel::ToDiesel;
 use std::sync::Arc;
 
 use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::schema::{harvest_schedule_decisions, harvest_schedules};
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::{DagCatalog, SchedulerMonitor, WorkflowContext, tick_once};
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -46,7 +48,7 @@ fn workflow_schedule_max_runs_defaults_to_none() {
 #[test]
 fn workflow_schedule_with_end_at_builder() {
     use autumn_harvest::policy::{Schedule, WorkflowSchedule};
-    let cutoff = Utc::now() + chrono::Duration::days(7);
+    let cutoff = Timestamp::now() + autumn_harvest::time::days(7);
     let sched = WorkflowSchedule::new("my_wf", Schedule::Manual).with_end_at(cutoff);
     assert_eq!(sched.end_at, Some(cutoff));
 }
@@ -63,7 +65,7 @@ fn workflow_schedule_with_max_runs_builder() {
 #[test]
 fn workflow_schedule_end_conditions_can_be_chained() {
     use autumn_harvest::policy::{Schedule, WorkflowSchedule};
-    let cutoff = Utc::now() + chrono::Duration::days(30);
+    let cutoff = Timestamp::now() + autumn_harvest::time::days(30);
     let sched = WorkflowSchedule::new(
         "promo_wf",
         Schedule::Interval(std::time::Duration::from_hours(24)),
@@ -154,11 +156,11 @@ fn make_pool(url: &str) -> DbPool {
 async fn insert_bounded_schedule(
     conn: &mut AsyncPgConnection,
     wf_name: &str,
-    end_at: Option<chrono::DateTime<Utc>>,
+    end_at: Option<jiff::Timestamp>,
     max_runs: Option<i32>,
 ) -> Uuid {
     use autumn_harvest::schema::harvest_schedules::dsl;
-    let now = Utc::now();
+    let now = Timestamp::now();
     let id = Uuid::new_v4();
     diesel::insert_into(harvest_schedules::table)
         .values((
@@ -169,13 +171,13 @@ async fn insert_bounded_schedule(
             dsl::catchup.eq(false),
             dsl::max_active_runs.eq(10),
             dsl::is_paused.eq(false),
-            dsl::next_run_at.eq(now - chrono::Duration::seconds(5)),
+            dsl::next_run_at.eq((now - jiff::SignedDuration::from_secs(5)).to_diesel()),
             dsl::jitter_secs.eq(0_i64),
             dsl::overlap_policy.eq("skip"),
             dsl::buffered_runs.eq(serde_json::json!([])),
             dsl::buffer_all_max.eq(100),
             dsl::skip_policy.eq("skip"),
-            dsl::end_at.eq(end_at),
+            dsl::end_at.eq(end_at.to_diesel()),
             dsl::max_runs.eq(max_runs),
         ))
         .execute(conn)
@@ -193,7 +195,7 @@ async fn schedule_exhausted_by_end_at_does_not_fire() {
 
     let wf_name = "br_end_at_stop_wf";
     // end_at is in the past relative to next_run_at (which is 5s ago).
-    let end_at = Utc::now() - chrono::Duration::seconds(60);
+    let end_at = Timestamp::now() - jiff::SignedDuration::from_secs(60);
     let sched_id = insert_bounded_schedule(&mut conn, wf_name, Some(end_at), None).await;
     drop(conn);
 
@@ -215,7 +217,6 @@ async fn schedule_exhausted_by_end_at_does_not_fire() {
         .await
         .expect("check conn");
 
-    // No execution must have been created.
     let exec_count: i64 = autumn_harvest::schema::harvest_workflow_executions::table
         .filter(autumn_harvest::schema::harvest_workflow_executions::dsl::workflow_name.eq(wf_name))
         .count()
@@ -227,8 +228,7 @@ async fn schedule_exhausted_by_end_at_does_not_fire() {
         "no run must be started when end_at is reached"
     );
 
-    // Schedule must be exhausted.
-    let (exhausted_at, exhausted_reason): (Option<chrono::DateTime<Utc>>, Option<String>) =
+    let (exhausted_at, exhausted_reason): (Option<SqlTimestamp>, Option<String>) =
         harvest_schedules::table
             .find(sched_id)
             .select((
@@ -257,7 +257,7 @@ async fn schedule_before_end_at_fires_normally() {
 
     let wf_name = "br_before_end_at_wf";
     // end_at is 1 hour in the future — schedule is still active.
-    let end_at = Utc::now() + chrono::Duration::hours(1);
+    let end_at = Timestamp::now() + jiff::SignedDuration::from_hours(1);
     let sched_id = insert_bounded_schedule(&mut conn, wf_name, Some(end_at), None).await;
     drop(conn);
 
@@ -290,7 +290,7 @@ async fn schedule_before_end_at_fires_normally() {
         "exactly one execution must be created when before end_at"
     );
 
-    let exhausted_at: Option<chrono::DateTime<Utc>> = harvest_schedules::table
+    let exhausted_at: Option<SqlTimestamp> = harvest_schedules::table
         .find(sched_id)
         .select(harvest_schedules::dsl::exhausted_at)
         .first(&mut check)
@@ -312,7 +312,6 @@ async fn schedule_exhausted_by_max_runs_does_not_fire() {
     // Budget of 3, already used up.
     let sched_id = insert_bounded_schedule(&mut conn, wf_name, None, Some(3)).await;
 
-    // Simulate budget already exhausted by setting runs_started = 3.
     diesel::update(harvest_schedules::table.find(sched_id))
         .set(harvest_schedules::dsl::runs_started.eq(3))
         .execute(&mut conn)
@@ -349,7 +348,7 @@ async fn schedule_exhausted_by_max_runs_does_not_fire() {
         "no run must be started when max_runs budget is exhausted"
     );
 
-    let (exhausted_at, exhausted_reason): (Option<chrono::DateTime<Utc>>, Option<String>) =
+    let (exhausted_at, exhausted_reason): (Option<SqlTimestamp>, Option<String>) =
         harvest_schedules::table
             .find(sched_id)
             .select((
@@ -410,16 +409,15 @@ async fn max_runs_1_fires_once_then_exhausts() {
         "exactly one execution must be created on first tick"
     );
 
-    let (exhausted_at, runs_started): (Option<chrono::DateTime<Utc>>, i32) =
-        harvest_schedules::table
-            .find(sched_id)
-            .select((
-                harvest_schedules::dsl::exhausted_at,
-                harvest_schedules::dsl::runs_started,
-            ))
-            .first(&mut check)
-            .await
-            .expect("select after first tick");
+    let (exhausted_at, runs_started): (Option<SqlTimestamp>, i32) = harvest_schedules::table
+        .find(sched_id)
+        .select((
+            harvest_schedules::dsl::exhausted_at,
+            harvest_schedules::dsl::runs_started,
+        ))
+        .first(&mut check)
+        .await
+        .expect("select after first tick");
     assert!(
         exhausted_at.is_some(),
         "schedule must be exhausted after consuming max_runs=1"
@@ -436,7 +434,6 @@ async fn runs_started_incremented_per_dispatch() {
     let (mut conn, url, _c) = setup_db().await;
 
     let wf_name = "br_runs_started_wf";
-    // Budget of 5, nothing consumed yet.
     let sched_id = insert_bounded_schedule(&mut conn, wf_name, None, Some(5)).await;
     drop(conn);
 
@@ -469,7 +466,7 @@ async fn runs_started_incremented_per_dispatch() {
         "runs_started must be 1 after one successful dispatch"
     );
 
-    let exhausted_at: Option<chrono::DateTime<Utc>> = harvest_schedules::table
+    let exhausted_at: Option<SqlTimestamp> = harvest_schedules::table
         .find(sched_id)
         .select(harvest_schedules::dsl::exhausted_at)
         .first(&mut check)
@@ -492,7 +489,7 @@ async fn exhausted_schedule_stays_exhausted() {
     diesel::update(harvest_schedules::table.find(sched_id))
         .set((
             harvest_schedules::dsl::runs_started.eq(2),
-            harvest_schedules::dsl::exhausted_at.eq(Some(Utc::now())),
+            harvest_schedules::dsl::exhausted_at.eq(Some(Timestamp::now()).to_diesel()),
             harvest_schedules::dsl::exhausted_reason.eq(Some("max_runs_exhausted")),
         ))
         .execute(&mut conn)
@@ -568,7 +565,7 @@ async fn schedule_without_bounds_fires_normally() {
         .expect("count executions");
     assert_eq!(exec_count, 1, "unbounded schedule must fire normally");
 
-    let exhausted_at: Option<chrono::DateTime<Utc>> = harvest_schedules::table
+    let exhausted_at: Option<SqlTimestamp> = harvest_schedules::table
         .find(sched_id)
         .select(harvest_schedules::dsl::exhausted_at)
         .first(&mut check)
@@ -634,7 +631,7 @@ async fn decision_log_records_end_at_reached() {
     let (mut conn, url, _c) = setup_db().await;
 
     let wf_name = "br_decision_end_at_wf";
-    let end_at = Utc::now() - chrono::Duration::minutes(1);
+    let end_at = Timestamp::now() - jiff::SignedDuration::from_mins(1);
     let sched_id = insert_bounded_schedule(&mut conn, wf_name, Some(end_at), None).await;
     drop(conn);
 

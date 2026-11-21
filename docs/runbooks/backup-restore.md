@@ -59,6 +59,13 @@ in a schema-and-data restore with constraints enforced, those probes are
 expected to return zero. Run them anyway: they are the cheapest possible check
 and the failure they catch is silent.
 
+The DLQ depth gauge reads `harvest_dead_letter_counts`. Triggers on
+`harvest_dead_letters` keep it exact. A full schema-and-data restore and a
+`--disable-triggers` restore copy both tables, so they agree. A data-only
+restore with the triggers on, or a restore of `harvest_dead_letters` alone,
+does not. After such a restore, run `SELECT harvest_dead_letter_recount();`
+on each shard as the table owner, at `READ COMMITTED`.
+
 ---
 
 ## 2. Post-restore semantics: what resumes, what re-runs
@@ -406,7 +413,7 @@ below, so the verifying binary must ask for the feature explicitly:
 ```toml
 # Cargo.toml of the binary that runs the drill
 [dependencies]
-autumn-harvest = { version = "0.10", features = ["db", "testing"] }
+autumn-harvest = { version = "0.11", features = ["db", "testing"] }
 ```
 
 `testing` pulls in no extra runtime dependency and is safe in a drill binary;

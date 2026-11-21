@@ -1,11 +1,11 @@
 //! Balanced-delimiter text helpers for the *paths and types* MIR prints.
 //!
-//! Four of the analyzer's modules — [`crate::model::callee`],
+//! Four of the analyzer's modules ask the same handful of questions about a
+//! printed path or type. They are [`crate::model::callee`],
 //! [`crate::model::matcher`], [`crate::resolve`] and its `subst`/`impls`
-//! submodules — all have to answer the same handful of questions about a
-//! printed path or type: where does this segment end, what are its generic
-//! arguments, what is its last `::` segment, is this rule a suffix of that
-//! path. Each question has exactly one implementation, and it lives here.
+//! submodules. Where does this segment end? What are its generic arguments?
+//! What is its last `::` segment? Is this rule a suffix of that path? Each
+//! question has exactly one implementation, and it lives here.
 //!
 //! # The one rule everything obeys
 //!
@@ -13,8 +13,8 @@
 //! `<<T as IntoIterator>::IntoIter as Iterator>::collect::<Vec<(String, u32)>>`
 //! and `Box<dyn Fn() -> String>`, which contain ` as `, `,` and `>` at nesting
 //! depths a naive `split` cannot see. Every helper here tracks `<>`, `()`,
-//! `[]` and `{}` depth, and treats the `>` of an `->` arrow as part of the
-//! arrow rather than as a closing bracket.
+//! `[]` and `{}` depth. It treats the `>` of an `->` arrow as part of the
+//! arrow, not as a closing bracket.
 //!
 //! # Tolerance
 //!
@@ -170,8 +170,8 @@ pub fn peel_refs(ty: &str) -> &str {
 /// `Pin` — and any references, repeatedly.
 ///
 /// `Box<dyn Jitter>` → `dyn Jitter`; `&Arc<Mutex<Vec<u64>>>` → `Mutex<Vec<u64>>`.
-/// A wrapper is transparent for both questions the analyzer asks of a type
-/// (which trait object is inside, and whether a static is ambient), so both
+/// The analyzer asks two questions of a type: which trait object is inside, and
+/// whether a static is ambient. A wrapper is transparent for both, so both
 /// callers peel with this one function.
 pub fn peel_containers(ty: &str) -> &str {
     const TRANSPARENT: [&str; 4] = ["Box", "Arc", "Rc", "Pin"];
@@ -279,9 +279,9 @@ pub fn segments(path: &str) -> Vec<&str> {
 /// True when `needle`'s `::` segments are a suffix of `have`.
 ///
 /// This is *the* path-matching rule of the model and of
-/// [`crate::model::callee::CalleePath::ends_with_path`]: MIR prints rustc's
-/// **trimmed** def-paths, so a rule keyed on a full path would match nothing,
-/// and a rule is therefore always a suffix of what was printed.
+/// [`crate::model::callee::CalleePath::ends_with_path`]. MIR prints rustc's
+/// **trimmed** def-paths, so a rule keyed on a full path would match nothing.
+/// A rule is therefore always a suffix of what was printed.
 pub fn is_segment_suffix<S: AsRef<str>>(needle: &str, have: &[S]) -> bool {
     let want = segments(needle);
     if want.is_empty() || want.len() > have.len() {
@@ -318,8 +318,8 @@ pub fn peel_path_head(text: &str) -> &str {
 ///
 /// `Some` only when the leading identifier starts with a lowercase ASCII letter
 /// and is followed by `::`. rustc's trimmed prints (`SystemTime::now`,
-/// `String::len`) therefore have no crate root at all, which is exactly what
-/// keeps a `[[trusted]]` row from matching a type named like a crate.
+/// `String::len`) therefore have no crate root at all. That keeps a
+/// `[[trusted]]` row from matching a type named like a crate.
 pub fn crate_root(text: &str) -> Option<&str> {
     let text = text.trim();
     let end = text

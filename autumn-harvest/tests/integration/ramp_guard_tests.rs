@@ -238,6 +238,7 @@ fn make_worker(build_id: &str, info: WorkflowInfo, metrics: Arc<RecordingMetrics
     ));
     Worker::new(
         WorkerRuntimeConfig {
+            gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
             codec_rotation_batch_size: 0,
             dr: autumn_harvest::replication::DrConfig::default(),
             worker_id: uuid::Uuid::new_v4().to_string(),
@@ -248,6 +249,8 @@ fn make_worker(build_id: &str, info: WorkflowInfo, metrics: Arc<RecordingMetrics
             max_concurrent_workflows: 10,
             max_concurrent_activities: 10,
             max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
+            claim_slots_per_shard: None,
+            claim_batch_max: None,
             poll_interval: Duration::from_millis(50),
             shutdown_timeout: Duration::from_secs(2),
             cancellation_grace_period: Duration::from_secs(2),
@@ -492,7 +495,6 @@ async fn ramp_aborts_automatically_when_target_build_fails_every_run() {
         )]
     );
 
-    // The worker metrics carry the build of the worker that ran the task.
     // The worker metrics carry the build of the worker that ran the task.
     // The label cap is process-wide. A full local run of every suite in one
     // process can fill it first, so `__other__` is also accepted.
@@ -1247,13 +1249,13 @@ async fn a_blocked_clear_fails_on_the_server_and_changes_nothing() {
     );
 }
 
-/// Set the test ramp on one pool with a given `ramp_id`, as the API fan-out
-/// does on every shard.
 /// The `ramp_id` that [`set_ramp_with_id`] stores for a caller id.
 fn stored(ramp_id: uuid::Uuid) -> uuid::Uuid {
     ramp_generation_id(ramp_id, QUEUE, BUILD_A, BUILD_B)
 }
 
+/// Set the test ramp on one pool with a given `ramp_id`, as the API fan-out
+/// does on every shard.
 async fn set_ramp_with_id(conn: &mut AsyncPgConnection, ramp_id: uuid::Uuid) {
     set_build_policy(conn, QUEUE, BUILD_A, None)
         .await
@@ -1263,7 +1265,7 @@ async fn set_ramp_with_id(conn: &mut AsyncPgConnection, ramp_id: uuid::Uuid) {
         .expect("set ramp");
 }
 
-async fn policy_step(conn: &mut AsyncPgConnection) -> chrono::DateTime<chrono::Utc> {
+async fn policy_step(conn: &mut AsyncPgConnection) -> jiff::Timestamp {
     get_build_policy(conn, QUEUE)
         .await
         .expect("read policy")

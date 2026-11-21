@@ -2,7 +2,8 @@
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
 use autumn_harvest::table_split::Ext;
-use chrono::Utc;
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 use serde_json::{Value, json};
 use std::future::Future;
 use std::pin::Pin;
@@ -82,8 +83,8 @@ async fn test_replay_canary_simple_pass() {
             harvest_workflow_executions::state.eq("RUNNING".to_string()),
             harvest_workflow_executions::input.eq(json!("hi")),
             harvest_workflow_executions::queue_name.eq("default".to_string()),
-            harvest_workflow_executions::started_at.eq(Utc::now()),
-            harvest_workflow_executions::created_at.eq(Utc::now()),
+            harvest_workflow_executions::started_at.eq(Timestamp::now().to_diesel()),
+            harvest_workflow_executions::created_at.eq(Timestamp::now().to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -91,7 +92,7 @@ async fn test_replay_canary_simple_pass() {
 
     let event = WorkflowEvent::WorkflowStarted {
         input: json!("hi"),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -104,13 +105,12 @@ async fn test_replay_canary_simple_pass() {
             harvest_events::event_id.eq(1),
             harvest_events::event_type.eq("WorkflowStarted".to_string()),
             harvest_events::event_data.eq(event_json),
-            harvest_events::timestamp.eq(Utc::now()),
+            harvest_events::timestamp.eq(Timestamp::now().to_diesel()),
         ))
         .execute(&mut conn)
         .await
         .unwrap();
 
-    // Run the canary.
     let replayer = WorkflowReplayer::new().register_fn("hello", hello_workflow);
     let options = ReplayCanaryOptions {
         sample_size: 10,
@@ -167,17 +167,16 @@ async fn test_replay_canary_suspended_workflow() {
             harvest_workflow_executions::state.eq("RUNNING".to_string()),
             harvest_workflow_executions::input.eq(json!("hi")),
             harvest_workflow_executions::queue_name.eq("default".to_string()),
-            harvest_workflow_executions::started_at.eq(Utc::now()),
-            harvest_workflow_executions::created_at.eq(Utc::now()),
+            harvest_workflow_executions::started_at.eq(Timestamp::now().to_diesel()),
+            harvest_workflow_executions::created_at.eq(Timestamp::now().to_diesel()),
         ))
         .execute(&mut conn)
         .await
         .unwrap();
 
-    // Event 1: WorkflowStarted
     let start_event = WorkflowEvent::WorkflowStarted {
         input: json!("hi"),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -190,13 +189,12 @@ async fn test_replay_canary_suspended_workflow() {
             harvest_events::event_id.eq(1),
             harvest_events::event_type.eq("WorkflowStarted".to_string()),
             harvest_events::event_data.eq(start_json),
-            harvest_events::timestamp.eq(Utc::now()),
+            harvest_events::timestamp.eq(Timestamp::now().to_diesel()),
         ))
         .execute(&mut conn)
         .await
         .unwrap();
 
-    // Event 2: ActivityScheduled
     let act_event = WorkflowEvent::ActivityScheduled {
         activity_id: ActivityExecId::new(),
         name: "my_activity".to_string(),
@@ -211,13 +209,12 @@ async fn test_replay_canary_suspended_workflow() {
             harvest_events::event_id.eq(2),
             harvest_events::event_type.eq("ActivityScheduled".to_string()),
             harvest_events::event_data.eq(act_json),
-            harvest_events::timestamp.eq(Utc::now()),
+            harvest_events::timestamp.eq(Timestamp::now().to_diesel()),
         ))
         .execute(&mut conn)
         .await
         .unwrap();
 
-    // Run the canary.
     let replayer = WorkflowReplayer::new().register_fn("activity_wf", activity_workflow);
     let options = ReplayCanaryOptions {
         sample_size: 10,
@@ -228,7 +225,7 @@ async fn test_replay_canary_suspended_workflow() {
         .await
         .expect("canary run");
 
-    // This should PASS because suspending at the end of history for a RUNNING workflow is expected.
+    // A RUNNING workflow may suspend at the end of history, so the canary passes.
     assert_eq!(report.verdict, CanaryVerdict::Pass);
     assert_eq!(report.sampled, 1);
     assert_eq!(report.replay_succeeded, 1);
@@ -262,17 +259,16 @@ async fn test_replay_canary_divergent_workflow() {
             harvest_workflow_executions::state.eq("RUNNING".to_string()),
             harvest_workflow_executions::input.eq(json!("hi")),
             harvest_workflow_executions::queue_name.eq("default".to_string()),
-            harvest_workflow_executions::started_at.eq(Utc::now()),
-            harvest_workflow_executions::created_at.eq(Utc::now()),
+            harvest_workflow_executions::started_at.eq(Timestamp::now().to_diesel()),
+            harvest_workflow_executions::created_at.eq(Timestamp::now().to_diesel()),
         ))
         .execute(&mut conn)
         .await
         .unwrap();
 
-    // Event 1: WorkflowStarted
     let start_event = WorkflowEvent::WorkflowStarted {
         input: json!("hi"),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -285,13 +281,13 @@ async fn test_replay_canary_divergent_workflow() {
             harvest_events::event_id.eq(1),
             harvest_events::event_type.eq("WorkflowStarted".to_string()),
             harvest_events::event_data.eq(start_json),
-            harvest_events::timestamp.eq(Utc::now()),
+            harvest_events::timestamp.eq(Timestamp::now().to_diesel()),
         ))
         .execute(&mut conn)
         .await
         .unwrap();
 
-    // Event 2: ActivityScheduled with a mismatching activity name "different_activity"
+    // A mismatching activity name, "different_activity".
     let act_event = WorkflowEvent::ActivityScheduled {
         activity_id: ActivityExecId::new(),
         name: "different_activity".to_string(),
@@ -306,13 +302,12 @@ async fn test_replay_canary_divergent_workflow() {
             harvest_events::event_id.eq(2),
             harvest_events::event_type.eq("ActivityScheduled".to_string()),
             harvest_events::event_data.eq(act_json),
-            harvest_events::timestamp.eq(Utc::now()),
+            harvest_events::timestamp.eq(Timestamp::now().to_diesel()),
         ))
         .execute(&mut conn)
         .await
         .unwrap();
 
-    // Run the canary.
     let replayer = WorkflowReplayer::new().register_fn("activity_wf", activity_workflow);
     let options = ReplayCanaryOptions {
         sample_size: 10,
@@ -323,7 +318,7 @@ async fn test_replay_canary_divergent_workflow() {
         .await
         .expect("canary run");
 
-    // This should FAIL because code scheduled "my_activity" but history expected "different_activity".
+    // The code schedules "my_activity", but history holds "different_activity".
     assert_eq!(report.verdict, CanaryVerdict::Fail);
     assert_eq!(report.sampled, 1);
     assert_eq!(report.replay_succeeded, 0);

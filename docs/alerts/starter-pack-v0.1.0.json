@@ -481,7 +481,7 @@
       "id": "harvest_shard_undrained",
       "status": "enforceable",
       "signal_source": "The harvest.shard.stranded_pending gauge, sampled per shard by the worker's stranded-work sampler (issue #522), cross-checked against the harvest.shard.dispatched counter (issue #961).",
-      "default_threshold": "Page when any shard reports stranded_pending > 0 sustained for longer than 2 x worker poll_interval (default 2 x 500 ms; a 2m `for` is a conservative starter value that also rides out a rolling worker restart). This pack ships expressions only, not `for` windows \u2014 set one in your own rule and tune it to your restart window.",
+      "default_threshold": "Page when any shard reports stranded_pending > 0 sustained for longer than 2 x WorkerConfig::gauge_sample_interval (default 2 x 15 s; a 2m `for` is a conservative starter value that also rides out a rolling worker restart). This pack ships expressions only, not `for` windows \u2014 set one in your own rule and tune it to your restart window.",
       "severity": "page",
       "owner_persona": "platform on-call",
       "description": "A writable shard has pending work that no live worker can claim. The cause can be missing shard coverage or a queue, build-id, capability, or sticky-lease mismatch. Use shard health to select the remediation path.",
@@ -970,7 +970,7 @@
     {
       "id": "harvest_queue_paused_too_long",
       "status": "enforceable",
-      "signal_source": "ADR-0001/#619 gauge harvest.queue.paused sampled per worker on the poll interval. Label: queue (bounded to distinct queue names). 1 while an operator hold is in effect, 0 otherwise.",
+      "signal_source": "ADR-0001/#619 gauge harvest.queue.paused sampled per worker on WorkerConfig::gauge_sample_interval (15 s default). Label: queue (bounded to distinct queue names). 1 while an operator hold is in effect, 0 otherwise.",
       "default_threshold": "Ticket when any queue has been held for more than 1 hour. Page when held for more than 4 hours. Both are starter defaults, not universal SLOs: tune them to how long your longest downstream outage is expected to last.",
       "severity": "ticket",
       "owner_persona": "service on-call",

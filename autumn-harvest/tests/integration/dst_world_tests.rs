@@ -36,13 +36,14 @@ use autumn_harvest::models::HarvestSchedule;
 use autumn_harvest::policy::{JitterPolicy, RetryPolicy, Schedule, WorkflowSchedule};
 use autumn_harvest::schema::{harvest_schedules, harvest_workflow_executions};
 use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics, TelemetryConfig};
+use autumn_harvest::time::sql::NullableTimestamp;
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker};
 use autumn_harvest::{ActivityContext, StartSource, StartWorkflowParams, WorkflowContext};
-use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use diesel::sql_types::Text;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 use crate::integration_e2e::{build_test_pool, runtime_config, setup_test_database_url_or_env};
@@ -430,7 +431,7 @@ struct PgWorld {
     conn: AsyncPgConnection,
     columns: Vec<(String, Vec<String>)>,
     /// The real time at which the clock began.
-    t0: DateTime<Utc>,
+    t0: Timestamp,
     /// The total clock shift so far.
     shift_ms: i64,
     workers: Vec<Option<SimWorker>>,
@@ -455,7 +456,7 @@ impl PgWorld {
         let url = db.url();
         let mut conn = connect(&url).await;
         let columns = instant_columns(&mut conn).await;
-        let t0 = Utc::now();
+        let t0 = Timestamp::now();
         let mut chains = Vec::new();
         let mut labels = BTreeMap::new();
         for i in 0..config.workflows {
@@ -570,8 +571,8 @@ impl PgWorld {
     }
 
     /// The tick that holds a stored instant.
-    fn tick_of(&self, at: DateTime<Utc>) -> u64 {
-        let virtual_ms = (at - self.t0).num_milliseconds() + self.shift_ms;
+    fn tick_of(&self, at: Timestamp) -> u64 {
+        let virtual_ms = autumn_harvest::time::num_milliseconds(at - self.t0) + self.shift_ms;
         u64::try_from(virtual_ms.div_euclid(TICK_MS)).expect("an instant after the start")
     }
 
@@ -661,9 +662,10 @@ impl PgWorld {
 
     /// The due schedules, by the query of the scheduler tick.
     async fn scan(&mut self, s: usize) -> Effect {
-        let due = autumn_harvest::scheduler::due_workflow_schedules(&mut self.conn, Utc::now())
-            .await
-            .expect("scan the schedules");
+        let due =
+            autumn_harvest::scheduler::due_workflow_schedules(&mut self.conn, Timestamp::now())
+                .await
+                .expect("scan the schedules");
         let count = due.len();
         match due.into_iter().next() {
             Some(schedule) => {
@@ -694,14 +696,14 @@ impl PgWorld {
         };
         // The clock moved the stored row since the scan, so the snapshot
         // moves with it. The claim compares `next_run_at` exactly.
-        let moved = chrono::Duration::milliseconds(self.shift_ms - shift_ms);
+        let moved = jiff::SignedDuration::from_millis(self.shift_ms - shift_ms);
         schedule.next_run_at = schedule.next_run_at.map(|at| at - moved);
         let before = runs_started(&mut self.conn, schedule.id).await;
         let metrics: Arc<dyn MetricsRecorder> = Arc::new(NoOpMetrics);
         autumn_harvest::scheduler::claim_and_fire_workflow_schedule(
             &mut self.conn,
             &schedule,
-            Utc::now(),
+            Timestamp::now(),
             ShardId::new(0),
             &autumn_harvest::scheduler::DagCatalog::new(),
             &self.registry,
@@ -761,13 +763,12 @@ impl PgWorld {
 
     async fn read_snapshot(&mut self) -> Snapshot {
         use harvest_workflow_executions::dsl;
-        let rows: Vec<(uuid::Uuid, String, Option<DateTime<Utc>>)> =
-            dsl::harvest_workflow_executions
-                .order((dsl::started_at.asc(), dsl::id.asc()))
-                .select((dsl::id, dsl::state, dsl::nd_blocked_at))
-                .load(&mut self.conn)
-                .await
-                .expect("read executions");
+        let rows: Vec<(uuid::Uuid, String, NullableTimestamp)> = dsl::harvest_workflow_executions
+            .order((dsl::started_at.asc(), dsl::id.asc()))
+            .select((dsl::id, dsl::state, dsl::nd_blocked_at))
+            .load(&mut self.conn)
+            .await
+            .expect("read executions");
         let mut executions = Vec::new();
         for (id, status, blocked) in rows {
             // Only the schedule starts executions after the start.
@@ -789,7 +790,7 @@ impl PgWorld {
             executions.push(ExecFacts {
                 label,
                 status,
-                blocked: blocked.is_some(),
+                blocked: blocked.0.is_some(),
                 expected: Some(expected),
                 events: Fact::from_events(&history.events),
             });

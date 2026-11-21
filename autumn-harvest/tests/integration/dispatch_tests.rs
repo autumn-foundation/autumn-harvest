@@ -289,6 +289,7 @@ fn shared_state_with(log: Arc<ActivityLog>) -> autumn_harvest::context::SharedSt
 
 fn worker_config(queue: &str, shards: Vec<ShardId>) -> WorkerRuntimeConfig {
     WorkerRuntimeConfig {
+        gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
         codec_rotation_batch_size: 0,
         scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
         dr: autumn_harvest::replication::DrConfig::default(),
@@ -300,6 +301,8 @@ fn worker_config(queue: &str, shards: Vec<ShardId>) -> WorkerRuntimeConfig {
         max_concurrent_workflows: 4,
         max_concurrent_activities: 4,
         max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
+        claim_slots_per_shard: None,
+        claim_batch_max: None,
         poll_interval: Duration::from_millis(20),
         shutdown_timeout: Duration::from_secs(2),
         cancellation_grace_period: Duration::from_secs(2),
@@ -554,7 +557,7 @@ async fn hint_publishes_after_commit_not_before() {
     let hint = autumn_harvest::dispatch::DispatchHint {
         task_id: uuid::Uuid::new_v4(),
         queue_name: "default".to_string(),
-        scheduled_at: chrono::Utc::now(),
+        scheduled_at: jiff::Timestamp::now(),
         priority: 0,
         shard: None,
         kind: Some(autumn_harvest::dispatch::DispatchKind::Workflow),
@@ -616,7 +619,7 @@ async fn redelivery_of_a_terminal_row_is_acked() {
         .publish(&[autumn_harvest::dispatch::DispatchHint {
             task_id: task.id,
             queue_name: "default".to_string(),
-            scheduled_at: chrono::Utc::now(),
+            scheduled_at: jiff::Timestamp::now(),
             priority: 0,
             shard: None,
             kind: Some(autumn_harvest::dispatch::DispatchKind::Workflow),
@@ -1581,7 +1584,7 @@ async fn a_multi_shard_worker_never_consumes_references() {
         .publish(&[autumn_harvest::dispatch::DispatchHint {
             task_id,
             queue_name: queue.clone(),
-            scheduled_at: chrono::Utc::now(),
+            scheduled_at: jiff::Timestamp::now(),
             priority: 0,
             shard: None,
             kind: Some(autumn_harvest::dispatch::DispatchKind::Workflow),
@@ -1807,7 +1810,7 @@ async fn a_reference_for_a_full_pool_does_not_spin_the_reader() {
 }
 
 /// A stale reference must not spend a claimable sibling's share of the same
-/// batch (Codex review, issue #1429).
+/// batch (issue #1429).
 ///
 /// `dispatch_leases` used to increment `claimed_workflow` before calling
 /// `consume_reference`, for every workflow-kind lease regardless of outcome.
@@ -1884,7 +1887,7 @@ async fn a_stale_reference_does_not_spend_a_sibling_lease_share() {
             autumn_harvest::dispatch::DispatchHint {
                 task_id: stale_task.id,
                 queue_name: queue.clone(),
-                scheduled_at: chrono::Utc::now(),
+                scheduled_at: jiff::Timestamp::now(),
                 priority: 0,
                 shard: None,
                 kind: Some(autumn_harvest::dispatch::DispatchKind::Workflow),
@@ -1892,7 +1895,7 @@ async fn a_stale_reference_does_not_spend_a_sibling_lease_share() {
             autumn_harvest::dispatch::DispatchHint {
                 task_id: claimable_task.id,
                 queue_name: queue.clone(),
-                scheduled_at: chrono::Utc::now(),
+                scheduled_at: jiff::Timestamp::now(),
                 priority: 0,
                 shard: None,
                 kind: Some(autumn_harvest::dispatch::DispatchKind::Workflow),

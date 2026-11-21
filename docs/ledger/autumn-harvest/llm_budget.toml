@@ -5,5 +5,5 @@ driver = "per_task"
 backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_llm_ledger", "harvest_shard_migrations", "harvest_workflow_executions"]
-measured = "unmeasured"
+measured = "docs/performance-llm-spend-tenant-window.md"
 plan = "docs/ledger/plans/autumn-harvest/llm_budget.md"

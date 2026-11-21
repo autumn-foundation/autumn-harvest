@@ -452,7 +452,7 @@ mod tests {
     #[tokio::test]
     async fn an_attempt_deadline_too_close_for_the_run_is_a_retryable_failure() {
         let (backend, activity) = activity(FakeBackend::new(IsolationLevel::Process));
-        let deadline = chrono::Utc::now() + chrono::Duration::seconds(15);
+        let deadline = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(15);
         let ctx =
             ctx_for(state_with(activity), CancellationToken::new()).with_deadline(Some(deadline));
         let request = SandboxRequest::new("sh", "true").with_timeout_ms(30_000);

@@ -1,5 +1,5 @@
-//! `harvest agents`: list, describe, pause, resume and erase durable agents
-//! (issue #2267).
+//! `harvest agents`: list, describe, pause, resume, reload and erase
+//! durable agents (issue #2267).
 //!
 //! A durable agent is a keyed-entity run of the workflow `agent`. Its id,
 //! `<kind>/<name>`, is the workflow id. Each command uses the generic routes
@@ -9,7 +9,7 @@
 //! |---|---|
 //! | `list` | `GET /workflows` with a `filter` on the agent search attributes |
 //! | `describe` | `GET /workflows/by-id/agent/{id}/query/harvest.entity.state` |
-//! | `pause`, `resume` | `POST /workflows/by-id/agent/{id}/signal/harvest.entity.op` |
+//! | `pause`, `resume`, `reload` | `POST /workflows/by-id/agent/{id}/signal/harvest.entity.op` |
 //! | `erase` | the signal route, then `POST /workflows/{id}/erase-payloads` for each run |
 //! | `sampling policy <kind> show`, `set`, `reset` | `GET`, `PUT`, `DELETE /admin/agents/{kind}/sampling-policy` |
 //!
@@ -109,6 +109,13 @@ pub enum AgentCommand {
         /// The agent id, `<kind>/<name>`.
         agent_id: String,
     },
+    /// Make an agent read the profile of its kind again. A good read ends
+    /// the run, so the next op runs on the new profile. Deploy the new
+    /// harness to every worker first.
+    Reload {
+        /// The agent id, `<kind>/<name>`.
+        agent_id: String,
+    },
     /// Erase an agent: its memory, episodes, workspace, history, stream
     /// chunks and cost ledger rows.
     ///
@@ -119,6 +126,8 @@ pub enum AgentCommand {
     /// report. `stores_reset` is `false` when a reset failed, and
     /// `stores_error` names the error. `episodes_erased` and
     /// `facts_erased` count the episode log and its derived facts.
+    /// `lessons_removed` counts the lessons of the kind that a run of the
+    /// agent is a source of.
     Erase {
         /// The agent id, `<kind>/<name>`.
         agent_id: String,
@@ -206,6 +215,9 @@ pub struct PolicySetArgs {
     /// The cap of the in-loop answer check, 0 to 16. Default: 0.
     #[arg(long, conflicts_with = "json")]
     pub max_answer_retries: Option<u32>,
+    /// The harness models that a cascade tier may name. Default: none.
+    #[arg(long, conflicts_with = "json")]
+    pub cascade_models: Option<String>,
     /// The whole policy as one JSON object. It replaces every other flag.
     #[arg(long)]
     pub json: Option<String>,
@@ -246,6 +258,9 @@ pub fn agent_request(command: &AgentCommand) -> Result<ApiRequest, CliError> {
             Ok(signal(agent_id, op_payload(control)))
         }
         AgentCommand::Resume { agent_id } => Ok(signal(agent_id, control_payload("resume"))),
+        AgentCommand::Reload { agent_id } => {
+            Ok(signal(agent_id, control_payload("reload_profile")))
+        }
         AgentCommand::Erase { .. } => Err(CliError::AgentEraseIsMultiStep),
         AgentCommand::Profile { command } => crate::agent_profile::profile_request(command),
         AgentCommand::Sampling {
@@ -307,6 +322,7 @@ fn policy_body(args: &PolicySetArgs) -> Result<Value, CliError> {
         ("strategies", &args.strategies),
         ("draw_effects", &args.draw_effects),
         ("judge_models", &args.judge_models),
+        ("cascade_models", &args.cascade_models),
     ] {
         if let Some(raw) = value {
             policy.insert(key.to_owned(), json!(list(raw)));
@@ -369,11 +385,10 @@ fn list_path(filter: &ListFilter<'_>, page_size: i64, cursor: Option<&str>) -> S
 
 /// A quoted string of the `filter` grammar. A backslash escapes the next
 /// character.
-fn literal(value: &str) -> String {
+pub fn literal(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
-/// The by-id route of the agent `agent_id`.
 fn by_id(agent_id: &str) -> String {
     format!(
         "/workflows/by-id/{AGENT_WORKFLOW}/{}",
@@ -527,6 +542,15 @@ pub struct StoresOutcome {
     pub episodes_erased: u64,
     /// The derived facts that the memory reset removed (issue #2454).
     pub facts_erased: u64,
+    /// The lessons of the kind that the memory reset removed. A lesson goes
+    /// when a run of the agent is one of its sources.
+    pub lessons_removed: u64,
+    /// The memory entries that the memory reset removed. `None` when the
+    /// agent has no memory scope, or when its run predates the count.
+    pub memory_entries_erased: Option<u64>,
+    /// The transcript windows of the agent that the memory reset removed.
+    /// `None` when the transcript store cannot erase by session.
+    pub transcripts_erased: Option<u64>,
 }
 
 /// Compare the failure count of the agent before the resets with its final
@@ -541,6 +565,9 @@ pub fn stores_outcome(failures_before: u64, output: Option<&Value>) -> StoresOut
             error: Some("the deleted run has no final state".to_owned()),
             episodes_erased: 0,
             facts_erased: 0,
+            lessons_removed: 0,
+            memory_entries_erased: None,
+            transcripts_erased: None,
         };
     };
     let count = |key: &str| {
@@ -551,6 +578,12 @@ pub fn stores_outcome(failures_before: u64, output: Option<&Value>) -> StoresOut
             .unwrap_or(0)
     };
     let (episodes_erased, facts_erased) = (count("episodes"), count("facts"));
+    let lessons_removed = state
+        .get("lessons_removed")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let memory_entries_erased = state.get("memory_entries_erased").and_then(Value::as_u64);
+    let transcripts_erased = state.get("transcripts_erased").and_then(Value::as_u64);
     if failures(state) > failures_before {
         let error = state
             .get("last_error")
@@ -561,6 +594,9 @@ pub fn stores_outcome(failures_before: u64, output: Option<&Value>) -> StoresOut
             error: Some(error.to_owned()),
             episodes_erased,
             facts_erased,
+            lessons_removed,
+            memory_entries_erased,
+            transcripts_erased,
         };
     }
     StoresOutcome {
@@ -568,15 +604,16 @@ pub fn stores_outcome(failures_before: u64, output: Option<&Value>) -> StoresOut
         error: None,
         episodes_erased,
         facts_erased,
+        lessons_removed,
+        memory_entries_erased,
+        transcripts_erased,
     }
 }
 
-/// The failure count of an agent state.
 fn failures(state: &Value) -> u64 {
     state.get("failures").and_then(Value::as_u64).unwrap_or(0)
 }
 
-/// The state query of the agent `agent_id`.
 fn state_query(agent_id: &str) -> ApiRequest {
     ApiRequest::get(format!("{}/query/{ENTITY_STATE_QUERY}", by_id(agent_id)))
 }
@@ -700,6 +737,15 @@ pub fn erase_report(agent_id: &str, stores: &StoresOutcome, outcomes: &[Value]) 
     }
     report.insert("episodes_erased".to_owned(), json!(stores.episodes_erased));
     report.insert("facts_erased".to_owned(), json!(stores.facts_erased));
+    report.insert("lessons_removed".to_owned(), json!(stores.lessons_removed));
+    report.insert(
+        "memory_entries_erased".to_owned(),
+        json!(stores.memory_entries_erased),
+    );
+    report.insert(
+        "transcripts_erased".to_owned(),
+        json!(stores.transcripts_erased),
+    );
     report.insert("runs_erased".to_owned(), json!(runs));
     report.extend(totals);
     report.insert("skipped_children".to_owned(), Value::Array(skipped));
@@ -781,6 +827,22 @@ mod tests {
     }
 
     #[test]
+    fn reload_sends_the_reload_profile_op_to_the_agent() {
+        let reload = agent_request(&AgentCommand::Reload {
+            agent_id: "support/ada".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(
+            reload.path,
+            "/workflows/by-id/agent/support%2Fada/signal/harvest.entity.op"
+        );
+        assert_eq!(
+            reload.body,
+            Some(json!({"kind": "op", "op": {"type": "control", "action": "reload_profile"}}))
+        );
+    }
+
+    #[test]
     fn the_report_sums_each_run_and_each_child() {
         let child = json!({"events_scrubbed": 1, "ledger_rows_deleted": 2});
         let outcomes = [
@@ -796,6 +858,9 @@ mod tests {
             error: None,
             episodes_erased: 0,
             facts_erased: 0,
+            lessons_removed: 0,
+            memory_entries_erased: None,
+            transcripts_erased: None,
         };
         let report = erase_report("support/ada", &stores, &outcomes);
         assert_eq!(report["runs_erased"], 3);
@@ -824,6 +889,47 @@ mod tests {
     }
 
     #[test]
+    fn the_report_counts_the_erased_memory_entries_and_windows() {
+        let state = json!({"failures": 0, "memory_entries_erased": 4, "transcripts_erased": 7});
+        let stores = stores_outcome(0, Some(&state));
+        assert!(stores.reset);
+        assert_eq!(stores.memory_entries_erased, Some(4));
+        assert_eq!(stores.transcripts_erased, Some(7));
+        let report = erase_report("support/ada", &stores, &[]);
+        assert_eq!(report["memory_entries_erased"], 4);
+        assert_eq!(report["transcripts_erased"], 7);
+        // A store that cannot count reports null, not a false 0.
+        let plain = stores_outcome(0, Some(&json!({"failures": 0})));
+        let report = erase_report("support/ada", &plain, &[]);
+        assert_eq!(report["memory_entries_erased"], Value::Null);
+        assert_eq!(report["transcripts_erased"], Value::Null);
+        // A failed reset keeps the counts that the state holds.
+        let failed = json!({"failures": 1, "last_error": "down", "transcripts_erased": 2});
+        let failed = stores_outcome(0, Some(&failed));
+        assert!(!failed.reset);
+        assert_eq!(failed.transcripts_erased, Some(2));
+    }
+
+    #[test]
+    fn the_report_counts_the_removed_lessons() {
+        let state = json!({"failures": 0, "lessons_removed": 2});
+        let stores = stores_outcome(0, Some(&state));
+        assert_eq!(stores.lessons_removed, 2);
+        let report = erase_report("support/acct-42", &stores, &[]);
+        assert_eq!(report["lessons_removed"], 2);
+        // A state with no count removes no lesson.
+        let plain = stores_outcome(0, Some(&json!({"failures": 0})));
+        assert_eq!(plain.lessons_removed, 0);
+        assert_eq!(
+            erase_report("support/ada", &plain, &[])["lessons_removed"],
+            0
+        );
+        // A failed reset keeps the count that the state holds.
+        let failed = json!({"failures": 1, "last_error": "down", "lessons_removed": 1});
+        assert_eq!(stores_outcome(0, Some(&failed)).lessons_removed, 1);
+    }
+
+    #[test]
     fn a_running_pass_is_a_failure_and_a_closed_pass_is_erased() {
         let rows = [
             json!({"id": "p1", "state": "COMPLETED"}),
@@ -846,6 +952,9 @@ mod tests {
                 error: None,
                 episodes_erased: 0,
                 facts_erased: 0,
+                lessons_removed: 0,
+                memory_entries_erased: None,
+                transcripts_erased: None,
             }
         );
         let failed = json!({"failures": 3, "last_error": "the store is down"});

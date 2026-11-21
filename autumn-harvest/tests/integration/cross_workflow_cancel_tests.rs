@@ -47,11 +47,10 @@ async fn setup_test_database_url() -> (String, Option<ContainerAsync<Postgres>>)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
 
-    // Local-Postgres path (no Docker): when HARVEST_TEST_DATABASE_URL points at
-    // a live Postgres, create a fresh per-test database, apply the full
-    // migration bundle, and hand back its URL — fully isolated regardless of
-    // suite concurrency (matching the signal suite). CI leaves the env var unset
-    // and uses the testcontainers path below (the authoritative path).
+    // Local-Postgres path (no Docker). When HARVEST_TEST_DATABASE_URL points at
+    // a live Postgres, each test gets a fresh, fully migrated database. That
+    // isolates it under any suite concurrency, as in the signal suite. CI leaves
+    // the env var unset and uses the authoritative testcontainers path below.
     if let Ok(base_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         use diesel_async::SimpleAsyncConnection;
         // The per-test `harvest757c_<uuid>` database is intentionally NOT dropped:
@@ -144,7 +143,6 @@ fn long_running_target_workflow<'a>(
     })
 }
 
-// Target workflow that completes immediately.
 fn instant_complete_workflow<'a>(
     _ctx: &'a WorkflowContext,
     _input: serde_json::Value,

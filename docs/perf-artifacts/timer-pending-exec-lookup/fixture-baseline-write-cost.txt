@@ -1,0 +1,34 @@
+##### variant=base repeat=1
+CHECKPOINT
+INSERT 0 1
+DO
+DO
+ insert_wal_bytes | fire_wal_bytes | insert_wal_per_timer | fire_wal_per_timer 
+------------------+----------------+----------------------+--------------------
+         30637600 |        3577392 |               3063.8 |              357.7
+(1 row)
+
+        indexrelname        |  size   |  bytes   
+----------------------------+---------+----------
+ harvest_timers_pkey        | 43 MB   | 45383680
+ idx_harvest_timers_exec    | 8592 kB |  8798208
+ idx_harvest_timers_pending | 600 kB  |   614400
+(3 rows)
+
+##### variant=base repeat=2
+CHECKPOINT
+INSERT 0 1
+DO
+DO
+ insert_wal_bytes | fire_wal_bytes | insert_wal_per_timer | fire_wal_per_timer 
+------------------+----------------+----------------------+--------------------
+         30874696 |        3383936 |               3087.5 |              338.4
+(1 row)
+
+        indexrelname        |  size   |  bytes   
+----------------------------+---------+----------
+ harvest_timers_pkey        | 44 MB   | 46080000
+ idx_harvest_timers_exec    | 8728 kB |  8937472
+ idx_harvest_timers_pending | 664 kB  |   679936
+(3 rows)
+

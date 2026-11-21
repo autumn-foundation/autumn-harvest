@@ -1,7 +1,7 @@
 //! Chrome Trace Event Format exporter for DAG profiles.
 //!
-//! Converts a `DagProfile` into a JSON structure compatible with trace viewers
-//! like `chrome://tracing` or `ui.perfetto.dev`.
+//! The output loads in trace viewers such as `chrome://tracing` or
+//! `ui.perfetto.dev`.
 
 use crate::dag_profiler::{DagProfile, ProfilerEventKind};
 use serde_json::{Value, json};
@@ -9,12 +9,9 @@ use std::collections::HashMap;
 
 /// Exports a `DagProfile` to Chrome Trace Event Format.
 ///
-/// Converts the simulated DAG timeline into a series of "Complete" (`"ph": "X"`)
-/// trace events. Each task is represented as a span with a start time (`ts`)
-/// and duration (`dur`) in microseconds.
-///
-/// # Returns
-/// A JSON `Value` representing the trace events array.
+/// Each task of the simulated timeline becomes one "Complete" (`"ph": "X"`)
+/// event, with a start (`ts`) and a duration (`dur`) in microseconds. The
+/// result is the JSON array of these events.
 #[must_use]
 pub fn export_chrome_trace(profile: &DagProfile) -> Value {
     let mut events = Vec::new();

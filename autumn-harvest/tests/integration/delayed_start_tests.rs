@@ -157,8 +157,8 @@ async fn test_delayed_start_validation() {
             concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
-            start_at: Some(chrono::Utc::now() + chrono::Duration::seconds(10)),
-            delay: Some(chrono::Duration::seconds(10)),
+            start_at: Some(jiff::Timestamp::now() + jiff::SignedDuration::from_secs(10)),
+            delay: Some(jiff::SignedDuration::from_secs(10)),
             max_workflow_start_delay: None,
 
             owner: None,
@@ -223,7 +223,7 @@ async fn test_delayed_start_validation() {
             concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
-            start_at: Some(chrono::Utc::now() - chrono::Duration::seconds(10)),
+            start_at: Some(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(10)),
             delay: None,
             max_workflow_start_delay: None,
 
@@ -282,6 +282,7 @@ async fn test_delayed_start_no_premature_dispatch() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
                 codec_rotation_batch_size: 0,
                 scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
@@ -291,6 +292,8 @@ async fn test_delayed_start_no_premature_dispatch() {
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
                 max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
+                claim_slots_per_shard: None,
+                claim_batch_max: None,
                 poll_interval: Duration::from_millis(50),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -333,7 +336,7 @@ async fn test_delayed_start_no_premature_dispatch() {
     };
 
     let exec_id = autumn_harvest::ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
-    let delay_duration = chrono::Duration::seconds(3);
+    let delay_duration = jiff::SignedDuration::from_secs(3);
 
     let _started = start_or_load_workflow_execution(
         &mut conn,
@@ -399,11 +402,11 @@ async fn test_delayed_start_no_premature_dispatch() {
 
     // Scheduled at should be approximately 3 seconds in the future
     let scheduled_at = tasks[0].scheduled_at;
-    let now = chrono::Utc::now();
-    assert!(scheduled_at > now + chrono::Duration::seconds(1));
-    assert!(scheduled_at <= now + chrono::Duration::seconds(4));
+    let now = jiff::Timestamp::now();
+    assert!(scheduled_at > now + jiff::SignedDuration::from_secs(1));
+    assert!(scheduled_at <= now + jiff::SignedDuration::from_secs(4));
 
-    // Verify worker hasn't claimed it immediately
+    // Verify that the worker has not claimed it immediately
     tokio::time::sleep(Duration::from_millis(500)).await;
     let tasks_mid = load_tasks(&mut conn, exec_id).await;
     assert_eq!(tasks_mid.len(), 1);
@@ -457,7 +460,7 @@ async fn test_delayed_start_cancel_before_firing() {
             priority: Priority::default(),
             max_workflow_input_bytes: 0,
             start_at: None,
-            delay: Some(chrono::Duration::seconds(10)),
+            delay: Some(jiff::SignedDuration::from_secs(10)),
             max_workflow_start_delay: None,
 
             owner: None,
@@ -534,7 +537,7 @@ async fn test_delayed_start_workflow_started_event_timestamp() {
     let (mut conn, _container) = setup_test_db().await;
 
     let exec_id = autumn_harvest::ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
-    let target_future = chrono::Utc::now() + chrono::Duration::hours(2);
+    let target_future = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(2);
 
     start_or_load_workflow_execution(
         &mut conn,
@@ -606,7 +609,7 @@ async fn test_immediate_start_skew_tolerance() {
     let (mut conn, _container) = setup_test_db().await;
 
     let exec_id = autumn_harvest::ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
 
     start_or_load_workflow_execution(
         &mut conn,
@@ -667,10 +670,10 @@ async fn test_immediate_start_skew_tolerance() {
 
     // Scheduled_at should be approximately now - 5 seconds to tolerate skew
     let scheduled_at = tasks[0].scheduled_at;
-    let expected_skew_scheduled = now - chrono::Duration::seconds(5);
+    let expected_skew_scheduled = now - jiff::SignedDuration::from_secs(5);
 
     // It should be within a 2 second window of expected_skew_scheduled
-    let diff = (scheduled_at - expected_skew_scheduled).num_seconds().abs();
+    let diff = (scheduled_at - expected_skew_scheduled).as_secs().abs();
     assert!(
         diff <= 2,
         "scheduled_at={scheduled_at:?} expected_skew_scheduled={expected_skew_scheduled:?}"

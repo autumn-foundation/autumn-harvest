@@ -15,7 +15,7 @@ use autumn_harvest_sqlite::{
     ExecutionFilter, ExecutionOutcome, ListCursor, MAX_FILTER_TERMS, MAX_LIST_LIMIT, RunState,
     SqliteError, SqliteReader, SqliteRuntime, StartOptions, Stored,
 };
-use chrono::Utc;
+use jiff::Timestamp;
 use rusqlite::Connection;
 use serde_json::{Map, Value, json};
 
@@ -60,15 +60,14 @@ async fn staged(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
 
 /// Upserts, then reaches an unsupported command in the same cycle.
 #[workflow]
-async fn upserts_then_schedules_external(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+async fn upserts_then_acquires_session(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
     ctx.upsert_search_attrs([("stage".to_string(), Some(json!("lost")))])
         .map_err(|e| e.to_string())?;
-    // Poll the external activity once, so its command joins the last batch,
-    // then return without awaiting it.
-    let mut external =
-        std::pin::pin!(ctx.execute_activity_external("external", json!({}), "default", 60));
+    // Poll the worker-session acquire once, so its command joins the last
+    // batch, then return without awaiting it.
+    let mut session = std::pin::pin!(ctx.create_session(SessionOptions::new("gpu")));
     let _ = std::future::Future::poll(
-        external.as_mut(),
+        session.as_mut(),
         &mut std::task::Context::from_waker(std::task::Waker::noop()),
     );
     Ok(0)
@@ -109,7 +108,7 @@ fn runtime() -> SqliteRuntime {
         fails_info(),
         waits_info(),
         staged_info(),
-        upserts_then_schedules_external_info(),
+        upserts_then_acquires_session_info(),
         chained_info(),
         retried_info(),
     ] {
@@ -151,7 +150,7 @@ fn ids(rt: &SqliteRuntime, filter: &ExecutionFilter) -> Vec<ExecutionId> {
 #[tokio::test]
 async fn describe_returns_every_field_the_daemon_reads() {
     let mut rt = runtime();
-    let before = Utc::now();
+    let before = Timestamp::now();
     let started = rt
         .start_workflow_with_options(
             "echo",
@@ -184,9 +183,9 @@ async fn describe_returns_every_field_the_daemon_reads() {
     );
     let started_at = *summary.started_at.value().expect("a start time");
     let closed_at = *summary.closed_at.value().expect("a close time");
-    assert!(started_at >= before - chrono::TimeDelta::milliseconds(1));
+    assert!(started_at >= before - jiff::SignedDuration::from_millis(1));
     assert!(closed_at >= started_at, "{closed_at} < {started_at}");
-    assert!(closed_at <= Utc::now());
+    assert!(closed_at <= Timestamp::now());
 
     // The listed row is the same row, without the payloads.
     let page = rt
@@ -207,11 +206,8 @@ async fn the_start_time_is_the_started_event_time() {
     };
     let row = rt.describe(exec).unwrap();
     assert_eq!(
-        row.summary
-            .started_at
-            .value()
-            .map(chrono::DateTime::timestamp_millis),
-        Some(timestamp.timestamp_millis())
+        row.summary.started_at.value().map(|at| at.as_millisecond()),
+        Some(timestamp.as_millisecond())
     );
     assert_eq!(row.summary.closed_at, Stored::Null, "a running run is open");
     assert_eq!(row.summary.search_attributes, Stored::Null);
@@ -412,7 +408,7 @@ fn list_filters_by_start_time() {
     let mut rt = runtime();
     let early = rt.start_workflow("echo", json!(1)).unwrap();
     std::thread::sleep(Duration::from_millis(5));
-    let middle = Utc::now();
+    let middle = Timestamp::now();
     std::thread::sleep(Duration::from_millis(5));
     let late = rt.start_workflow("echo", json!(2)).unwrap();
 
@@ -446,7 +442,7 @@ fn list_filters_by_start_time() {
     );
 }
 
-fn early_at(rt: &SqliteRuntime, exec: ExecutionId) -> chrono::DateTime<Utc> {
+fn early_at(rt: &SqliteRuntime, exec: ExecutionId) -> jiff::Timestamp {
     *rt.describe(exec)
         .unwrap()
         .summary
@@ -564,7 +560,7 @@ async fn upserted_search_attributes_filter_the_list() {
 async fn a_rolled_back_cycle_keeps_no_upsert() {
     let mut rt = runtime();
     let exec = rt
-        .start_workflow("upserts_then_schedules_external", json!(0))
+        .start_workflow("upserts_then_acquires_session", json!(0))
         .unwrap();
     let err = rt.run_until_blocked(exec).await.unwrap_err();
     assert!(matches!(err, SqliteError::Unsupported(_)), "{err}");
@@ -924,7 +920,7 @@ fn a_reader_reads_a_file_without_the_new_columns() {
     assert_eq!(row.output_json, Stored::Value("2".to_string()));
     // A filter on a missing column matches nothing, and does not fail.
     let page = reader
-        .list_executions(&ExecutionFilter::new().started_after(Utc::now()))
+        .list_executions(&ExecutionFilter::new().started_after(Timestamp::now()))
         .unwrap();
     assert_eq!(page.executions, Vec::new());
 }
@@ -992,7 +988,7 @@ fn the_start_time_filter_is_exact_to_the_microsecond() {
     };
     let row = rt.describe(exec).unwrap();
     assert_eq!(row.summary.started_at, Stored::Value(timestamp));
-    let tick = chrono::TimeDelta::microseconds(1);
+    let tick = jiff::SignedDuration::from_micros(1);
     assert_eq!(
         ids(
             &rt,

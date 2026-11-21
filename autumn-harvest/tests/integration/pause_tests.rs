@@ -4,7 +4,10 @@
 #![cfg(feature = "db")]
 #![allow(clippy::items_after_statements)]
 
+use autumn_harvest::time::sql::SqlTimestamp;
+use jiff_diesel::ToDiesel;
 use std::pin::Pin;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -100,6 +103,7 @@ fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn)
 fn make_worker(registry: Arc<HandlerRegistry>) -> Worker {
     Worker::new(
         WorkerRuntimeConfig {
+            gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
             codec_rotation_batch_size: 0,
             scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
             dr: autumn_harvest::replication::DrConfig::default(),
@@ -109,6 +113,8 @@ fn make_worker(registry: Arc<HandlerRegistry>) -> Worker {
             max_concurrent_workflows: 10,
             max_concurrent_activities: 20,
             max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
+            claim_slots_per_shard: None,
+            claim_batch_max: None,
             poll_interval: Duration::from_millis(50),
             shutdown_timeout: Duration::from_secs(2),
             cancellation_grace_period: Duration::from_secs(2),
@@ -211,18 +217,15 @@ async fn get_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> String
 async fn pause_columns(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
-) -> (
-    Option<chrono::DateTime<chrono::Utc>>,
-    Option<String>,
-    Option<String>,
-) {
+) -> (Option<jiff::Timestamp>, Option<String>, Option<String>) {
     use autumn_harvest::schema::harvest_workflow_executions as e;
-    e::table
+    let (paused_at, reason, actor) = e::table
         .filter(e::id.eq(exec_id.as_uuid()))
         .select((e::paused_at, e::pause_reason, e::pause_actor))
-        .first(conn)
+        .first::<(Option<SqlTimestamp>, Option<String>, Option<String>)>(conn)
         .await
-        .expect("execution must exist")
+        .expect("execution must exist");
+    (paused_at.map(SqlTimestamp::to_jiff), reason, actor)
 }
 
 async fn history(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Vec<WorkflowEvent> {
@@ -295,10 +298,11 @@ fn timer_wf<'a>(
     })
 }
 
-/// Sleeps before producing its `StartTimer` command so a test can land a pause
-/// while this workflow decision task is still mid-flight (already claimed by a
-/// worker but not yet at its suspension point). Used to exercise the
-/// claimed-then-paused race (issue #383): the worker must discard the pending
+/// Sleeps before producing its `StartTimer` command.
+///
+/// A test can then land a pause while this decision task is mid-flight:
+/// claimed by a worker but not yet at its suspension point. This exercises the
+/// claimed-then-paused race (issue #383). The worker must discard the pending
 /// decision and re-park rather than persist the timer.
 fn slow_timer_wf<'a>(
     ctx: &'a WorkflowContext,
@@ -344,7 +348,7 @@ async fn pause_then_resume_transitions_and_records_events() {
     // microsecond precision while the result carries the in-memory instant.
     let reported_at = paused.paused_at.expect("checked Some above");
     assert!(
-        (reported_at - column_at).abs() < chrono::Duration::milliseconds(1),
+        (reported_at - column_at).abs() < jiff::SignedDuration::from_millis(1),
         "reported paused_at must match the persisted column"
     );
     assert_eq!(reason.as_deref(), Some("investigating"));
@@ -384,8 +388,8 @@ async fn pause_then_resume_transitions_and_records_events() {
 
 #[tokio::test]
 async fn resume_extends_deadline_by_pause_duration() {
-    // Pause suspends the SLA clock (issue #383 × #243): on resume the absolute
-    // `deadline_at` is pushed forward by the time spent paused so paused
+    // Pause suspends the SLA clock (issue #383 × #243). Resume pushes the
+    // absolute `deadline_at` forward by the time spent paused. So paused
     // wall-clock is not charged against the workflow's execution_timeout.
     use autumn_harvest::schema::harvest_workflow_executions as e;
 
@@ -399,13 +403,13 @@ async fn resume_extends_deadline_by_pause_duration() {
 
     // Establish a known pre-resume deadline and a 30-minute backdated pause so
     // the resume computes a deterministic, non-zero span.
-    let now = chrono::Utc::now();
-    let deadline_before = now + chrono::Duration::minutes(30);
-    let paused_at = now - chrono::Duration::minutes(30);
+    let now = jiff::Timestamp::now();
+    let deadline_before = now + jiff::SignedDuration::from_mins(30);
+    let paused_at = now - jiff::SignedDuration::from_mins(30);
     diesel::update(e::table.filter(e::id.eq(exec_id.as_uuid())))
         .set((
-            e::deadline_at.eq(Some(deadline_before)),
-            e::paused_at.eq(Some(paused_at)),
+            e::deadline_at.eq(Some(deadline_before).to_diesel()),
+            e::paused_at.eq(Some(paused_at).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -415,18 +419,20 @@ async fn resume_extends_deadline_by_pause_duration() {
         .await
         .expect("resume should succeed");
 
-    let deadline_after: Option<chrono::DateTime<chrono::Utc>> = e::table
+    let deadline_after: Option<SqlTimestamp> = e::table
         .filter(e::id.eq(exec_id.as_uuid()))
         .select(e::deadline_at)
         .first(&mut conn)
         .await
         .expect("execution must exist");
 
-    let deadline_after = deadline_after.expect("deadline_at must remain set after resume");
+    let deadline_after = deadline_after
+        .expect("deadline_at must remain set after resume")
+        .to_jiff();
     // Expected ≈ deadline_before + 30min pause span. Allow a few seconds of
     // slack for the wall-clock read inside resume.
-    let expected = deadline_before + chrono::Duration::minutes(30);
-    let drift = (deadline_after - expected).num_seconds().abs();
+    let expected = deadline_before + jiff::SignedDuration::from_mins(30);
+    let drift = (deadline_after - expected).as_secs().abs();
     assert!(
         drift <= 5,
         "deadline should advance by the pause span: after={deadline_after}, expected≈{expected} (drift {drift}s)"
@@ -450,7 +456,7 @@ async fn resume_without_deadline_leaves_it_null() {
         .await
         .expect("resume should succeed");
 
-    let deadline_after: Option<chrono::DateTime<chrono::Utc>> = e::table
+    let deadline_after: Option<SqlTimestamp> = e::table
         .filter(e::id.eq(exec_id.as_uuid()))
         .select(e::deadline_at)
         .first(&mut conn)
@@ -469,7 +475,7 @@ async fn resume_without_deadline_leaves_it_null() {
 async fn insert_pending_activity_task(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
-    schedule_to_close_at: chrono::DateTime<chrono::Utc>,
+    schedule_to_close_at: jiff::Timestamp,
 ) -> uuid::Uuid {
     let task_id = uuid::Uuid::new_v4();
     diesel::sql_query(
@@ -482,7 +488,7 @@ async fn insert_pending_activity_task(
     .bind::<diesel::sql_types::Uuid, _>(task_id)
     .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
     .bind::<diesel::sql_types::Uuid, _>(uuid::Uuid::new_v4())
-    .bind::<diesel::sql_types::Timestamptz, _>(schedule_to_close_at)
+    .bind::<diesel::sql_types::Timestamptz, _>(schedule_to_close_at.to_diesel())
     .execute(conn)
     .await
     .expect("insert pending activity task");
@@ -491,9 +497,9 @@ async fn insert_pending_activity_task(
 
 #[tokio::test]
 async fn schedule_to_close_scanner_skips_paused_executions() {
-    // Pause suspends the cross-retry wall-clock deadline: an expired
-    // schedule_to_close_at on a PAUSED execution's task must not be enforced
-    // by the scanner, while a RUNNING execution's identical task must be.
+    // Pause suspends the cross-retry wall-clock deadline. The scanner must not
+    // enforce an expired schedule_to_close_at on a PAUSED execution's task. It
+    // must enforce the identical task of a RUNNING execution.
     use autumn_harvest::timeout::{TimeoutReason, find_timed_out_tasks};
 
     let (url, _c) = setup().await;
@@ -502,7 +508,7 @@ async fn schedule_to_close_scanner_skips_paused_executions() {
     let task_id = insert_pending_activity_task(
         &mut conn,
         exec_id,
-        chrono::Utc::now() - chrono::Duration::seconds(1),
+        jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1),
     )
     .await;
 
@@ -549,7 +555,7 @@ async fn schedule_to_close_scanner_skips_paused_executions() {
 #[tokio::test]
 async fn resume_shifts_schedule_to_close_at_by_pause_span() {
     // AC5 (issue #609) × #378: resume pushes each open task's
-    // schedule_to_close_at forward by the clamped pause span so paused
+    // schedule_to_close_at forward by the clamped pause span. So paused
     // wall-clock is not charged against the activity's cross-retry budget.
     let (url, _c) = setup().await;
     let mut conn = connect(&url).await;
@@ -559,15 +565,15 @@ async fn resume_shifts_schedule_to_close_at_by_pause_span() {
         .await
         .expect("pause should succeed");
 
-    let now = chrono::Utc::now();
-    let deadline_before = now + chrono::Duration::minutes(10);
+    let now = jiff::Timestamp::now();
+    let deadline_before = now + jiff::SignedDuration::from_mins(10);
     let task_id = insert_pending_activity_task(&mut conn, exec_id, deadline_before).await;
 
     // Backdate the pause 30 minutes so the resume computes a deterministic,
     // non-zero span (mirrors resume_extends_deadline_by_pause_duration).
     use autumn_harvest::schema::harvest_workflow_executions as e;
     diesel::update(e::table.filter(e::id.eq(exec_id.as_uuid())))
-        .set(e::paused_at.eq(Some(now - chrono::Duration::minutes(30))))
+        .set(e::paused_at.eq(Some(now - jiff::SignedDuration::from_mins(30)).to_diesel()))
         .execute(&mut conn)
         .await
         .expect("backdate paused_at for test");
@@ -577,29 +583,30 @@ async fn resume_shifts_schedule_to_close_at_by_pause_span() {
         .expect("resume should succeed");
 
     use autumn_harvest::schema::harvest_task_queue as t;
-    let deadline_after: Option<chrono::DateTime<chrono::Utc>> = t::table
+    let deadline_after: Option<SqlTimestamp> = t::table
         .filter(t::id.eq(task_id))
         .select(t::schedule_to_close_at)
         .first(&mut conn)
         .await
         .expect("task must exist");
-    let deadline_after = deadline_after.expect("deadline must remain set");
+    let deadline_after = deadline_after.expect("deadline must remain set").to_jiff();
     let shift = deadline_after - deadline_before;
     assert!(
-        shift >= chrono::Duration::minutes(29) && shift <= chrono::Duration::minutes(31),
+        shift >= jiff::SignedDuration::from_mins(29)
+            && shift <= jiff::SignedDuration::from_mins(31),
         "schedule_to_close_at must shift forward by the ~30-minute pause span, got {shift:?}"
     );
 }
 
-/// Inserts a PENDING activity task with explicit queue-timing columns for the
-/// frozen-row tests (issue #609 post-review hardening, finding 3):
-/// `scheduled_at`, a `schedule_to_start` window in seconds, and an optional
-/// cross-retry deadline.
+/// Inserts a PENDING activity task with explicit queue-timing columns.
+///
+/// It serves the frozen-row tests (issue #609). The columns are `scheduled_at`,
+/// a `schedule_to_start` window in seconds, and an optional cross-retry deadline.
 async fn insert_pending_activity_task_with_schedule(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
-    schedule_to_close_at: Option<chrono::DateTime<chrono::Utc>>,
-    scheduled_at: chrono::DateTime<chrono::Utc>,
+    schedule_to_close_at: Option<jiff::Timestamp>,
+    scheduled_at: jiff::Timestamp,
     schedule_to_start_secs: i64,
 ) -> uuid::Uuid {
     let task_id = uuid::Uuid::new_v4();
@@ -613,8 +620,10 @@ async fn insert_pending_activity_task_with_schedule(
     .bind::<diesel::sql_types::Uuid, _>(task_id)
     .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
     .bind::<diesel::sql_types::Uuid, _>(uuid::Uuid::new_v4())
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(schedule_to_close_at)
-    .bind::<diesel::sql_types::Timestamptz, _>(scheduled_at)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
+        schedule_to_close_at.to_diesel(),
+    )
+    .bind::<diesel::sql_types::Timestamptz, _>(scheduled_at.to_diesel())
     .bind::<diesel::sql_types::BigInt, _>(schedule_to_start_secs)
     .execute(conn)
     .await
@@ -623,11 +632,11 @@ async fn insert_pending_activity_task_with_schedule(
 }
 
 /// Inserts a PENDING external activity task (`harvest_external_tasks`) with
-/// the given wall-clock deadline (issue #609 post-review hardening, finding 2).
+/// the given wall-clock deadline (issue #609).
 async fn insert_pending_external_task(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
-    schedule_to_close_at: chrono::DateTime<chrono::Utc>,
+    schedule_to_close_at: jiff::Timestamp,
 ) -> uuid::Uuid {
     let ext_id = uuid::Uuid::new_v4();
     diesel::sql_query(
@@ -640,7 +649,7 @@ async fn insert_pending_external_task(
     .bind::<diesel::sql_types::Uuid, _>(uuid::Uuid::new_v4())
     .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
     .bind::<diesel::sql_types::Uuid, _>(uuid::Uuid::new_v4())
-    .bind::<diesel::sql_types::Timestamptz, _>(schedule_to_close_at)
+    .bind::<diesel::sql_types::Timestamptz, _>(schedule_to_close_at.to_diesel())
     .execute(conn)
     .await
     .expect("insert pending external task");
@@ -650,26 +659,26 @@ async fn insert_pending_external_task(
 async fn task_timing_columns(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
-) -> (
-    String,
-    chrono::DateTime<chrono::Utc>,
-    Option<chrono::DateTime<chrono::Utc>>,
-) {
+) -> (String, jiff::Timestamp, Option<jiff::Timestamp>) {
     use autumn_harvest::schema::harvest_task_queue as t;
-    t::table
+    let (state, scheduled_at, schedule_to_close_at) = t::table
         .filter(t::id.eq(task_id))
         .select((t::state, t::scheduled_at, t::schedule_to_close_at))
-        .first(conn)
+        .first::<(String, SqlTimestamp, Option<SqlTimestamp>)>(conn)
         .await
-        .expect("task must exist")
+        .expect("task must exist");
+    (
+        state,
+        scheduled_at.to_jiff(),
+        schedule_to_close_at.map(SqlTimestamp::to_jiff),
+    )
 }
 
 #[tokio::test]
 async fn external_task_timeout_scanner_skips_paused_executions() {
-    // Finding 2 (issue #609 post-review hardening): the external-task
-    // schedule_to_close scanner is pause-aware — an expired deadline on a
-    // PAUSED execution's external task must not be enforced mid-pause; after
-    // resume the (shifted) deadline applies again.
+    // Issue #609: the external-task schedule_to_close scanner is pause-aware.
+    // It must not enforce an expired deadline on a PAUSED execution's external
+    // task mid-pause. After resume the shifted deadline applies again.
     use autumn_harvest::timeout::enforce_external_task_timeouts;
 
     let (url, _c) = setup().await;
@@ -678,7 +687,7 @@ async fn external_task_timeout_scanner_skips_paused_executions() {
     let ext_id = insert_pending_external_task(
         &mut conn,
         exec_id,
-        chrono::Utc::now() - chrono::Duration::seconds(1),
+        jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1),
     )
     .await;
 
@@ -743,9 +752,9 @@ async fn external_task_timeout_scanner_skips_paused_executions() {
 
 #[tokio::test]
 async fn resume_shifts_external_task_schedule_to_close_by_pause_span() {
-    // Finding 2 (issue #609 post-review hardening): resume pushes each
-    // still-open external task's schedule_to_close_at forward by the clamped
-    // pause span, mirroring the harvest_task_queue treatment.
+    // Issue #609: resume pushes each still-open external task's
+    // schedule_to_close_at forward by the clamped pause span, mirroring the
+    // harvest_task_queue treatment.
     let (url, _c) = setup().await;
     let mut conn = connect(&url).await;
     let exec_id = start(&mut conn, "wf", "ext-shift-1").await;
@@ -754,15 +763,15 @@ async fn resume_shifts_external_task_schedule_to_close_by_pause_span() {
         .await
         .expect("pause should succeed");
 
-    let now = chrono::Utc::now();
-    let deadline_before = now + chrono::Duration::minutes(10);
+    let now = jiff::Timestamp::now();
+    let deadline_before = now + jiff::SignedDuration::from_mins(10);
     let ext_id = insert_pending_external_task(&mut conn, exec_id, deadline_before).await;
 
     // Backdate the pause 30 minutes so the resume computes a deterministic,
     // non-zero span (mirrors resume_shifts_schedule_to_close_at_by_pause_span).
     use autumn_harvest::schema::harvest_workflow_executions as e;
     diesel::update(e::table.filter(e::id.eq(exec_id.as_uuid())))
-        .set(e::paused_at.eq(Some(now - chrono::Duration::minutes(30))))
+        .set(e::paused_at.eq(Some(now - jiff::SignedDuration::from_mins(30)).to_diesel()))
         .execute(&mut conn)
         .await
         .expect("backdate paused_at for test");
@@ -772,41 +781,43 @@ async fn resume_shifts_external_task_schedule_to_close_by_pause_span() {
         .expect("resume should succeed");
 
     use autumn_harvest::schema::harvest_external_tasks as ext;
-    let deadline_after: chrono::DateTime<chrono::Utc> = ext::table
+    let deadline_after = ext::table
         .filter(ext::id.eq(ext_id))
         .select(ext::schedule_to_close_at)
-        .first(&mut conn)
+        .first::<SqlTimestamp>(&mut conn)
         .await
-        .expect("external task must exist");
+        .expect("external task must exist")
+        .to_jiff();
     let shift = deadline_after - deadline_before;
     assert!(
-        shift >= chrono::Duration::minutes(29) && shift <= chrono::Duration::minutes(31),
+        shift >= jiff::SignedDuration::from_mins(29)
+            && shift <= jiff::SignedDuration::from_mins(31),
         "external schedule_to_close_at must shift forward by the ~30-minute pause span, got {shift:?}"
     );
 }
 
 #[tokio::test]
 async fn schedule_to_start_scanner_spares_frozen_rows_but_enforces_unfrozen_paused_rows() {
-    // Finding 3 (issue #609 post-review hardening), option (b): a PENDING row
-    // of a PAUSED execution past its (unshifted) schedule_to_close deadline
-    // is frozen-unclaimable — the ScheduleToStart scanner must spare exactly
-    // that row. An unfrozen pending activity of the same paused execution is
-    // still claimable by design (activities are not pause-gated), so its
-    // schedule_to_start signal (worker capacity) remains genuine and MUST
-    // still be enforced — never a blanket paused-execution exclusion.
+    // Issue #609: a PENDING row of a PAUSED execution past its unshifted
+    // schedule_to_close deadline is frozen-unclaimable. The ScheduleToStart
+    // scanner must spare exactly that row. Activities are not pause-gated, so
+    // an unfrozen pending activity of the same paused execution stays
+    // claimable. Its schedule_to_start signal (worker capacity) is genuine and
+    // MUST still be enforced. This is never a blanket paused-execution
+    // exclusion.
     use autumn_harvest::timeout::{TimeoutReason, find_timed_out_tasks};
 
     let (url, _c) = setup().await;
     let mut conn = connect(&url).await;
     let exec_id = start(&mut conn, "wf", "s2s-frozen-1").await;
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
 
     // Frozen: deadline elapsed → unclaimable while paused.
     let frozen_id = insert_pending_activity_task_with_schedule(
         &mut conn,
         exec_id,
-        Some(now - chrono::Duration::minutes(1)),
-        now - chrono::Duration::minutes(10),
+        Some(now - jiff::SignedDuration::from_mins(1)),
+        now - jiff::SignedDuration::from_mins(10),
         60,
     )
     .await;
@@ -814,8 +825,8 @@ async fn schedule_to_start_scanner_spares_frozen_rows_but_enforces_unfrozen_paus
     let unfrozen_id = insert_pending_activity_task_with_schedule(
         &mut conn,
         exec_id,
-        Some(now + chrono::Duration::minutes(10)),
-        now - chrono::Duration::minutes(10),
+        Some(now + jiff::SignedDuration::from_mins(10)),
+        now - jiff::SignedDuration::from_mins(10),
         60,
     )
     .await;
@@ -843,11 +854,10 @@ async fn schedule_to_start_scanner_spares_frozen_rows_but_enforces_unfrozen_paus
 
 #[tokio::test]
 async fn resume_shifts_scheduled_at_for_frozen_rows_only() {
-    // Finding 3 (issue #609 post-review hardening), option (b): on resume,
-    // exactly the frozen rows get scheduled_at shifted forward by the pause
-    // span — restoring their schedule_to_start budget and retry-backoff
-    // position — while unfrozen rows (claimable throughout the pause) keep
-    // their queue position untouched.
+    // Issue #609: on resume, exactly the frozen rows get scheduled_at shifted
+    // forward by the pause span. That restores their schedule_to_start budget
+    // and retry-backoff position. Unfrozen rows stay claimable throughout the
+    // pause and keep their queue position.
     let (url, _c) = setup().await;
     let mut conn = connect(&url).await;
     let exec_id = start(&mut conn, "wf", "s2s-shift-1").await;
@@ -856,12 +866,12 @@ async fn resume_shifts_scheduled_at_for_frozen_rows_only() {
         .await
         .expect("pause should succeed");
 
-    let now = chrono::Utc::now();
-    let scheduled_before = now - chrono::Duration::minutes(40);
+    let now = jiff::Timestamp::now();
+    let scheduled_before = now - jiff::SignedDuration::from_mins(40);
     let frozen_id = insert_pending_activity_task_with_schedule(
         &mut conn,
         exec_id,
-        Some(now - chrono::Duration::minutes(5)),
+        Some(now - jiff::SignedDuration::from_mins(5)),
         scheduled_before,
         60,
     )
@@ -869,7 +879,7 @@ async fn resume_shifts_scheduled_at_for_frozen_rows_only() {
     let unfrozen_id = insert_pending_activity_task_with_schedule(
         &mut conn,
         exec_id,
-        Some(now + chrono::Duration::minutes(10)),
+        Some(now + jiff::SignedDuration::from_mins(10)),
         scheduled_before,
         60,
     )
@@ -877,7 +887,7 @@ async fn resume_shifts_scheduled_at_for_frozen_rows_only() {
 
     use autumn_harvest::schema::harvest_workflow_executions as e;
     diesel::update(e::table.filter(e::id.eq(exec_id.as_uuid())))
-        .set(e::paused_at.eq(Some(now - chrono::Duration::minutes(30))))
+        .set(e::paused_at.eq(Some(now - jiff::SignedDuration::from_mins(30)).to_diesel()))
         .execute(&mut conn)
         .await
         .expect("backdate paused_at for test");
@@ -891,15 +901,15 @@ async fn resume_shifts_scheduled_at_for_frozen_rows_only() {
     assert_eq!(frozen_state, "PENDING");
     let frozen_shift = frozen_scheduled_at - scheduled_before;
     assert!(
-        frozen_shift >= chrono::Duration::minutes(29)
-            && frozen_shift <= chrono::Duration::minutes(31),
+        frozen_shift >= jiff::SignedDuration::from_mins(29)
+            && frozen_shift <= jiff::SignedDuration::from_mins(31),
         "the frozen row's scheduled_at must shift by the ~30-minute pause span, got {frozen_shift:?}"
     );
-    let frozen_deadline_shift =
-        frozen_deadline.expect("deadline must remain set") - (now - chrono::Duration::minutes(5));
+    let frozen_deadline_shift = frozen_deadline.expect("deadline must remain set")
+        - (now - jiff::SignedDuration::from_mins(5));
     assert!(
-        frozen_deadline_shift >= chrono::Duration::minutes(29)
-            && frozen_deadline_shift <= chrono::Duration::minutes(31),
+        frozen_deadline_shift >= jiff::SignedDuration::from_mins(29)
+            && frozen_deadline_shift <= jiff::SignedDuration::from_mins(31),
         "the frozen row's deadline still shifts like every open deadline, got {frozen_deadline_shift:?}"
     );
 
@@ -907,30 +917,30 @@ async fn resume_shifts_scheduled_at_for_frozen_rows_only() {
         task_timing_columns(&mut conn, unfrozen_id).await;
     assert_eq!(unfrozen_state, "PENDING");
     assert!(
-        (unfrozen_scheduled_at - scheduled_before).abs() < chrono::Duration::seconds(1),
+        (unfrozen_scheduled_at - scheduled_before).abs() < jiff::SignedDuration::from_secs(1),
         "an unfrozen row's scheduled_at (queue position) must stay untouched"
     );
     let unfrozen_deadline_shift = unfrozen_deadline.expect("deadline must remain set")
-        - (now + chrono::Duration::minutes(10));
+        - (now + jiff::SignedDuration::from_mins(10));
     assert!(
-        unfrozen_deadline_shift >= chrono::Duration::minutes(29)
-            && unfrozen_deadline_shift <= chrono::Duration::minutes(31),
+        unfrozen_deadline_shift >= jiff::SignedDuration::from_mins(29)
+            && unfrozen_deadline_shift <= jiff::SignedDuration::from_mins(31),
         "the unfrozen row's deadline still shifts forward, got {unfrozen_deadline_shift:?}"
     );
 }
 
-// ── Second bot-review round (issue #609 post-review hardening): scan-vs- ────
-// ── enforce races in the timeout scanners ───────────────────────────────────
+// ── Issue #609 hardening: scan-vs-enforce races in the timeout scanners ─────
 
-/// Inserts a PENDING activity task with a caller-chosen `activity_id` so a
-/// matching non-terminal `ActivityScheduled` event can be appended to history
-/// (the activity-timeout enforcer resolves the pending activity through
-/// exactly that pairing).
+/// Inserts a PENDING activity task with a caller-chosen `activity_id`.
+///
+/// A test can then append a matching non-terminal `ActivityScheduled` event.
+/// The activity-timeout enforcer resolves the pending activity through
+/// exactly that pairing.
 async fn insert_pending_activity_task_with_id(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     activity_id: uuid::Uuid,
-    schedule_to_close_at: chrono::DateTime<chrono::Utc>,
+    schedule_to_close_at: jiff::Timestamp,
 ) -> uuid::Uuid {
     let task_id = uuid::Uuid::new_v4();
     diesel::sql_query(
@@ -943,19 +953,20 @@ async fn insert_pending_activity_task_with_id(
     .bind::<diesel::sql_types::Uuid, _>(task_id)
     .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
     .bind::<diesel::sql_types::Uuid, _>(activity_id)
-    .bind::<diesel::sql_types::Timestamptz, _>(schedule_to_close_at)
+    .bind::<diesel::sql_types::Timestamptz, _>(schedule_to_close_at.to_diesel())
     .execute(conn)
     .await
     .expect("insert pending activity task");
     task_id
 }
 
-/// Holds the execution row lock open on a dedicated connection (explicit
-/// `BEGIN` + `SELECT ... FOR UPDATE`, no commit) so the test can queue a real
-/// `pause_workflow_execution` behind it and release only after the scanner
-/// under test has taken its non-locking scan snapshot — the exact
-/// scan-then-pause-then-enforce ordering of the race. Mirrors the
-/// lock-holding precedent in `integration_e2e.rs`
+/// Holds the execution row lock open on a dedicated connection.
+///
+/// It uses an explicit `BEGIN` + `SELECT ... FOR UPDATE` with no commit. The
+/// test queues a real `pause_workflow_execution` behind it. It releases the
+/// lock only after the scanner under test takes its non-locking scan snapshot.
+/// That is the exact scan-then-pause-then-enforce ordering of the race. It
+/// mirrors the lock-holding precedent in `integration_e2e.rs`
 /// (`wake_workflow_task_retries_after_losing_the_park_row_lock_race`).
 async fn hold_execution_row_lock(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
     conn.batch_execute("BEGIN")
@@ -970,18 +981,18 @@ async fn hold_execution_row_lock(conn: &mut AsyncPgConnection, exec_id: Executio
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn activity_schedule_to_close_enforcement_yields_to_a_pause_committed_after_the_scan() {
-    // Second bot-review round, finding A (issue #609 post-review hardening,
-    // P2): the ScheduleToClose scanner's PAUSED exclusion protects only the
-    // `find_timed_out_tasks` SELECT snapshot. `enforce_activity_timeout`
-    // then locks the execution row — but previously never re-checked whether
-    // the locked row was now PAUSED, so a pause committing after the scan
-    // (or while enforcement waited on the lock) still appended
-    // `ActivityTimedOut { ScheduleToClose }` and failed the task mid-pause.
+    // Issue #609 hardening: the PAUSED exclusion of the
+    // ScheduleToClose scanner protects only the `find_timed_out_tasks`
+    // SELECT snapshot. `enforce_activity_timeout` then locks the execution
+    // row. It previously never re-checked whether the locked row was now
+    // PAUSED. So a pause that committed after the scan (or while enforcement
+    // waited on the lock) still appended `ActivityTimedOut { ScheduleToClose }`
+    // and failed the task mid-pause.
     // Choreography: hold the execution row lock on one connection, queue the
-    // real pause behind it, then start the scanner — its scan snapshot (a
+    // real pause behind it, then start the scanner. Its scan snapshot (a
     // non-locking read) sees the still-RUNNING execution and picks up the
-    // expired task, and its enforcement transaction queues on the row lock
-    // BEHIND the pause. Releasing the lock lets the pause commit first; the
+    // expired task. Its enforcement transaction queues on the row lock
+    // BEHIND the pause. Releasing the lock lets the pause commit first. The
     // authoritative locked re-check must then skip enforcement entirely.
     use autumn_harvest::timeout::enforce_timeouts_once;
 
@@ -1009,7 +1020,7 @@ async fn activity_schedule_to_close_enforcement_yields_to_a_pause_committed_afte
         &mut conn,
         exec_id,
         activity_id,
-        chrono::Utc::now() - chrono::Duration::seconds(1),
+        jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1),
     )
     .await;
 
@@ -1029,9 +1040,9 @@ async fn activity_schedule_to_close_enforcement_yields_to_a_pause_committed_afte
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // The scan snapshot runs unblocked (the execution's committed state is
-    // still RUNNING, so the task is picked up as ScheduleToClose-expired);
-    // the per-task enforcement transaction then blocks on the execution row
+    // The scan snapshot runs unblocked. The execution's committed state is
+    // still RUNNING, so the scan picks the task up as ScheduleToClose-expired.
+    // The per-task enforcement transaction then blocks on the execution row
     // lock behind the queued pause.
     let scan_handle = tokio::spawn(async move {
         enforce_timeouts_once(
@@ -1098,19 +1109,18 @@ async fn activity_schedule_to_close_enforcement_yields_to_a_pause_committed_afte
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn external_task_enforcement_yields_to_a_pause_committed_after_the_scan() {
-    // Second bot-review round, finding B (issue #609 post-review hardening,
-    // P2): the external-task scan's PAUSED check was a non-locking NOT EXISTS
-    // subquery inside the claiming UPDATE — it never serialized with
-    // `pause_workflow_execution` (which locks only the execution row), so a
-    // pause committing between the UPDATE's snapshot and the event append
-    // still flipped the external task to TIMED_OUT and appended
-    // `ActivityTimedOut` mid-pause. The per-task transaction now locks the
-    // external-task row first (third bot-review round: task-row-first is the
-    // harvest_external_tasks convention set by the completion paths — taking
-    // the execution lock first was an ABBA inversion against
-    // `complete_externally`/`fail_externally`/`extend_deadline`), THEN the
-    // execution row, and re-checks PAUSED under the execution lock — so the
-    // state flip and the event append still serialize with the pause path.
+    // Issue #609 hardening: the PAUSED check of the external-task
+    // scan was a non-locking NOT EXISTS subquery inside the claiming UPDATE.
+    // It never serialized with `pause_workflow_execution`, which locks only
+    // the execution row. So a pause that committed between the UPDATE
+    // snapshot and the event append still flipped the external task to
+    // TIMED_OUT and appended `ActivityTimedOut` mid-pause. The per-task
+    // transaction now locks the external-task row first, THEN the execution
+    // row. It re-checks PAUSED under the execution lock, so the state flip
+    // and the event append still serialize with the pause path.
+    // Task-row-first is the harvest_external_tasks convention set by the
+    // completion paths. Taking the execution lock first was an ABBA inversion
+    // against `complete_externally`/`fail_externally`/`extend_deadline`.
     // Same choreography as the sibling task-queue test above.
     use autumn_harvest::timeout::enforce_external_task_timeouts;
 
@@ -1124,7 +1134,7 @@ async fn external_task_enforcement_yields_to_a_pause_committed_after_the_scan() 
     let ext_id = insert_pending_external_task(
         &mut conn,
         exec_id,
-        chrono::Utc::now() - chrono::Duration::seconds(1),
+        jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1),
     )
     .await;
 
@@ -1143,7 +1153,7 @@ async fn external_task_enforcement_yields_to_a_pause_committed_after_the_scan() 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // The scan SELECT is non-locking and sees the still-RUNNING committed
-    // state, so the expired external task is claimed for enforcement; the
+    // state, so it claims the expired external task for enforcement. The
     // per-task transaction's execution row lock then queues behind the pause.
     let scan_handle =
         tokio::spawn(async move { enforce_external_task_timeouts(&mut conn_scan).await });
@@ -1195,13 +1205,15 @@ async fn external_task_enforcement_yields_to_a_pause_committed_after_the_scan() 
     );
 }
 
-// ── Finding 1 (issue #609 post-review hardening): stale claim-time snapshot ─
+// ── Issue #609: stale claim-time snapshot ───────────────────────────────────
 
-/// Activity handler that simulates a pause→resume cycle completing while the
-/// attempt is in flight: it shifts its own task row's `schedule_to_close_at`
-/// forward (exactly what `resume_workflow_execution` does) and then fails
-/// retryably. The worker's retry path then holds a claim-time snapshot whose
-/// deadline is exceeded while the row-current deadline is comfortably ahead.
+/// Activity handler that simulates a pause→resume cycle that completes while
+/// the attempt is in flight.
+///
+/// It shifts its own task row's `schedule_to_close_at` forward, exactly as
+/// `resume_workflow_execution` does, and then fails retryably. The worker's
+/// retry path then holds a claim-time snapshot with an exceeded deadline. The
+/// row-current deadline is comfortably ahead.
 fn deadline_shifting_activity<'a>(
     _ctx: &'a autumn_harvest::ActivityContext,
     input: Value,
@@ -1230,16 +1242,15 @@ fn deadline_shifting_activity<'a>(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
 async fn retry_path_requeues_when_a_concurrent_resume_shifted_the_deadline() {
-    // Finding 1 (issue #609 post-review hardening, P1): the retry path's
-    // schedule_to_close gate evaluates the claim-time TaskQueueItem snapshot;
-    // resume_workflow_execution is the first post-enqueue mutator of that
-    // column. An attempt claimed pre/mid-pause whose deadline is shifted by a
-    // resume before it fails must be REQUEUED against the fresh (future)
-    // deadline — not terminally failed against the stale snapshot, which
-    // would charge paused wall-clock to the activity budget (AC5's exact
-    // failure mode). The in-transaction fresh re-read under the execution row
-    // lock is the guarantee; this test constructs the stale-snapshot state
-    // deterministically by letting the activity itself perform the shift
+    // Issue #609: the retry path's schedule_to_close gate evaluates the
+    // claim-time TaskQueueItem snapshot. resume_workflow_execution is the
+    // first post-enqueue mutator of that column. Take an attempt claimed
+    // pre/mid-pause whose deadline a resume shifts before it fails. It must be
+    // REQUEUED against the fresh (future) deadline. A terminal failure against
+    // the stale snapshot would charge paused wall-clock to the activity budget
+    // (AC5's exact failure mode). The in-transaction fresh re-read under the
+    // execution row lock is the guarantee. This test builds the stale-snapshot
+    // state deterministically: the activity itself performs the shift
     // mid-attempt.
     use autumn_harvest::info::ActivityInfo;
     use autumn_harvest::queue::{EnqueueParams, TaskType};
@@ -1270,7 +1281,7 @@ async fn retry_path_requeues_when_a_concurrent_resume_shifted_the_deadline() {
         &[
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!({}),
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -1299,7 +1310,8 @@ async fn retry_path_requeues_when_a_concurrent_resume_shifted_the_deadline() {
     params.activity_name = Some("deadline_shifting_activity".to_string());
     params.activity_id = Some(activity_id.as_uuid());
     params.max_attempts = 5;
-    params.schedule_to_close_at = Some(chrono::Utc::now() + chrono::Duration::seconds(30));
+    params.schedule_to_close_at =
+        Some(jiff::Timestamp::now() + jiff::SignedDuration::from_secs(30));
     params.retry_policy = Some(
         serde_json::to_value(
             RetryPolicy::fixed(5, Duration::from_secs(300)).with_jitter(JitterPolicy::None),
@@ -1345,20 +1357,20 @@ async fn retry_path_requeues_when_a_concurrent_resume_shifted_the_deadline() {
         runner.run(&pool_for_run).await;
     });
 
-    // Wait for the attempt to fail and be re-resolved by the retry path: a
-    // requeue lands the row back in PENDING with the attempt's error stored
-    // (for `ActivityContext::previous_failure`) and a ~300s backoff, while
-    // the buggy path lands it in FAILED with an ActivityTimedOut event.
+    // Wait for the attempt to fail and for the retry path to re-resolve it. A
+    // requeue lands the row back in PENDING with a ~300s backoff. It stores
+    // the attempt's error for `ActivityContext::previous_failure`. The buggy
+    // path lands it in FAILED with an ActivityTimedOut event.
     use autumn_harvest::schema::harvest_task_queue as t;
     let poll_deadline = std::time::Instant::now() + Duration::from_secs(30);
     let (state, error, scheduled_at) = loop {
-        let (state, error, scheduled_at): (String, Option<String>, chrono::DateTime<chrono::Utc>) =
-            t::table
-                .filter(t::id.eq(task_id))
-                .select((t::state, t::error, t::scheduled_at))
-                .first(&mut conn)
-                .await
-                .expect("task must exist");
+        let (state, error, scheduled_at): (String, Option<String>, SqlTimestamp) = t::table
+            .filter(t::id.eq(task_id))
+            .select((t::state, t::error, t::scheduled_at))
+            .first(&mut conn)
+            .await
+            .expect("task must exist");
+        let scheduled_at = scheduled_at.to_jiff();
         let resolved = state == "FAILED" || (state == "PENDING" && error.is_some());
         if resolved || std::time::Instant::now() > poll_deadline {
             break (state, error, scheduled_at);
@@ -1381,7 +1393,7 @@ async fn retry_path_requeues_when_a_concurrent_resume_shifted_the_deadline() {
         "the requeued row must carry the attempt's error for the next attempt, got {error:?}"
     );
     assert!(
-        scheduled_at > chrono::Utc::now() + chrono::Duration::seconds(200),
+        scheduled_at > jiff::Timestamp::now() + jiff::SignedDuration::from_secs(200),
         "the requeue must respect the retry policy's 300s backoff, got {scheduled_at}"
     );
     assert!(
@@ -1399,19 +1411,21 @@ async fn retry_path_requeues_when_a_concurrent_resume_shifted_the_deadline() {
     );
 }
 
-// ── Round 2 (issue #609 post-review hardening): pause after the gate ────────
+// ── Issue #609 hardening: pause after the gate ──────────────────────────────
 
-/// Activity handler that reproduces an operator pause committing in the gap
-/// between the retry path's non-locking `owning_execution_is_paused` gate and
-/// `record_schedule_to_close_activity_timeout`'s transaction taking the
-/// execution row lock. Mirroring the round-3 lock-holding precedent
-/// (`wake_workflow_task_retries_after_losing_the_park_row_lock_race`): a hold
-/// connection takes the execution row's `FOR UPDATE` lock in an explicit
-/// open `BEGIN`, a second connection queues the *real*
-/// `pause_workflow_execution` behind it, and the hold is released only after
-/// this attempt's retryable failure has passed the gate (reading the still
-/// committed-RUNNING snapshot) and blocked on the row lock — so the pause
-/// commits first in the lock queue and the timeout transaction observes a
+/// Activity handler that reproduces an operator pause that commits inside a
+/// gap in the retry path.
+///
+/// The gap starts at the non-locking `owning_execution_is_paused` gate. It
+/// ends when the `record_schedule_to_close_activity_timeout` transaction takes
+/// the execution row lock. It mirrors the lock-holding precedent of
+/// `wake_workflow_task_retries_after_losing_the_park_row_lock_race`. A hold
+/// connection takes the `FOR UPDATE` lock of the execution row in an explicit
+/// open `BEGIN`. A second connection queues the *real*
+/// `pause_workflow_execution` behind it. The retryable failure of this attempt
+/// first passes the gate, which reads the still committed-RUNNING snapshot. It
+/// then blocks on the row lock. Only then is the hold released. So the pause
+/// commits first in the lock queue. The timeout transaction then observes a
 /// now-PAUSED execution whose row deadline IS exceeded. Only the
 /// in-transaction PAUSED re-check can save the task from being
 /// deadline-failed mid-pause.
@@ -1465,17 +1479,17 @@ fn self_pausing_activity<'a>(
             .await
             .expect("pause should succeed once the hold releases");
         });
-        // Give the spawned pause a moment to reach and block on the FOR
-        // UPDATE queue before this attempt fails — so it is ahead of the
-        // retry path's timeout transaction in the lock queue.
+        // Give the spawned pause a moment to block on the FOR UPDATE queue
+        // before this attempt fails. It is then ahead of the retry path's
+        // timeout transaction in the lock queue.
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // Release the hold only after the failure below has reached the
-        // retry path: the non-locking gate reads the committed (RUNNING)
-        // snapshot, then the timeout transaction blocks on the row lock
-        // behind the pause. On a slow runner the gate may instead read an
-        // already-committed PAUSED and short-circuit — the asserted end
-        // state is identical either way.
+        // Release the hold only after the failure below reaches the retry
+        // path. The non-locking gate reads the committed (RUNNING) snapshot.
+        // Then the timeout transaction blocks on the row lock behind the
+        // pause. On a slow runner the gate may instead read an
+        // already-committed PAUSED and short-circuit. The asserted end state
+        // is identical either way.
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(500)).await;
             conn_hold
@@ -1490,20 +1504,21 @@ fn self_pausing_activity<'a>(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
 async fn retry_path_requeues_when_a_concurrent_pause_committed_after_the_gate() {
-    // Round 2 (issue #609 post-review hardening, P2): the retry path's
-    // `owning_execution_is_paused` gate is a non-locking read taken BEFORE
+    // Issue #609 hardening: the `owning_execution_is_paused` gate of the
+    // retry path is a non-locking read. It is taken BEFORE
     // `record_schedule_to_close_activity_timeout` opens its transaction and
     // takes the execution row lock. A pause committing in that gap used to
     // be deadline-failed anyway (the transaction only re-checked task state
-    // and the row-current deadline), violating the
+    // and the row-current deadline). That violated the
     // pause-suspends-schedule_to_close contract for the race window. The
     // authoritative PAUSED re-check under the execution row lock is the
-    // guarantee; this test constructs the race window by letting the activity
-    // itself queue a real pause of its own execution behind a held row lock
-    // mid-attempt (released only after the failure reaches the retry path).
+    // guarantee. This test constructs the race window. Mid-attempt, the
+    // activity itself queues a real pause of its own execution behind a held
+    // row lock. The lock is released only after the failure reaches the retry
+    // path.
     // Both the claim-time snapshot deadline AND the row-current deadline are
-    // exceeded, so neither the snapshot gate nor the resume-shift staleness
-    // re-check can save the task — only the new PAUSED re-check.
+    // exceeded. So neither the snapshot gate nor the resume-shift staleness
+    // re-check can save the task, only the new PAUSED re-check.
     use autumn_harvest::info::ActivityInfo;
     use autumn_harvest::queue::{EnqueueParams, TaskType};
     use autumn_harvest::types::ActivityExecId;
@@ -1534,7 +1549,7 @@ async fn retry_path_requeues_when_a_concurrent_pause_committed_after_the_gate() 
         &[
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!({}),
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -1551,15 +1566,16 @@ async fn retry_path_requeues_when_a_concurrent_pause_committed_after_the_gate() 
     .await
     .expect("append history");
 
-    // Deadline 30s ahead (claimable) with a 300s retry delay: exceeded at
-    // fail time both on the claim-time snapshot AND on the untouched row
-    // value — deterministically, with no sleeping.
+    // Deadline 30s ahead (claimable) with a 300s retry delay. At fail time
+    // the deadline is exceeded both on the claim-time snapshot AND on the
+    // untouched row value. That holds deterministically, with no sleeping.
     let mut params = EnqueueParams::new("default", TaskType::Activity, activity_input);
     params.workflow_exec_id = Some(exec_id.as_uuid());
     params.activity_name = Some("self_pausing_activity".to_string());
     params.activity_id = Some(activity_id.as_uuid());
     params.max_attempts = 5;
-    params.schedule_to_close_at = Some(chrono::Utc::now() + chrono::Duration::seconds(30));
+    params.schedule_to_close_at =
+        Some(jiff::Timestamp::now() + jiff::SignedDuration::from_secs(30));
     params.retry_policy = Some(
         serde_json::to_value(
             RetryPolicy::fixed(5, Duration::from_secs(300)).with_jitter(JitterPolicy::None),
@@ -1605,9 +1621,9 @@ async fn retry_path_requeues_when_a_concurrent_pause_committed_after_the_gate() 
         runner.run(&pool_for_run).await;
     });
 
-    // Wait for the attempt to fail and be re-resolved by the retry path: a
-    // requeue lands the row back in PENDING with the attempt's error stored,
-    // while the buggy path lands it in FAILED with an ActivityTimedOut event.
+    // Wait for the attempt to fail and for the retry path to re-resolve it. A
+    // requeue lands the row back in PENDING with the attempt's error stored.
+    // The buggy path lands it in FAILED with an ActivityTimedOut event.
     use autumn_harvest::schema::harvest_task_queue as t;
     let poll_deadline = std::time::Instant::now() + Duration::from_secs(30);
     let (state, error) = loop {
@@ -1674,7 +1690,7 @@ async fn pause_is_idempotent() {
     // Tolerant comparison (µs column precision vs ns in-memory instant): the
     // repeat must report the original pause instant, not its own timestamp.
     assert!(
-        (second_at - first_at).abs() < chrono::Duration::milliseconds(1),
+        (second_at - first_at).abs() < jiff::SignedDuration::from_millis(1),
         "expected the original pause instant, got {second_at} vs {first_at}"
     );
 
@@ -1750,7 +1766,7 @@ async fn resume_of_completed_execution_is_a_success_noop() {
     diesel::update(e::table.filter(e::id.eq(exec_id.as_uuid())))
         .set((
             e::state.eq("COMPLETED"),
-            e::completed_at.eq(Some(chrono::Utc::now())),
+            e::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -1896,7 +1912,11 @@ async fn auto_resume_expired_pauses_force_resumes() {
     // Backdate paused_at so the pause is well past the ceiling.
     use autumn_harvest::schema::harvest_workflow_executions as e;
     diesel::update(e::table.filter(e::id.eq(exec_id.as_uuid())))
-        .set(e::paused_at.eq(Some(chrono::Utc::now() - chrono::Duration::hours(48))))
+        .set(
+            e::paused_at.eq(
+                Some(jiff::Timestamp::now() - jiff::SignedDuration::from_hours(48)).to_diesel(),
+            ),
+        )
         .execute(&mut conn)
         .await
         .unwrap();
@@ -1945,7 +1965,6 @@ async fn pause_defers_timer_then_resume_fires_and_replays_deterministically() {
     })
     .await;
 
-    // Pause while the timer is pending.
     pause_workflow_execution(&mut conn, exec_id, Some("freeze"), "oncall", &NoOpMetrics)
         .await
         .expect("pause should succeed");
@@ -1985,8 +2004,8 @@ async fn pause_defers_timer_then_resume_fires_and_replays_deterministically() {
     let _ = worker_handle.await;
 
     // Replay determinism: re-run the recorded history on a cold executor (no
-    // cache) and confirm the pause/resume events are transparent — the workflow
-    // reproduces the same terminal outcome.
+    // cache). Confirm that the pause/resume events are transparent: the
+    // workflow reproduces the same terminal outcome.
     let replay_history: Vec<WorkflowEvent> = final_history
         .iter()
         .filter(|e| !matches!(e, WorkflowEvent::WorkflowCompleted { .. }))
@@ -2026,9 +2045,9 @@ async fn pause_during_inflight_decision_task_discards_pending_commands() {
         let _ = tokio::time::timeout(Duration::from_secs(25), worker_ref.run(&worker_pool)).await;
     });
 
-    // Land the pause while the decision task is mid-flight: the worker has
-    // claimed it (worker_id set) but the handler is still in its 800ms sleep,
-    // so the StartTimer command has not yet been produced or persisted.
+    // Land the pause while the decision task is mid-flight. The worker has
+    // claimed it (worker_id set), but the handler is still in its 800ms
+    // sleep. So the StartTimer command is not yet produced or persisted.
     wait_for_task_claimed(&mut conn, exec_id).await;
     pause_workflow_execution(
         &mut conn,

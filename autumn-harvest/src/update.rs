@@ -1,9 +1,9 @@
 //! Update handler registry for the workflow Update primitive (issue #140).
 //!
 //! An `UpdateRegistry` stores type-erased validators and async handlers keyed
-//! by name. Registration is idempotent — calling `register` twice for the same
-//! name is a no-op, making it safe to call at the top of every `#[workflow]`
-//! function on each replay cycle.
+//! by name. Registration is idempotent: a second `register` for the same name
+//! is a no-op. So a `#[workflow]` function can register at its top on each
+//! replay cycle.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -11,7 +11,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::Value;
 
 use crate::context::{WorkflowCommand, WorkflowContext};
@@ -29,7 +29,7 @@ pub(crate) const UPDATE_HANDLER_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) struct UpdateDispatch {
     /// The end of the workflow-task budget. With `None`, the budget is off and
     /// the window is a fixed 30 seconds.
-    pub(crate) cutoff: Option<DateTime<Utc>>,
+    pub(crate) cutoff: Option<Timestamp>,
     /// Whether the first update may run after the window closes. Only the first
     /// drive of a decision sets it. A re-drive of the same decision shares the
     /// budget, so it must not run another update past the window.
@@ -91,6 +91,12 @@ impl UpdateRegistry {
         self.entries
             .entry(name.to_string())
             .or_insert(UpdateEntry { validator, handler });
+    }
+
+    /// Returns `true` if no handler is registered.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     /// Returns `true` if a handler is registered under `name`.
@@ -206,9 +212,9 @@ pub(crate) async fn dispatch_pending_updates(
 ///
 /// The window is half of the budget that is left. The persist needs the rest.
 /// A task with no budget gets a fixed [`UNBUDGETED_WINDOW`].
-fn window_end(cutoff: Option<DateTime<Utc>>) -> tokio::time::Instant {
+fn window_end(cutoff: Option<Timestamp>) -> tokio::time::Instant {
     let window = cutoff.map_or(UNBUDGETED_WINDOW, |cutoff| {
-        (cutoff - Utc::now()).to_std().unwrap_or(Duration::ZERO) / 2
+        Duration::try_from(cutoff - Timestamp::now()).unwrap_or(Duration::ZERO) / 2
     });
     tokio::time::Instant::now() + window
 }
@@ -218,9 +224,9 @@ fn window_end(cutoff: Option<DateTime<Utc>>) -> tokio::time::Instant {
 /// It is [`UPDATE_HANDLER_TIMEOUT`], or half of what is left of the budget when
 /// that is less. A body that used most of the budget thus cannot push the cycle
 /// past its cut-off, and the persist keeps the other half.
-fn handler_limit(cutoff: Option<DateTime<Utc>>) -> Duration {
+fn handler_limit(cutoff: Option<Timestamp>) -> Duration {
     cutoff.map_or(UPDATE_HANDLER_TIMEOUT, |cutoff| {
-        let left = (cutoff - Utc::now()).to_std().unwrap_or(Duration::ZERO);
+        let left = Duration::try_from(cutoff - Timestamp::now()).unwrap_or(Duration::ZERO);
         UPDATE_HANDLER_TIMEOUT.min(left / 2)
     })
 }
@@ -359,7 +365,7 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use chrono::Utc;
+    use jiff::Timestamp;
     use serde_json::json;
 
     use crate::event::WorkflowEvent;
@@ -372,7 +378,7 @@ mod tests {
     fn started() -> WorkflowEvent {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -384,7 +390,7 @@ mod tests {
             update_id,
             name: name.to_string(),
             input,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
         }
     }
 
@@ -429,7 +435,7 @@ mod tests {
     fn context_with_cutoff(
         history: Vec<WorkflowEvent>,
         handlers: &[&UpdateHandlerInfo],
-        cutoff: DateTime<Utc>,
+        cutoff: Timestamp,
     ) -> WorkflowContext {
         let ctx = crate::executor::default_task_context(ExecutionId::new(), history);
         for handler in handlers {
@@ -445,7 +451,7 @@ mod tests {
     fn redrive_context(
         history: Vec<WorkflowEvent>,
         handlers: &[&UpdateHandlerInfo],
-        cutoff: DateTime<Utc>,
+        cutoff: Timestamp,
     ) -> WorkflowContext {
         let ctx = crate::executor::default_task_context(ExecutionId::new(), history);
         for handler in handlers {
@@ -933,7 +939,7 @@ mod tests {
             admitted(second, "count", json!(2)),
             admitted(third, "count", json!(3)),
         ];
-        let cutoff = Utc::now() - chrono::Duration::seconds(1);
+        let cutoff = Timestamp::now() - jiff::SignedDuration::from_secs(1);
         let drive = drive_full(context_with_cutoff(history, &[&handler], cutoff), parked).await;
 
         assert_eq!(
@@ -951,7 +957,7 @@ mod tests {
         let id = UpdateId::new();
         let handler = info("hang", never_finishes);
         let history = vec![started(), admitted(id, "hang", json!({}))];
-        let cutoff = Utc::now() + chrono::Duration::seconds(4);
+        let cutoff = Timestamp::now() + jiff::SignedDuration::from_secs(4);
         let began = tokio::time::Instant::now();
         let drive = drive_full(context_with_cutoff(history, &[&handler], cutoff), parked).await;
 
@@ -1024,7 +1030,7 @@ mod tests {
             },
         ];
         // 4 s left: half of it is under one handler limit, so the window is closed.
-        let cutoff = Utc::now() + chrono::Duration::seconds(4);
+        let cutoff = Timestamp::now() + jiff::SignedDuration::from_secs(4);
         let ctx = redrive_context(history, &[&handler], cutoff);
         let key = crate::resident::ResidentKey::new(
             signal_then_activity,
@@ -1071,7 +1077,7 @@ mod tests {
         let id = UpdateId::new();
         let handler = info("count", count_redrive);
         let history = vec![started(), admitted(id, "count", json!(1))];
-        let cutoff = Utc::now() - chrono::Duration::seconds(1);
+        let cutoff = Timestamp::now() - jiff::SignedDuration::from_secs(1);
         let drive = drive_full(redrive_context(history, &[&handler], cutoff), parked).await;
 
         assert_eq!(results(&drive.outcome, &drive.pending), Vec::new());
@@ -1087,7 +1093,7 @@ mod tests {
         for (n, id) in ids.iter().enumerate() {
             history.push(admitted(*id, "order", json!(n)));
         }
-        let cutoff = Utc::now() + chrono::Duration::hours(1);
+        let cutoff = Timestamp::now() + jiff::SignedDuration::from_hours(1);
         let drive = drive_full(context_with_cutoff(history, &[&handler], cutoff), parked).await;
 
         assert_eq!(results(&drive.outcome, &drive.pending).len(), 3);
@@ -1136,7 +1142,7 @@ mod tests {
         for (n, id) in ids.iter().enumerate() {
             history.push(admitted(*id, "slow", json!(n)));
         }
-        let cutoff = Utc::now() + chrono::Duration::seconds(30);
+        let cutoff = Timestamp::now() + jiff::SignedDuration::from_secs(30);
         let drive = drive_full(context_with_cutoff(history, &[&handler], cutoff), parked).await;
 
         let recorded = results(&drive.outcome, &drive.pending);

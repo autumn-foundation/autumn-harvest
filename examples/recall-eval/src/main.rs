@@ -8,14 +8,15 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use autoresearch::claude::{ClaudeModel, DEFAULT_MODEL};
+use autumn_harvest_agent::anthropic::{ClaudeModel, DEFAULT_MODEL};
+use autumn_harvest_agent::openai::OpenAiModel;
 use autumn_harvest_agent::recall::{
     self, EPISODES, MEMORY, NOTES, ReaderModel, RecallFixture, WINDOW,
 };
 use autumn_harvest_agent::{AgentModel, sqlite};
 use autumn_harvest_sqlite::SqliteRuntime;
-use chrono::{DateTime, Utc};
 use clap::Parser;
+use jiff::Timestamp;
 
 /// The command line.
 #[derive(Debug, Parser)]
@@ -24,9 +25,18 @@ struct Args {
     /// Run on the scripted `ReaderModel`. It needs no key and no network.
     #[arg(long)]
     scripted: bool,
-    /// The Claude model.
+    /// The model: a Claude model, or with `--base-url` a model of that
+    /// server.
     #[arg(long, default_value = DEFAULT_MODEL)]
     model: String,
+    /// The base URL of an OpenAI-compatible server, such as `OpenRouter` or
+    /// Ollama. A flag only, so a variable of another tool cannot move a run.
+    #[arg(long)]
+    base_url: Option<String>,
+    /// The environment variable of the key of `--base-url`. The default is
+    /// the variable of a known host: `OPENAI_API_KEY` or `OPENROUTER_API_KEY`.
+    #[arg(long)]
+    api_key_env: Option<String>,
     /// The API key. Only a real-model run reads it.
     #[arg(long, env = "ANTHROPIC_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
@@ -48,17 +58,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let (model, name): (Arc<dyn AgentModel>, String) = if args.scripted {
         (ReaderModel::new(), "ReaderModel (scripted)".to_owned())
+    } else if let Some(base_url) = &args.base_url {
+        let model = args
+            .api_key_env
+            .as_ref()
+            .map_or_else(
+                || OpenAiModel::with_env_key(base_url, args.model.clone()),
+                |var| OpenAiModel::with_key_from(base_url, args.model.clone(), var),
+            )
+            .map_err(|e| format!("--base-url: {}", e.message()))?;
+        let name = model.model_id().unwrap_or_default().to_owned();
+        (Arc::new(model), name)
     } else {
         let key = args
             .api_key
             .clone()
             .ok_or("a real-model run needs ANTHROPIC_API_KEY, or pass --scripted")?;
-        let model = ClaudeModel::new(key).model(args.model.clone());
+        let model = ClaudeModel::new(&key)
+            .map_err(|e| format!("ANTHROPIC_API_KEY: {}", e.message()))?
+            .model(args.model.clone());
         (Arc::new(model), args.model.clone())
     };
     let temp = tempfile::tempdir()?;
     let db = args.db.unwrap_or_else(|| temp.path().join("recall.db"));
-    let section = run(model, &name, args.window, &db, Utc::now()).await?;
+    let section = run(model, &name, args.window, &db, Timestamp::now()).await?;
     println!("{section}");
     Ok(())
 }
@@ -69,7 +92,7 @@ async fn run(
     name: &str,
     window: u32,
     db: &std::path::Path,
-    at: DateTime<Utc>,
+    at: Timestamp,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let fixture = RecallFixture::builtin()?;
     let harness = Arc::new(recall::harness(model, window));
@@ -82,7 +105,7 @@ async fn run(
 
 /// The Markdown section of one run: the model, the date, the config and
 /// the table.
-fn render(name: &str, window: u32, at: DateTime<Utc>, report: &recall::RecallReport) -> String {
+fn render(name: &str, window: u32, at: Timestamp, report: &recall::RecallReport) -> String {
     format!(
         "### {name}, {date}\n\n\
          - Model: `{name}`\n\
@@ -92,7 +115,7 @@ fn render(name: &str, window: u32, at: DateTime<Utc>, report: &recall::RecallRep
          and `EpisodeSettings::default().every(1)`.\n\
          - Fixture: the built-in fixture, {items} items. Scorer: `ExactMatch`.\n\n\
          {table}",
-        date = at.format("%Y-%m-%d"),
+        date = at.strftime("%Y-%m-%d"),
         items = report.items.len(),
         table = report.to_markdown(),
     )
@@ -105,9 +128,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_scripted_run_renders_the_model_the_date_the_config_and_the_table() {
         let dir = tempfile::tempdir().expect("a temporary directory");
-        let at = DateTime::parse_from_rfc3339("2026-11-04T00:00:00Z")
-            .expect("a date")
-            .with_timezone(&Utc);
+        let at: Timestamp = "2026-11-04T00:00:00Z".parse().expect("a date");
         let section = run(
             ReaderModel::new(),
             "reader",

@@ -29,8 +29,8 @@
 //! \* HVG011's catalog severity is the class's worst case (a loop body that
 //! schedules commands). Detection surfaces (the `#[workflow]` macro lint and
 //! `det_check`'s DET010) downgrade a command-free loop to a Warning.
-//! Note the ID remap: issue #785's text proposed HVG010, but HVG010 was
-//! already permanently assigned to SelectMacro (issue #600) — IDs are never
+//! Note the ID remap: issue #785's text proposed HVG010. But HVG010 was
+//! already permanently assigned to SelectMacro (issue #600). IDs are never
 //! reused, so the iteration-order rule ships as HVG011.
 
 /// Severity of a guardrail rule violation.
@@ -45,7 +45,7 @@ pub enum Severity {
 /// The determinism category a rule belongs to.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RuleCategory {
-    /// Direct reads of wall-clock time (`SystemTime`, `Instant`, `chrono::Utc::now()`).
+    /// Direct reads of wall-clock time (`SystemTime`, `Instant`, `jiff::Timestamp::now()`).
     WallClock,
     /// Random number generation or ad-hoc UUID creation (`rand`, `Uuid::new_v4()`).
     Randomness,
@@ -98,15 +98,15 @@ static CATALOG: &[RuleEntry] = &[
         severity: Severity::HardBlocker,
         category: RuleCategory::WallClock,
         explanation: "Reading wall-clock time inside a workflow (std::time::Instant::now(), \
-            SystemTime::now(), chrono::Utc::now(), etc.) produces a different value on every \
-            replay. The workflow engine re-executes the function body deterministically against \
-            recorded history; a fresh timestamp breaks that contract and causes a \
-            non-determinism error.",
+            SystemTime::now(), jiff::Timestamp::now(), chrono::Utc::now(), etc.) produces a \
+            different value on every replay. The workflow engine re-executes the function \
+            body deterministically against recorded history; a fresh timestamp breaks that \
+            contract and causes a non-determinism error.",
         alternative: "Use ctx.now() (WorkflowContext) to read the workflow-logical clock, \
             which returns the WorkflowStarted timestamp and replays identically on every \
             subsequent run. For a real wall-clock instant captured at the call site (e.g. \
             \"skip the notification if the event is older than 24h *now*\"), use \
-            ctx.system_now() -> DateTime<Utc> (or ctx.system_time_now() -> SystemTime), which \
+            ctx.system_now() -> jiff::Timestamp (or ctx.system_time_now() -> SystemTime), which \
             captures the current time once and replays it deterministically via a recorded \
             SideEffectRecorded event.",
     },
@@ -248,9 +248,9 @@ static CATALOG: &[RuleEntry] = &[
             instead of racing them; to block until a workflow-local predicate holds (optionally \
             bounded by a deadline), use ctx.await_condition_timeout().",
     },
-    // HVG011 (issue #785). ID remap: the issue text proposed HVG010, but
-    // HVG010 was already permanently assigned to SelectMacro (issue #600) and
-    // rule IDs are never reused, so this rule ships as HVG011.
+    // HVG011 (issue #785). ID remap: the issue text proposed HVG010. But
+    // HVG010 was already permanently assigned to SelectMacro (issue #600).
+    // Rule IDs are never reused, so this rule ships as HVG011.
     //
     // Severity note: the catalog severity is the class's worst case (a loop
     // body that schedules commands is a HardBlocker). Detection surfaces (the
@@ -289,8 +289,6 @@ pub fn catalog() -> &'static [RuleEntry] {
 pub fn rule_by_id(id: &str) -> Option<&'static RuleEntry> {
     CATALOG.iter().find(|e| e.id == id)
 }
-
-// ── GuardrailFinding ──────────────────────────────────────────────────────────
 
 /// A machine-readable finding produced by a guardrail checker.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -331,8 +329,6 @@ impl GuardrailFinding {
         }
     }
 }
-
-// ── GuardrailSuppression ──────────────────────────────────────────────────────
 
 /// Error returned when a suppression is constructed with invalid arguments.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -404,8 +400,6 @@ impl GuardrailSuppression {
         &self.reason
     }
 }
-
-// ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

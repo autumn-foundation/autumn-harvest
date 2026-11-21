@@ -167,7 +167,8 @@ pub enum RefineError {
         /// The kind of the source, if it names one.
         found: Option<String>,
     },
-    /// The replay probe cannot read the source. The text says why.
+    /// The replay probe cannot read the source, such as a durable `agent`
+    /// run. The text says why.
     #[error("the source run {run} cannot be probed: {reason}")]
     SourceNotReplayable {
         /// The source run.

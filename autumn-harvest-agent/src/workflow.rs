@@ -4,6 +4,7 @@
 //!
 //! - [`agent_model_turn`] — one model call and the policy decisions.
 //! - [`agent_tool_call`] — one tool call.
+//! - [`agent_approval_notice`] — one notice before an approval wait.
 //! - an approval signal with a deadline, for a call the policy gates.
 //! - [`agent_memory_snapshot`] — the frozen memory of a segment.
 //! - [`agent_deliver`] — one report to the delivery.
@@ -18,6 +19,7 @@
 //! results. That keeps replay deterministic.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::pin::Pin;
 use std::time::Duration;
 
 use autumn_harvest::llm_budget::LlmBudgetExceeded;
@@ -29,7 +31,8 @@ use crate::agent::{
     Steer,
 };
 use crate::agent::{
-    agent_info, agent_memory_reset_info, agent_profile_info, agent_profile_overlay_info,
+    agent_info, agent_memory_count_info, agent_memory_reset_info, agent_profile_info,
+    agent_profile_overlay_info, agent_transcript_count_info, agent_transcript_erase_info,
     agent_workspace_floor_info, agent_workspace_reset_info, agent_workspace_retain_info,
 };
 use crate::answer_check::{self, Checked};
@@ -38,30 +41,33 @@ use crate::bounds::{
     RoundBudget, full_round_resets, json_len, reaches_percent, reset_due, sibling_cap,
 };
 use crate::context_reset::{self, ProgressNotes, SAVE_PROGRESS_TOOL};
-use crate::delivery::{Report, ReportSource, report_text};
+use crate::delivery::{ParkedCall, Report, ReportSource, cut_arguments, report_text};
 use crate::draw::Draw;
 use crate::fan_out_plan::{Fit, Step, fan_out_plan};
 use crate::flow::Released;
 use crate::followup::{self, FOLLOWUP_TOOL, Planned};
 use crate::harness::{
-    AgentHarness, CacheTenant, TRUNCATED, max_tool_result_bytes, truncate, truncate_flagged,
+    AgentHarness, CacheTenant, REASON_CUT_BYTES, TRUNCATED, cut_bytes, max_tool_result_bytes,
+    truncate, truncate_flagged,
 };
 use crate::heartbeat::{HeartbeatTask, agent_heartbeat_info};
 use crate::loop_guard::{LoopTracker, LoopVerdict, warning_note};
 use crate::memory::{
-    MEMORY_TOOL, MemoryBlock, MemoryOp, MemoryScope, MemorySnapshot, MemoryTool, apply_to,
-    edit_result,
+    MEMORY_TOOL, MemoryBlock, MemoryOp, MemoryScope, MemorySnapshot, MemoryTool,
+    READ_ONLY_SNAPSHOT_PATCH, SnapshotAccess, apply_to, edit_result,
 };
 use crate::mesh::{
     DELEGATE_TOOL, DelegateArgs, DelegationRecord, INVALID_NAME, Mandate, Peer, Refusal,
-    SerialReason, delegate_definition, valid_name,
+    SerialReason, delegate_definition, sample_cap, valid_name,
 };
 use crate::mesh_control::{MESH_ATTR, MESH_BUDGET_EXCEEDED, MeshBudgetExceeded};
 use crate::message::{
     ChatMessage, ChatRole, ContentPart, RunId, StopReason, TokenUsage, ToolCall, ToolDefinition,
 };
 use crate::policy::ToolDecision;
+use crate::sampling::{MAX_SWEEP_REASON_BYTES, SWEEP_WORKFLOW_NAME, SweepReport};
 use crate::skill::{self, LOAD_SKILL_TOOL};
+use crate::sweep_tool::{self, SWEEP_TOOL, SweepTool};
 use crate::transcript::{PREFIX_MISSING, PrefixRef, Sent, TRANSCRIPT_DELTA_PATCH};
 use crate::types::{
     AgentReport, AgentStop, AgentTask, MAX_PARALLEL_CHILDREN, ModelTurn, ModelTurnRequest,
@@ -79,6 +85,17 @@ const FINAL_TURN_PATCH: &str = "agent_final_turn_rules";
 /// with the old input.
 const CHILD_FAILURE_REPORT_PATCH: &str = "agent_child_failure_report";
 
+/// The gate of the `sample` argument of `delegate`. A history from before
+/// the gate refused such a call as `invalid_arguments`, so its replay still
+/// does. The gate runs only for a call with a sample, so a plain call
+/// records no marker.
+const DELEGATE_SAMPLE_PATCH: &str = "agent_delegate_sample";
+
+/// The gate of the `sample` argument in the schema of the `delegate` tool.
+/// A history from before the gate recorded each model input with the old
+/// schema, so its replay keeps it.
+const DELEGATE_SAMPLE_SCHEMA_PATCH: &str = "agent_delegate_sample_schema";
+
 /// The cut of a delegation answer in a history from before issue #2481.
 ///
 /// Such a history recorded its peer lookup with no `answer_limit`. Its run
@@ -91,6 +108,38 @@ const LEGACY_ANSWER_LIMIT: usize = 8_000;
 /// resets, and a stopped save round. A history recorded before the gate
 /// holds no marker there, so it replays as it ran.
 const RESET_ON_FULL_PATCH: &str = "agent_reset_on_full_round";
+
+/// The gate of the approval notice. A history from before the gate holds no
+/// notice before its approval waits, so its replay sends none. The loop asks
+/// the gate only for a gated call, so each other run records no marker.
+const APPROVAL_NOTICE_PATCH: &str = "agent_approval_notice";
+
+/// The patch that gates the verdict of a durable peer with no reply (issue
+/// #2484). It gates the model text, the record verdict and the decode of a
+/// value that is not a reply. A history from before the gate keeps each of
+/// them, so its replay holds.
+///
+/// A sent message asks the gate before its wait. A run that waits across
+/// the upgrade then reads no marker, so it keeps the old shape. The strict
+/// replayer of the test engine refuses a marker right after a fired wait
+/// deadline. So the gate cannot come after the wait.
+const REPLY_VERDICT_PATCH: &str = "agent_peer_reply_verdict";
+
+/// A signal name that no client sends. A probe of it claims nothing.
+///
+/// The probe moves each signal that waits at the end of history into the
+/// signal buffer. The patch gate reads a gate with only signals after it as a
+/// recorded position, and takes the old branch. A decision left over from an
+/// earlier wait would then hide the notice. After the probe, the gate sees the
+/// real end of history.
+const APPROVAL_NOTICE_PROBE: &str = "agent.approval_notice.probe";
+
+/// The side effect that records whether the notice input fits the caps.
+///
+/// A schedule over a cap records nothing. The wait after it would then meet a
+/// replay that expects the notice. The recorded answer keeps the choice the
+/// same on each replay, also after a cap change.
+const APPROVAL_NOTICE_FITS: &str = "agent.approval_notice.fits";
 
 /// The registered workflow name.
 pub const WORKFLOW_NAME: &str = "agent_loop";
@@ -291,6 +340,7 @@ impl Progress {
             error: None,
             resets: self.reset.count,
             answer_rejections: self.rejections.clone(),
+            parked_until_ms: self.parked_until,
         }
     }
 
@@ -368,6 +418,10 @@ impl Outbox {
 pub(crate) struct Member {
     mandate: Mandate,
     peers: Vec<Peer>,
+    /// Whether the `delegate` tool may show the `sample` argument. The patch
+    /// gate decides it once per member, so a history from before the gate
+    /// keeps the old tool schema in each model input.
+    sample_schema: bool,
 }
 
 impl Member {
@@ -376,6 +430,7 @@ impl Member {
         Self {
             mandate,
             peers: Vec::new(),
+            sample_schema: false,
         }
     }
 
@@ -388,17 +443,24 @@ impl Member {
             .filter(|peer| mandate.peers.contains(&peer.name))
             .cloned()
             .collect();
-        Self { mandate, peers }
+        Self {
+            mandate,
+            peers,
+            sample_schema: self.sample_schema,
+        }
     }
 
-    /// The mandate of the member.
     pub(crate) const fn mandate(&self) -> &Mandate {
         &self.mandate
     }
 
     /// The `delegate` tool, when the agent has a peer to ask.
     fn delegate_tool(&self) -> Option<crate::message::ToolDefinition> {
-        (!self.peers.is_empty()).then(|| delegate_definition(&self.peers))
+        let cap = self
+            .sample_schema
+            .then(|| sample_cap(&self.mandate, &self.peers))
+            .flatten();
+        (!self.peers.is_empty()).then(|| delegate_definition(&self.peers, cap))
     }
 }
 
@@ -436,6 +498,7 @@ impl Run<'_> {
                     .as_ref()
                     .map(context_reset::definition),
             )
+            .chain(self.task.sweep.as_deref().map(sweep_tool::definition))
             .collect()
     }
 }
@@ -579,7 +642,7 @@ pub(crate) async fn drive(
             agent: agent.as_ref(),
             live: false,
         };
-        let stop = match run_segment(ctx, run, &mut progress, &mut tree, input).await {
+        let stop = match boxed_run_segment(ctx, run, &mut progress, &mut tree, input).await {
             Ok(stop) => stop,
             Err(error) if task.report_failure => {
                 return Ok((progress.failure(error, &tree), delivered));
@@ -670,10 +733,17 @@ pub(crate) async fn discover(ctx: &WorkflowContext, mandate: &Mandate) -> Result
             .await
             .map_err(|e| e.to_string())?
     };
-    Ok(Member {
+    let mut member = Member {
         mandate: mandate.clone(),
         peers,
-    })
+        sample_schema: false,
+    };
+    // The gate runs only for a member that can offer a strategy, so each
+    // other run records no marker.
+    if sample_cap(&member.mandate, &member.peers).is_some() {
+        member.sample_schema = ctx.patched(DELEGATE_SAMPLE_SCHEMA_PATCH);
+    }
+    Ok(member)
 }
 
 /// Send one report.
@@ -685,7 +755,28 @@ pub(crate) async fn discover(ctx: &WorkflowContext, mandate: &Mandate) -> Result
 ///
 /// Returns an engine error that is not a failed send, such as a cancel.
 pub(crate) async fn deliver(ctx: &WorkflowContext, report: Report) -> Result<bool, String> {
-    let sent: HarvestResult<()> = ctx.execute_activity(&agent_deliver_info(), report).await;
+    tolerate(ctx.execute_activity(&agent_deliver_info(), report).await)
+}
+
+/// Send the notice of one parked call.
+///
+/// A failed notice never fails the run and never releases the call. A failed
+/// or timed-out send is recorded, so replay gives the same answer. An input
+/// over the cap records nothing, so [`notice_fits`] records the check first.
+///
+/// # Errors
+///
+/// Returns an engine error that is not a failed send, such as a cancel.
+async fn notify(ctx: &WorkflowContext, call: ParkedCall) -> Result<bool, String> {
+    tolerate(
+        ctx.execute_activity(&agent_approval_notice_info(), call)
+            .await,
+    )
+}
+
+/// Read the result of one send. A failed send is `false`. Any other engine
+/// error goes on.
+fn tolerate(sent: HarvestResult<()>) -> Result<bool, String> {
     match sent {
         Ok(()) => Ok(true),
         Err(
@@ -717,7 +808,10 @@ async fn open_segment(
     if task.context_reset.is_some() && input == followup::WAKE_MESSAGE {
         progress.reset.woken_by = booking(&messages);
     }
-    messages.push(ChatMessage::text(ChatRole::User, input));
+    // A beam step continues its history, which holds the user message.
+    if !task.beam_step {
+        messages.push(ChatMessage::text(ChatRole::User, input));
+    }
     if progress.reset.restore
         && let Some(notes) = &progress.reset.notes
     {
@@ -874,6 +968,8 @@ pub(crate) async fn run_segment(
         progress.push_assistant(&turn);
 
         match Box::pin(run_round(ctx, run, progress, tree, slot, &turn, calls)).await? {
+            // A beam step ends after its first tool round.
+            RoundEnd::Continue if task.beam_step => return Ok(AgentStop::StepEnded),
             RoundEnd::Continue => {}
             RoundEnd::Full { stopped } => {
                 if !full_round_goes_on(ctx, run, progress, tree, input, stopped, narration) {
@@ -888,6 +984,22 @@ pub(crate) async fn run_segment(
             }
         }
     }
+}
+
+/// [`run_segment`] on the heap.
+///
+/// It makes its future in its own frame, as [`autumn_harvest::frame`]
+/// explains (issue #2752). The future names a lifetime and holds `&mut`
+/// borrows, so a closure future would be a harvest-verify boundary.
+#[inline(never)]
+pub(crate) fn boxed_run_segment<'a>(
+    ctx: &'a WorkflowContext,
+    run: Run<'a>,
+    progress: &'a mut Progress,
+    tree: &'a mut Tree,
+    input: &'a str,
+) -> Pin<Box<impl Future<Output = Result<AgentStop, String>> + 'a>> {
+    Box::pin(run_segment(ctx, run, progress, tree, input))
 }
 
 /// Read the policy of the answer check of `task` and admit the check
@@ -1301,6 +1413,16 @@ async fn model_turn(
     }
 }
 
+/// [`model_turn`] on the heap. See [`boxed_run_segment`].
+#[inline(never)]
+fn boxed_model_turn(
+    ctx: &WorkflowContext,
+    live: bool,
+    request: ModelTurnRequest,
+) -> Pin<Box<impl Future<Output = HarvestResult<Option<ModelTurn>>> + '_>> {
+    Box::pin(model_turn(ctx, live, request))
+}
+
 /// Send one model turn: as a delta on the last window when the run allows
 /// it, else in the full form (issue #2264).
 ///
@@ -1314,7 +1436,7 @@ async fn send_turn(
     mut request: ModelTurnRequest,
 ) -> HarvestResult<Option<ModelTurn>> {
     if !progress.delta {
-        return model_turn(ctx, live, request).await;
+        return boxed_model_turn(ctx, live, request).await;
     }
     request.remember = true;
     let window = std::mem::take(&mut request.messages);
@@ -1331,7 +1453,7 @@ async fn send_turn(
             messages: window[sent.len..].to_vec(),
             ..request.clone()
         };
-        match model_turn(ctx, live, delta).await {
+        match boxed_model_turn(ctx, live, delta).await {
             Err(error) if error.activity_error_type() == Some(PREFIX_MISSING) => {}
             other => {
                 if matches!(other, Ok(Some(_))) {
@@ -1343,7 +1465,7 @@ async fn send_turn(
     }
     let sent = Sent::of(&window);
     request.messages = window;
-    let turn = model_turn(ctx, live, request).await;
+    let turn = boxed_model_turn(ctx, live, request).await;
     if matches!(turn, Ok(Some(_))) {
         progress.sent = Some(sent);
     }
@@ -1468,10 +1590,16 @@ async fn system_prompt(
         .execute_activity(&agent_memory_snapshot_info(), scope.clone())
         .await
         .map_err(|e| e.to_string())?;
-    let prompt = system.as_ref().map_or_else(
-        || snapshot.text().to_owned(),
-        |system| format!("{system}\n\n{}", snapshot.text()),
-    );
+    // The prompt must not name a tool that the run lacks. The gate keeps the
+    // edit head in the replay of a history from before the change.
+    let text = if task.memory_tool_scope().is_none() && ctx.patched(READ_ONLY_SNAPSHOT_PATCH) {
+        crate::memory::with_access(snapshot.text(), SnapshotAccess::Read)
+    } else {
+        snapshot.text().to_owned()
+    };
+    let prompt = system
+        .as_ref()
+        .map_or_else(|| text.clone(), |system| format!("{system}\n\n{text}"));
     Ok((Some(prompt), snapshot.labels()))
 }
 
@@ -1842,6 +1970,11 @@ fn fit(call: &ToolCall, decision: Option<&ToolDecision>, agent: &Member) -> Fit 
         Some(ToolDecision::RequireApproval { .. }) => return Fit::Gated,
         Some(ToolDecision::Allow) => {}
     }
+    // A call with a sample never joins a batch. Before the patch gate it
+    // did not decode, so an old history plans the same round.
+    if holds_sample(&call.arguments) {
+        return Fit::Other;
+    }
     let Some(peer) = delegate_args(&call.arguments)
         .and_then(|args| agent.peers.iter().find(|peer| peer.name == args.agent))
     else {
@@ -1859,8 +1992,9 @@ fn fit(call: &ToolCall, decision: Option<&ToolDecision>, agent: &Member) -> Fit 
 ///
 /// The call pushes its own record last, after the records of its subtree.
 /// A refused delegation did not run, so its record keeps no reason. This
-/// includes a durable peer that refuses the message. A person can also
-/// reject a gated call. It then pushes no record.
+/// includes a durable peer that refuses the message. A message with no
+/// reply went out, so its record keeps its serial reason (issue #2484). A
+/// person can also reject a gated call. It then pushes no record.
 fn note_serial(
     ctx: &WorkflowContext,
     tree: &mut Tree,
@@ -1871,7 +2005,7 @@ fn note_serial(
     let Some(record) = tree.records.get_mut(before..).and_then(<[_]>::last_mut) else {
         return;
     };
-    if record.refusal.is_some() {
+    if record.refusal.is_some_and(|refusal| !refusal.unanswered()) {
         return;
     }
     record.serial = Some(reason);
@@ -1962,18 +2096,18 @@ async fn decide(
         ToolDecision::Deny { reason } => {
             Ok(ToolOutcome::error(&format!("denied by policy: {reason}")))
         }
-        ToolDecision::RequireApproval { .. } => {
-            gated_call(ctx, run, progress, tree, slot, call).await
+        ToolDecision::RequireApproval { reason } => {
+            gated_call(ctx, run, progress, tree, slot, call, reason).await
         }
     }
 }
 
 /// Wait for a decision on one gated call, then run it or refuse it.
 ///
-/// The wait races the call's own approval signal against a durable deadline.
-/// A missing decision denies the call, so an unattended run keeps moving. A
-/// payload that is not an `Approval` denies the call too. It never fails the
-/// run.
+/// The call first sends one notice. The wait then races the call's own
+/// approval signal against a durable deadline. A missing decision denies the
+/// call, so an unattended run keeps moving. A payload that is not an
+/// `Approval` denies the call too. It never fails the run.
 async fn gated_call(
     ctx: &WorkflowContext,
     run: Run<'_>,
@@ -1981,10 +2115,19 @@ async fn gated_call(
     tree: &mut Tree,
     slot: Slot<'_>,
     mut call: ToolCall,
+    reason: String,
 ) -> Result<ToolOutcome, String> {
     let task = run.task;
     let name = approval_signal(slot.round, slot.position, &call.id);
     let timeout = Duration::from_secs(task.approval_timeout_secs);
+    // A probe run sends no notice. Nobody answers it.
+    if task.probe.is_none() && notice_gate(ctx)? {
+        let parked = parked_call(ctx, run, progress, &name, &call, reason);
+        // The result changes nothing. Only a decision releases the call.
+        if notice_fits(ctx, &parked)? {
+            notify(ctx, parked).await?;
+        }
+    }
     let decision = if run.live {
         let Some(decision) = live_decision(ctx, &name, timeout).await? else {
             progress.interrupted = true;
@@ -2016,6 +2159,59 @@ async fn gated_call(
             "denied: no approval arrived within {}s",
             task.approval_timeout_secs
         ))),
+    }
+}
+
+/// Ask the patch gate of the notice. See [`APPROVAL_NOTICE_PROBE`].
+fn notice_gate(ctx: &WorkflowContext) -> Result<bool, String> {
+    ctx.try_wait_for_signal(APPROVAL_NOTICE_PROBE)
+        .map_err(|err| err.to_string())?;
+    Ok(ctx.patched(APPROVAL_NOTICE_PATCH))
+}
+
+/// Record whether the notice input fits the caps. See
+/// [`APPROVAL_NOTICE_FITS`].
+fn notice_fits(ctx: &WorkflowContext, parked: &ParkedCall) -> Result<bool, String> {
+    let input = serde_json::to_value(parked).map_err(|err| err.to_string())?;
+    let name = agent_approval_notice_info().name;
+    ctx.side_effect(APPROVAL_NOTICE_FITS, || {
+        ctx.activity_input_fits(name, &input)
+    })
+    .map_err(|err| err.to_string())
+}
+
+/// The notice input of one gated call.
+///
+/// The arguments are cut to the tool result cap. The reason is cut to the
+/// reason cut of a full turn. Each escaped byte of the reason grows the input
+/// up to six times, so a small cut keeps the whole input under the cap.
+fn parked_call(
+    ctx: &WorkflowContext,
+    run: Run<'_>,
+    progress: &Progress,
+    signal: &str,
+    call: &ToolCall,
+    reason: String,
+) -> ParkedCall {
+    let task = run.task;
+    let max = max_tool_result_bytes(task.request_cap());
+    let (arguments, arguments_truncated) = cut_arguments(call.arguments.clone(), max);
+    // The workflow id of a durable agent is its agent id. An inline child of
+    // the agent runs in the same workflow, so it names the agent too.
+    let agent_id = (ctx.workflow_type() == AGENT_WORKFLOW_NAME)
+        .then(|| AgentId::parse(ctx.workflow_id()).ok())
+        .flatten();
+    ParkedCall {
+        run_id: RunId::new(progress.run_id.clone()),
+        execution_id: ctx.execution_id(),
+        agent_id,
+        session_id: task.session_id.clone(),
+        signal: signal.to_owned(),
+        tool: call.name.clone(),
+        reason: cut_bytes(reason, REASON_CUT_BYTES.min(max)),
+        arguments,
+        arguments_truncated,
+        timeout_secs: task.approval_timeout_secs,
     }
 }
 
@@ -2092,6 +2288,11 @@ async fn run_tool(
         .filter(|_| call.name == SAVE_PROGRESS_TOOL)
     {
         return Ok(save_notes(&settings, progress, tree, &call));
+    }
+    if let Some(settings) = task.sweep.as_deref().filter(|_| call.name == SWEEP_TOOL) {
+        // The sweep future holds a whole child result, so it goes on the
+        // heap. Each caller of the tool round keeps its size.
+        return Box::pin(sweep(ctx, task, progress, tree, settings, &call)).await;
     }
     // State memory is edited in the workflow, so the edit commits with the
     // op (issue #2273).
@@ -2278,6 +2479,35 @@ fn delegate_args(arguments: &serde_json::Value) -> Option<DelegateArgs> {
         .flatten()
 }
 
+/// Whether the arguments of a `delegate` call hold the key `sample`,
+/// whatever its value. Before the patch gate, such a call never decoded.
+fn holds_sample(arguments: &serde_json::Value) -> bool {
+    arguments.get("sample").is_some()
+}
+
+/// The arguments of a `delegate` call that the workflow runs.
+///
+/// A call that holds the key `sample` passes the patch gate first, also
+/// with a `null` value. A history from before the gate reads `None`, as it
+/// did then.
+fn sampled_args(ctx: &WorkflowContext, arguments: &serde_json::Value) -> Option<DelegateArgs> {
+    if holds_sample(arguments) && !ctx.patched(DELEGATE_SAMPLE_PATCH) {
+        return None;
+    }
+    delegate_args(arguments)
+}
+
+/// The units of the nested delegations that ran: one for each delegation,
+/// plus its draw units.
+fn nested_units(records: &[DelegationRecord]) -> u32 {
+    records
+        .iter()
+        .filter(|record| record.run_id.is_some())
+        .fold(0_u32, |units, record| {
+            units.saturating_add(1).saturating_add(record.draws)
+        })
+}
+
 /// Run one `delegate` call: refuse it with a named verdict, or run the peer
 /// inline as a sub-agent.
 ///
@@ -2294,14 +2524,14 @@ async fn delegate(
     call: &ToolCall,
 ) -> Result<ToolOutcome, String> {
     let task = run.task;
-    let admitted = delegate_args(&call.arguments)
+    let admitted = sampled_args(ctx, &call.arguments)
         .ok_or((Refusal::InvalidArguments, String::new()))
         .and_then(|args| {
             admit(agent, task, progress, tree, &args.agent)
-                .map(|child| (child, args.task))
+                .map(|child| (child, args.task, args.sample))
                 .map_err(|refusal| (refusal, args.agent))
         });
-    let (child, child_input) = match admitted {
+    let (child, child_input, sample) = match admitted {
         Ok(admitted) => admitted,
         Err((refusal, name)) => return Ok(refuse_delegation(agent, tree, refusal, &name)),
     };
@@ -2311,16 +2541,17 @@ async fn delegate(
         max_total_tokens,
     } = child;
     if peer.agent.is_some() {
-        return Box::pin(durable_peer(
-            ctx,
-            run,
-            agent,
-            progress,
-            tree,
-            peer,
-            child_input,
-        ))
-        .await;
+        let ask = Ask {
+            text: child_input,
+            sample,
+        };
+        return Box::pin(durable_peer(ctx, run, agent, progress, tree, peer, ask)).await;
+    }
+    // An inline peer is a role, not a kind, so no sampling policy admits
+    // its draws.
+    if sample.is_some() {
+        let refusal = Refusal::StrategyNeedsDurablePeer;
+        return Ok(refuse_delegation(agent, tree, refusal, &peer.name));
     }
     tree.delegations = tree.delegations.saturating_add(1);
     let run_id = format!("{}:d{}", tree.root, tree.delegations);
@@ -2333,14 +2564,7 @@ async fn delegate(
         agent: Some(&child_agent),
         live: run.live,
     };
-    let ended = Box::pin(run_segment(
-        ctx,
-        child_run,
-        &mut child,
-        tree,
-        &child_task.input,
-    ))
-    .await;
+    let ended = boxed_run_segment(ctx, child_run, &mut child, tree, &child_task.input).await;
     // A failed child paid for its turns, so the parent counts them.
     if ended.is_err() {
         progress.usage = progress.usage.saturating_add(child.usage);
@@ -2369,6 +2593,8 @@ async fn delegate(
         resets: child.reset.count,
         answer_truncated: false,
         serial: None,
+        draws: 0,
+        idempotency_key: None,
     });
     let mut outcome = serde_json::json!({
         "agent": peer.name,
@@ -2381,6 +2607,88 @@ async fn delegate(
         is_error: stop != AgentStop::Completed,
         workspace: None,
     })
+}
+
+/// Run one `sweep` call as an `agent_sweep` child (issue #2716).
+///
+/// A refused call gets an error result, and no child starts. The parent
+/// counts the usage and the cost of the sweep tree, and takes the labels of
+/// the setting. A sweep that fails in the engine gives an error result, so
+/// the run goes on.
+async fn sweep(
+    ctx: &WorkflowContext,
+    task: &AgentTask,
+    progress: &mut Progress,
+    tree: &mut Tree,
+    settings: &SweepTool,
+    call: &ToolCall,
+) -> Result<ToolOutcome, String> {
+    // A probe runs no child. A draw never gets the tool, so this is a second
+    // fence.
+    if task.probe.is_some() || task.draw.is_some() {
+        return Ok(ToolOutcome::error(
+            "sweep does not run in a probe or a draw",
+        ));
+    }
+    let mut planned = match sweep_tool::plan(&call.arguments, settings) {
+        Ok(planned) => planned,
+        Err(reason) => return Ok(ToolOutcome::error(&reason)),
+    };
+    // The sweep takes at most the tokens that the parent has left, as a
+    // delegated child does. A zero cap would still let an item make one
+    // model call, so it starts no child.
+    let ceiling = sweep_tool::ceiling(settings, task.max_total_tokens, progress.usage.total());
+    if ceiling == 0 {
+        return Ok(ToolOutcome::error("the run has no token left for a sweep"));
+    }
+    planned.input.max_total_tokens = Some(ceiling);
+    // Each draw starts with the labels of the parent, as a delegated child
+    // does. So a flow rule in a draw sees what the parent read.
+    planned.input.flow_labels.clone_from(&tree.exercised);
+    // A draw never runs a wider effect than the parent, as a delegated
+    // child never does.
+    planned.input.read_only = task.read_only;
+    planned
+        .input
+        .allowed_effects
+        .clone_from(&task.allowed_effects);
+    if crate::bounds::exceeds_activity_input(&planned.input) {
+        return Ok(ToolOutcome::error(
+            "the sweep items are too large for one call; split the list",
+        ));
+    }
+    let value = serde_json::to_value(&planned.input).map_err(|err| err.to_string())?;
+    let ended = ctx
+        .spawn_child_workflow_fan_out_collect_raw(vec![(SWEEP_WORKFLOW_NAME.to_owned(), value)])
+        .await
+        .map_err(|err| err.to_string())?;
+    // The labels apply once the child ran, whatever its end. An item can
+    // read outside text before a later item fails.
+    tree.exercised.extend(settings.flow_labels.iter().cloned());
+    let report = ended
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| Err("the sweep returned no result".to_owned()))
+        .and_then(|value| {
+            serde_json::from_value::<SweepReport>(value).map_err(|err| err.to_string())
+        });
+    let report = match report {
+        Ok(report) => report,
+        Err(error) => {
+            let error = crate::harness::truncate(&error, MAX_SWEEP_REASON_BYTES);
+            return Ok(ToolOutcome::error(&format!("the sweep failed: {error}")));
+        }
+    };
+    // The labels that the items exercised join the run, as the labels of a
+    // delegated child do.
+    for row in &report.rows {
+        tree.exercised.extend(row.flow_labels.iter().cloned());
+    }
+    progress.usage = progress.usage.saturating_add(report.totals.usage);
+    progress.add_cost(report.totals.cost_usd_micros);
+    let result = sweep_tool::result_of(&planned.labels, &report, ceiling);
+    let content = serde_json::to_string(&result).map_err(|err| err.to_string())?;
+    Ok(ToolOutcome::ok(content))
 }
 
 /// The room for one delegation answer in the next request of the parent
@@ -2512,6 +2820,8 @@ fn refuse_delegation(agent: &Member, tree: &mut Tree, refusal: Refusal, name: &s
         resets: 0,
         answer_truncated: false,
         serial: None,
+        draws: 0,
+        idempotency_key: None,
     });
     refused(refusal, name)
 }
@@ -2554,10 +2864,17 @@ async fn fan_out(
     for (position, call) in calls.iter().enumerate() {
         let taken = u32::try_from(siblings.len()).unwrap_or(u32::MAX);
         let used = tree.delegations.saturating_add(taken);
-        let admitted = delegate_args(&call.arguments)
+        let admitted = sampled_args(ctx, &call.arguments)
             .ok_or((Refusal::InvalidArguments, String::new()))
             .and_then(|args| {
+                // A batch holds inline peers only, and an inline peer runs
+                // no strategy.
+                let refusal = args
+                    .sample
+                    .is_some()
+                    .then_some(Refusal::StrategyNeedsDurablePeer);
                 sibling(agent, used, &args.agent)
+                    .and_then(|admitted| refusal.map_or(Ok(admitted), Err))
                     .map(|(mandate, peer)| Sibling {
                         position,
                         mandate,
@@ -2701,14 +3018,9 @@ fn merge_child(
         .delegated_tool_calls
         .saturating_add(report.tool_calls);
     tree.exercised.extend(report.flow_labels.iter().cloned());
-    let nested = report
-        .delegations
-        .iter()
-        .filter(|record| record.run_id.is_some())
-        .count();
     tree.delegations = tree
         .delegations
-        .saturating_add(u32::try_from(nested).unwrap_or(u32::MAX));
+        .saturating_add(nested_units(&report.delegations));
     tree.records.extend(report.delegations.iter().cloned());
     tree.records.push(DelegationRecord {
         chain: child
@@ -2724,6 +3036,8 @@ fn merge_child(
         resets: report.resets,
         answer_truncated: false,
         serial: None,
+        draws: 0,
+        idempotency_key: None,
     });
     let mut outcome = serde_json::json!({
         "agent": peer.name,
@@ -2750,7 +3064,7 @@ async fn durable_peer(
     progress: &mut Progress,
     tree: &mut Tree,
     peer: &Peer,
-    text: String,
+    ask: Ask,
 ) -> Result<ToolOutcome, String> {
     let target = peer.agent.as_deref().and_then(|id| AgentId::parse(id).ok());
     let Some(target) = target else {
@@ -2776,6 +3090,24 @@ async fn durable_peer(
     // A read-only segment sends a read-only mandate, as an inline child
     // inherits it (issue #2319).
     mandate.read_only |= run.task.read_only;
+    // The caller admits the draws of a strategy under its own tree before
+    // it sends anything. The cap of the peer role narrows its cap.
+    let draws = match &ask.sample {
+        Some(sample) => {
+            let strategy = &sample.strategy;
+            let admitted = agent.mandate.admit_delegated_draws(
+                peer.max_draws,
+                strategy.draws(),
+                strategy.counts_fan_out(),
+                tree.delegations,
+            );
+            match admitted {
+                Ok(units) => units,
+                Err(refusal) => return Ok(refuse(agent, tree, refusal, &peer.name)),
+            }
+        }
+        None => 0,
+    };
     tree.delegations = tree.delegations.saturating_add(1);
     let seq = tree.outbox.next_seq(target_id);
     let mut promise = ctx.new_promise().map_err(|err| err.to_string())?;
@@ -2785,12 +3117,13 @@ async fn durable_peer(
         from: tree.outbox.from.clone(),
         sender: agent.mandate.holder().to_owned(),
         seq,
-        text,
+        text: ask.text,
         mandate: mandate.clone(),
         flow_labels: tree.exercised.clone(),
         reply_to: Some(promise.id().to_string()),
         waiting,
         mesh: tree.outbox.mesh.clone(),
+        sample: ask.sample,
     };
     let key = format!("{}:{seq}", envelope.from);
     let sent = ctx
@@ -2799,27 +3132,117 @@ async fn durable_peer(
             target_id,
             ENTITY_OP_SIGNAL,
             EntityMessage::op(AgentOp::PeerMessage(envelope)),
-            key,
+            key.clone(),
         )
         .await;
     match sent {
-        Ok(()) => {}
+        // The draw units count once the message is out. A refused send
+        // runs no draw, and its record keeps no unit.
+        Ok(()) => tree.delegations = tree.delegations.saturating_add(draws),
         Err(HarvestError::ExternalSignalFailed { .. }) => {
             return Ok(refuse(agent, tree, Refusal::PeerUnavailable, &peer.name));
         }
         Err(other) => return Err(other.to_string()),
     }
+    let verdict_text = ctx.patched(REPLY_VERDICT_PATCH);
     let timeout = Duration::from_secs(
         peer.reply_timeout_secs
             .unwrap_or(crate::mesh::DEFAULT_REPLY_TIMEOUT_SECS),
     );
-    let outcome = await_reply(ctx, run.live, progress, &mut promise, timeout).await?;
+    let wait = ReplyWait {
+        live: run.live,
+        timeout,
+        verdict_text,
+    };
+    let outcome = await_reply(ctx, wait, progress, &mut promise).await?;
     let mut chain = mandate.chain;
     if chain.last().is_none_or(|last| *last != peer.name) {
         chain.push(peer.name.clone());
     }
     let room = AnswerRoom::of(ctx, run.task);
-    Ok(peer_outcome(room, tree, peer, target_id, chain, outcome))
+    let sent = PeerSent {
+        target_id,
+        chain,
+        draws,
+        key,
+        verdict_text,
+    };
+    Ok(peer_outcome(room, tree, peer, sent, outcome))
+}
+
+/// What a `delegate` call asks a durable peer.
+struct Ask {
+    text: String,
+    /// The strategy, if the call asks for one.
+    sample: Option<crate::sampling::OpSample>,
+}
+
+/// One message that a caller sent to a durable peer.
+struct PeerSent<'a> {
+    /// The workflow id of the peer.
+    target_id: &'a str,
+    /// The chain of the record.
+    chain: Vec<String>,
+    /// The draw units that the caller counted.
+    draws: u32,
+    /// The idempotency key of the message.
+    key: String,
+    /// The value of [`REPLY_VERDICT_PATCH`] for this message.
+    verdict_text: bool,
+}
+
+/// The most characters of a no-reply cause that the model reads. A caller
+/// outside the run writes the reason of a rejection, so the cause has a
+/// bound.
+const MAX_NO_REPLY_CAUSE_CHARS: usize = 256;
+
+/// Why a durable peer sent no reply (issue #2484).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NoReply {
+    /// The deadline passed.
+    Timeout(Duration),
+    /// A caller rejected the reply promise, with this reason.
+    Rejected(String),
+    /// A person interrupted the wait.
+    Interrupted,
+}
+
+impl NoReply {
+    const fn verdict(&self) -> Refusal {
+        match self {
+            Self::Timeout(_) => Refusal::ReplyTimeout,
+            Self::Rejected(_) => Refusal::ReplyRejected,
+            Self::Interrupted => Refusal::ReplyInterrupted,
+        }
+    }
+
+    fn cause(&self) -> String {
+        match self {
+            Self::Timeout(timeout) => {
+                format!("no reply arrived within {}s", timeout.as_secs())
+            }
+            Self::Rejected(reason) => reason.clone(),
+            Self::Interrupted => {
+                "a person interrupted this op while it waited for the reply".to_owned()
+            }
+        }
+    }
+
+    /// The error text that the model reads: the verdict text, then the cause
+    /// cut to [`MAX_NO_REPLY_CAUSE_CHARS`].
+    fn error(&self, peer: &str) -> String {
+        let cause = crate::harness::truncate(&self.cause(), MAX_NO_REPLY_CAUSE_CHARS);
+        format!("{}: {cause}", self.verdict().message(peer))
+    }
+
+    /// The error text of a history from before [`REPLY_VERDICT_PATCH`]. It
+    /// must not change, so it keeps the whole cause.
+    fn legacy(&self, peer: &str) -> String {
+        format!(
+            "the durable agent {peer:?} gave no answer: {}",
+            self.cause()
+        )
+    }
 }
 
 /// Record one exchange with a durable peer and answer the model.
@@ -2827,10 +3250,16 @@ fn peer_outcome(
     room: AnswerRoom<'_>,
     tree: &mut Tree,
     peer: &Peer,
-    target_id: &str,
-    chain: Vec<String>,
-    outcome: Result<PeerReply, String>,
+    sent: PeerSent<'_>,
+    outcome: Result<PeerReply, NoReply>,
 ) -> ToolOutcome {
+    let PeerSent {
+        target_id,
+        chain,
+        draws,
+        key,
+        verdict_text,
+    } = sent;
     match outcome {
         Ok(reply) => {
             // The answer enters this context, so the labels of the peer count.
@@ -2846,14 +3275,15 @@ fn peer_outcome(
                 resets: 0,
                 answer_truncated: false,
                 serial: None,
+                draws,
+                idempotency_key: Some(key),
             });
             if let Some(refusal) = reply.refusal {
                 refused(refusal, &peer.name)
             } else {
-                // The keys keep their old order, also under the
-                // `preserve_order` feature of `serde_json`.
-                // The answer key comes first, then `error`, so the cut
-                // measures the error too.
+                // The keys keep their old order, also under the `preserve_order`
+                // feature of `serde_json`. The answer key comes first, then
+                // `error`, so the cut measures the error too.
                 let mut content = serde_json::json!({
                     "agent": peer.name,
                     "stop": reply.stop,
@@ -2869,48 +3299,77 @@ fn peer_outcome(
                 }
             }
         }
-        Err(error) => {
+        Err(missing) => {
+            // The message went out, so the record keeps the run id. A
+            // parent then still counts its unit and its draws. A history
+            // from before the gate keeps its old record with no verdict.
             tree.records.push(DelegationRecord {
                 chain,
                 run_id: Some(target_id.to_owned()),
                 stop: None,
-                refusal: None,
+                refusal: verdict_text.then(|| missing.verdict()),
                 usage: TokenUsage::default(),
                 steps_used: 0,
                 tool_calls: 0,
                 resets: 0,
                 answer_truncated: false,
                 serial: None,
+                draws,
+                idempotency_key: Some(key),
             });
-            ToolOutcome::error(&format!(
-                "the durable agent {:?} gave no answer: {error}",
-                peer.name
-            ))
+            if verdict_text {
+                ToolOutcome {
+                    content: serde_json::json!({
+                        "error": missing.error(&peer.name),
+                        "verdict": missing.verdict(),
+                    })
+                    .to_string(),
+                    is_error: true,
+                    workspace: None,
+                }
+            } else {
+                ToolOutcome::error(&missing.legacy(&peer.name))
+            }
         }
     }
 }
 
-/// Wait for the reply of a durable peer until `timeout`.
+/// How one caller waits for the reply of a durable peer.
+#[derive(Debug, Clone, Copy)]
+struct ReplyWait {
+    /// `true` for a durable agent. It also races the wait against an
+    /// interrupt.
+    live: bool,
+    timeout: Duration,
+    /// The value of [`REPLY_VERDICT_PATCH`] for this message.
+    verdict_text: bool,
+}
+
+/// Wait for the reply of a durable peer until its deadline.
 ///
 /// A durable agent also races the wait against an interrupt. Returns the
 /// reply, or why there is none.
 async fn await_reply(
     ctx: &WorkflowContext,
-    live: bool,
+    wait: ReplyWait,
     progress: &mut Progress,
     promise: &mut autumn_harvest::durable_promise::DurablePromise<'_>,
-    timeout: Duration,
-) -> Result<Result<PeerReply, String>, String> {
-    let timed_out = || format!("no reply arrived within {}s", timeout.as_secs());
+) -> Result<Result<PeerReply, NoReply>, String> {
+    let ReplyWait {
+        live,
+        timeout,
+        verdict_text,
+    } = wait;
     if !live {
         let settled = promise
-            .wait_timeout::<PeerReply>(timeout)
+            .wait_timeout::<serde_json::Value>(timeout)
             .await
             .map_err(|err| err.to_string())?;
-        return Ok(settled.map_or_else(
-            || Err(timed_out()),
-            |settled| settled.map_err(|rejected| rejected.error),
-        ));
+        return match settled {
+            None => Ok(Err(NoReply::Timeout(timeout))),
+            Some(Ok(value)) => decode_reply(value, verdict_text),
+            Some(Err(rejected)) => Ok(Err(NoReply::Rejected(rejected.error))),
+        };
     }
     let winner = ctx
         .race()
@@ -2921,15 +3380,37 @@ async fn await_reply(
         .await
         .map_err(|err| err.to_string())?;
     Ok(match winner.index {
-        0 => PromiseSettlement::decode::<PeerReply>(winner.value)
+        0 => match PromiseSettlement::decode::<serde_json::Value>(winner.value)
             .map_err(|err| err.to_string())?
-            .map_err(|rejected| rejected.error),
+        {
+            Ok(value) => decode_reply(value, verdict_text)?,
+            Err(rejected) => Err(NoReply::Rejected(rejected.error)),
+        },
         1 => {
             progress.interrupted = true;
-            Err("a person interrupted this op while it waited for the reply".to_owned())
+            Err(NoReply::Interrupted)
         }
-        _ => Err(timed_out()),
+        _ => Err(NoReply::Timeout(timeout)),
     })
+}
+
+/// Decode the value of a resolved reply.
+///
+/// A caller outside the run can resolve the promise with any value. With
+/// the gate, a value that is not a reply is a rejected reply, so the record
+/// keeps its verdict and its key (issue #2484). Without the gate, it fails
+/// the call with the old error text.
+fn decode_reply(
+    value: serde_json::Value,
+    verdict_text: bool,
+) -> Result<Result<PeerReply, NoReply>, String> {
+    match serde_json::from_value::<PeerReply>(value) {
+        Ok(reply) => Ok(Ok(reply)),
+        Err(err) if verdict_text => Ok(Err(NoReply::Rejected(format!(
+            "the reply does not decode: {err}"
+        )))),
+        Err(err) => Err(HarvestError::from(err).to_string()),
+    }
 }
 
 /// Record a refused delegation to `name` and answer the model.
@@ -2947,6 +3428,8 @@ fn refuse(agent: &Member, tree: &mut Tree, refusal: Refusal, name: &str) -> Tool
         resets: 0,
         answer_truncated: false,
         serial: None,
+        draws: 0,
+        idempotency_key: None,
     });
     refused(refusal, name)
 }
@@ -3001,6 +3484,9 @@ fn child_task(
         // A child keeps the setting. Its new run holds no notes of the
         // parent (issue #2453).
         context_reset: task.context_reset,
+        // A child sweeps nothing. Only the operator gives a run the tool, and
+        // the parent pays for its own sweeps (issue #2716).
+        sweep: None,
         // The peer has its own prompt, so the guidance and the skills of the
         // parent do not apply to it (issue #2373).
         tool_guidance: std::collections::BTreeMap::new(),
@@ -3016,6 +3502,8 @@ fn child_task(
         probe: task.probe,
         // A peer is another agent, so it is not of the kind of the parent.
         kind: None,
+        // A child runs its whole task. Only the root of a step stops early.
+        beam_step: false,
     }
 }
 
@@ -3135,7 +3623,7 @@ pub async fn agent_model_turn(
             tenant,
             |_content| {},
             Some(&publish),
-            autumn_harvest::chrono::Utc::now(),
+            autumn_harvest::time::Timestamp::now(),
         )
         .await?;
     if let Some(latency) = latency {
@@ -3269,6 +3757,19 @@ pub async fn agent_deliver(ctx: &ActivityContext, report: Report) -> Result<(), 
     harness(ctx)?.deliver(report).await
 }
 
+/// The notice of one parked call, as an activity.
+///
+/// # Errors
+///
+/// Returns the delivery error. The loop records it and waits as before.
+#[activity(
+    start_to_close = "1m",
+    retry = RetryPolicy::exponential(3, Duration::from_secs(1))
+)]
+pub async fn agent_approval_notice(ctx: &ActivityContext, call: ParkedCall) -> Result<(), String> {
+    harness(ctx)?.notify_approval(call).await
+}
+
 /// The heartbeat precheck, as an activity.
 ///
 /// # Errors
@@ -3299,8 +3800,8 @@ pub async fn agent_discover_peers(
 }
 
 /// The workflows to register on a `HarvestBuilder`: `agent_loop`,
-/// `agent_heartbeat`, the durable `agent`, the strategy runs `agent_draws`
-/// and `agent_sample`, and the pass `agent_consolidate`.
+/// `agent_heartbeat`, the durable `agent`, the strategy runs `agent_draws`,
+/// `agent_sample` and `agent_sweep`, and the pass `agent_consolidate`.
 ///
 /// With the `eval` feature, it also holds the refine run `agent_refine`
 /// (issue #2380).
@@ -3313,6 +3814,7 @@ pub fn workflows() -> Vec<WorkflowInfo> {
         agent_info(),
         crate::sampling::agent_draws_info(),
         crate::sampling::agent_sample_info(),
+        crate::sampling::agent_sweep_info(),
         crate::consolidate::agent_consolidate_info(),
         crate::consolidate_all::agent_consolidate_all_info(),
     ];
@@ -3330,11 +3832,15 @@ pub fn activities() -> Vec<ActivityInfo> {
         agent_tool_call_info(),
         agent_memory_snapshot_info(),
         agent_deliver_info(),
+        agent_approval_notice_info(),
         agent_precheck_info(),
         agent_discover_peers_info(),
         agent_profile_info(),
         agent_profile_overlay_info(),
         agent_memory_reset_info(),
+        agent_memory_count_info(),
+        agent_transcript_count_info(),
+        agent_transcript_erase_info(),
         agent_workspace_retain_info(),
         agent_workspace_reset_info(),
         agent_workspace_floor_info(),
@@ -3344,12 +3850,17 @@ pub fn activities() -> Vec<ActivityInfo> {
         crate::score::agent_score_info(),
         crate::answer_check::agent_answer_check_info(),
         crate::score::agent_sample_score_info(),
+        crate::sampling::agent_sweep_items_info(),
+        crate::sampling::agent_vote_key_info(),
         crate::consolidate::agent_consolidate_read_info(),
         crate::consolidate::agent_consolidate_turn_info(),
         crate::consolidate::agent_consolidate_write_info(),
         crate::consolidate_all::agent_consolidate_due_info(),
         crate::consolidate::agent_episode_append_info(),
         crate::consolidate::agent_episode_reset_info(),
+        crate::refine::agent_refine_lesson_info(),
+        crate::refine::agent_lesson_match_info(),
+        crate::refine::agent_lesson_erase_info(),
     ];
     #[cfg(feature = "eval")]
     list.extend([
@@ -3357,8 +3868,29 @@ pub fn activities() -> Vec<ActivityInfo> {
         crate::refine::agent_refine_probe_info(),
         crate::refine::agent_refine_compose_info(),
         crate::refine::agent_refine_select_info(),
+        crate::refine::agent_refine_adopt_info(),
+        crate::refine::agent_refine_decide_info(),
     ]);
     list
+}
+
+/// Register the agent workflows, their activities and `harness` on a
+/// worker builder.
+///
+/// It needs no backend feature. Each activity reads the harness with
+/// `ActivityContext::state`. The Postgres worker and the SQLite driver of
+/// `HarvestPlugin` both give the builder state to an `#[activity]` body.
+/// A worker with no harness fails each call as `AgentHarnessMissing`. Call
+/// it once per builder.
+#[must_use]
+pub fn register(
+    builder: autumn_harvest::builder::HarvestBuilder,
+    harness: AgentHarness,
+) -> autumn_harvest::builder::HarvestBuilder {
+    builder
+        .workflows(workflows())
+        .activities(activities())
+        .state(harness)
 }
 
 #[cfg(test)]
@@ -3457,6 +3989,7 @@ mod tests {
                     Peer::new("inline", "Inline."),
                     Peer::agent("durable", "Durable.", &id),
                 ],
+                sample_schema: false,
             };
             let agent = mandated.then_some(&agent);
             let plan = round_plan(&calls, &decisions, agent, bound);
@@ -4017,5 +4550,211 @@ mod tests {
     fn a_failed_read_skips_the_cache() {
         let failed = Err("the pool is down".to_owned());
         assert_eq!(resolve_tenant(failed, Some("a")), CacheTenant::Skip);
+    }
+
+    fn durable() -> Peer {
+        Peer::agent(
+            "researcher",
+            "Finds facts.",
+            &AgentId::new("research", "r1").unwrap(),
+        )
+    }
+
+    /// Whether the `delegate` tool of a member shows the `sample` argument.
+    fn shows_sample(mandate: Mandate, peers: Vec<Peer>) -> bool {
+        let member = Member {
+            mandate,
+            peers,
+            sample_schema: true,
+        };
+        let tool = member.delegate_tool().unwrap();
+        tool.input_schema["properties"].get("sample").is_some()
+    }
+
+    #[test]
+    fn the_delegate_tool_shows_sample_only_under_a_cap_of_two_and_a_durable_peer() {
+        let inline = Peer::new("helper", "Helps.");
+        assert!(shows_sample(
+            Mandate::new("a").max_draws(2),
+            vec![inline.clone(), durable()]
+        ));
+        assert!(!shows_sample(
+            Mandate::new("a").max_draws(1),
+            vec![durable()]
+        ));
+        assert!(!shows_sample(Mandate::new("a"), vec![durable()]));
+        assert!(!shows_sample(Mandate::new("a").max_draws(3), vec![inline]));
+        // The cap of a durable peer role counts, met with the mandate cap.
+        let capped = |max| Peer {
+            max_draws: Some(max),
+            ..durable()
+        };
+        assert!(shows_sample(Mandate::new("a"), vec![capped(3)]));
+        assert!(!shows_sample(
+            Mandate::new("a").max_draws(5),
+            vec![capped(1)]
+        ));
+        let mut member = Member {
+            mandate: Mandate::new("a").max_draws(4),
+            peers: vec![durable()],
+            sample_schema: false,
+        };
+        let old = member.delegate_tool().unwrap();
+        assert!(
+            old.input_schema["properties"].get("sample").is_none(),
+            "a member before the gate keeps the old schema"
+        );
+        member.sample_schema = true;
+        let tool = member.delegate_tool().unwrap();
+        assert_eq!(tool.input_schema["additionalProperties"], json!(false));
+        let sample = &tool.input_schema["properties"]["sample"];
+        assert!(sample["description"].as_str().unwrap().contains('4'));
+        assert_eq!(tool.input_schema["required"], json!(["agent", "task"]));
+    }
+
+    #[test]
+    fn delegate_args_take_an_optional_sample() {
+        let plain = delegate_args(&json!({"agent": "a", "task": "t"})).unwrap();
+        assert_eq!(plain.sample, None);
+        let sampled = delegate_args(&json!({
+            "agent": "a",
+            "task": "t",
+            "sample": {"strategy": {"best_of_n": {"n": 3}}, "scorer": {"id": "table"}},
+        }))
+        .unwrap();
+        assert_eq!(sampled.sample.unwrap().strategy.draws(), 3);
+        let policy_key = json!({
+            "agent": "a",
+            "task": "t",
+            "sample": {"strategy": "single", "max_draws": 9},
+        });
+        assert_eq!(delegate_args(&policy_key), None);
+        assert_eq!(
+            delegate_args(&json!({"agent": "a", "task": "t", "n": 3})),
+            None
+        );
+    }
+
+    #[test]
+    fn a_call_that_holds_a_sample_key_never_joins_a_batch() {
+        let member = Member {
+            mandate: Mandate::new("a").peers(["helper"]).max_draws(3),
+            peers: vec![Peer::new("helper", "Helps.")],
+            sample_schema: true,
+        };
+        let delegate = |arguments: serde_json::Value| ToolCall {
+            id: "c".into(),
+            name: DELEGATE_TOOL.into(),
+            arguments,
+        };
+        let allow = ToolDecision::Allow;
+        let plain = delegate(json!({"agent": "helper", "task": "t"}));
+        assert_eq!(fit(&plain, Some(&allow), &member), Fit::Batchable);
+        // Before the patch gate, each of these failed to decode. So an old
+        // history plans the same round.
+        for sample in [json!(null), json!({"strategy": "single"})] {
+            let call = delegate(json!({"agent": "helper", "task": "t", "sample": sample}));
+            assert!(holds_sample(&call.arguments));
+            assert_eq!(fit(&call, Some(&allow), &member), Fit::Other);
+        }
+        assert!(!holds_sample(&json!({"agent": "helper", "task": "t"})));
+    }
+
+    fn ran(draws: u32) -> DelegationRecord {
+        DelegationRecord {
+            chain: vec!["a".into(), "b".into()],
+            run_id: Some("r".into()),
+            stop: Some(AgentStop::Completed),
+            refusal: None,
+            usage: TokenUsage::default(),
+            steps_used: 0,
+            tool_calls: 0,
+            resets: 0,
+            answer_truncated: false,
+            serial: None,
+            draws,
+            idempotency_key: None,
+        }
+    }
+
+    #[test]
+    fn a_parent_counts_each_nested_delegation_and_its_draw_units() {
+        let refused = DelegationRecord {
+            run_id: None,
+            refusal: Some(Refusal::DrawsExceeded),
+            ..ran(0)
+        };
+        assert_eq!(nested_units(&[ran(0), ran(3), refused]), 1 + 4);
+        assert_eq!(nested_units(&[]), 0);
+        assert_eq!(nested_units(&[ran(u32::MAX), ran(1)]), u32::MAX);
+    }
+
+    // Issue #2484: the message of an unanswered delegation went out, so
+    // its unit and its draws still count.
+    #[test]
+    fn an_unanswered_delegation_still_counts_its_units() {
+        let unanswered = DelegationRecord {
+            stop: None,
+            refusal: Some(Refusal::ReplyTimeout),
+            idempotency_key: Some("r:1".into()),
+            ..ran(2)
+        };
+        assert_eq!(nested_units(&[unanswered]), 1 + 2);
+    }
+
+    // Issue #2484: each cause of a missing reply has its own verdict.
+    #[test]
+    fn each_missing_reply_has_its_verdict_and_its_cause() {
+        let timeout = NoReply::Timeout(Duration::from_secs(60));
+        let rejected = NoReply::Rejected("the operator said no".into());
+        let interrupted = NoReply::Interrupted;
+        assert_eq!(timeout.verdict(), Refusal::ReplyTimeout);
+        assert_eq!(rejected.verdict(), Refusal::ReplyRejected);
+        assert_eq!(interrupted.verdict(), Refusal::ReplyInterrupted);
+        for cause in [&timeout, &rejected, &interrupted] {
+            assert!(cause.verdict().unanswered());
+            let text = cause.error("researcher");
+            assert!(
+                text.starts_with(&cause.verdict().message("researcher")),
+                "{text}"
+            );
+        }
+        assert!(timeout.error("researcher").contains("60s"));
+        assert!(
+            rejected
+                .error("researcher")
+                .contains("the operator said no")
+        );
+    }
+
+    // Issue #2484: a caller outside the run writes a rejection reason, so
+    // the model reads a bounded cause. The legacy text keeps it whole.
+    #[test]
+    fn a_long_rejection_reason_is_cut_for_the_model() {
+        let long = NoReply::Rejected("x".repeat(10_000));
+        let text = long.error("researcher");
+        let message = Refusal::ReplyRejected.message("researcher");
+        let cause = text.strip_prefix(&format!("{message}: ")).unwrap();
+        assert!(cause.starts_with(&"x".repeat(256)), "{cause}");
+        assert!(!cause.contains(&"x".repeat(257)), "{cause}");
+        assert!(long.legacy("researcher").ends_with(&"x".repeat(10_000)));
+    }
+
+    // Issue #2484: a history from before the gate keeps its old text.
+    #[test]
+    fn the_legacy_text_of_each_missing_reply_is_unchanged() {
+        assert_eq!(
+            NoReply::Timeout(Duration::from_secs(60)).legacy("researcher"),
+            "the durable agent \"researcher\" gave no answer: no reply arrived within 60s"
+        );
+        assert_eq!(
+            NoReply::Rejected("no".into()).legacy("researcher"),
+            "the durable agent \"researcher\" gave no answer: no"
+        );
+        assert_eq!(
+            NoReply::Interrupted.legacy("researcher"),
+            "the durable agent \"researcher\" gave no answer: \
+             a person interrupted this op while it waited for the reply"
+        );
     }
 }

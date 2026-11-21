@@ -2,9 +2,9 @@
 //! Deadline-bounded child-workflow await (issue #779).
 //!
 //! Demonstrates `ctx.execute_child_workflow_timeout`: spawn a child workflow
-//! and await its result, but give up after a deadline and run a fallback —
-//! in ≤ 3 lines, with no hand-rolled `tokio::join!` over a child + a timer
-//! (which a replay engine cannot make deterministic on its own).
+//! and await its result, but give up after a deadline and run a fallback. It
+//! takes ≤ 3 lines. A hand-rolled `tokio::join!` over a child + a timer is not
+//! needed, and a replay engine cannot make one deterministic on its own.
 //!
 //! Determinism contract: the race composes the existing
 //! `ChildWorkflowStarted`/`ChildWorkflowCompleted`/`ChildWorkflowFailed` and

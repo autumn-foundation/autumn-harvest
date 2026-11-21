@@ -26,7 +26,8 @@ result. So a change applies to the next read only:
 - An execution stores `deadline_at`, `sla` and `sla_deadline_at` at start.
 - A task row stores `retry_policy`, `max_attempts`, `heartbeat_timeout`,
   `schedule_to_start`, `schedule_to_close_at` and `concurrency_cap` when the
-  activity is scheduled. A retry reuses the stored row.
+  activity is scheduled. A retry reuses the stored row. The activity cap
+  override sets `concurrency_cap` on the live rows too (#2411).
 - A local activity freezes its retry policy and start-to-close at the first
   schedule, in `LocalActivityScheduled` (issue #620).
 - `ActivityScheduled` stores no timeout and no retry policy, so replay never
@@ -102,7 +103,7 @@ Declared with `#[activity(...)]`.
 | `ActivityInfo.default_heartbeat_timeout` | no | Frozen at schedule, as above. | override (#2410) |
 | `ActivityInfo.default_schedule_to_start` | no | Frozen at schedule, as above. | override (#2410) |
 | `ActivityInfo.default_queue` | no | Routing. A queue with no worker strands new tasks. The queue pause covers the incident case. | deploy-only |
-| `ActivityInfo.max_concurrent` | no. An adaptive limit (#1836) is a separate cap per worker, which moves on its own. No route sets this fleet-wide cap. | Stored on each task row as `concurrency_cap` at enqueue, and enforced at claim. A change applies to tasks enqueued after it. Pending tasks keep the old cap. | override (#2411) |
+| `ActivityInfo.max_concurrent` | yes, `max_concurrent` on `PATCH /admin/activity-types/{activity_name}/defaults` (#2411). An adaptive limit (#1836) is a separate cap per worker, which moves on its own. | Stored on each task row as `concurrency_cap` at enqueue, and enforced at claim. A change sets the stored cap of the live rows, so pending tasks take it. A running task runs on. | already runtime |
 | `ActivityInfo.concurrency_key` | no | Changes which tasks share a cap. A change mid-run splits one bucket into several. | deploy-only |
 | `ActivityInfo.default_schedule_to_close` | no | Frozen at schedule as `schedule_to_close_at`. | override (#2410) |
 | `ActivityInfo.is_local` | no | Changes the execution model and the history events. | deploy-only |

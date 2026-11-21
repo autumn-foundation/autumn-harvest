@@ -14,6 +14,7 @@
 //! | State change | A snapshot event, [`ENTITY_STATE_SIDE_EFFECT`](crate::entity::ENTITY_STATE_SIDE_EFFECT) |
 //! | Read state without replay | The projection, [`crate::entity_state`] |
 //! | Run an op at a deadline | A [`Wake`](crate::entity::Wake) from the hook of [`Entity::run_with_wakes`](crate::entity::Entity::run_with_wakes) (issue #2266) |
+//! | End a run after an op | The `take` hook of [`Entity::run_with_wakes_and_checkpoints`](crate::entity::Entity::run_with_wakes_and_checkpoints) |
 //!
 //! # Guarantees
 //!
@@ -114,13 +115,14 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::context::WorkflowContext;
 use crate::error::HarvestResult;
+use crate::frame::boxed;
 
 /// The signal name that carries an [`EntityMessage`].
 pub const ENTITY_OP_SIGNAL: &str = "harvest.entity.op";
@@ -328,7 +330,7 @@ pub struct EntitySnapshot<S> {
 #[non_exhaustive]
 pub struct Wake<O> {
     /// When the op is due.
-    pub at: DateTime<Utc>,
+    pub at: Timestamp,
     /// The op that the loop runs at `at`.
     pub op: O,
 }
@@ -336,7 +338,7 @@ pub struct Wake<O> {
 impl<O> Wake<O> {
     /// A wake that runs `op` at `at`.
     #[must_use]
-    pub const fn new(at: DateTime<Utc>, op: O) -> Self {
+    pub const fn new(at: Timestamp, op: O) -> Self {
         Self { at, op }
     }
 }
@@ -453,7 +455,7 @@ where
         Fut: Future<Output = Result<S, String>>,
     {
         // No hook means no clock read and no timer, so old histories replay.
-        self.run_loop(handler, |_: &S| None::<Wake<O>>).await
+        boxed(|| self.run_loop(handler, |_: &S| None::<Wake<O>>, |_: &mut S| false)).await
     }
 
     /// Run the loop like [`run`](Self::run), and also run the op of `wake` at
@@ -493,16 +495,66 @@ where
         Fut: Future<Output = Result<S, String>>,
         W: FnMut(&S) -> Option<Wake<O>>,
     {
-        self.run_loop(handler, wake).await
+        boxed(|| self.run_loop(handler, wake, |_: &mut S| false)).await
     }
 
-    /// The loop of [`run`](Self::run) and [`run_with_wakes`](Self::run_with_wakes).
-    async fn run_loop<O, H, Fut, W>(self, mut handler: H, mut wake: W) -> HarvestResult<S>
+    /// Run the loop like [`run_with_wakes`](Self::run_with_wakes), and also
+    /// take a checkpoint when the state asks for one.
+    ///
+    /// After each op, the loop calls `take` with the new state. A `true`
+    /// ends the run at a checkpoint after that op. The ops that wait move to
+    /// the next run, as at any checkpoint. `take` must clear the request in
+    /// the state, so the next run does not ask again.
+    ///
+    /// The loop calls `take` before the snapshot of the op. So no snapshot
+    /// and no checkpoint input holds a request that `take` cleared. The
+    /// answer of `take` must depend only on the state. Replay runs the
+    /// handler again, so `take` then gives the same answer. A history from
+    /// before this hook replays when `take` gives `false` for each state.
+    ///
+    /// A checkpoint that `take` asks for records no checkpoint side effect
+    /// for that op. A waiting op that does not fit the checkpoint input runs
+    /// in this run first. The request stays until the checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`run_with_wakes`](Self::run_with_wakes).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `continue_as_new` resolves. The engine never resolves it.
+    pub async fn run_with_wakes_and_checkpoints<O, H, Fut, W, C>(
+        self,
+        handler: H,
+        wake: W,
+        take: C,
+    ) -> HarvestResult<S>
     where
         O: DeserializeOwned,
         H: FnMut(S, O) -> Fut,
         Fut: Future<Output = Result<S, String>>,
         W: FnMut(&S) -> Option<Wake<O>>,
+        C: FnMut(&mut S) -> bool,
+    {
+        // On the heap, the loop adds only a pointer to the frame of the
+        // workflow in a debug build (issue #2752).
+        boxed(|| self.run_loop(handler, wake, take)).await
+    }
+
+    /// The loop of [`run`](Self::run), [`run_with_wakes`](Self::run_with_wakes)
+    /// and [`run_with_wakes_and_checkpoints`](Self::run_with_wakes_and_checkpoints).
+    async fn run_loop<O, H, Fut, W, C>(
+        self,
+        mut handler: H,
+        mut wake: W,
+        mut take: C,
+    ) -> HarvestResult<S>
+    where
+        O: DeserializeOwned,
+        H: FnMut(S, O) -> Fut,
+        Fut: Future<Output = Result<S, String>>,
+        W: FnMut(&S) -> Option<Wake<O>>,
+        C: FnMut(&mut S) -> bool,
     {
         let Self {
             ctx,
@@ -513,7 +565,6 @@ where
             raw_input,
         } = self;
         let drops_input = !trust_start_input && ctx.start_source().carries_caller_input();
-        // Decode the raw input only when the run keeps it.
         if let Some(raw) = raw_input.filter(|_| !drops_input) {
             checkpoint = serde_json::from_value(raw)?;
         }
@@ -531,6 +582,9 @@ where
         record_snapshot(ctx, &mut checkpoint, ENTITY_STATE_SIDE_EFFECT, &mut run)?;
         let published = Arc::new(Mutex::new(Published::of(&checkpoint)));
         register_queries(ctx, &published);
+        // A request stays until the checkpoint, also when a waiting op does
+        // not fit and runs in this run first.
+        let mut requested = false;
 
         loop {
             let message = match next_step(ctx, &mut waiting, wake(&checkpoint.state)).await? {
@@ -542,13 +596,17 @@ where
                 Step::Wake(op) => Ok(EntityMessage::op(op)),
             };
             match message {
-                Ok(EntityMessage::Op { op }) => match handler(checkpoint.state.clone(), op).await {
-                    Ok(next) => {
-                        checkpoint.state = next;
-                        checkpoint.stats.applied += 1;
+                // A handler future can be large. On the heap, it adds only a
+                // pointer to this frame in a debug build (issue #2752).
+                Ok(EntityMessage::Op { op }) => {
+                    match boxed(|| handler(checkpoint.state.clone(), op)).await {
+                        Ok(next) => {
+                            checkpoint.state = next;
+                            checkpoint.stats.applied += 1;
+                        }
+                        Err(error) => record_failure(&mut checkpoint.stats, error),
                     }
-                    Err(error) => record_failure(&mut checkpoint.stats, error),
-                },
+                }
                 Ok(EntityMessage::Delete) => {
                     waiting.extend(ctx.drain_signals_raw(ENTITY_OP_SIGNAL)?);
                     if waiting.is_empty() {
@@ -567,11 +625,13 @@ where
                     format!("entity message does not decode: {error}"),
                 ),
             }
+            // Before the snapshot, so replay sees the same request.
+            requested |= take(&mut checkpoint.state);
             run.ops += 1;
             record_snapshot(ctx, &mut checkpoint, ENTITY_STATE_SIDE_EFFECT, &mut run)?;
             *lock(&published) = Published::of(&checkpoint);
 
-            if checkpoint_due(ctx, &mut run, max_ops_per_run)? {
+            if requested || checkpoint_due(ctx, &mut run, max_ops_per_run)? {
                 // Record the budget at each attempt. A cap that changes while a
                 // handler waits then applies to the next attempt.
                 let limit = ctx.side_effect(ENTITY_CHECKPOINT_BUDGET_SIDE_EFFECT, || {
@@ -639,8 +699,8 @@ async fn next_step<O>(
 /// The time from `now` to `at`, rounded up to whole milliseconds.
 ///
 /// The result is at least 1 ms, so the race always arms a timer.
-fn time_until(at: DateTime<Utc>, now: DateTime<Utc>) -> std::time::Duration {
-    let delta = (at - now).to_std().unwrap_or_default();
+fn time_until(at: Timestamp, now: Timestamp) -> std::time::Duration {
+    let delta = std::time::Duration::try_from(at - now).unwrap_or_default();
     let millis = delta.as_millis() + u128::from(!delta.subsec_nanos().is_multiple_of(1_000_000));
     std::time::Duration::from_millis(u64::try_from(millis.max(1)).unwrap_or(u64::MAX))
 }
@@ -1732,7 +1792,7 @@ mod tests {
     #[tokio::test]
     async fn the_deadline_probe_and_the_decision_replay_together() {
         let outcome = env_with(&[op(1), op(2), delete()])
-            .with_execution_timeout(chrono::Duration::hours(1))
+            .with_execution_timeout(jiff::SignedDuration::from_hours(1))
             .run(counter, json!({}))
             .await;
         assert_eq!(outcome.result, Ok(json!(3)));
@@ -2396,7 +2456,7 @@ mod tests {
     fn started(input: Value) -> WorkflowEvent {
         WorkflowEvent::WorkflowStarted {
             input,
-            timestamp: chrono::Utc::now(),
+            timestamp: jiff::Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -2447,7 +2507,7 @@ mod tests {
     fn ticker(
         ctx: &WorkflowContext,
         input: Value,
-        offset: chrono::Duration,
+        offset: jiff::SignedDuration,
         max_ticks: u32,
         max_ops: Option<u64>,
     ) -> BoxedRun<'_> {
@@ -2474,17 +2534,17 @@ mod tests {
 
     /// One wake, one minute after the start of the run.
     fn late_ticker(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
-        ticker(ctx, input, chrono::Duration::minutes(1), 1, None)
+        ticker(ctx, input, jiff::SignedDuration::from_mins(1), 1, None)
     }
 
     /// One wake, one minute before the start of the run. It is due at once.
     fn due_ticker(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
-        ticker(ctx, input, chrono::Duration::minutes(-1), 1, None)
+        ticker(ctx, input, jiff::SignedDuration::from_mins(-1), 1, None)
     }
 
     /// Two wakes in all, with a checkpoint after each op.
     fn chained_ticker(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
-        ticker(ctx, input, chrono::Duration::minutes(1), 2, Some(1))
+        ticker(ctx, input, jiff::SignedDuration::from_mins(1), 2, Some(1))
     }
 
     /// A counter entity on the wake path with a hook that never wakes.
@@ -2736,18 +2796,18 @@ mod tests {
     /// The wait rounds up to whole milliseconds and is at least 1 ms.
     #[test]
     fn the_wait_for_a_wake_rounds_up_to_a_millisecond() {
-        let now = DateTime::UNIX_EPOCH;
-        let wait = |delta: chrono::Duration| time_until(now + delta, now);
+        let now = Timestamp::UNIX_EPOCH;
+        let wait = |delta: jiff::SignedDuration| time_until(now + delta, now);
         let ms = std::time::Duration::from_millis;
-        assert_eq!(wait(chrono::Duration::milliseconds(2)), ms(2));
-        assert_eq!(wait(chrono::Duration::microseconds(1500)), ms(2));
-        assert_eq!(wait(chrono::Duration::nanoseconds(1)), ms(1));
-        assert_eq!(wait(chrono::Duration::zero()), ms(1), "never a zero wait");
+        assert_eq!(wait(jiff::SignedDuration::from_millis(2)), ms(2));
+        assert_eq!(wait(jiff::SignedDuration::from_micros(1500)), ms(2));
+        assert_eq!(wait(jiff::SignedDuration::from_nanos(1)), ms(1));
+        assert_eq!(wait(jiff::SignedDuration::ZERO), ms(1), "never a zero wait");
         assert_eq!(
-            wait(chrono::Duration::seconds(-5)),
+            wait(jiff::SignedDuration::from_secs(-5)),
             ms(1),
             "never a negative wait"
         );
-        assert_eq!(wait(chrono::Duration::days(400)), ms(400 * 86_400_000));
+        assert_eq!(wait(crate::time::days(400)), ms(400 * 86_400_000));
     }
 }

@@ -4,9 +4,8 @@ use std::path::Path;
 
 /// Render `path` as the string literal `include_str!` takes.
 ///
-/// A Windows path carries backslashes, which are escapes inside a string
-/// literal; escape them (and any quote) so the generated file is valid Rust on
-/// every platform.
+/// A Windows path carries backslashes, which are escapes in a string literal.
+/// Escape them and any quote, so the generated file is valid Rust everywhere.
 fn include_literal(path: &Path) -> String {
     path.display()
         .to_string()
@@ -17,14 +16,13 @@ fn include_literal(path: &Path) -> String {
 fn main() {
     let migrations_dir = Path::new("migrations");
 
-    // Watch the directory so Cargo re-runs this script when migrations are
-    // added or removed.
+    // Re-run when a migration is added or removed.
     println!("cargo:rerun-if-changed=migrations/");
 
-    // Collect and sort migration names, then emit them as a rustc-env so
-    // that the build-script *output* changes whenever a new migration
-    // appears.  A changed output invalidates the lib fingerprint and forces
-    // Cargo to recompile lib.rs (re-running embed_migrations!()).
+    // The names go out as a rustc-env, so the build-script *output* changes
+    // when a new migration appears. A changed output invalidates the lib
+    // fingerprint and forces Cargo to recompile lib.rs (re-running
+    // embed_migrations!()).
     let mut names: Vec<String> = migrations_dir
         .read_dir()
         .into_iter()
@@ -35,11 +33,10 @@ fn main() {
         .collect();
     names.sort();
 
-    // Watch each migration directory (catches added/removed sibling files like
-    // down.sql) AND its `up.sql` file explicitly, so an IN-PLACE edit to an
-    // existing migration's up.sql — which changes neither the directory listing
-    // nor `HARVEST_MIGRATIONS_LIST` — still invalidates the fingerprint and
-    // regenerates the concatenated bundle below.
+    // Watch each migration directory for added or removed files such as
+    // down.sql. Also watch its `up.sql` explicitly. An IN-PLACE edit of an
+    // `up.sql` changes neither the listing nor `HARVEST_MIGRATIONS_LIST`. It
+    // must still invalidate the fingerprint and regenerate the bundle below.
     for name in &names {
         let dir = migrations_dir.join(name);
         println!("cargo:rerun-if-changed={}", dir.display());
@@ -51,26 +48,23 @@ fn main() {
         names.join(",")
     );
 
-    // Emit a single concatenated bundle of every migration's `up.sql`, in
-    // sorted (== timestamp) directory order, joined with newlines.  This is
-    // the "paved path" for testcontainers-backed integration tests: they can
-    // `include_str!` it via `autumn_harvest::full_migrations_sql()` instead of
-    // hand-rolling a `concat!(include_str!(...))` list that silently drifts
-    // out of date whenever a new migration lands (issue: nd_block_tests was
-    // missing 20260704000001_harvest_build_policy_ramp, so every start there
-    // failed `column "target_build_id" does not exist` — invisible because CI
-    // only compiled that suite, never ran it against a DB).
+    // One bundle of every `up.sql`, in sorted (== timestamp) order. It is the
+    // "paved path" for testcontainers-backed integration tests. They
+    // `include_str!` it via `autumn_harvest::full_migrations_sql()`. A
+    // hand-rolled `concat!(include_str!(...))` list drifts when a migration
+    // lands. For example, nd_block_tests once lacked
+    // 20260704000001_harvest_build_policy_ramp. Every start there failed
+    // `column "target_build_id" does not exist`. CI only compiled that suite,
+    // so nobody saw it.
     //
-    // Concatenating all `up.sql` files in timestamp order applies cleanly to a
-    // fresh Postgres (the migrations are ordered and idempotent-safe: no live
-    // `CREATE INDEX CONCURRENTLY`, distinct `ADD COLUMN`s, `DO $$` blocks that
-    // are self-contained).
+    // The bundle applies cleanly to a fresh Postgres. The migrations are
+    // ordered and idempotent-safe: no live `CREATE INDEX CONCURRENTLY`,
+    // distinct `ADD COLUMN`s, and self-contained `DO $$` blocks.
     let mut bundle = String::new();
     for name in &names {
         let up = migrations_dir.join(name).join("up.sql");
-        // Fail the build LOUDLY on a missing/unreadable up.sql rather than
-        // silently dropping that migration from the bundle — a silently-short
-        // bundle is exactly the drift this helper exists to prevent.
+        // Fail the build LOUDLY on a missing or unreadable up.sql. A silently
+        // short bundle is exactly the drift this helper exists to prevent.
         let sql = fs::read_to_string(&up).unwrap_or_else(|e| {
             panic!(
                 "migration {name}: missing/unreadable up.sql ({}): {e}",
@@ -92,12 +86,12 @@ fn main() {
     let bundle_path = Path::new(&out_dir).join("all_migrations_bundle.sql");
     fs::write(&bundle_path, bundle).expect("failed to write all_migrations_bundle.sql");
 
-    // Emit the same `up.sql` files a SECOND time, but kept apart per migration
-    // and paired with the directory name. The concatenated bundle above is a
-    // fresh-database shortcut with no notion of "which migrations does this
-    // database already have"; `crate::migrate` needs exactly that, because it
-    // applies a *pending subset* against a live Harvest database and records
-    // each one in `__diesel_schema_migrations` (issue #1240).
+    // Emit the same `up.sql` files a SECOND time, per migration and paired
+    // with the directory name. The bundle above is a fresh-database shortcut.
+    // It does not know which migrations a database already has.
+    // `crate::migrate` needs that. It applies a *pending subset* to a live
+    // Harvest database and records each one in `__diesel_schema_migrations`
+    // (issue #1240).
     //
     // `include_str!` rather than an inlined string literal so the SQL is still
     // watched by the `rerun-if-changed` lines above and never has to be escaped.
@@ -114,10 +108,9 @@ fn main() {
         scripts.push_str("\", include_str!(\"");
         scripts.push_str(&include_literal(&up));
         scripts.push_str("\"), ");
-        // Diesel's optional per-migration metadata (`run_in_transaction`).
-        // Emitted as its raw text — the empty string when absent — so
-        // `crate::migrate` reads it with the SAME parser it uses for a
-        // `--include-dir` set, rather than a second copy of the rule here.
+        // Diesel's optional per-migration metadata (`run_in_transaction`),
+        // as raw text or the empty string. So `crate::migrate` reads it with
+        // the SAME parser as an `--include-dir` set, not a second copy here.
         let metadata = source.join("metadata.toml");
         if metadata.is_file() {
             // Only watched when it exists: `rerun-if-changed` on a missing path

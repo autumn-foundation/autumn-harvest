@@ -5,19 +5,20 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::ext::IdentExt as _;
 
-/// Compile-time validator for the runtime `task_duration()` string format
-/// (`"30s"`, `"5m"`, `"1h"`, `"1h30m"`, ...): digits followed by one of
-/// `s`/`m`/`h`/`d`, optionally space-separated, with no overflow and no
-/// trailing garbage. Mirrors (but does not call) the runtime parser in
-/// `autumn-harvest/src/lib.rs::task_duration` so an invalid duration string
-/// is rejected at compile time rather than silently accepted by the macro
-/// and failing only when the workflow/DAG actually starts.
+/// Compile-time validator for the runtime `task_duration()` string format.
 ///
-/// Shared by every attribute-macro argument parser that accepts a duration
-/// string (`#[workflow(...)]`'s `start_to_close`/`heartbeat_timeout`/
-/// `schedule_to_start`/`execution_timeout`, `#[dag(...)]`'s
-/// `execution_timeout`/`sla`, ...) so the validation rule lives in exactly
-/// one place.
+/// Valid strings are `"30s"`, `"5m"`, `"1h"`, `"1h30m"` and similar. Each part
+/// is digits followed by one of `s`/`m`/`h`/`d`, optionally space-separated.
+/// No overflow and no trailing garbage is allowed. This mirrors, but does not
+/// call, the runtime parser in `autumn-harvest/src/lib.rs::task_duration`.
+/// So the macro rejects an invalid duration string at compile time. Otherwise
+/// it would fail only when the workflow or DAG starts.
+///
+/// Every attribute-macro argument parser that accepts a duration string uses
+/// it, so the validation rule lives in exactly one place. Examples are
+/// `#[workflow(...)]`'s `start_to_close`/`heartbeat_timeout`/
+/// `schedule_to_start`/`execution_timeout` and `#[dag(...)]`'s
+/// `execution_timeout`/`sla`.
 pub fn is_valid_task_duration(s: &str) -> bool {
     task_duration_secs(s).is_some_and(|secs| secs != 0)
 }
@@ -84,11 +85,10 @@ pub fn parse_bool_flag(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<boo
 /// whatever context-type name `expected_ident` names (e.g. `"WorkflowContext"`,
 /// `"WebhookCtx"`).
 ///
-/// `query.rs`/`update.rs`/`signal.rs` each hard-code their own copy of this
-/// check against a fixed `"WorkflowContext"` ident; this generalized version
-/// exists so newer macros (`webhook.rs`) don't add yet another near-identical
-/// copy. The three pre-existing hard-coded copies are left as-is to keep this
-/// change scoped.
+/// `query.rs`, `update.rs` and `signal.rs` each hard-code their own copy of
+/// this check against a fixed `"WorkflowContext"` ident. This generalized
+/// version exists so that newer macros (`webhook.rs`) do not add another
+/// near-identical copy. The three older copies stay as they are.
 pub fn first_param_is_ctx_type(
     inputs: &syn::punctuated::Punctuated<syn::FnArg, syn::token::Comma>,
     expected_ident: &str,
@@ -253,9 +253,9 @@ pub fn first_non_ident_param<'a>(params: &'a [&syn::FnArg]) -> Option<&'a syn::P
     })
 }
 
-/// Emits `match #source { Some(d) => Some(chrono::Duration::from_std(d)?), None => None }`.
-/// Rejects with a `HarvestError::Config` naming `field_name` when `d` is too
-/// large for `chrono::Duration` to represent.
+/// Emits `match #source { Some(d) => Some(time::from_std_bounded(d)?), None => None }`.
+/// Rejects with a `HarvestError::Config` naming `field_name` when `d` is
+/// past `i64::MAX` milliseconds, the range that `chrono` accepted.
 ///
 /// `workflow.rs`'s `start_with_options` hard-codes this match four times:
 /// `execution_timeout`, `max_execution_timeout_ceiling`,
@@ -269,13 +269,13 @@ pub fn first_non_ident_param<'a>(params: &'a [&syn::FnArg]) -> Option<&'a syn::P
 /// parity with" the pre-existing `execution_timeout` pair above it. It was
 /// added with the chain-cap fields, issue #617. The duplication was a
 /// deliberate copy, not a coincidence.
-pub fn optional_chrono_duration_tokens(field_name: &str, source: &TokenStream) -> TokenStream {
-    let message = format!("{field_name} exceeds chrono duration range");
+pub fn optional_duration_tokens(field_name: &str, source: &TokenStream) -> TokenStream {
+    let message = format!("{field_name} exceeds the duration range");
     quote! {
         match #source {
             ::std::option::Option::Some(d) => ::std::option::Option::Some(
-                ::autumn_harvest::chrono::Duration::from_std(d)
-                    .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
+                ::autumn_harvest::time::from_std_bounded(d)
+                    .ok_or_else(|| ::autumn_harvest::error::HarvestError::Config(
                         #message.to_string()
                     ))?
             ),
@@ -285,8 +285,8 @@ pub fn optional_chrono_duration_tokens(field_name: &str, source: &TokenStream) -
 }
 
 #[cfg(test)]
-mod optional_chrono_duration_tokens_tests {
-    use super::optional_chrono_duration_tokens;
+mod optional_duration_tokens_tests {
+    use super::optional_duration_tokens;
     use quote::quote;
 
     /// Pins the exact shape `workflow.rs`'s `start_with_options`/
@@ -294,7 +294,7 @@ mod optional_chrono_duration_tokens_tests {
     /// before this extraction, for both of their shared fields.
     #[test]
     fn reproduces_the_execution_timeout_match_workflow_rs_and_signal_with_start_shared() {
-        let out = optional_chrono_duration_tokens(
+        let out = optional_duration_tokens(
             "execution_timeout",
             &quote! { opts.execution_timeout.or(info.execution_timeout) },
         )
@@ -302,9 +302,9 @@ mod optional_chrono_duration_tokens_tests {
         let expected = quote! {
             match opts.execution_timeout.or(info.execution_timeout) {
                 ::std::option::Option::Some(d) => ::std::option::Option::Some(
-                    ::autumn_harvest::chrono::Duration::from_std(d)
-                        .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
-                            "execution_timeout exceeds chrono duration range".to_string()
+                    ::autumn_harvest::time::from_std_bounded(d)
+                        .ok_or_else(|| ::autumn_harvest::error::HarvestError::Config(
+                            "execution_timeout exceeds the duration range".to_string()
                         ))?
                 ),
                 ::std::option::Option::None => ::std::option::Option::None,
@@ -319,17 +319,14 @@ mod optional_chrono_duration_tokens_tests {
     /// the source expression, not the shared match shape.
     #[test]
     fn reproduces_the_execution_timeout_match_update_with_start_variant() {
-        let out = optional_chrono_duration_tokens(
-            "execution_timeout",
-            &quote! { opts.execution_timeout },
-        )
-        .to_string();
+        let out = optional_duration_tokens("execution_timeout", &quote! { opts.execution_timeout })
+            .to_string();
         let expected = quote! {
             match opts.execution_timeout {
                 ::std::option::Option::Some(d) => ::std::option::Option::Some(
-                    ::autumn_harvest::chrono::Duration::from_std(d)
-                        .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
-                            "execution_timeout exceeds chrono duration range".to_string()
+                    ::autumn_harvest::time::from_std_bounded(d)
+                        .ok_or_else(|| ::autumn_harvest::error::HarvestError::Config(
+                            "execution_timeout exceeds the duration range".to_string()
                         ))?
                 ),
                 ::std::option::Option::None => ::std::option::Option::None,
@@ -343,7 +340,7 @@ mod optional_chrono_duration_tokens_tests {
     /// sites. Only the field name, hence the error message, varies here.
     #[test]
     fn reproduces_the_max_execution_timeout_ceiling_match_shared_by_all_three_call_sites() {
-        let out = optional_chrono_duration_tokens(
+        let out = optional_duration_tokens(
             "max_execution_timeout_ceiling",
             &quote! { client.max_workflow_execution_timeout() },
         )
@@ -351,9 +348,9 @@ mod optional_chrono_duration_tokens_tests {
         let expected = quote! {
             match client.max_workflow_execution_timeout() {
                 ::std::option::Option::Some(d) => ::std::option::Option::Some(
-                    ::autumn_harvest::chrono::Duration::from_std(d)
-                        .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
-                            "max_execution_timeout_ceiling exceeds chrono duration range".to_string()
+                    ::autumn_harvest::time::from_std_bounded(d)
+                        .ok_or_else(|| ::autumn_harvest::error::HarvestError::Config(
+                            "max_execution_timeout_ceiling exceeds the duration range".to_string()
                         ))?
                 ),
                 ::std::option::Option::None => ::std::option::Option::None,
@@ -366,7 +363,7 @@ mod optional_chrono_duration_tokens_tests {
     /// The two chain-cap fields (issue #617) are `start_with_options`-only.
     #[test]
     fn reproduces_the_chain_execution_timeout_match() {
-        let out = optional_chrono_duration_tokens(
+        let out = optional_duration_tokens(
             "chain_execution_timeout",
             &quote! { info.chain_execution_timeout },
         )
@@ -374,9 +371,9 @@ mod optional_chrono_duration_tokens_tests {
         let expected = quote! {
             match info.chain_execution_timeout {
                 ::std::option::Option::Some(d) => ::std::option::Option::Some(
-                    ::autumn_harvest::chrono::Duration::from_std(d)
-                        .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
-                            "chain_execution_timeout exceeds chrono duration range".to_string()
+                    ::autumn_harvest::time::from_std_bounded(d)
+                        .ok_or_else(|| ::autumn_harvest::error::HarvestError::Config(
+                            "chain_execution_timeout exceeds the duration range".to_string()
                         ))?
                 ),
                 ::std::option::Option::None => ::std::option::Option::None,
@@ -388,7 +385,7 @@ mod optional_chrono_duration_tokens_tests {
 
     #[test]
     fn reproduces_the_max_workflow_chain_timeout_ceiling_match() {
-        let out = optional_chrono_duration_tokens(
+        let out = optional_duration_tokens(
             "max_workflow_chain_timeout_ceiling",
             &quote! { client.max_workflow_chain_timeout() },
         )
@@ -396,9 +393,9 @@ mod optional_chrono_duration_tokens_tests {
         let expected = quote! {
             match client.max_workflow_chain_timeout() {
                 ::std::option::Option::Some(d) => ::std::option::Option::Some(
-                    ::autumn_harvest::chrono::Duration::from_std(d)
-                        .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
-                            "max_workflow_chain_timeout_ceiling exceeds chrono duration range".to_string()
+                    ::autumn_harvest::time::from_std_bounded(d)
+                        .ok_or_else(|| ::autumn_harvest::error::HarvestError::Config(
+                            "max_workflow_chain_timeout_ceiling exceeds the duration range".to_string()
                         ))?
                 ),
                 ::std::option::Option::None => ::std::option::Option::None,
@@ -412,11 +409,8 @@ mod optional_chrono_duration_tokens_tests {
     /// name at a call site is caught here, not silently accepted.
     #[test]
     fn error_message_names_the_field() {
-        let out = optional_chrono_duration_tokens("sla", &quote! { opts.sla }).to_string();
-        assert!(
-            out.contains("\"sla exceeds chrono duration range\""),
-            "{out}"
-        );
+        let out = optional_duration_tokens("sla", &quote! { opts.sla }).to_string();
+        assert!(out.contains("\"sla exceeds the duration range\""), "{out}");
     }
 }
 

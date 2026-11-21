@@ -4,9 +4,9 @@
 //!
 //! Verifies, against a real Postgres container:
 //! 1. `append_events_offloaded` writes a tiny reference envelope to
-//!    `harvest_events` (success metric: row < 4 KB) and records a
-//!    `harvest_payload_refs` row, while `load_history_inflated` reconstructs
-//!    the original payload byte-for-byte.
+//!    `harvest_events` (success metric: row < 4 KB). It records a
+//!    `harvest_payload_refs` row. `load_history_inflated` reconstructs the
+//!    original payload byte-for-byte.
 //! 2. The GC primitives (`load_payload_refs`, `blob_key_still_referenced`)
 //!    drive orphan-safe blob deletion: a blob shared by two executions stays
 //!    referenced until the last execution's refs are gone.
@@ -27,9 +27,9 @@ use autumn_harvest::store;
 use autumn_harvest::telemetry::NoOpMetrics;
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
 
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -158,7 +158,7 @@ async fn offload_round_trips_through_postgres_with_tiny_event_row() {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,

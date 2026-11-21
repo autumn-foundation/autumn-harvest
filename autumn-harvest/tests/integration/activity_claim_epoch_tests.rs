@@ -10,6 +10,7 @@
 //! A background reclaimer in the same database can therefore race only on
 //! A's requeue, and the helper accepts that outcome.
 
+use jiff_diesel::ToDiesel;
 use std::time::Duration;
 
 use autumn_harvest::event::WorkflowEvent;
@@ -21,14 +22,15 @@ use autumn_harvest::schema::{harvest_task_queue, harvest_workflow_executions};
 use autumn_harvest::store;
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
 use autumn_harvest::worker::{
-    DbPool, append_activity_started_for_test, fail_task_and_execution_with_history,
-    finalize_activity_completion, finalize_activity_failure, observe_task_cancellation,
-    preload_failure_history, requeue_workflow_task_after_event_id_conflict,
+    DbPool, append_activity_started_for_test, append_activity_started_without_handler_for_test,
+    fail_task_and_execution_with_history, finalize_activity_completion, finalize_activity_failure,
+    observe_task_cancellation, preload_failure_history,
+    requeue_workflow_task_after_event_id_conflict,
 };
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -172,7 +174,7 @@ async fn seed_activity(conn: &mut AsyncPgConnection) -> Fixture {
         &[
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!({}),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -194,7 +196,7 @@ async fn seed_activity(conn: &mut AsyncPgConnection) -> Fixture {
     params.activity_name = Some(ACTIVITY.to_string());
     params.activity_id = Some(activity_id.as_uuid());
     params.max_attempts = 5;
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
     let task_id = queue::enqueue(conn, &params).await.expect("enqueue");
     Fixture {
         queue,
@@ -246,7 +248,7 @@ async fn requeue_orphan(conn: &mut AsyncPgConnection, task: &TaskQueueItem) {
                 .bind::<diesel::sql_types::Integer, _>(strikes)
                 .bind::<diesel::sql_types::Integer, _>(strikes + 1)
                 .bind::<diesel::sql_types::BigInt, _>(10_i64)
-                .bind::<diesel::sql_types::Timestamptz, _>(Utc::now())
+                .bind::<diesel::sql_types::Timestamptz, _>(Timestamp::now().to_diesel())
                 .execute(conn)
                 .await
         })
@@ -294,7 +296,8 @@ struct RowState {
     #[diesel(sql_type = diesel::sql_types::Integer)]
     attempt: i32,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    last_heartbeat_at: Option<chrono::DateTime<Utc>>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+    last_heartbeat_at: Option<jiff::Timestamp>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
     heartbeat_details: Option<serde_json::Value>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
@@ -546,10 +549,10 @@ async fn stale_claim_cannot_fail_requeue_or_defer_the_row() {
         .await
         .expect("query runs");
     let requeued =
-        queue::requeue_claimed_task_for_retry(&mut conn, &claim_a, chrono::Duration::zero(), "A")
+        queue::requeue_claimed_task_for_retry(&mut conn, &claim_a, jiff::SignedDuration::ZERO, "A")
             .await
             .expect("query runs");
-    let deferred = queue::defer_claimed_rate_limited_task(&mut conn, &claim_a, Utc::now())
+    let deferred = queue::defer_claimed_rate_limited_task(&mut conn, &claim_a, Timestamp::now())
         .await
         .expect("query runs");
 
@@ -572,7 +575,7 @@ async fn current_claim_writes_still_apply() {
     let claim_b = TaskClaim::of(&b).expect("B holds a claim");
 
     let requeued =
-        queue::requeue_claimed_task_for_retry(&mut conn, &claim_b, chrono::Duration::zero(), "B")
+        queue::requeue_claimed_task_for_retry(&mut conn, &claim_b, jiff::SignedDuration::ZERO, "B")
             .await
             .expect("query runs");
 
@@ -952,6 +955,7 @@ fn e2e_worker(
     std::sync::Arc::new(
         autumn_harvest::worker::Worker::new(
             autumn_harvest::worker::WorkerRuntimeConfig {
+                gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
                 codec_rotation_batch_size: 0,
                 scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
@@ -961,6 +965,8 @@ fn e2e_worker(
                 max_concurrent_workflows: 2,
                 max_concurrent_activities: 2,
                 max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
+                claim_slots_per_shard: None,
+                claim_batch_max: None,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -1009,7 +1015,7 @@ async fn seed_e2e_workflow(conn: &mut AsyncPgConnection, queue: &str) -> Executi
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1027,7 +1033,7 @@ async fn seed_e2e_workflow(conn: &mut AsyncPgConnection, queue: &str) -> Executi
     .expect("name the workflow");
     let mut params = EnqueueParams::new(queue, TaskType::Workflow, input);
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(1);
     queue::enqueue(conn, &params)
         .await
         .expect("enqueue workflow task");
@@ -1275,4 +1281,172 @@ async fn stale_event_id_conflict_redrive_leaves_a_peer_claim_alone() {
         "{after:?}"
     );
     assert_eq!(after.attempt, 2, "{after:?}");
+}
+
+// ---------------------------------------------------------------------------
+// One task-row lock per write
+// ---------------------------------------------------------------------------
+
+fn record_statements(
+    conn: &mut AsyncPgConnection,
+) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+    use diesel::connection::InstrumentationEvent;
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&log);
+    conn.set_instrumentation(move |event: InstrumentationEvent<'_>| {
+        if let InstrumentationEvent::StartQuery { query, .. } = event {
+            sink.lock().expect("statement log").push(query.to_string());
+        }
+    });
+    log
+}
+
+/// The separate claim lock: `queue::lock_claim_for_update`.
+fn claim_locks(log: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
+    log.lock()
+        .expect("statement log")
+        .iter()
+        .filter(|q| {
+            q.starts_with(r#"SELECT "harvest_task_queue"."state", ((("harvest_task_queue"."state""#)
+                && q.contains("FOR UPDATE")
+        })
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn a_start_takes_no_separate_claim_lock() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let fx = seed_activity(&mut conn).await;
+    let a = claim(&mut conn, &fx, &fx.worker_a).await;
+
+    let log = record_statements(&mut conn);
+    let started = append_activity_started_for_test(
+        &mut conn,
+        &a,
+        fx.exec_id,
+        ACTIVITY,
+        &fx.worker_a,
+        &PayloadCodecs::default(),
+    )
+    .await
+    .expect("start");
+
+    assert_eq!(started, Some(fx.activity_id));
+    assert_eq!(claim_locks(&log), Vec::<String>::new());
+    assert_eq!(
+        count_started_by(&events(&mut conn, fx.exec_id).await, &fx.worker_a),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_completion_takes_no_separate_claim_lock() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let fx = seed_activity(&mut conn).await;
+    let codecs = PayloadCodecs::default();
+    let a = claim(&mut conn, &fx, &fx.worker_a).await;
+    append_activity_started_for_test(&mut conn, &a, fx.exec_id, ACTIVITY, &fx.worker_a, &codecs)
+        .await
+        .expect("start");
+
+    let log = record_statements(&mut conn);
+    finalize_activity_completion(
+        &mut conn,
+        &a,
+        fx.exec_id,
+        fx.activity_id,
+        serde_json::json!({"done": true}),
+        None,
+        &codecs,
+    )
+    .await
+    .expect("complete");
+
+    assert_eq!(claim_locks(&log), Vec::<String>::new());
+    assert_eq!(row(&mut conn, fx.task_id).await.state, "COMPLETED");
+    assert_eq!(
+        completed_outputs(&events(&mut conn, fx.exec_id).await),
+        vec![serde_json::json!({"done": true})]
+    );
+}
+
+#[tokio::test]
+async fn a_failure_takes_no_separate_claim_lock() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let fx = seed_activity(&mut conn).await;
+    let codecs = PayloadCodecs::default();
+    let a = claim(&mut conn, &fx, &fx.worker_a).await;
+    append_activity_started_for_test(&mut conn, &a, fx.exec_id, ACTIVITY, &fx.worker_a, &codecs)
+        .await
+        .expect("start");
+
+    let log = record_statements(&mut conn);
+    finalize_activity_failure(&mut conn, &a, fx.exec_id, fx.activity_id, "boom", &codecs)
+        .await
+        .expect("fail");
+
+    assert_eq!(claim_locks(&log), Vec::<String>::new());
+    assert_eq!(row(&mut conn, fx.task_id).await.state, "FAILED");
+    assert_eq!(count_failed(&events(&mut conn, fx.exec_id).await), 1);
+}
+
+#[tokio::test]
+async fn stale_start_without_a_handler_appends_nothing() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let fx = seed_activity(&mut conn).await;
+    let a = claim(&mut conn, &fx, &fx.worker_a).await;
+    requeue_orphan(&mut conn, &a).await;
+    let _b = claim(&mut conn, &fx, &fx.worker_b).await;
+
+    let started = append_activity_started_without_handler_for_test(
+        &mut conn,
+        &a,
+        fx.exec_id,
+        ACTIVITY,
+        &fx.worker_a,
+        &PayloadCodecs::default(),
+    )
+    .await
+    .expect("a stale start is a no-op, not an error");
+
+    assert_eq!(started, None);
+    assert_eq!(
+        count_started_by(&events(&mut conn, fx.exec_id).await, &fx.worker_a),
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_start_without_a_handler_keeps_its_claim_lock_and_sets_no_marker() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let fx = seed_activity(&mut conn).await;
+    let a = claim(&mut conn, &fx, &fx.worker_a).await;
+
+    let log = record_statements(&mut conn);
+    let started = append_activity_started_without_handler_for_test(
+        &mut conn,
+        &a,
+        fx.exec_id,
+        ACTIVITY,
+        &fx.worker_a,
+        &PayloadCodecs::default(),
+    )
+    .await
+    .expect("start");
+
+    assert_eq!(started, Some(fx.activity_id));
+    assert_eq!(claim_locks(&log).len(), 1);
+    let marker: Option<i32> = harvest_task_queue::table
+        .find(fx.task_id)
+        .select(harvest_task_queue::handler_started_attempt)
+        .first(&mut conn)
+        .await
+        .expect("marker");
+    assert_eq!(marker, None);
 }

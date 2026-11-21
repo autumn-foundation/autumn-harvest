@@ -263,7 +263,7 @@ fn the_engine_registration_builds() {
         .build();
     // The `eval` feature adds the refine run `agent_refine` (issue #2380).
     let refine = usize::from(cfg!(feature = "eval"));
-    assert_eq!(built.workflow_count(), 7 + refine);
+    assert_eq!(built.workflow_count(), 8 + refine);
     assert!(built.state::<AgentHarness>().is_some());
     let names: Vec<&str> = activities().iter().map(|a| a.name).collect();
     let refine_steps = [
@@ -271,9 +271,11 @@ fn the_engine_registration_builds() {
         "agent_refine_probe",
         "agent_refine_compose",
         "agent_refine_select",
+        "agent_refine_adopt",
+        "agent_refine_decide",
     ];
-    let (core, steps) = names.split_at(names.len() - 4 * refine);
-    assert_eq!(steps, &refine_steps[..4 * refine]);
+    let (core, steps) = names.split_at(names.len() - refine_steps.len() * refine);
+    assert_eq!(steps, &refine_steps[..refine_steps.len() * refine]);
     assert_eq!(
         core,
         [
@@ -281,11 +283,15 @@ fn the_engine_registration_builds() {
             "agent_tool_call",
             "agent_memory_snapshot",
             "agent_deliver",
+            "agent_approval_notice",
             "agent_precheck",
             "agent_discover_peers",
             "agent_profile",
             "agent_profile_overlay",
             "agent_memory_reset",
+            "agent_memory_count",
+            "agent_transcript_count",
+            "agent_transcript_erase",
             "agent_workspace_retain",
             "agent_workspace_reset",
             "agent_workspace_floor",
@@ -295,12 +301,17 @@ fn the_engine_registration_builds() {
             "agent_score",
             "agent_answer_check",
             "agent_sample_score",
+            "agent_sweep_items",
+            "agent_vote_key",
             "agent_consolidate_read",
             "agent_consolidate_turn",
             "agent_consolidate_write",
             "agent_consolidate_due",
             "agent_episode_append",
             "agent_episode_reset",
+            "agent_refine_lesson",
+            "agent_lesson_match",
+            "agent_lesson_erase",
         ]
     );
     let flows: Vec<&str> = workflows().iter().map(|w| w.name).collect();
@@ -314,6 +325,7 @@ fn the_engine_registration_builds() {
             autumn_harvest_agent::AGENT_WORKFLOW_NAME,
             autumn_harvest_agent::sampling::DRAWS_WORKFLOW_NAME,
             autumn_harvest_agent::sampling::SAMPLE_WORKFLOW_NAME,
+            autumn_harvest_agent::sampling::SWEEP_WORKFLOW_NAME,
             autumn_harvest_agent::CONSOLIDATE_WORKFLOW_NAME,
             autumn_harvest_agent::CONSOLIDATE_ALL_WORKFLOW_NAME,
         ]

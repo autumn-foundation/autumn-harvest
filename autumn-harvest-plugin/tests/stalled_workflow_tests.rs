@@ -1,8 +1,10 @@
 //! Integration tests for the stalled-workflow discovery filter on
-//! `GET /workflows` (issue #486). Seeds workflows in specific states and
-//! verifies that `no_progress_minutes` returns only the expected subset,
-//! that sleeping-on-future-timer workflows are excluded by default (zero false
-//! positives), and that `include_sleeping=true` opts them back in.
+//! `GET /workflows` (issue #486).
+//!
+//! The suite seeds workflows in specific states. `no_progress_minutes` must
+//! return only the expected subset. Workflows asleep on a future timer are
+//! excluded by default (zero false positives). `include_sleeping=true` opts
+//! them back in.
 
 use autumn_harvest::schema::harvest_events;
 use autumn_harvest::types::{ExecutionId, Priority, ShardId};
@@ -13,12 +15,13 @@ use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{Duration, Utc};
 use diesel::ExpressionMethods;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use jiff::{SignedDuration, Timestamp};
+use jiff_diesel::ToDiesel;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -144,11 +147,11 @@ async fn seed_stalled_workflow(
     .expect("seed workflow");
 
     // Backdate the WorkflowStarted event that was just appended.
-    let backdated_ts = Utc::now() - Duration::hours(hours_ago);
+    let backdated_ts = Timestamp::now() - SignedDuration::from_hours(hours_ago);
     autumn_harvest::append_only::with_guard_off(&mut conn, async |c| {
         diesel::update(harvest_events::table)
             .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
-            .set(harvest_events::timestamp.eq(backdated_ts))
+            .set(harvest_events::timestamp.eq(backdated_ts.to_diesel()))
             .execute(c)
             .await
     })
@@ -421,9 +424,9 @@ fn test_stall_reason_serializes_as_snake_case() {
     );
 }
 
-/// AC: `no_pending_work` is always surfaced regardless of `include_sleeping` — even
-/// if we pass `include_sleeping=false`, a workflow with no pending work at all
-/// must still be returned (since it cannot be a sleeping-timer case).
+/// AC: `no_pending_work` is always surfaced, whatever `include_sleeping` says.
+/// With `include_sleeping=false`, a workflow with no pending work still returns.
+/// It cannot be a sleeping-timer case.
 #[tokio::test]
 async fn test_no_pending_work_always_returned_regardless_of_include_sleeping() {
     let (database_url, _container) = setup_database().await;

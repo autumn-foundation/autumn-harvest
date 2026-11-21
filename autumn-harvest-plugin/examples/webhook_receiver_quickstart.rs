@@ -38,11 +38,10 @@ struct StripeEvent {
     id: String,
 }
 
-/// Starts a fresh subscription-flow run per Stripe event id -- redelivering
-/// the same event resolves to the same execution (`AllowDuplicate` reuse
-/// policy, keyed by this deterministic `WorkflowId`). The workflow's input is
-/// always the verified JSON body itself -- the mapping function's return
-/// value is only the `WorkflowId`.
+/// Starts a fresh subscription-flow run per Stripe event id. A redelivered
+/// event resolves to the same execution (`AllowDuplicate` reuse policy, keyed
+/// by this deterministic `WorkflowId`). The workflow's input is always the
+/// verified JSON body. The mapping function returns only the `WorkflowId`.
 #[webhook(path = "/hooks/stripe", starts = "subscription_flow")]
 fn map_stripe_event(_ctx: &WebhookCtx, evt: StripeEvent) -> Result<WorkflowId, String> {
     Ok(WorkflowId::new(format!("stripe-{}", evt.id)))

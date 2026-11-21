@@ -23,7 +23,6 @@ const RED_SEEDS: SeedPlan = SeedPlan {
     count: 200,
 };
 
-/// The seeds of a coverage sweep.
 const COVER_SEEDS: SeedPlan = SeedPlan {
     first: 0,
     count: 200,

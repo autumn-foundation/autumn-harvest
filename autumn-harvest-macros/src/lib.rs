@@ -25,6 +25,10 @@ mod workflow;
 /// as a `u64` literal in the generated `WorkflowInfo`/`ActivityInfo`.
 ///
 /// Returns `None` for empty strings or strings with unrecognised suffixes.
+///
+/// This body is a sibling of `autumn_harvest::parse_byte_size` (issue
+/// #2625). Change both copies the same way. `cargo xtask audit
+/// byte-size-parse-sync` checks that in CI.
 #[allow(clippy::option_if_let_else)]
 pub(crate) fn parse_byte_size_macro(s: &str) -> Option<u64> {
     let s = s.trim();
@@ -153,11 +157,10 @@ pub fn update(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Marks a synchronous function as an inbound webhook trigger mapping
 /// function (issue #344).
 ///
-/// Signature verification, timestamp tolerance, replay protection, and secret
-/// rotation are handled entirely by autumn-web 0.5's
-/// `[security.webhooks.endpoints]` / `SignedWebhook` extractor, upstream of
-/// this macro -- `#[webhook]` only maps an already-verified delivery to a
-/// deterministic workflow trigger.
+/// autumn-web 0.5's `[security.webhooks.endpoints]` / `SignedWebhook`
+/// extractor handles signature verification, timestamp tolerance, replay
+/// protection, and secret rotation, upstream of this macro. `#[webhook]` only
+/// maps a verified delivery to a deterministic workflow trigger.
 ///
 /// Generates a companion function
 /// `__autumn_webhook_info_{fn_name}() -> WebhookTriggerInfo` and a public
@@ -193,7 +196,7 @@ pub fn webhook(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Marks a function as a Harvest workflow signal handler.
 ///
 /// Generates a typed signal sender method `signal_[signal_name]` on the sibling
-/// `[WorkflowName]Stub` struct, plus a companion function
+/// `[WorkflowName]Stub` struct. It also generates a companion function
 /// `__autumn_signal_handler_info_{fn_name}() -> SignalHandlerInfo` and a public
 /// alias `{fn_name}_info()` for interface discovery (issue #610).
 ///
@@ -295,7 +298,6 @@ pub(crate) fn parse_and_validate_workflow_path(
     let is_absolute = workflow_name.starts_with("::");
     let parts: Vec<&str> = workflow_name.split("::").collect();
 
-    // Validate segments
     for (idx, part) in parts.iter().enumerate() {
         if part.is_empty() {
             // An empty segment is only allowed at the very start for absolute paths

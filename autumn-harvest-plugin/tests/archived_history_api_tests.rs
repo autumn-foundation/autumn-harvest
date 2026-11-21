@@ -72,7 +72,7 @@ fn doc_with_events(
         shard_id: 0,
         state: "COMPLETED".to_string(),
         events: Vec::new(),
-        exported_at: chrono::Utc::now(),
+        exported_at: jiff::Timestamp::now(),
         payload_policy: HistoryPayloadPolicy::Full,
         max_bytes: Some(usize::MAX),
         context_headers: None,

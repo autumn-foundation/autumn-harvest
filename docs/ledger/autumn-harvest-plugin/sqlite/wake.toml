@@ -1,0 +1,24 @@
+# Ledger profiles for `autumn-harvest-plugin/src/sqlite/wake.rs`. See `docs/ledger/README.md`.
+# Each query is diesel on the SQLite control database. The scan reads diesel
+# as Postgres, so `backend` lists both.
+
+["WakeBook::due_page"]
+driver = "per_tick"
+backend = ["postgres", "sqlite"]
+kind = ["read"]
+tables = ["harvest_tenant_wakes"]
+measured = "unmeasured"
+
+["WakeBook::open"]
+driver = "setup"
+backend = ["postgres", "sqlite"]
+kind = ["ddl"]
+tables = ["harvest_tenant_wakes"]
+measured = "unmeasured"
+
+["write"]
+driver = "per_tick"
+backend = ["postgres", "sqlite"]
+kind = ["write"]
+tables = ["harvest_tenant_wakes"]
+measured = "unmeasured"

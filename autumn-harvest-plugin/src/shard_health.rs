@@ -9,12 +9,12 @@ use autumn_harvest::scheduler::SchedulerMonitor;
 use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::DbPool;
 use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, WorkerStatus, list_workers};
-use chrono::{DateTime, Utc};
 use diesel::migration::MigrationSource;
 use diesel::pg::Pg;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use futures::future::join_all;
+use jiff::Timestamp;
 use serde::Serialize;
 
 use crate::api::{HarvestApiRuntime, HarvestApiState};
@@ -42,7 +42,7 @@ pub enum ShardRole {
 #[derive(Debug, Clone, Serialize)]
 pub struct ShardHealthReport {
     pub overall_readiness: ShardReadiness,
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: Timestamp,
     pub freshness_window_secs: u64,
     pub candidate_shard: Option<i32>,
     pub shards: Vec<ShardHealthRow>,
@@ -62,7 +62,7 @@ pub struct ShardHealthRow {
     pub scheduler: ShardSchedulerCoverage,
     pub queue_depth: QueueDepthSummary,
     pub dlq: DlqSummary,
-    pub last_health_sample_time: Option<DateTime<Utc>>,
+    pub last_health_sample_time: Option<Timestamp>,
     pub readiness: ShardReadiness,
     pub reason_codes: Vec<String>,
     pub blocking_reasons: Vec<String>,
@@ -96,7 +96,7 @@ pub struct ShardSchedulerCoverage {
     pub enabled: bool,
     pub ready: bool,
     pub running: bool,
-    pub last_tick_at: Option<DateTime<Utc>>,
+    pub last_tick_at: Option<Timestamp>,
     pub tick_interval_ms: u64,
     pub freshness_window_secs: u64,
     pub schedule_count: usize,
@@ -119,14 +119,16 @@ pub struct QueueDepthSummary {
 }
 
 /// A distinct constraint set among claimable pending tasks on a queue
-/// (issue #522 review).
+/// (issue #522).
 ///
-/// `claim_task` only lets a worker whose labels satisfy `required_capabilities`
-/// AND whose build is eligible for `required_build_id` AND — when the row is
-/// held by an unexpired sticky lease — *is* `sticky_owner` claim the task, so a
-/// covering worker that polls the queue but fails any constraint does not
-/// actually drain it. At least one of the three fields is non-empty (rows with
-/// no constraint are covered by the basic per-queue check).
+/// `claim_task` lets a worker claim the task only when all three hold:
+/// - its labels satisfy `required_capabilities`;
+/// - its build is eligible for `required_build_id`;
+/// - it *is* `sticky_owner`, when an unexpired sticky lease holds the row.
+///
+/// A worker that polls the queue but fails any constraint does not drain it.
+/// At least one of the three fields is non-empty. The basic per-queue check
+/// covers rows with no constraint.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConstraintDemand {
     pub queue_name: String,
@@ -160,7 +162,7 @@ struct WorkerReadiness {
     coverage: Vec<QueueWorkerCoverage>,
     active_worker_count: usize,
     stale_worker_count: usize,
-    last_health_sample_time: Option<DateTime<Utc>>,
+    last_health_sample_time: Option<Timestamp>,
     reason_codes: Vec<String>,
     blocking_reasons: Vec<String>,
     error_summary: Option<String>,
@@ -185,7 +187,7 @@ pub async fn build_shard_health_report(
     api_state: &HarvestApiState,
     candidate_shard: Option<i32>,
 ) -> ShardHealthReport {
-    let observed_at = Utc::now();
+    let observed_at = Timestamp::now();
     let freshness_window = api_state.worker_stale_threshold();
     let runtime = api_state.runtime().ok();
     let required_migrations = required_migration_versions();
@@ -306,16 +308,14 @@ fn push_reason_code(reason_codes: &mut Vec<String>, reason_code: &'static str) {
     }
 }
 
-/// Gate readiness when a writable shard has claimable work but no live covering
-/// worker (issue #522). A stale (unresponsive) worker does not count.
 /// Whether an unreadable claimable-queue-depth query should degrade this shard's
 /// readiness (issue #522).
 ///
-/// Only writable shards — and candidate shards being evaluated for promotion to
-/// writable — must prove there is no claimable stranded work before reporting
-/// Ready, so only they fail closed when the depth query fails. A read-only shard
-/// takes no new starts and is outside the no-live-worker gate's scope, so an
-/// unreadable depth there is recorded in `error_summary` without blocking.
+/// Only writable shards and promotion candidates must prove that no claimable
+/// work is stranded before they report Ready. So only they fail closed when
+/// the depth query fails. A read-only shard takes no new starts and is outside
+/// the no-live-worker gate. Its unreadable depth goes to `error_summary`
+/// without blocking.
 fn queue_depth_unreadable_degrades(roles: &[ShardRole], candidate: bool) -> bool {
     roles.contains(&ShardRole::Writable) || candidate
 }
@@ -353,6 +353,8 @@ fn restore_reason(pending: i64, queues: &[&str]) -> String {
     )
 }
 
+/// Gate readiness when a writable shard has claimable work but no live covering
+/// worker (issue #522). A stale (unresponsive) worker does not count.
 #[allow(clippy::too_many_arguments)]
 fn check_no_live_worker_gate(
     shard_id: i32,
@@ -364,17 +366,15 @@ fn check_no_live_worker_gate(
     reason_codes: &mut Vec<String>,
     blocking_reasons: &mut Vec<String>,
 ) {
-    // Writable shards take new starts, and a candidate shard being evaluated for
-    // promotion to writable must prove the same "no stranded claimable work"
-    // invariant *before* the flip (issue #522 review) — so a candidate that
-    // already has claimable rows (prior test writes, migration validation) with
-    // no covering worker must not report ready. Read-only, non-candidate shards
-    // are outside this gate's scope.
+    // Writable shards take new starts. A promotion candidate must prove the
+    // same "no stranded claimable work" invariant *before* the flip (issue
+    // #522). A candidate can already hold claimable rows, for example from
+    // test writes or migration validation. With no covering worker, it must
+    // not report ready. Read-only, non-candidate shards are out of scope.
     if (!roles.contains(&ShardRole::Writable) && !candidate) || queue_depth.total_pending == 0 {
         return;
     }
 
-    // The queues that actually have claimable pending tasks.
     let pending_queues: std::collections::HashSet<&str> = queue_depth
         .by_queue
         .iter()
@@ -389,12 +389,10 @@ fn check_no_live_worker_gate(
         return;
     };
 
-    // Coverage is per pending queue, not shard-wide (fix #8 + per-queue,
-    // issue #522): a worker assigned to this shard that polls `default` does
-    // not drain pending `email` tasks, so checking that *any* worker covers
-    // *any* pending queue would hide stranded work on an uncovered queue. Flag
-    // when any queue with claimable work lacks a healthy, active, assigned
-    // worker that polls it.
+    // Coverage is per pending queue, not shard-wide (issue #522). A worker
+    // that polls `default` does not drain pending `email` tasks. A shard-wide
+    // check would hide stranded work on an uncovered queue. So flag each
+    // queue with claimable work that no healthy, active, assigned worker polls.
     let queue_covered = |queue: &str| {
         ws.iter().any(|w| {
             worker_assigned_to_shard(w, shard_id)
@@ -426,17 +424,16 @@ fn check_no_live_worker_gate(
         blocking_reasons.push(no_poller_reason(pending_in(&unpolled), &unpolled));
     }
 
-    // Constraint-aware coverage (issue #522 review): a worker that polls the
-    // queue may still be unable to claim a pending task because of its
-    // `required_capabilities` (Exact/In label match), its `required_build_id`
-    // (exact / declared-compatible / legacy rule), or an unexpired sticky lease
-    // binding it to a specific owner (only that worker can claim it until the
-    // lease expires). claim_task enforces all three, so e.g. a GPU-only or
-    // v2-only task, or a row leased to a now-stale worker, is stranded even
-    // though `default` looks covered by the per-queue check above. All
-    // constraints are checked against the *same* worker so a task needing
-    // several is not falsely covered by different workers each satisfying only
-    // one. Skip queues no assigned worker polls, which already have a reason.
+    // Constraint-aware coverage (issue #522). A worker that polls the queue can
+    // still be unable to claim a pending task. Three constraints can stop it:
+    // - `required_capabilities` (Exact/In label match);
+    // - `required_build_id` (exact, declared-compatible or legacy rule);
+    // - an unexpired sticky lease that binds the row to another owner.
+    // claim_task enforces all three. So a GPU-only or v2-only task, or a row
+    // leased to a stale worker, is stranded even when `default` looks covered.
+    // All constraints are checked against the *same* worker. Two workers that
+    // each satisfy one constraint do not cover a task that needs both.
+    // Skip queues no assigned worker polls, which already have a reason.
     // When no live worker can claim a demand, look at the inactive assigned
     // workers. If one would satisfy the demand once restored, report a liveness
     // problem. Otherwise restoring cannot help, and the constraint blocker stays.
@@ -510,7 +507,7 @@ async fn observe_shard(
     candidate_shard: Option<i32>,
     freshness_window: Duration,
     required_migrations: &Result<Vec<String>, String>,
-    observed_at: DateTime<Utc>,
+    observed_at: Timestamp,
 ) -> ShardHealthRow {
     let roles = roles_for_shard(shard_id, runtime);
     let candidate = candidate_shard == Some(shard_id);
@@ -530,9 +527,9 @@ async fn observe_shard(
     let required_queues = required_queues(runtime, schedules.as_deref().ok());
     let workers = load_workers(&mut conn, freshness_window).await;
     let workers_snapshot = workers.clone();
-    // Activity names with a circuit-breaker policy skip the rate-limit gate at
-    // claim, so the queue-depth query must exempt them from its rate-limit
-    // filter to match claim_task. Empty when no runtime or no breakers.
+    // Activities with a circuit-breaker policy skip the rate-limit gate at
+    // claim. The queue-depth query exempts them too, to match claim_task.
+    // Empty when no runtime or no breakers.
     let circuit_breaker_activities: Vec<String> = runtime
         .map(|r| {
             r.registry()
@@ -590,7 +587,6 @@ async fn observe_shard(
         error_summary.get_or_insert(error);
     }
 
-    // Gate: writable shard with claimable work but no live covering worker (issue #522).
     check_no_live_worker_gate(
         shard_id,
         &roles,
@@ -625,12 +621,10 @@ async fn observe_shard(
 
     if let Some(error) = &queue_depth.error {
         error_summary.get_or_insert_with(|| error.clone());
-        // An unreadable queue-depth query forces `total_pending` to 0, which
-        // makes `check_no_live_worker_gate` bail and would otherwise let a
-        // writable/candidate shard report Ready (issue #522). In that failure
-        // mode the gate cannot prove there is no claimable stranded work, so
-        // fail closed: degrade readiness rather than attaching the error to an
-        // otherwise-ready row.
+        // An unreadable queue-depth query forces `total_pending` to 0. Then
+        // `check_no_live_worker_gate` bails, and a writable or candidate shard
+        // could report Ready (issue #522). The gate cannot rule out stranded
+        // work here, so fail closed: degrade readiness.
         if queue_depth_unreadable_degrades(&roles, candidate) {
             push_reason_code(&mut reason_codes, REASON_QUEUE_DEPTH_UNREADABLE);
             blocking_reasons.push(format!(
@@ -850,7 +844,7 @@ fn worker_readiness(
     required_queues: &BTreeSet<String>,
     workers: Result<Vec<WorkerRow>, String>,
     freshness_window: Duration,
-    observed_at: DateTime<Utc>,
+    observed_at: Timestamp,
 ) -> WorkerReadiness {
     let mut blocking_reasons = Vec::new();
     match workers {
@@ -909,9 +903,9 @@ fn worker_readiness(
 }
 
 fn push_health_freshness_blocker(
-    last_seen: Option<DateTime<Utc>>,
+    last_seen: Option<Timestamp>,
     freshness_window: Duration,
-    observed_at: DateTime<Utc>,
+    observed_at: Timestamp,
     reason_codes: &mut Vec<String>,
     blocking_reasons: &mut Vec<String>,
 ) {
@@ -920,9 +914,7 @@ fn push_health_freshness_blocker(
         blocking_reasons.push("no worker health data recorded on shard".to_string());
         return;
     };
-    let elapsed = observed_at
-        .signed_duration_since(last_seen)
-        .to_std()
+    let elapsed = std::time::Duration::try_from(observed_at.duration_since(last_seen))
         .unwrap_or(Duration::ZERO);
     if elapsed > freshness_window {
         push_reason_code(reason_codes, REASON_WORKER_HEALTH_STALE);
@@ -1005,10 +997,10 @@ fn worker_can_cover(worker: &WorkerRow, queue: &str, shard_id: i32) -> bool {
     has_queue && worker_assigned_to_shard(worker, shard_id)
 }
 
-/// Delegates to the shared [`shard_fanout::worker_covers_shard`] predicate --
-/// see its doc comment for why an empty `shard_assignments` array must be
-/// treated as covering *any* shard being inspected, not "assigned to
-/// nothing" or hardcoded to shard 0 (issue #1150).
+/// Delegates to [`shard_fanout::worker_covers_shard`] (issue #1150).
+///
+/// An empty `shard_assignments` array covers *any* inspected shard. It is not
+/// "assigned to nothing" and not shard 0. Its doc comment explains why.
 fn worker_assigned_to_shard(worker: &WorkerRow, shard_id: i32) -> bool {
     shard_fanout::worker_covers_shard(worker, shard_id)
 }
@@ -1018,13 +1010,13 @@ async fn load_queue_depth(
     circuit_breaker_activities: &[String],
     activity_requirements: &std::collections::HashMap<String, serde_json::Value>,
 ) -> QueueDepthSummary {
-    // Derive both the per-queue depth and the constraint demands from the single
-    // shared core query, so the basic per-queue coverage check and the
-    // capability/build constraint check see exactly the same claimable rows the
-    // stranded-work sampler sees (issue #522). The query mirrors every claim_task
-    // gate: PAUSED workflow tasks, expired `schedule_to_close_at`, concurrency-cap
-    // saturation, and rate-limit exhaustion (with the circuit-breaker exemption).
-    // A row no worker could claim right now never degrades readiness.
+    // One shared core query gives both the per-queue depth and the constraint
+    // demands. So both coverage checks see exactly the claimable rows that the
+    // stranded-work sampler sees (issue #522). The query mirrors every
+    // claim_task gate: PAUSED workflow tasks, expired `schedule_to_close_at`,
+    // concurrency-cap saturation and rate-limit exhaustion. The circuit-breaker
+    // exemption applies. A row no worker could claim now never degrades
+    // readiness.
     let mut demands = match autumn_harvest::queue::claimable_pending_demand_by_queue(
         conn,
         circuit_breaker_activities,
@@ -1042,9 +1034,9 @@ async fn load_queue_depth(
         }
     };
 
-    // Back-fill effective requirements for activity rows that didn't snapshot
-    // required_capabilities (legacy/manual enqueues), mirroring claim_task's
-    // ineligible-activities gate so the constraint check below catches them.
+    // Back-fill requirements for activity rows that did not snapshot
+    // required_capabilities (legacy/manual enqueues). This mirrors claim_task's
+    // ineligible-activities gate, so the constraint check catches them.
     autumn_harvest::queue::apply_activity_requirements(&mut demands, activity_requirements);
 
     let mut total_pending = 0;
@@ -1054,9 +1046,7 @@ async fn load_queue_depth(
         *by_queue.entry(demand.queue_name.clone()).or_default() += demand.count;
     }
 
-    // Keep only the rows that carry a capability, build-id, OR sticky-lease
-    // constraint; the fully-unconstrained rows are already covered by the basic
-    // per-queue check.
+    // The basic per-queue check already covers unconstrained rows.
     let constraint_demands = demands
         .into_iter()
         .filter(|d| {
@@ -1143,12 +1133,10 @@ fn required_queues(
             // See the matching comment in `preflight::required_queues`: the
             // two reserved worker-session internal activities dispatch on
             // the caller-supplied session queue, never `default_queue`.
-            // Synthetic liveness canary (issue #796): the built-in canary
-            // activity has `default_queue: None` but is dispatched on the
-            // probe's target queue (from the workflow input), never
-            // `default_queue` — counting it would inject a phantom `"default"`
-            // required queue and flip a healthy deployment to a missing-worker
-            // readiness failure. See `preflight::required_queues`.
+            // The synthetic liveness canary (issue #796) has
+            // `default_queue: None`. It runs on the probe's target queue from
+            // the workflow input. Counting it would add a phantom `"default"`
+            // required queue. A healthy deployment would then fail readiness.
             if !activity.is_local
                 && !autumn_harvest::is_reserved_session_activity_name(activity.name)
                 && !autumn_harvest::canary::is_reserved_canary_name(activity.name)
@@ -1188,7 +1176,7 @@ fn scheduler_coverage(
     schedules: Option<&[ScheduleProbe]>,
     shard_id: i32,
     freshness_window: Duration,
-    observed_at: DateTime<Utc>,
+    observed_at: Timestamp,
 ) -> ShardSchedulerCoverage {
     let snapshot = runtime.map_or_else(
         || SchedulerMonitor::offline().snapshot(),
@@ -1214,9 +1202,7 @@ fn scheduler_coverage(
     if !snapshot.running {
         error = Some("scheduler coverage is required but scheduler is not running".to_string());
     } else if let Some(last_tick_at) = snapshot.last_tick_at {
-        let elapsed = observed_at
-            .signed_duration_since(last_tick_at)
-            .to_std()
+        let elapsed = std::time::Duration::try_from(observed_at.duration_since(last_tick_at))
             .unwrap_or(Duration::ZERO);
         if elapsed > scheduler_window {
             error = Some(format!(
@@ -1248,14 +1234,13 @@ fn schedule_count_for_shard(
 ) -> usize {
     let mut count = 0;
     if let Some(runtime) = runtime {
-        // Count a workflow schedule only on the shard that actually owns its
-        // rows, mirroring scheduler::workflow_schedule_shard /
-        // register_workflow_schedules_for_shard: workflow-only schedules route to
-        // the router's default shard, DAG-derived schedules to pick_for_dag.
-        // Without this filter every shard counts every schedule, so an offline
-        // local scheduler monitor on a non-owning shard would degrade readiness
-        // with `scheduler_not_running` for rows that live on another shard
-        // (issue #522 review).
+        // Count a workflow schedule only on the shard that owns its rows (issue
+        // #522). This mirrors scheduler::workflow_schedule_shard and
+        // register_workflow_schedules_for_shard. Workflow-only schedules go to
+        // the router's default shard, DAG-derived ones to pick_for_dag.
+        // Without this filter, every shard counts every schedule. An offline
+        // local scheduler monitor on a non-owning shard would then report
+        // `scheduler_not_running` for rows on another shard.
         let target = ShardId::new(shard_id);
         count += runtime
             .workflow_schedules()
@@ -1340,13 +1325,9 @@ mod tests {
         assert!(!queues.contains("default"));
     }
 
-    // -------------------------------------------------------------------------
-    // no_live_worker gate unit tests (issue #522)
-    // -------------------------------------------------------------------------
-
     fn make_worker_row(shard_id: i32, status: &str, health: WorkerHealth) -> WorkerRow {
         use autumn_harvest::models::HarvestWorker;
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         WorkerRow {
             worker: HarvestWorker {
                 worker_id: format!("test-worker-{shard_id}"),
@@ -1386,19 +1367,14 @@ mod tests {
         }
     }
 
-    /// An empty build-compatibility set: only the exact-build rule applies,
-    /// matching a deployment with no declared
-    /// cross-build compatibility.
+    /// An empty build-compatibility set: only the exact-build rule applies.
     fn empty_compat() -> autumn_harvest::build_routing::BuildCompatibilitySet {
         autumn_harvest::build_routing::BuildCompatibilitySet::default()
     }
 
-    // ── worker_assigned_to_shard / worker_can_cover: legacy empty-array
-    //    shard_assignments (issue #1150, discovered via #774's review) ────
-
     fn worker_row_with_shard_assignments(shard_assignments: &[i64], queues: &[&str]) -> WorkerRow {
         use autumn_harvest::models::HarvestWorker;
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         WorkerRow {
             worker: HarvestWorker {
                 worker_id: "legacy-worker".to_string(),
@@ -1425,27 +1401,21 @@ mod tests {
 
     #[test]
     fn worker_assigned_to_shard_treats_empty_array_as_covering_shard_zero() {
-        // A `Worker::run` legacy single-shard worker (no explicit
-        // `shard_assignments` configured) registers with a literal `[]`, but
-        // its poll loop falls back to the default pool and claims work
-        // against whatever database that pool points at -- this shard-
-        // membership check must treat that the same way, or a perfectly
-        // healthy legacy worker's readiness/coverage counts under-report it
-        // (issue #1150).
+        // A `Worker::run` legacy single-shard worker with no explicit
+        // `shard_assignments` registers with a literal `[]` (issue #1150).
+        // Its poll loop falls back to the default pool and claims work there.
+        // This check must agree, or readiness under-reports a healthy worker.
         let worker = worker_row_with_shard_assignments(&[], &["default"]);
         assert!(worker_assigned_to_shard(&worker, 0));
     }
 
     #[test]
     fn worker_assigned_to_shard_empty_array_is_not_hardcoded_to_shard_zero() {
-        // The empty-array normalization must NOT be hardcoded to shard 0 --
-        // this predicate is only ever evaluated with a worker/shard_id pair
-        // already scoped to one shard's own connection (`observe_shard`), so
-        // an empty-array worker found there covers whatever `shard_id` is
-        // being evaluated, including a deployment whose single/default shard
-        // is numbered something other than 0 (`ShardRouter::new` accepts an
-        // arbitrary `default_shard`; see `queue_coverage.rs`'s identical
-        // fix and its doc comment for the full rationale).
+        // The empty-array normalization must NOT be hardcoded to shard 0.
+        // `observe_shard` reads each worker over one shard's own connection.
+        // So an empty-array worker covers whatever `shard_id` is evaluated.
+        // `ShardRouter::new` accepts an arbitrary `default_shard`, so the
+        // single shard can carry any number.
         let worker = worker_row_with_shard_assignments(&[], &["default"]);
         assert!(worker_assigned_to_shard(&worker, 5));
     }
@@ -1601,7 +1571,7 @@ mod tests {
     #[test]
     fn no_live_worker_gate_keeps_constraint_blocker_when_stale_poller_is_ineligible() {
         // Restoring the stale worker cannot help: the sticky lease binds the row
-        // to another worker (issue #1463 review).
+        // to another worker (issue #1463).
         let mut stale = worker_row_with_shard_assignments(&[0], &["default"]);
         stale.health = WorkerHealth::Stale;
         let mut queue_depth = pending_queue_depth(5);
@@ -1764,10 +1734,9 @@ mod tests {
 
     #[test]
     fn no_live_worker_gate_fires_for_candidate_shard_with_uncovered_pending() {
-        // A read-only shard offered as a promotion candidate must prove the
-        // no-stranded-work invariant before the flip (issue #522 review): pending
-        // rows with no covering worker block readiness even though it is not yet
-        // Writable.
+        // A read-only promotion candidate must prove the no-stranded-work
+        // invariant before the flip (issue #522). Pending rows with no covering
+        // worker block readiness, though the shard is not yet Writable.
         let roles = vec![ShardRole::Readable];
         let queue_depth = pending_queue_depth(5);
         let workers: Result<Vec<WorkerRow>, String> = Ok(vec![]);
@@ -1794,8 +1763,8 @@ mod tests {
 
     #[test]
     fn no_live_worker_gate_skips_readonly_non_candidate_shard() {
-        // A plain read-only shard that is not a candidate takes no new starts and
-        // is outside this gate's scope — pending rows there do not block.
+        // A read-only, non-candidate shard takes no new starts. It is outside
+        // this gate, so its pending rows do not block.
         let roles = vec![ShardRole::Readable];
         let queue_depth = pending_queue_depth(5);
         let workers: Result<Vec<WorkerRow>, String> = Ok(vec![]);
@@ -2124,10 +2093,9 @@ mod tests {
 
     #[test]
     fn no_live_worker_gate_fires_when_capability_requirement_unsatisfied() {
-        // A GPU-only activity is queued on `default`; the only worker polls
-        // `default` but has no `gpu` label, so claim_task would never let it
-        // claim the task — the work is stranded even though `default` looks
-        // covered by the basic per-queue check.
+        // A GPU-only activity is queued on `default`. The only worker polls
+        // `default` but has no `gpu` label, so claim_task never lets it claim
+        // the task. The work is stranded, though `default` looks covered.
         let roles = vec![ShardRole::Writable];
         let queue_depth = gpu_queue_depth();
         let worker = make_worker_row(0, WorkerStatus::Active.as_str(), WorkerHealth::Healthy);
@@ -2219,10 +2187,9 @@ mod tests {
 
     #[test]
     fn no_live_worker_gate_fires_when_build_requirement_unsatisfied() {
-        // A v2-only task is queued on `default`; the only worker polls `default`
-        // but runs build `v1` with no compatibility declared, so claim_task
-        // would never let it claim the task — stranded even though `default`
-        // looks covered by the basic per-queue check.
+        // A v2-only task is queued on `default`. The only worker polls
+        // `default` but runs build `v1` with no declared compatibility. So
+        // claim_task never lets it claim the task, and the work is stranded.
         let roles = vec![ShardRole::Writable];
         let queue_depth = build_routed_queue_depth();
         let mut worker = make_worker_row(0, WorkerStatus::Active.as_str(), WorkerHealth::Healthy);
@@ -2319,10 +2286,9 @@ mod tests {
 
     #[test]
     fn no_live_worker_gate_fires_when_sticky_lease_owner_is_not_covering() {
-        // The pending row is held by an unexpired sticky lease owned by a worker
-        // that is not present (stale/gone). The only live worker on `default`
-        // (test-worker-0) is NOT the owner, so claim_task would not let it claim
-        // the row until the lease expires — the work is stranded.
+        // An unexpired sticky lease binds the pending row to an absent worker.
+        // The only live worker on `default` (test-worker-0) is NOT the owner.
+        // claim_task blocks it until the lease expires, so the work is stranded.
         let roles = vec![ShardRole::Writable];
         let queue_depth = sticky_queue_depth("test-worker-stale");
         let worker = make_worker_row(0, WorkerStatus::Active.as_str(), WorkerHealth::Healthy);

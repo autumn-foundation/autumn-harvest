@@ -1,0 +1,412 @@
+Pager usage is off.
+PREPARE
+PREPARE
+PREPARE
+##### plan_cache_mode = force_custom_plan
+SET
+=== long-lived run (10,000 timers)
+                                                                         QUERY PLAN                                                                          
+-------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Incremental Sort  (cost=4.87..850.10 rows=184 width=51) (actual time=0.553..0.553 rows=0 loops=1)
+   Output: id, workflow_exec_id, timer_id, fires_at, fired
+   Sort Key: harvest_timers.fires_at, harvest_timers.timer_id
+   Presorted Key: harvest_timers.fires_at
+   Full-sort Groups: 1  Sort Method: quicksort  Average Memory: 25kB  Peak Memory: 25kB
+   Buffers: shared hit=1935
+   ->  Index Scan using idx_harvest_timers_pending on public.harvest_timers  (cost=0.29..841.82 rows=184 width=51) (actual time=0.520..0.520 rows=0 loops=1)
+         Output: id, workflow_exec_id, timer_id, fires_at, fired
+         Index Cond: (harvest_timers.fires_at <= now())
+         Filter: (harvest_timers.workflow_exec_id = '00000000-0000-4000-8000-000000000001'::uuid)
+         Rows Removed by Filter: 2000
+         Buffers: shared hit=1926
+ Settings: plan_cache_mode = 'force_custom_plan'
+ Query Identifier: -2385119656255178348
+ Planning:
+   Buffers: shared hit=131
+ Planning Time: 0.474 ms
+ Execution Time: 0.580 ms
+(18 rows)
+
+                                                                        QUERY PLAN                                                                         
+-----------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.29..849.42 rows=1 width=51) (actual time=0.474..0.475 rows=1 loops=1)
+   Output: id, workflow_exec_id, timer_id, fires_at, fired
+   Buffers: shared hit=1950
+   ->  Index Scan using idx_harvest_timers_pending on public.harvest_timers  (cost=0.29..849.42 rows=1 width=51) (actual time=0.473..0.474 rows=1 loops=1)
+         Output: id, workflow_exec_id, timer_id, fires_at, fired
+         Filter: ((harvest_timers.workflow_exec_id = '00000000-0000-4000-8000-000000000001'::uuid) AND (harvest_timers.timer_id = 'timer-10000'::text))
+         Rows Removed by Filter: 3762
+         Buffers: shared hit=1950
+ Settings: plan_cache_mode = 'force_custom_plan'
+ Query Identifier: 4952928457353633331
+ Planning:
+   Buffers: shared hit=8
+ Planning Time: 0.118 ms
+ Execution Time: 0.483 ms
+(14 rows)
+
+                                                                                  QUERY PLAN                                                                                  
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Incremental Sort  (cost=849.43..849.47 rows=2 width=51) (actual time=2.067..2.068 rows=1 loops=1)
+   Output: id, workflow_exec_id, timer_id, fires_at, fired
+   Sort Key: harvest_timers.fires_at, harvest_timers.id
+   Presorted Key: harvest_timers.fires_at
+   Full-sort Groups: 1  Sort Method: quicksort  Average Memory: 25kB  Peak Memory: 25kB
+   Buffers: shared hit=2143
+   ->  Index Scan using idx_harvest_timers_pending on public.harvest_timers  (cost=0.29..849.42 rows=1 width=51) (actual time=0.513..2.049 rows=1 loops=1)
+         Output: id, workflow_exec_id, timer_id, fires_at, fired
+         Filter: ((harvest_timers.timer_id = ANY ('{timer-10000,timer-10001}'::text[])) AND (harvest_timers.workflow_exec_id = '00000000-0000-4000-8000-000000000001'::uuid))
+         Rows Removed by Filter: 18199
+         Buffers: shared hit=2140
+ Settings: plan_cache_mode = 'force_custom_plan'
+ Query Identifier: -8636908276334910924
+ Planning:
+   Buffers: shared hit=7
+ Planning Time: 0.124 ms
+ Execution Time: 2.080 ms
+(17 rows)
+
+=== medium run (100 timers)
+                                                               QUERY PLAN                                                                
+-----------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=255.89..255.90 rows=1 width=51) (actual time=0.455..0.455 rows=0 loops=1)
+   Output: id, workflow_exec_id, timer_id, fires_at, fired
+   Sort Key: harvest_timers.fires_at, harvest_timers.timer_id
+   Sort Method: quicksort  Memory: 25kB
+   Buffers: shared hit=103
+   ->  Bitmap Heap Scan on public.harvest_timers  (cost=4.92..255.88 rows=1 width=51) (actual time=0.447..0.448 rows=0 loops=1)
+         Output: id, workflow_exec_id, timer_id, fires_at, fired
+         Recheck Cond: (harvest_timers.workflow_exec_id = '00000000-0000-4000-8000-0000000001f4'::uuid)
+         Filter: ((NOT harvest_timers.fired) AND (harvest_timers.fires_at <= now()))
+         Rows Removed by Filter: 100
+         Heap Blocks: exact=100
+         Buffers: shared hit=103
+         ->  Bitmap Index Scan on idx_harvest_timers_exec  (cost=0.00..4.92 rows=66 width=0) (actual time=0.018..0.018 rows=100 loops=1)
+               Index Cond: (harvest_timers.workflow_exec_id = '00000000-0000-4000-8000-0000000001f4'::uuid)
+               Buffers: shared hit=3
+ Settings: plan_cache_mode = 'force_custom_plan'
+ Query Identifier: -2385119656255178348
+ Planning Time: 0.175 ms
+ Execution Time: 0.478 ms
+(19 rows)
+
+                                                               QUERY PLAN                                                                
+-----------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=4.92..255.72 rows=1 width=51) (actual time=0.086..0.086 rows=1 loops=1)
+   Output: id, workflow_exec_id, timer_id, fires_at, fired
+   Buffers: shared hit=103
+   ->  Bitmap Heap Scan on public.harvest_timers  (cost=4.92..255.72 rows=1 width=51) (actual time=0.085..0.085 rows=1 loops=1)
+         Output: id, workflow_exec_id, timer_id, fires_at, fired
+         Recheck Cond: (harvest_timers.workflow_exec_id = '00000000-0000-4000-8000-0000000001f4'::uuid)
+         Filter: ((NOT harvest_timers.fired) AND (harvest_timers.timer_id = 'timer-100'::text))
+         Rows Removed by Filter: 99
+         Heap Blocks: exact=100
+         Buffers: shared hit=103
+         ->  Bitmap Index Scan on idx_harvest_timers_exec  (cost=0.00..4.92 rows=66 width=0) (actual time=0.011..0.011 rows=100 loops=1)
+               Index Cond: (harvest_timers.workflow_exec_id = '00000000-0000-4000-8000-0000000001f4'::uuid)
+               Buffers: shared hit=3
+ Settings: plan_cache_mode = 'force_custom_plan'
+ Query Identifier: 4952928457353633331
+ Planning Time: 0.078 ms
+ Execution Time: 0.095 ms
+(17 rows)
+
+                                                               QUERY PLAN                                                                
+-----------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=255.73..255.73 rows=1 width=51) (actual time=0.047..0.047 rows=1 loops=1)
+   Output: id, workflow_exec_id, timer_id, fires_at, fired
+   Sort Key: harvest_timers.fires_at, harvest_timers.id
+   Sort Method: quicksort  Memory: 25kB
+   Buffers: shared hit=103
+   ->  Bitmap Heap Scan on public.harvest_timers  (cost=4.92..255.72 rows=1 width=51) (actual time=0.044..0.044 rows=1 loops=1)
+         Output: id, workflow_exec_id, timer_id, fires_at, fired
+         Recheck Cond: (harvest_timers.workflow_exec_id = '00000000-0000-4000-8000-0000000001f4'::uuid)
+         Filter: ((NOT harvest_timers.fired) AND (harvest_timers.timer_id = ANY ('{timer-100,timer-101}'::text[])))
+         Rows Removed by Filter: 99
+         Heap Blocks: exact=100
+         Buffers: shared hit=103
+         ->  Bitmap Index Scan on idx_harvest_timers_exec  (cost=0.00..4.92 rows=66 width=0) (actual time=0.006..0.006 rows=100 loops=1)
+               Index Cond: (harvest_timers.workflow_exec_id = '00000000-0000-4000-8000-0000000001f4'::uuid)
+               Buffers: shared hit=3
+ Settings: plan_cache_mode = 'force_custom_plan'
+ Query Identifier: -8636908276334910924
+ Planning Time: 0.062 ms
+ Execution Time: 0.055 ms
+(19 rows)
+
+=== short run (4 timers)
+                                                              QUERY PLAN                                                               
+---------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=255.89..255.90 rows=1 width=51) (actual time=0.034..0.034 rows=0 loops=1)
+   Output: id, workflow_exec_id, timer_id, fires_at, fired
+   Sort Key: harvest_timers.fires_at, harvest_timers.timer_id
+   Sort Method: quicksort  Memory: 25kB
+   Buffers: shared hit=7
+   ->  Bitmap Heap Scan on public.harvest_timers  (cost=4.92..255.88 rows=1 width=51) (actual time=0.032..0.032 rows=0 loops=1)
+         Output: id, workflow_exec_id, timer_id, fires_at, fired
+         Recheck Cond: (harvest_timers.workflow_exec_id = '00000000-0000-4000-8000-00000000138c'::uuid)
+         Filter: ((NOT harvest_timers.fired) AND (harvest_timers.fires_at <= now()))
+         Rows Removed by Filter: 4
+         Heap Blocks: exact=4
+         Buffers: shared hit=7
+         ->  Bitmap Index Scan on idx_harvest_timers_exec  (cost=0.00..4.92 rows=66 width=0) (actual time=0.016..0.016 rows=4 loops=1)
+               Index Cond: (harvest_timers.workflow_exec_id = '00000000-0000-4000-8000-00000000138c'::uuid)
+               Buffers: shared hit=3
+ Settings: plan_cache_mode = 'force_custom_plan'
+ Query Identifier: -2385119656255178348
+ Planning Time: 0.048 ms
+ Execution Time: 0.040 ms
+(19 rows)
+
+                                                              QUERY PLAN                                                               
+---------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=4.92..255.72 rows=1 width=51) (actual time=0.008..0.009 rows=1 loops=1)
+   Output: id, workflow_exec_id, timer_id, fires_at, fired
+   Buffers: shared hit=7
+   ->  Bitmap Heap Scan on public.harvest_timers  (cost=4.92..255.72 rows=1 width=51) (actual time=0.008..0.008 rows=1 loops=1)
+         Output: id, workflow_exec_id, timer_id, fires_at, fired
+         Recheck Cond: (harvest_timers.workflow_exec_id = '00000000-0000-4000-8000-00000000138c'::uuid)
+         Filter: ((NOT harvest_timers.fired) AND (harvest_timers.timer_id = 'timer-4'::text))
+         Rows Removed by Filter: 3
+         Heap Blocks: exact=4
+         Buffers: shared hit=7
+         ->  Bitmap Index Scan on idx_harvest_timers_exec  (cost=0.00..4.92 rows=66 width=0) (actual time=0.005..0.005 rows=4 loops=1)
+               Index Cond: (harvest_timers.workflow_exec_id = '00000000-0000-4000-8000-00000000138c'::uuid)
+               Buffers: shared hit=3
+ Settings: plan_cache_mode = 'force_custom_plan'
+ Query Identifier: 4952928457353633331
+ Planning Time: 0.042 ms
+ Execution Time: 0.015 ms
+(17 rows)
+
+                                                              QUERY PLAN                                                               
+---------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=255.73..255.73 rows=1 width=51) (actual time=0.009..0.009 rows=1 loops=1)
+   Output: id, workflow_exec_id, timer_id, fires_at, fired
+   Sort Key: harvest_timers.fires_at, harvest_timers.id
+   Sort Method: quicksort  Memory: 25kB
+   Buffers: shared hit=7
+   ->  Bitmap Heap Scan on public.harvest_timers  (cost=4.92..255.72 rows=1 width=51) (actual time=0.006..0.007 rows=1 loops=1)
+         Output: id, workflow_exec_id, timer_id, fires_at, fired
+         Recheck Cond: (harvest_timers.workflow_exec_id = '00000000-0000-4000-8000-00000000138c'::uuid)
+         Filter: ((NOT harvest_timers.fired) AND (harvest_timers.timer_id = ANY ('{timer-4,timer-5}'::text[])))
+         Rows Removed by Filter: 3
+         Heap Blocks: exact=4
+         Buffers: shared hit=7
+         ->  Bitmap Index Scan on idx_harvest_timers_exec  (cost=0.00..4.92 rows=66 width=0) (actual time=0.003..0.003 rows=4 loops=1)
+               Index Cond: (harvest_timers.workflow_exec_id = '00000000-0000-4000-8000-00000000138c'::uuid)
+               Buffers: shared hit=3
+ Settings: plan_cache_mode = 'force_custom_plan'
+ Query Identifier: -8636908276334910924
+ Planning Time: 0.048 ms
+ Execution Time: 0.015 ms
+(19 rows)
+
+##### plan_cache_mode = force_generic_plan
+SET
+=== long-lived run (10,000 timers)
+                                                                 QUERY PLAN                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=1864.67..1865.35 rows=273 width=51) (actual time=13.635..13.637 rows=0 loops=1)
+   Output: id, workflow_exec_id, timer_id, fires_at, fired
+   Sort Key: harvest_timers.fires_at, harvest_timers.timer_id
+   Sort Method: quicksort  Memory: 25kB
+   Buffers: shared hit=6962
+   ->  Bitmap Heap Scan on public.harvest_timers  (cost=8.64..1853.62 rows=273 width=51) (actual time=13.631..13.632 rows=0 loops=1)
+         Output: id, workflow_exec_id, timer_id, fires_at, fired
+         Recheck Cond: (harvest_timers.workflow_exec_id = $1)
+         Filter: ((harvest_timers.fired = $2) AND (harvest_timers.fires_at <= now()))
+         Rows Removed by Filter: 10000
+         Heap Blocks: exact=6952
+         Buffers: shared hit=6962
+         ->  Bitmap Index Scan on idx_harvest_timers_exec  (cost=0.00..8.58 rows=553 width=0) (actual time=1.220..1.221 rows=10040 loops=1)
+               Index Cond: (harvest_timers.workflow_exec_id = $1)
+               Buffers: shared hit=10
+ Settings: plan_cache_mode = 'force_generic_plan'
+ Query Identifier: -2385119656255178348
+ Planning:
+   Buffers: shared hit=4
+ Planning Time: 0.075 ms
+ Execution Time: 13.702 ms
+(21 rows)
+
+                                                                 QUERY PLAN                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=8.58..1852.17 rows=1 width=51) (actual time=10.113..10.114 rows=1 loops=1)
+   Output: id, workflow_exec_id, timer_id, fires_at, fired
+   Buffers: shared hit=6934
+   ->  Bitmap Heap Scan on public.harvest_timers  (cost=8.58..1852.17 rows=1 width=51) (actual time=10.111..10.112 rows=1 loops=1)
+         Output: id, workflow_exec_id, timer_id, fires_at, fired
+         Recheck Cond: (harvest_timers.workflow_exec_id = $1)
+         Filter: ((harvest_timers.timer_id = $2) AND (harvest_timers.fired = $3))
+         Rows Removed by Filter: 9979
+         Heap Blocks: exact=6924
+         Buffers: shared hit=6934
+         ->  Bitmap Index Scan on idx_harvest_timers_exec  (cost=0.00..8.58 rows=553 width=0) (actual time=1.156..1.156 rows=10040 loops=1)
+               Index Cond: (harvest_timers.workflow_exec_id = $1)
+               Buffers: shared hit=10
+ Settings: plan_cache_mode = 'force_generic_plan'
+ Query Identifier: 4952928457353633331
+ Planning Time: 0.097 ms
+ Execution Time: 10.237 ms
+(17 rows)
+
+                                                                 QUERY PLAN                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=1857.71..1857.71 rows=1 width=51) (actual time=9.289..9.291 rows=1 loops=1)
+   Output: id, workflow_exec_id, timer_id, fires_at, fired
+   Sort Key: harvest_timers.fires_at, harvest_timers.id
+   Sort Method: quicksort  Memory: 25kB
+   Buffers: shared hit=6962
+   ->  Bitmap Heap Scan on public.harvest_timers  (cost=8.58..1857.70 rows=1 width=51) (actual time=9.252..9.282 rows=1 loops=1)
+         Output: id, workflow_exec_id, timer_id, fires_at, fired
+         Recheck Cond: (harvest_timers.workflow_exec_id = $1)
+         Filter: ((harvest_timers.fired = $3) AND (harvest_timers.timer_id = ANY ($2)))
+         Rows Removed by Filter: 9999
+         Heap Blocks: exact=6952
+         Buffers: shared hit=6962
+         ->  Bitmap Index Scan on idx_harvest_timers_exec  (cost=0.00..8.58 rows=553 width=0) (actual time=1.049..1.049 rows=10040 loops=1)
+               Index Cond: (harvest_timers.workflow_exec_id = $1)
+               Buffers: shared hit=10
+ Settings: plan_cache_mode = 'force_generic_plan'
+ Query Identifier: -8636908276334910924
+ Planning Time: 0.104 ms
+ Execution Time: 9.377 ms
+(19 rows)
+
+=== medium run (100 timers)
+                                                                QUERY PLAN                                                                
+------------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=1864.67..1865.35 rows=273 width=51) (actual time=0.166..0.166 rows=0 loops=1)
+   Output: id, workflow_exec_id, timer_id, fires_at, fired
+   Sort Key: harvest_timers.fires_at, harvest_timers.timer_id
+   Sort Method: quicksort  Memory: 25kB
+   Buffers: shared hit=103
+   ->  Bitmap Heap Scan on public.harvest_timers  (cost=8.64..1853.62 rows=273 width=51) (actual time=0.161..0.161 rows=0 loops=1)
+         Output: id, workflow_exec_id, timer_id, fires_at, fired
+         Recheck Cond: (harvest_timers.workflow_exec_id = $1)
+         Filter: ((harvest_timers.fired = $2) AND (harvest_timers.fires_at <= now()))
+         Rows Removed by Filter: 100
+         Heap Blocks: exact=100
+         Buffers: shared hit=103
+         ->  Bitmap Index Scan on idx_harvest_timers_exec  (cost=0.00..8.58 rows=553 width=0) (actual time=0.020..0.020 rows=100 loops=1)
+               Index Cond: (harvest_timers.workflow_exec_id = $1)
+               Buffers: shared hit=3
+ Settings: plan_cache_mode = 'force_generic_plan'
+ Query Identifier: -2385119656255178348
+ Planning Time: 0.012 ms
+ Execution Time: 0.209 ms
+(19 rows)
+
+                                                                QUERY PLAN                                                                
+------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=8.58..1852.17 rows=1 width=51) (actual time=0.099..0.100 rows=1 loops=1)
+   Output: id, workflow_exec_id, timer_id, fires_at, fired
+   Buffers: shared hit=103
+   ->  Bitmap Heap Scan on public.harvest_timers  (cost=8.58..1852.17 rows=1 width=51) (actual time=0.098..0.098 rows=1 loops=1)
+         Output: id, workflow_exec_id, timer_id, fires_at, fired
+         Recheck Cond: (harvest_timers.workflow_exec_id = $1)
+         Filter: ((harvest_timers.timer_id = $2) AND (harvest_timers.fired = $3))
+         Rows Removed by Filter: 99
+         Heap Blocks: exact=100
+         Buffers: shared hit=103
+         ->  Bitmap Index Scan on idx_harvest_timers_exec  (cost=0.00..8.58 rows=553 width=0) (actual time=0.012..0.012 rows=100 loops=1)
+               Index Cond: (harvest_timers.workflow_exec_id = $1)
+               Buffers: shared hit=3
+ Settings: plan_cache_mode = 'force_generic_plan'
+ Query Identifier: 4952928457353633331
+ Planning Time: 0.017 ms
+ Execution Time: 0.115 ms
+(17 rows)
+
+                                                                QUERY PLAN                                                                
+------------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=1857.71..1857.71 rows=1 width=51) (actual time=0.086..0.086 rows=1 loops=1)
+   Output: id, workflow_exec_id, timer_id, fires_at, fired
+   Sort Key: harvest_timers.fires_at, harvest_timers.id
+   Sort Method: quicksort  Memory: 25kB
+   Buffers: shared hit=103
+   ->  Bitmap Heap Scan on public.harvest_timers  (cost=8.58..1857.70 rows=1 width=51) (actual time=0.080..0.081 rows=1 loops=1)
+         Output: id, workflow_exec_id, timer_id, fires_at, fired
+         Recheck Cond: (harvest_timers.workflow_exec_id = $1)
+         Filter: ((harvest_timers.fired = $3) AND (harvest_timers.timer_id = ANY ($2)))
+         Rows Removed by Filter: 99
+         Heap Blocks: exact=100
+         Buffers: shared hit=103
+         ->  Bitmap Index Scan on idx_harvest_timers_exec  (cost=0.00..8.58 rows=553 width=0) (actual time=0.012..0.012 rows=100 loops=1)
+               Index Cond: (harvest_timers.workflow_exec_id = $1)
+               Buffers: shared hit=3
+ Settings: plan_cache_mode = 'force_generic_plan'
+ Query Identifier: -8636908276334910924
+ Planning Time: 0.015 ms
+ Execution Time: 0.102 ms
+(19 rows)
+
+=== short run (4 timers)
+                                                               QUERY PLAN                                                               
+----------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=1864.67..1865.35 rows=273 width=51) (actual time=0.020..0.020 rows=0 loops=1)
+   Output: id, workflow_exec_id, timer_id, fires_at, fired
+   Sort Key: harvest_timers.fires_at, harvest_timers.timer_id
+   Sort Method: quicksort  Memory: 25kB
+   Buffers: shared hit=7
+   ->  Bitmap Heap Scan on public.harvest_timers  (cost=8.64..1853.62 rows=273 width=51) (actual time=0.017..0.018 rows=0 loops=1)
+         Output: id, workflow_exec_id, timer_id, fires_at, fired
+         Recheck Cond: (harvest_timers.workflow_exec_id = $1)
+         Filter: ((harvest_timers.fired = $2) AND (harvest_timers.fires_at <= now()))
+         Rows Removed by Filter: 4
+         Heap Blocks: exact=4
+         Buffers: shared hit=7
+         ->  Bitmap Index Scan on idx_harvest_timers_exec  (cost=0.00..8.58 rows=553 width=0) (actual time=0.009..0.009 rows=4 loops=1)
+               Index Cond: (harvest_timers.workflow_exec_id = $1)
+               Buffers: shared hit=3
+ Settings: plan_cache_mode = 'force_generic_plan'
+ Query Identifier: -2385119656255178348
+ Planning Time: 0.005 ms
+ Execution Time: 0.031 ms
+(19 rows)
+
+                                                               QUERY PLAN                                                               
+----------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=8.58..1852.17 rows=1 width=51) (actual time=0.010..0.011 rows=1 loops=1)
+   Output: id, workflow_exec_id, timer_id, fires_at, fired
+   Buffers: shared hit=7
+   ->  Bitmap Heap Scan on public.harvest_timers  (cost=8.58..1852.17 rows=1 width=51) (actual time=0.010..0.010 rows=1 loops=1)
+         Output: id, workflow_exec_id, timer_id, fires_at, fired
+         Recheck Cond: (harvest_timers.workflow_exec_id = $1)
+         Filter: ((harvest_timers.timer_id = $2) AND (harvest_timers.fired = $3))
+         Rows Removed by Filter: 3
+         Heap Blocks: exact=4
+         Buffers: shared hit=7
+         ->  Bitmap Index Scan on idx_harvest_timers_exec  (cost=0.00..8.58 rows=553 width=0) (actual time=0.006..0.006 rows=4 loops=1)
+               Index Cond: (harvest_timers.workflow_exec_id = $1)
+               Buffers: shared hit=3
+ Settings: plan_cache_mode = 'force_generic_plan'
+ Query Identifier: 4952928457353633331
+ Planning Time: 0.012 ms
+ Execution Time: 0.034 ms
+(17 rows)
+
+                                                               QUERY PLAN                                                               
+----------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=1857.71..1857.71 rows=1 width=51) (actual time=0.010..0.010 rows=1 loops=1)
+   Output: id, workflow_exec_id, timer_id, fires_at, fired
+   Sort Key: harvest_timers.fires_at, harvest_timers.id
+   Sort Method: quicksort  Memory: 25kB
+   Buffers: shared hit=7
+   ->  Bitmap Heap Scan on public.harvest_timers  (cost=8.58..1857.70 rows=1 width=51) (actual time=0.006..0.007 rows=1 loops=1)
+         Output: id, workflow_exec_id, timer_id, fires_at, fired
+         Recheck Cond: (harvest_timers.workflow_exec_id = $1)
+         Filter: ((harvest_timers.fired = $3) AND (harvest_timers.timer_id = ANY ($2)))
+         Rows Removed by Filter: 3
+         Heap Blocks: exact=4
+         Buffers: shared hit=7
+         ->  Bitmap Index Scan on idx_harvest_timers_exec  (cost=0.00..8.58 rows=553 width=0) (actual time=0.003..0.003 rows=4 loops=1)
+               Index Cond: (harvest_timers.workflow_exec_id = $1)
+               Buffers: shared hit=3
+ Settings: plan_cache_mode = 'force_generic_plan'
+ Query Identifier: -8636908276334910924
+ Planning Time: 0.009 ms
+ Execution Time: 0.017 ms
+(19 rows)
+

@@ -92,6 +92,9 @@ variant fails to compile until its author classifies it.
    change the history (issue #2517). Add the activity to
    `shared_activities`, so the timing guard reads it.
 5. List each command that the workflow emits in `covers`.
+6. To settle an external activity, await `ActivityAwaitingExternal`, then
+   add a `CompleteExternal` or `FailExternal` step. Each driver reads the
+   pending handoff by its activity name, as a dispatcher does.
 
 ## Known Postgres defects
 

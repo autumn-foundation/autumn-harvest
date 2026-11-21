@@ -421,7 +421,7 @@ async fn each_activation_is_in_the_audit_export() {
         0,
         100,
         std::time::Duration::from_secs(0),
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await
     .expect("claim")
@@ -892,7 +892,7 @@ async fn reset_restores_every_default_and_each_change_is_audited() {
         0,
         100,
         std::time::Duration::from_secs(0),
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await
     .expect("claim")

@@ -177,18 +177,83 @@ The process executor gives each run:
 - uid and gid `65534` when the worker runs as root. The executor refuses
   uid 0 and gid 0 for the code. It also refuses `u32::MAX`, which is
   `(uid_t)-1` and which `setuid` and `setgid` refuse. The launcher refuses
-  the same ids for the jail, and for `harvest.uid` and `harvest.gid`.
+  the same ids for the jail, and for `harvest.uid` and `harvest.gid`;
+- with `ExecOptions::fs`, a private file system (issue #2697). See below.
 
 The process backend has these limits. Inside a microVM, none of them
 matters, because the microVM ends after one run.
 
-- It has no seccomp filter, no mount namespace and no cgroup.
+- It has no seccomp filter. It has no mount namespace unless you set
+  `ExecOptions::fs`. It has no cgroup unless you set
+  `ExecOptions::cgroup_root`.
 - Without `ExecOptions::cgroup_root`, a process that calls `setsid` leaves
   the group, and the executor cannot kill it.
-- The code can write wherever its uid can write, such as `/tmp`. The
-  executor removes only the work directory, also when the code moves it.
+- With `FsIsolation::Shared`, the default, the code sees the whole file
+  system of the worker. It can write wherever its uid can write, such as
+  `/tmp`. The executor removes only the work directory, also when the code
+  moves it. Set `ExecOptions::fs` to change that.
 - On a root host, concurrent runs share the uid `nobody`, unless `run_as`
   names another uid. A non-root worker refuses `run_as`.
+
+### A private file system
+
+With the default `FsIsolation::Shared`, the code runs with the uid of the
+worker. It can read the databases of the app, write its config, and connect
+to each Unix socket that the app serves. `NetworkPolicy::Deny` does not stop
+a socket on the file system. Set `ExecOptions::fs` to close that:
+
+```rust,ignore
+use autumn_harvest::sandbox::exec::ExecOptions;
+use autumn_harvest::sandbox::fs_isolation::FsIsolation;
+use autumn_harvest::sandbox::process::ProcessBackend;
+
+let backend = ProcessBackend::new(ExecOptions {
+    fs: FsIsolation::pivot(),
+    ..ExecOptions::default()
+});
+```
+
+| Setting | The code sees | Use it when |
+|---|---|---|
+| `Shared` | The file system of the worker | Never for code that you do not trust |
+| `Mask(paths)` | The file system of the worker, minus `paths` | You know each path that holds secrets |
+| `Pivot { read_only }` | A new root: `read_only`, the work directory, a private `/tmp`, and some device nodes | You want a closed default |
+
+- **`Pivot`** fails closed. A path that nobody names stays hidden, and so
+  do the other runs in the scratch root. `FsIsolation::pivot()` lists
+  `PIVOT_READ_ONLY`: `/usr`, the library directories, and a few files of
+  `/etc`. It mounts no `/proc`. The code cannot write a `read_only` path.
+  A runtime in another directory, such as `/opt/node`, needs that directory
+  in `read_only`. A path that does not exist is skipped. The new root holds
+  each link on the way to a listed path, and the pivot binds the file or
+  directory at the end. So a chain of links works, also from a link in a
+  bound directory such as `/usr/local/bin`. A link into `/proc` stays a
+  link, and the pivot binds nothing in `/proc`. The setup needs `/proc` in
+  the worker.
+- **`Mask`** fails open. A directory lists as empty, and the code cannot
+  write it. A file, or a socket, reads as `/dev/null`. A mask hides a
+  path, not an inode, so a hard link or a second path still reaches the
+  data. It does not hide the other runs in the scratch root, and it does
+  not hide `/proc`. Each path must be absolute and must exist. It must not
+  hold `..` or cover the work directory. Otherwise the run is refused with
+  a config error.
+- **`Mask` is not a boundary under a non-root worker.** The code has the
+  uid of the worker, so it can open `/proc/<pid>/root` of the worker. That
+  path shows the file system of the worker, with no mask. A mask stops a
+  mistake. It does not stop code that looks for a path. Use `Pivot` for
+  code that you do not trust.
+- Both settings need a mount namespace. A non-root worker enters it through
+  its user namespace. When the host refuses, the run fails closed with
+  `SandboxUnavailable`. `sandbox::fs_isolation::fs_isolation_available()`
+  probes the host, as `network_isolation_available()` does for the network.
+  The probe tries the mount namespace only, so a `Pivot` run can still fail
+  closed.
+- Under `Pivot`, the code writes only the work directory and `/tmp`.
+- Neither setting hides abstract Unix sockets of the worker network
+  namespace when the policy allows the network. Deny the network to close
+  them.
+- `SandboxPolicy::for_development` does not set `ExecOptions::fs`. Set it
+  on the options of the backend.
 
 The process backend is the only backend that can give code a network. A
 runtime refuses a policy that allows the network on a backend without one.
@@ -554,6 +619,19 @@ cargo test -p autumn-harvest-sandbox-guest
 cargo test -p autumn-harvest-agent --features sqlite,eval,sandbox
 ```
 
+On a host without a mount or a network namespace, a test that needs one
+skips. A few check only the fail-closed path. Both pass, and libtest hides
+the `skipped` line. Set `HARVEST_TEST_REQUIRE_ISOLATION=1` to make each such
+test fail, as CI does. On Ubuntu, AppArmor can refuse the namespace to a
+non-root user. To allow it, run
+`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`. The change
+lasts until the next reboot.
+
+A test that needs root has a name that starts with `root_` and has
+`#[ignore]`. No test that is not ignored skips for lack of root (issue
+#2757). As root, run the mount tests with the filter
+`sandbox::fs_isolation::tests::root_` and `--ignored`.
+
 The `Sandbox (KVM)` workflow boots real microVMs on a GitHub runner with
 `/dev/kvm`. It runs on each pull request that changes the sandbox code, and
 weekly. It builds the guest image and runs the ignored KVM tests. Run them on
@@ -568,8 +646,11 @@ HARVEST_FIRECRACKER_BIN=/usr/local/bin/firecracker \
 ```
 
 The tests whose names start with `root_` need root. They include the jailer
-and snapshot tests. Set `HARVEST_JAILER_BIN`, and run the test binary as root
-with the filter `root_` and `--ignored`. The workflow does both.
+and snapshot tests, the cgroup tests and the mount tests. Set
+`HARVEST_JAILER_BIN`, and run the test binary as root with the filter
+`root_` and `--ignored`. The workflow does both. It also passes
+`HARVEST_TEST_REQUIRE_ISOLATION=1` through `sudo env`, so a missing
+namespace fails a root test.
 
 ## Research sources
 

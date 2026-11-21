@@ -7,11 +7,11 @@
 
 use autumn_harvest::queue::{self, EnqueueParams, TaskType, force_retry_activity_now};
 use autumn_harvest::schema::harvest_task_queue;
-use chrono::{Duration, Utc};
 use diesel::ExpressionMethods;
 use diesel::QueryDsl;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use jiff::{SignedDuration, Timestamp};
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -78,7 +78,7 @@ async fn enqueue_backing_off_activity(
     params.workflow_exec_id = Some(workflow_exec_id);
     params.activity_name = Some("test_activity".to_string());
     // Future scheduled_at simulates a backing-off retry.
-    params.scheduled_at = Utc::now() + Duration::seconds(backoff_delay_secs);
+    params.scheduled_at = Timestamp::now() + SignedDuration::from_secs(backoff_delay_secs);
     params.max_attempts = 5;
 
     queue::enqueue(conn, &params)
@@ -113,17 +113,16 @@ async fn backing_off_task_is_advanced_to_now() {
 
     let task_id = enqueue_backing_off_activity(&mut conn, workflow_exec_id, 300).await;
 
-    let before = Utc::now();
+    let before = Timestamp::now();
     let outcome = force_retry_activity_now(&mut conn, workflow_exec_id, task_id)
         .await
         .expect("force_retry_activity_now should succeed for a backing-off task");
-    let after = Utc::now();
+    let after = Timestamp::now();
 
     assert!(outcome.advanced, "backing-off task should be advanced");
-    // scheduled_at should have been moved to approximately now.
     assert!(
-        outcome.scheduled_at >= before - Duration::seconds(15)
-            && outcome.scheduled_at <= after + Duration::seconds(5),
+        outcome.scheduled_at >= before - SignedDuration::from_secs(15)
+            && outcome.scheduled_at <= after + SignedDuration::from_secs(5),
         "scheduled_at should be near now, got {:?}",
         outcome.scheduled_at
     );
@@ -137,7 +136,6 @@ async fn attempt_counter_is_not_changed() {
 
     let task_id = enqueue_backing_off_activity(&mut conn, workflow_exec_id, 300).await;
 
-    // Record the attempt count before.
     let row_before = harvest_task_queue::table
         .filter(harvest_task_queue::id.eq(task_id))
         .select((
@@ -223,7 +221,7 @@ async fn running_task_returns_conflict_error() {
     let (mut conn, _container) = setup_test_db().await;
     let workflow_exec_id = Uuid::new_v4();
 
-    // Enqueue and then claim the task to put it in RUNNING state.
+    // Claim the task so it is RUNNING.
     let task_id = enqueue_eligible_activity(&mut conn, workflow_exec_id).await;
     queue::claim_task(
         &mut conn,

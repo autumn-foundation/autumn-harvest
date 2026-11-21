@@ -1,11 +1,11 @@
 //! Turning findings and boundaries into the three-valued verdict (D9).
 //!
 //! The precedence is fixed and deliberate:
-//! `nondeterminism-found` > `unknown` > `proven-deterministic`. A workflow that
-//! hit a boundary *and* found a real flow reports the finding — the boundary is
-//! still attached, because a finding does not make the unexplored part of the
-//! program explored — but a workflow that hit a boundary and found nothing is
-//! never called proven: that is the whole content of AC2.
+//! `nondeterminism-found` > `unknown` > `proven-deterministic`. A workflow
+//! that hit a boundary *and* found a real flow reports the finding. The
+//! boundary stays attached, because a finding does not explore the unexplored
+//! part of the program. A workflow that hit a boundary and found nothing is
+//! never called proven. That is the whole content of AC2.
 
 use std::collections::BTreeSet;
 
@@ -41,11 +41,11 @@ pub fn assemble(
 
 /// Add boundaries discovered *after* [`assemble`] ran, re-deriving the verdict.
 ///
-/// The pipeline learns some boundaries only once every doc has been parsed (a
-/// crate whose dump did not fully parse, a dump that was not valid UTF-8).
-/// Appending them to [`WorkflowVerdict::boundaries`] without re-deriving would
-/// leave a `proven-deterministic` verdict carrying a non-empty boundary list —
-/// the exact self-contradiction AC2 forbids.
+/// The pipeline learns some boundaries only after it parses every doc. Two
+/// examples are a crate whose dump did not fully parse and a dump that was not
+/// valid UTF-8. Appending them to [`WorkflowVerdict::boundaries`] without
+/// re-deriving would leave a `proven-deterministic` verdict with a non-empty
+/// boundary list. That is the exact self-contradiction AC2 forbids.
 pub fn attach_boundaries(verdict: &mut WorkflowVerdict, extra: Vec<Boundary>) {
     if extra.is_empty() {
         return;
@@ -64,10 +64,10 @@ pub fn attach_boundaries(verdict: &mut WorkflowVerdict, extra: Vec<Boundary>) {
 /// One finding per `(kind, taint, source, sink)`: the same flow reached through
 /// two call contexts is one bug, and printing it twice only hides the others.
 ///
-/// The taint kind is part of the key because one source can reach one sink in
-/// two different ways — an ambient comparator decides both the *order* of a
-/// collection and, through the branch inside it, the *values* that come out —
-/// and collapsing those two onto whichever arrived first would drop the more
+/// The taint kind is part of the key, because one source can reach one sink
+/// in two ways. An ambient comparator decides the *order* of a collection.
+/// Through the branch inside it, it also decides the *values* that come out.
+/// Collapsing those two onto whichever arrived first would drop the more
 /// precise label from the report.
 fn dedup(findings: Vec<Finding>) -> Vec<Finding> {
     let mut seen: BTreeSet<(String, String, String, String, String, String)> = BTreeSet::new();

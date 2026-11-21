@@ -18,6 +18,7 @@ use autumn_harvest::WorkflowIdReusePolicy;
 use autumn_harvest::entity::{ENTITY_OP_SIGNAL, ENTITY_STATE_QUERY};
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 use autumn_harvest::llm_ledger::LlmCall;
+use autumn_harvest::time::Timestamp;
 use autumn_harvest_sqlite::{
     ExecutionFilter, ExecutionId, RunState, SignalWithStart, SignalWithStartOutcome, SqliteReader,
     SqliteResult, SqliteRuntime,
@@ -28,7 +29,8 @@ use serde_json::Value;
 
 use crate::agent::{
     AGENT_WORKFLOW_NAME, Agent, AgentId, AgentOp, AgentState, Control, INTERRUPT_SIGNAL, Interrupt,
-    agent_info, agent_memory_reset_info, agent_profile_info, agent_profile_overlay_info,
+    agent_info, agent_memory_count_info, agent_memory_reset_info, agent_profile_info,
+    agent_profile_overlay_info, agent_transcript_count_info, agent_transcript_erase_info,
     agent_workspace_floor_info, agent_workspace_reset_info, agent_workspace_retain_info,
 };
 use crate::answer_check::{CheckRequest, admission, agent_answer_check_info};
@@ -50,16 +52,18 @@ use crate::model::BoxFuture;
 use crate::refine::agent_refine_propose_info;
 use crate::refine::propose::run_stage_metered;
 use crate::sampling::{
-    DRAWS_WORKFLOW_NAME, DrawsInput, SAMPLE_WORKFLOW_NAME, SampleInput, agent_draws_info,
-    agent_sample_info, agent_sampling_policy_info,
+    DRAWS_WORKFLOW_NAME, DrawsInput, SAMPLE_WORKFLOW_NAME, SWEEP_WORKFLOW_NAME, SampleInput,
+    SweepInput, SweepPage, VoteKeyRequest, agent_draws_info, agent_sample_info,
+    agent_sampling_policy_info, agent_sweep_info, agent_sweep_items_info, agent_vote_key_info,
+    run_vote_key,
 };
 use crate::score::{SampleScore, agent_sample_score_info, agent_score_info, run_score};
 use crate::types::{AgentTask, ModelTurnRequest};
 use crate::workflow::{
-    WORKFLOW_NAME, agent_deliver_info, agent_discover_peers_info, agent_loop_info,
-    agent_memory_snapshot_info, agent_model_turn_info, agent_precheck_info, agent_tool_call_info,
+    WORKFLOW_NAME, agent_approval_notice_info, agent_deliver_info, agent_discover_peers_info,
+    agent_loop_info, agent_memory_snapshot_info, agent_model_turn_info, agent_precheck_info,
+    agent_tool_call_info,
 };
-use autumn_harvest::chrono::{DateTime, Utc};
 
 /// Register the agent workflows and their activities against `harness`.
 ///
@@ -89,6 +93,18 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
     let h = Arc::clone(&harness);
     rt.register_activity_with_body(&agent_memory_reset_info(), move |input| {
         call(input, |scope| h.memory_reset(scope))
+    });
+    let h = Arc::clone(&harness);
+    rt.register_activity_with_body(&agent_memory_count_info(), move |input| {
+        call(input, |scope| h.memory_count(scope))
+    });
+    let h = Arc::clone(&harness);
+    rt.register_activity_with_body(&agent_transcript_count_info(), move |input| {
+        call(input, |session| h.transcript_count(session))
+    });
+    let h = Arc::clone(&harness);
+    rt.register_activity_with_body(&agent_transcript_erase_info(), move |input| {
+        call(input, |session| h.transcript_erase(session))
     });
     register_workspace(rt, &harness);
     let h = Arc::clone(&harness);
@@ -122,6 +138,10 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
         call(input, |report| h.deliver(report))
     });
     let h = Arc::clone(&harness);
+    rt.register_activity_with_body(&agent_approval_notice_info(), move |input| {
+        call(input, |parked| h.notify_approval(parked))
+    });
+    let h = Arc::clone(&harness);
     rt.register_activity_with_body(&agent_discover_peers_info(), move |input| {
         call(input, |names: Vec<String>| {
             std::future::ready(Ok::<_, String>(h.discover_peers(&names)))
@@ -133,15 +153,29 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
     });
 }
 
-/// Register the strategy run and its policy read (issue #2439).
+/// Register the strategy runs, their policy read and the key of a vote.
 fn register_sampling(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
     rt.register_workflow(&agent_draws_info());
     rt.register_workflow(&agent_sample_info());
+    rt.register_workflow(&agent_sweep_info());
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_sweep_items_info(), move |input| {
+        call(input, |page: SweepPage| {
+            let h = Arc::clone(&h);
+            async move { h.sweep_page(&page).await }
+        })
+    });
     let h = Arc::clone(harness);
     rt.register_activity_with_body(&agent_sampling_policy_info(), move |input| {
         call(input, |kind: String| {
             let h = Arc::clone(&h);
             async move { h.sampling_policy(&kind).await }
+        })
+    });
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_vote_key_info(), move |input| {
+        call(input, |request: VoteKeyRequest| {
+            std::future::ready(run_vote_key(&h, &request))
         })
     });
     // SQLite keeps no run tenant, so the task tenant applies (issue #2442).
@@ -204,13 +238,29 @@ fn register_refine(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
 #[cfg(feature = "eval")]
 fn register_refine_run(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
     use crate::refine::compose::{run_compose, run_select};
+    use crate::refine::gate::{run_adopt, run_decide};
     use crate::refine::run::{probe_calls, run_probe, run_start};
     use crate::refine::{
-        agent_refine_compose_info, agent_refine_info, agent_refine_probe_info,
-        agent_refine_select_info, agent_refine_start_info,
+        agent_refine_adopt_info, agent_refine_compose_info, agent_refine_decide_info,
+        agent_refine_info, agent_refine_probe_info, agent_refine_select_info,
+        agent_refine_start_info,
     };
 
     rt.register_workflow(&agent_refine_info());
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_refine_adopt_info(), move |input| {
+        call(input, |input| {
+            let h = Arc::clone(&h);
+            async move { run_adopt(&h, input).await }
+        })
+    });
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&agent_refine_decide_info(), move |input| {
+        call(input, |input| {
+            let h = Arc::clone(&h);
+            async move { run_decide(&h, input).await }
+        })
+    });
     let h = Arc::clone(harness);
     rt.register_activity_with_body(&agent_refine_start_info(), move |input| {
         call(input, |input| {
@@ -223,7 +273,8 @@ fn register_refine_run(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
         call_with_ledger(input, |request| {
             let h = Arc::clone(&h);
             async move {
-                let result = run_probe(&h, request).await?;
+                // SQLite has no fork, so the probe needs no fork key.
+                let result = run_probe(&h, request, None).await?;
                 let calls = probe_calls(&result);
                 Ok((result, calls))
             }
@@ -260,6 +311,27 @@ pub fn start_refine(
     rt.start_workflow(
         crate::refine::REFINE_WORKFLOW_NAME,
         serde_json::to_value(input)?,
+    )
+}
+
+/// Send a decision of a person to the adoption gate of the refine run
+/// `exec`.
+///
+/// The gate drops a decision that arrives before its wait opens. Wait for
+/// the search attribute `refine_status = waiting_approval` first.
+///
+/// # Errors
+///
+/// Returns an error when the runtime cannot record the signal.
+pub fn decide_refine(
+    rt: &mut SqliteRuntime,
+    exec: ExecutionId,
+    decision: &crate::refine::RefineDecision,
+) -> SqliteResult<()> {
+    rt.send_signal(
+        exec,
+        &crate::refine::refine_approval_signal(exec),
+        serde_json::to_value(decision)?,
     )
 }
 
@@ -363,6 +435,27 @@ fn register_episodes(rt: &mut SqliteRuntime, harness: &Arc<AgentHarness>) {
         })
     });
     let h = Arc::clone(harness);
+    rt.register_activity_with_body(&crate::refine::agent_refine_lesson_info(), move |input| {
+        call(input, |request| {
+            let h = Arc::clone(&h);
+            async move { crate::refine::lessons::run_write(&h, request).await }
+        })
+    });
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&crate::refine::agent_lesson_match_info(), move |input| {
+        call(input, |agent| {
+            let h = Arc::clone(&h);
+            async move { crate::refine::lessons::run_match(&h, agent).await }
+        })
+    });
+    let h = Arc::clone(harness);
+    rt.register_activity_with_body(&crate::refine::agent_lesson_erase_info(), move |input| {
+        call(input, |request| {
+            let h = Arc::clone(&h);
+            async move { crate::refine::lessons::run_erase(&h, request).await }
+        })
+    });
+    let h = Arc::clone(harness);
     rt.register_activity_with_body(&agent_consolidate_read_info(), move |input| {
         call(input, |agent: AgentId| {
             let h = Arc::clone(&h);
@@ -447,6 +540,15 @@ pub fn start_draws(rt: &mut SqliteRuntime, input: &DrawsInput) -> SqliteResult<E
 /// Returns an error when the runtime cannot record the start.
 pub fn start_sample(rt: &mut SqliteRuntime, input: &SampleInput) -> SqliteResult<ExecutionId> {
     rt.start_workflow(SAMPLE_WORKFLOW_NAME, serde_json::to_value(input)?)
+}
+
+/// Start one `agent_sweep` run. Returns its execution id.
+///
+/// # Errors
+///
+/// Returns an error when the runtime cannot record the start.
+pub fn start_sweep(rt: &mut SqliteRuntime, input: &SweepInput) -> SqliteResult<ExecutionId> {
+    rt.start_workflow(SWEEP_WORKFLOW_NAME, serde_json::to_value(input)?)
 }
 
 /// Start one heartbeat tick. Returns its execution id.
@@ -611,7 +713,7 @@ impl LedgerSpend {
         }
     }
 
-    fn read(&self, mesh: &str, since: DateTime<Utc>) -> SqliteResult<Spend> {
+    fn read(&self, mesh: &str, since: Timestamp) -> SqliteResult<Spend> {
         let reader = SqliteReader::open(&self.path)?;
         let filter = ExecutionFilter::new().search_attribute(MESH_ATTR, serde_json::json!(mesh));
         let mut runs = std::collections::HashSet::new();
@@ -633,7 +735,7 @@ impl LedgerSpend {
         }
         // A row of a simulated drive can be later than the wall clock, so the
         // read has no upper bound (issue #2272).
-        let rows = reader.llm_ledger_between(since, DateTime::<Utc>::MAX_UTC)?;
+        let rows = reader.llm_ledger_between(since, Timestamp::MAX)?;
         let spend = rows.iter().filter(|row| runs.contains(&row.exec_id)).fold(
             Spend::default(),
             |spend, row| Spend {
@@ -654,7 +756,7 @@ impl MeshSpend for LedgerSpend {
     fn spent<'a>(
         &'a self,
         mesh: &'a str,
-        since: DateTime<Utc>,
+        since: Timestamp,
     ) -> BoxFuture<'a, Result<Spend, AgentError>> {
         let read = self
             .read(mesh, since)
@@ -721,7 +823,8 @@ impl Directory {
                 .executions
                 .first()
                 .and_then(|summary| summary.started_at.value())
-                .map(DateTime::timestamp_millis))
+                .copied()
+                .map(Timestamp::as_millisecond))
         };
         if let Some(started_ms) = newest(&filter.clone().state("RUNNING"))? {
             return Ok(Some(LastPass {
@@ -776,7 +879,7 @@ impl AgentDirectory for Directory {
 /// Returns a list or a send error. Agents that got the pause before it stay
 /// paused.
 pub fn pause_mesh(rt: &mut SqliteRuntime, mesh: &str, reason: &str) -> SqliteResult<MeshPause> {
-    let at_ms = Utc::now().timestamp_millis();
+    let at_ms = Timestamp::now().as_millisecond();
     let filter = ExecutionFilter::new()
         .workflow_name(AGENT_WORKFLOW_NAME)
         .state("RUNNING")
@@ -827,6 +930,54 @@ pub fn pause_mesh(rt: &mut SqliteRuntime, mesh: &str, reason: &str) -> SqliteRes
         "a mesh was paused"
     );
     Ok(record)
+}
+
+/// Send `Control::ReloadProfile` to each running agent of `kind`. Returns
+/// the agents, sorted by id.
+///
+/// Register the new harness first. The reload reads the profile when the
+/// agent runs the op, so [`drive`] each agent after the call. The op goes
+/// to the listed run only, so an agent with no running run stays ended.
+/// Each call uses its own idempotency key.
+///
+/// The filter is the workflow id prefix `<kind>/`. So a run that has run no
+/// op yet gets the reload. An agent of a kind such as `<kind>2` does not.
+///
+/// # Errors
+///
+/// Returns a list or a send error. Agents that got the op before it keep
+/// it.
+pub fn reload_profiles(rt: &mut SqliteRuntime, kind: &str) -> SqliteResult<Vec<AgentId>> {
+    let filter = ExecutionFilter::new()
+        .workflow_name(AGENT_WORKFLOW_NAME)
+        .state("RUNNING")
+        .workflow_id_prefix(format!("{kind}/"));
+    let mut targets = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = cursor.map_or_else(|| filter.clone(), |cursor| filter.clone().before(cursor));
+        let found = rt.list_executions(&page)?;
+        targets.extend(found.executions.iter().filter_map(|summary| {
+            let id = AgentId::parse(summary.workflow_id.value()?).ok()?;
+            Some((summary.execution_id()?, id)).filter(|(_, id)| id.kind() == kind)
+        }));
+        match found.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    targets.sort_by(|(_, a), (_, b)| a.as_str().cmp(b.as_str()));
+    let key = format!(
+        "reload-profiles:{kind}:{}",
+        Timestamp::now().as_millisecond()
+    );
+    let payload = Agent::payload(&AgentOp::Control(Control::ReloadProfile));
+    let mut agents = Vec::with_capacity(targets.len());
+    for (exec, id) in targets {
+        rt.send_signal_idempotent(exec, ENTITY_OP_SIGNAL, payload.clone(), Some(&key))?;
+        agents.push(id);
+    }
+    Ok(agents)
 }
 
 /// Decode `input`, run `body` to completion, and encode its result.

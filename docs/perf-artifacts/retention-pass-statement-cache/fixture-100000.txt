@@ -1,0 +1,22 @@
+ setseed 
+---------
+ 
+(1 row)
+
+      state       | count 
+------------------+-------
+ COMPLETED        | 62175
+ CONTINUED_AS_NEW | 27867
+ FAILED           |  4386
+ RUNNING          |  2570
+ CANCELLED        |  1526
+ TIMED_OUT        |   738
+ PAUSED           |   373
+ TERMINATED       |   365
+(8 rows)
+
+ children | forks | holds | identities 
+----------+-------+-------+------------
+    24385 |   193 |    97 |      79913
+(1 row)
+

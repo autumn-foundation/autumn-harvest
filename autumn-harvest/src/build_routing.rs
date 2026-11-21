@@ -35,7 +35,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use uuid::Uuid;
 
 use crate::error::{HarvestError, HarvestResult, database_error};
@@ -153,8 +153,8 @@ pub struct BuildPolicy {
     pub queue_name: String,
     pub build_id: String,
     pub deployment_name: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
     /// Ramp target build. `None` = no ramp configured (100% `build_id`).
     #[serde(default)]
     pub target_build_id: Option<String>,
@@ -164,9 +164,10 @@ pub struct BuildPolicy {
     pub ramp_percent: Option<i32>,
 }
 
-/// Domain separator for the ramp-decision hash, so it is decoupled from the
-/// shard-router rendezvous hash and the scheduler jitter hash even though all
-/// three use `seahash` over a fixed byte layout.
+/// Domain separator for the ramp-decision hash.
+///
+/// It decouples this hash from the shard-router rendezvous hash and the
+/// scheduler jitter hash. All three use `seahash` over a fixed byte layout.
 const RAMP_HASH_DOMAIN_SEP: &[u8] = b"harvest_build_ramp:";
 
 /// Deterministic bucket in `0..100` for `exec_id`, used to decide ramp membership.
@@ -205,10 +206,10 @@ impl BuildPolicy {
     ///
     /// Returns `target_build_id` for approximately `ramp_percent`% of
     /// `exec_id` values and `build_id` otherwise. The decision is a pure,
-    /// deterministic function of `exec_id` (via [`ramp_bucket`]) so an
-    /// outbox/start retry for the same execution never flips its build
-    /// (issue #604 AC3), and in-flight executions are never re-routed since
-    /// this is only ever called once, at start time.
+    /// deterministic function of `exec_id` (via [`ramp_bucket`]). So an
+    /// outbox/start retry for the same execution never flips its build (issue
+    /// #604 AC3). In-flight executions are never re-routed, because this runs
+    /// only once, at start time.
     ///
     /// `ramp_percent = None` or `Some(0)`, or `target_build_id = None`, all
     /// resolve to `build_id` — clearing either field alone is enough to stop
@@ -239,7 +240,7 @@ pub struct BuildCompatEntry {
     pub build_id: String,
     /// Execution build whose tasks the worker may process.
     pub compatible_with: String,
-    pub declared_at: DateTime<Utc>,
+    pub declared_at: Timestamp,
 }
 
 /// Per-build reachability snapshot.
@@ -262,6 +263,8 @@ pub struct BuildReachability {
 
 // ── DB functions ──────────────────────────────────────────────────────────────
 
+#[cfg(feature = "db")]
+use crate::cached_stmt::CachePreparedDsl as _;
 #[cfg(feature = "db")]
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 
@@ -287,9 +290,11 @@ struct BuildPolicyRow {
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     deployment_name: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    created_at: DateTime<Utc>,
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+    created_at: Timestamp,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    updated_at: DateTime<Utc>,
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+    updated_at: Timestamp,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     target_build_id: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
@@ -564,12 +569,15 @@ pub async fn get_build_policy(
     conn: &mut AsyncPgConnection,
     queue_name: &str,
 ) -> HarvestResult<Option<BuildPolicy>> {
+    // The column list is a constant, so the text is one constant text. Each
+    // workflow start reads the policy of its queue (issue #2651).
     let rows: Vec<BuildPolicyRow> = diesel::sql_query(format!(
         "SELECT {BUILD_POLICY_COLUMNS} \
          FROM harvest_build_policies \
          WHERE queue_name = $1"
     ))
     .bind::<diesel::sql_types::Text, _>(queue_name)
+    .cache_prepared()
     .load(conn)
     .await
     .map_err(database_error)?;
@@ -598,9 +606,9 @@ pub async fn list_build_policies(conn: &mut AsyncPgConnection) -> HarvestResult<
 
 /// Set (or update) the percentage ramp for a queue's existing build policy.
 ///
-/// The base policy (`build_id`) must already exist for `queue_name` — a ramp
-/// targets a second build *in addition to* the base, so there must be a base
-/// to ramp away from. `percent` is validated via [`validate_ramp_percent`].
+/// The base policy (`build_id`) must already exist for `queue_name`. A ramp
+/// targets a second build *in addition to* the base, so it needs a base to
+/// ramp away from. [`validate_ramp_percent`] validates `percent`.
 ///
 /// # Errors
 ///
@@ -1010,7 +1018,8 @@ pub async fn declare_compat(
         #[diesel(sql_type = diesel::sql_types::Text)]
         compatible_with: String,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        declared_at: DateTime<Utc>,
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+        declared_at: Timestamp,
     }
 
     let rows: Vec<Row> = diesel::sql_query(
@@ -1069,8 +1078,8 @@ pub async fn revoke_compat(
 /// [`BuildCompatibilitySet`] for in-process use.
 ///
 /// Workers can cache this and refresh it periodically to avoid per-claim DB
-/// round-trips (the claim SQL already enforces the rule server-side; this is
-/// for application-layer checks and logging).
+/// round-trips. The claim SQL already enforces the rule server-side. This copy
+/// serves application-layer checks and logging.
 ///
 /// # Errors
 ///
@@ -1193,7 +1202,8 @@ pub async fn list_build_compat(
         #[diesel(sql_type = diesel::sql_types::Text)]
         compatible_with: String,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        declared_at: DateTime<Utc>,
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+        declared_at: Timestamp,
     }
 
     let rows: Vec<Row> = diesel::sql_query(
@@ -1419,10 +1429,9 @@ pub async fn all_build_reachability(
 ///
 /// # Errors
 ///
-/// Returns `HarvestError::Database` on the first shard that fails. Errors from
-/// unreachable shards bubble up rather than being silently skipped so that
-/// callers get an honest picture of fleet state (a failed shard means the
-/// reachability data is incomplete).
+/// Returns `HarvestError::Database` on the first shard that fails. An
+/// unreachable shard's error propagates and is never skipped. A failed shard
+/// means incomplete reachability data, and callers must see that.
 #[cfg(feature = "db")]
 pub async fn all_build_reachability_sharded(
     pool: &crate::shard::ShardedDbPool,
@@ -1430,7 +1439,6 @@ pub async fn all_build_reachability_sharded(
 ) -> HarvestResult<Vec<BuildReachability>> {
     use futures::future::try_join_all;
 
-    // Fan out to all shards concurrently.
     let shard_futures: Vec<_> = pool
         .iter_shards()
         .map(|(_, shard_pool)| {

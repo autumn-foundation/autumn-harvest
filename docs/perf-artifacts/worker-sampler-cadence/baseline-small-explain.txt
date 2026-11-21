@@ -1,0 +1,36 @@
+-- concurrency_key_stats
+GroupAggregate  (cost=1092.32..1092.73 rows=13 width=33) (actual time=2.183..2.212 rows=44 loops=1)
+  Group Key: concurrency_key, task_type
+  Buffers: shared hit=672
+  ->  Sort  (cost=1092.32..1092.35 rows=14 width=28) (actual time=2.175..2.179 rows=107 loops=1)
+        Sort Key: concurrency_key, task_type
+        Sort Method: quicksort  Memory: 30kB
+        Buffers: shared hit=672
+        ->  Seq Scan on harvest_task_queue  (cost=0.05..1092.05 rows=14 width=28) (actual time=0.044..2.122 rows=107 loops=1)
+              Filter: ((concurrency_key IS NOT NULL) AND (concurrency_cap IS NOT NULL) AND (queue_name = ANY ('{q0,q1,q2,q3,q4,q5,q6,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,q17,q18,q19}'::text[])) AND ((state = 'PENDING'::text) OR ((state = 'RUNNING'::text) AND (worker_id IS NOT NULL))))
+              Rows Removed by Filter: 20893
+              Buffers: shared hit=672
+Planning:
+  Buffers: shared hit=8
+Planning Time: 0.333 ms
+Execution Time: 2.234 ms
+
+-- sample_rate_limit_buckets
+Seq Scan on harvest_rate_limit_buckets  (cost=0.00..3.50 rows=9 width=33) (actual time=0.008..0.015 rows=10 loops=1)
+  Filter: (((key)::text !~~ 'dyn-rate:%'::text) AND ((key)::text !~~ 'start-throttle:%'::text))
+  Rows Removed by Filter: 90
+  Buffers: shared hit=2
+Planning Time: 0.049 ms
+Execution Time: 0.025 ms
+
+-- dead_letter_count
+Aggregate  (cost=331.29..331.30 rows=1 width=8) (actual time=1.343..1.344 rows=1 loops=1)
+  Buffers: shared hit=39
+  ->  Index Only Scan using idx_harvest_dl_failed_at on harvest_dead_letters  (cost=0.29..306.29 rows=10000 width=0) (actual time=0.016..0.883 rows=10000 loops=1)
+        Heap Fetches: 0
+        Buffers: shared hit=39
+Planning:
+  Buffers: shared hit=3
+Planning Time: 0.067 ms
+Execution Time: 1.375 ms
+

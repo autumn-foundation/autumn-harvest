@@ -84,11 +84,11 @@
 # model error, not a warning, because an unexplained rule is how a model rots.
 #
 # The version string is printed with every verdict ("no non-determinism found,
-# under model 2026.10.2, up to boundaries ..."), so a verdict can always be
+# under model 2026.11.18, up to boundaries ..."), so a verdict can always be
 # traced to the rules that produced it. Bump the date component when rows change,
 # or when the analysis gives another structure manifest for the same MIR.
 
-version = "2026.10.2"
+version = "2026.11.18"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # AMBIENT TYPES — statics of these types are taint roots
@@ -216,6 +216,26 @@ reason = "Monotonic clock read; see `Instant::now`."
 path = "Instant::duration_since"
 kind = "value"
 reason = "Difference of two monotonic reads. Included because the difference is itself a wall-clock-derived quantity whose value depends on how long the original run took — a laundering shape (`t1.duration_since(t0).as_secs() % 3`) that the syntactic layer's `Instant::now` rule catches at the read but not at the use."
+[[source]]
+path = "Timestamp::now"
+receiver = "Timestamp"
+kind = "value"
+reason = "jiff wall clock, the engine's own clock type since ADR 0018. Prints as `Timestamp::now`, `jiff::Timestamp::now` or, through this crate's re-exports, `autumn_harvest::time::Timestamp::now` or `autumn_harvest::jiff::Timestamp::now`, so the row is a suffix. `jiff` is a `[[trusted]]` propagator; this source row takes precedence over that."
+[[source]]
+path = "ZonedDateTime::now"
+receiver = "ZonedDateTime"
+kind = "value"
+reason = "jiff zoned clock: non-deterministic in the clock AND in the machine's time zone."
+[[source]]
+path = "TimeZone::system"
+receiver = "TimeZone"
+kind = "value"
+reason = "jiff host time zone: differs between machines, so a value derived from it differs between a run and its replay on another worker."
+[[source]]
+path = "TimeZone::try_system"
+receiver = "TimeZone"
+kind = "value"
+reason = "Fallible form of `TimeZone::system`; same host read."
 [[source]]
 path = "Utc::now"
 receiver = "Utc"
@@ -728,6 +748,11 @@ path = "is_replaying"
 receiver = "WorkflowContext"
 kind = "value"
 reason = "context.rs:4545, doc 4519-4544: \"Observability-only: use it to gate side effects, never to derive workflow commands. Branching command-affecting logic on it records different commands live vs replay and triggers non-determinism.\" The doc's own example (`if !ctx.is_replaying() { println!(..) }`) is the clean use; a command inside that branch is the finding."
+[[source]]
+path = "activity_input_fits"
+receiver = "WorkflowContext"
+kind = "value"
+reason = "context.rs `activity_input_fits` reads the payload caps, the cap overrides and the offload threshold of the worker. A deploy can change each one, so a replay on another build can get another answer at the same program point. Its doc says to record the answer with `side_effect`, whose closure is opaque. The agent loop does that in `notice_fits`."
 [[source]]
 path = "history_event_count"
 receiver = "WorkflowContext"
@@ -1684,6 +1709,10 @@ path = "with_activity_defaults"
 receiver = "WorkflowContext"
 reason = "context.rs:3726; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
 [[non_sink]]
+path = "with_activity_overrides"
+receiver = "WorkflowContext"
+reason = "context.rs:4442; builder-style setter called by the worker before the workflow body runs. Emits no command. The cache it installs is read only at schedule time, and replay never compares the values it resolves."
+[[non_sink]]
 path = "with_activity_input_override"
 receiver = "WorkflowContext"
 reason = "context.rs:3747; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
@@ -2442,6 +2471,10 @@ reason = "tracing::field::debug — the `?field` sigil's half of the pair above,
 path = "task_duration"
 reason = "autumn_harvest::task_duration (`autumn-harvest/src/lib.rs`), a `[[trusted]]` crate's free function that parses a `&str` into an `Option<Duration>`. rustc trims it to one segment in every `#[activity]` info body. Verified in the dumps: `_4 = task_duration(move _5)` with `_5: &str` and `_4: std::option::Option<std::time::Duration>`. Pure string parsing: no clock, no ambient state."
 
+[[std_free_fn]]
+path = "from_millisecond_clamped"
+reason = "autumn_harvest::time::from_millisecond_clamped (`autumn-harvest/src/time/mod.rs`, ADR 0018), a `[[trusted]]` crate's free function. It turns an `i64` of milliseconds into a `jiff::Timestamp` and clamps a value past the jiff range. rustc trims it to one segment in the `autumn-harvest-agent` wake-time closure, so no receiver at the call site names its crate. Pure arithmetic: no clock, no ambient state."
+
 [[trusted]]
 name = "core"
 reason = "Always trusted. Language primitives: arithmetic, formatting, iteration, `Option`/`Result` combinators. No ambient state and no I/O; every hazard reached through it (`core::hint::must_use`, `Iterator::next` over a hash-seeded iterator) is carried by a rule above."
@@ -2461,6 +2494,9 @@ reason = "JSON encode/decode over a `BTreeMap`-backed `Map`, so `Value` object i
 name = "serde_core"
 reason = "The trait-only split of `serde`; same argument."
 [[trusted]]
+name = "jiff"
+reason = "Date/time ARITHMETIC, parsing and formatting are pure functions of their inputs. The clock and host-zone ENTRY POINTS are not: `Timestamp::now`, `ZonedDateTime::now`, `TimeZone::system` and `TimeZone::try_system` are `[[source]]` rows and take precedence. jiff prints as `autumn_harvest::time::...` or `autumn_harvest::jiff::...` through the re-exports, which is why the source rows are suffix-matched."
+[[trusted]]
 name = "chrono"
 reason = "Date/time ARITHMETIC and formatting are pure functions of their inputs. The clock ENTRY POINTS are not: `Utc::now` and `Local::now` are `[[source]]` rows and take precedence. Note the re-export: chrono prints as `autumn_harvest::chrono::...` in MIR emitted from this workspace, which is why the source rows are suffix-matched."
 [[trusted]]
@@ -2468,7 +2504,7 @@ name = "uuid"
 reason = "UUID parsing, formatting and byte manipulation are pure. The generators are not: `new_v4`, `now_v7`, `now_v6` and `new_v1` are `[[source]]` rows and take precedence."
 [[trusted]]
 name = "autumn_harvest"
-reason = "The engine itself. Its `WorkflowContext` surface is fully classified above (160 public methods) and an UNMODELLED `WorkflowContext::*` method yields `unknown(\"unmodeled-ctx-method\")` rather than being silently trusted. Everything else in the crate — `info`, `policy`, `shard`, error types, the `Saga` builder — is a propagator. The crate is also the re-export point for `chrono`, `serde_json` and `uuid`, which is why paths through it are matched by suffix."
+reason = "The engine itself. Its `WorkflowContext` surface is fully classified above (160 public methods) and an UNMODELLED `WorkflowContext::*` method yields `unknown(\"unmodeled-ctx-method\")` rather than being silently trusted. Everything else in the crate — `info`, `policy`, `shard`, error types, the `Saga` builder — is a propagator. The crate is also the re-export point for `jiff`, `chrono`, `serde_json` and `uuid`, which is why paths through it are matched by suffix."
 [[trusted]]
 name = "tokio"
 reason = "Async runtime plumbing propagates taint like any other library, but the runtime's EFFECTS are `[[forbidden]]` rows that take precedence: `sleep`, `sleep_until`, `spawn`, `spawn_blocking`, `spawn_local`, `block_on`. `tokio::select!` is the acknowledged hole — the macro lowers to an inline poll loop with no callee path, so nothing in this table can see it, and HVG010 remains its only gate."

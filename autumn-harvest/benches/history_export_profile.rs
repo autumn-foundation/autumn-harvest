@@ -2,12 +2,11 @@
 //! harness for `autumn_harvest::history_export::export_history`. This is the
 //! archival-export path. `retention.rs`'s reclamation sweep calls it once per
 //! retiring execution, before deleting its row (issue #524/#698/#772/#798).
-//! The same function is also re-exported at the crate root as public API.
+//! The crate root also re-exports it as public API.
 //! Wall-clock timing is not admissible evidence on this (shared-vCPU)
-//! machine. Every number this harness produces evidence for is a
-//! deterministic instruction count (`valgrind --tool=callgrind`) or
-//! allocation count/bytes (`valgrind --tool=dhat`). Both are reproducible
-//! bit-for-bit on any machine.
+//! machine. Use instruction counts (`valgrind --tool=callgrind`) and
+//! allocation counts/bytes (`valgrind --tool=dhat`). Both repeat bit for
+//! bit on any machine.
 //!
 //! # Workload
 //!
@@ -71,15 +70,15 @@ fn build_request(
         shard_id: 0,
         state: "COMPLETED".to_string(),
         events,
-        exported_at: chrono::Utc::now(),
+        exported_at: jiff::Timestamp::now(),
         payload_policy: HistoryPayloadPolicy::Full,
         // Archival always exports with no ceiling (`retention.rs` passes
         // `Some(usize::MAX)`), so `measure_export_bytes` is never short
         // circuited by an early size-limit rejection.
         max_bytes: Some(usize::MAX),
         context_headers: None,
-        execution_timeout: Some(chrono::Duration::hours(24)),
-        deadline_at: Some(chrono::Utc::now() + chrono::Duration::hours(24)),
+        execution_timeout: Some(jiff::SignedDuration::from_hours(24)),
+        deadline_at: Some(jiff::Timestamp::now() + jiff::SignedDuration::from_hours(24)),
         start_provenance: None,
         parent_execution_id: None,
     }

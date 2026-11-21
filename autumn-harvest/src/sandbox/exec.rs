@@ -18,20 +18,21 @@
 //!   reservations;
 //! - an empty network namespace when the plan denies the network;
 //! - a dedicated uid and gid when the executor runs as root, or else a new
-//!   user namespace, so the process limit counts only this run.
+//!   user namespace, so the process limit counts only this run;
+//! - with [`ExecOptions::fs`], a private mount namespace that hides paths, or
+//!   a new root. See [`FsIsolation`].
 //!
 //! With [`ExecOptions::cgroup_root`], each run also gets its own cgroup. It
 //! bounds the CPU time of the whole run, and the end of the run kills each
 //! process in it.
 //!
 //! Without a cgroup, a process that calls `setsid` leaves the group, and the
-//! host executor
-//! cannot kill it. On a root host, concurrent runs share the uid `nobody`
+//! host executor cannot kill it. On a root host, concurrent runs share the uid `nobody`
 //! unless `run_as` names another. Inside a microVM, neither matters: the
 //! microVM ends after one run.
 
 use std::io::{self, Read as _, Write as _};
-use std::os::fd::{AsRawFd, FromRawFd as _, OwnedFd};
+use std::os::fd::{AsFd as _, AsRawFd, FromRawFd as _, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
@@ -44,6 +45,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::capture::StreamCapture;
 use super::error::SandboxError;
+use super::fs_isolation::{FS_FAILED, FsIsolation, FsPlan, PivotDirs, ROOT_NAME, WORK_NAME};
 use super::guest::PlanExecutor;
 use super::outcome::{
     MAX_SKIP_REASON_BYTES, MISSING_OUTPUT_REASON, NOT_A_DIRECTORY_REASON, OutputFile, RunStatus,
@@ -109,6 +111,9 @@ pub struct ExecOptions {
     /// together, and the end of the run kills each of them. `None` gives
     /// each process its own CPU limit. The guest agent always sets it.
     pub cgroup_root: Option<PathBuf>,
+    /// The file system that the code sees. `Shared` by default. See
+    /// [`FsIsolation`].
+    pub fs: FsIsolation,
 }
 
 impl Default for ExecOptions {
@@ -117,6 +122,7 @@ impl Default for ExecOptions {
             scratch_root: std::env::temp_dir(),
             run_as: None,
             cgroup_root: None,
+            fs: FsIsolation::Shared,
         }
     }
 }
@@ -177,14 +183,16 @@ pub async fn execute_plan(
         .transpose()?;
     // The work directory belongs to the executor until the files are in
     // place. So no other process of the code uid can plant a link there.
-    let work = WorkDir::create(&options.scratch_root)?;
+    let mut work = WorkDir::create(&options.scratch_root)?;
     write_files(work.path(), plan, run_as)?;
     work.hand_over(run_as)?;
 
+    let fs = fs_plan(options, &mut work, plan)?;
     let setup = ChildSetup::new(
         plan,
         run_as,
         cgroup.as_ref().map(|cgroup| cgroup.procs.as_raw_fd()),
+        fs,
     );
     let started = Instant::now();
     let mut child = command(plan, work.path(), setup)
@@ -273,6 +281,20 @@ pub async fn execute_plan(
         isolation: IsolationLevel::Process,
         image: None,
     })
+}
+
+/// The steps of the private file system of a run, or `None` for a shared one.
+fn fs_plan(
+    options: &ExecOptions,
+    work: &mut WorkDir,
+    plan: &ExecPlan,
+) -> Result<Option<FsPlan>, SandboxError> {
+    if options.fs.needs_root() {
+        work.create_root()?;
+    }
+    options
+        .fs
+        .prepare(work.pivot_dirs(), work.path(), plan.limits.memory_bytes)
 }
 
 /// How the main process ended.
@@ -668,11 +690,16 @@ impl Drop for GroupGuard {
 }
 
 /// Map a spawn error to a sandbox error.
-fn spawn_error(command: &str, err: &io::Error) -> SandboxError {
+pub(super) fn spawn_error(command: &str, err: &io::Error) -> SandboxError {
     match err.raw_os_error() {
         Some(NETNS_FAILED) => SandboxError::Unavailable(
             "the policy denies the network, and this host does not allow an empty network \
              namespace; the run fails closed"
+                .into(),
+        ),
+        Some(FS_FAILED) => SandboxError::Unavailable(
+            "the options ask for a private file system, and this host does not allow the mount \
+             namespace or one of its mounts; the run fails closed"
                 .into(),
         ),
         Some(CGROUP_FAILED) => SandboxError::Unavailable(
@@ -708,7 +735,7 @@ pub(crate) fn kill_group(group: i32) {
 }
 
 /// The values that the child setup needs, computed before the fork.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ChildSetup {
     /// `cgroup.procs` of the run cgroup, or -1.
     cgroup_procs: libc::c_int,
@@ -722,10 +749,19 @@ struct ChildSetup {
     processes: libc::rlim_t,
     /// The soft and hard stack limits of the child.
     stack: Option<(libc::rlim_t, libc::rlim_t)>,
+    /// The uid and gid of the executor, for the map of its user namespace.
+    ids: (u32, u32),
+    /// The private file system, or `None` for the file system of the worker.
+    fs: Option<FsPlan>,
 }
 
 impl ChildSetup {
-    fn new(plan: &ExecPlan, run_as: Option<(u32, u32)>, cgroup_procs: Option<i32>) -> Self {
+    fn new(
+        plan: &ExecPlan,
+        run_as: Option<(u32, u32)>,
+        cgroup_procs: Option<i32>,
+        fs: Option<FsPlan>,
+    ) -> Self {
         let limits = &plan.limits;
         Self {
             cgroup_procs: cgroup_procs.unwrap_or(-1),
@@ -739,6 +775,9 @@ impl ChildSetup {
             open_files: libc::rlim_t::from(limits.max_open_files),
             processes: libc::rlim_t::from(limits.max_processes),
             stack: stack_hard_limit().map(|hard| (child_stack_limit(hard), hard)),
+            // SAFETY: geteuid and getegid have no preconditions.
+            ids: unsafe { (libc::geteuid(), libc::getegid()) },
+            fs,
         }
     }
 
@@ -785,7 +824,14 @@ impl ChildSetup {
                 };
                 return Err(io::Error::from_raw_os_error(failed));
             }
+            // The walk of `/proc/self/fd` needs `/proc`, which a pivot removes,
+            // so mark the descriptors before the mounts.
             mark_descriptors_cloexec()?;
+            // The mounts need the rights of the executor, so they run before
+            // the code uid below.
+            if let Some(fs) = &self.fs {
+                fs.apply((!self.root).then_some(self.ids))?;
+            }
             set_limit(libc::RLIMIT_CORE, 0, 0)?;
             set_limit(
                 libc::RLIMIT_CPU,
@@ -1223,6 +1269,9 @@ struct WorkDir {
     /// through `path`. The cleanup finds both directories through their
     /// handles.
     handle: std::fs::File,
+    /// The open directory for the new root of a pivot. The child setup
+    /// names it by its descriptor, so it stays open until the run ends.
+    root: Option<std::fs::File>,
     removed: bool,
 }
 
@@ -1231,7 +1280,7 @@ impl WorkDir {
     /// new parent with mode `0711`.
     fn create(root: &Path) -> Result<Self, SandboxError> {
         let parent = root.join(format!("harvest-sbx-{}", uuid::Uuid::new_v4().simple()));
-        let path = parent.join("work");
+        let path = parent.join(WORK_NAME);
         let opened = std::fs::DirBuilder::new()
             .mode(0o711)
             .create(&parent)
@@ -1256,7 +1305,35 @@ impl WorkDir {
             parent_handle,
             path,
             handle,
+            root: None,
             removed: false,
+        })
+    }
+
+    /// Create and open the empty directory that holds the new root of a
+    /// pivot. Only the executor can use it, and the removal of the parent
+    /// takes it.
+    fn create_root(&mut self) -> Result<(), SandboxError> {
+        let root = self.parent.join(ROOT_NAME);
+        let opened = std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .and_then(|()| open_directory(&root))
+            .map_err(|e| {
+                SandboxError::Unavailable(format!(
+                    "could not create the root directory {}: {e}",
+                    root.display()
+                ))
+            })?;
+        self.root = Some(opened);
+        Ok(())
+    }
+
+    /// The open directories of a pivot, after [`Self::create_root`].
+    fn pivot_dirs(&self) -> Option<PivotDirs<'_>> {
+        self.root.as_ref().map(|root| PivotDirs {
+            root: root.as_fd(),
+            work: self.handle.as_fd(),
         })
     }
 
@@ -1708,6 +1785,7 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+    use crate::sandbox::isolation_gate::host_has;
     use crate::sandbox::outcome::RunStatus;
     use crate::sandbox::policy::{NetworkPolicy, SandboxPolicy};
     use crate::sandbox::request::{SandboxFile, SandboxRequest};
@@ -1751,7 +1829,10 @@ mod tests {
                     }
                     stderr = out.stderr;
                 }
-                Err(SandboxError::Unavailable(m)) if m.contains("user namespace") => return,
+                Err(SandboxError::Unavailable(m)) if m.contains("user namespace") => {
+                    host_has(false, "user namespace");
+                    return;
+                }
                 // EAGAIN: the worker uid is at its process limit.
                 Err(SandboxError::Unavailable(m)) if m.contains("(os error 11)") => stderr = m,
                 Err(e) => panic!("{e:?}"),
@@ -2804,7 +2885,7 @@ mod tests {
             .plan(&sh("cat /proc/net/dev"))
             .unwrap();
         let result = execute_plan(&denied, &options(), &CancellationToken::new()).await;
-        if network_isolation_available().await {
+        if host_has(network_isolation_available().await, "network namespace") {
             let out = result.expect("isolation is available");
             let interfaces: Vec<&str> = out
                 .stdout

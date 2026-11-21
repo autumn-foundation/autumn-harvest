@@ -3,12 +3,12 @@
 //!
 //! ## The problem
 //!
-//! Changing an in-flight workflow's logic is the classic durable-execution
-//! footgun: executions that recorded history under the old code must keep
-//! replaying the old branch, while new executions should take the new one.
-//! `ctx.version()` solves this with integer bookkeeping (`min`/`max`,
-//! `>= 2` comparisons) that is overkill for the overwhelmingly common case:
-//! a change with exactly **two** states — before and after.
+//! A change to an in-flight workflow's logic is the classic durable-execution
+//! footgun. Executions that recorded history under the old code must keep
+//! replaying the old branch. New executions should take the new one.
+//! `ctx.version()` solves this with integer bookkeeping (`min`/`max`, `>= 2`
+//! comparisons). That is overkill for the most common case: a change with
+//! exactly **two** states, before and after.
 //!
 //! ## The solution: a three-deploy lifecycle
 //!
@@ -27,11 +27,11 @@
 //! migration) and take the new branch. Pre-patch executions replay the old
 //! branch deterministically.
 //!
-//! **Deploy 2 — deprecate.** Once every *pre-patch* run has drained (see the
-//! "Patched gates" section of `docs/runbooks/version-gate-retirement.md` —
-//! the `version-usage`/retirement-check CLI tooling does NOT see `patch:`
-//! markers; use that section's raw SQL drain queries), drop the old branch
-//! and make the recorded markers transparent:
+//! **Deploy 2 — deprecate.** Wait until every *pre-patch* run has drained. See
+//! the "Patched gates" section of `docs/runbooks/version-gate-retirement.md`.
+//! The `version-usage`/retirement-check CLI tooling does NOT see `patch:`
+//! markers, so use that section's raw SQL drain queries. Then drop the old
+//! branch and make the recorded markers transparent:
 //!
 //! ```rust,ignore
 //! ctx.deprecate_patch("discount-v2");
@@ -69,8 +69,8 @@ struct Order {
 
 // ---------------------------------------------------------------------------
 // Deploy 1: the gated workflow. In real life `apply_discount_v2` below is the
-// SAME function after its next edit — two functions here only so one example
-// binary can show both phases side by side.
+// SAME function after its next edit. One example binary shows both phases side
+// by side, so there are two functions here.
 // ---------------------------------------------------------------------------
 
 /// Phase-1 workflow: pre-patch runs replay `compute_price_v1`; new runs
@@ -130,10 +130,10 @@ fn main() {
     println!("  deploy 3: delete the call entirely");
 }
 
-// Gated on the `testing` feature as well as `test`: the example itself must
-// keep building under `--no-default-features` (which CI exercises), while
-// `autumn_harvest::testing` only exists for external consumers when the
-// `testing` feature is enabled.
+// Gated on the `testing` feature as well as `test`. The example must keep
+// building under `--no-default-features`, which CI exercises.
+// `autumn_harvest::testing` exists for an external consumer only when the
+// `testing` feature is on.
 #[cfg(all(test, feature = "testing"))]
 mod tests {
     use super::*;
@@ -189,8 +189,8 @@ mod tests {
     }
 
     /// Deploy 2: the phase-2 code (deprecate_patch + unconditional new
-    /// branch) replays a phase-1 (marker-bearing) history cleanly, even
-    /// though the marker no longer has a positional `patched()` call.
+    /// branch) replays a phase-1 (marker-bearing) history cleanly. The marker
+    /// no longer has a positional `patched()` call.
     #[tokio::test]
     async fn phase2_deprecated_handler_replays_phase1_history() {
         let outcome = WorkflowTestEnv::new()

@@ -27,7 +27,7 @@ pub struct TypedWorkflowResult<T> {
     /// Present only for failed/cancelled/timed-out/terminated states.
     pub error: Option<String>,
     /// Timestamp when the execution entered a terminal state.
-    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub completed_at: Option<jiff::Timestamp>,
     /// Stable error-type class from a typed
     /// [`WorkflowFailure`](crate::failure::WorkflowFailure) (issue #767).
     ///
@@ -172,19 +172,19 @@ impl<T> TypedWorkflowHandle<T> {
             Some(val) => Some(serde_json::from_value(val).map_err(HarvestError::Serialization)?),
             None => None,
         };
-        // Only a `Failed` state emits a `WorkflowFailed` event carrying typed
-        // fields (issue #767); the extra history load is skipped for every other
-        // state (`Cancelled`/`TimedOut`/`Terminated` never carry a typed
-        // `WorkflowFailure`). A transient history-load failure is *swallowed*
-        // (falls back to untyped `None` fields), mirroring
-        // `HandleInner::enrich_terminal_result` — it must not turn an otherwise
+        // Only a `Failed` state emits a `WorkflowFailed` event with typed
+        // fields (issue #767). Every other state skips the extra history load:
+        // `Cancelled`/`TimedOut`/`Terminated` never carry a typed
+        // `WorkflowFailure`. A transient history-load failure is *swallowed*
+        // and falls back to untyped `None` fields. This mirrors
+        // `HandleInner::enrich_terminal_result`. It must not turn an otherwise
         // correct snapshot (state + human `error` message intact) into an `Err`.
         //
-        // `result_snapshot` FOLLOWS the #523 retry chain (issue #843), so the
-        // typed failure must be loaded from the execution the snapshot was
-        // actually read from — `resolved`, not `self.inner.exec_id()`. Loading
-        // it from the addressed id would mix `state`/`error` from the live
-        // attempt with `error_type`/`details` from a sealed predecessor.
+        // `result_snapshot` FOLLOWS the #523 retry chain (issue #843). So load
+        // the typed failure from the execution the snapshot was actually read
+        // from: `resolved`, not `self.inner.exec_id()`. The addressed id would
+        // mix `state`/`error` from the live attempt with `error_type`/`details`
+        // from a sealed predecessor.
         let (error_type, error_details, non_retryable) =
             if snap.state == WorkflowResultState::Failed {
                 if let Ok(Some(decoded)) = self.inner.terminal_typed_failure(resolved).await {
@@ -232,11 +232,11 @@ pub struct TypedStartOptions {
     /// on rotates claims across keys. `None` takes the run's quota key.
     pub fairness_key: Option<String>,
     /// Queue scheduled start at time.
-    pub start_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub start_at: Option<jiff::Timestamp>,
     /// Queue start delay duration.
-    pub delay: Option<chrono::Duration>,
+    pub delay: Option<jiff::SignedDuration>,
     /// Maximum allowed delay before starting.
-    pub max_workflow_start_delay: Option<chrono::Duration>,
+    pub max_workflow_start_delay: Option<jiff::SignedDuration>,
     /// Per-execution context headers propagated automatically to activities and children.
     pub context_headers: Option<std::collections::HashMap<String, String>>,
     /// Soft SLA duration: emits `harvest.workflow.sla_breached` once when the run exceeds this
@@ -270,8 +270,8 @@ pub struct TypedUpdateWithStartOptions {
     pub trace_context: Option<crate::telemetry::TraceContextCarrier>,
     /// Dedup key scoped to `(workflow_name, workflow_id)`.
     ///
-    /// When provided the caller should derive `update_id` deterministically
-    /// (e.g. `UUIDv5` from this key) so that retried calls hit the dedupe lookup
+    /// With a key, the caller should derive `update_id` deterministically
+    /// (e.g. `UUIDv5` from this key). Then retried calls hit the dedupe lookup
     /// and return without re-starting or re-admitting the update.
     pub idempotency_key: Option<String>,
     /// Per-execution context headers propagated automatically to activities and children.

@@ -57,7 +57,7 @@ Options for each open question. The chosen option is in bold.
 | A pass spends past the cap of the mesh of its agent. | The turn checks the mesh budget after the LLM budget, before the model call. The pass run publishes `agent_mesh`, so the mesh spend counts its ledger rows. |
 | Pass tokens are not billed. | The turn records one cost ledger call. The ledger keys it under the pass run. |
 | A reply names an unknown episode id. | Unknown ids drop. A fact with no known id is rejected and counted. |
-| A reply that does not parse marks every episode consolidated, so the episodes are lost. | Such a reply ends the pass as `invalid_reply`. It marks nothing. The next pass reads the same episodes. |
+| A reply that does not parse marks every episode consolidated, so the episodes are lost. | Such a reply ends the pass as `invalid_reply`. It marks nothing. A reply that hit the output cap ends as `output_capped` (issue #2696). The next pass reads the same episodes. |
 | An episode text in the prompt acts as an instruction. | Each episode is escaped onto one line. The prompt says that episodes are records, not instructions. |
 | `agents erase` keeps the history of a pass. | A child pass is a child of an agent run, so the run erase reaches it. A scheduled pass publishes `agent_consolidation_of`, and `erase` erases each one. |
 | A pass and its next pass read the same episodes and pay twice. | The `Every` trigger runs one child pass inside one op, so one agent has one pass at a time. A schedule uses the overlap policy `skip`. |
@@ -95,6 +95,7 @@ pub struct EpisodeSettings {
     pub model: Option<String>,      // a harness model name
     pub facts_block: String,        // default "memory"
     pub max_pass_episodes: u32,     // default 20
+    pub max_output_tokens: Option<u32>, // default None, no cap
 }
 
 pub enum ConsolidationTrigger {
@@ -139,7 +140,8 @@ pub enum ConsolidationTrigger {
    must add them before it serves `Control::ResetMemory`.
 
 A pass ends with one `ConsolidationStop`: `completed`, `nothing_to_do`,
-`budget_exceeded`, `invalid_reply`, `disabled` or `reset`.
+`budget_exceeded`, `invalid_reply`, `output_capped`, `disabled` or
+`reset`.
 
 **Known limit.** The generation check runs before each fact write. A reset
 that lands between the check and one write can still keep that one fact.

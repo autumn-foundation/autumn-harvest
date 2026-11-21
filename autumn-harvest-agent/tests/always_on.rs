@@ -28,8 +28,8 @@ fn fresh_db() -> (tempfile::TempDir, std::path::PathBuf) {
     (dir, path)
 }
 
-fn later(seconds: i64) -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc::now() + chrono::Duration::seconds(seconds)
+fn later(seconds: i64) -> jiff::Timestamp {
+    jiff::Timestamp::now() + jiff::SignedDuration::from_secs(seconds)
 }
 
 /// A delivery channel that keeps every report.
@@ -661,8 +661,18 @@ async fn a_heartbeat_does_not_write_memory_unless_allowed() {
         assert_eq!(offered, allowed);
         let user = store.load(&scope).await.unwrap()[1].entries.clone();
         assert_eq!(user.is_empty(), !allowed, "{user:?}");
+        // The prompt names the `memory` tool only when the tick has it.
+        let system = format!("{:?}", model.requests()[0].messages[0]);
+        assert_eq!(system.contains(EDIT_HEAD), allowed, "{system}");
+        assert_eq!(system.contains(READ_HEAD), !allowed, "{system}");
     }
 }
+
+/// A phrase of the snapshot head that offers the `memory` tool.
+const EDIT_HEAD: &str = "Edit them with the `memory` tool";
+
+/// A phrase of the snapshot head of a run without the `memory` tool.
+const READ_HEAD: &str = "This run has no `memory` tool";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_looping_heartbeat_delivers_a_notice() {
@@ -871,6 +881,12 @@ async fn a_followup_segment_with_actions_gets_no_memory_tool() {
     };
     assert!(has_memory(0), "the attended segment keeps the tool");
     assert!(!has_memory(2), "the woken segment is unattended");
+    // Each prompt names the `memory` tool only when its segment has it.
+    let system = |i: usize| format!("{:?}", model.requests()[i].messages[0]);
+    assert!(system(0).contains(EDIT_HEAD), "{}", system(0));
+    assert!(!system(0).contains(READ_HEAD), "{}", system(0));
+    assert!(system(2).contains(READ_HEAD), "{}", system(2));
+    assert!(!system(2).contains(EDIT_HEAD), "{}", system(2));
 }
 
 #[tokio::test(flavor = "multi_thread")]

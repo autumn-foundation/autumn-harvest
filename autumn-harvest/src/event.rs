@@ -8,7 +8,7 @@
 //! **Append-only invariant:** Never remove or reorder variants. Stored JSON
 //! must deserialize into the same variants after deployment.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -25,13 +25,13 @@ fn default_error_type() -> String {
 /// Failure reason recorded on the synthetic terminal event of a dispatch that a
 /// **failing decision cycle abandoned** (issue #952).
 ///
-/// A workflow that dispatches awaited work (a child workflow, an activity) and
-/// then returns `Err` from a sibling branch in the same decision cycle never
-/// suspends, so the dispatch never becomes a queue row or an execution row. The
-/// terminal persist path records what the code actually did — a
-/// `ChildWorkflowStarted`/`ActivityScheduled` at the command's emission position
-/// — immediately followed by a terminal carrying this reason, so the audit trail
-/// neither drops the dispatch nor claims work that is still in flight.
+/// A workflow can dispatch awaited work (a child workflow, an activity), then
+/// return `Err` from a sibling branch in the same decision cycle. It never
+/// suspends, so the dispatch never becomes a queue row or an execution row.
+/// The terminal persist path records what the code actually did. It writes a
+/// `ChildWorkflowStarted`/`ActivityScheduled` at the command's emission
+/// position, then a terminal with this reason. So the audit trail neither
+/// drops the dispatch nor claims work that is still in flight.
 ///
 /// Deliberately a plain message on the **existing** `ChildWorkflowFailed` /
 /// `ActivityFailed` variants: issue #952 adds no `WorkflowEvent` variant, no
@@ -42,11 +42,11 @@ pub const ABANDONED_DISPATCH_REASON: &str =
 /// Which deterministic built-in produced a [`WorkflowEvent::SideEffectRecorded`]
 /// event (issue #384).
 ///
-/// This is a **bounded** enum — it has a fixed, small set of variants and is
-/// safe to use as a low-cardinality `OTel` attribute value (ADR-0001 §7). Each of
-/// the `WorkflowContext` deterministic primitives lowers onto a single
-/// `SideEffectRecorded` event and stamps the originating helper here so replay
-/// diagnostics and metrics can distinguish a clock read from a UUID mint without
+/// This is a **bounded** enum with a fixed, small set of variants. It is safe
+/// to use as a low-cardinality `OTel` attribute value (ADR-0001 §7). Each
+/// `WorkflowContext` deterministic primitive lowers onto a single
+/// `SideEffectRecorded` event and stamps the originating helper here. So replay
+/// diagnostics and metrics can tell a clock read from a UUID mint without
 /// inspecting the recorded value.
 ///
 /// **Append-only invariant:** never remove or rename a variant. The serialised
@@ -99,7 +99,8 @@ pub enum WorkflowEvent {
         #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         input: serde_json::Value,
         /// Time when the workflow was initiated.
-        timestamp: DateTime<Utc>,
+        #[serde(deserialize_with = "crate::time::serde_clamped::deserialize")]
+        timestamp: Timestamp,
         /// Output of the most recent prior COMPLETED run of the same schedule (issue #488).
         /// `None` for the first run, for manual (non-scheduled) starts, and when no prior
         /// run succeeded. Frozen at workflow start time; replay always returns this value.
@@ -116,8 +117,12 @@ pub enum WorkflowEvent {
         /// direct/manual API starts, ad-hoc trigger-now, and pre-#508 histories. This is
         /// the pre-jitter logical slot (`scheduled_for`), NOT `effective_fire_time` and
         /// NOT the execution start wall-clock (`timestamp`). Frozen at start; replay-stable.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        scheduled_time: Option<DateTime<Utc>>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::time::serde_clamped::option::deserialize"
+        )]
+        scheduled_time: Option<Timestamp>,
     },
     /// The workflow ran to completion without an error.
     WorkflowCompleted {
@@ -348,8 +353,8 @@ pub enum WorkflowEvent {
 
     // ── Continue-as-new ───────────────────────────────────────────
     /// The workflow signalled `continue_as_new`. This is the terminal event
-    /// for the current execution; a fresh execution sharing the same logical
-    /// `WorkflowId` is started in its place with the recorded `input`.
+    /// for the current execution. A fresh execution with the same logical
+    /// `WorkflowId` starts in its place with the recorded `input`.
     WorkflowContinuedAsNew {
         /// The execution ID of the freshly started run that succeeds this one.
         new_exec_id: ExecutionId,
@@ -358,8 +363,8 @@ pub enum WorkflowEvent {
         input: serde_json::Value,
         /// Registered workflow type the successor runs as (issue #803).
         ///
-        /// `None` — the overwhelmingly common case, and what every event
-        /// written before #803 deserializes to — means **same type**: the
+        /// `None` means **same type**. It is the overwhelmingly common case,
+        /// and every event written before #803 deserializes to it. The
         /// successor inherits the predecessor's `workflow_name` and carries
         /// its lifecycle columns forward verbatim, exactly as before.
         ///
@@ -379,8 +384,8 @@ pub enum WorkflowEvent {
     // ── Local activities (issue #98) ─────────────────────────────────────
     /// A local activity was dispatched for inline execution on the workflow
     /// worker. Unlike regular activities, local activities never write a row to
-    /// `harvest_task_queue`; the worker runs the handler in the same Tokio task
-    /// that drives the workflow loop.
+    /// `harvest_task_queue`. The worker runs the handler in the same Tokio
+    /// task that drives the workflow loop.
     LocalActivityScheduled {
         /// Unique ID for this local activity attempt sequence.
         activity_id: ActivityExecId,
@@ -389,16 +394,17 @@ pub enum WorkflowEvent {
         /// JSON input for the activity.
         #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         input: serde_json::Value,
-        /// Disambiguation marker distinguishing a #620+ event whose defaults were
-        /// fully resolved at first schedule from a genuine pre-#620 legacy event
-        /// (issue #620, Codex P2). BOTH `retry_policy` and `start_to_close_nanos`
-        /// below serialize as absent when they resolved to "no floor", so an
-        /// absent value alone cannot tell a resolved-to-nothing #620+ event apart
-        /// from a legacy event — the former MUST stay frozen (implicit 1-attempt /
-        /// no STC floor) on recovery, the latter MUST fall back to live
-        /// re-derivation for backward compat. This one marker covers both frozen
-        /// fields: every #620+ schedule writes it `true` at the same first-schedule
-        /// anchor; a pre-#620 event has the field absent → deserializes to `false`.
+        /// Marks a #620+ event whose defaults were fully resolved at first
+        /// schedule, as opposed to a genuine pre-#620 legacy event (issue #620).
+        ///
+        /// BOTH `retry_policy` and `start_to_close_nanos` below serialize as
+        /// absent when they resolved to "no floor". So an absent value alone
+        /// cannot tell a resolved-to-nothing #620+ event from a legacy event.
+        /// The former MUST stay frozen on recovery (implicit 1-attempt / no STC
+        /// floor). The latter MUST fall back to live re-derivation for backward
+        /// compat. This one marker covers both frozen fields. Every #620+
+        /// schedule writes it `true` at the same first-schedule anchor. A
+        /// pre-#620 event has the field absent, which deserializes to `false`.
         #[serde(default)]
         resolved: bool,
         /// The fully-resolved retry policy this local activity was scheduled
@@ -406,33 +412,37 @@ pub enum WorkflowEvent {
         ///
         /// Additive/optional: pre-#620 events deserialize to `None`. On a #620+
         /// event (`resolved == true`), a recorded `None` means "explicitly
-        /// resolved to no retry floor" and MUST stay frozen (implicit 1 attempt);
-        /// a legacy event (`resolved == false`) with `None` falls back to today's
-        /// live re-derivation. Frozen here so a local activity mid-retry across a
-        /// worker crash keeps its ORIGINAL retry budget even if the builder-level
-        /// default (`WorkerConfig::with_default_activity_retry_policy`) is changed
-        /// in the crash-recovery window (AC8: an in-flight execution is unaffected
-        /// by later default changes). Recorded on the live frontier at first
-        /// schedule; read on crash-recovery replay — the established side-effect
-        /// pattern.
+        /// resolved to no retry floor". It MUST stay frozen (implicit 1
+        /// attempt). A legacy event (`resolved == false`) with `None` falls
+        /// back to today's live re-derivation.
+        ///
+        /// It is frozen here so a local activity mid-retry across a worker crash
+        /// keeps its ORIGINAL retry budget. That holds even if the builder-level
+        /// default (`WorkerConfig::with_default_activity_retry_policy`) changes
+        /// in the crash-recovery window. AC8 requires that later default changes
+        /// do not affect an in-flight execution. Recorded on the live frontier
+        /// at first schedule; read on crash-recovery replay. That is the
+        /// established side-effect pattern.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_policy: Option<crate::policy::RetryPolicy>,
         /// The fully-resolved `start_to_close` this local activity was scheduled
         /// with, in **nanoseconds** (call-site → activity default → builder
-        /// default; issue #620, Codex P2). Nanoseconds — the FULL `Duration`
-        /// precision — so no floor is ever truncated: the local per-attempt
-        /// timeout is `Duration::from_nanos(this).min(cap)`. Truncating at any
-        /// coarser unit is the same footgun one order down (a seconds field
-        /// zeroes a subsecond floor; a millis field zeroes a sub-millisecond
-        /// floor like `Duration::from_micros(500)`), so the full `Duration` is
-        /// carried end-to-end (`u64` nanos ≈ 584 years — never saturates for a
-        /// realistic timeout).
+        /// default; issue #620).
         ///
-        /// Additive/optional, same freeze semantics as `retry_policy`: on a #620+
-        /// event (`resolved == true`) a recorded value — `Some` OR `None` — is
-        /// authoritative on recovery (`None` = "explicitly resolved to no STC
-        /// floor", frozen); a legacy event (`resolved == false`) falls back to
-        /// live re-derivation.
+        /// Nanoseconds are the FULL `Duration` precision, so no floor is ever
+        /// truncated. The local per-attempt timeout is
+        /// `Duration::from_nanos(this).min(cap)`. Any coarser unit is the same
+        /// footgun one order down. A seconds field zeroes a subsecond floor. A
+        /// millis field zeroes a sub-millisecond floor like
+        /// `Duration::from_micros(500)`. So the full `Duration` is carried
+        /// end-to-end. `u64` nanos ≈ 584 years, so it never saturates for a
+        /// realistic timeout.
+        ///
+        /// Additive/optional, with the same freeze semantics as `retry_policy`.
+        /// On a #620+ event (`resolved == true`), a recorded value, `Some` OR
+        /// `None`, is authoritative on recovery. There `None` means "explicitly
+        /// resolved to no STC floor", frozen. A legacy event
+        /// (`resolved == false`) falls back to live re-derivation.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         start_to_close_nanos: Option<u64>,
     },
@@ -446,10 +456,10 @@ pub enum WorkflowEvent {
     },
     /// A local activity attempt returned an error or the handler panicked.
     ///
-    /// Multiple `LocalActivityFailed` events may appear in sequence (one per
-    /// attempt) before a terminal `LocalActivityCompleted` (retry eventually
-    /// succeeded) or before the retry budget is exhausted (followed by a
-    /// `LocalActivityExhausted` event that marks the terminal state).
+    /// Multiple `LocalActivityFailed` events may appear in sequence, one per
+    /// attempt. A terminal `LocalActivityCompleted` follows when a retry
+    /// succeeds. A `LocalActivityExhausted` event follows when the retry
+    /// budget is exhausted, and marks the terminal state.
     LocalActivityFailed {
         /// Unique ID matching the corresponding `LocalActivityScheduled`.
         activity_id: ActivityExecId,
@@ -473,7 +483,7 @@ pub enum WorkflowEvent {
         /// JSON input for the activity.
         #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         input: serde_json::Value,
-        /// Target worker queue (informational; external activities don't occupy a slot).
+        /// Target worker queue (informational; external activities do not occupy a slot).
         queue: String,
         /// Maximum seconds the external system has to deliver a result.
         schedule_to_close_secs: u64,
@@ -524,7 +534,7 @@ pub enum WorkflowEvent {
         #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
         input: serde_json::Value,
         /// Time when the update was admitted.
-        timestamp: DateTime<Utc>,
+        timestamp: Timestamp,
     },
     /// The update handler ran to completion and returned a value.
     UpdateCompleted {
@@ -570,10 +580,10 @@ pub enum WorkflowEvent {
     /// immediately after the final `LocalActivityFailed` event so replay can
     /// identify the terminal state without knowing the current retry policy.
     ///
-    /// This makes the terminal-vs-in-progress distinction policy-invariant:
-    /// if this event is present the activity is unambiguously done; if only
-    /// `LocalActivityFailed` events are present (without a following
-    /// `LocalActivityExhausted`) the worker crashed between retries and must
+    /// This makes the terminal-vs-in-progress distinction policy-invariant.
+    /// If this event is present, the activity is unambiguously done. If only
+    /// `LocalActivityFailed` events are present, with no following
+    /// `LocalActivityExhausted`, the worker crashed between retries. It must
     /// continue from the next attempt.
     LocalActivityExhausted {
         /// Unique ID matching the corresponding `LocalActivityScheduled`.
@@ -585,10 +595,11 @@ pub enum WorkflowEvent {
     },
 
     // ── External workflow signals (issue #330, by-id targeting #751) ─────────
-    /// A workflow requested delivery of a named signal to another workflow,
-    /// addressed either by a specific `ExecutionId` or by a stable
-    /// `(workflow_name, workflow_id)` business key resolved to the current
-    /// run at delivery time (issue #751).
+    /// A workflow requested delivery of a named signal to another workflow.
+    ///
+    /// The target is a specific `ExecutionId`, or a stable
+    /// `(workflow_name, workflow_id)` business key. The key resolves to the
+    /// current run at delivery time (issue #751).
     ///
     /// The `signal_id` correlates this request with its terminal outcome event
     /// (`ExternalSignalDelivered` or `ExternalSignalFailed`). On replay the
@@ -596,9 +607,9 @@ pub enum WorkflowEvent {
     /// side effect.
     ///
     /// `target`'s type widened from a bare `ExecutionId` to
-    /// [`crate::types::ExternalTarget`] in issue #751 — `#[serde(untagged)]`
-    /// makes every pre-#751 stored event (a bare UUID string) deserialize
-    /// unchanged into the `ExecutionId` variant.
+    /// [`crate::types::ExternalTarget`] in issue #751. With
+    /// `#[serde(untagged)]`, every pre-#751 stored event (a bare UUID string)
+    /// deserializes unchanged into the `ExecutionId` variant.
     ExternalSignalRequested {
         /// Correlation ID linking this event to its terminal outcome.
         signal_id: ExternalSignalId,
@@ -624,9 +635,9 @@ pub enum WorkflowEvent {
     /// - `"target_terminal"` — the target execution is already in a terminal
     ///   state (`ExecutionId`-targeted requests only).
     /// - `"not_running"` — the resolved current run for a `workflow_id`
-    ///   target is definitively terminal (issue #751; no grace window needed,
-    ///   since a continue-as-new always leaves an active successor behind
-    ///   atomically, so this observation can never be a false negative).
+    ///   target is definitively terminal (issue #751). No grace window is
+    ///   needed. A continue-as-new always leaves an active successor behind
+    ///   atomically, so this observation can never be a false negative.
     /// - `"target_unknown"` — no execution with the given ID (or business key)
     ///   was ever found, after the configured grace window.
     ExternalSignalFailed {
@@ -690,23 +701,23 @@ pub enum WorkflowEvent {
     /// the timeout decision is derivable from the stored `deadline` alone.
     WorkflowExecutionTimedOut {
         /// The absolute deadline that was exceeded (`started_at + execution_timeout`).
-        deadline: DateTime<Utc>,
+        deadline: Timestamp,
         /// The actual wall-clock time when the scanner detected and enforced the timeout.
-        timed_out_at: DateTime<Utc>,
+        timed_out_at: Timestamp,
     },
 
     // ── Deterministic side-effect primitives (issue #384) ─────────────────────
     /// A deterministic value was captured during live execution and frozen into
     /// history so subsequent replays return the identical value.
     ///
-    /// All of the `WorkflowContext` deterministic primitives — `system_now()`,
-    /// `system_time_now()`, `new_uuid()`, `random_u64()`, `random_f64()`,
-    /// `random_range()`, and `side_effect()` — lower onto this single variant so
-    /// the event-schema cost of the feature is paid exactly once. The `kind`
-    /// discriminator (a bounded enum) records which helper produced the value;
-    /// `name` is `Some` only for `side_effect()` (the author-supplied dedup key)
-    /// and `None` for the built-in unnamed helpers; `value` is the recorded JSON
-    /// result returned on every replay.
+    /// All of the `WorkflowContext` deterministic primitives lower onto this
+    /// single variant: `system_now()`, `system_time_now()`, `new_uuid()`,
+    /// `random_u64()`, `random_f64()`, `random_range()`, and `side_effect()`.
+    /// So the event-schema cost of the feature is paid exactly once. The
+    /// `kind` discriminator (a bounded enum) records which helper produced the
+    /// value. `name` is `Some` only for `side_effect()` (the author-supplied
+    /// dedup key) and `None` for the built-in unnamed helpers. `value` is the
+    /// recorded JSON result returned on every replay.
     ///
     /// This is an **append-only** variant added at the end of the enum. The
     /// `harvest_events` table stores it as opaque JSON, so no migration is
@@ -732,13 +743,13 @@ pub enum WorkflowEvent {
     ///
     /// ## Replay determinism
     ///
-    /// Pause/resume events are no-ops for command dispatch during replay: the
-    /// [`crate::replay::HistoryMatcher`] skips them transparently, so a recorded
-    /// pause/resume pair never alters the command sequence reconstructed from
-    /// history.
+    /// Pause/resume events are no-ops for command dispatch during replay. The
+    /// [`crate::replay::HistoryMatcher`] skips them transparently. So a
+    /// recorded pause/resume pair never alters the command sequence
+    /// reconstructed from history.
     WorkflowExecutionPaused {
         /// Wall-clock time the pause was applied.
-        paused_at: DateTime<Utc>,
+        paused_at: Timestamp,
         /// Optional operator-supplied reason (max 500 chars, enforced at the API
         /// boundary). `None` when no reason was given.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -749,22 +760,23 @@ pub enum WorkflowEvent {
     },
     /// An operator (or the bounded-pause auto-resume scanner) resumed a paused
     /// execution. The executor re-arms and the workflow advances on its next
-    /// decision attempt; timers whose fire time elapsed while paused fire
-    /// immediately in their original order, and signals queued during the pause
+    /// decision attempt. Timers whose fire time elapsed while paused fire
+    /// immediately in their original order. Signals queued during the pause
     /// are delivered in order.
     WorkflowExecutionResumed {
         /// Wall-clock time the resume was applied.
-        resumed_at: DateTime<Utc>,
+        resumed_at: Timestamp,
         /// Identity that requested the resume. `"auto-resume(timeout)"` when the
         /// bounded-pause scanner resumed an over-long pause.
         actor: String,
     },
 
     // ── External workflow cancellation (issue #492, by-id targeting #751) ────
-    /// A workflow requested cancellation of another workflow, addressed
-    /// either by a specific `ExecutionId` or by a stable
-    /// `(workflow_name, workflow_id)` business key resolved to the current
-    /// run at delivery time (issue #751).
+    /// A workflow requested cancellation of another workflow.
+    ///
+    /// The target is a specific `ExecutionId`, or a stable
+    /// `(workflow_name, workflow_id)` business key. The key resolves to the
+    /// current run at delivery time (issue #751).
     ///
     /// The `cancel_id` correlates this request with its terminal outcome event
     /// (`ExternalCancelDelivered` or `ExternalCancelFailed`). On replay the
@@ -800,18 +812,18 @@ pub enum WorkflowEvent {
 
     // ── DLQ redrive reactivation (issue #510) ─────────────────────────────────
     /// An operator redrove a dead-lettered task whose owning execution had been
-    /// sealed `FAILED` at quarantine time. This event reopens the execution: it
-    /// is appended **after** the superseded terminal
-    /// [`WorkflowFailed`](Self::WorkflowFailed) and the execution transitions
-    /// `FAILED` → `RUNNING` so the re-enqueued task resumes from existing
+    /// sealed `FAILED` at quarantine time. This event reopens the execution.
+    /// It is appended **after** the superseded terminal
+    /// [`WorkflowFailed`](Self::WorkflowFailed). The execution transitions
+    /// `FAILED` → `RUNNING`, so the re-enqueued task resumes from existing
     /// history (append-only; no prior event is rewritten).
     ///
     /// ## Replay determinism
     ///
     /// `WorkflowRedriven` is a **non-terminal** lifecycle event and is a no-op
-    /// for command dispatch during replay: the
+    /// for command dispatch during replay. The
     /// [`crate::replay::HistoryMatcher`] marks both this event **and** the
-    /// `WorkflowFailed` it supersedes as transparent, so the reconstructed
+    /// `WorkflowFailed` it supersedes as transparent. So the reconstructed
     /// command sequence advances past the reopened terminal instead of
     /// diverging against it. A bare trailing `WorkflowFailed` with no following
     /// `WorkflowRedriven` stays non-transparent (a genuinely failed run).
@@ -824,7 +836,7 @@ pub enum WorkflowEvent {
     /// still advances past them instead of diverging.
     WorkflowRedriven {
         /// Wall-clock time the redrive reactivation was applied.
-        redriven_at: DateTime<Utc>,
+        redriven_at: Timestamp,
         /// The `harvest_dead_letters` row that triggered this reactivation.
         dead_letter_id: Uuid,
         /// Optional operator-supplied reason. `None` when no reason was given.
@@ -841,7 +853,7 @@ pub enum WorkflowEvent {
     /// This event lives ONLY in the sealed failed run's history and is appended
     /// **after** the terminal `WorkflowFailed` event. The
     /// [`crate::replay::HistoryMatcher`] stops consuming events after a terminal
-    /// lifecycle event, so this trailing event is transparent to replay: the
+    /// lifecycle event. So this trailing event is transparent to replay. The
     /// failed run is already sealed; its retry is a separate execution.
     WorkflowRetryScheduled {
         /// The execution ID of the newly-created retry run.
@@ -849,8 +861,9 @@ pub enum WorkflowEvent {
         /// Attempt number of the NEW run (= `failed_run.workflow_attempt` + 1).
         attempt: u32,
         /// Wall-clock instant when the retry becomes claimable by a worker.
-        /// `Utc::now()` for immediate retries, or `now + backoff` for delayed ones.
-        fire_at: DateTime<Utc>,
+        /// `Timestamp::now()` for immediate retries, or `now + backoff` for delayed ones.
+        #[serde(deserialize_with = "crate::time::serde_clamped::deserialize")]
+        fire_at: Timestamp,
     },
 
     // ── Cancellable / renewable durable timers (issue #768) ───────────────────────
@@ -867,9 +880,9 @@ pub enum WorkflowEvent {
     /// A `TimerCancelled { timer_id }` recorded **before** any `TimerFired` with the
     /// same id resolves the timer's observed outcome to
     /// [`crate::context::TimerOutcome::Cancelled`]. It is a command-bearing event
-    /// that may interleave with unrelated activity/timer/child scans, so every
-    /// forward scan loop in [`crate::replay::HistoryMatcher`] skips it out of order
-    /// (mirroring the `TimerFired` / external-cancel skip pattern).
+    /// that may interleave with unrelated activity/timer/child scans. So every
+    /// forward scan loop in [`crate::replay::HistoryMatcher`] skips it out of
+    /// order, like the `TimerFired` / external-cancel skip pattern.
     ///
     /// Appended at the END of the enum; pre-#768 histories that never contain this
     /// variant deserialize unchanged.
@@ -952,7 +965,7 @@ pub enum WorkflowEvent {
         /// Monotonic fencing token minted for this grant.
         lock_seq: i64,
         /// Wall-clock instant the lock was granted.
-        acquired_at: DateTime<Utc>,
+        acquired_at: Timestamp,
     },
 
     // ── Decision boundary (issue #1833) ───────────────────────────────────────
@@ -1056,10 +1069,7 @@ impl WorkflowEvent {
     /// `None`. Gives downstream code a non-breaking construction path across future
     /// additive field additions to this variant (issue #688).
     #[must_use]
-    pub const fn workflow_started(
-        input: serde_json::Value,
-        timestamp: chrono::DateTime<chrono::Utc>,
-    ) -> Self {
+    pub const fn workflow_started(input: serde_json::Value, timestamp: jiff::Timestamp) -> Self {
         Self::WorkflowStarted {
             input,
             timestamp,
@@ -1203,13 +1213,13 @@ impl WorkflowEvent {
                 | Self::WorkflowContinuedAsNew { .. }
                 | Self::WorkflowResetTerminated { .. }
                 | Self::WorkflowExecutionTimedOut { .. }
-                // Written to the parent history after the parent's own terminal event;
-                // never consumed by the workflow function itself, so must be skipped
-                // during unconsumed-event checks to avoid false non-determinism reports.
+                // Written to the parent history after the parent's own terminal
+                // event. The workflow function never consumes it. Unconsumed-event
+                // checks skip it, or they would report false non-determinism.
                 | Self::ChildWorkflowCascadeApplied { .. }
                 // Appended to the failed run's history after WorkflowFailed as a
-                // durable linkage record; the failed run is sealed and the event is
-                // never consumed by its workflow function on replay.
+                // durable linkage record. The failed run is sealed. Its workflow
+                // function never consumes the event on replay.
                 | Self::WorkflowRetryScheduled { .. }
         )
     }
@@ -1359,13 +1369,53 @@ impl PayloadSlot<'_> {
 mod tests {
     use super::*;
     use crate::types::ActivityExecId;
-    use chrono::Utc;
+    use jiff::Timestamp;
+
+    /// A chrono-era event with a year past 9999 still loads, clamped.
+    #[test]
+    fn a_chrono_year_past_the_jiff_range_reads_clamped() {
+        let id = ExecutionId::new();
+        let json = serde_json::json!({
+            "type": "WorkflowRetryScheduled",
+            "data": {"retry_exec_id": id, "attempt": 2, "fire_at": "+12026-01-01T00:00:00Z"},
+        });
+        let event: WorkflowEvent = serde_json::from_value(json).unwrap();
+        assert!(
+            matches!(event, WorkflowEvent::WorkflowRetryScheduled { fire_at, .. } if fire_at == Timestamp::MAX)
+        );
+        let json = serde_json::json!({
+            "type": "WorkflowStarted",
+            "data": {
+                "input": {},
+                "timestamp": "+12026-01-01T00:00:00.000Z",
+                "scheduled_time": "+12026-01-01T00:00:00Z",
+            },
+        });
+        let event: WorkflowEvent = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            event,
+            WorkflowEvent::WorkflowStarted { timestamp, scheduled_time: Some(slot), .. }
+                if timestamp == Timestamp::MAX && slot == Timestamp::MAX
+        ));
+        let json = serde_json::json!({
+            "type": "WorkflowStarted",
+            "data": {"input": {}, "timestamp": "2026-01-01T00:00:00Z"},
+        });
+        let event: WorkflowEvent = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            event,
+            WorkflowEvent::WorkflowStarted {
+                scheduled_time: None,
+                ..
+            }
+        ));
+    }
 
     /// Issue #2253: a state change evicts the owner's cache entry. A plain
     /// result does not.
     #[test]
     fn a_state_change_evicts_the_owner_cache() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let evicting = [
             WorkflowEvent::WorkflowExecutionPaused {
                 paused_at: now,
@@ -1565,7 +1615,7 @@ mod tests {
     fn workflow_started_round_trips_serde() -> Result<(), serde_json::Error> {
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({"user_id": 42}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1598,11 +1648,11 @@ mod tests {
     /// `scheduled_time: Some(t)` round-trips correctly through serde.
     #[test]
     fn workflow_started_scheduled_time_round_trips() {
-        use chrono::TimeZone as _;
-        let slot = Utc.with_ymd_and_hms(2026, 3, 15, 0, 0, 0).unwrap();
+        use jiff::Timestamp;
+        let slot = crate::time::utc_ymd_hms(2026, 3, 15, 0, 0, 0).unwrap();
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!(null),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: Some(slot),
@@ -1622,7 +1672,7 @@ mod tests {
     fn workflow_started_scheduled_time_none_omitted_from_json() {
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!(null),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1655,7 +1705,7 @@ mod tests {
         let event = WorkflowEvent::MutexGranted {
             key: "ledger:acct-42".into(),
             lock_seq: 7,
-            acquired_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            acquired_at: Timestamp::from_second(1_700_000_000).unwrap(),
         };
         let value = serde_json::to_value(&event)?;
         assert_eq!(value["type"], "MutexGranted");
@@ -1672,16 +1722,13 @@ mod tests {
         };
         assert_eq!(key, "ledger:acct-42");
         assert_eq!(lock_seq, 7);
-        assert_eq!(
-            acquired_at,
-            DateTime::from_timestamp(1_700_000_000, 0).unwrap()
-        );
+        assert_eq!(acquired_at, Timestamp::from_second(1_700_000_000).unwrap());
         Ok(())
     }
 
     #[test]
     fn local_activity_scheduled_round_trips() -> Result<(), serde_json::Error> {
-        // Issue #620 (Codex P2): a #620+ event carrying the resolution marker
+        // Issue #620: a #620+ event carrying the resolution marker
         // plus frozen retry/STC must round-trip all three fields verbatim.
         let event = WorkflowEvent::LocalActivityScheduled {
             activity_id: ActivityExecId::new(),
@@ -1809,7 +1856,7 @@ mod tests {
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -1928,7 +1975,7 @@ mod tests {
                 update_id: crate::types::UpdateId::new(),
                 name: "approve".into(),
                 input: serde_json::Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
             },
             WorkflowEvent::UpdateCompleted {
                 update_id: crate::types::UpdateId::new(),
@@ -1964,8 +2011,8 @@ mod tests {
                 reason_code: "target_terminal".into(),
             },
             WorkflowEvent::WorkflowExecutionTimedOut {
-                deadline: Utc::now(),
-                timed_out_at: Utc::now(),
+                deadline: Timestamp::now(),
+                timed_out_at: Timestamp::now(),
             },
             WorkflowEvent::SideEffectRecorded {
                 kind: crate::event::SideEffectKind::Now,
@@ -1973,12 +2020,12 @@ mod tests {
                 value: serde_json::Value::Null,
             },
             WorkflowEvent::WorkflowExecutionPaused {
-                paused_at: Utc::now(),
+                paused_at: Timestamp::now(),
                 reason: Some("incident".into()),
                 actor: "oncall".into(),
             },
             WorkflowEvent::WorkflowExecutionResumed {
-                resumed_at: Utc::now(),
+                resumed_at: Timestamp::now(),
                 actor: "oncall".into(),
             },
             WorkflowEvent::ChildWorkflowSpawnedDetached {
@@ -2004,14 +2051,14 @@ mod tests {
                 reason_code: "target_unknown".into(),
             },
             WorkflowEvent::WorkflowRedriven {
-                redriven_at: Utc::now(),
+                redriven_at: Timestamp::now(),
                 dead_letter_id: Uuid::new_v4(),
                 reason: None,
             },
             WorkflowEvent::WorkflowRetryScheduled {
                 retry_exec_id: ExecutionId::new(),
                 attempt: 2,
-                fire_at: Utc::now(),
+                fire_at: Timestamp::now(),
             },
             WorkflowEvent::TimerCancelled {
                 timer_id: TimerId::new("t"),
@@ -2347,8 +2394,8 @@ mod tests {
 
     #[test]
     fn workflow_execution_timed_out_round_trips() -> Result<(), serde_json::Error> {
-        let deadline = Utc::now();
-        let timed_out_at = Utc::now();
+        let deadline = Timestamp::now();
+        let timed_out_at = Timestamp::now();
         let event = WorkflowEvent::WorkflowExecutionTimedOut {
             deadline,
             timed_out_at,
@@ -2382,8 +2429,8 @@ mod tests {
     #[test]
     fn workflow_execution_timed_out_type_name_is_stable() {
         let e = WorkflowEvent::WorkflowExecutionTimedOut {
-            deadline: Utc::now(),
-            timed_out_at: Utc::now(),
+            deadline: Timestamp::now(),
+            timed_out_at: Timestamp::now(),
         };
         assert_eq!(e.type_name(), "WorkflowExecutionTimedOut");
     }
@@ -2412,8 +2459,8 @@ mod tests {
                 operator_id: "op".into(),
             },
             WorkflowEvent::WorkflowExecutionTimedOut {
-                deadline: Utc::now(),
-                timed_out_at: Utc::now(),
+                deadline: Timestamp::now(),
+                timed_out_at: Timestamp::now(),
             },
             // Trailing bookkeeping events appended after the terminal seal.
             WorkflowEvent::ChildWorkflowCascadeApplied {
@@ -2424,7 +2471,7 @@ mod tests {
             WorkflowEvent::WorkflowRetryScheduled {
                 retry_exec_id: exec,
                 attempt: 2,
-                fire_at: Utc::now(),
+                fire_at: Timestamp::now(),
             },
         ];
         for event in &terminal {
@@ -2460,14 +2507,14 @@ mod tests {
             },
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::Value::Null,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
             },
             // Redrive reopens a previously-failed run — must NOT count as a seal.
             WorkflowEvent::WorkflowRedriven {
-                redriven_at: Utc::now(),
+                redriven_at: Timestamp::now(),
                 dead_letter_id: Uuid::new_v4(),
                 reason: None,
             },
@@ -2485,7 +2532,7 @@ mod tests {
 
     #[test]
     fn workflow_execution_paused_round_trips() -> Result<(), serde_json::Error> {
-        let paused_at = Utc::now();
+        let paused_at = Timestamp::now();
         let event = WorkflowEvent::WorkflowExecutionPaused {
             paused_at,
             reason: Some("investigating runaway dispatch".into()),
@@ -2516,7 +2563,7 @@ mod tests {
     #[test]
     fn workflow_execution_paused_round_trips_without_reason() -> Result<(), serde_json::Error> {
         let event = WorkflowEvent::WorkflowExecutionPaused {
-            paused_at: Utc::now(),
+            paused_at: Timestamp::now(),
             reason: None,
             actor: "auto".into(),
         };
@@ -2531,7 +2578,7 @@ mod tests {
 
     #[test]
     fn workflow_execution_resumed_round_trips() -> Result<(), serde_json::Error> {
-        let resumed_at = Utc::now();
+        let resumed_at = Timestamp::now();
         let event = WorkflowEvent::WorkflowExecutionResumed {
             resumed_at,
             actor: "auto-resume(timeout)".into(),
@@ -2561,7 +2608,7 @@ mod tests {
     #[test]
     fn workflow_redriven_type_name_and_not_terminal() {
         let event = WorkflowEvent::WorkflowRedriven {
-            redriven_at: Utc::now(),
+            redriven_at: Timestamp::now(),
             dead_letter_id: Uuid::new_v4(),
             reason: Some("downstream fixed".into()),
         };
@@ -2576,7 +2623,7 @@ mod tests {
     fn workflow_redriven_round_trips_adjacently_tagged() -> Result<(), serde_json::Error> {
         let dead_letter_id = Uuid::new_v4();
         let event = WorkflowEvent::WorkflowRedriven {
-            redriven_at: Utc::now(),
+            redriven_at: Timestamp::now(),
             dead_letter_id,
             reason: Some("credential rotated".into()),
         };
@@ -2603,7 +2650,7 @@ mod tests {
     #[test]
     fn workflow_redriven_omits_reason_when_none() -> Result<(), serde_json::Error> {
         let event = WorkflowEvent::WorkflowRedriven {
-            redriven_at: Utc::now(),
+            redriven_at: Timestamp::now(),
             dead_letter_id: Uuid::new_v4(),
             reason: None,
         };
@@ -2623,7 +2670,7 @@ mod tests {
     #[test]
     fn workflow_started_constructor_defaults_additive_fields_to_none()
     -> Result<(), serde_json::Error> {
-        let ts = Utc::now();
+        let ts = Timestamp::now();
         let event = WorkflowEvent::workflow_started(serde_json::json!({"k": 1}), ts);
         match &event {
             WorkflowEvent::WorkflowStarted {
@@ -2642,7 +2689,6 @@ mod tests {
             _ => panic!("wrong variant"),
         }
 
-        // The three additive optionals skip when None.
         let json = serde_json::to_string(&event)?;
         assert!(
             !json.contains("last_completion_result"),
@@ -2657,7 +2703,6 @@ mod tests {
             "scheduled_time must skip when None, got {json}"
         );
 
-        // Round-trips back to an equivalent value.
         let back: WorkflowEvent = serde_json::from_str(&json)?;
         match back {
             WorkflowEvent::WorkflowStarted {
@@ -2825,9 +2870,9 @@ mod tests {
 
     // ── Cross-type continue-as-new (issue #803) ──────────────────────────
 
-    /// A same-type continue-as-new records `new_workflow_type: None`, and the
-    /// additive field must be **absent** from the serialized JSON so a
-    /// pre-#803 reader (and a byte-comparison against a pre-#803 history) sees
+    /// A same-type continue-as-new records `new_workflow_type: None`. The
+    /// additive field must be **absent** from the serialized JSON. So a
+    /// pre-#803 reader, and a byte-comparison against a pre-#803 history, sees
     /// exactly today's shape.
     #[test]
     fn continued_as_new_same_type_omits_the_additive_field() -> Result<(), serde_json::Error> {
@@ -2879,8 +2924,8 @@ mod tests {
     }
 
     /// **Append-only invariant (AC3).** A history written by a pre-#803 build
-    /// carries no `new_workflow_type` key at all; it must deserialize to
-    /// `None` (same-type) rather than failing, so in-flight executions replay
+    /// carries no `new_workflow_type` key at all. It must deserialize to
+    /// `None` (same-type) rather than fail. So in-flight executions replay
     /// identically across the upgrade.
     #[test]
     fn pre_803_continued_as_new_json_deserializes_to_none() -> Result<(), serde_json::Error> {

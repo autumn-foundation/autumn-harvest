@@ -1,21 +1,21 @@
 #![cfg(feature = "db")]
 //! Integration tests for DAG-level execution timeout and SLA — issue #743.
 //!
-//! Proves the whole pipeline end to end: a `DagInfo` with `execution_timeout`/
-//! `sla` set -> `DagInfo::as_workflow_info()` -> the shadow `WorkflowInfo` ->
-//! `StartWorkflowParams` (mirroring exactly how the scheduler tick resolves
-//! these fields today for `#[workflow]`s, see
-//! `scheduler::tick_one_workflow_schedule`) -> `deadline_at`/`sla_deadline_at`
-//! on the execution row -> the EXISTING #243/#487 scanners
-//! (`timeout::enforce_workflow_execution_timeouts`,
-//! `timeout::enforce_workflow_sla_breaches`). No new scanner, no new event
+//! Proves the whole pipeline end to end. A `DagInfo` with
+//! `execution_timeout`/`sla` set goes through `DagInfo::as_workflow_info()` to
+//! the shadow `WorkflowInfo`, then to `StartWorkflowParams`. That step mirrors
+//! how the scheduler tick resolves these fields for `#[workflow]`s
+//! (`scheduler::tick_one_workflow_schedule`). The start writes
+//! `deadline_at`/`sla_deadline_at` on the execution row. The EXISTING #243/#487
+//! scanners (`timeout::enforce_workflow_execution_timeouts`,
+//! `timeout::enforce_workflow_sla_breaches`) act on them. No new scanner, no new event
 //! variant, no new migration — issue #743 AC12.
 //!
 //! - AC1/AC3: a DAG-declared `execution_timeout` produces `deadline_at`, and a
 //!   crossed deadline is caught by the existing scanner (`TIMED_OUT`, tagged
 //!   `TimeoutType::WorkflowExecution` -- not the chain path).
-//! - AC2/AC4: a DAG-declared `sla` produces `sla_deadline_at`, and a crossed
-//!   SLA is caught by the existing scanner (metric exactly once, lifecycle
+//! - AC2/AC4: a DAG-declared `sla` produces `sla_deadline_at`. The existing
+//!   scanner catches a crossed SLA (metric exactly once, lifecycle
 //!   unaffected -- the run can still reach `COMPLETED`).
 //! - AC5: `sla` is clamped down to `execution_timeout` at start when it would
 //!   otherwise exceed it (reuses the shared clamp logic in `execution.rs`).
@@ -26,6 +26,7 @@
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
 use autumn_harvest::table_split::SetExt;
+use jiff_diesel::ToDiesel;
 use std::sync::{Arc, Mutex};
 
 use autumn_harvest::execution::{StartWorkflowParams, start_or_load_workflow_execution};
@@ -36,17 +37,18 @@ use autumn_harvest::scheduler::{
 };
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::telemetry::MetricsRecorder;
+use autumn_harvest::time::sql::NullableTimestamp;
 use autumn_harvest::timeout;
 use autumn_harvest::types::{
     ExecutionId, Priority, ShardId, StartSource, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
 };
 use autumn_harvest::worker::HandlerRegistry;
 use autumn_harvest::{DagBuilder, DagInfo, OverlapPolicy, WorkflowInfo};
-use chrono::{Duration as ChronoDuration, Utc};
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use jiff::{SignedDuration, Timestamp};
 use uuid::Uuid;
 
 use crate::integration_e2e::{build_test_pool, setup_test_database_url_or_env};
@@ -57,10 +59,10 @@ async fn connect(url: &str) -> AsyncPgConnection {
         .expect("connect")
 }
 
-/// Build a `DagInfo` carrying the given `execution_timeout`/`sla`, with a
-/// no-op builder and a trivial identity `workflow_handler` so
-/// `as_workflow_info()` returns `Some` -- exactly the shape the `#[dag]`
-/// macro's companion function produces (issue #743).
+/// Build a `DagInfo` carrying the given `execution_timeout`/`sla`. A no-op
+/// builder and an identity `workflow_handler` make `as_workflow_info()` return
+/// `Some`. This is the shape the `#[dag]` macro's companion function produces
+/// (issue #743).
 fn deadline_dag(
     name: &'static str,
     execution_timeout: Option<std::time::Duration>,
@@ -88,14 +90,14 @@ fn deadline_dag(
 }
 
 /// Mirrors `scheduler::tick_one_workflow_schedule`'s resolution of a
-/// `WorkflowInfo`'s `execution_timeout`/`sla` into `chrono::Duration` for
+/// `WorkflowInfo`'s `execution_timeout`/`sla` into `jiff::SignedDuration` for
 /// `StartWorkflowParams` -- the exact conversion a real scheduled DAG fire
 /// performs.
-fn resolve_deadlines(info: &WorkflowInfo) -> (Option<ChronoDuration>, Option<ChronoDuration>) {
+fn resolve_deadlines(info: &WorkflowInfo) -> (Option<SignedDuration>, Option<SignedDuration>) {
     let execution_timeout = info
         .execution_timeout
-        .and_then(|d| ChronoDuration::from_std(d).ok());
-    let sla = info.sla.and_then(|d| ChronoDuration::from_std(d).ok());
+        .and_then(|d| SignedDuration::try_from(d).ok());
+    let sla = info.sla.and_then(|d| SignedDuration::try_from(d).ok());
     (execution_timeout, sla)
 }
 
@@ -103,9 +105,9 @@ fn base_params<'a>(
     workflow_name: &'a str,
     workflow_id: &'a str,
     exec_id: ExecutionId,
-    execution_timeout: Option<ChronoDuration>,
-    max_execution_timeout_ceiling: Option<ChronoDuration>,
-    sla: Option<ChronoDuration>,
+    execution_timeout: Option<SignedDuration>,
+    max_execution_timeout_ceiling: Option<SignedDuration>,
+    sla: Option<SignedDuration>,
 ) -> StartWorkflowParams<'a> {
     StartWorkflowParams {
         workflow_name,
@@ -157,8 +159,10 @@ fn base_params<'a>(
 #[derive(Queryable)]
 struct DeadlineRow {
     state: String,
-    deadline_at: Option<chrono::DateTime<Utc>>,
-    sla_deadline_at: Option<chrono::DateTime<Utc>>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+    deadline_at: Option<jiff::Timestamp>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+    sla_deadline_at: Option<jiff::Timestamp>,
     sla_breached: bool,
     error: Option<String>,
 }
@@ -182,7 +186,7 @@ async fn backdate_deadline_at(conn: &mut AsyncPgConnection, exec_id: ExecutionId
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set(
             harvest_workflow_executions::deadline_at
-                .eq(Some(Utc::now() - ChronoDuration::minutes(5))),
+                .eq(Some(Timestamp::now() - SignedDuration::from_mins(5)).to_diesel()),
         )
         .execute(conn)
         .await
@@ -191,10 +195,9 @@ async fn backdate_deadline_at(conn: &mut AsyncPgConnection, exec_id: ExecutionId
 
 async fn backdate_sla_deadline_at(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-        .set(SetExt(
-            harvest_workflow_executions_ext::sla_deadline_at
-                .eq(Some(Utc::now() - ChronoDuration::minutes(5))),
-        ))
+        .set(SetExt(harvest_workflow_executions_ext::sla_deadline_at.eq(
+            Some(Timestamp::now() - SignedDuration::from_mins(5)).to_diesel(),
+        )))
         .execute(conn)
         .await
         .expect("backdate sla_deadline_at");
@@ -230,9 +233,9 @@ fn unique_name(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4().simple())
 }
 
-/// Leak a UNIQUE `&'static str` DAG name so a scheduler-tick-driven or
-/// directly-triggered DAG run's own row can be found unambiguously in the
-/// shared CI database (`DagInfo::name` requires `&'static str`).
+/// Leak a UNIQUE `&'static str` DAG name (`DagInfo::name` requires one). A
+/// scheduler-tick-driven or directly-triggered DAG run can then find its own
+/// row unambiguously in the shared CI database.
 fn leaked_dag_name(prefix: &str) -> &'static str {
     Box::leak(unique_name(prefix).into_boxed_str())
 }
@@ -256,7 +259,7 @@ async fn dag_declared_execution_timeout_and_sla_set_deadline_columns() {
     let (execution_timeout, sla) = resolve_deadlines(&info);
 
     let exec_id = ExecutionId::new();
-    let before = Utc::now();
+    let before = Timestamp::now();
     let started = start_or_load_workflow_execution(
         &mut conn,
         base_params(&wf_name, "wf-1", exec_id, execution_timeout, None, sla),
@@ -265,21 +268,21 @@ async fn dag_declared_execution_timeout_and_sla_set_deadline_columns() {
     .await
     .expect("start");
     assert!(started.created);
-    let after = Utc::now();
+    let after = Timestamp::now();
 
     let row = load_row(&mut conn, exec_id).await;
     let deadline_at = row
         .deadline_at
         .expect("execution_timeout must set deadline_at");
     assert!(
-        deadline_at >= before + ChronoDuration::hours(4)
-            && deadline_at <= after + ChronoDuration::hours(4),
+        deadline_at >= before + SignedDuration::from_hours(4)
+            && deadline_at <= after + SignedDuration::from_hours(4),
         "deadline_at must be started_at + 4h (the DagInfo's declared execution_timeout)"
     );
     let sla_deadline_at = row.sla_deadline_at.expect("sla must set sla_deadline_at");
     assert!(
-        sla_deadline_at >= before + ChronoDuration::hours(1)
-            && sla_deadline_at <= after + ChronoDuration::hours(1),
+        sla_deadline_at >= before + SignedDuration::from_hours(1)
+            && sla_deadline_at <= after + SignedDuration::from_hours(1),
         "sla_deadline_at must be started_at + 1h (the DagInfo's declared sla)"
     );
 }
@@ -310,9 +313,8 @@ async fn dag_execution_timeout_scanner_transitions_expired_run_to_timed_out() {
     .await
     .expect("start");
 
-    // Simulate time passing without waiting an hour: the same mechanism a
-    // real overrun uses (this is only what NOW() being later than the
-    // deadline would look like).
+    // Simulate time passing without waiting an hour. A real overrun uses the
+    // same mechanism: NOW() is later than the deadline.
     backdate_deadline_at(&mut conn, exec_id).await;
 
     let spy = TimeoutSpy::default();
@@ -400,7 +402,7 @@ async fn dag_sla_breach_emits_metric_exactly_once_without_terminating() {
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
             harvest_workflow_executions::output.eq(Some(serde_json::json!({"ok": true}))),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -457,7 +459,7 @@ async fn dag_and_workflow_execution_timeout_ceilings_apply_identically() {
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
-    let ceiling = Some(ChronoDuration::hours(1));
+    let ceiling = Some(SignedDuration::from_hours(1));
 
     // A DAG declaring a 10h execution_timeout, capped by a 1h fleet ceiling.
     let dag_wf_name = unique_name("dag743_ceiling_dag");
@@ -469,7 +471,7 @@ async fn dag_and_workflow_execution_timeout_ceilings_apply_identically() {
     let info = dag.as_workflow_info().unwrap();
     let (dag_execution_timeout, _) = resolve_deadlines(&info);
     let dag_exec_id = ExecutionId::new();
-    let dag_before = Utc::now();
+    let dag_before = Timestamp::now();
     start_or_load_workflow_execution(
         &mut conn,
         base_params(
@@ -484,23 +486,23 @@ async fn dag_and_workflow_execution_timeout_ceilings_apply_identically() {
     )
     .await
     .expect("start dag-derived");
-    let dag_after = Utc::now();
+    let dag_after = Timestamp::now();
     let dag_row = load_row(&mut conn, dag_exec_id).await;
     let dag_deadline_at = dag_row.deadline_at.expect("must be set");
 
     // A plain (non-DAG) start declaring the SAME 10h execution_timeout, capped
-    // by the SAME 1h ceiling -- mirrors exactly how a `#[workflow(execution_timeout
-    // = "10h")]` would resolve at start time.
+    // by the SAME 1h ceiling. It mirrors how a `#[workflow(execution_timeout
+    // = "10h")]` resolves at start time.
     let wf_name = unique_name("dag743_ceiling_workflow");
     let wf_exec_id = ExecutionId::new();
-    let wf_before = Utc::now();
+    let wf_before = Timestamp::now();
     start_or_load_workflow_execution(
         &mut conn,
         base_params(
             &wf_name,
             "wf-1",
             wf_exec_id,
-            Some(ChronoDuration::hours(10)),
+            Some(SignedDuration::from_hours(10)),
             ceiling,
             None,
         ),
@@ -508,26 +510,28 @@ async fn dag_and_workflow_execution_timeout_ceilings_apply_identically() {
     )
     .await
     .expect("start workflow-declared");
-    let wf_after = Utc::now();
+    let wf_after = Timestamp::now();
     let wf_row = load_row(&mut conn, wf_exec_id).await;
     let wf_deadline_at = wf_row.deadline_at.expect("must be set");
 
     // Both must be clamped to started_at + 1h (the ceiling), NOT + 10h.
     assert!(
-        dag_deadline_at <= dag_before + ChronoDuration::hours(1) + ChronoDuration::seconds(5)
+        dag_deadline_at
+            <= dag_before + SignedDuration::from_hours(1) + SignedDuration::from_secs(5)
             && dag_deadline_at
-                >= dag_before + ChronoDuration::hours(1) - ChronoDuration::seconds(5),
+                >= dag_before + SignedDuration::from_hours(1) - SignedDuration::from_secs(5),
         "the DAG-declared 10h timeout must be clamped to the 1h ceiling"
     );
     assert!(
-        wf_deadline_at <= wf_before + ChronoDuration::hours(1) + ChronoDuration::seconds(5)
-            && wf_deadline_at >= wf_before + ChronoDuration::hours(1) - ChronoDuration::seconds(5),
+        wf_deadline_at <= wf_before + SignedDuration::from_hours(1) + SignedDuration::from_secs(5)
+            && wf_deadline_at
+                >= wf_before + SignedDuration::from_hours(1) - SignedDuration::from_secs(5),
         "the workflow-declared 10h timeout must be clamped to the 1h ceiling identically"
     );
     let dag_delta = dag_deadline_at - dag_before;
     let wf_delta = wf_deadline_at - wf_before;
     assert!(
-        (dag_delta - wf_delta).num_seconds().abs() < 2,
+        (dag_delta - wf_delta).as_secs().abs() < 2,
         "the SAME ceiling clamp must apply identically regardless of DAG vs #[workflow] origin: dag_delta={dag_delta:?} wf_delta={wf_delta:?} dag_after={dag_after:?} wf_after={wf_after:?}"
     );
 }
@@ -569,17 +573,16 @@ async fn dag_without_deadline_attributes_has_null_deadline_columns() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Codex review (PR #1141) on issue #743: the 7 tests above prove the
-// resolution mechanism (`DagInfo::as_workflow_info` -> `StartWorkflowParams`)
-// works correctly in isolation, but 3 REAL production code paths that also
-// start a scheduled/manual DAG run hardcoded `execution_timeout`/`sla`/the
-// fleet-wide ceiling to `None` instead of reading them from the shadow
-// `WorkflowInfo` the way `tick_one_workflow_schedule`'s NON-buffered branch
-// already correctly does. These 3 tests drive the REAL entry points
-// (`trigger_unified_dag`, `tick_once` via a buffered-drain fire, `tick_once`
-// with a fleet-wide ceiling configured) rather than hand-mirroring scheduler
-// resolution logic in the test itself -- exactly the gap that let these 3
-// sites go unnoticed by the 7 tests above.
+// Issue #743 (PR #1141): the 7 tests above prove the resolution mechanism
+// (`DagInfo::as_workflow_info` -> `StartWorkflowParams`) in isolation. But 3
+// REAL production code paths that start a scheduled/manual DAG run hardcoded
+// `execution_timeout`/`sla`/the fleet-wide ceiling to `None`. They did not
+// read them from the shadow `WorkflowInfo`, as the NON-buffered branch of
+// `tick_one_workflow_schedule` does. Findings #1-#3 below drive the REAL entry
+// points (`trigger_unified_dag`, `tick_once` via a buffered-drain fire,
+// `tick_once` with a fleet-wide ceiling configured). They do not hand-mirror
+// scheduler resolution logic in the test. That hand-mirroring is the gap that
+// hid these 3 sites from the 7 tests above.
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn dag_registry(dag: &DagInfo) -> Arc<HandlerRegistry> {
@@ -625,16 +628,12 @@ async fn insert_manual_workflow_schedule(
         .expect("register schedule");
 }
 
-async fn seed_buffered_run(
-    conn: &mut AsyncPgConnection,
-    dag_name: &str,
-    fire_at: chrono::DateTime<Utc>,
-) {
+async fn seed_buffered_run(conn: &mut AsyncPgConnection, dag_name: &str, fire_at: jiff::Timestamp) {
     use autumn_harvest::schema::harvest_schedules::dsl;
     diesel::update(dsl::harvest_schedules.filter(dsl::workflow_name.eq(dag_name)))
         .set(
             dsl::buffered_runs.eq(serde_json::Value::Array(vec![serde_json::Value::String(
-                fire_at.to_rfc3339(),
+                autumn_harvest::time::rfc3339(fire_at),
             )])),
         )
         .execute(conn)
@@ -645,11 +644,7 @@ async fn seed_buffered_run(
 async fn load_fired_deadline(
     conn: &mut AsyncPgConnection,
     dag_name: &str,
-) -> (
-    Uuid,
-    Option<chrono::DateTime<Utc>>,
-    Option<chrono::DateTime<Utc>>,
-) {
+) -> (Uuid, Option<jiff::Timestamp>, Option<jiff::Timestamp>) {
     harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(dag_name))
         .select((
@@ -657,10 +652,11 @@ async fn load_fired_deadline(
             harvest_workflow_executions::deadline_at,
             harvest_workflow_executions_ext::sla_deadline_at,
         ))
-        .first(conn)
+        .first::<(Uuid, NullableTimestamp, NullableTimestamp)>(conn)
         .await
         .optional()
         .expect("query fired execution")
+        .map(|(id, deadline, sla_deadline)| (id, deadline.0, sla_deadline.0))
         .expect("the tick must have fired an execution for this DAG")
 }
 
@@ -680,7 +676,7 @@ async fn trigger_unified_dag_threads_dag_declared_execution_timeout_and_sla() {
     );
     let registry = dag_registry(&dag);
 
-    let before = Utc::now();
+    let before = Timestamp::now();
     let started = trigger_unified_dag(
         pool,
         dag_name,
@@ -696,7 +692,7 @@ async fn trigger_unified_dag_threads_dag_declared_execution_timeout_and_sla() {
     )
     .await
     .expect("manual trigger must succeed");
-    let after = Utc::now();
+    let after = Timestamp::now();
 
     let mut conn = connect(&url).await;
     let row = load_row(&mut conn, started.exec_id).await;
@@ -705,23 +701,23 @@ async fn trigger_unified_dag_threads_dag_declared_execution_timeout_and_sla() {
          not hardcode None",
     );
     assert!(
-        deadline_at >= before + ChronoDuration::hours(2)
-            && deadline_at <= after + ChronoDuration::hours(2),
+        deadline_at >= before + SignedDuration::from_hours(2)
+            && deadline_at <= after + SignedDuration::from_hours(2),
         "deadline_at must be started_at + 2h (the DagInfo's declared execution_timeout)"
     );
     let sla_deadline_at = row
         .sla_deadline_at
         .expect("a manually-triggered DAG run must inherit its DAG-declared sla");
     assert!(
-        sla_deadline_at >= before + ChronoDuration::hours(1)
-            && sla_deadline_at <= after + ChronoDuration::hours(1),
+        sla_deadline_at >= before + SignedDuration::from_hours(1)
+            && sla_deadline_at <= after + SignedDuration::from_hours(1),
         "sla_deadline_at must be started_at + 1h (the DagInfo's declared sla)"
     );
 }
 
-// ── Finding #2: the scheduler's buffered-drain path (fired when
-//    overlap_policy is buffer_one/buffer_all and a collision was queued)
-//    must thread execution_timeout the same way the main tick path does.
+// ── Finding #2: the scheduler's buffered-drain path must thread
+//    execution_timeout the same way the main tick path does. It fires when
+//    overlap_policy is buffer_one/buffer_all and a collision was queued.
 
 #[tokio::test]
 async fn scheduler_tick_buffered_drain_threads_dag_declared_execution_timeout() {
@@ -731,14 +727,14 @@ async fn scheduler_tick_buffered_drain_threads_dag_declared_execution_timeout() 
     let dag_name = leaked_dag_name("dag743_buffered");
     // `dag.schedule`/`dag.overlap_policy` must match the cadence and
     // overlap policy of the separately-registered `WorkflowSchedule` row
-    // below (`Interval(3600s)` / `BufferOne`) -- `register_schedules_for_shard`'s
-    // `upsert_schedule` (which runs on EVERY tick, before the buffered
-    // drain) treats the DAG's own attributes as authoritative and
+    // below (`Interval(3600s)` / `BufferOne`). The `upsert_schedule` of
+    // `register_schedules_for_shard` runs on EVERY tick, before the buffered
+    // drain. It treats the DAG's own attributes as authoritative and
     // unconditionally overwrites `overlap_policy` from the stored row.
     // A mismatched `overlap_policy` (e.g. `deadline_dag`'s default `Skip`)
-    // makes `is_buffering_policy = false`, which WIPES the just-seeded
-    // `buffered_runs` back to `[]` regardless of whether the cadence
-    // changed, before the drain ever queries it.
+    // makes `is_buffering_policy = false`. That WIPES the just-seeded
+    // `buffered_runs` back to `[]` before the drain queries it, whether or
+    // not the cadence changed.
     let dag = DagInfo {
         schedule: Some(Schedule::Interval(std::time::Duration::from_secs(3600))),
         overlap_policy: OverlapPolicy::BufferOne,
@@ -748,14 +744,19 @@ async fn scheduler_tick_buffered_drain_threads_dag_declared_execution_timeout() 
     let catalog = compile_dag_catalog(vec![dag]).expect("compile dag catalog");
 
     insert_manual_workflow_schedule(&mut conn, dag_name, 1).await;
-    // Directly seed a due buffered fire time -- bypassing the real
-    // overlap-collision path (which requires a still-running prior execution)
-    // since only the buffered-drain CODE PATH is under test here, not the
-    // collision-detection logic that populates `buffered_runs` in production.
-    seed_buffered_run(&mut conn, dag_name, Utc::now() - ChronoDuration::seconds(1)).await;
+    // Directly seed a due buffered fire time. This bypasses the real
+    // overlap-collision path, which needs a still-running prior execution.
+    // Only the buffered-drain CODE PATH is under test here, not the
+    // collision detection that populates `buffered_runs` in production.
+    seed_buffered_run(
+        &mut conn,
+        dag_name,
+        Timestamp::now() - SignedDuration::from_secs(1),
+    )
+    .await;
 
     let pool = build_test_pool(&url);
-    let before = Utc::now();
+    let before = Timestamp::now();
     tick_once(
         pool,
         Arc::clone(&registry),
@@ -772,8 +773,9 @@ async fn scheduler_tick_buffered_drain_threads_dag_declared_execution_timeout() 
          not hardcode None",
     );
     assert!(
-        deadline_at >= before + ChronoDuration::hours(2)
-            && deadline_at <= before + ChronoDuration::hours(2) + ChronoDuration::seconds(10),
+        deadline_at >= before + SignedDuration::from_hours(2)
+            && deadline_at
+                <= before + SignedDuration::from_hours(2) + SignedDuration::from_secs(10),
         "deadline_at must be ~started_at + 2h (the DagInfo's declared execution_timeout): got {deadline_at}"
     );
 }
@@ -789,12 +791,12 @@ async fn scheduler_tick_applies_fleet_wide_execution_timeout_ceiling_to_dag() {
     let dag_name = leaked_dag_name("dag743_ceiling_tick");
     // Declares a 10h execution_timeout; the fleet-wide ceiling (1h) must win.
     // `dag.schedule` must match the separately-registered `WorkflowSchedule`
-    // row's cadence below (also `Interval(3600s)`) -- see the identical note
-    // in `scheduler_tick_buffered_drain_threads_dag_declared_execution_timeout`:
-    // a mismatched cadence makes `register_schedules_for_shard`'s
-    // `upsert_schedule` recompute (and NULL out) `next_run_at` from a `None`
-    // schedule, so the forced-due `next_run_at` set below is wiped before
-    // `tick_workflow_schedules` ever sees it as due.
+    // row's cadence below (also `Interval(3600s)`). See the identical note
+    // in `scheduler_tick_buffered_drain_threads_dag_declared_execution_timeout`.
+    // With a mismatched cadence, the `upsert_schedule` of
+    // `register_schedules_for_shard` recomputes (and NULLs out) `next_run_at`
+    // from a `None` schedule. That wipes the forced-due `next_run_at` set below
+    // before `tick_workflow_schedules` sees it as due.
     let dag = DagInfo {
         schedule: Some(Schedule::Interval(std::time::Duration::from_secs(3600))),
         ..deadline_dag(dag_name, Some(std::time::Duration::from_hours(10)), None)
@@ -844,14 +846,14 @@ async fn scheduler_tick_applies_fleet_wide_execution_timeout_ceiling_to_dag() {
     )
     .set(
         autumn_harvest::schema::harvest_schedules::next_run_at
-            .eq(Some(Utc::now() - ChronoDuration::seconds(1))),
+            .eq(Some(Timestamp::now() - SignedDuration::from_secs(1)).to_diesel()),
     )
     .execute(&mut conn)
     .await
     .expect("force due");
 
     let pool = build_test_pool(&url);
-    let before = Utc::now();
+    let before = Timestamp::now();
     tick_once(
         pool,
         Arc::clone(&registry),
@@ -865,8 +867,9 @@ async fn scheduler_tick_applies_fleet_wide_execution_timeout_ceiling_to_dag() {
     let (_id, deadline_at, _sla_deadline_at) = load_fired_deadline(&mut conn, dag_name).await;
     let deadline_at = deadline_at.expect("execution_timeout must be set (ceiling-derived)");
     assert!(
-        deadline_at <= before + ChronoDuration::hours(1) + ChronoDuration::seconds(10)
-            && deadline_at >= before + ChronoDuration::hours(1) - ChronoDuration::seconds(10),
+        deadline_at <= before + SignedDuration::from_hours(1) + SignedDuration::from_secs(10)
+            && deadline_at
+                >= before + SignedDuration::from_hours(1) - SignedDuration::from_secs(10),
         "the DAG's declared 10h timeout must be clamped to the 1h fleet-wide ceiling \
          for a scheduler-tick-fired run, exactly like a manual/HTTP start: got {deadline_at}"
     );

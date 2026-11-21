@@ -13,8 +13,8 @@
 //! - **use_existing attaches to a RUNNING prior** → `200`, same execution_id,
 //!   `started_fresh: false`, prior stays RUNNING, exactly one WorkflowStarted.
 //! - **AC-3 idempotent-starter corner** — `reuse=terminate_if_running` +
-//!   `conflict=use_existing` over a COMPLETED prior → `201` fresh (terminal
-//!   priors follow the reuse axis; the conflict axis is inert there).
+//!   `conflict=use_existing` over a COMPLETED prior → `201` fresh. Terminal
+//!   priors follow the reuse axis, and the conflict axis is inert there.
 //! - **fail over a RUNNING prior** → `409`.
 //! - **terminate_existing over a RUNNING prior** → `201` fresh, prior cancelled.
 //! - **omitting conflict_policy** preserves today's response (no `started_fresh`
@@ -26,9 +26,9 @@
 //!   the precise "can cancel a live run" capability = effective active behavior
 //!   is `Terminate`).
 //! - **terminate_if_running + use_existing without admin, RUNNING prior** →
-//!   `200` attach (NOT admin-gated: effective is `Attach`, cannot cancel a live
-//!   run) — the flagship non-admin idempotent-starter shape, doubling as the
-//!   HTTP AC-3 RUNNING-prior corner (zero WorkflowCancelled for the prior).
+//!   `200` attach. It is NOT admin-gated, because `Attach` cannot cancel a
+//!   live run. This is the flagship non-admin idempotent-starter shape. It is
+//!   also the HTTP AC-3 RUNNING-prior corner (zero WorkflowCancelled).
 //! - **terminate_if_running + use_existing without admin, COMPLETED prior** →
 //!   `201` fresh (still non-admin; the terminal prior is replaced by the reuse
 //!   axis).
@@ -418,8 +418,8 @@ async fn fail_conflict_running_returns_409() {
 }
 
 /// AC: `conflict_policy=terminate_existing` over a RUNNING prior → `201` fresh,
-/// prior cancelled (a WorkflowCancelled event is appended and the prior is no
-/// longer RUNNING — `replace_execution` seals the cancelled row).
+/// prior cancelled. A WorkflowCancelled event is appended. The prior is no
+/// longer RUNNING, because `replace_execution` seals the cancelled row.
 #[tokio::test]
 async fn terminate_existing_running_returns_201_and_cancels_prior() {
     let (url, _c) = setup_db().await;
@@ -510,9 +510,9 @@ async fn unknown_conflict_policy_returns_400() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "unknown value → 400: {b}");
 }
 
-/// AC: a non-default `conflict_policy` on a throttled workflow → `400` (a
-/// throttled start is deferred and has no active prior to resolve at request
-/// time — mutual exclusion, mirroring the idempotency_key rule).
+/// AC: a non-default `conflict_policy` on a throttled workflow → `400`.
+/// A throttled start is deferred, so it has no active prior at request time.
+/// The rule mirrors the `idempotency_key` mutual exclusion.
 #[tokio::test]
 async fn conflict_policy_on_throttled_workflow_returns_400() {
     let (url, _c) = setup_db().await;
@@ -550,9 +550,8 @@ async fn conflict_policy_on_throttled_workflow_returns_400() {
     );
 }
 
-/// FIX 5: the debounce leg of the `conflict_policy != Unspecified &&
-/// (throttle||debounce||batch) → 400` mutual-exclusion guard (the throttle leg
-/// is covered above; this exercises the debounce leg).
+/// The debounce leg of the `conflict_policy != Unspecified &&
+/// (throttle||debounce||batch) → 400` mutual-exclusion guard.
 #[tokio::test]
 async fn conflict_policy_on_debounced_workflow_returns_400() {
     let (url, _c) = setup_db().await;
@@ -589,7 +588,7 @@ async fn conflict_policy_on_debounced_workflow_returns_400() {
     );
 }
 
-/// FIX 5: the batch leg of the same mutual-exclusion guard.
+/// The batch leg of the same mutual-exclusion guard.
 #[tokio::test]
 async fn conflict_policy_on_batched_workflow_returns_400() {
     let (url, _c) = setup_db().await;
@@ -660,13 +659,11 @@ async fn terminate_existing_without_admin_returns_401() {
     );
 }
 
-/// FIX 1 gate-narrowing + semantics-review L1 (HTTP AC-3 RUNNING-prior corner):
-/// the flagship non-admin idempotent-starter shape `reuse=terminate_if_running`
-/// + `conflict=use_existing` over a RUNNING prior resolves to `Attach` and
-/// provably cannot cancel a live run, so it is NOT admin-gated — `200`,
-/// `started_fresh:false`, same execution_id, prior stays RUNNING, ZERO
-/// WorkflowCancelled events for the prior. This is the shape the narrowed
-/// capability-precise gate exists to permit.
+/// HTTP AC-3 RUNNING-prior corner: the non-admin idempotent-starter shape
+/// `reuse=terminate_if_running` with `conflict=use_existing` over a RUNNING
+/// prior resolves to `Attach`. It cannot cancel a live run, so it is NOT admin-gated. Expect
+/// `200`, `started_fresh:false`, the same execution_id, a RUNNING prior, and
+/// ZERO WorkflowCancelled events. The narrowed gate exists to permit this shape.
 #[tokio::test]
 async fn terminate_if_running_plus_use_existing_is_not_admin_gated() {
     let (url, _c) = setup_db().await;
@@ -722,11 +719,11 @@ async fn terminate_if_running_plus_use_existing_is_not_admin_gated() {
     );
 }
 
-/// FIX 1: the AC-3 corner as a non-admin idempotent starter —
+/// The AC-3 corner as a non-admin idempotent starter:
 /// `reuse=terminate_if_running` + `conflict=use_existing` over a COMPLETED
-/// (terminal) prior on a NO-admin app → `201` fresh. The gate is
-/// state-independent (Attach resolution regardless of prior state), so it never
-/// requires admin; the terminal prior is then replaced by the reuse axis.
+/// prior on a NO-admin app → `201` fresh. The gate resolves to `Attach` for any
+/// prior state, so it never requires admin. The reuse axis replaces the
+/// terminal prior.
 #[tokio::test]
 async fn terminate_if_running_plus_use_existing_over_completed_is_not_admin_gated() {
     let (url, _c) = setup_db().await;
@@ -769,9 +766,9 @@ async fn terminate_if_running_plus_use_existing_over_completed_is_not_admin_gate
     );
 }
 
-/// FIX 1 no-regression: `reuse=terminate_if_running` with the conflict axis
-/// OMITTED (Unspecified → native Terminate) over a RUNNING prior STILL requires
-/// admin — the narrowed gate must not weaken the stock trunk behavior.
+/// No regression: `reuse=terminate_if_running` with the conflict axis OMITTED
+/// (native Terminate) over a RUNNING prior STILL requires admin. The narrowed
+/// gate must not weaken the stock behavior.
 #[tokio::test]
 async fn terminate_if_running_without_conflict_still_requires_admin() {
     let (url, _c) = setup_db().await;
@@ -819,9 +816,10 @@ async fn terminate_if_running_without_conflict_still_requires_admin() {
 }
 
 /// Success-metric proof: N concurrent same-workflow_id starts under
-/// `conflict_policy=use_existing` converge on exactly one execution — all
-/// 200/201, exactly one 201 (the creator), zero 409, prior stays RUNNING, zero
-/// terminations. (100/100 is this same shape; N=20 here.)
+/// `conflict_policy=use_existing` converge on exactly one execution. Expect
+/// exactly one 201 (the creator), the rest 200, zero 409 and zero
+/// terminations. The prior stays RUNNING. N is 20 here; 100/100 is the same
+/// shape.
 #[tokio::test]
 async fn concurrent_use_existing_converges() {
     let (url, _c) = setup_db().await;

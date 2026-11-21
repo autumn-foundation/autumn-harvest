@@ -3,9 +3,9 @@
 //! Compiled standalone with:
 //!   rustc --crate-type lib --edition 2024 --emit=mir -o parse_drift.mir parse_drift.rs
 //!
-//! `parse_drift_garbled.mir` is a byte-for-byte copy of `parse_drift.mir` with a
-//! single call terminator rewritten from `_N = wall_clock_secs() -> [..]` to
-//! `_N <== wall_clock_secs() -> [..]`, simulating a future rustc that prints a
+//! `parse_drift_garbled.mir` is a byte-for-byte copy of `parse_drift.mir`. One
+//! call terminator changes from `_N = wall_clock_secs() -> [..]` to
+//! `_N <== wall_clock_secs() -> [..]`, to simulate a future rustc that prints a
 //! call differently. The clean dump must be `nondeterminism-found`; the garbled
 //! one must be `unknown: mir-parse` — never `proven-deterministic`.
 #![allow(dead_code, unused_variables)]

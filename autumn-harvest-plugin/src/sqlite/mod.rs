@@ -22,11 +22,14 @@
 //!   [`ops`] for the admin routes.
 //! - MCP tools and tasks, webhook receivers and broker connectors start runs
 //!   through the [`HarvestSqlite`] handle (issue #2471).
+//! - `HarvestPlugin::agent` hosts the durable agent. The [`agent`] module
+//!   sends its ops and decisions through the handle.
 //!
 //! Every builder option and mode that this slice cannot honour fails the
 //! build or the boot, and names the issue that ports it. A silent no-op would
 //! let an app believe a protection or a feature is on.
 
+pub mod agent;
 mod api;
 mod driver;
 mod fleet;
@@ -36,9 +39,11 @@ pub(crate) mod mcp;
 mod ops;
 mod outbox;
 mod reads;
+mod replica;
 #[cfg(any(feature = "webhooks", feature = "connectors"))]
 pub(crate) mod triggers;
 mod ui;
+mod wake;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -55,6 +60,8 @@ pub use fleet::{HarvestFleet, HarvestTenant, tenant_harvest_file};
 pub use handle::{HarvestSqlite, HarvestSqliteError};
 pub use outbox::{SCHEMA_SQL as OUTBOX_SCHEMA_SQL, enqueue_workflow_start_outbox};
 pub(crate) use outbox::{SqliteOutbox, warn_if_stranded};
+pub use replica::{REPLICA_ENGINE, TenantReplica, tenant_harvest_replica_root};
+pub use wake::SCHEMA_SQL as TENANT_WAKES_SCHEMA_SQL;
 
 /// The `autumn-harvest-sqlite` types that [`HarvestSqlite`] takes and returns.
 pub use autumn_harvest_sqlite::{
@@ -65,6 +72,7 @@ pub use autumn_harvest_sqlite::{
 
 use crate::api::HarvestApiState;
 use crate::config::{HarvestMode, HarvestRuntimeConfig, HarvestSqliteConfig};
+use crate::mcp_unserved::warn_for_builder;
 use driver::{Driver, Registry, Retention};
 
 /// The epic that tracks every surface this slice does not port.
@@ -80,6 +88,8 @@ pub(crate) struct SqliteParts {
     pub path: Option<PathBuf>,
     /// One Harvest per open fleet tenant (issue #2472).
     pub per_tenant: bool,
+    /// Where the tenant Harvest files ship, when the app sets it in code.
+    pub tenant_replica: Option<TenantReplica>,
     /// The admin-auth layers (issue #2469). They run as on Postgres.
     pub auth: crate::api::AdminAuthLayers,
     /// The MCP tools and tasks (issue #2471). The build fills in the roles,
@@ -108,10 +118,14 @@ struct Slot {
     code_path: Option<PathBuf>,
     /// Whether to run one Harvest per open fleet tenant.
     per_tenant: bool,
+    /// Where the tenant Harvest files ship, when the app sets it in code.
+    tenant_replica: Option<TenantReplica>,
     /// The per-tenant Harvests. The shutdown hook releases them.
     fleet: Option<HarvestFleet>,
     /// The outbox relay and its stop token (issue #2470).
     relay: Option<Relay>,
+    /// The sweep that wakes closed tenants, and its stop token.
+    wake_sweep: Option<Relay>,
     /// The broker connectors. The startup hook starts them after the
     /// driver. The shutdown hook stops them before it (issue #2471).
     #[cfg(feature = "connectors")]
@@ -119,6 +133,20 @@ struct Slot {
     /// The running connector loops.
     #[cfg(feature = "connectors")]
     connector_loops: Vec<crate::plugin::ConnectorRuntimeHandle>,
+}
+
+/// Whether the app mounts MCP tool or task routes (issue #2488).
+#[cfg(feature = "mcp")]
+macro_rules! mcp_mounted {
+    ($mcp:ident) => {
+        $mcp.tools || $mcp.tasks
+    };
+}
+#[cfg(not(feature = "mcp"))]
+macro_rules! mcp_mounted {
+    ($mcp:ident) => {
+        false
+    };
 }
 
 struct StartParts {
@@ -141,6 +169,12 @@ struct StartParts {
     state: autumn_harvest::context::SharedStateMap,
 }
 
+/// Fail now on a bad `[harvest.sqlite]`, not at the first request.
+fn validate_config() {
+    HarvestSqliteConfig::load()
+        .unwrap_or_else(|error| panic!("cannot load the Harvest SQLite configuration: {error}"));
+}
+
 /// Build the plugin on the SQLite backend.
 ///
 /// # Panics
@@ -156,6 +190,7 @@ pub(crate) fn build(app: AppBuilder, parts: SqliteParts) -> AppBuilder {
         allow_unauthenticated_mutations,
         path: code_path,
         per_tenant,
+        tenant_replica,
         auth,
         #[cfg(feature = "mcp")]
         mut mcp,
@@ -172,15 +207,14 @@ pub(crate) fn build(app: AppBuilder, parts: SqliteParts) -> AppBuilder {
     if let Some(message) = refusal_message(&refused) {
         panic!("{message}");
     }
-    // Fail now on a bad `[harvest.sqlite]`, not at the first request.
-    HarvestSqliteConfig::load()
-        .unwrap_or_else(|error| panic!("cannot load the Harvest SQLite configuration: {error}"));
+    validate_config();
 
     #[cfg(feature = "connectors")]
     crate::plugin::validate_connectors(&connectors, &builder);
 
     let app = app.config_section(crate::config::HARVEST_CONFIG_ROOT);
 
+    warn_for_builder("sqlite", &builder, mcp_mounted!(mcp));
     let start_parts = StartParts {
         workflows: builder.workflow_infos().to_vec(),
         activities: builder.take_activities(),
@@ -193,7 +227,6 @@ pub(crate) fn build(app: AppBuilder, parts: SqliteParts) -> AppBuilder {
         schedules: builder.workflow_schedules().to_vec(),
         retention: builder.retention_config().clone(),
     };
-
     // A login declares the boundary, as on Postgres.
     #[cfg(feature = "oidc")]
     let boundary = api_middleware.is_some() || oidc.is_some();
@@ -238,15 +271,12 @@ pub(crate) fn build(app: AppBuilder, parts: SqliteParts) -> AppBuilder {
 
     let slot = Arc::new(Mutex::new(Slot {
         parts: Some(start_parts),
-        driver: None,
         code_path,
         per_tenant,
-        fleet: None,
-        relay: None,
+        tenant_replica,
         #[cfg(feature = "connectors")]
         connectors,
-        #[cfg(feature = "connectors")]
-        connector_loops: Vec::new(),
+        ..Slot::default()
     }));
     let app = lifecycle_hooks(app, slot, &handles, &api_state);
 
@@ -265,7 +295,6 @@ pub(crate) fn build(app: AppBuilder, parts: SqliteParts) -> AppBuilder {
     app.nest(&path, router.with_state(()))
 }
 
-/// The API state of a SQLite app.
 fn sqlite_api_state(allow_unauthenticated_mutations: bool, boundary: bool) -> HarvestApiState {
     let api_state = HarvestApiState::new();
     // MCP, webhook and connector starts go through the SQLite handle
@@ -278,7 +307,6 @@ fn sqlite_api_state(allow_unauthenticated_mutations: bool, boundary: bool) -> Ha
     api_state
 }
 
-/// Register the startup and the shutdown hook.
 fn lifecycle_hooks(
     app: AppBuilder,
     slot: Arc<Mutex<Slot>>,
@@ -316,9 +344,14 @@ async fn stop(slot: &Mutex<Slot>) {
         );
         crate::plugin::stop_connectors(loops).await;
     }
-    let (driver, fleet, relay) = {
+    let (driver, fleet, relay, wake_sweep) = {
         let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
-        (slot.driver.take(), slot.fleet.take(), slot.relay.take())
+        (
+            slot.driver.take(),
+            slot.fleet.take(),
+            slot.relay.take(),
+            slot.wake_sweep.take(),
+        )
     };
     if let Some((stop, task)) = relay {
         stop.cancel();
@@ -326,7 +359,18 @@ async fn stop(slot: &Mutex<Slot>) {
             tracing::warn!("the harvest-sqlite outbox relay did not stop cleanly");
         }
     }
+    // The sweep wakes no tenant after this. It writes its book once more.
+    if let Some((stop, task)) = wake_sweep {
+        stop.cancel();
+        if task.await.is_err() {
+            tracing::warn!("the harvest-sqlite tenant wake sweep did not stop cleanly");
+        }
+    }
     if let Some(fleet) = fleet {
+        // The fleet's own shutdown flush bounds this one too.
+        let within = fleet.flush_window();
+        let flushing = fleet.clone();
+        let _ = tokio::task::spawn_blocking(move || flushing.flush_replicas(within)).await;
         fleet.release();
     }
     if let Some(driver) = driver {
@@ -397,6 +441,26 @@ fn builder_refusals(builder: &HarvestBuilder) -> Vec<(&'static str, u32)> {
         refused.push(("WorkerConfig::with_cost_hold", EPIC_ISSUE));
     }
     refused
+}
+
+/// The options that a Harvest per fleet tenant cannot honour.
+///
+/// Each tenant driver shares the one plugin state. The agent keys its
+/// memory, its workspace and its transcript by agent id, with no tenant. So
+/// two tenants with the same agent id would share that data.
+pub(crate) fn tenant_refusals(
+    builder: &HarvestBuilder,
+    per_tenant: bool,
+) -> Vec<(&'static str, u32)> {
+    let agent = builder
+        .workflow_infos()
+        .iter()
+        .any(|info| info.name == autumn_harvest_agent::AGENT_WORKFLOW_NAME);
+    if per_tenant && agent {
+        vec![("HarvestPlugin::agent with sqlite_per_tenant", EPIC_ISSUE)]
+    } else {
+        Vec::new()
+    }
 }
 
 /// The days to keep an audit row. A dry run keeps every row.
@@ -595,7 +659,7 @@ async fn start(
             runtime_config.mode
         )));
     }
-    apply_driver_check(runtime_config.worker_enabled, state.role().base())?;
+    apply_driver_check(runtime_config.worker_enabled, state.role())?;
     refuse_worker_queues(&runtime_config.worker.queues)?;
     if let Some(pin) = crate::worker_queues::role_pin(state.role()) {
         tracing::info!(
@@ -606,19 +670,21 @@ async fn start(
     let sqlite_config = HarvestSqliteConfig::load()
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
     let app_config = state.config();
-    let (parts, code_path, per_tenant) = {
+    let (parts, code_path, per_tenant, tenant_replica) = {
         let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
-        (slot.parts.take(), slot.code_path.clone(), slot.per_tenant)
+        (
+            slot.parts.take(),
+            slot.code_path.clone(),
+            slot.per_tenant,
+            slot.tenant_replica.take(),
+        )
     };
     let Some(parts) = parts else {
         // A second startup in one process keeps the running driver.
         return Ok(());
     };
-    let fleet = if per_tenant {
-        Some(app_fleet(state).map_err(AutumnError::service_unavailable_msg)?)
-    } else {
-        None
-    };
+    let fleet = tenant_fleet(state, per_tenant, tenant_replica.is_some())
+        .map_err(AutumnError::service_unavailable_msg)?;
     let path = resolve_path(
         sqlite_config.path.as_deref(),
         code_path.as_deref(),
@@ -675,14 +741,93 @@ async fn start(
     tracing::info!(path = %path.display(), "harvest is running on SQLite");
 
     if let Some(fleet) = fleet {
-        let tenants = HarvestFleet::new(fleet, registry, tick);
-        tenants.install().await;
-        state.insert_extension(tenants.clone());
-        slot.lock().unwrap_or_else(PoisonError::into_inner).fleet = Some(tenants.clone());
+        let tenants = start_tenants(state, slot, fleet, registry, tick, tenant_replica).await?;
         let _ = handles.fleet.set(tenants);
-        tracing::info!("harvest runs one SQLite file per open fleet tenant");
     }
     Ok(())
+}
+
+/// The book of tenant wake times on the control database.
+///
+/// `None` when the app has no control database. A closed tenant then runs
+/// nothing until its next open, and the boot says so.
+///
+/// # Errors
+///
+/// Returns the error of the wake table DDL.
+async fn tenant_wakes(
+    state: &AppState,
+    fleet: &autumn_web::db::fleet::DatabaseFleet,
+) -> autumn_web::AutumnResult<Option<Arc<wake::WakeBook>>> {
+    let Some(pool) = state.pool() else {
+        tracing::warn!(
+            "the app has no control database, so no sweep wakes a closed tenant: its timers \
+             and schedules wait for its next open"
+        );
+        return Ok(None);
+    };
+    let book = wake::WakeBook::open(pool.clone(), Some(fleet.clone()))
+        .await
+        .map_err(AutumnError::service_unavailable_msg)?;
+    Ok(Some(Arc::new(book)))
+}
+
+/// Start the per-tenant Harvests, the shippers of their files and the sweep
+/// that wakes a closed tenant. Keep them in `slot` for the shutdown hook.
+///
+/// # Errors
+///
+/// Returns the error of the replication thread start or of the wake table
+/// DDL.
+async fn start_tenants(
+    state: &AppState,
+    slot: &Mutex<Slot>,
+    fleet: autumn_web::db::fleet::DatabaseFleet,
+    registry: Arc<Registry>,
+    tick: Duration,
+    tenant_replica: Option<TenantReplica>,
+) -> autumn_web::AutumnResult<HarvestFleet> {
+    // The wake table comes first. Its error then starts no replication loop.
+    let wakes = tenant_wakes(state, &fleet).await?;
+    let replicas = tenant_replicas(state, &fleet, tenant_replica)
+        .await
+        .map_err(AutumnError::service_unavailable_msg)?;
+    let tenants = HarvestFleet::new(fleet, registry, tick, replicas, wakes.clone());
+    tenants.install().await;
+    state.insert_extension(tenants.clone());
+    tracing::info!("harvest runs one SQLite file per open fleet tenant");
+    let wake_sweep = wakes.map(|wakes| {
+        let stop = CancellationToken::new();
+        let task = wake::WakeSweep::new(tenants.clone(), wakes).spawn(tick, stop.clone());
+        (stop, task)
+    });
+    let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    slot.fleet = Some(tenants.clone());
+    slot.wake_sweep = wake_sweep;
+    drop(slot);
+    Ok(tenants)
+}
+
+/// The app's fleet when `sqlite_per_tenant` is on, else `None`.
+///
+/// # Errors
+///
+/// Returns a message when `sqlite_per_tenant` is on and the app has no
+/// fleet.
+fn tenant_fleet(
+    state: &AppState,
+    per_tenant: bool,
+    replica_set: bool,
+) -> Result<Option<autumn_web::db::fleet::DatabaseFleet>, String> {
+    if per_tenant {
+        return app_fleet(state).map(Some);
+    }
+    if replica_set {
+        tracing::warn!(
+            "HarvestPlugin::sqlite_tenant_replica has no effect without sqlite_per_tenant"
+        );
+    }
+    Ok(None)
 }
 
 /// Open the control file on a blocking thread: the runtime with its code
@@ -823,6 +968,87 @@ async fn start_outbox(
     Ok(Some((stop, task)))
 }
 
+/// The shippers of the tenant Harvest files, with their loop running.
+///
+/// They run only when the fleet replicates. The destination comes from
+/// app code, or else from `[replication]`, as the fleet's does.
+///
+/// # Errors
+///
+/// Returns a message when the loop thread cannot start.
+async fn tenant_replicas(
+    state: &AppState,
+    fleet: &autumn_web::db::fleet::DatabaseFleet,
+    explicit: Option<TenantReplica>,
+) -> Result<Option<Arc<replica::Replicas>>, String> {
+    if fleet.replication().is_none() {
+        if explicit.is_some() {
+            tracing::warn!(
+                "HarvestPlugin::sqlite_tenant_replica is set, but the fleet does not replicate: \
+                 the tenant Harvest files do not ship"
+            );
+        }
+        return Ok(None);
+    }
+    let replica = match explicit {
+        Some(replica) => Some(replica),
+        None => replica_from_config(state).await,
+    };
+    let Some(replica) = replica else {
+        tracing::warn!(
+            "the fleet replicates its databases, but the tenant Harvest files do not ship: \
+             no [replication] destination reaches the plugin"
+        );
+        return Ok(None);
+    };
+    let replicas = Arc::new(replica::Replicas::new(
+        replica.clone(),
+        autumn_web::db::DbState::clock(state),
+        fleet.clone(),
+    ));
+    replicas
+        .spawn_loop()
+        .map_err(|error| format!("cannot start the tenant Harvest replication thread: {error}"))?;
+    tracing::info!(root = %replica.root(), "tenant Harvest files ship with their databases");
+    Ok(Some(replicas))
+}
+
+/// The tenant replica from `[replication]`, with the root of the fleet.
+async fn replica_from_config(state: &AppState) -> Option<TenantReplica> {
+    let config = state.config();
+    let replication = config.replication.as_deref()?.clone();
+    // The same URL and profile as the fleet replication of the app, so the
+    // root is the same.
+    let url = config
+        .database
+        .primary_url
+        .clone()
+        .or_else(|| config.database.url.clone())
+        .unwrap_or_default();
+    let profile = config.profile.clone().unwrap_or_else(|| "dev".to_owned());
+    let clock = autumn_web::db::DbState::clock(state);
+    // The S3 destination uses a blocking client.
+    let built = tokio::task::spawn_blocking(move || {
+        autumn_web::replication::build(&replication, &url, &profile, None, clock)
+    })
+    .await;
+    match built {
+        Ok(Ok(runtime)) => Some(TenantReplica::new(
+            Arc::clone(runtime.replicator.destination()),
+            runtime.settings,
+        )),
+        Ok(Err(autumn_web::replication::SetupError::Disabled)) => None,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "cannot build the tenant Harvest replica from [replication]");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(%error, "the tenant Harvest replica setup task failed");
+            None
+        }
+    }
+}
+
 /// The app's SQLite fleet, for `sqlite_per_tenant` (issue #2472).
 ///
 /// # Errors
@@ -889,7 +1115,7 @@ const fn sqlite_scheduler(explicit: Option<bool>) -> bool {
 enum DriverCheck {
     /// Run the driver.
     Run,
-    /// Run the driver, and warn that the `web` role does not stop it.
+    /// Run the driver, and warn that the role does not stop it.
     RunAgainstRole,
     /// Refuse the boot.
     Refuse,
@@ -898,9 +1124,12 @@ enum DriverCheck {
 /// Warn or refuse the boot after [`driver_check`].
 fn apply_driver_check(
     explicit: Option<bool>,
-    role: autumn_web::config::ProcessRole,
+    role: &autumn_web::config::Role,
 ) -> autumn_web::AutumnResult<()> {
-    let check = driver_check(explicit, role);
+    let check = driver_check(
+        explicit,
+        role.runs_plugin(crate::process_role::HARVEST_WORKER),
+    );
     if check != DriverCheck::Refuse {
         let source = if explicit.is_some() {
             "explicit"
@@ -908,7 +1137,7 @@ fn apply_driver_check(
             "sqlite"
         };
         tracing::info!(
-            role = %role.as_str(),
+            role = %role.name(),
             worker_enabled = true,
             worker_source = %source,
             "harvest SQLite driver runs on every process role"
@@ -918,9 +1147,10 @@ fn apply_driver_check(
         DriverCheck::Run => Ok(()),
         DriverCheck::RunAgainstRole => {
             tracing::warn!(
-                "the Autumn process role `web` does not turn off the Harvest SQLite driver: \
+                "the Autumn process role `{}` does not turn off the Harvest SQLite driver: \
                  the app process is the only writer, so it always runs the driver. Set \
-                 harvest.worker_enabled = true to remove this warning"
+                 harvest.worker_enabled = true to remove this warning",
+                role.name()
             );
             Ok(())
         }
@@ -951,11 +1181,12 @@ fn refuse_worker_queues(queues: &[String]) -> autumn_web::AutumnResult<()> {
 ///
 /// One process holds the writer lock. A process with no driver could not
 /// write at all, so an API-only replica is not a SQLite topology. An
-/// explicit `false` is refused. The `web` role default does not apply.
-fn driver_check(explicit: Option<bool>, role: autumn_web::config::ProcessRole) -> DriverCheck {
+/// explicit `false` is refused. `worker_default` is the `harvest.worker`
+/// default of the role. A role default of off does not apply.
+const fn driver_check(explicit: Option<bool>, worker_default: bool) -> DriverCheck {
     match explicit {
         Some(false) => DriverCheck::Refuse,
-        None if role == autumn_web::config::ProcessRole::Web => DriverCheck::RunAgainstRole,
+        None if !worker_default => DriverCheck::RunAgainstRole,
         Some(true) | None => DriverCheck::Run,
     }
 }
@@ -965,23 +1196,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_sqlite_driver_ignores_the_web_role_default() {
-        use autumn_web::config::ProcessRole;
-        for role in [ProcessRole::Combined, ProcessRole::Web, ProcessRole::Worker] {
+    fn the_sqlite_driver_ignores_the_role_default() {
+        use autumn_web::config::{ProcessRole, Role};
+        for default in [true, false] {
             assert_eq!(
-                driver_check(Some(false), role),
+                driver_check(Some(false), default),
                 DriverCheck::Refuse,
-                "{role:?}"
+                "{default}"
             );
-            assert_eq!(driver_check(Some(true), role), DriverCheck::Run, "{role:?}");
+            assert_eq!(
+                driver_check(Some(true), default),
+                DriverCheck::Run,
+                "{default}"
+            );
         }
-        assert_eq!(
-            driver_check(None, ProcessRole::Web),
-            DriverCheck::RunAgainstRole
+        assert_eq!(driver_check(None, false), DriverCheck::RunAgainstRole);
+        assert_eq!(driver_check(None, true), DriverCheck::Run);
+        let worker = Role::from(ProcessRole::Worker);
+        assert!(apply_driver_check(Some(false), &worker).is_err());
+    }
+
+    /// A named role that turns off `harvest.worker` gets the warning too.
+    #[test]
+    fn the_sqlite_driver_warns_for_a_named_role() {
+        use crate::process_role::capture_logs;
+
+        let cron = crate::process_role::tests::resolve_role(
+            "role = \"cron\"\n[roles.cron]\nbase = \"worker\"\n\
+             capabilities = { \"harvest.worker\" = false }\n",
         );
-        assert_eq!(driver_check(None, ProcessRole::Worker), DriverCheck::Run);
-        assert_eq!(driver_check(None, ProcessRole::Combined), DriverCheck::Run);
-        assert!(apply_driver_check(Some(false), ProcessRole::Worker).is_err());
+        let out = capture_logs(tracing::Level::WARN, || {
+            assert!(apply_driver_check(None, &cron).is_ok());
+        });
+        assert!(out.contains("role `cron`"), "{out}");
     }
 
     /// Issue #2477: a `web` SQLite app warns that its driver still runs, and
@@ -992,9 +1239,10 @@ mod tests {
 
         use crate::process_role::capture_logs;
 
-        let run = |explicit, role| {
+        let run = |explicit, role: ProcessRole| {
+            let role = autumn_web::config::Role::from(role);
             capture_logs(tracing::Level::INFO, || {
-                assert!(apply_driver_check(explicit, role).is_ok());
+                assert!(apply_driver_check(explicit, &role).is_ok());
             })
         };
         let out = run(None, ProcessRole::Web);
@@ -1109,6 +1357,39 @@ mod tests {
     #[test]
     fn a_plain_builder_has_no_refusal() {
         assert!(builder_refusals(&HarvestBuilder::default()).is_empty());
+    }
+
+    /// Fleet tenants would share one harness, and so one agent memory. The
+    /// build refuses the agent with a Harvest per tenant.
+    #[test]
+    fn the_agent_is_refused_with_a_harvest_per_tenant() {
+        let model: Arc<dyn autumn_harvest_agent::AgentModel> = Arc::new(Idle);
+        let agent = autumn_harvest_agent::register(
+            HarvestBuilder::default(),
+            autumn_harvest_agent::AgentHarness::new(model),
+        );
+        assert_eq!(
+            tenant_refusals(&agent, true),
+            [("HarvestPlugin::agent with sqlite_per_tenant", EPIC_ISSUE)]
+        );
+        assert_eq!(tenant_refusals(&agent, false), []);
+        assert_eq!(tenant_refusals(&HarvestBuilder::default(), true), []);
+    }
+
+    /// A model that the refusal test never calls.
+    #[derive(Debug)]
+    struct Idle;
+
+    impl autumn_harvest_agent::AgentModel for Idle {
+        fn chat<'a>(
+            &'a self,
+            _request: &'a autumn_harvest_agent::ChatRequest,
+        ) -> autumn_harvest_agent::BoxFuture<
+            'a,
+            Result<autumn_harvest_agent::ChatResponse, autumn_harvest_agent::AgentError>,
+        > {
+            panic!("the refusal calls no model")
+        }
     }
 
     /// The SQLite worker reads no cost hold, so a hold is refused rather than

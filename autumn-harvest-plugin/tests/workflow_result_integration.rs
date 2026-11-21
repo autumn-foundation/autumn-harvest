@@ -8,6 +8,7 @@
 
 #![allow(clippy::too_many_lines)]
 
+use jiff_diesel::ToDiesel;
 use std::sync::Arc;
 
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
@@ -26,10 +27,10 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -220,7 +221,7 @@ async fn mark_completed(conn: &mut AsyncPgConnection, exec_id: ExecutionId, outp
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             harvest_workflow_executions::output.eq(Some(output)),
         ))
         .execute(conn)
@@ -233,7 +234,7 @@ async fn mark_ended(conn: &mut AsyncPgConnection, exec_id: ExecutionId, state: &
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq(state),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             harvest_workflow_executions::error.eq(Some(error)),
         ))
         .execute(conn)
@@ -246,7 +247,6 @@ async fn mark_continued_as_new(
     exec_id: ExecutionId,
     new_id: ExecutionId,
 ) {
-    // Append the ContinuedAsNew event to history.
     let history = store::load_history(conn, exec_id).await.unwrap();
     let events = vec![WorkflowEvent::WorkflowContinuedAsNew {
         new_exec_id: new_id,
@@ -257,24 +257,22 @@ async fn mark_continued_as_new(
         .await
         .expect("append ContinuedAsNew event");
 
-    // Seal the predecessor row.
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
         ))
         .execute(conn)
         .await
         .unwrap();
 
-    // Verify the event was appended.
     let count: i64 = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
         .count()
         .get_result(conn)
         .await
         .unwrap();
-    // >= 2: WorkflowStarted is always present; ContinuedAsNew must be the second row.
+    // `WorkflowStarted` is always present, so `ContinuedAsNew` makes at least 2 rows.
     assert!(count >= 2, "ContinuedAsNew event must have been appended");
 }
 
@@ -347,14 +345,12 @@ async fn result_follows_continue_as_new_to_final_output() {
     let app = build_app(&pool);
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
 
-    // Seed the predecessor as CONTINUED_AS_NEW → successor COMPLETED.
     let predecessor_id = seed_running(&mut conn, "can-predecessor").await;
     let successor_id = seed_running(&mut conn, "can-successor").await;
 
     mark_continued_as_new(&mut conn, predecessor_id, successor_id).await;
     mark_completed(&mut conn, successor_id, json!({"final": "result"})).await;
 
-    // Querying the predecessor must resolve through the chain to the successor's output.
     let (status, body) = get_json(&app, &format!("/workflows/{predecessor_id}/result")).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(
@@ -380,19 +376,18 @@ async fn test_get_update_result_orphaned() {
     let exec_id = seed_running(&mut conn, "orphaned-wf").await;
     let update_id = UpdateId::new();
 
-    // 1. Append UpdateAdmitted to history
     let history = store::load_history(&mut conn, exec_id).await.unwrap();
     let events = vec![WorkflowEvent::UpdateAdmitted {
         update_id,
         name: "test_update".to_string(),
         input: Value::Null,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
     }];
     store::append_events(&mut conn, exec_id, &events, history.next_event_id)
         .await
         .expect("append admitted update event");
 
-    // 2. Querying result while running should return 202 Accepted
+    // A running workflow answers 202.
     let (status, body) = get_json(
         &app,
         &format!("/workflows/{exec_id}/update/{update_id}/result"),
@@ -401,9 +396,9 @@ async fn test_get_update_result_orphaned() {
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(body["update_id"], update_id.to_string());
 
-    // 3. Mark the workflow COMPLETED (unresolved update becomes orphaned)
+    // Completion orphans the unresolved update.
     mark_completed(&mut conn, exec_id, Value::Null).await;
-    // Append WorkflowCompleted event to history to make get_terminal_workflow_state find it
+    // `get_terminal_workflow_state` reads the terminal state from the `WorkflowCompleted` event.
     let history = store::load_history(&mut conn, exec_id).await.unwrap();
     let completed_event = vec![WorkflowEvent::WorkflowCompleted {
         output: Value::Null,
@@ -412,7 +407,6 @@ async fn test_get_update_result_orphaned() {
         .await
         .expect("append completed event");
 
-    // 4. Querying result now should return 409 Conflict with update_orphaned
     let (status, body) = get_json(
         &app,
         &format!("/workflows/{exec_id}/update/{update_id}/result"),
@@ -436,19 +430,17 @@ async fn test_poll_update_result_orphaned() {
     let exec_id = seed_running(&mut conn, "orphaned-poll-wf").await;
     let update_id = UpdateId::new();
 
-    // Append UpdateAdmitted to history
     let history = store::load_history(&mut conn, exec_id).await.unwrap();
     let events = vec![WorkflowEvent::UpdateAdmitted {
         update_id,
         name: "test_update".to_string(),
         input: Value::Null,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
     }];
     store::append_events(&mut conn, exec_id, &events, history.next_event_id)
         .await
         .expect("append admitted update event");
 
-    // Mark completed + append WorkflowCompleted event
     mark_completed(&mut conn, exec_id, Value::Null).await;
     let history2 = store::load_history(&mut conn, exec_id).await.unwrap();
     let completed_event = vec![WorkflowEvent::WorkflowCompleted {
@@ -458,7 +450,7 @@ async fn test_poll_update_result_orphaned() {
         .await
         .expect("append completed event");
 
-    // Poll the result — it should immediately resolve with 409 Conflict
+    // The poll resolves at once.
     let response = poll_update_result(
         &harvest_pool,
         exec_id,
@@ -489,23 +481,22 @@ async fn test_get_update_result_orphaned_timed_out() {
     let exec_id = seed_running(&mut conn, "orphaned-timeout-wf").await;
     let update_id = UpdateId::new();
 
-    // 1. Append UpdateAdmitted to history
     let history = store::load_history(&mut conn, exec_id).await.unwrap();
     let events = vec![WorkflowEvent::UpdateAdmitted {
         update_id,
         name: "test_update".to_string(),
         input: Value::Null,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
     }];
     store::append_events(&mut conn, exec_id, &events, history.next_event_id)
         .await
         .expect("append admitted update event");
 
-    // 2. Set DB execution state to TIMED_OUT and append WorkflowFailed to history (simulates enforce_workflow_timeout)
+    // Simulate `enforce_workflow_timeout`: a `TIMED_OUT` row and a `WorkflowFailed` event.
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("TIMED_OUT"),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             harvest_workflow_executions::error.eq(Some(
                 "timeout: workflow exceeded execution timeout".to_string(),
             )),
@@ -522,7 +513,6 @@ async fn test_get_update_result_orphaned_timed_out() {
         .await
         .expect("append WorkflowFailed event");
 
-    // 3. Querying result should return 409 Conflict with workflow_state: "TIMED_OUT"
     let (status, body) = get_json(
         &app,
         &format!("/workflows/{exec_id}/update/{update_id}/result"),

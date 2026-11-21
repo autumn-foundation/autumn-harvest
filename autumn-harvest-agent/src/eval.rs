@@ -46,11 +46,13 @@
 //! - A tool, snapshot or peer-lookup activity that failed the source fails
 //!   the candidate at the same activity.
 //! - `agent_deliver` is a stub. No report leaves the harness.
+//! - `agent_approval_notice` is a stub. No notice leaves the harness.
 //! - Any other activity has no mock, so it fails the candidate run.
 //!
 //! The harness sends again each approval for a wait that the source opened,
-//! when it arrived before the deadline. It drops every other signal. A late or
-//! unsolicited approval therefore cannot release a call.
+//! when it arrived before the deadline. A wait opens with its approval notice
+//! or its deadline timer. It drops every other signal. A late or unsolicited
+//! approval therefore cannot release a call.
 //!
 //! # The fork rules
 //!
@@ -131,8 +133,8 @@ pub mod evidence;
 mod probe;
 
 pub use probe::{
-    LiveProbe, LiveProbeHost, PROBE_APPROVAL_TIMEOUT_SECS, ProbeFork, SourceRun, live_probe,
-    live_probe_with,
+    LiveProbe, LiveProbeHost, PROBE_APPROVAL_TIMEOUT_SECS, PROBE_FORK_ID_PREFIX, ProbeFork,
+    SourceRun, live_probe, live_probe_keyed, live_probe_with, probe_fork_id,
 };
 #[cfg(feature = "postgres")]
 pub(crate) use probe::{PROBE_FORK_OPERATOR, PROBE_FORK_REASON};
@@ -144,6 +146,7 @@ use std::time::Duration;
 use autumn_harvest::erase::is_erasure_tombstone;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::failure::parse_typed_payload;
+use autumn_harvest::frame::boxed;
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::testing::WorkflowTestEnv;
 use autumn_harvest::types::ActivityExecId;
@@ -159,6 +162,7 @@ use crate::memory::MemorySnapshot;
 use crate::mesh::Peer;
 use crate::message::{ContentPart, StopReason, TokenUsage, ToolCall};
 use crate::policy::ToolDecision;
+use crate::refine::Charge;
 use crate::score::{self, ScoreContext, ScoreInput, Scorer};
 pub use crate::types::PROBE_EFFECT_REFUSED;
 use crate::types::{
@@ -168,12 +172,13 @@ mod anonymise;
 
 pub(crate) use anonymise::recorded_pool;
 pub use anonymise::{
-    AnonymisedEvaluation, AnonymisedPool, AnonymisedReport, CandidateRef, compare_anonymised,
+    AnonymisedEvaluation, AnonymisedPool, AnonymisedReport, CandidateRef, LiveCheck,
+    compare_anonymised,
 };
 
 use crate::workflow::{
-    WORKFLOW_NAME, agent_deliver_info, agent_discover_peers_info, agent_loop_info,
-    agent_memory_snapshot_info, agent_model_turn_info, agent_tool_call_info,
+    WORKFLOW_NAME, agent_approval_notice_info, agent_deliver_info, agent_discover_peers_info,
+    agent_loop_info, agent_memory_snapshot_info, agent_model_turn_info, agent_tool_call_info,
 };
 
 /// The error text of the stub outcome. A candidate call with no recorded
@@ -543,6 +548,10 @@ pub enum EvalError {
     /// #2378). The source stays unchanged.
     #[error("the live probe fork failed: {0}")]
     Fork(String),
+    /// Another run holds the workflow id of a keyed probe fork. The value
+    /// is the id.
+    #[error("the probe fork id {0} is in use")]
+    ForkIdInUse(String),
     /// The scorer failed, or did not end within
     /// [`AgentHarness::score_timeout`] (issue #2447). A scorer error is not
     /// a reject, so the evaluation fails. [`Side::Recorded`] is the source
@@ -754,6 +763,13 @@ pub struct Evaluation {
     /// (issue #2380). An unpriced turn adds none.
     #[serde(default, skip_serializing_if = "is_zero_cost")]
     pub candidate_cost_usd_micros: u64,
+    /// The model, the tokens and the cost of each candidate turn that
+    /// called a model, in run order. A cache hit adds none. The tokens sum
+    /// to [`Self::candidate_usage`], and the costs to
+    /// [`Self::candidate_cost_usd_micros`]. An evaluation of an older
+    /// release decodes with none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidate_calls: Vec<Charge>,
 }
 
 /// Whether `usage` is empty, so an evaluation leaves it out.
@@ -1049,34 +1065,34 @@ async fn run_with_routes(
         .mock_activity(agent_model_turn_info().name, model)
         .mock_activity(agent_tool_call_info().name, tool)
         .mock_activity(agent_memory_snapshot_info().name, snapshot)
-        .mock_activity(agent_deliver_info().name, |_report| Ok(Value::Null));
+        .mock_activity(agent_deliver_info().name, |_report| Ok(Value::Null))
+        .mock_activity(agent_approval_notice_info().name, |_call| Ok(Value::Null));
     for (name, payload) in &recording.signals {
         env = env.queue_signal(name.clone(), payload.clone());
     }
-    let outcome = env.run(agent_loop_info().handler, input).await;
+    // On the heap, the run adds only a pointer to the probe frame in a debug
+    // build (issue #2752).
+    let outcome = boxed(|| env.run(agent_loop_info().handler, input)).await;
 
     let candidate_turns = model_turns(outcome.events())?;
-    let (candidate_usage, candidate_cost_usd_micros) =
-        candidate_turns
-            .iter()
-            .fold((TokenUsage::default(), 0_u64), |(usage, cost), turn| {
-                (
-                    usage.saturating_add(turn.usage),
-                    cost.saturating_add(turn.cost_usd_micros.unwrap_or(0)),
-                )
-            });
-    let (replayed, stubbed, cap_reached, root, mut routes) = {
+    let (replayed, stubbed, cap_reached, root, mut routes, candidate_calls) = {
         let mut session = lock(&session);
         let root = session.root.clone();
         let routes = std::mem::take(&mut session.routes);
+        let calls = std::mem::take(&mut session.calls);
         (
             session.replayed,
             session.stubbed,
             session.cap_reached,
             root,
             routes,
+            calls,
         )
     };
+    // Each turn that called a model has one charge. A cache hit has none
+    // and spent nothing, so the charges sum to the spend of every turn.
+    let (candidate_usage, candidate_cost_usd_micros) =
+        crate::refine::meter::total(&candidate_calls);
     let candidate_end = run_end_of(outcome.result, root.as_deref(), recording)?;
 
     let turns = diff_turns(&recording.turns, &candidate_turns);
@@ -1102,6 +1118,7 @@ async fn run_with_routes(
         scorer_usage: verdicts.usage,
         candidate_usage,
         candidate_cost_usd_micros,
+        candidate_calls,
     };
     Ok((evaluation, routes))
 }
@@ -1300,6 +1317,8 @@ fn run_end_of(
 ///
 /// Only the root id itself, or the id of a lane under it, changes. A lane
 /// starts with `:`, so another id that starts with `from` keeps its value.
+/// A run keys its peer messages on its run id, so each key gets the same
+/// change (issue #2484).
 fn rebase_run_ids(report: &mut AgentReport, from: &str, to: &str) {
     let rebase = |run_id: &mut Option<String>| {
         let lane = run_id
@@ -1313,6 +1332,7 @@ fn rebase_run_ids(report: &mut AgentReport, from: &str, to: &str) {
     rebase(&mut report.run_id);
     for delegation in &mut report.delegations {
         rebase(&mut delegation.run_id);
+        rebase(&mut delegation.idempotency_key);
     }
 }
 
@@ -1414,6 +1434,9 @@ impl Recording {
                             decode(input.clone()).map_err(EvalError::Undecodable)?;
                         run_id = Some(request.run_id);
                     }
+                    if let Some(signal) = noticed_wait(name, input) {
+                        opened.insert(signal);
+                    }
                     scheduled.insert(*activity_id, (name.as_str(), input));
                 }
                 WorkflowEvent::ActivityFailed {
@@ -1472,9 +1495,9 @@ impl Recording {
             effects.failed(scheduled, error, run_id.as_deref())?;
         }
         // Only a signal for a wait that the source opened is sent again. A
-        // wait opens with its deadline timer. A signal that arrived before
-        // its wait opened leaves no timer, so it is dropped too. The candidate
-        // then times out, which shows as a divergence.
+        // wait opens with its notice or its deadline timer. A signal that
+        // arrived before both is dropped too. The candidate then times out,
+        // which shows as a divergence.
         signals.retain(|(name, _)| opened.contains(name.as_str()));
         let turns = model_turns(history)?;
         let turn_agents = model_turn_agents(history, run_id.as_deref())?;
@@ -1492,6 +1515,16 @@ impl Recording {
             end: end.ok_or(EvalError::InFlightSource)?,
         })
     }
+}
+
+/// The wait that a scheduled approval notice names, if `name` is the notice.
+///
+/// A notice opens its wait. An app can decide before the deadline timer
+/// starts.
+fn noticed_wait<'a>(name: &str, input: &'a Value) -> Option<&'a str> {
+    (name == agent_approval_notice_info().name)
+        .then(|| input.get("signal").and_then(Value::as_str))
+        .flatten()
 }
 
 /// Name the agent of each recorded tool call from the model turns of its
@@ -1750,6 +1783,8 @@ struct Session {
     /// Each model route that a candidate turn asked for. `None` is the
     /// default model.
     routes: BTreeSet<Option<String>>,
+    /// The spend of each candidate turn that called a model, in order.
+    calls: Vec<Charge>,
 }
 
 impl Session {
@@ -1769,6 +1804,7 @@ impl Session {
             replayed: 0,
             stubbed: 0,
             routes: BTreeSet::new(),
+            calls: Vec::new(),
         }
     }
 
@@ -1949,6 +1985,17 @@ fn model_mock(
             (&recorded, &taken, index),
             &retry,
         )?;
+        if !turn.cache_hit {
+            let model_id = harness
+                .model(request.model.as_deref())
+                .ok()
+                .and_then(|model| model.model_id());
+            lock(&session).calls.push(Charge {
+                model_id: model_id.map(str::to_owned),
+                usage: turn.usage,
+                cost_usd_micros: turn.cost_usd_micros,
+            });
+        }
         encode(&turn)
     }
 }
@@ -2107,7 +2154,6 @@ fn model_turn_agents(
     Ok(agents)
 }
 
-/// Compare the two runs turn by turn.
 fn diff_turns(recorded: &[ModelTurn], candidate: &[ModelTurn]) -> Vec<TurnDiff> {
     (0..recorded.len().max(candidate.len()))
         .map(|turn| {
@@ -2398,6 +2444,9 @@ mod tests {
             resets: 0,
             answer_truncated: false,
             serial: None,
+            draws: 0,
+            // A sender keys its message on its own run id (issue #2484).
+            idempotency_key: Some(format!("{run_id}:1")),
         };
         report.delegations = vec![child("e1:d1"), child("e10"), child("x")];
         rebase_run_ids(&mut report, "e1", "r1");
@@ -2408,6 +2457,12 @@ mod tests {
             .map(|record| record.run_id.as_deref())
             .collect();
         assert_eq!(ids, [Some("r1:d1"), Some("e10"), Some("x")]);
+        let keys: Vec<_> = report
+            .delegations
+            .iter()
+            .map(|record| record.idempotency_key.as_deref())
+            .collect();
+        assert_eq!(keys, [Some("r1:d1:1"), Some("e10:1"), Some("x:1")]);
     }
 
     #[test]
@@ -2632,6 +2687,7 @@ mod tests {
                 error: None,
                 resets: 0,
                 answer_rejections: Vec::new(),
+                parked_until_ms: None,
             })
         };
         let done = report(crate::AgentStop::Completed);

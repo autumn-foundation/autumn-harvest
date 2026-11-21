@@ -2,40 +2,40 @@
 //!
 //! [`Model::classify`] answers the only question the taint analysis asks about a
 //! callee: *which model rows apply here?* It returns **every** class that
-//! matches, in a fixed order, because a single method routinely belongs to more
-//! than one table — `WorkflowContext::side_effect` is a sink (its closure must
-//! not be descended) *and* sanctioned (its return value is clean), and
-//! `autumn_harvest::chrono::Utc::now` is a `[[source]]` inside a `[[trusted]]`
-//! crate.
+//! matches, in a fixed order. A single method routinely belongs to more than one
+//! table. `WorkflowContext::side_effect` is a sink (its closure must not be
+//! descended) *and* sanctioned (its return value is clean).
+//! `autumn_harvest::time::Timestamp::now` is a `[[source]]` inside a
+//! `[[trusted]]` crate.
 //!
 //! # The matching semantics, exactly
 //!
 //! * **`path`** — a `::`-separated **suffix** of the callee's generic-stripped
 //!   segments ([`CalleePath::ends_with_path`]). MIR prints rustc's *trimmed*
 //!   def-paths, so a rule keyed on a full path would match nothing.
-//! * **`receiver`** — when a row carries one it must equal the callee's
-//!   receiver: the self type's last `::` segment with generics stripped and
+//! * **`receiver`** — when a row carries one, it must equal the callee's
+//!   receiver. That is the self type's last `::` segment, generics stripped and
 //!   references peeled (`&HashMap<K, V>` → `HashMap`, `dyn Src` → `Src`,
 //!   `{closure@..}` → `{closure}`). A row *without* a receiver matches
 //!   regardless of the callee's.
 //! * **`dest_type`** — when a row carries one, the destination local's declared
-//!   type must match it: references are peeled off the declared type, then the
-//!   rule's base path must be a `::`-segment **suffix** of the declared type's
-//!   base path, and the rule's generic arguments (when it writes any) must be
+//!   type must match it. References are peeled off the declared type. The
+//!   rule's base path must then be a `::`-segment **suffix** of the declared
+//!   type's base path. The rule's generic arguments, when it writes any, must be
 //!   textually equal to the declared type's. So
 //!   `std::collections::BTreeMap` matches
-//!   `std::collections::BTreeMap<std::string::String, u32>` (a rule that names
-//!   no arguments does not constrain them), `BTreeMap` matches it too, and
+//!   `std::collections::BTreeMap<std::string::String, u32>`, because a rule that
+//!   names no arguments does not constrain them. `BTreeMap` matches it too.
 //!   `std::result::Result<std::string::String, std::env::VarError>` matches only
 //!   that exact instantiation. A row with a `dest_type` never matches a call
 //!   whose destination type is unknown.
-//! * **`[[trusted]]`** — matched on the callee's **crate root**: the leading
-//!   identifier of the path text, after peeling `<`, `&`, `*const`/`*mut` and
-//!   `dyn `, and only when it is followed by `::` and starts with a lowercase
-//!   ASCII letter. Trimmed paths are the reason for that guard: `SystemTime::now`
-//!   and `String::len` have *no* crate root (`SystemTime` is a type, not a
-//!   crate), so `std`/`core`/`alloc` are treated as trusted only when the path
-//!   is *clearly* std — explicitly rooted at `std::`, `core::` or `alloc::`, as
+//! * **`[[trusted]]`** — matched on the callee's **crate root**. That is the
+//!   leading identifier of the path text, after peeling `<`, `&`, `*const`/`*mut`
+//!   and `dyn `. It counts only when `::` follows it and it starts with a
+//!   lowercase ASCII letter. Trimmed paths are the reason for that guard.
+//!   `SystemTime::now` and `String::len` have *no* crate root (`SystemTime` is a
+//!   type, not a crate). So `std`/`core`/`alloc` are trusted only when the path
+//!   is *clearly* std: explicitly rooted at `std::`, `core::` or `alloc::`, as
 //!   `std::string::String::clone` is. A trimmed std path therefore falls through
 //!   to [`CallClass::Unclassified`] rather than being silently trusted.
 //!
@@ -47,8 +47,9 @@
 //! `Unclassified`. Within one table the rows are ordered most-specific first
 //! (`receiver` + `dest_type` > one of them > `path` alone), matching the model
 //! TOML header. **A `[[source]]` match is always reported, and always first,
-//! even when a `[[trusted]]` row also matches** — that precedence is what keeps
-//! `chrono` a trusted taint-propagator without making `Utc::now` clean.
+//! even when a `[[trusted]]` row also matches.** That precedence keeps `jiff`
+//! and `chrono` trusted taint-propagators. It does not make `Timestamp::now` or
+//! `Utc::now` clean.
 
 use super::callee::{self, CalleePath};
 use super::{
@@ -99,8 +100,8 @@ impl Model {
     /// Every class that applies to `callee`, in the documented order.
     ///
     /// `dest_type` is the declared type of the call's destination local
-    /// (`let _7: T;`), or `None` when it is unknown — in which case no row that
-    /// carries a `dest_type` can match.
+    /// (`let _7: T;`), or `None` when it is unknown. Then no row that carries a
+    /// `dest_type` can match.
     #[must_use]
     pub fn classify(&self, callee: &CalleePath, dest_type: Option<&str>) -> Vec<CallClass<'_>> {
         let mut out: Vec<CallClass<'_>> = Vec::new();
@@ -465,6 +466,29 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, CallClass::Trusted(t) if t.name == "autumn_harvest")),
             "and the trusted row is still reported: {classes:?}"
+        );
+    }
+
+    #[test]
+    fn a_jiff_clock_read_is_a_source_before_the_trusted_crate() {
+        let m = model();
+        for path in [
+            "autumn_harvest::time::Timestamp::now",
+            "autumn_harvest::jiff::Timestamp::now",
+            "jiff::Timestamp::now",
+            "jiff::ZonedDateTime::now",
+            "jiff::tz::TimeZone::system",
+        ] {
+            let classes = classify(&m, path, None);
+            assert!(
+                matches!(classes.first(), Some(CallClass::Source(_))),
+                "{path}: the source row must be reported first: {classes:?}"
+            );
+        }
+        let pure = classify(&m, "jiff::Timestamp::as_second", None);
+        assert!(
+            !pure.iter().any(|c| matches!(c, CallClass::Source(_))),
+            "jiff arithmetic is not a source: {pure:?}"
         );
     }
 

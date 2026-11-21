@@ -1,13 +1,16 @@
 //! Management read model for per-schedule run history (issue #534).
 //!
 //! Answers the first triage question an operator asks of a misbehaving cron:
-//! *"show me this schedule's last N runs and which ones failed."* A schedule's
-//! runs are attributed at start time via
+//!
+//! > *Show me this schedule's last N runs and which ones failed.*
+//!
+//! Runs are attributed to a schedule at start time via
 //! [`schedule_id`](autumn_harvest::StartWorkflowParams::schedule_id) +
-//! [`origin`](autumn_harvest::StartWorkflowParams::origin), so this endpoint can
-//! list exactly the executions a schedule launched — without conflating them with
-//! manually-started, signal-with-start, or unrelated runs of the same workflow
-//! type — and break a backfill storm or ad-hoc trigger out from normal cadence.
+//! [`origin`](autumn_harvest::StartWorkflowParams::origin). So this endpoint
+//! lists exactly the executions a schedule launched. It never conflates them
+//! with manually-started, signal-with-start, or unrelated runs of the same
+//! workflow type. It also breaks a backfill storm or ad-hoc trigger out from
+//! normal cadence.
 //!
 //! The runs may be spread across shards, so the handler fans
 //! [`list_schedule_runs`](autumn_harvest::list_schedule_runs) and
@@ -19,13 +22,13 @@
 //!
 //! ## Partial answers
 //!
-//! When a shard is unreachable it is reported in `shards` (never silently
-//! dropped) and the report `status` becomes `partial` (some inspected) or
-//! `unavailable` (none inspected) — never a hard 500. The cadence summary and run
-//! list then reflect only the inspected shards.
+//! An unreachable shard is reported in `shards`, never silently dropped. The
+//! report `status` becomes `partial` (some inspected) or `unavailable` (none
+//! inspected), never a hard 500. The cadence summary and run list then reflect
+//! only the inspected shards.
 
 use autumn_harvest::{ScheduleRunRow, ScheduleRunStateCount};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -33,9 +36,9 @@ use crate::shard_fanout::FanoutStatus;
 
 /// Cross-shard completeness of a run-history response.
 ///
-/// A type alias onto the shared [`FanoutStatus`] (rather than its own enum)
-/// so the complete/partial/unavailable derivation rule lives in exactly one
-/// place, alongside `workflow_reachability`'s and `workflow_count`'s reports.
+/// A type alias onto the shared [`FanoutStatus`], not its own enum. So the
+/// complete/partial/unavailable rule lives in one place, shared with the
+/// `workflow_reachability` and `workflow_count` reports.
 pub type RunsReportStatus = FanoutStatus;
 
 /// Per-shard run + summary observation fed into [`build_runs_response`].
@@ -57,11 +60,11 @@ pub struct ScheduleRunEntry {
     /// Execution id of the run.
     pub execution_id: Uuid,
     /// Logical schedule slot the run fired for (`null` for a `manual_trigger`).
-    pub nominal_fire_time: Option<DateTime<Utc>>,
+    pub nominal_fire_time: Option<Timestamp>,
     /// When the run started.
-    pub started_at: DateTime<Utc>,
+    pub started_at: Timestamp,
     /// When the run reached a terminal state, or `null` while active.
-    pub completed_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<Timestamp>,
     /// Current execution state.
     pub state: String,
     /// At-a-glance collapse of `state` into an outcome bucket (issue #762):
@@ -78,8 +81,8 @@ pub struct ScheduleRunEntry {
 /// Collapse an execution `state` into a compact per-run outcome bucket (issue #762).
 ///
 /// Returns the six buckets the AC names (`completed`/`failed`/`timed_out`/
-/// `cancelled`/`terminated`/`running`) plus `continued_as_new`/`paused`/`other`
-/// for the states outside that list, so an unexpected/active state is never
+/// `cancelled`/`terminated`/`running`). States outside that list map to
+/// `continued_as_new`/`paused`/`other`. So an unexpected/active state is never
 /// mislabelled as one of the six.
 #[must_use]
 pub fn collapse_outcome(state: &str) -> &'static str {
@@ -96,8 +99,9 @@ pub fn collapse_outcome(state: &str) -> &'static str {
     }
 }
 
-/// The terminal failure cause for display: the raw `error`'s first line, but only
-/// when the run is terminally-*failed* (`FAILED`/`TIMED_OUT`) — a cancel/terminate
+/// The terminal failure cause for display: the first line of the raw `error`.
+///
+/// Only for a terminally-*failed* run (`FAILED`/`TIMED_OUT`). A cancel/terminate
 /// carries no failure cause, so its `error` (if any) is suppressed (issue #762).
 fn terminal_failed_error(state: &str, error: Option<String>) -> Option<String> {
     if state == "FAILED" || state == "TIMED_OUT" {
@@ -194,7 +198,7 @@ pub struct ScheduleRunsResponse {
     /// The schedule's next expected fire time (issue #762), echoed so a caller gets
     /// "last N actual + next expected" without a second call. `null` when the
     /// schedule has no upcoming fire (paused, exhausted, or manual-only).
-    pub next_run_at: Option<DateTime<Utc>>,
+    pub next_run_at: Option<Timestamp>,
     /// The schedule's runs, newest-slot-first, capped at `limit`.
     pub runs: Vec<ScheduleRunEntry>,
     /// Per-state cadence summary over the window (scheduled-origin only).
@@ -219,11 +223,14 @@ pub const MAX_LIMIT: i64 = 200;
 
 /// Parsed query parameters for `GET /admin/schedules/{id}/runs` (issue #534).
 ///
-/// Pure and testable: `state`/`origin` are repeatable (and each value may be a
-/// comma-separated list); `since`/`until` accept an RFC 3339 timestamp or a
-/// relative duration (`24h`); `limit` is clamped to `[1, MAX_LIMIT]`. Domain
-/// validation of `state`/`origin` values is left to the caller (it owns the
-/// authoritative state/origin vocabularies).
+/// Pure and testable:
+/// - `state`/`origin` are repeatable, and each value may be a comma-separated
+///   list;
+/// - `since`/`until` accept an RFC 3339 timestamp or a relative duration (`24h`);
+/// - `limit` is clamped to `[1, MAX_LIMIT]`.
+///
+/// The caller validates `state`/`origin` values, because it owns the
+/// authoritative state/origin vocabularies.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScheduleRunsParams {
     /// State filter (empty = all states).
@@ -231,12 +238,12 @@ pub struct ScheduleRunsParams {
     /// Origin filter (empty = all origins).
     pub origins: Vec<String>,
     /// Inclusive lower bound on `started_at`.
-    pub since: Option<DateTime<Utc>>,
+    pub since: Option<Timestamp>,
     /// Exclusive upper bound on `started_at`.
-    pub until: Option<DateTime<Utc>>,
+    pub until: Option<Timestamp>,
     /// Keyset cursor `(sort_key, execution_id)`, where `sort_key` is the logical-slot
     /// ordering key (`COALESCE(scheduled_for, started_at)`, issue #762).
-    pub cursor: Option<(DateTime<Utc>, Uuid)>,
+    pub cursor: Option<(Timestamp, Uuid)>,
     /// Applied row cap.
     pub limit: i64,
 }
@@ -257,10 +264,7 @@ impl ScheduleRunsParams {
     ///
     /// Returns `Err` with a human-readable message for a malformed `limit`,
     /// `since`, `until`, or `cursor` — the handler maps this to `400`, never `500`.
-    pub fn from_query_pairs(
-        pairs: &[(String, String)],
-        now: DateTime<Utc>,
-    ) -> Result<Self, String> {
+    pub fn from_query_pairs(pairs: &[(String, String)], now: Timestamp) -> Result<Self, String> {
         let mut out = Self {
             limit: DEFAULT_LIMIT,
             ..Self::default()
@@ -297,7 +301,7 @@ impl ScheduleRunsParams {
 /// (`COALESCE(scheduled_for, started_at)`, issue #762) so pagination stays
 /// consistent with the newest-slot-first ordering.
 #[must_use]
-pub fn encode_cursor(sort_key: DateTime<Utc>, execution_id: Uuid) -> String {
+pub fn encode_cursor(sort_key: Timestamp, execution_id: Uuid) -> String {
     crate::api::encode_workflow_list_cursor_raw(&sort_key, &execution_id)
 }
 
@@ -306,13 +310,12 @@ pub fn encode_cursor(sort_key: DateTime<Utc>, execution_id: Uuid) -> String {
 /// # Errors
 ///
 /// Returns `Err` with a human-readable reason when the token is malformed.
-pub fn parse_cursor(raw: &str) -> Result<(DateTime<Utc>, Uuid), String> {
+pub fn parse_cursor(raw: &str) -> Result<(Timestamp, Uuid), String> {
     let (ts_part, id_part) = raw
         .split_once('|')
         .ok_or_else(|| "invalid cursor; expected '<started_at>|<execution_id>'".to_string())?;
-    let started_at = DateTime::parse_from_rfc3339(ts_part)
-        .map_err(|_| "invalid cursor: bad timestamp".to_string())?
-        .with_timezone(&Utc);
+    let started_at = autumn_harvest::time::parse::rfc3339(ts_part)
+        .map_err(|_| "invalid cursor: bad timestamp".to_string())?;
     let execution_id = id_part
         .parse::<Uuid>()
         .map_err(|_| "invalid cursor: bad execution id".to_string())?;
@@ -324,16 +327,16 @@ pub fn parse_cursor(raw: &str) -> Result<(DateTime<Utc>, Uuid), String> {
 /// Runs are merged across shards, sorted newest-slot-first
 /// (`COALESCE(scheduled_for, started_at) DESC, execution_id DESC` — the same
 /// logical-slot key [`ScheduleRunRow::sort_key`] the core query orders by), and
-/// truncated to `limit`. Each shard is queried for `limit + 1` rows, so a merged
-/// total exceeding `limit` means a further page exists: the list is truncated and
-/// `next_cursor` is derived from the last kept row's slot key. The cadence summary
+/// truncated to `limit`. Each shard is queried for `limit + 1` rows. So a merged
+/// total over `limit` means a further page exists. The list is then truncated,
+/// and `next_cursor` comes from the slot key of the last kept row. The cadence summary
 /// sums each shard's scheduled-origin per-state counts. `status` is `complete` only
 /// when every shard was inspected. `next_run_at` is echoed from the schedule row.
 #[must_use]
 #[allow(clippy::needless_pass_by_value)]
 pub fn build_runs_response(
     schedule_id: Uuid,
-    next_run_at: Option<DateTime<Utc>>,
+    next_run_at: Option<Timestamp>,
     limit: i64,
     observations: Vec<ShardRunsObservation>,
 ) -> ScheduleRunsResponse {
@@ -355,7 +358,7 @@ pub fn build_runs_response(
     });
 
     // A merged total beyond `limit` means at least one more row exists in the
-    // window: truncate and emit a cursor anchored on the last kept row's slot key.
+    // window. Truncate, and anchor the cursor on the slot key of the last kept row.
     let keep = usize::try_from(limit).unwrap_or(usize::MAX);
     let has_more = merged.len() > keep;
     if has_more {
@@ -409,10 +412,10 @@ pub fn build_runs_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone as _;
+    use jiff::Timestamp;
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(secs, 0).unwrap()
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::new(secs, 0).unwrap()
     }
 
     fn uid(n: u128) -> Uuid {
@@ -500,7 +503,7 @@ mod tests {
             ],
         );
 
-        let order: Vec<i64> = resp.runs.iter().map(|r| r.started_at.timestamp()).collect();
+        let order: Vec<i64> = resp.runs.iter().map(|r| r.started_at.as_second()).collect();
         assert_eq!(order, vec![300, 200, 100], "newest-first across shards");
         assert_eq!(resp.status, RunsReportStatus::Complete);
         assert!(resp.next_cursor.is_none());
@@ -632,6 +635,21 @@ mod tests {
         assert_eq!(id, uid(99));
     }
 
+    /// A cursor reads every instant that `parse_from_rfc3339` read.
+    #[test]
+    fn parse_cursor_reads_the_chrono_rfc3339_grammar() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        let (ts, _) = parse_cursor(&format!("2026-01-01T00:00:00.1234567891Z|{id}")).unwrap();
+        assert_eq!(
+            ts,
+            "2026-01-01T00:00:00.123456789Z"
+                .parse::<Timestamp>()
+                .unwrap()
+        );
+        let (ts, _) = parse_cursor(&format!("9999-12-31T23:59:59Z|{id}")).unwrap();
+        assert_eq!(ts, Timestamp::MAX);
+    }
+
     #[test]
     fn parse_cursor_rejects_garbage() {
         assert!(parse_cursor("not-a-cursor").is_err(), "missing delimiter");
@@ -683,7 +701,7 @@ mod tests {
     fn params_relative_since_duration() {
         let now = at(1_000_000);
         let p = ScheduleRunsParams::from_query_pairs(&pairs(&[("since", "1h")]), now).unwrap();
-        assert_eq!(p.since, Some(now - chrono::Duration::hours(1)));
+        assert_eq!(p.since, Some(now - jiff::SignedDuration::from_hours(1)));
     }
 
     #[test]
@@ -822,7 +840,7 @@ mod tests {
                 ),
             ],
         );
-        let slots: Vec<i64> = resp.runs.iter().map(|r| r.started_at.timestamp()).collect();
+        let slots: Vec<i64> = resp.runs.iter().map(|r| r.started_at.as_second()).collect();
         // 400 (s0) > 300 (s1) > 200 (s0) > 100 (s1 manual).
         assert_eq!(slots, vec![400, 300, 200, 100]);
     }

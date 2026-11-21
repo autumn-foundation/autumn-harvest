@@ -1,9 +1,9 @@
 //! End-to-end-style tests for the shard routing primitives that do not
 //! require a live Postgres instance.
 //!
-//! The integration tests that exercise multi-shard Postgres setups live under
-//! `tests/multi_shard.rs` (planned follow-up) and require Docker; the checks
-//! here validate the routing contract in isolation so the logic is covered
+//! The multi-shard Postgres integration tests live under
+//! `tests/multi_shard.rs` (planned follow-up) and require Docker. The checks
+//! here validate the routing contract in isolation. So the logic is covered
 //! even on hosts that cannot spin up testcontainers.
 
 use autumn_harvest::{ExecutionId, ShardId, ShardRouter};

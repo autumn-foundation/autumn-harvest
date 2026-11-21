@@ -165,6 +165,17 @@ pub type Parked = HashMap<ExecutionId, ParkedState>;
 /// history.
 type Live = Vec<ExecutionId>;
 
+/// Register the session workflow and its two activities on `runtime`.
+///
+/// The model turn returns its cost ledger call with its reply, so the
+/// runtime writes the row with the completion.
+fn register(runtime: &mut SqliteRuntime, model: ModelConfig, workspace: PathBuf) {
+    runtime.register_workflow(&session::agent_session_info());
+    runtime
+        .register_activity_with_ledger(&session::claude_turn_info(), claude::activity_body(model));
+    runtime.register_activity_with_body(&session::run_tool_info(), tools::activity_body(workspace));
+}
+
 /// Run the daemon until `Ctrl-C`.
 ///
 /// # Errors
@@ -230,12 +241,7 @@ pub async fn serve(options: Options) -> Result<(), String> {
     // catches a swap that landed inside it. The one above keeps the reclaim
     // off another daemon's file in every slower case.
     lock.still_names(&options.db)?;
-    runtime.register_workflow(&session::agent_session_info());
-    runtime.register_activity_with_body(&session::claude_turn_info(), claude::activity_body(model));
-    runtime.register_activity_with_body(
-        &session::run_tool_info(),
-        tools::activity_body(options.workspace.clone()),
-    );
+    register(&mut runtime, model, options.workspace.clone());
 
     let reader = inspect::open(&options.db)?;
     // Check the sessions already in the file BEFORE anything drives them. A
@@ -599,7 +605,6 @@ async fn accept_loop(listener: UnixListener, tx: mpsc::Sender<Job>, owner: u32) 
         };
         match listener.accept().await {
             Ok((stream, _)) => {
-                // Every caller is identified before it is served.
                 if !peer_is_owner(&stream, owner) {
                     drop(permit);
                     continue;
@@ -1802,6 +1807,16 @@ async fn drive_one(
         // A session spawns no child, but the match must stay exhaustive.
         Ok(RunState::WaitingWorkflow(other)) => {
             note(blocked, exec, format!("waiting for run {other}"), None);
+        }
+        // A session sends no external activity, but the match must stay
+        // exhaustive. A settle of the token wakes it.
+        Ok(RunState::WaitingExternal(token)) => {
+            note(
+                blocked,
+                exec,
+                format!("waiting for external token {token}"),
+                None,
+            );
         }
         // Issue #2029: another run holds the mutex. A later tick retries.
         Ok(RunState::WaitingMutex(key)) => {

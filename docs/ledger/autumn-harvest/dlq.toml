@@ -24,12 +24,19 @@ tables = ["harvest_dead_letters"]
 measured = "docs/performance-dead-letter-indexes.md"
 plan = "docs/ledger/plans/autumn-harvest/dlq.md"
 
+["counter_call"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_dead_letter_counts", "harvest_dead_letters"]
+measured = "unmeasured"
+
 ["dead_letter_count"]
-driver = "per_request"
+driver = "per_tick"
 backend = ["postgres"]
 kind = ["read"]
-tables = ["harvest_dead_letters"]
-measured = "unmeasured"
+tables = ["harvest_dead_letter_counts"]
+measured = "docs/performance-dlq-depth-counter.md"
 plan = "docs/ledger/plans/autumn-harvest/dlq.md"
 
 ["dead_letter_with_codecs"]

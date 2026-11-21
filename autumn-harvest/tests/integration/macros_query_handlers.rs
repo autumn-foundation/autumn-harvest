@@ -3,7 +3,7 @@
 //! Run with:
 //!   `cargo test -p autumn-harvest --test macros_query_handlers --features testing`
 // Test handler functions are constrained by the macro interface (must return
-// Result, take args by value, etc.) so several pedantic lints don't apply here.
+// Result, take args by value, etc.) so several pedantic lints do not apply here.
 #![allow(
     clippy::doc_markdown,
     clippy::missing_const_for_fn,
@@ -254,7 +254,7 @@ async fn update_handler_dispatches_without_validator() {
     let info = __autumn_update_handler_info_approve();
     let ctx = WorkflowContext::new_for_handler(
         ExecutionId::new(),
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
         None,
         empty_shared_state(),
     );
@@ -276,7 +276,7 @@ async fn update_handler_with_validator_accept() {
 
     let ctx = WorkflowContext::new_for_handler(
         ExecutionId::new(),
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
         None,
         empty_shared_state(),
     );
@@ -380,7 +380,8 @@ fn query_ctx_can_access_shared_state() {
     let state = std::sync::Arc::new(map);
 
     let info = __autumn_query_handler_info_read_counter();
-    let ctx = WorkflowContext::new_for_handler(ExecutionId::new(), chrono::Utc::now(), None, state);
+    let ctx =
+        WorkflowContext::new_for_handler(ExecutionId::new(), jiff::Timestamp::now(), None, state);
     let result = (info.handler)(ctx.as_ref(), serde_json::Value::Null).unwrap();
     assert_eq!(result, serde_json::json!(77));
 }

@@ -1,0 +1,95 @@
+##### variant=after added_sleepers=0 unfired=18200
+Pager usage is off.
+PREPARE
+SET
+ generic_plans | custom_plans 
+---------------+--------------
+             0 |            6
+(1 row)
+
+                                                                   QUERY PLAN                                                                    
+-------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=6.21..654.53 rows=1 width=51) (actual time=0.014..0.015 rows=1 loops=1)
+   Output: id, workflow_exec_id, timer_id, fires_at, fired
+   Buffers: shared hit=3 read=1
+   ->  Bitmap Heap Scan on public.harvest_timers  (cost=6.21..654.53 rows=1 width=51) (actual time=0.014..0.014 rows=1 loops=1)
+         Output: id, workflow_exec_id, timer_id, fires_at, fired
+         Recheck Cond: ((harvest_timers.workflow_exec_id = '00000000-0000-4000-8000-000000000001'::uuid) AND (NOT harvest_timers.fired))
+         Filter: (harvest_timers.timer_id = 'timer-10000'::text)
+         Heap Blocks: exact=1
+         Buffers: shared hit=3 read=1
+         ->  Bitmap Index Scan on idx_harvest_timers_exec  (cost=0.00..6.21 rows=178 width=0) (actual time=0.010..0.010 rows=1 loops=1)
+               Index Cond: ((harvest_timers.workflow_exec_id = '00000000-0000-4000-8000-000000000001'::uuid) AND (harvest_timers.fired = false))
+               Buffers: shared hit=2 read=1
+ Query Identifier: 4952928457353633331
+ Planning Time: 0.065 ms
+ Execution Time: 0.024 ms
+(15 rows)
+
+ generic_plans | custom_plans 
+---------------+--------------
+             0 |            7
+(1 row)
+
+##### variant=after added_sleepers=100000 unfired=118200
+Pager usage is off.
+PREPARE
+SET
+ generic_plans | custom_plans 
+---------------+--------------
+             1 |            5
+(1 row)
+
+                                                               QUERY PLAN                                                               
+----------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=5.70..479.46 rows=1 width=51) (actual time=0.019..0.019 rows=1 loops=1)
+   Output: id, workflow_exec_id, timer_id, fires_at, fired
+   Buffers: shared hit=2 read=2
+   ->  Bitmap Heap Scan on public.harvest_timers  (cost=5.70..479.46 rows=1 width=51) (actual time=0.018..0.018 rows=1 loops=1)
+         Output: id, workflow_exec_id, timer_id, fires_at, fired
+         Recheck Cond: ((harvest_timers.workflow_exec_id = $1) AND (harvest_timers.fired = $3))
+         Filter: (harvest_timers.timer_id = $2)
+         Heap Blocks: exact=1
+         Buffers: shared hit=2 read=2
+         ->  Bitmap Index Scan on idx_harvest_timers_exec  (cost=0.00..5.70 rows=127 width=0) (actual time=0.011..0.011 rows=1 loops=1)
+               Index Cond: ((harvest_timers.workflow_exec_id = $1) AND (harvest_timers.fired = $3))
+               Buffers: shared hit=2 read=1
+ Query Identifier: 4952928457353633331
+ Planning Time: 0.009 ms
+ Execution Time: 0.032 ms
+(15 rows)
+
+ generic_plans | custom_plans 
+---------------+--------------
+             2 |            5
+(1 row)
+
+##### variant=after added_sleepers=1000000 unfired=1018200
+Pager usage is off.
+PREPARE
+SET
+ generic_plans | custom_plans 
+---------------+--------------
+             1 |            5
+(1 row)
+
+                                                                       QUERY PLAN                                                                       
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.43..101.61 rows=1 width=50) (actual time=0.018..0.019 rows=1 loops=1)
+   Output: id, workflow_exec_id, timer_id, fires_at, fired
+   Buffers: shared hit=2 read=2 written=2
+   ->  Index Scan using idx_harvest_timers_exec on public.harvest_timers  (cost=0.43..101.61 rows=1 width=50) (actual time=0.018..0.018 rows=1 loops=1)
+         Output: id, workflow_exec_id, timer_id, fires_at, fired
+         Index Cond: ((harvest_timers.workflow_exec_id = $1) AND (harvest_timers.fired = $3))
+         Filter: (harvest_timers.timer_id = $2)
+         Buffers: shared hit=2 read=2 written=2
+ Query Identifier: 4952928457353633331
+ Planning Time: 0.006 ms
+ Execution Time: 0.027 ms
+(11 rows)
+
+ generic_plans | custom_plans 
+---------------+--------------
+             2 |            5
+(1 row)
+

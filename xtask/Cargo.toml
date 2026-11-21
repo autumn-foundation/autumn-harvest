@@ -13,9 +13,9 @@ name = "xtask"
 path = "src/main.rs"
 
 [dependencies]
-smop = { version = "0.3.2", default-features = false, features = ["sh", "fs", "path", "env", "cli", "json", "toml", "glob", "time"] }
+smop = { version = "0.4.0", default-features = false, features = ["sh", "fs", "path", "env", "cli", "json", "toml", "glob", "time"] }
 regex = "1"
-fancy-regex = "0.11"
+fancy-regex = "0.20"
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

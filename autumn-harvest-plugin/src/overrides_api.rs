@@ -1,9 +1,10 @@
 //! `GET /admin/overrides`: every operator override in one list (issue #2388).
 //!
-//! The list has two parts. Schedule overrides (issues #2385 and #2386) live
+//! The list has three parts. Schedule overrides (issues #2385 and #2386) live
 //! on the shard of their schedule row, so the route reads every pool. The
-//! run-default overrides (issue #2387) live on the default shard. A pool that
-//! cannot be read is named, and the route still answers with the rest.
+//! run-default overrides (issue #2387) and the activity default overrides
+//! live on the default shard. A pool that cannot be read is named, and the
+//! route still answers with the rest.
 //!
 //! `harvest overrides list` and the count on `GET /admin/config` read this
 //! list.
@@ -14,6 +15,7 @@ use autumn_web::reexports::axum;
 use axum::extract::{Extension, Json};
 use serde::Serialize;
 
+use crate::activity_defaults_api::ActivityDefaultOverrideView;
 use crate::api::{HarvestApiState, acquire_conn, map_error};
 use crate::run_defaults_api::RunDefaultOverrideView;
 use crate::shard_fanout::UnavailableShard;
@@ -38,6 +40,16 @@ pub struct RunDefaultOverrideEntry {
     pub stored: RunDefaultOverrideView,
 }
 
+/// One activity default override.
+#[derive(Debug, Clone, Serialize)]
+pub struct ActivityDefaultOverrideEntry {
+    /// The activity name.
+    pub activity_name: String,
+    /// The stored override.
+    #[serde(flatten)]
+    pub stored: ActivityDefaultOverrideView,
+}
+
 /// The body of `GET /admin/overrides`.
 #[derive(Debug, Clone, Serialize)]
 pub struct OverridesView {
@@ -45,6 +57,8 @@ pub struct OverridesView {
     pub schedule_overrides: Vec<ScheduleOverrideEntry>,
     /// Every run-default override, by workflow name.
     pub run_default_overrides: Vec<RunDefaultOverrideEntry>,
+    /// Every activity default override, by activity name.
+    pub activity_default_overrides: Vec<ActivityDefaultOverrideEntry>,
     /// The shards that the route could not read. Their overrides are absent.
     pub unavailable_shards: Vec<UnavailableShard>,
 }
@@ -56,6 +70,8 @@ pub struct OverrideCounts {
     pub schedule_overrides: usize,
     /// The number of run-default overrides.
     pub run_default_overrides: usize,
+    /// The number of activity default overrides.
+    pub activity_default_overrides: usize,
     /// The number of shards that could not be read, so a count may be low.
     pub unavailable_shards: usize,
 }
@@ -67,6 +83,7 @@ impl OverridesView {
         OverrideCounts {
             schedule_overrides: self.schedule_overrides.len(),
             run_default_overrides: self.run_default_overrides.len(),
+            activity_default_overrides: self.activity_default_overrides.len(),
             unavailable_shards: self.unavailable_shards.len(),
         }
     }
@@ -85,6 +102,7 @@ pub async fn collect_overrides(api_state: &HarvestApiState) -> Result<OverridesV
     let mut view = OverridesView {
         schedule_overrides: Vec::new(),
         run_default_overrides: Vec::new(),
+        activity_default_overrides: Vec::new(),
         unavailable_shards: Vec::new(),
     };
     for (shard_pool, shards) in pool.sharded_pool().pool_groups() {
@@ -120,12 +138,20 @@ pub async fn collect_overrides(api_state: &HarvestApiState) -> Result<OverridesV
 
     let default_shard = pool.sharded_pool().default_shard().as_i32();
     let loaded = match acquire_conn(pool.default_pool()).await {
-        Ok(mut conn) => autumn_harvest::run_defaults::load_run_default_overrides(&mut conn)
-            .await
-            .map_err(|error| error.to_string()),
-        Err(error) => Err(error.to_string()),
+        Ok(mut conn) => {
+            let workflows = autumn_harvest::run_defaults::load_run_default_overrides(&mut conn)
+                .await
+                .map_err(|error| error.to_string());
+            let activities =
+                autumn_harvest::activity_defaults::load_activity_default_overrides(&mut conn)
+                    .await
+                    .map_err(|error| error.to_string());
+            (workflows, activities)
+        }
+        Err(error) => (Err(error.to_string()), Err(error.to_string())),
     };
-    match loaded {
+    let mut default_failure = None;
+    match loaded.0 {
         Ok(rows) => {
             view.run_default_overrides = rows
                 .into_iter()
@@ -137,18 +163,34 @@ pub async fn collect_overrides(api_state: &HarvestApiState) -> Result<OverridesV
             view.run_default_overrides
                 .sort_by(|a, b| a.workflow_name.cmp(&b.workflow_name));
         }
-        Err(reason) => {
-            if !view
-                .unavailable_shards
-                .iter()
-                .any(|shard| shard.shard_id == default_shard)
-            {
-                view.unavailable_shards.push(UnavailableShard {
-                    shard_id: default_shard,
-                    reason,
-                });
-            }
+        Err(reason) => default_failure = Some(reason),
+    }
+    match loaded.1 {
+        Ok(rows) => {
+            view.activity_default_overrides = rows
+                .into_iter()
+                .map(|stored| ActivityDefaultOverrideEntry {
+                    activity_name: stored.activity_name.clone(),
+                    stored: stored.into(),
+                })
+                .collect();
+            view.activity_default_overrides
+                .sort_by(|a, b| a.activity_name.cmp(&b.activity_name));
         }
+        Err(reason) => {
+            default_failure.get_or_insert(reason);
+        }
+    }
+    if let Some(reason) = default_failure
+        && !view
+            .unavailable_shards
+            .iter()
+            .any(|shard| shard.shard_id == default_shard)
+    {
+        view.unavailable_shards.push(UnavailableShard {
+            shard_id: default_shard,
+            reason,
+        });
     }
     view.unavailable_shards.sort_by_key(|shard| shard.shard_id);
     Ok(view)

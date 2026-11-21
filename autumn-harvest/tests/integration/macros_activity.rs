@@ -29,7 +29,6 @@ async fn timed_local(_ctx: &ActivityContext, val: String) -> Result<String, Stri
     Ok(val.to_uppercase())
 }
 
-// Local activity with a retry policy
 #[activity(local = true, retry = RetryPolicy::fixed(3, Duration::from_secs(1)))]
 async fn retryable_local(_ctx: &ActivityContext) -> Result<(), String> {
     Ok(())
@@ -57,7 +56,6 @@ async fn dyn_rate_activity(_ctx: &ActivityContext, x: i64) -> Result<i64, String
     Ok(x)
 }
 
-// Dynamic per-key rate limit with explicit burst.
 #[activity(rate_limit(key = "input.tenant_id", rps = 50, burst = 10))]
 async fn dyn_rate_burst_activity(_ctx: &ActivityContext, x: i64) -> Result<i64, String> {
     Ok(x)

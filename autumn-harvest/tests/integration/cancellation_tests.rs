@@ -19,6 +19,7 @@ use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use jiff_diesel::ToDiesel;
 use serde_json::Value;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
@@ -426,7 +427,7 @@ async fn signal_insert_waits_for_concurrent_cancellation_lock() {
         .set((
             harvest_workflow_executions::state.eq("CANCELLED"),
             harvest_workflow_executions::error.eq(Some("racing cancel")),
-            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(&mut locker)
         .await
@@ -459,7 +460,7 @@ async fn signal_insert_waits_for_concurrent_cancellation_lock() {
         .expect_err("signal should be rejected after cancellation commits");
     assert!(matches!(error, HarvestError::Cancelled(message) if message.contains("racing cancel")));
 
-    let pending = signal::load_pending_signals(&mut locker, exec_id)
+    let pending = signal::load_pending_signals(&locker, exec_id)
         .await
         .expect("pending signal query should succeed");
     assert!(
@@ -481,6 +482,7 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
                 codec_rotation_batch_size: 0,
                 scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
@@ -490,6 +492,8 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
                 max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
+                claim_slots_per_shard: None,
+                claim_batch_max: None,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -730,6 +734,7 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
                 codec_rotation_batch_size: 0,
                 scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
@@ -739,6 +744,8 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
                 max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
+                claim_slots_per_shard: None,
+                claim_batch_max: None,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(2),
                 // Short grace period so the test completes quickly.
@@ -851,9 +858,9 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
     .await
     .expect("workflow cancellation should succeed");
 
-    // Give the worker time to: observe cancellation (up to ~500ms poll),
-    // cancel the token, elapse the 500ms grace period, then abort the
-    // handler and record the activity failure.
+    // The worker observes cancellation (up to ~500ms poll) and cancels the
+    // token. After the 500ms grace period it aborts the handler and records
+    // the activity failure.
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let tasks = load_tasks(&mut conn, exec_id).await;
@@ -895,8 +902,6 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
 // AC #9 — three named integration tests
 // ---------------------------------------------------------------------------
 
-// AC test 1: activity_exits_early_on_workflow_cancellation
-//
 // An activity that calls ctx.heartbeat() in a loop exits early (and sets the
 // probe flag) within one heartbeat interval after the workflow is cancelled.
 #[allow(clippy::too_many_lines)]
@@ -912,6 +917,7 @@ async fn activity_exits_early_on_workflow_cancellation() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
                 codec_rotation_batch_size: 0,
                 scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
@@ -921,6 +927,8 @@ async fn activity_exits_early_on_workflow_cancellation() {
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
                 max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
+                claim_slots_per_shard: None,
+                claim_batch_max: None,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(2),
                 cancellation_grace_period: Duration::from_secs(2),
@@ -1070,8 +1078,6 @@ async fn activity_exits_early_on_workflow_cancellation() {
     worker_task.await.expect("worker should stop cleanly");
 }
 
-// AC test 2: activity_without_cancellation_check_completes_normally
-//
 // An activity that never calls heartbeat() is not stopped by the cooperative
 // cancellation path.  It is only stopped by the worker's hard-abort after the
 // grace period — confirming cancellation is purely cooperative via heartbeat.
@@ -1088,6 +1094,7 @@ async fn activity_without_cancellation_check_completes_normally() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
                 codec_rotation_batch_size: 0,
                 scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
@@ -1097,6 +1104,8 @@ async fn activity_without_cancellation_check_completes_normally() {
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
                 max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
+                claim_slots_per_shard: None,
+                claim_batch_max: None,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(2),
                 cancellation_grace_period: Duration::from_millis(300),
@@ -1233,13 +1242,11 @@ async fn activity_without_cancellation_check_completes_normally() {
     worker_task.await.expect("worker should stop cleanly");
 }
 
-// AC test 3: heartbeat_checkpoint_preserved_across_cancel_signal
-//
 // When cancellation arrives, the checkpoint payload flushed to the database
 // before the cancel must still be the value the activity context received at
 // dispatch time.  The cancel path clears heartbeat_details on the task row
-// (for fresh retries), but an activity context built before the cancel already
-// holds the pre-cancel snapshot in memory — so its view is stable.
+// for fresh retries. An activity context built before the cancel already
+// holds the pre-cancel snapshot in memory, so its view is stable.
 #[tokio::test]
 async fn heartbeat_checkpoint_preserved_across_cancel_signal() {
     use autumn_harvest::schema::harvest_task_queue::dsl;

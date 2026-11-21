@@ -8,9 +8,9 @@
 //! 4. Bounded / windowed fan-out: process a collection larger than the window,
 //!    keeping at most `W` activities in flight at a time (issue #750).
 //!
-//! The input collection MUST be derived from already-recorded state (workflow
-//! input, prior activity outputs, signals) — never from non-deterministic
-//! sources such as the wall clock or a random number generator.
+//! The input collection MUST derive from already-recorded state: workflow
+//! input, prior activity outputs, or signals. It must never derive from the
+//! wall clock, a random number generator or another non-deterministic source.
 //!
 //! Run with:
 //!   cargo run --example fanout_batch
@@ -123,8 +123,8 @@ pub async fn collect_all_batch(
 
 /// Dynamic fan-out: N is derived from a prior activity output.
 ///
-/// The collection is always derived from durable recorded state (the output of
-/// `fetch_items`), never from the wall clock or a random number — this is what
+/// The collection always derives from durable recorded state, the output of
+/// `fetch_items`. It never derives from the wall clock or a random number. That
 /// keeps fan-out deterministic across replays.
 #[workflow]
 pub async fn dynamic_fan_out(ctx: &WorkflowContext, source: String) -> Result<BatchResult, String> {
@@ -154,12 +154,12 @@ pub async fn dynamic_fan_out(ctx: &WorkflowContext, source: String) -> Result<Ba
 
 /// Bounded / windowed fan-out (issue #750).
 ///
-/// Process a large collection with at most `W` activities in flight at a time,
-/// applying natural backpressure to workers and downstreams instead of
+/// Process a large collection with at most `W` activities in flight at a time.
+/// That applies backpressure to workers and downstreams, in place of
 /// scheduling all `N` at once.
 ///
-/// The entire windowed step is a single method call — replacing the ~30-line
-/// manual "loop / slice / call fan-out per chunk / stitch results" idiom:
+/// The windowed step is one method call. It replaces the ~30-line manual
+/// "loop / slice / call fan-out per chunk / stitch results" idiom:
 /// ```rust,ignore
 /// let results = ctx
 ///     .execute_activity_fan_out_windowed(&process_item_info(), input.items, 10)
@@ -170,9 +170,9 @@ pub async fn windowed_batch(
     ctx: &WorkflowContext,
     input: BatchInput,
 ) -> Result<Vec<ItemResult>, String> {
-    // `input.items` may be far larger than the window (10); at most 10 of these
-    // activities are ever scheduled-but-not-completed at once, yet every item is
-    // processed and the results come back in input order.
+    // `input.items` may be far larger than the window (10). At most 10 of these
+    // activities are scheduled but not completed at once. Every item is still
+    // processed, and the results come back in input order.
     let results = ctx
         .execute_activity_fan_out_windowed(&process_item_info(), input.items, 10)
         .await
@@ -210,8 +210,8 @@ mod tests {
     use serde_json::json;
 
     /// A windowed fan-out over 12 items (window 10) processes every item in
-    /// input order and records all 12 activity events — the harness drives the
-    /// two waves (10 + 2) to completion without any manual batching glue.
+    /// input order and records all 12 activity events. The harness drives the
+    /// two waves (10 + 2) to completion with no manual batching glue.
     #[tokio::test]
     async fn windowed_batch_processes_a_collection_larger_than_the_window() {
         let items: Vec<String> = (0..12).map(|i| format!("item_{i}")).collect();

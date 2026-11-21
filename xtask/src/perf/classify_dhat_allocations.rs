@@ -110,12 +110,13 @@
 //!      not. These are the own allocations of the storage engine from OTHER
 //!      call sites: task claims, activity enqueues and timer bookkeeping.
 //!      They do not depend on the history reload.
-//! 5. `other_uncategorized`: everything else. That holds the setup and teardown of the tokio runtime
-//!    and thread pool. It also holds the rusqlite plumbing that is not already
-//!    attributed to `load_history`, such as the statement cache and row access. It also holds the UUID-to-string formatting for
-//!    diagnostics and the small accessor and glue functions of `store::`,
-//!    `queue::`, `worker::` and `context::`. One-time allocations at process
-//!    startup are in it too.
+//! 5. `other_uncategorized`: everything else. That holds the setup and
+//!    teardown of the tokio runtime and thread pool. It also holds the
+//!    rusqlite plumbing that is not already attributed to `load_history`,
+//!    such as the statement cache and row access. It also holds the
+//!    UUID-to-string formatting for diagnostics and the small accessor and
+//!    glue functions of `store::`, `queue::`, `worker::` and `context::`.
+//!    One-time allocations at process startup are in it too.
 //!
 //!    This is a real, coherent "infrastructure glue" bucket. An inspection of
 //!    every stack in it confirmed that. It is not a sign of an

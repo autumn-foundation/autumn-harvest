@@ -5,7 +5,7 @@
 //! code, so both backends share them. The SQLite backend applies an override
 //! with the same rules as Postgres (issue #2390).
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use std::time::Duration;
 
 use crate::error::{HarvestError, HarvestResult};
@@ -17,12 +17,12 @@ use crate::policy::{OverlapPolicy, Schedule, WorkflowSchedule};
 /// Nullable columns use a double-`Option` — the outer `None` means
 /// "unchanged", `Some(None)` means "clear to NULL", `Some(Some(v))` sets `v`.
 ///
-/// The schedule's workflow type is deliberately absent: it is not editable
-/// (changing it is semantically a different schedule).
+/// The patch cannot change the workflow type. A schedule of another type is
+/// a different schedule.
 #[derive(Debug, Clone, Default)]
 pub struct WorkflowSchedulePatch {
-    /// New schedule cadence. Changing it recomputes `next_run_at` anchored
-    /// at now — elapsed slots are never retroactively fired.
+    /// New schedule cadence. A change recomputes `next_run_at` from now, and
+    /// no elapsed slot fires.
     pub schedule: Option<Schedule>,
     /// New JSON input passed to every scheduled run.
     pub input: Option<serde_json::Value>,
@@ -46,7 +46,7 @@ pub struct WorkflowSchedulePatch {
     /// New auto-pause threshold (issue #360). `Some(None)` disables.
     pub consecutive_failure_limit: Option<Option<u32>>,
     /// New absolute cutoff (issue #478). `Some(None)` removes the cutoff.
-    pub end_at: Option<Option<DateTime<Utc>>>,
+    pub end_at: Option<Option<Timestamp>>,
     /// New total run budget (issue #478). `Some(None)` (or `Some(Some(0))`)
     /// removes the budget.
     pub max_runs: Option<Option<u32>>,
@@ -80,7 +80,7 @@ pub const fn workflow_fields_are_empty(fields: &WorkflowSchedulePatch) -> bool {
 /// Merge `patch` over the `stored` fields of a workflow override.
 ///
 /// A field that the patch sets wins. A field that it leaves out keeps the
-/// stored value. The merge never carries an input.
+/// stored value.
 #[must_use]
 pub fn merge_workflow_fields(
     patch: &WorkflowSchedulePatch,
@@ -91,7 +91,7 @@ pub fn merge_workflow_fields(
     }
     WorkflowSchedulePatch {
         schedule: pick(patch.schedule.as_ref(), stored.schedule.as_ref()),
-        input: None,
+        input: pick(patch.input.as_ref(), stored.input.as_ref()),
         queue_name: pick(patch.queue_name.as_ref(), stored.queue_name.as_ref()),
         catchup: pick(patch.catchup.as_ref(), stored.catchup.as_ref()),
         max_active_runs: pick(
@@ -135,6 +135,9 @@ pub fn effective_workflow_schedule(
     let mut ws = code.clone();
     if let Some(schedule) = &fields.schedule {
         ws.schedule = schedule.clone();
+    }
+    if let Some(input) = &fields.input {
+        ws.input.clone_from(input);
     }
     if let Some(queue_name) = &fields.queue_name {
         ws.queue_name.clone_from(queue_name);
@@ -183,19 +186,12 @@ pub fn effective_workflow_schedule(
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Config`] when the fields carry an input, for an
-/// invalid cadence, or for a jitter that the effective cadence cannot hold.
+/// Returns [`HarvestError::Config`] for an invalid cadence, or for a jitter
+/// that the effective cadence cannot hold.
 pub fn validate_effective_workflow(
     code: &WorkflowSchedule,
     fields: &WorkflowSchedulePatch,
 ) -> HarvestResult<WorkflowSchedule> {
-    if fields.input.is_some() {
-        return Err(HarvestError::Config(format!(
-            "schedule '{}' is declared in code; an override cannot change its input. \
-             Change the input in code",
-            code.workflow_name
-        )));
-    }
     let effective = effective_workflow_schedule(code, fields);
     crate::policy::validate_schedule(&effective.schedule).map_err(HarvestError::Config)?;
     crate::policy::validate_jitter(&effective.schedule, effective.jitter)

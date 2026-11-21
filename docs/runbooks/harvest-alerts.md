@@ -638,6 +638,27 @@ error, worker panic, timeout misconfiguration, or a replay determinism error.
 Old DLQ entries are not growth. Page on new entries or increasing gauge depth,
 not on a stable backlog that is already being drained under an incident ticket.
 
+The gauge reads `harvest_dead_letter_counts`. Triggers on `harvest_dead_letters`
+keep it exact. A write with the triggers off makes it drift: for example,
+`ALTER TABLE ... DISABLE TRIGGER` or `session_replication_role = replica`. A
+drift is a constant offset, so it does not fire this rule. A negative count
+makes the sampler log a warning. To see a drift, compare
+`SELECT harvest_dead_letter_depth()` with
+`SELECT count(*) FROM harvest_dead_letters` on that shard. To repair it, run
+this as the table owner:
+
+```sql
+BEGIN;
+SET LOCAL lock_timeout = '5s';
+SELECT harvest_dead_letter_recount();
+COMMIT;
+```
+
+The recount needs `READ COMMITTED`. It locks the DLQ, counts it once, and
+blocks dead-letter writes until it commits. If the lock times out, run it
+again. A repair moves the gauge by the drift. A move of more than 5 fires
+this rule once, as a discard of more than 5 entries does.
+
 ### Safe actions
 
 Stop the producer or pause schedules if new DLQ entries are flooding in. Fix
@@ -822,7 +843,7 @@ capacity.
 1. Run `harvest retention status`.
 2. Confirm retention is enabled and note `max_age`, `batch_size`, and dry-run state.
 3. Run `harvest retention run-now` only if the status shows eligible rows and no shard blockers.
-   On a split fleet, the API replicas run no janitor by default (issue #2478). There the status shows `placed_elsewhere: true` and no shard results, and `run-now` returns 503. Read the retention metrics of the `worker` replicas, or see [`process-roles.md`](../operations/process-roles.md#background-runtimes-issue-2478).
+   On a split fleet, the API replicas run no janitor by default (issue #2478). There the status shows `placed_elsewhere: true` and no shard results, and `run-now` returns 503. Read the retention metrics of the `worker` replicas, or see [`process-roles.md`](../operations/process-roles.md#background-runtimes).
 4. Check database storage pressure before changing retention settings.
 
 ### Likely causes
@@ -3562,8 +3583,9 @@ that slow queries hold connections too long.
 
 - The worker pool size, `HarvestPoolConfig::worker_pool_size` per shard, is
   smaller than the worker's concurrency needs. Count the claim loops too:
-  `max_concurrent_claims`, 2 by default. In embedded mode the worker shares
-  the application pool.
+  `max_concurrent_claims`, 2 by default. Claim slots do not lower this need.
+  A claim that misses a slot still holds a connection for one short
+  statement. In embedded mode the worker shares the application pool.
 - Slow queries or lock waits hold connections for longer than usual.
 - A connection leak in an activity that calls `run_transactional` and does
   not finish.

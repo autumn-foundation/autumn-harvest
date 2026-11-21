@@ -1,7 +1,42 @@
 # Ledger profiles for `autumn-harvest/src/schedule_override.rs`. See `docs/ledger/README.md`.
 
+["apply_floor"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_schedule_overrides"]
+measured = "unmeasured"
+
+["bound_carry_lock_waits"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = []
+tables = []
+measured = "unmeasured"
+
 ["carry_dag_override"]
 driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_schedule_overrides"]
+measured = "unmeasured"
+
+["copy_newest"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_schedule_overrides"]
+measured = "unmeasured"
+
+["dag_floor_names"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_schedule_override_receipts"]
+measured = "unmeasured"
+
+["delete_dag_override_returning"]
+driver = "per_request"
 backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_schedule_overrides"]
@@ -12,6 +47,13 @@ driver = "per_request"
 backend = ["postgres"]
 kind = ["write"]
 tables = ["harvest_schedule_overrides"]
+measured = "unmeasured"
+
+["drop_floor"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_schedule_override_receipts"]
 measured = "unmeasured"
 
 ["get_dag_override"]
@@ -56,6 +98,20 @@ driver = "per_tick"
 backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_schedule_overrides"]
+measured = "unmeasured"
+
+["raise_floor"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_schedule_override_receipts"]
+measured = "unmeasured"
+
+["read_floor"]
+driver = "per_tick"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_schedule_override_receipts"]
 measured = "unmeasured"
 
 ["select_workflow_override"]

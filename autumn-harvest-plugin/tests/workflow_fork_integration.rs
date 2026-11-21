@@ -10,6 +10,7 @@
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
 use autumn_harvest::table_split::SetExt;
+use jiff_diesel::ToDiesel;
 use std::sync::Arc;
 
 use autumn_harvest::event::WorkflowEvent;
@@ -26,10 +27,10 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::Utc;
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -199,7 +200,7 @@ async fn seed_completed_on(conn: &mut AsyncPgConnection, shard: i32) -> Executio
         &[
             WorkflowEvent::WorkflowStarted {
                 input,
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -216,7 +217,7 @@ async fn seed_completed_on(conn: &mut AsyncPgConnection, shard: i32) -> Executio
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
             harvest_workflow_executions::output.eq(Some(json!("done"))),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
         ))
         .execute(conn)
         .await

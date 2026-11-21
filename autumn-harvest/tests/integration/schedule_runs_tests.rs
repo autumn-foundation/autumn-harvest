@@ -7,11 +7,13 @@
 )]
 //! Per-schedule run-history read helpers + origin attribution — issue #534.
 //!
-//! Verifies that `start_or_load_workflow_execution` persists the dispatch
-//! `origin`, that `list_schedule_runs` returns a schedule's runs newest-first
-//! with state/origin filtering and keyset pagination, and that
-//! `schedule_run_state_summary` counts only `scheduled`-origin runs (so a
-//! backfill or manual fire never inflates the cadence failure ratio).
+//! Verifies three things:
+//!
+//! - `start_or_load_workflow_execution` persists the dispatch `origin`.
+//! - `list_schedule_runs` returns a schedule's runs newest-first, with
+//!   state/origin filtering and keyset pagination.
+//! - `schedule_run_state_summary` counts only `scheduled`-origin runs. So a
+//!   backfill or manual fire never inflates the cadence failure ratio.
 
 use autumn_harvest::execution::{
     ORIGIN_BACKFILL, ORIGIN_MANUAL_TRIGGER, ORIGIN_SCHEDULED, ScheduleRunQuery, list_schedule_runs,
@@ -22,7 +24,9 @@ use autumn_harvest::types::ExecutionId;
 use autumn_harvest::{
     StartWorkflowParams, WorkflowIdReusePolicy, start_or_load_workflow_execution,
 };
-use chrono::{DateTime, Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
+use jiff_diesel::ToDiesel;
+
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
@@ -59,9 +63,9 @@ async fn seed_run(
     schedule_id: Uuid,
     workflow_id: &str,
     origin: Option<&str>,
-    scheduled_for: Option<DateTime<Utc>>,
+    scheduled_for: Option<Timestamp>,
     state: &str,
-    started_at: DateTime<Utc>,
+    started_at: Timestamp,
 ) -> Uuid {
     use harvest_workflow_executions::dsl;
 
@@ -122,13 +126,13 @@ async fn seed_run(
     let completed_at = if state == "RUNNING" {
         None
     } else {
-        Some(started_at + Duration::seconds(5))
+        Some(started_at + SignedDuration::from_secs(5))
     };
     diesel::update(dsl::harvest_workflow_executions.filter(dsl::id.eq(id)))
         .set((
             dsl::state.eq(state),
-            dsl::started_at.eq(started_at),
-            dsl::completed_at.eq(completed_at),
+            dsl::started_at.eq(started_at.to_diesel()),
+            dsl::completed_at.eq(completed_at.to_diesel()),
         ))
         .execute(conn)
         .await
@@ -140,7 +144,7 @@ async fn seed_run(
 async fn origin_is_persisted_for_each_dispatch_source() {
     let (mut conn, _c) = setup_db().await;
     let sid = Uuid::new_v4();
-    let slot = Utc::now() - Duration::hours(1);
+    let slot = Timestamp::now() - SignedDuration::from_hours(1);
 
     seed_run(
         &mut conn,
@@ -157,9 +161,9 @@ async fn origin_is_persisted_for_each_dispatch_source() {
         sid,
         "backfill-1",
         Some(ORIGIN_BACKFILL),
-        Some(slot - Duration::hours(2)),
+        Some(slot - SignedDuration::from_hours(2)),
         "COMPLETED",
-        slot - Duration::minutes(30),
+        slot - SignedDuration::from_mins(30),
     )
     .await;
     seed_run(
@@ -169,7 +173,7 @@ async fn origin_is_persisted_for_each_dispatch_source() {
         Some(ORIGIN_MANUAL_TRIGGER),
         None,
         "FAILED",
-        slot - Duration::minutes(10),
+        slot - SignedDuration::from_mins(10),
     )
     .await;
 
@@ -207,7 +211,7 @@ async fn origin_is_persisted_for_each_dispatch_source() {
 async fn list_orders_newest_first_and_filters_by_state() {
     let (mut conn, _c) = setup_db().await;
     let sid = Uuid::new_v4();
-    let base = Utc::now() - Duration::hours(5);
+    let base = Timestamp::now() - SignedDuration::from_hours(5);
 
     seed_run(
         &mut conn,
@@ -224,9 +228,9 @@ async fn list_orders_newest_first_and_filters_by_state() {
         sid,
         "r2",
         Some(ORIGIN_SCHEDULED),
-        Some(base + Duration::hours(1)),
+        Some(base + SignedDuration::from_hours(1)),
         "FAILED",
-        base + Duration::hours(1),
+        base + SignedDuration::from_hours(1),
     )
     .await;
     seed_run(
@@ -234,9 +238,9 @@ async fn list_orders_newest_first_and_filters_by_state() {
         sid,
         "r3",
         Some(ORIGIN_SCHEDULED),
-        Some(base + Duration::hours(2)),
+        Some(base + SignedDuration::from_hours(2)),
         "COMPLETED",
-        base + Duration::hours(2),
+        base + SignedDuration::from_hours(2),
     )
     .await;
 
@@ -274,7 +278,7 @@ async fn list_orders_newest_first_and_filters_by_state() {
 async fn keyset_cursor_paginates_without_overlap() {
     let (mut conn, _c) = setup_db().await;
     let sid = Uuid::new_v4();
-    let base = Utc::now() - Duration::hours(10);
+    let base = Timestamp::now() - SignedDuration::from_hours(10);
 
     for i in 0..5 {
         seed_run(
@@ -282,9 +286,9 @@ async fn keyset_cursor_paginates_without_overlap() {
             sid,
             &format!("p{i}"),
             Some(ORIGIN_SCHEDULED),
-            Some(base + Duration::minutes(i)),
+            Some(base + SignedDuration::from_mins(i)),
             "COMPLETED",
-            base + Duration::minutes(i),
+            base + SignedDuration::from_mins(i),
         )
         .await;
     }
@@ -341,7 +345,7 @@ async fn list_orders_by_logical_slot_and_returns_error() {
     // and surface the raw `error` column (the plugin gates it to terminal-failed).
     let (mut conn, _c) = setup_db().await;
     let sid = Uuid::new_v4();
-    let base = Utc::now() - Duration::hours(6);
+    let base = Timestamp::now() - SignedDuration::from_hours(6);
 
     // A: scheduled COMPLETED, slot = base+3h, started = base+3h.
     let a = seed_run(
@@ -349,9 +353,9 @@ async fn list_orders_by_logical_slot_and_returns_error() {
         sid,
         "a",
         Some(ORIGIN_SCHEDULED),
-        Some(base + Duration::hours(3)),
+        Some(base + SignedDuration::from_hours(3)),
         "COMPLETED",
-        base + Duration::hours(3),
+        base + SignedDuration::from_hours(3),
     )
     .await;
     // B: scheduled FAILED, slot = base+2h but started LATER (base+4h) than A — proves
@@ -361,9 +365,9 @@ async fn list_orders_by_logical_slot_and_returns_error() {
         sid,
         "b",
         Some(ORIGIN_SCHEDULED),
-        Some(base + Duration::hours(2)),
+        Some(base + SignedDuration::from_hours(2)),
         "FAILED",
-        base + Duration::hours(4),
+        base + SignedDuration::from_hours(4),
     )
     .await;
     set_error(&mut conn, b, "billing failed: card declined\nstack line 2").await;
@@ -375,7 +379,7 @@ async fn list_orders_by_logical_slot_and_returns_error() {
         Some(ORIGIN_MANUAL_TRIGGER),
         None,
         "FAILED",
-        base + Duration::minutes(150),
+        base + SignedDuration::from_mins(150),
     )
     .await;
     set_error(&mut conn, c, "manual boom").await;
@@ -419,8 +423,8 @@ async fn list_orders_by_logical_slot_and_returns_error() {
         "manual run's sort key falls back to started_at"
     );
     assert_eq!(
-        c_row.started_at.timestamp_micros(),
-        (base + Duration::minutes(150)).timestamp_micros(),
+        c_row.started_at.as_microsecond(),
+        (base + SignedDuration::from_mins(150)).as_microsecond(),
         "manual run's started_at matches the expected seeded value"
     );
 }
@@ -431,7 +435,7 @@ async fn keyset_cursor_uses_slot_key() {
     // overlaps even when start times disagree with slot order.
     let (mut conn, _c) = setup_db().await;
     let sid = Uuid::new_v4();
-    let base = Utc::now() - Duration::hours(12);
+    let base = Timestamp::now() - SignedDuration::from_hours(12);
 
     // Five runs whose slots strictly decrease but whose start times are shuffled.
     let starts = [7, 3, 9, 1, 5];
@@ -442,9 +446,9 @@ async fn keyset_cursor_uses_slot_key() {
             sid,
             &format!("k{i}"),
             Some(ORIGIN_SCHEDULED),
-            Some(base + Duration::hours(10 - i)), // slot decreasing
+            Some(base + SignedDuration::from_hours(10 - i)), // slot decreasing
             "COMPLETED",
-            base + Duration::hours(*s), // start shuffled
+            base + SignedDuration::from_hours(*s), // start shuffled
         )
         .await;
     }
@@ -491,7 +495,7 @@ async fn keyset_cursor_uses_slot_key() {
 async fn summary_counts_scheduled_origin_only() {
     let (mut conn, _c) = setup_db().await;
     let sid = Uuid::new_v4();
-    let base = Utc::now() - Duration::hours(3);
+    let base = Timestamp::now() - SignedDuration::from_hours(3);
 
     // 2 scheduled COMPLETED, 1 scheduled FAILED.
     seed_run(
@@ -509,9 +513,9 @@ async fn summary_counts_scheduled_origin_only() {
         sid,
         "s2",
         Some(ORIGIN_SCHEDULED),
-        Some(base + Duration::minutes(1)),
+        Some(base + SignedDuration::from_mins(1)),
         "COMPLETED",
-        base + Duration::minutes(1),
+        base + SignedDuration::from_mins(1),
     )
     .await;
     seed_run(
@@ -519,9 +523,9 @@ async fn summary_counts_scheduled_origin_only() {
         sid,
         "s3",
         Some(ORIGIN_SCHEDULED),
-        Some(base + Duration::minutes(2)),
+        Some(base + SignedDuration::from_mins(2)),
         "FAILED",
-        base + Duration::minutes(2),
+        base + SignedDuration::from_mins(2),
     )
     .await;
     // A backfill FAILED and a manual FAILED must NOT count toward cadence.
@@ -530,9 +534,9 @@ async fn summary_counts_scheduled_origin_only() {
         sid,
         "b1",
         Some(ORIGIN_BACKFILL),
-        Some(base - Duration::hours(1)),
+        Some(base - SignedDuration::from_hours(1)),
         "FAILED",
-        base + Duration::minutes(3),
+        base + SignedDuration::from_mins(3),
     )
     .await;
     seed_run(
@@ -542,7 +546,7 @@ async fn summary_counts_scheduled_origin_only() {
         Some(ORIGIN_MANUAL_TRIGGER),
         None,
         "FAILED",
-        base + Duration::minutes(4),
+        base + SignedDuration::from_mins(4),
     )
     .await;
 

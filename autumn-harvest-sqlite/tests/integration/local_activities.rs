@@ -19,7 +19,7 @@ use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest::{WorkflowHandlerFn, WorkflowInfo};
 use autumn_harvest_sqlite::{RunState, SqliteError, SqliteRuntime};
-use chrono::{TimeZone, Utc};
+use jiff::Timestamp;
 use serde_json::json;
 
 /// A policy with a fixed backoff and no jitter.
@@ -321,7 +321,7 @@ fn a_local_activity_with_schedule_to_close_panics_at_registration() {
 fn install_clock(rt: &mut SqliteRuntime) -> Arc<AtomicI64> {
     let clock = Arc::new(AtomicI64::new(1_000_000));
     let read = clock.clone();
-    rt.set_clock(move || Utc.timestamp_opt(read.load(Ordering::SeqCst), 0).unwrap());
+    rt.set_clock(move || Timestamp::new(read.load(Ordering::SeqCst), 0).unwrap());
     clock
 }
 

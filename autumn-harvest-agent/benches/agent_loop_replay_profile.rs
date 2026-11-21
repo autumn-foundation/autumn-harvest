@@ -71,10 +71,8 @@ use autumn_harvest_agent::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// The model-turn activity name.
 const MODEL_TURN: &str = "agent_model_turn";
 
-/// The tool-call activity name.
 const TOOL_CALL: &str = "agent_tool_call";
 
 /// The tool that each round calls.
@@ -215,7 +213,7 @@ fn runtime() -> tokio::runtime::Runtime {
 /// Record one run of `n` tool rounds with `WorkflowTestEnv`.
 fn record(rt: &tokio::runtime::Runtime, shape: Shape, n: usize, result_bytes: usize) -> Recording {
     let rounds = u32::try_from(n).expect("the round count fits in u32");
-    let anchor = chrono::DateTime::from_timestamp(1_790_000_000, 0).expect("a fixed time");
+    let anchor = jiff::Timestamp::from_second(1_790_000_000).expect("a fixed time");
     let env = WorkflowTestEnv::new()
         .with_frozen_anchor(anchor)
         .with_workflow_id(WORKFLOW_ID)
@@ -321,7 +319,7 @@ fn span_meta() -> WorkflowExecuteSpanMeta {
         workflow_id: WORKFLOW_ID.to_owned(),
         shard_id: 0,
         queue_name: String::new(),
-        drive_clock: chrono::DateTime::from_timestamp(1_790_000_000, 0),
+        drive_clock: jiff::Timestamp::from_second(1_790_000_000).ok(),
         is_replay: false,
         link_traceparent: None,
         build_id: None,
@@ -333,7 +331,6 @@ fn span_meta() -> WorkflowExecuteSpanMeta {
     }
 }
 
-/// Decode the history file.
 #[inline(never)]
 fn decode(bytes: &[u8]) -> Recording {
     serde_json::from_slice(bytes).expect("the history file decodes")

@@ -3,31 +3,31 @@
 //! approval-or-timeout gate expressed via `ctx.race()` (issue #600).
 //!
 //! Harvest already sanctions `futures::join!` for wait-*all* concurrency
-//! (see `docs/workflow-determinism-guide.md`, HVG005). Until this primitive,
-//! there was no sanctioned way to wait for the *first* of several concurrent
-//! operations and durably cancel the rest — `tokio::select!`/`futures::select!`
-//! over ctx awaitables is now a compile-time HardBlocker (HVG010) because it
-//! is a double footgun in a replay engine: the winner depends on
-//! non-deterministic poll order, and dropped loser futures do not durably
-//! cancel the underlying work (a scheduled activity keeps running; a durable
-//! timer row stays live).
+//! (see `docs/workflow-determinism-guide.md`, HVG005). Before this primitive,
+//! no sanctioned way waited for the *first* of several concurrent operations
+//! and durably cancelled the rest. `tokio::select!`/`futures::select!` over ctx
+//! awaitables is now a compile-time HardBlocker (HVG010). It is a double
+//! footgun in a replay engine:
+//! - The winner depends on non-deterministic poll order.
+//! - Dropped loser futures do not durably cancel the underlying work. A
+//!   scheduled activity keeps running, and a durable timer row stays live.
 //!
 //! # Determinism contract
 //!
 //! The winning branch is recorded via the existing `MarkerRecorded` event —
 //! mirroring `execute_activity_fan_out`'s count marker, no new
-//! `WorkflowEvent` variant. Every subsequent replay of the same history
-//! *verifies* — rather than re-derives — the previously recorded winner, so a
-//! code change that would flip the outcome is rejected as
-//! `HarvestError::NonDeterministic` instead of silently diverging.
+//! `WorkflowEvent` variant. Every later replay of the same history *verifies*
+//! the recorded winner and does not re-derive it. So a code change that flips
+//! the outcome fails as `HarvestError::NonDeterministic` and does not silently
+//! diverge.
 //!
 //! # Cancellation
 //!
 //! Losing branches are durably cancelled in the *same* transaction that
-//! records the winner: a still-open losing activity's task row is
-//! transitioned out of `PENDING`/`RUNNING` and a synthetic `ActivityFailed`
-//! terminal is recorded (reusing the existing event variant) so no future
-//! replay ever observes it stuck `ActivityInProgress`. A losing child
+//! records the winner. A still-open losing activity's task row leaves
+//! `PENDING`/`RUNNING`. A synthetic `ActivityFailed` terminal is recorded with
+//! the existing event variant. So no future replay observes it stuck
+//! `ActivityInProgress`. A losing child
 //! workflow is cancelled via the same primitive
 //! `ctx.request_cancel_external_workflow` uses (issue #492).
 //!

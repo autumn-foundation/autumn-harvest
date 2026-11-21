@@ -41,16 +41,28 @@ A crash costs at most the one step that was in flight. The crate depends on
 the core engine only. It has no Autumn plugin and no `autumn-web` dependency.
 An app implements `AgentModel` for its provider.
 
+The `anthropic` feature adds `anthropic::ClaudeModel`, an `AgentModel` over
+the Anthropic Messages API. It is off by default, so the crate without it has
+no HTTP client. The model reports a ledger id and a price for each call. See
+[The Claude model](../docs/agent-adapter.md#the-claude-model).
+
+The `openai` feature adds `openai::OpenAiModel`. It speaks the Chat
+Completions API at a base URL, so it reaches OpenAI, OpenRouter, Ollama,
+vLLM and a LiteLLM proxy. See
+[An OpenAI-compatible model](../docs/agent-adapter.md#an-openai-compatible-model).
+
 ```sh
 cargo run -p autumn-harvest-agent --features sqlite --example sqlite_agent
+cargo run -p autumn-harvest-agent --features sqlite --example sqlite_mesh
 cargo run -p autumn-harvest-agent --features sqlite --example agent_session_entity
 DATABASE_URL=postgres://localhost/harvest \
   cargo run -p autumn-harvest-agent --features postgres --example postgres_agent
 ```
 
-The first example runs the agent loop once. The second runs a chat session
-as a durable `Agent`. The third runs both on Postgres, with a worker in the
-process.
+`sqlite_agent` runs the agent loop once. `sqlite_mesh` runs a small mesh: a
+delegation, a refused delegation and a restart. `agent_session_entity` runs
+a chat session as a durable `Agent`. `postgres_agent` runs the loop and a
+durable agent on Postgres, with a worker in the process.
 
 | Feature | Contents |
 |---|---|

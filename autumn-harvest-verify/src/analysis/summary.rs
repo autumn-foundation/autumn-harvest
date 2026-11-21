@@ -4,25 +4,27 @@
 //! # Shape of the analysis
 //!
 //! Per body, a **flow-insensitive fixpoint** over place-keyed facts
-//! ([`taint`]). Flow-insensitive because MIR at `opt-level=0` is already
-//! SSA-ish for the values that matter and because the question being asked —
-//! "can this source reach this sink at all" — is a reachability question;
-//! flow-sensitivity would buy precision only for code that overwrites a tainted
-//! local with a clean value, which the corpus deliberately does not reward.
+//! ([`taint`]). Flow-insensitive, for two reasons. MIR at `opt-level=0` is
+//! already SSA-ish for the values that matter. And the question, "can this
+//! source reach this sink at all", is a reachability question.
+//! Flow-sensitivity would buy precision only for code that overwrites a
+//! tainted local with a clean value. The corpus deliberately does not reward
+//! that.
 //!
 //! Across bodies, **context-sensitive expansion with memoisation** rather than
-//! symbolic summaries: a callee is analyzed with its arguments' actual facts
-//! seeded on its parameters, and the result is memoised on
-//! `(body, substitution, argument signature)`. That keeps the *whole* hop chain
-//! — `wf_three_hop_chain` → `a` → `b` → `fine_stamp` → `SystemTime::now` —
-//! attached to the fact itself, which is what the corpus's `trace_contains`
-//! oracle checks, and it costs nothing on bodies that are called once.
+//! symbolic summaries. A callee is analyzed with its arguments' actual facts
+//! seeded on its parameters. The result is memoised on
+//! `(body, substitution, argument signature)`. That keeps the *whole* hop
+//! chain attached to the fact itself:
+//! `wf_three_hop_chain` → `a` → `b` → `fine_stamp` → `SystemTime::now`. The
+//! corpus's `trace_contains` oracle checks that chain. It costs nothing on
+//! bodies that are called once.
 //!
-//! Recursion is the one case expansion cannot handle: re-entering a body
-//! already on the stack returns the conservative answer (every argument's taint
-//! flows to the return value and to every out-parameter) **and** records a
-//! [`BoundaryKind::Recursion`], so a recursive helper makes a workflow
-//! `unknown` rather than silently `proven`.
+//! Recursion is the one case expansion cannot handle. Re-entering a body
+//! already on the stack returns the conservative answer: every argument's
+//! taint flows to the return value and to every out-parameter. It **also**
+//! records a [`BoundaryKind::Recursion`]. So a recursive helper makes a
+//! workflow `unknown`, not silently `proven`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
@@ -76,23 +78,23 @@ const BUDGET: u32 = 6000;
 const MAX_RECURSION_ROUNDS: u32 = 8;
 /// Native recursion depth of [`Analyzer::analyze_body`] before it gives up.
 ///
-/// The analyzer descends into callees on the *native* stack, so a long enough
-/// call chain overflows it — a `SIGABRT` that reads as an infrastructure
-/// failure rather than as "the tool gave up". One level costs roughly 8 KB in a
-/// debug build (`analyze_body` → `run_body` → `run_block` → `transfer_call` →
-/// `follow_call`), so the cliff is near 900 levels on the CLI's 8 MB main stack
-/// but only ~230 on the 2 MB stack a spawned thread — a test harness thread
-/// included — gets by default. The cap is chosen for the smaller of the two and
-/// is still an order of magnitude above the deepest chain any real workflow
-/// has: the whole corpus stays under ten.
+/// The analyzer descends into callees on the *native* stack. A long enough
+/// call chain overflows it, and the `SIGABRT` reads as an infrastructure
+/// failure, not as "the tool gave up". One level costs roughly 8 KB in a
+/// debug build: `analyze_body` → `run_body` → `run_block` → `transfer_call` →
+/// `follow_call`. So the cliff is near 900 levels on the CLI's 8 MB main
+/// stack. A spawned thread, a test harness thread included, gets a 2 MB stack
+/// by default, so its cliff is near 230. The cap suits the smaller of the two.
+/// It is still an order of magnitude above the deepest real workflow chain:
+/// the whole corpus stays under ten.
 const MAX_DEPTH: usize = 96;
 /// Calls that return a new name for an existing place rather than a new value.
 ///
-/// The guard family matters as much as the `deref` family: `RefCell::borrow`
+/// The guard family matters as much as the `deref` family. `RefCell::borrow`
 /// and `RefCell::borrow_mut` hand out two different names for the *same*
-/// interior, and a body that mutates through one and reads through the other
-/// (`*c.borrow_mut() += 1; *c.borrow()`) is only connected if both collapse
-/// onto the cell.
+/// interior. A body can mutate through one and read through the other
+/// (`*c.borrow_mut() += 1; *c.borrow()`). The two connect only if both
+/// collapse onto the cell.
 const REBORROWS: [&str; 15] = [
     "deref",
     "deref_mut",
@@ -132,9 +134,9 @@ struct SinkRecord {
 /// Where the analyzer currently is: the body being walked, the block inside it,
 /// and the context the body was entered with.
 ///
-/// These five values are threaded verbatim through every transfer function and
-/// never change inside one, so they travel as one `Copy` value rather than as
-/// five parameters repeated down the call chain.
+/// Every transfer function receives these five values and never changes
+/// them. So they travel as one `Copy` value, not as five parameters repeated
+/// down the call chain.
 #[derive(Clone, Copy)]
 struct Frame<'f> {
     /// MIR path of the body being analyzed.
@@ -191,11 +193,11 @@ struct InvokedArgument<'i> {
 /// Everything about one call site that is fixed once `(body, substitution)` is:
 /// the substituted callee text, its decomposition, and the model rows it matches.
 ///
-/// The fixpoint visits every block up to `3 * MAX_ROUNDS + 1` times, and each
+/// The fixpoint visits every block up to `3 * MAX_ROUNDS + 1` times. Each
 /// visit used to re-run `Substitution::apply`, `CalleePath::parse` and
-/// `Model::classify` over the same text — all three of which scan the path
-/// character by character. Caching them turns the analyzer's one accidental
-/// quadratic (rounds x call sites) back into a linear pass.
+/// `Model::classify` over the same text. All three scan the path character by
+/// character. The cache turns the analyzer's one accidental quadratic (rounds
+/// x call sites) back into a linear pass.
 struct CallClasses<'m> {
     printed: String,
     parsed: CalleePath,
@@ -271,9 +273,10 @@ impl<'m> CallClasses<'m> {
         })
     }
 
-    /// The call is a ctx primitive whose return value is recorded in history
-    /// (`[[sanctioned]]`) or is pure observability (`[[non_sink]]`) — either
-    /// way it starts nothing and propagates nothing.
+    /// The call is a ctx primitive that starts and propagates nothing.
+    ///
+    /// History records its return value (`[[sanctioned]]`), or it is pure
+    /// observability (`[[non_sink]]`).
     fn is_clean_ctx_call(&self) -> bool {
         self.classes
             .iter()
@@ -283,10 +286,10 @@ impl<'m> CallClasses<'m> {
 
 /// Where a call site goes, and under which substitution.
 ///
-/// Split from [`CallClasses`] because resolution is only asked for on the calls
-/// the model does *not* decide, and [`Program::call_substitution_in`] scans
-/// every block of the caller to find the call site — an O(blocks) answer that
-/// must be computed once per site, never once per round.
+/// Split from [`CallClasses`], because only the calls the model does *not*
+/// decide need resolution. [`Program::call_substitution_in`] scans every block
+/// of the caller to find the call site. That O(blocks) answer must be computed
+/// once per site, never once per round.
 struct CallTarget {
     resolution: Resolution,
     subst: Substitution,
@@ -485,13 +488,13 @@ impl<'a> Analyzer<'a> {
             return conservative(args);
         };
         // Two nested loops. The inner one is the flow-insensitive fixpoint over
-        // facts; the outer one exists because a sanitizer discovered *late* in a
-        // round (`keys().collect()` in `bb3`, `sort()` in `bb5`) cannot retract
-        // the taint the earlier blocks already pushed downstream. Re-running the
-        // whole body with the kills already in hand is the cheapest correct
-        // answer, and the kill set only grows, so it terminates.
+        // facts. The outer one handles a sanitizer found *late* in a round
+        // (`keys().collect()` in `bb3`, `sort()` in `bb5`). Such a sanitizer
+        // cannot retract taint that earlier blocks already pushed downstream.
+        // Re-running the whole body with the kills in hand is the cheapest
+        // correct answer. The kill set only grows, so it terminates.
         // A body with no blocks (a truncated dump) has nothing to walk and no
-        // block to anchor a frame on; it is clean, not conservative, because
+        // block to anchor a frame on. It is clean, not conservative, because
         // nothing in it could have connected a source to a sink.
         let Some(first) = body.blocks.first() else {
             // A body whose block structure did not parse is not "clean": it is a
@@ -657,10 +660,10 @@ impl<'a> Analyzer<'a> {
                 }
                 continue;
             };
-            // `&x` and `&mut x` alias the referent identically for taint: a
-            // shared borrow of a tainted place reads it, a unique one also
-            // writes it back, and `TaintState` models both as one canonical
-            // place — so the mutability flag is deliberately not consulted.
+            // `&x` and `&mut x` alias the referent identically for taint. A
+            // shared borrow of a tainted place reads it, and a unique one also
+            // writes it back. `TaintState` models both as one canonical place,
+            // so the mutability flag is deliberately not consulted.
             if let Some((place, _)) = &rvalue.ref_of
                 && dest.projections.is_empty()
             {
@@ -669,10 +672,9 @@ impl<'a> Analyzer<'a> {
                 && let Some(place) = copied_reference(frame.body, dest, rvalue)
             {
                 // Copying a reference makes a second name for the same referent.
-                // A closure's captured-by-reference field is reached exactly
-                // this way — `_3 = copy ((*_1).0: &mut u64); (*_3) = ...` — and
-                // without the alias the write lands on a local the caller has no
-                // name for.
+                // A closure reaches its captured-by-reference field this way:
+                // `_3 = copy ((*_1).0: &mut u64); (*_3) = ...`. Without the
+                // alias, the write lands on a local the caller has no name for.
                 state.alias(dest.local, &place);
             }
             let mut set = TaintSet::new();
@@ -685,9 +687,9 @@ impl<'a> Analyzer<'a> {
             }
             if let Some(alloc) = &rvalue.static_alloc {
                 // `const {allocN: *mut T}` is a raw pointer to a static, not a
-                // reference to one: its provenance is outside the memory model,
-                // and the `unsafe-raw-pointer` boundary below is the honest
-                // answer rather than an ambient-source verdict (U04).
+                // reference to one. Its provenance is outside the memory model.
+                // The `unsafe-raw-pointer` boundary below is the honest answer,
+                // not an ambient-source verdict (U04).
                 if !rvalue.text.contains(": *mut ") && !rvalue.text.contains(": *const ") {
                     let alloc = alloc.clone();
                     let text = rvalue.text.clone();
@@ -789,9 +791,9 @@ impl<'a> Analyzer<'a> {
     /// class that applies decide it.
     ///
     /// The order of the arms is the model's documented decision order
-    /// ([`crate::model::matcher`]), and each arm is total — it returns without
-    /// falling through — because a call that is a sink *and* a source must be
-    /// treated as exactly one of them, never as both in sequence.
+    /// ([`crate::model::matcher`]). Each arm is total and returns without
+    /// falling through. A call that is a sink *and* a source must be treated as
+    /// exactly one of them, never as both in sequence.
     fn transfer_call(
         &mut self,
         frame: Frame<'_>,
@@ -984,8 +986,10 @@ impl<'a> Analyzer<'a> {
         });
     }
 
-    /// A `[[forbidden]]` effect is a finding on reachability alone, and it also
-    /// counts as a sink so that reaching it only on a tainted branch is one too.
+    /// A `[[forbidden]]` effect is a finding on reachability alone.
+    ///
+    /// It also counts as a sink, so reaching it only on a tainted branch is a
+    /// finding too.
     fn record_forbidden(
         &mut self,
         frame: Frame<'_>,
@@ -1017,10 +1021,10 @@ impl<'a> Analyzer<'a> {
     /// A `[[source]]` call: start a fact, unless the row is keyed on an ambient
     /// receiver type and *this* receiver carries no taint.
     ///
-    /// That guard is the whole reason `[[ambient_type]]` exists: a `Mutex`
-    /// created inside the workflow body reaching `lock()` is not a source, while
-    /// the identical call on a `static` one — whose read already tainted the
-    /// receiver — is.
+    /// That guard is the whole reason `[[ambient_type]]` exists. A `Mutex`
+    /// created inside the workflow body reaching `lock()` is not a source. The
+    /// identical call on a `static` one is, because its read already tainted
+    /// the receiver.
     #[allow(clippy::too_many_arguments)]
     fn transfer_source(
         &mut self,
@@ -1311,8 +1315,8 @@ impl<'a> Analyzer<'a> {
             Resolution::Bodies(bodies, kind) => {
                 // Two analyzed bodies answer to this printed callee and the text
                 // does not say which. For an impl, narrowing on the receiver's
-                // declared type — which MIR prints fully qualified — usually
-                // picks one; a closure has no such handle, because its printed
+                // declared type usually picks one, because MIR prints it fully
+                // qualified. A closure has no such handle, because its printed
                 // type IS the span that collided. When narrowing does not
                 // decide, EVERY candidate is analyzed and the results are
                 // unioned, so a finding in any of them is reported. Picking one
@@ -1378,43 +1382,45 @@ impl<'a> Analyzer<'a> {
     /// Is this body-less callee provably std/core/alloc (hence modelled), rather
     /// than a body the analysis never saw?
     ///
-    /// rustc prints **trimmed** def-paths, so the overwhelming majority of std
-    /// calls arrive as `String::clone` or `format` with no crate root at all —
-    /// and so does `now_ish` from a dependency that was never asked for MIR.
-    /// Treating every trimmed path as a boundary would make every workflow
-    /// `unknown`; treating every trimmed path as an opaque propagator is the
-    /// silent `proven` the soundness review found.
+    /// rustc prints **trimmed** def-paths. So most std calls arrive as
+    /// `String::clone` or `format`, with no crate root at all. So does `now_ish`
+    /// from a dependency that was never asked for MIR. Treating every trimmed
+    /// path as a boundary would make every workflow `unknown`. Treating every
+    /// trimmed path as an opaque propagator is the silent `proven` the
+    /// soundness review found.
     ///
     /// The discriminator has to be evidence about the **callee**. A declared
     /// type at the call site is not: `now_ish() -> std::string::String` names
     /// std in its result and is still a dependency's body. Neither is the
-    /// qualifying TRAIT of a `<Ty as Trait>::m` call: rustc prints
+    /// qualifying TRAIT of a `<Ty as Trait>::m` call. rustc prints
     /// `<Clock as std::convert::Into<String>>::into` for a dependency's own
-    /// `From<Clock> for String` wherever it cannot trim the trait, and that
-    /// impl is as free to read the wall clock as any other dependency body.
+    /// `From<Clock> for String` wherever it cannot trim the trait. That impl is
+    /// as free to read the wall clock as any other dependency body.
     /// Trust is a property of the **owner** of the executed item. Three things
     /// count:
     ///
-    ///  1. the callee's OWNER path is rooted at std/core/alloc or at a
-    ///     `[[trusted]]` crate — the qualified self type of `<Ty as Trait>::m`
-    ///     and of `Ty::m` (`<std::string::String as std::convert::From<&str>>::from`),
-    ///     or, for a free function, its own path (`std::env::var`). A trusted
+    ///  1. The callee's OWNER path is rooted at std/core/alloc or at a
+    ///     `[[trusted]]` crate. The owner is the qualified self type of
+    ///     `<Ty as Trait>::m` and of `Ty::m`
+    ///     (`<std::string::String as std::convert::From<&str>>::from`). For a
+    ///     free function, it is its own path (`std::env::var`). A trusted
     ///     root that appears only in the trait, in generic arguments or in an
-    ///     argument or result type is not evidence;
-    ///  2. the call is a **method**, and its receiver type is std — either a
-    ///     primitive (the language reserves inherent impls on those, and rustc
-    ///     prints them trimmed: `<u64 as From<u32>>::from`), or the declared type
-    ///     of its *receiver argument* is rooted entirely in trusted crates
-    ///     (`Vec::<u32>::push(move _12, ..)` with `_12: &mut std::vec::Vec<u32>`),
-    ///     or — for an associated function, which has no receiver argument —
-    ///     some declared type at the site spells the receiver type itself with a
+    ///     argument or result type is not evidence.
+    ///  2. The call is a **method**, and its receiver type is std. One case is
+    ///     a primitive. The language reserves inherent impls on those, and
+    ///     rustc prints them trimmed: `<u64 as From<u32>>::from`. Another case
+    ///     is a *receiver argument* whose declared type is rooted entirely in
+    ///     trusted crates
+    ///     (`Vec::<u32>::push(move _12, ..)` with `_12: &mut std::vec::Vec<u32>`).
+    ///     An associated function has no receiver argument. For it, some
+    ///     declared type at the site spells the receiver type itself with a
     ///     trusted root (`DateTime::<Utc>::from_timestamp_millis` returns a
-    ///     `std::option::Option<chrono::DateTime<chrono::Utc>>`);
-    ///  3. the callee matches a `[[std_free_fn]]` row — the residue of (2), free
+    ///     `std::option::Option<chrono::DateTime<chrono::Utc>>`).
+    ///  3. The callee matches a `[[std_free_fn]]` row: the residue of (2), free
     ///     functions with no receiver to reason about.
     ///
-    /// (2) is refused when the call goes through a trait some impl in the
-    /// analyzed set implements: a user `impl MyTrait for Vec<u32>` is user code,
+    /// (2) is refused when the call goes through a trait that some impl in the
+    /// analyzed set implements. A user `impl MyTrait for Vec<u32>` is user code,
     /// and `Vec`'s std-ness says nothing about it. In practice `resolve_call`
     /// finds that impl's body first and never gets here, so this is a belt on
     /// top of braces.
@@ -1461,12 +1467,12 @@ impl<'a> Analyzer<'a> {
         if self.is_trusted_receiver_type(parsed) {
             return true;
         }
-        // The receiver ARGUMENT: `_1` of a method call is the self value, and
-        // MIR declares it fully qualified even where the callee path is trimmed
+        // The receiver ARGUMENT. `_1` of a method call is the self value. MIR
+        // declares it fully qualified even where the callee path is trimmed
         // (`<DefaultCallsite as Callsite>::metadata(move _17)` with
         // `_17: &tracing::__macro_support::MacroCallsite`). It is evidence about
-        // the callee precisely because it *is* the callee's self type; every
-        // root in it must be trusted, so a `&dep::Worker` receiver never is.
+        // the callee because it *is* the callee's self type. Every root in it
+        // must be trusted, so a `&dep::Worker` receiver never is.
         if let Some(ty) = call
             .args
             .first()
@@ -1561,9 +1567,9 @@ impl<'a> Analyzer<'a> {
     ///
     /// `[[forbidden]] path = "sleep"` and `[[source]] path = "var"` exist because
     /// rustc trims `std::thread::sleep` and `std::env::var` to one segment. The
-    /// same suffix match would fire on a user's own `fn sleep`, so a
+    /// same suffix match would fire on a user's own `fn sleep`. So a
     /// single-segment row with no receiver applies only where the callee has no
-    /// body in the analyzed set — a user function with a body is analyzed
+    /// body in the analyzed set. A user function with a body is analyzed
     /// instead, which is strictly better information.
     fn bare_row_applies(
         &self,
@@ -1580,21 +1586,21 @@ impl<'a> Analyzer<'a> {
 
     /// A `drop` terminator on a place whose type has a user `impl Drop`.
     ///
-    /// Drop glue is a call the user never wrote and MIR never spells out, so it
-    /// is invisible to every other transfer function — yet a `Drop` impl is
-    /// ordinary code that can read ambient state and emit commands. The glue is
-    /// followed with the dropped place as the `&mut self` argument, exactly as
-    /// an explicit `Ty::drop(&mut place)` would be.
+    /// The user never writes drop glue and MIR never spells it out. So every
+    /// other transfer function misses it. Yet a `Drop` impl is ordinary code
+    /// that can read ambient state and emit commands. The glue is followed with
+    /// the dropped place as the `&mut self` argument, exactly as an explicit
+    /// `Ty::drop(&mut place)` would be.
     ///
     /// Types with no user `Drop` impl (every std type, and any plain struct) run
     /// no user code here, so they contribute nothing. A type whose glue the
-    /// analyzer *cannot* pin down is the opposite case and must never be
-    /// confused with it: it becomes a [`BoundaryKind::DropGlue`], because a
-    /// missing header says nothing about what the glue does.
+    /// analyzer *cannot* pin down is the opposite case, and the two must never
+    /// be confused. Such a type becomes a [`BoundaryKind::DropGlue`], because
+    /// a missing header says nothing about what the glue does.
     ///
-    /// Where several same-named types' glue bodies survive the module
-    /// narrowing, every one of them is followed and the results unioned, for
-    /// the same reason an ambiguous call is.
+    /// Several same-named types' glue bodies can survive the module narrowing.
+    /// Then every one is followed and the results unioned, for the same reason
+    /// as an ambiguous call.
     fn transfer_drop(
         &mut self,
         frame: Frame<'_>,
@@ -1704,9 +1710,10 @@ impl<'a> Analyzer<'a> {
         self.closure_argument_taint_inner(frame, call, arg_taints, state, &BTreeSet::new(), emit)
     }
 
-    /// Every closure argument outside `opaque`, analyzed as if it were invoked
-    /// here, with its environment seeded from that argument's own taint and its
-    /// remaining parameters from everything else the call was given.
+    /// Every closure argument outside `opaque`, analyzed as if invoked here.
+    ///
+    /// Its environment is seeded from that argument's own taint. Its other
+    /// parameters are seeded from everything else the call was given.
     fn closure_argument_taint_inner(
         &mut self,
         frame: Frame<'_>,
@@ -1729,10 +1736,10 @@ impl<'a> Analyzer<'a> {
                 (span, bodies)
             });
             // A fn item that names two impl bodies (`Worker::run` where two
-            // modules define one) is followed into all of them, and so is a
-            // `{closure@..}` span two macro expansions share, for the same
-            // reason `follow_call` unions an ambiguous call: skipping it, or
-            // picking one, can lose the finding.
+            // modules define one) is followed into all of them. So is a
+            // `{closure@..}` span that two macro expansions share. The reason
+            // is the one for which `follow_call` unions an ambiguous call:
+            // skipping it, or picking one, can lose the finding.
             let mut note = String::new();
             let targets: Vec<(String, String, bool)> = match closure {
                 // A closure span is present, but no body in the analyzed
@@ -1921,9 +1928,9 @@ impl<'a> Analyzer<'a> {
             let outcome = self.analyze_body(target, &Substitution::new(), &seeded, &inner_hops);
             out.absorb(&outcome.ret);
             self.follow_returned_future(target, callee_body, &outcome.ret, &inner_hops, emit, out);
-            // What the closure wrote through its environment is written back
-            // onto the locals it captured, which is the only way a capture-by-
-            // reference mutation reaches the caller.
+            // Write what the closure wrote through its environment back onto
+            // the locals it captured. Only this way does a capture-by-reference
+            // mutation reach the caller.
             if has_env && let Some(written) = outcome.out.get(&0) {
                 Self::write_back_closure_captures(frame.body, operand, written, state);
             }
@@ -2216,8 +2223,8 @@ impl<'a> Analyzer<'a> {
     /// Write a closure's environment taint onto the places it captured.
     ///
     /// The captures are the operands of the `{closure@..} { field: move _4, .. }`
-    /// aggregate that built the value, so the write-back is a scan of the
-    /// caller's own body for that construction. Both the captured place and its
+    /// aggregate that built the value. So the write-back scans the caller's own
+    /// body for that construction. Both the captured place and its
     /// referent are tainted: a capture is either the value itself (`move`) or a
     /// reference to it (`move _4` where `_4 = &mut _2`).
     fn write_back_closure_captures(
@@ -2457,11 +2464,11 @@ impl<'a> Analyzer<'a> {
     /// Classify the `static` items one printed name could denote.
     ///
     /// One candidate is the ordinary case. Several mean the name was a bare
-    /// last segment two modules both define: the pointee type printed at the
-    /// read disambiguates when it picks exactly one, and otherwise the answer
-    /// must cover every candidate — ambient if **any** of them is — because
-    /// choosing one is exactly the coin flip that made a read of an
-    /// `AtomicU64` look like a read of a `u64` that shared its name.
+    /// last segment that two modules both define. The pointee type printed at
+    /// the read disambiguates when it picks exactly one. Otherwise the answer
+    /// must cover every candidate: ambient if **any** of them is. Choosing one
+    /// is the coin flip that made a read of an `AtomicU64` look like a read of
+    /// a `u64` that shared its name.
     fn ambient_of_candidates(
         &mut self,
         frame: Frame<'_>,
@@ -2647,7 +2654,7 @@ fn async_fn_owner(form: &str) -> Option<&str> {
 /// followed by `::` and is itself the *start* of a path.
 ///
 /// MIR prints `let` declarations fully qualified even where it trims callee
-/// paths, which is what makes this a usable discriminator at all:
+/// paths. That makes this a usable discriminator at all:
 /// `&chrono::DateTime<chrono::Utc>` names `chrono` twice, and
 /// `<T as std::future::IntoFuture>::into_future` names `std`.
 fn path_roots(text: &str) -> impl Iterator<Item = &str> {
@@ -2684,16 +2691,16 @@ const fn is_path_start(c: char) -> bool {
 /// A `dest = copy/move (*PLACE).f` whose destination is declared as a
 /// reference: a **reborrow of a field read through a reference**.
 ///
-/// MIR reaches a closure's captured `&mut` this way — `_3 = no_retag copy
-/// ((*_1).0: &mut u64); (*_3) = ...` — and without the alias the write lands on
-/// `_3`, a local the caller has no name for, so the capture never comes back.
+/// MIR reaches a closure's captured `&mut` this way: `_3 = no_retag copy
+/// ((*_1).0: &mut u64); (*_3) = ...`. Without the alias the write lands on
+/// `_3`, a local the caller has no name for. The capture then never comes back.
 ///
 /// The source place must go *through* a `Deref`. A copy of a field of the local
-/// itself (`_54 = copy (_1.0)`, how a coroutine reaches its own state through
-/// `Pin`) is deliberately excluded: aliasing there would collapse `_54` and
-/// `(*_54)` onto one canonical place, and the coroutine's resume-state
-/// `discriminant((*_54))` — exactly-read so that it stays clean — would start
-/// seeing every fact the body ever put on that local.
+/// itself is deliberately excluded. That is `_54 = copy (_1.0)`, how a
+/// coroutine reaches its own state through `Pin`. Aliasing there would
+/// collapse `_54` and `(*_54)` onto one canonical place. The coroutine's
+/// resume-state `discriminant((*_54))` is exactly-read so that it stays clean.
+/// With the alias, it would see every fact the body ever put on that local.
 fn copied_reference(body: &Body, dest: &Place, rvalue: &crate::mir::ast::Rvalue) -> Option<Place> {
     let text = rvalue.text.trim();
     let text = text.strip_prefix("no_retag ").unwrap_or(text);
@@ -2786,21 +2793,21 @@ fn read_root_at_every_return(
 /// taint (D4/D5).
 ///
 /// `Control` taint alone only flags command emissions the branch decides. It
-/// says nothing about the *values* the branch decides, so the standard
-/// laundering idiom — read ambient state, branch on it, return one of two
-/// constants — would otherwise wash a source out completely:
+/// says nothing about the *values* the branch decides. The standard laundering
+/// idiom would then wash a source out completely: read ambient state, branch
+/// on it, return one of two constants.
 ///
 /// ```text
 /// let shard = if COUNTER.load(SeqCst) % 2 == 0 { 0 } else { 1 };
 /// ctx.execute_activity_raw("charge".into(), shard)   // shard is not a constant
 /// ```
 ///
-/// Every place written in a block that is control-dependent on a tainted
-/// `switchInt` — a statement's destination or a call's destination — therefore
-/// gains that branch's facts, re-labelled [`TaintKind::Value`] and carrying a
-/// hop that names the branch. Post-dominating blocks are excluded by
-/// [`ControlGraph::is_control_dependent`], which is what keeps the code *after*
-/// an `if` clean.
+/// So every place written in a block that is control-dependent on a tainted
+/// `switchInt` gains that branch's facts. That covers a statement's
+/// destination and a call's destination. The facts are re-labelled
+/// [`TaintKind::Value`] and carry a hop that names the branch.
+/// [`ControlGraph::is_control_dependent`] excludes post-dominating blocks,
+/// which keeps the code *after* an `if` clean.
 ///
 /// Returns `true` when anything new landed, so the caller can iterate: a
 /// control-derived value can itself decide a later branch.
@@ -2886,9 +2893,9 @@ fn tainted_branches(body: &Body, state: &TaintState, graph: &ControlGraph) -> Ve
 /// Statement heads that carry no value flow, so the parser folding them into
 /// [`Statement::Other`] loses nothing.
 ///
-/// Every *other* unrecognised statement is a `mir-parse` boundary: it is a shape
-/// this parser was not written against, and the honest answer to "what does it
-/// do" is "unknown", not "nothing". `discriminant` covers the
+/// Every *other* unrecognised statement is a `mir-parse` boundary. This parser
+/// was not written against that shape. The honest answer to "what does it do"
+/// is "unknown", not "nothing". `discriminant` covers the
 /// `discriminant(_3) = 1;` spelling of `SetDiscriminant`.
 const BENIGN_STATEMENT_HEADS: &[&str] = &[
     "StorageLive",
@@ -2952,17 +2959,17 @@ struct Report<'r> {
 /// Crate roots of every fully-qualified spelling of `receiver` inside a
 /// declared type.
 ///
-/// MIR prints `let` declarations fully qualified even where it trims the callee
-/// path, so a declared type that *contains* the receiver type says which crate
-/// the receiver is from — and a receiver is the one thing at a call site that
+/// MIR prints `let` declarations fully qualified even where it trims the
+/// callee path. So a declared type that *contains* the receiver type says which
+/// crate the receiver is from. A receiver is the one thing at a call site that
 /// is genuinely about the callee. The receiver is often not the whole type:
 /// `DateTime::<Utc>::from_timestamp_millis` takes an `i64` and returns
 /// `std::option::Option<chrono::DateTime<chrono::Utc>>`, whose `chrono::DateTime`
 /// is the spelling wanted here.
 ///
-/// Only paths whose LAST segment is exactly the receiver count, so the
+/// Only paths whose LAST segment is exactly the receiver count. So the
 /// `std::option::Option` wrapper and the `chrono::Utc` parameter contribute
-/// nothing: a std-rooted type that is not the receiver is not evidence about
+/// nothing. A std-rooted type that is not the receiver is not evidence about
 /// the callee, which is the whole point of the rule.
 fn receiver_roots<'t>(ty: &'t str, receiver: &'t str) -> impl Iterator<Item = &'t str> {
     ty.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
@@ -2971,29 +2978,31 @@ fn receiver_roots<'t>(ty: &'t str, receiver: &'t str) -> impl Iterator<Item = &'
 }
 
 /// The part of a callee path that names the item's **owner**, for a crate-root
-/// scan: the qualified self type of `<Ty as Trait>::m` and of `Ty::m`, and the
-/// function's own path for a free function.
+/// scan.
+///
+/// The owner is the qualified self type of `<Ty as Trait>::m` and of `Ty::m`.
+/// For a free function, it is the function's own path.
 ///
 /// Everything else a callee path spells is about something other than the body
-/// that runs. The TRAIT is the sharpest case: an external type implementing a
-/// standard trait prints as `<Clock as std::convert::Into<String>>::into`
-/// wherever rustc cannot trim the trait, and the body that runs is the
+/// that runs. The TRAIT is the sharpest case. An external type that implements
+/// a standard trait prints as `<Clock as std::convert::Into<String>>::into`
+/// wherever rustc cannot trim the trait. The body that runs is the
 /// dependency's `From<Clock> for String`, free to read the wall clock. Generic
-/// arguments are the caller's type arguments (`helper::<std::string::String>`
-/// from a dependency compiled without `--emit=mir` names std without being
-/// std), and [`CalleePath::receiver_path`] has already dropped them from the
-/// self type.
+/// arguments are the caller's type arguments.
+/// `helper::<std::string::String>` from a dependency compiled without
+/// `--emit=mir` names std without being std. [`CalleePath::receiver_path`]
+/// has already dropped them from the self type.
 ///
-/// A qualified header the parser could not decompose — `<impl at FILE:l:c>`,
-/// which names no type at all — yields nothing rather than its span text: an
-/// owner that cannot be read is not an owner that is trusted.
+/// A qualified header the parser could not decompose yields nothing, not its
+/// span text. `<impl at FILE:l:c>` is such a header: it names no type at all.
+/// An owner that cannot be read is not an owner that is trusted.
 ///
 /// An unqualified path carries its owner's MODULE prefix, and that prefix is
-/// part of the owner: core's inherent slice impl prints as
-/// `core::slice::<impl [LineItem]>::iter`, whose self type (`[LineItem]`) names
-/// a first-party type while the impl block is core's own. So everything up to
-/// the method segment is the owner there, and a free function — which owns
-/// nothing — is judged on the root of its own path (`std::env::var`,
+/// part of the owner. Core's inherent slice impl prints as
+/// `core::slice::<impl [LineItem]>::iter`. Its self type (`[LineItem]`) names
+/// a first-party type, while the impl block is core's own. So everything up to
+/// the method segment is the owner there. A free function owns nothing. It is
+/// judged on the root of its own path (`std::env::var`,
 /// `serde_json::to_value`).
 fn callee_owner_text(printed: &str, parsed: &CalleePath) -> String {
     let text = printed.trim();
@@ -3009,9 +3018,9 @@ fn callee_owner_text(printed: &str, parsed: &CalleePath) -> String {
 
 /// `const {alloc2: &Atomic<u64>}` → `&Atomic<u64>`.
 ///
-/// The pointee is the one piece of type information printed at a static read,
-/// and it is what tells `a::COUNTER: u64` from `b::COUNTER: AtomicU64` when the
-/// footer's name was too short to.
+/// The pointee is the one piece of type information printed at a static read.
+/// It tells `a::COUNTER: u64` from `b::COUNTER: AtomicU64` when the footer's
+/// name was too short to.
 fn alloc_pointee(text: &str) -> Option<&str> {
     let at = text.find("{alloc")?;
     let rest = text.get(at..)?;
@@ -3123,8 +3132,10 @@ fn subst_note(subst: &Substitution) -> String {
     format!(" [{}]", bindings.join(", "))
 }
 
-/// The first sentence of a model row's `reason` — short enough for a hop, long
-/// enough to name the canonical path the row stands for (`std::process::id`).
+/// The first sentence of a model row's `reason`.
+///
+/// It is short enough for a hop and long enough to name the canonical path the
+/// row stands for (`std::process::id`).
 fn first_sentence(reason: &str) -> &str {
     let reason = reason.trim();
     reason.find(". ").map_or_else(

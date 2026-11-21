@@ -17,7 +17,7 @@ files by path.
 | Changelog entry | [`docs/changelog.d/`](../changelog.d/README.md) | see its README |
 
 Never write one of these at the repository root.
-[`root-files.py`](../audits/root-files.py) fails the `lint` job on a root
+`cargo xtask audit root-files` ([`xtask/src/audit/root_files.rs`](../../xtask/src/audit/root_files.rs)) fails the `lint` job on a root
 file that is not in its allow list.
 
 ## Links
@@ -26,3 +26,13 @@ Cite a design record by its repository path, for example
 `docs/design/DESIGN-1971.md`. A Markdown link from a page in `docs/` is
 relative to that page. A link from a design record to another page in
 `docs/` starts with `../`.
+
+## ADRs
+
+[The ADR index](../adr/README.md) lists each ADR. An ADR records a
+decision, and a design record holds its plan. For example,
+[ADR 0016](../adr/0016-agent-refinement.md) records why agent refinement
+is offline and operator-governed. `DESIGN-2383.md` holds its plan.
+[ADR 0017](../adr/0017-inference-strategies.md) records why inference
+strategies are workflows over durable child runs, scored by verifiers.
+`DESIGN-2450.md` holds its plan.

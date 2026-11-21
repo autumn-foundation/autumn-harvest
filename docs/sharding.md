@@ -880,6 +880,7 @@ The loop reports as scanner `rebalance_resume` in `scanner_liveness` and in
 | Workflow logs | ✅ | none — copied for a privacy reason as much as an operational one: they are free text, so a PII sink, and `erase.rs` scrubs them via the execution's own shard. Logs left behind would be out of reach of an erasure issued against the run. |
 | Durable stream chunks (`harvest_stream_chunks`, #1974) | ✅ in pages of 1,000 rows, and again at activation, so a chunk stored after verification is not lost | none — copied for the same reason as the logs: they are author output, and erasure must reach them |
 | Entity state projection (`harvest_entity_state`, #2259) | ✅ rebuilt, not copied: the projection trigger on the target writes the row as the event copy inserts each snapshot | none — the target row is the last snapshot of the copied history. The cutover deletes the row of the sealed source run. An aborted copy gives the target row back to the runs that stay there. |
+| External outbox pending rows (`harvest_external_outbox_pending`, #2724) | ✅ rebuilt, not copied: the outbox trigger on the target adds a row for each unresolved request as the event copy inserts it | none — the target claims the request. The cutover deletes the rows of the sealed source run. A discarded staged copy deletes its rows. |
 | Start idempotency keys | ❌ | none for an existing run: a keyed start still hashes to the same shard |
 | Debounce rows | ❌ | at most one extra debounced start per key immediately after the move |
 | Start-throttle tokens, rate-limit buckets | ❌ | already per-shard; unaffected for an existing run |
@@ -1417,7 +1418,7 @@ The `harvest.shard.stranded_pending` gauge (emitted by the stranded-work sampler
 harvest_shard_stranded_pending{shard="1"} > 0
 ```
 
-A non-zero value means tasks are queued on that shard but no worker is draining them. Healthy steady state is `0` on all shards. Use this as an alerting signal: if it stays non-zero for more than `2 × poll_interval`, check the fleet's *effective* coverage with `GET /admin/config` → `worker.shard_assignments` (see [Verify coverage](#verify-coverage--dont-assume-it-issue-961)).
+A non-zero value means tasks are queued on that shard but no worker is draining them. Healthy steady state is `0` on all shards. Use this as an alerting signal: if it stays non-zero for more than `2 × WorkerConfig::gauge_sample_interval` (30 s by default), check the fleet's *effective* coverage with `GET /admin/config` → `worker.shard_assignments` (see [Verify coverage](#verify-coverage--dont-assume-it-issue-961)).
 
 ### Pre-flip checklist
 

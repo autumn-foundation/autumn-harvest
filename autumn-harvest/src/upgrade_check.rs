@@ -487,9 +487,9 @@ pub struct EncodedHistory {
     /// The run's `context_headers` column, still codec-encoded.
     pub context_headers: Option<serde_json::Value>,
     /// The run's `execution_timeout`. Deadline-aware code reads it.
-    pub execution_timeout: Option<chrono::Duration>,
+    pub execution_timeout: Option<jiff::SignedDuration>,
     /// The run's `deadline_at`. `ctx.should_continue_as_new()` reads it.
-    pub deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub deadline_at: Option<jiff::Timestamp>,
     /// The run's parent, when it is a child run.
     pub parent_execution_id: Option<ExecutionId>,
     /// How the run started (issue #2082). `None` replays with an unknown source.
@@ -1511,9 +1511,11 @@ struct InFlightRow {
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
     context_headers: Option<serde_json::Value>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Interval>)]
-    execution_timeout: Option<chrono::Duration>,
+    #[diesel(deserialize_as = crate::time::sql::NullablePgDuration)]
+    execution_timeout: Option<jiff::SignedDuration>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[diesel(deserialize_as = crate::time::sql::NullableTimestamp)]
+    deadline_at: Option<jiff::Timestamp>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
     parent_id: Option<uuid::Uuid>,
     #[diesel(sql_type = diesel::sql_types::Text)]

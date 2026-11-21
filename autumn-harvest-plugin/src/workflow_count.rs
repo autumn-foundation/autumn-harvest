@@ -1,9 +1,12 @@
 //! Management read model for the grouped workflow-count fleet snapshot (issue #544).
 //!
-//! Answers the first question an on-call operator or dashboard asks: *"right
-//! now, how many executions are RUNNING / FAILED / SUSPENDED per workflow
-//! type, across every shard?"* Today that requires paginating `GET /workflows`
-//! or hand-querying every shard database. `GET /workflows/count` groups
+//! Answers the first question an on-call operator or dashboard asks:
+//!
+//! > *Right now, how many executions are RUNNING / FAILED / SUSPENDED per
+//! > workflow type, across every shard?*
+//!
+//! Today that requires paginating `GET /workflows` or hand-querying every
+//! shard database. `GET /workflows/count` groups
 //! `harvest_workflow_executions` rows by `state` and/or `workflow_name` with a
 //! real per-shard SQL `GROUP BY … COUNT(*)`
 //! ([`count_workflow_executions_grouped`](autumn_harvest::execution::count_workflow_executions_grouped))
@@ -18,24 +21,24 @@
 //! ## Bounded cardinality
 //!
 //! The number of distinct groups returned is capped at `limit_groups`
-//! (default [`DEFAULT_LIMIT_GROUPS`], max [`MAX_LIMIT_GROUPS`]); the long tail
-//! is rolled into a single `{"other": true}` group so a pathological number of
-//! workflow types can never produce an unbounded payload, via the same
-//! [`rollup_top_n`](autumn_harvest::dlq::rollup_top_n) helper the DLQ
-//! aggregation endpoint's `_other` rollup (issue #385) uses.
+//! (default [`DEFAULT_LIMIT_GROUPS`], max [`MAX_LIMIT_GROUPS`]). The long tail
+//! is rolled into a single `{"other": true}` group. So a pathological number
+//! of workflow types can never produce an unbounded payload. The rollup uses
+//! the same [`rollup_top_n`](autumn_harvest::dlq::rollup_top_n) helper as the
+//! `_other` rollup of the DLQ aggregation endpoint (issue #385).
 //!
 //! ## Partial answers
 //!
-//! Every shard the router knows about (`readable_shards`/`default_shard`),
-//! not just the ones with a live connection pool right now, is included in
-//! the fan-out via [`shard_fanout::expected_shards`] — a shard mid a
-//! shard-add rollout that has no pool wired up yet is reported `unavailable`
-//! rather than silently omitted, so `status` can never read `complete` while
-//! a known shard was never queried. When a shard is unreachable it is named
-//! in the `unavailable_shards` field (never silently dropped) and `status`
-//! becomes `partial` (some shards inspected) or `unavailable` (none
-//! inspected) — the call never fails wholesale, matching the shard-health
-//! `degraded` contract.
+//! The fan-out includes every shard the router knows about
+//! (`readable_shards`/`default_shard`) via [`shard_fanout::expected_shards`].
+//! That includes shards with no live connection pool right now. A shard in a
+//! shard-add rollout with no pool wired up yet is reported `unavailable`, not
+//! silently omitted. So `status` can never read `complete` while a known shard
+//! was never queried. An unreachable shard is named in the
+//! `unavailable_shards` field, never silently dropped. `status` then becomes
+//! `partial` (some shards inspected) or `unavailable` (none inspected). The
+//! call never fails wholesale, which matches the shard-health `degraded`
+//! contract.
 
 use std::collections::HashMap;
 
@@ -44,8 +47,8 @@ use autumn_harvest::execution::{
     WorkflowCountDimension, WorkflowCountQuery, WorkflowCountRow, count_workflow_executions_grouped,
 };
 use autumn_harvest::worker::DbPool;
-use chrono::{DateTime, Utc};
 use futures::future::join_all;
+use jiff::Timestamp;
 use serde::Serialize;
 
 use crate::api::HarvestApiState;
@@ -58,9 +61,9 @@ pub const MAX_LIMIT_GROUPS: u32 = 500;
 
 /// Cross-shard completeness of a count response.
 ///
-/// A type alias onto the shared [`FanoutStatus`] (rather than its own enum)
-/// so the complete/partial/unavailable derivation rule lives in exactly one
-/// place, alongside `workflow_reachability`'s and `schedule_runs`' reports.
+/// A type alias onto the shared [`FanoutStatus`], not its own enum. So the
+/// complete/partial/unavailable rule lives in one place, shared with the
+/// `workflow_reachability` and `schedule_runs` reports.
 pub type WorkflowCountReportStatus = FanoutStatus;
 
 // serde's `skip_serializing_if` calls this with `&bool` (a reference to the
@@ -93,7 +96,7 @@ pub struct WorkflowCountResponse {
     pub status: WorkflowCountReportStatus,
     /// When the snapshot was assembled. Eventually-consistent point-in-time —
     /// no replay or ordering guarantee under concurrent writes.
-    pub as_of: DateTime<Utc>,
+    pub as_of: Timestamp,
     /// Returned groups, ordered by descending count.
     pub groups: Vec<WorkflowCountGroupEntry>,
     /// Total executions matching the filters, summed across inspected shards
@@ -116,9 +119,9 @@ pub struct WorkflowCountParams {
     /// Filter: restrict to these states (empty = all states).
     pub states: Vec<String>,
     /// Filter: inclusive lower bound on `started_at`.
-    pub started_after: Option<DateTime<Utc>>,
+    pub started_after: Option<Timestamp>,
     /// Filter: inclusive upper bound on `started_at`.
-    pub started_before: Option<DateTime<Utc>>,
+    pub started_before: Option<Timestamp>,
     /// Cap on returned groups; long tail rolls into `other`.
     pub limit_groups: u32,
 }
@@ -139,10 +142,10 @@ impl Default for WorkflowCountParams {
 impl WorkflowCountParams {
     /// Parse and validate query-string pairs into count parameters.
     ///
-    /// `known_states` is the caller's authoritative state vocabulary (mirrors
-    /// `KNOWN_WORKFLOW_STATES` used by `GET /workflows`) — an unknown `state`
-    /// value returns `Err` so the caller can answer `400 Bad Request` rather
-    /// than silently matching nothing.
+    /// `known_states` is the authoritative state vocabulary of the caller. It
+    /// mirrors `KNOWN_WORKFLOW_STATES` of `GET /workflows`. An unknown `state`
+    /// value returns `Err`, so the caller can answer `400 Bad Request`, not
+    /// silently match nothing.
     ///
     /// # Errors
     ///
@@ -202,25 +205,21 @@ impl WorkflowCountParams {
                     }
                 }
                 "started_after" => {
-                    let dt = DateTime::parse_from_rfc3339(value.trim())
-                        .map_err(|_| {
-                            format!(
-                                "invalid started_after '{value}'; expected RFC 3339 \
+                    let dt = autumn_harvest::time::parse::rfc3339(value.trim()).map_err(|_| {
+                        format!(
+                            "invalid started_after '{value}'; expected RFC 3339 \
                                  (e.g. 2026-01-01T00:00:00Z)"
-                            )
-                        })?
-                        .with_timezone(&Utc);
+                        )
+                    })?;
                     params.started_after = Some(dt);
                 }
                 "started_before" => {
-                    let dt = DateTime::parse_from_rfc3339(value.trim())
-                        .map_err(|_| {
-                            format!(
-                                "invalid started_before '{value}'; expected RFC 3339 \
+                    let dt = autumn_harvest::time::parse::rfc3339(value.trim()).map_err(|_| {
+                        format!(
+                            "invalid started_before '{value}'; expected RFC 3339 \
                                  (e.g. 2026-01-01T00:00:00Z)"
-                            )
-                        })?
-                        .with_timezone(&Utc);
+                        )
+                    })?;
                     params.started_before = Some(dt);
                 }
                 "limit_groups" => {
@@ -264,7 +263,7 @@ type CountKey = (Option<String>, Option<String>);
 #[must_use]
 #[allow(clippy::needless_pass_by_value)]
 pub fn build_count_response(
-    as_of: DateTime<Utc>,
+    as_of: Timestamp,
     limit_groups: usize,
     observations: Vec<ShardObservation<WorkflowCountRow>>,
 ) -> WorkflowCountResponse {
@@ -312,9 +311,9 @@ pub fn build_count_response(
 
 /// Query one shard for its grouped counts (issue #544).
 ///
-/// Returns a [`ShardObservation`] rather than propagating errors so a single
-/// unreachable shard never fails the whole fan-out — the caller folds it into
-/// `unavailable_shards` and a `partial`/`unavailable` status instead.
+/// Returns a [`ShardObservation`], not an error. So one unreachable shard
+/// never fails the whole fan-out. The caller folds it into
+/// `unavailable_shards` and a `partial`/`unavailable` status.
 async fn observe_shard(
     shard_id: i32,
     pool: Option<DbPool>,
@@ -333,21 +332,20 @@ async fn observe_shard(
 /// Build the grouped workflow-count report for `GET /workflows/count`
 /// (issue #544).
 ///
-/// Fans the query out across [`shard_fanout::expected_shards`] — every shard
-/// with a live pool *and* every shard the router already knows about — so a
-/// shard mid a shard-add rollout is reported `unavailable` rather than
-/// silently skipped, then queries all of them concurrently (`join_all`)
-/// rather than one at a time.
+/// Fans the query out across [`shard_fanout::expected_shards`]: every shard
+/// with a live pool *and* every shard the router already knows about. So a
+/// shard in the middle of a shard-add rollout is reported `unavailable`, not
+/// silently skipped. All shards are queried concurrently (`join_all`).
 ///
-/// Never fails outright: a missing storage pool (or an unreachable shard)
-/// surfaces as `status: unavailable`/`partial` in the response, matching
-/// `workflow_reachability`'s and the shard-health "never fail wholesale"
-/// contract.
+/// Never fails outright. A missing storage pool (or an unreachable shard)
+/// surfaces as `status: unavailable`/`partial` in the response. That matches
+/// the "never fail wholesale" contract of `workflow_reachability` and
+/// shard-health.
 pub async fn build_workflow_count_report(
     api_state: &HarvestApiState,
     params: WorkflowCountParams,
 ) -> WorkflowCountResponse {
-    let as_of = Utc::now();
+    let as_of = Timestamp::now();
     let pools = shard_fanout::pools_by_shard(api_state);
     let expected = shard_fanout::expected_shards(api_state, &pools);
     let limit_groups = params.limit_groups as usize;
@@ -375,10 +373,10 @@ pub async fn build_workflow_count_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone as _;
+    use jiff::Timestamp;
 
-    fn at(seconds: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(seconds, 0).unwrap()
+    fn at(seconds: i64) -> Timestamp {
+        Timestamp::new(seconds, 0).unwrap()
     }
 
     fn row(state: Option<&str>, workflow_name: Option<&str>, count: i64) -> WorkflowCountRow {
@@ -408,8 +406,6 @@ mod tests {
     }
 
     const STATES: &[&str] = &["RUNNING", "FAILED", "COMPLETED", "SUSPENDED"];
-
-    // ── build_count_response ─────────────────────────────────────────────
 
     #[test]
     fn sums_counts_across_shards_and_sorts_descending() {
@@ -558,8 +554,6 @@ mod tests {
         assert!(value.get("workflow_name").is_none());
         assert!(value.get("other").is_none(), "other:false is omitted");
     }
-
-    // ── WorkflowCountParams::from_query_pairs ─────────────────────────────
 
     #[test]
     fn params_default_group_by_is_state() {

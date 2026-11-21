@@ -1,9 +1,9 @@
 //! Background heartbeat flusher for activities.
 //!
 //! Activities send heartbeat payloads via an mpsc channel. This module spawns
-//! a background Tokio task that receives those payloads, debounces them (keeping
-//! only the most recent), and periodically flushes the heartbeat timestamp and
-//! payload to the database.
+//! a background Tokio task that receives those payloads. It debounces them,
+//! keeping only the most recent. It periodically flushes the heartbeat
+//! timestamp and payload to the database.
 //!
 //! The flusher runs every 1 second, draining all pending heartbeats and keeping
 //! only the last one. This avoids hammering Postgres with per-heartbeat writes
@@ -137,9 +137,9 @@ fn drain_latest(rx: &mut mpsc::Receiver<Value>) -> Option<Value> {
 /// `claim` fences the write (issue #1789). When the claim is no longer
 /// current, the flusher cancels `cancel` and stops.
 ///
-/// The returned sender has a buffer of 64 messages -- if the activity sends
-/// heartbeats faster than that without the flusher draining, sends will
-/// await (backpressure).
+/// The returned sender has a buffer of 64 messages. If the activity sends
+/// heartbeats faster than the flusher drains them, sends await
+/// (backpressure).
 ///
 /// [`crate::pool::acquire_bound`] limits each pool acquire (issue #1788). The
 /// write stamps the time of the flush, and a failed flush drops its payload.
@@ -754,7 +754,6 @@ async fn stamped_heartbeat_loop(
             pending = newest;
         }
 
-        // If we got at least one heartbeat, flush to DB.
         if let Some(mut beat) = pending.take() {
             let started = tokio::time::Instant::now();
             let outcome = flush(
@@ -829,7 +828,6 @@ async fn stamped_heartbeat_loop(
             }
         }
 
-        // Check cancellation after flush.
         if cancel.is_cancelled() {
             break;
         }
@@ -880,10 +878,6 @@ async fn wait_for_newer_heartbeat(
 #[cfg(feature = "db")]
 const SITE_HEARTBEAT_FLUSH: &str = "heartbeat_flush";
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -897,7 +891,6 @@ mod tests {
     async fn heartbeat_batcher_debounces() {
         let (tx, mut rx) = mpsc::channel::<Value>(64);
 
-        // Send 5 heartbeats rapidly.
         for i in 0..5 {
             tx.send(serde_json::json!({"progress": i}))
                 .await

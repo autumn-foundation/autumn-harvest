@@ -162,6 +162,7 @@ fn make_worker(registry: Arc<HandlerRegistry>) -> Worker {
 fn make_worker_on(registry: Arc<HandlerRegistry>, queue: &str) -> Worker {
     Worker::new(
         WorkerRuntimeConfig {
+            gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
             codec_rotation_batch_size: 0,
             scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
             dr: autumn_harvest::replication::DrConfig::default(),
@@ -171,6 +172,8 @@ fn make_worker_on(registry: Arc<HandlerRegistry>, queue: &str) -> Worker {
             max_concurrent_workflows: 10,
             max_concurrent_activities: 20,
             max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
+            claim_slots_per_shard: None,
+            claim_batch_max: None,
             poll_interval: Duration::from_millis(50),
             shutdown_timeout: Duration::from_secs(2),
             cancellation_grace_period: Duration::from_secs(2),

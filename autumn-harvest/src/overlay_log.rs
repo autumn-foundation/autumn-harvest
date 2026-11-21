@@ -29,7 +29,7 @@
 //! `docs/design/DESIGN-2374.md` and `docs/design/DESIGN-2394.md`.
 //! `formal/verus/src/overlay_log.rs` proves the kernel.
 
-use chrono::{DateTime, TimeDelta, Utc};
+use jiff::Timestamp;
 
 /// The `author_kind` of a version that an operator wrote.
 pub const AUTHOR_OPERATOR: &str = "operator";
@@ -175,6 +175,46 @@ pub const fn decide_rollback(
     }
 }
 
+/// What a guarded activation does. `read_seq` is the `seq` of the last move
+/// that the caller read, or `None` for an empty log. `last_seq` is the
+/// `seq` of the last move under the lock.
+///
+/// A move after the read changes `last_seq`, so the swap is a conflict. A
+/// pointer that moved away and back therefore never passes.
+///
+/// `formal/verus/src/overlay_log.rs` proves it.
+#[must_use]
+pub const fn decide_guarded(
+    known: bool,
+    expected: Option<u64>,
+    actual: Option<u64>,
+    read_seq: Option<u64>,
+    last_seq: Option<u64>,
+) -> ActivateDecision {
+    match decide_activate(known, expected, actual) {
+        ActivateDecision::Activate => {
+            let same = match (read_seq, last_seq) {
+                (None, None) => true,
+                (Some(read), Some(last)) => read == last,
+                _ => false,
+            };
+            if same {
+                ActivateDecision::Activate
+            } else {
+                ActivateDecision::Conflict
+            }
+        }
+        other => other,
+    }
+}
+
+/// The log head that a guarded move read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadHead {
+    /// The `seq` of the last move, or `None` for an empty log.
+    pub seq: Option<u64>,
+}
+
 /// One move request for a raw log. The caller validates the version first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MoveRequest<'a> {
@@ -190,11 +230,21 @@ pub struct MoveRequest<'a> {
     /// then also needs that move to be the last one. See
     /// [`decide_rollback`].
     pub after_seq: Option<u64>,
+    /// For a guarded move, the log head that the caller read. The swap then
+    /// also needs the log to be unchanged. See [`decide_guarded`]. A
+    /// rollback ignores it.
+    pub head: Option<ReadHead>,
 }
 
 impl MoveRequest<'_> {
+    /// Whether the decision reads the `seq` of the last move.
+    #[must_use]
+    pub const fn needs_last_seq(&self) -> bool {
+        self.after_seq.is_some() || self.head.is_some()
+    }
+
     /// The decision under the lock. `last_seq` is the `seq` of the last
-    /// move, and it counts only for a rollback.
+    /// move, and it counts only for a rollback or a guarded move.
     #[must_use]
     pub const fn decide(
         &self,
@@ -212,7 +262,10 @@ impl MoveRequest<'_> {
                 ActivateDecision::UnknownVersion => ActivateDecision::UnknownVersion,
                 _ => ActivateDecision::Conflict,
             },
-            (None, _) => decide_activate(known, self.expected, actual),
+            (None, _) => match self.head {
+                Some(read) => decide_guarded(known, self.expected, actual, read.seq, last_seq),
+                None => decide_activate(known, self.expected, actual),
+            },
         }
     }
 }
@@ -231,7 +284,7 @@ pub struct ActivationRow {
     /// The operator id, or the execution id of the refine run.
     pub actor: String,
     /// The time of the move.
-    pub activated_at: DateTime<Utc>,
+    pub activated_at: Timestamp,
 }
 
 /// One stored overlay version.
@@ -246,19 +299,17 @@ pub struct OverlayRow {
     /// The operator id, or the execution id of the refine run.
     pub author: String,
     /// The time of the write.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 /// The start and the end of the UTC day of `at`.
 #[must_use]
-pub fn utc_day(at: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
-    let start = at
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .map_or(at, |midnight| midnight.and_utc());
+pub fn utc_day(at: Timestamp) -> (Timestamp, Timestamp) {
+    let midnight = crate::time::utc_date(at).to_datetime(jiff::civil::Time::midnight());
+    let start = crate::time::from_utc_datetime(midnight).unwrap_or(at);
     let end = start
-        .checked_add_signed(TimeDelta::days(1))
-        .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        .checked_add(crate::time::days(1))
+        .unwrap_or(Timestamp::MAX);
     (start, end)
 }
 
@@ -339,7 +390,7 @@ pub struct PolicyRow {
     /// The operator id.
     pub actor: String,
     /// The time of the change.
-    pub changed_at: DateTime<Utc>,
+    pub changed_at: Timestamp,
 }
 
 /// One write of the refine policy log. The caller checks the actor and the
@@ -380,7 +431,7 @@ pub struct AutoAdoptRequest<'a> {
     /// The daily cap, or `None` for no cap.
     pub cap: Option<u32>,
     /// The time of the move. Its UTC day is the day of the cap.
-    pub at: DateTime<Utc>,
+    pub at: Timestamp,
     /// The policy revision that the gate read. The transaction compares
     /// it, so a policy change after the gate refuses the move.
     pub policy_revision: Option<u64>,
@@ -422,10 +473,11 @@ pub use pg::{
 /// `ProfileOverlayStore`, which does.
 #[cfg(feature = "db")]
 mod pg {
-    use chrono::{DateTime, Utc};
     use diesel::QueryableByName;
     use diesel::sql_types::{BigInt, Binary, Bool, Nullable, Text, Timestamptz};
     use diesel_async::{AsyncPgConnection, RunQueryDsl};
+    use jiff::Timestamp;
+    use jiff_diesel::ToDiesel;
 
     use super::{
         AUTHOR_AUTO, ActivateDecision, ActivateOutcome, ActivationRow, AutoAdoptRaw,
@@ -448,7 +500,8 @@ mod pg {
         #[diesel(sql_type = Text)]
         author: String,
         #[diesel(sql_type = Timestamptz)]
-        created_at: DateTime<Utc>,
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+        created_at: Timestamp,
     }
 
     impl Row {
@@ -561,9 +614,10 @@ mod pg {
             };
             let known = overlay_exists(conn, kind, stored).await?;
             let actual = head.active.map(to_version).transpose()?;
-            let last_seq = match request.after_seq {
-                Some(_) => last_activation(conn, kind).await?.map(|row| row.seq),
-                None => None,
+            let last_seq = if request.needs_last_seq() {
+                last_activation(conn, kind).await?.map(|row| row.seq)
+            } else {
+                None
             };
             match request.decide(known, actual, last_seq) {
                 ActivateDecision::UnknownVersion => Ok(ActivateOutcome::UnknownVersion),
@@ -683,7 +737,8 @@ mod pg {
         #[diesel(sql_type = Text)]
         actor: String,
         #[diesel(sql_type = Timestamptz)]
-        activated_at: DateTime<Utc>,
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+        activated_at: Timestamp,
     }
 
     /// The last move of the pointer of `kind`, or `None`.
@@ -802,7 +857,8 @@ mod pg {
         #[diesel(sql_type = Text)]
         actor: String,
         #[diesel(sql_type = Timestamptz)]
-        changed_at: DateTime<Utc>,
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+        changed_at: Timestamp,
     }
 
     impl Policy {
@@ -1071,7 +1127,7 @@ mod pg {
             .bind::<BigInt, _>(version)
             .bind::<Text, _>(AUTHOR_AUTO)
             .bind::<Text, _>(request.actor)
-            .bind::<Timestamptz, _>(request.at)
+            .bind::<Timestamptz, _>(request.at.to_diesel())
             .execute(conn)
             .await?;
             Ok(AutoAdoptRaw::Adopted(row))
@@ -1098,8 +1154,8 @@ mod pg {
         )
         .bind::<Text, _>(kind)
         .bind::<Text, _>(AUTHOR_AUTO)
-        .bind::<Timestamptz, _>(start)
-        .bind::<Timestamptz, _>(end)
+        .bind::<Timestamptz, _>(start.to_diesel())
+        .bind::<Timestamptz, _>(end.to_diesel())
         .get_result(conn)
         .await
         .map_err(database_error)?;
@@ -1136,12 +1192,10 @@ mod tests {
 
     #[test]
     fn a_utc_day_runs_from_midnight_to_midnight() {
-        let at = DateTime::parse_from_rfc3339("2026-11-03T23:59:59Z")
-            .expect("time")
-            .with_timezone(&Utc);
+        let at = ("2026-11-03T23:59:59Z").parse::<Timestamp>().expect("time");
         let (start, end) = utc_day(at);
-        assert_eq!(start.to_rfc3339(), "2026-11-03T00:00:00+00:00");
-        assert_eq!(end.to_rfc3339(), "2026-11-04T00:00:00+00:00");
+        assert_eq!(crate::time::rfc3339(start), "2026-11-03T00:00:00+00:00");
+        assert_eq!(crate::time::rfc3339(end), "2026-11-04T00:00:00+00:00");
         assert_eq!(utc_day(start), (start, end));
         assert_eq!(utc_day(end).0, end);
     }
@@ -1195,6 +1249,7 @@ mod tests {
             actor_kind: AUTHOR_OPERATOR,
             actor: "ops",
             after_seq: Some(5),
+            head: None,
         };
         assert_eq!(rollback.decide(true, Some(2), Some(6)), Conflict);
         let plain = MoveRequest {
@@ -1208,6 +1263,51 @@ mod tests {
         };
         assert_eq!(unguarded.decide(true, None, Some(5)), Conflict);
         assert_eq!(unguarded.decide(false, None, Some(5)), UnknownVersion);
+    }
+
+    #[test]
+    fn a_guarded_move_needs_an_unchanged_log() {
+        use ActivateDecision::{Activate, Conflict, UnknownVersion};
+        assert_eq!(
+            decide_guarded(true, Some(2), Some(2), Some(5), Some(5)),
+            Activate
+        );
+        assert_eq!(decide_guarded(true, None, None, None, None), Activate);
+        assert_eq!(
+            decide_guarded(true, Some(2), Some(2), Some(5), Some(7)),
+            Conflict
+        );
+        assert_eq!(decide_guarded(true, None, None, None, Some(1)), Conflict);
+        assert_eq!(
+            decide_guarded(true, Some(2), Some(2), Some(5), None),
+            Conflict
+        );
+        assert_eq!(
+            decide_guarded(true, Some(2), Some(3), Some(5), Some(5)),
+            Conflict
+        );
+        assert_eq!(
+            decide_guarded(false, Some(2), Some(2), Some(5), Some(5)),
+            UnknownVersion
+        );
+        let guarded = MoveRequest {
+            version: 3,
+            expected: Some(2),
+            actor_kind: AUTHOR_REFINE,
+            actor: "run",
+            after_seq: None,
+            head: Some(ReadHead { seq: Some(5) }),
+        };
+        assert!(guarded.needs_last_seq());
+        assert_eq!(guarded.decide(true, Some(2), Some(5)), Activate);
+        // Away and back: the pointer is the expected one, but the log moved.
+        assert_eq!(guarded.decide(true, Some(2), Some(7)), Conflict);
+        let plain = MoveRequest {
+            head: None,
+            ..guarded
+        };
+        assert!(!plain.needs_last_seq());
+        assert_eq!(plain.decide(true, Some(2), Some(7)), Activate);
     }
 
     #[test]

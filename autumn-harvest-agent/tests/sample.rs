@@ -29,6 +29,7 @@ use autumn_harvest_agent::{
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
 use common::{Recorder, TryFnModel, answer, calls, recorded_tool, runtime};
 use futures::FutureExt as _;
+use jiff::Timestamp;
 use serde_json::json;
 
 const KIND: &str = "researcher";
@@ -446,8 +447,7 @@ fn judged_run(judge_model: &str) -> (AgentHarness, SampleInput) {
 }
 
 fn ledger_rows(rt: &SqliteRuntime) -> Vec<autumn_harvest_sqlite::LlmLedgerRow> {
-    use autumn_harvest::chrono::{DateTime, Utc};
-    rt.llm_ledger_between(DateTime::<Utc>::MIN_UTC, DateTime::<Utc>::MAX_UTC)
+    rt.llm_ledger_between(Timestamp::MIN, Timestamp::MAX)
         .unwrap()
 }
 
@@ -530,7 +530,7 @@ fn a_threshold_that_is_not_finite_fails_to_decode() {
     let value = json!({"rejection": {"max_attempts": 2, "threshold": 0.5}});
     let strategy: SampleStrategy = serde_json::from_value(value).unwrap();
     assert_eq!(strategy, SampleStrategy::rejection(2, threshold(0.5)));
-    assert_eq!(strategy.policy_strategy(), Strategy::Rejection);
+    assert_eq!(strategy.policy_strategy(), Some(Strategy::Rejection));
     assert_eq!(strategy.draws(), 2);
 }
 
@@ -718,4 +718,24 @@ async fn the_sample_history_replays_clean() {
             "{replay}"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_brief_run_drops_the_transcript_of_the_selected_draw() {
+    let (_dir, db) = fresh_db();
+    let scorer = || Table(vec![("a", 0.5)]);
+    let mut rt = runtime(&db, harness(by_draw(&["a"]), scorer(), &sampling(1)));
+    let input = SampleInput::new(KIND, "Pick.", SampleStrategy::best_of_n(1), table());
+    let full = sample_report(drive(&mut rt, &input).await);
+    assert_ne!(full.selected.as_ref().unwrap().messages.len(), 0);
+    let mut brief = input;
+    brief.brief = true;
+    let short = sample_report(drive(&mut rt, &brief).await);
+    let selected = short.selected.as_ref().unwrap();
+    assert!(
+        selected.messages.is_empty(),
+        "the history keeps no transcript"
+    );
+    assert_eq!(selected.text, "a", "the answer stays");
+    assert!(!short.refused);
 }

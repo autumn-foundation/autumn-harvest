@@ -90,6 +90,7 @@ An audit also needs a row in [`docs/audits/README.md`](audits/README.md).
 | `cargo xtask check changelog-connector-migration-version` | `xtask/src/check/changelog_connector_migration_version.rs` | `scripts/check-changelog-connector-migration-version.sh` |
 | `cargo xtask check child-idempotency-examples` | `xtask/src/check/child_idempotency_examples.rs` | `scripts/check-child-idempotency-examples.sh` |
 | `cargo xtask check continue-as-new-checkpoint-example` | `xtask/src/check/continue_as_new_checkpoint_example.rs` | `scripts/check-continue-as-new-checkpoint-example.sh` |
+| `cargo xtask check crate-packaging` | `xtask/src/check/crate_packaging.rs` | none |
 | `cargo xtask check dags-schedules-examples` | `xtask/src/check/dags_schedules_examples.rs` | `scripts/check-dags-schedules-examples.sh` |
 | `cargo xtask check default-run` | `xtask/src/check/default_run.rs` | `scripts/check-default-run.sh` |
 | `cargo xtask check dev-database-url-placeholder-caveat` | `xtask/src/check/dev_database_url_placeholder_caveat.rs` | `scripts/check-dev-database-url-placeholder-caveat.sh` |
@@ -140,6 +141,7 @@ An audit also needs a row in [`docs/audits/README.md`](audits/README.md).
 | `cargo xtask perf deep-backlog-ledger` | `xtask/src/perf/deep_backlog_ledger.rs` | `autumn-harvest/scripts/deep_backlog_ledger_repro.sh` |
 | `cargo xtask perf external-outbox-scan-matrix` | `xtask/src/perf/external_outbox_scan_matrix.rs` | `autumn-harvest/scripts/external_outbox_scan_matrix.sh` |
 | `cargo xtask perf external-outbox-scan` | `xtask/src/perf/external_outbox_scan.rs` | `autumn-harvest/scripts/external_outbox_scan_perf_repro.sh` |
+| `cargo xtask perf llm-spend-tenant-window` | `xtask/src/perf/llm_spend_tenant_window.rs` | none (new command) |
 | `cargo xtask perf history-ceiling-claim` | `xtask/src/perf/history_ceiling_claim.rs` | `autumn-harvest/scripts/history_ceiling_claim_perf_repro.sh` |
 | `cargo xtask perf notify-stage-probe` | `xtask/src/perf/notify_stage_probe.rs` | `autumn-harvest/scripts/notify_stage_probe_perf_repro.sh` |
 | `cargo xtask perf parent-close-cascade-unfinished-handlers` | `xtask/src/perf/parent_close_cascade_unfinished_handlers.rs` | `autumn-harvest/scripts/parent_close_cascade_unfinished_handlers_perf_repro.sh` |

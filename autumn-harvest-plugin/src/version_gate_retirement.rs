@@ -1,8 +1,8 @@
 //! Management read model for the version-gate retirement check.
 //!
-//! Answers "is change id X safe to retire below version N?" by aggregating
-//! [`load_retirement_check`] results across all configured shards and surfacing
-//! per-shard availability status so callers know whether the result is
+//! Answers "is change id X safe to retire below version N?" It aggregates
+//! [`load_retirement_check`] results across all configured shards. It also
+//! surfaces per-shard availability, so callers know whether the result is
 //! conclusive.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,8 +13,8 @@ use autumn_harvest::version_gate_retirement::{
 use autumn_harvest::version_usage::VersionExecutionStateGroup;
 use autumn_harvest::worker::DbPool;
 use autumn_web::error::AutumnError;
-use chrono::{DateTime, Utc};
 use futures::future::join_all;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -71,7 +71,7 @@ pub struct RetirementCheckReport {
     pub status: RetirementCheckStatus,
     /// `true` only when `status == "safe"` — all shards inspected, zero active blockers.
     pub safe_to_retire: bool,
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: Timestamp,
     pub filters: RetirementCheckReportFilters,
     /// One row per `(workflow_name, recorded_version)` group that has at least one
     /// execution with a version below `min_safe_version`.
@@ -97,8 +97,8 @@ pub struct RetirementBlockerReportRow {
     pub recorded_version: u32,
     pub active_executions: i64,
     pub terminal_executions: i64,
-    pub oldest_blocker_started_at: DateTime<Utc>,
-    pub newest_blocker_started_at: DateTime<Utc>,
+    pub oldest_blocker_started_at: Timestamp,
+    pub newest_blocker_started_at: Timestamp,
     pub oldest_blocker_age_secs: i64,
     pub newest_blocker_age_secs: i64,
     /// Sample of active execution IDs (up to 10 per shard, deduplicated).
@@ -149,8 +149,8 @@ struct RetirementKey {
 struct RetirementAccumulator {
     active_executions: i64,
     terminal_executions: i64,
-    oldest_blocker_started_at: DateTime<Utc>,
-    newest_blocker_started_at: DateTime<Utc>,
+    oldest_blocker_started_at: Timestamp,
+    newest_blocker_started_at: Timestamp,
     matched_shards: BTreeSet<i32>,
     sample_active_execution_ids: Vec<Uuid>,
 }
@@ -165,7 +165,7 @@ pub async fn build_retirement_check_report(
     api_state: &HarvestApiState,
     query: RetirementCheckQuery,
 ) -> Result<RetirementCheckReport, AutumnError> {
-    let observed_at = Utc::now();
+    let observed_at = Timestamp::now();
     let state_group = query
         .state_group
         .as_deref()
@@ -239,7 +239,7 @@ async fn observe_shard(
 }
 
 fn build_report_from_observations(
-    observed_at: DateTime<Utc>,
+    observed_at: Timestamp,
     filters: RetirementCheckReportFilters,
     observations: Vec<ShardObservation>,
 ) -> RetirementCheckReport {
@@ -342,7 +342,7 @@ fn blocker_from_accumulator(
     acc: &RetirementAccumulator,
     inspected_shards: &BTreeSet<i32>,
     unavailable_shards: &BTreeSet<i32>,
-    observed_at: DateTime<Utc>,
+    observed_at: Timestamp,
 ) -> RetirementBlockerReportRow {
     RetirementBlockerReportRow {
         workflow_name: key.workflow_name,
@@ -382,10 +382,10 @@ const fn compute_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone as _;
+    use jiff::Timestamp;
 
-    fn at(seconds: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(seconds, 0).unwrap()
+    fn at(seconds: i64) -> Timestamp {
+        Timestamp::new(seconds, 0).unwrap()
     }
 
     fn shard_row(

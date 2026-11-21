@@ -4,9 +4,9 @@
 //! rows-remaining-per-key-id shape after a real rotation, and the contract
 //! registration that keeps `docs/api-contract.json` honest.
 //!
-//! Runs against a real Postgres 16 container (or `HARVEST_TEST_DATABASE_URL`,
-//! in which case each test gets its own throwaway database — the rotation
-//! census is shard-wide by design and cannot share a database).
+//! Runs against a real Postgres 16 container or `HARVEST_TEST_DATABASE_URL`.
+//! With the variable, each test gets its own throwaway database, because the
+//! rotation census is shard-wide.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -28,9 +28,9 @@ use autumn_harvest_plugin::{management_api_response_fields, management_api_route
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::Utc;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
@@ -232,7 +232,7 @@ async fn seed_event_under_key(pool: &DbPool, codecs: &PayloadCodecs, key_id: &st
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: json!({"user": "alice"}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,

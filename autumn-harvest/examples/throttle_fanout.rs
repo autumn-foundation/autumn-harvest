@@ -5,23 +5,25 @@
 //!
 //! A scheduled fan-out, a post-downtime backfill (#337), or a webhook storm
 //! (#344) can admit *hundreds of distinct, legitimate starts in a single tick*.
-//! When every one of those workflows hammers the same rate-limited downstream
-//! (a third-party API capped at 100 req/min, a fragile internal service, a
-//! vendor quota), the operator wants a front-door knob to **pace admissions to
-//! a sustained rate and defer the excess** — dropping nothing, rejecting nothing.
+//! Each of those workflows can hammer the same rate-limited downstream: a
+//! third-party API capped at 100 req/min, a fragile internal service, or a
+//! vendor quota. The operator then wants a front-door knob to **pace admissions
+//! to a sustained rate and defer the excess**, with nothing dropped or rejected.
 //!
-//! The existing tools each miss: activity RPS limits (#332) only kick in *after*
-//! N workflows have already started and are now all parked on the bucket;
-//! debounce (#499) *drops* redundant same-key triggers; the admission gate
-//! (#377) is a *binary halt*; per-key concurrency (#247) bounds *in-flight
-//! count*, not *rate*.
+//! Each existing tool misses:
+//!
+//! - Activity RPS limits (#332) apply only *after* N workflows have started and
+//!   are all parked on the bucket.
+//! - Debounce (#499) *drops* redundant same-key triggers.
+//! - The admission gate (#377) is a *binary halt*.
+//! - Per-key concurrency (#247) bounds *in-flight count*, not *rate*.
 //!
 //! ## The solution: `#[workflow(throttle(...))]`
 //!
-//! Declaring a throttle paces starts through a per-key token bucket. Excess
-//! starts (when the bucket is empty) are **durably deferred** in Postgres —
-//! *before* any `WorkflowStarted` event exists — and admitted later by a
-//! background scanner as tokens refill.
+//! Declaring a throttle paces starts through a per-key token bucket. When the
+//! bucket is empty, an excess start is **durably deferred** in Postgres, before
+//! any `WorkflowStarted` event exists. A background scanner admits it later as
+//! tokens refill.
 //!
 //! ```rust
 //! use autumn_harvest::prelude::*;
@@ -48,7 +50,7 @@
 //! | Property | Behaviour |
 //! |---|---|
 //! | **Token bucket / GCRA** | Admitted starts for a key never exceed `rate` (+ `burst`) over any window. |
-//! | **Defer, don't drop** | An excess start is durably persisted and admitted later — nothing is dropped (contrast debounce) or rejected. |
+//! | **Defer, do not drop** | An excess start is durably persisted and admitted later — nothing is dropped (contrast debounce) or rejected. |
 //! | **Preserve every start** | Every start eventually runs — many pending rows per key, drained FIFO (contrast debounce's collapse-to-one). |
 //! | **Durable** | Deferred starts survive a plugin/worker restart — no in-memory pending queue. |
 //! | **Key scoping** | Shard-local — consistent with per-key concurrency (#247) and the activity limiter. |
@@ -140,10 +142,10 @@ pub struct SyncRequest {
 
 /// Pace tenant-sync starts at 100/min per tenant, burst 20.
 ///
-/// A scheduled fan-out or backfill that emits 500 sync requests for one tenant
-/// admits 20 immediately (the burst), then drains at 100/min — every request
-/// eventually runs, and the rate-limited downstream never exceeds its quota.
-/// Different `tenant_id` values throttle independently (per-key buckets).
+/// A fan-out or backfill that emits 500 sync requests for one tenant admits 20
+/// at once (the burst), then drains at 100/min. Every request eventually runs,
+/// and the rate-limited downstream never exceeds its quota. Different
+/// `tenant_id` values throttle independently (per-key buckets).
 #[workflow(throttle(rate = "100/m", burst = 20, key = "input.tenant_id"))]
 async fn sync_tenant(ctx: &WorkflowContext, req: SyncRequest) -> Result<(), String> {
     let _: () = ctx

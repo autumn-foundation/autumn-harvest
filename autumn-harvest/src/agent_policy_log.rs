@@ -17,7 +17,7 @@
 //!
 //! The design is in `docs/design/DESIGN-2439.md`.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 /// The policy name of the sampling policy (issue #2439).
 pub const POLICY_SAMPLING: &str = "sampling";
@@ -51,7 +51,7 @@ pub struct PolicyRow {
     /// The actor of the last change.
     pub updated_by: String,
     /// The time of the last change.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 /// The result of one set or reset.
@@ -79,7 +79,7 @@ pub struct PolicyAuditRow {
     /// The body after the change.
     pub new: Option<String>,
     /// The time of the change.
-    pub at: DateTime<Utc>,
+    pub at: Timestamp,
 }
 
 #[cfg(feature = "db")]
@@ -90,10 +90,10 @@ pub use pg::{list_agent_policy_audit, read_agent_policy, write_agent_policy};
 /// `SamplingPolicyStore`, which does.
 #[cfg(feature = "db")]
 mod pg {
-    use chrono::{DateTime, Utc};
     use diesel::QueryableByName;
     use diesel::sql_types::{BigInt, Nullable, Text, Timestamptz};
     use diesel_async::{AsyncPgConnection, RunQueryDsl};
+    use jiff::Timestamp;
 
     use super::{
         ACTION_RESET, ACTION_SET, PolicyAuditRow, PolicyChangeRow, PolicyRow, next_policy_revision,
@@ -109,7 +109,8 @@ mod pg {
         #[diesel(sql_type = Text)]
         updated_by: String,
         #[diesel(sql_type = Timestamptz)]
-        updated_at: DateTime<Utc>,
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+        updated_at: Timestamp,
     }
 
     #[derive(QueryableByName)]
@@ -125,7 +126,8 @@ mod pg {
         #[diesel(sql_type = Nullable<Text>)]
         new_body: Option<String>,
         #[diesel(sql_type = Timestamptz)]
-        at: DateTime<Utc>,
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+        at: Timestamp,
     }
 
     /// A stored revision as `u64`. The table check keeps it at 1 or more.

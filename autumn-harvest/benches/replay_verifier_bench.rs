@@ -14,8 +14,8 @@ use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::testing::{HistorySnapshot, ReplayVerifier};
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
-use chrono::Utc;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use jiff::Timestamp;
 use serde_json::Value;
 
 /// Workflow that executes N sequential activities.
@@ -40,7 +40,7 @@ fn build_fixture_json(activity_count: usize) -> String {
     let mut events = Vec::with_capacity(activity_count * 2 + 1);
     events.push(WorkflowEvent::WorkflowStarted {
         input: Value::from(activity_count as u64),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -86,7 +86,6 @@ fn bench_1000_fixtures(c: &mut Criterion) {
     c.bench_function("verify_1000_fixtures_1k_events", |b| {
         b.iter_batched(
             || {
-                // Create a temp dir with 1000 fixture files.
                 let dir = tempfile::tempdir().unwrap();
                 let fixture_json = build_fixture_json(500); // 500 activities = 1001 events
                 for i in 0..1000 {

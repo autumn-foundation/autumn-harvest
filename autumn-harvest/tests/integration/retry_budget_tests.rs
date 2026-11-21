@@ -31,10 +31,10 @@ use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{RetryPolicy, WorkflowContext, store};
 
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -286,6 +286,7 @@ fn build_worker_with(
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
                 codec_rotation_batch_size: 0,
                 scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
@@ -295,6 +296,8 @@ fn build_worker_with(
                 max_concurrent_workflows: 4,
                 max_concurrent_activities: 8,
                 max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
+                claim_slots_per_shard: None,
+                claim_batch_max: None,
                 poll_interval: Duration::from_millis(10),
                 shutdown_timeout: Duration::from_secs(5),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -380,7 +383,7 @@ async fn seed_workflow(conn: &mut AsyncPgConnection, queue: &str, activity: &str
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -391,7 +394,7 @@ async fn seed_workflow(conn: &mut AsyncPgConnection, queue: &str, activity: &str
     .expect("append WorkflowStarted");
     let mut params = EnqueueParams::new(queue, TaskType::Workflow, input);
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     queue::enqueue(conn, &params)
         .await
         .expect("enqueue workflow task");
@@ -803,7 +806,7 @@ async fn budget_deferral_keeps_crash_strikes_attempt_and_error() {
     params.workflow_exec_id = Some(exec.as_uuid());
     params.activity_name = Some("rb_strikes".to_string());
     params.activity_id = Some(Uuid::new_v4());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     let task_id = queue::enqueue(&mut conn, &params)
         .await
         .expect("enqueue activity");
@@ -842,10 +845,13 @@ async fn budget_deferral_keeps_crash_strikes_attempt_and_error() {
         worker_id: "rb-strikes-worker".to_string(),
         attempt: claimed.attempt,
     };
-    let write =
-        queue::defer_claimed_retry_for_budget(&mut conn, &claim, chrono::Duration::seconds(30))
-            .await
-            .expect("defer");
+    let write = queue::defer_claimed_retry_for_budget(
+        &mut conn,
+        &claim,
+        jiff::SignedDuration::from_secs(30),
+    )
+    .await
+    .expect("defer");
     assert_eq!(write, queue::ClaimWrite::Applied);
 
     let row: TaskQueueItem = harvest_task_queue::table
@@ -909,10 +915,13 @@ async fn budget_deferral_reports_applied_when_only_the_notify_fails() {
         attempt: claimed.attempt,
     };
 
-    let write =
-        queue::defer_claimed_retry_for_budget(&mut conn, &claim, chrono::Duration::seconds(30))
-            .await
-            .expect("an applied deferral is not an error when only the NOTIFY fails");
+    let write = queue::defer_claimed_retry_for_budget(
+        &mut conn,
+        &claim,
+        jiff::SignedDuration::from_secs(30),
+    )
+    .await
+    .expect("an applied deferral is not an error when only the NOTIFY fails");
     assert_eq!(write, queue::ClaimWrite::Applied);
 
     let row: TaskQueueItem = harvest_task_queue::table

@@ -3,9 +3,8 @@
 //! determinism check `shard_rebalance::db::verify_target_copy` runs on both
 //! sides of a shard migration (see `docs/performance-history-fingerprint.md`
 //! and `docs/sharding.md`). Wall-clock timing is not admissible evidence on
-//! this shared-vCPU machine. Every number this harness produces is either a
-//! deterministic instruction count (`valgrind --tool=callgrind`) or an
-//! allocation count/bytes figure (`valgrind --tool=dhat`).
+//! this shared-vCPU machine. Use instruction counts (`valgrind --tool=callgrind`)
+//! and allocation counts/bytes (`valgrind --tool=dhat`).
 //!
 //! # Workload
 //!

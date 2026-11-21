@@ -6,11 +6,12 @@ use std::sync::Arc;
 use agent_mesh::desk::Desk;
 use agent_mesh::mesh::{self, DeskDelivery, MESH, MeshConfig, PrintSink};
 use agent_mesh::scripted::ScriptedDesk;
-use autoresearch::claude::{ClaudeModel, DEFAULT_MODEL};
-use autumn_harvest::chrono::{DateTime, Duration, Utc};
+use autumn_harvest_agent::anthropic::{ClaudeModel, DEFAULT_MODEL};
+use autumn_harvest_agent::openai::{OPENAI_BASE_URL, OpenAiModel};
 use autumn_harvest_agent::{AgentModel, AgentOp, Approval, Control, sqlite};
 use autumn_harvest_sqlite::SqliteRuntime;
 use clap::{Parser, Subcommand, ValueEnum};
+use jiff::{SignedDuration, Timestamp};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -27,6 +28,16 @@ struct Cli {
     /// The Claude model, with `--model claude`.
     #[arg(long, default_value = DEFAULT_MODEL, global = true)]
     claude_model: String,
+    /// The model id, with `--model openai`.
+    #[arg(long, env = "OPENAI_MODEL", default_value = "", global = true)]
+    openai_model: String,
+    /// The base URL, with `--model openai`.
+    #[arg(long, env = "OPENAI_BASE_URL", default_value = OPENAI_BASE_URL, global = true)]
+    base_url: String,
+    /// The environment variable of the key, with `--model openai`. The
+    /// default is the variable of a known host.
+    #[arg(long, global = true)]
+    api_key_env: Option<String>,
     /// The most tokens of the mesh in one day.
     #[arg(long, default_value_t = 200_000, global = true)]
     daily_tokens: u64,
@@ -40,6 +51,9 @@ enum ModelKind {
     Scripted,
     /// Claude over the Messages API. Set `ANTHROPIC_API_KEY`.
     Claude,
+    /// A model behind an OpenAI-compatible API, at `--base-url`. Reads
+    /// `OPENAI_API_KEY` when it is set.
+    Openai,
 }
 
 #[derive(Debug, Subcommand)]
@@ -81,12 +95,19 @@ enum Command {
 
 /// The desk clock: the wall clock, moved on by each `tick`. It never runs
 /// back, so a timer that a tick fired stays fired.
-fn now(desk: &Desk) -> DateTime<Utc> {
+fn now(desk: &Desk) -> Timestamp {
     let offset = std::fs::read_to_string(desk.root().join("clock.txt"))
         .ok()
         .and_then(|text| text.trim().parse::<i64>().ok())
         .unwrap_or(0);
-    Utc::now() + Duration::minutes(offset)
+    moved_clock(Timestamp::now(), offset)
+}
+
+/// Moves `base` on by `offset_mins` minutes. A far offset saturates, so the
+/// desk stays usable.
+fn moved_clock(base: Timestamp, offset_mins: i64) -> Timestamp {
+    autumn_harvest::time::checked_add_chrono_range(base, SignedDuration::from_mins(offset_mins))
+        .unwrap_or(Timestamp::MAX)
 }
 
 fn move_clock(desk: &Desk, minutes: i64) -> std::io::Result<()> {
@@ -104,7 +125,22 @@ fn model(cli: &Cli) -> Result<Arc<dyn AgentModel>, Error> {
         ModelKind::Claude => {
             let key = std::env::var("ANTHROPIC_API_KEY")
                 .map_err(|_| "set ANTHROPIC_API_KEY to use --model claude")?;
-            Arc::new(ClaudeModel::new(key).model(&cli.claude_model))
+            Arc::new(
+                ClaudeModel::new(&key)
+                    .map_err(|e| format!("ANTHROPIC_API_KEY: {}", e.message()))?
+                    .model(&cli.claude_model),
+            )
+        }
+        ModelKind::Openai => {
+            if cli.openai_model.trim().is_empty() {
+                return Err("set --openai-model or OPENAI_MODEL to use --model openai".into());
+            }
+            let model = cli.openai_model.trim();
+            let built = cli.api_key_env.as_ref().map_or_else(
+                || OpenAiModel::with_env_key(&cli.base_url, model),
+                |var| OpenAiModel::with_key_from(&cli.base_url, model, var),
+            );
+            Arc::new(built.map_err(|e| format!("--model openai: {}", e.message()))?)
         }
     })
 }
@@ -264,5 +300,17 @@ async fn main() -> std::process::ExitCode {
             eprintln!("error: {err}");
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_far_desk_clock_offset_saturates() {
+        let base = Timestamp::constant(1_700_000_000, 0);
+        assert_eq!(moved_clock(base, 5_000_000_000), Timestamp::MAX);
+        assert_eq!(moved_clock(base, 60), base + SignedDuration::from_hours(1));
     }
 }

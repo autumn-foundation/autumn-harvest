@@ -10,7 +10,7 @@ use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::executor::{WorkflowOutcome, run_workflow};
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
@@ -167,7 +167,7 @@ async fn fan_out_raw_three_parallel_all_succeed() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -235,7 +235,7 @@ async fn fan_out_raw_fail_fast_on_first_failure() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -305,7 +305,7 @@ async fn fan_out_collect_all_returns_per_slot_results() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -381,7 +381,7 @@ async fn fan_out_empty_activities_returns_empty_vec() {
 
     let history = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -410,7 +410,7 @@ async fn fan_out_raw_live_execution_emits_marker_and_schedule_commands() {
     // Only WorkflowStarted — no activity history, no marker
     let history = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -463,7 +463,7 @@ async fn fan_out_count_mismatch_returns_non_deterministic_error() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -531,7 +531,7 @@ async fn fan_out_dynamic_from_prior_activity_replays_correctly() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -607,7 +607,7 @@ async fn fan_out_cancelled_workflow_returns_cancelled_error() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -671,7 +671,7 @@ async fn fan_out_typed_single_activity_type_replays_correctly() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -748,7 +748,7 @@ async fn fan_out_typed_collect_all_returns_per_slot_results() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -837,7 +837,7 @@ async fn fan_out_two_groups_in_same_workflow() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -954,10 +954,9 @@ fn windowed_collect_handler<'a>(
     })
 }
 
-/// Drive a workflow through repeated `run_workflow` cycles, feeding each
-/// suspension's `ScheduleActivity` commands back as recorded
-/// `ActivityScheduled` + `ActivityCompleted`/`ActivityFailed` events until the
-/// workflow reaches a terminal outcome.
+/// Drive a workflow through repeated `run_workflow` cycles until it reaches a
+/// terminal outcome. Each suspension's `ScheduleActivity` commands come back as
+/// recorded `ActivityScheduled` + `ActivityCompleted`/`ActivityFailed` events.
 ///
 /// `output_fn(name, input) -> Ok(output) | Err(error)` decides each activity's
 /// recorded result. Returns `(outcome, max_scheduled_per_suspension,
@@ -973,7 +972,7 @@ where
     let exec_id = ExecutionId::new();
     let mut history = vec![WorkflowEvent::WorkflowStarted {
         input: input.clone(),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -1039,15 +1038,15 @@ where
     panic!("windowed fan-out drive did not terminate within 1000 cycles");
 }
 
-/// AC2 (first wave): W=2 over 5 inputs — a single `run_workflow` cycle from a
-/// bare `WorkflowStarted` suspends with exactly 2 `ScheduleActivity` and a
+/// AC2 (first wave): W=2 over 5 inputs. One `run_workflow` cycle from a bare
+/// `WorkflowStarted` suspends with exactly 2 `ScheduleActivity` and a
 /// `fan_out:` marker recording N=5 (never W).
 #[tokio::test]
 async fn windowed_fan_out_first_wave_schedules_at_most_window() {
     let exec_id = ExecutionId::new();
     let history = vec![WorkflowEvent::WorkflowStarted {
         input: json!({ "n": 5, "w": 2 }),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -1166,7 +1165,7 @@ async fn windowed_window_ge_count_identical_history_to_unbounded() {
     let started = |input: Value| {
         vec![WorkflowEvent::WorkflowStarted {
             input,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1371,7 +1370,7 @@ async fn windowed_fan_out_empty_records_marker_and_returns_empty() {
     let exec_id = ExecutionId::new();
     let history = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -1408,7 +1407,7 @@ async fn windowed_fan_out_count_mismatch_non_deterministic() {
     let mut history = vec![
         WorkflowEvent::WorkflowStarted {
             input: json!({ "n": 2, "w": 2 }),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1460,7 +1459,7 @@ async fn windowed_fan_out_cancellation_returns_cancelled() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: json!({ "n": 3, "w": 2 }),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1491,8 +1490,8 @@ async fn windowed_fan_out_cancellation_returns_cancelled() {
 /// `WorkflowStarted`) through repeated `run_workflow` cycles until it reaches a
 /// terminal outcome. Unlike [`drive_windowed`], this also feeds back
 /// `WaitForActivity` commands by completing the referenced (already-scheduled)
-/// activity — so it can drive a fan-out that resumed an in-flight prefix under
-/// a changed window all the way to completion. Returns the terminal outcome.
+/// activity. So it can drive to completion a fan-out that resumed an in-flight
+/// prefix under a changed window. Returns the terminal outcome.
 async fn drive_windowed_from<F>(
     exec_id: ExecutionId,
     mut history: Vec<WorkflowEvent>,
@@ -1593,15 +1592,15 @@ where
     panic!("windowed fan-out resume drive did not terminate within 1000 cycles");
 }
 
-/// FINDING 1 (determinism-critical): a fan-out whose window is **increased**
+/// Determinism-critical: a fan-out whose window is **increased**
 /// across a partial suspension must **resume the already-scheduled in-flight
-/// prefix as a homogeneous batch** — never regroup an in-flight slot together
-/// with never-scheduled fresh slots into a mixed
-/// `[WaitForActivity + ScheduleActivity]` suspension batch. (Before issue #950
-/// the worker's `handle_suspended_workflow` could not persist that batch at all
-/// and terminally FAILED the run; it is persistable now, but the regrouping
-/// would still change the recorded command order across a window change, which
-/// is the determinism property this test pins.)
+/// prefix as a homogeneous batch**. It never regroups an in-flight slot with
+/// never-scheduled fresh slots into a mixed
+/// `[WaitForActivity + ScheduleActivity]` suspension batch. (Before issue #950,
+/// the worker's `handle_suspended_workflow` could not persist that batch and
+/// terminally FAILED the run. It is persistable now. But the regrouping would
+/// still change the recorded command order across a window change. This test
+/// pins that determinism property.)
 ///
 /// Recorded under `W1=1` (only slot 0 scheduled, still in-flight); re-driven
 /// under `W2=3`.
@@ -1615,7 +1614,7 @@ async fn windowed_fan_out_resumes_under_increased_window() {
     let partial = vec![
         WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1702,9 +1701,9 @@ async fn windowed_fan_out_resumes_under_increased_window() {
         other => panic!("expected Suspended, got {other:?}"),
     }
 
-    // Full drive to completion FROM the partial (pre-completion) history — this
+    // Full drive to completion FROM the partial (pre-completion) history. This
     // exercises the WaitForActivity resume path end-to-end across the window
-    // change — must yield byte-identical, input-order results to an unbounded
+    // change. It must yield byte-identical, input-order results to an unbounded
     // fan-out over the same 3 inputs.
     let out_fn = |_name: &str, input: &Value| Ok(json!(format!("done_{input}")));
     let windowed_out =
@@ -1731,11 +1730,12 @@ async fn windowed_fan_out_resumes_under_increased_window() {
     );
 }
 
-/// FINDING 1 (decrease direction): a fan-out re-driven under a **decreased**
-/// window must still resume the ENTIRE already-scheduled in-flight prefix (up
-/// to the old, larger window) as one homogeneous all-`WaitForActivity` batch —
-/// already-dispatched work cannot be un-dispatched, so the resume batch waits
-/// on all of it. Recorded under `W1=4` (all 4 scheduled, all in-flight);
+/// Decrease direction: a fan-out re-driven under a **decreased** window must
+/// still resume the ENTIRE already-scheduled in-flight prefix. That prefix
+/// reaches the old, larger window. It resumes as one homogeneous
+/// all-`WaitForActivity` batch.
+/// Dispatched work cannot be un-dispatched, so the resume batch waits on all of
+/// it. Recorded under `W1=4` (all 4 scheduled, all in-flight);
 /// re-driven under `W2=2`.
 #[tokio::test]
 async fn windowed_fan_out_resumes_under_decreased_window() {
@@ -1745,7 +1745,7 @@ async fn windowed_fan_out_resumes_under_decreased_window() {
     let mut partial = vec![
         WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1766,8 +1766,8 @@ async fn windowed_fan_out_resumes_under_decreased_window() {
     }
 
     // Cycle 1 under the DECREASED window: phase 1 resumes the whole scheduled
-    // prefix (all 4), emitting an all-`WaitForActivity` batch — never a mixed
-    // batch, never a partial 2-of-4 resume.
+    // prefix (all 4) as an all-`WaitForActivity` batch. It never emits a mixed
+    // batch or a partial 2-of-4 resume.
     let outcome = run_workflow(
         exec_id,
         partial.clone(),
@@ -1829,7 +1829,7 @@ where
     let mut history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -1894,10 +1894,10 @@ fn windowed_test_activity_info(name: &'static str) -> autumn_harvest::info::Acti
     }
 }
 
-/// MAJOR-1: typed windowed collect-all (`execute_activity_fan_out_collect_windowed`)
-/// over N=3 > W=2 where slot 1 fails — the `Vec<Result<i64, String>>` carries
+/// Typed windowed collect-all (`execute_activity_fan_out_collect_windowed`)
+/// over N=3 > W=2 where slot 1 fails. The `Vec<Result<i64, String>>` carries
 /// correctly-deserialized `Ok(typed)` slots and the `Err(String)` slot in input
-/// order. (This method had ZERO coverage before.)
+/// order.
 #[tokio::test]
 async fn windowed_typed_collect_returns_typed_ok_and_err_slots_in_order() {
     let info = windowed_test_activity_info("dbl");
@@ -1926,9 +1926,9 @@ async fn windowed_typed_collect_returns_typed_ok_and_err_slots_in_order() {
     assert_eq!(results[2], Ok(20), "slot 2 typed output");
 }
 
-/// MAJOR-1: typed windowed collect-all where a SUCCESSFUL slot returns JSON that
-/// cannot deserialize into `O` — the outer `Result` fails with
-/// `HarvestError::Serialization` (the per-slot `Ok` is not swallowed).
+/// Typed windowed collect-all where a SUCCESSFUL slot returns JSON that cannot
+/// deserialize into `O`. The outer `Result` fails with
+/// `HarvestError::Serialization`; the per-slot `Ok` is not swallowed.
 #[tokio::test]
 async fn windowed_typed_collect_surfaces_deserialization_error() {
     use autumn_harvest::error::HarvestError;
@@ -1952,7 +1952,7 @@ async fn windowed_typed_collect_surfaces_deserialization_error() {
     );
 }
 
-/// MINOR: mid-multi-wave cancellation — a fan-out whose reconstructed context is
+/// Mid-multi-wave cancellation — a fan-out whose reconstructed context is
 /// cancelled after wave 1 completed short-circuits at the top before dispatching
 /// wave 2. The run fails with a cancellation (never `Suspended` with fresh
 /// `ScheduleActivity` commands for wave 2).
@@ -1965,7 +1965,7 @@ async fn windowed_fan_out_mid_wave_cancellation_does_not_dispatch_next_wave() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -2013,9 +2013,9 @@ async fn windowed_fan_out_mid_wave_cancellation_does_not_dispatch_next_wave() {
     }
 }
 
-/// MINOR: collect-all where an ENTIRE wave fails — W=2, N=4, both slot 0 and
-/// slot 1 fail — the next wave is still dispatched and all 4 inputs processed
-/// (results `[Err, Err, Ok, Ok]`).
+/// Collect-all where an ENTIRE wave fails: W=2, N=4, and slots 0 and 1 fail.
+/// The next wave is still dispatched and all 4 inputs are processed (results
+/// `[Err, Err, Ok, Ok]`).
 #[tokio::test]
 async fn windowed_collect_all_whole_wave_failure_still_dispatches_next_wave() {
     let (outcome, _max, total, _history) = drive_windowed(
@@ -2049,7 +2049,7 @@ async fn windowed_collect_all_whole_wave_failure_still_dispatches_next_wave() {
     }
 }
 
-/// MINOR: the windowed TYPED methods reject `is_local = true` activities with
+/// The windowed TYPED methods reject `is_local = true` activities with
 /// `HarvestError::Config`, mirroring the unbounded typed methods.
 #[tokio::test]
 async fn windowed_typed_methods_reject_local_activities() {
@@ -2063,7 +2063,7 @@ async fn windowed_typed_methods_reject_local_activities() {
         exec_id,
         vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,

@@ -68,7 +68,8 @@ pub struct ToolContext {
     pub step: u32,
     /// The workspace of the run, for a tool that opts in with
     /// [`Tool::uses_workspace`] (issue #2274). A change is saved after the
-    /// call, when the call succeeds.
+    /// call, when the call succeeds. A read-only run saves nothing, so a call
+    /// that changes the workspace there returns an error (issue #2692).
     pub workspace: Option<WorkspaceHandle>,
 }
 

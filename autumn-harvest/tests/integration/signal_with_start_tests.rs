@@ -1,8 +1,8 @@
 //! Tests for `signal_with_start` core API (issue #244).
 //!
-//! These tests cover the atomic start-or-attach + signal primitive and
-//! enumerate every reuse-policy × prior-state outcome documented in the
-//! issue's 4×5 matrix, plus the optional idempotency-key dedup.
+//! These tests cover the atomic start-or-attach + signal primitive. They
+//! enumerate every reuse-policy × prior-state outcome in the issue's 4×5
+//! matrix, plus the optional idempotency-key dedup.
 
 #![cfg(feature = "db")]
 
@@ -18,6 +18,7 @@ use autumn_harvest::store;
 use autumn_harvest::types::{ExecutionId, WorkflowIdReusePolicy};
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::RunQueryDsl;
+use jiff_diesel::ToDiesel;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -103,7 +104,7 @@ async fn force_state(
     diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
         .set((
             dsl::state.eq(state),
-            dsl::completed_at.eq(Some(chrono::Utc::now())),
+            dsl::completed_at.eq(Some(jiff::Timestamp::now()).to_diesel()),
         ))
         .execute(conn)
         .await
@@ -136,7 +137,7 @@ async fn signal_with_start_starts_fresh_when_no_prior_execution_exists() {
     assert_eq!(out.exec_id, exec_id, "returns the new exec id");
     assert_eq!(out.state, "RUNNING");
 
-    let signals = load_pending_signals(&mut conn, exec_id).await.unwrap();
+    let signals = load_pending_signals(&conn, exec_id).await.unwrap();
     assert_eq!(signals.len(), 1, "one signal queued");
     assert_eq!(signals[0].signal_name, "webhook");
 }
@@ -157,16 +158,15 @@ async fn signal_with_start_appends_signal_to_history_before_first_dispatch() {
         .await
         .unwrap();
 
-    // The fresh-start path must record the signal as a pending row that the
-    // worker's `ingest_pending_signals` will turn into a `SignalReceived`
-    // event before invoking the workflow function. Two equivalent guarantees
-    // satisfy this: either the signal is already in `harvest_events` as a
-    // `SignalReceived` variant, OR it lives in `harvest_signals` waiting for
-    // the worker's first tick to ingest. Either is observable on the first
-    // dispatch — i.e., before any other event is produced — so we check
-    // that *one* of the two is true.
+    // The fresh-start path records the signal as a pending row. The worker's
+    // `ingest_pending_signals` turns it into a `SignalReceived` event before it
+    // invokes the workflow function. Either of two states satisfies this. The
+    // signal is already a `SignalReceived` event in `harvest_events`, OR it
+    // waits in `harvest_signals` for the worker's first tick. Both are
+    // observable on the first dispatch, before any other event. So the test
+    // checks that *one* of the two holds.
     let history = store::load_history(&mut conn, exec_id).await.unwrap();
-    let signals = load_pending_signals(&mut conn, exec_id).await.unwrap();
+    let signals = load_pending_signals(&conn, exec_id).await.unwrap();
     let in_history = history
         .events
         .iter()
@@ -226,16 +226,16 @@ async fn allow_duplicate_signals_running_execution_and_returns_existing_id() {
     assert!(out.signal_delivered);
     assert_eq!(out.exec_id, first);
 
-    let signals = load_pending_signals(&mut conn, first).await.unwrap();
+    let signals = load_pending_signals(&conn, first).await.unwrap();
     assert_eq!(signals.len(), 2, "seed + new signal both queued");
 }
 
 #[tokio::test]
 async fn allow_duplicate_attaches_to_paused_prior_and_buffers_signal() {
     // Issue #383: PAUSED is a non-terminal active state. A signal-with-start
-    // against a paused run must attach and buffer the signal for delivery on
-    // resume — it must NOT escalate to TerminateIfRunning and cancel/replace the
-    // run an operator deliberately paused.
+    // against a paused run attaches and buffers the signal for delivery on
+    // resume. It must NOT escalate to TerminateIfRunning and cancel or replace
+    // a run that an operator deliberately paused.
     let (mut conn, _container) = setup_test_db().await;
     let first = seed_running(&mut conn, "wf", "id-paused").await;
     force_state(&mut conn, first, "PAUSED").await;
@@ -272,7 +272,7 @@ async fn allow_duplicate_attaches_to_paused_prior_and_buffers_signal() {
         .unwrap();
     assert_eq!(state, "PAUSED", "the paused execution must not be sealed");
 
-    let signals = load_pending_signals(&mut conn, first).await.unwrap();
+    let signals = load_pending_signals(&conn, first).await.unwrap();
     assert_eq!(signals.len(), 2, "seed + buffered signal both queued");
 }
 
@@ -304,7 +304,7 @@ async fn allow_duplicate_with_completed_prior_starts_fresh_and_delivers_signal()
     assert_ne!(out.exec_id, first, "new exec id, not the COMPLETED prior");
     assert_eq!(out.exec_id, new_id);
 
-    let pending = load_pending_signals(&mut conn, new_id).await.unwrap();
+    let pending = load_pending_signals(&conn, new_id).await.unwrap();
     assert_eq!(pending.len(), 1, "exactly one signal queued on the new run");
 }
 
@@ -409,10 +409,10 @@ async fn terminate_if_running_cancels_then_starts_fresh_and_signals() {
     assert!(out.signal_delivered);
     assert_eq!(out.exec_id, new_id);
 
-    // Old execution should no longer be RUNNING. TerminateIfRunning cancels
-    // the prior row in a separate transaction; the start transaction's
-    // `replace_execution` then seals the now-CANCELLED row as
-    // `CONTINUED_AS_NEW` so the partial unique index lets the new run land.
+    // The old execution is no longer RUNNING. TerminateIfRunning cancels the
+    // prior row in a separate transaction. The start transaction's
+    // `replace_execution` then seals the CANCELLED row as `CONTINUED_AS_NEW`,
+    // so the partial unique index lets the new run land.
     let state: String = dsl::harvest_workflow_executions
         .find(first.as_uuid())
         .select(dsl::state)
@@ -469,7 +469,7 @@ async fn idempotency_key_dedupes_signal_within_the_same_execution() {
     );
     assert_eq!(out2.exec_id, out1.exec_id);
 
-    let signals = load_pending_signals(&mut conn, out1.exec_id).await.unwrap();
+    let signals = load_pending_signals(&conn, out1.exec_id).await.unwrap();
     assert_eq!(signals.len(), 1, "exactly one signal row");
 }
 
@@ -506,7 +506,7 @@ async fn different_idempotency_keys_deliver_independent_signals() {
     assert!(out2.signal_delivered);
     assert_eq!(out2.exec_id, out1.exec_id);
 
-    let signals = load_pending_signals(&mut conn, out1.exec_id).await.unwrap();
+    let signals = load_pending_signals(&conn, out1.exec_id).await.unwrap();
     assert_eq!(signals.len(), 2, "both unique keys delivered");
 }
 
@@ -545,9 +545,9 @@ async fn outcome_struct_distinguishes_started_vs_attached() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Input schema validation (issue #373) — only on a genuine fresh start
-// (issue #918 review: it used to run unconditionally, pre-lock, in the HTTP
-// handler, and could reject a signal to an already-running execution whenever
-// the signal payload didn't match the *start*-input schema).
+// (issue #918). It used to run unconditionally, pre-lock, in the HTTP
+// handler. It could then reject a signal to an already-running execution
+// whenever the signal payload did not match the *start*-input schema.
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn dummy_handler(

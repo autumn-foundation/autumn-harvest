@@ -1,8 +1,8 @@
 //! Shared harness for the end-to-end benchmark suite (issue #941).
 //!
-//! Harvest publishes two performance artifacts today: the replay CPU budget
-//! (#135, a 10 000-event history under 200 ms) and the task-claim
-//! microbenchmark with its p50 CI gate (#786). Neither answers the first
+//! Harvest publishes two other performance artifacts. The replay CPU budget
+//! (#135) holds a 10 000-event history under 200 ms. The task-claim
+//! microbenchmark (#786) has a p50 CI gate. Neither answers the first
 //! question an evaluating architect asks — *how many workflows per second, end
 //! to end, and at what latency?* This harness produces that answer, and
 //! `docs/benchmarks.md` publishes it.
@@ -29,31 +29,29 @@
 //!
 //! * **Warmup.** Every database scenario drains a discarded warmup batch before
 //!   the measured window opens ([`warmup_batch_for`]). The dispatch scenario
-//!   additionally discards the leading tenth of its samples
-//!   ([`measured_samples`]); the signal scenario instead signals a whole
-//!   separate warmup cohort through the identical path and keeps none of it, so
-//!   "no warmup sample reaches the published percentiles" is true by
-//!   construction there rather than by trimming a fraction off the front.
-//! * **Soundness before headlines.** A scenario that collected too few samples,
-//!   failed to drain, or left a shard idle reports `n/a` and a named reason
-//!   rather than a confident-looking number ([`latency_soundness`],
-//!   [`throughput_soundness`]).
+//!   also discards the leading tenth of its samples ([`measured_samples`]).
+//!   The signal scenario instead signals a separate warmup cohort through the
+//!   identical path and keeps none of it. There, no warmup sample reaches the
+//!   published percentiles by construction, not by trimming.
+//! * **Soundness before headlines.** A scenario with too few samples, an
+//!   incomplete drain or an idle shard reports `n/a` and a named reason
+//!   ([`latency_soundness`], [`throughput_soundness`]).
 //! * **Load is bounded, per scenario, on purpose.** `throughput` runs a
-//!   *bounded closed loop*: a fixed population is held in flight and topped up
-//!   as runs complete, so queue depth stays shallow and the rate is sustained
-//!   rather than a slice of a draining backlog. (A pre-loaded backlog measures
-//!   the claim-depth curve, which is issue #786's finding, not this suite's —
-//!   see §5 of `docs/plans/2026-09-01-e2e-benchmark-suite.md` for the
-//!   measurement that forced the change.) [`inflight_soundness`] refuses to
-//!   publish a run in which the harness, not the engine, was the limiter.
-//!   `dispatch_latency` and `signal_roundtrip` are paced *below* saturation, and
-//!   [`pacing_verdict`] marks a run that could not hold its pace, so a queueing
-//!   measurement can never be published as a dispatch measurement.
+//!   *bounded closed loop*. A fixed population stays in flight and is topped
+//!   up as runs complete. So queue depth stays shallow, and the rate is
+//!   sustained, not a slice of a draining backlog. A pre-loaded backlog
+//!   measures the claim-depth curve, which is the finding of issue #786. §5 of
+//!   `docs/plans/2026-09-01-e2e-benchmark-suite.md` has the measurement that
+//!   forced the change. [`inflight_soundness`] refuses to publish a run in
+//!   which the harness, not the engine, was the limiter.
+//!   `dispatch_latency` and `signal_roundtrip` are paced *below* saturation.
+//!   [`pacing_verdict`] marks a run that could not hold its pace. So a
+//!   queueing measurement is never published as a dispatch measurement.
 //! * **Clocks.** The signal round-trip is measured end to end on one monotonic
-//!   `Instant` clock inside a single process. Activity dispatch spans a DB clock
-//!   (`harvest_task_queue.created_at`) and the host clock, so the harness
-//!   *measures* the host-to-database offset and publishes it as an error term
-//!   instead of assuming it away.
+//!   `Instant` clock inside a single process. Activity dispatch spans a DB
+//!   clock (`harvest_task_queue.created_at`) and the host clock. So the
+//!   harness *measures* the host-to-database offset and publishes it as an
+//!   error term.
 
 #![allow(dead_code)]
 
@@ -64,7 +62,7 @@ use std::time::Duration;
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
@@ -88,7 +86,24 @@ pub enum BenchScenario {
     /// Replay throughput over the #135 history. Shard-invariant by
     /// construction, so it doubles as the run's noise control.
     ReplayThroughput,
+    /// The highest offered start rate a shard sustains, under an open loop.
+    ///
+    /// Opt-in. It is not part of the published matrix, see
+    /// [`BenchScenario::capacity`].
+    Capacity(CapacityArm),
 }
+
+/// The workflow shape of one capacity arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityArm {
+    /// A workflow with zero activities.
+    Noop,
+    /// The canonical 3-activity workflow.
+    Canonical,
+}
+
+/// Filter alias that selects every capacity arm.
+pub const CAPACITY_FILTER_ALIAS: &str = "capacity";
 
 /// Shard counts every scenario is run at (issue #941 AC2).
 pub const SHARD_COUNTS: [u32; 3] = [1, 2, 4];
@@ -97,12 +112,12 @@ pub const SHARD_COUNTS: [u32; 3] = [1, 2, 4];
 /// `docs/benchmarks/results-v<version>.md` the docs guard checks.
 ///
 /// Deliberately **not** `CARGO_PKG_VERSION`. Issue #941 AC4 asks that each
-/// release's numbers be *kept*, not that every release have fresh ones — and a
-/// benchmark sweep is a 20-40 minute run on a reference box, not something a
-/// version bump can conjure. Tying the guard to the crate version would fail CI
-/// on every bump until somebody re-measured. Bump this constant in the same
-/// commit that adds a new results file and updates the baselines below; see
-/// "Publishing a new release's numbers" in `docs/benchmarks.md`.
+/// release's numbers be *kept*, not that every release have fresh ones.
+/// A benchmark sweep is a 20-40 minute run on a reference box. Tying the guard
+/// to the crate version would fail CI on every bump until somebody re-measured.
+/// Bump this constant in the commit that adds a new results file and updates
+/// the baselines below. See "Publishing a new release's numbers" in
+/// `docs/benchmarks.md`.
 pub const PUBLISHED_RESULTS_VERSION: &str = "0.8.0";
 
 /// Published reproduction tolerance (issue #941 AC3): a fresh clone on the
@@ -129,8 +144,7 @@ pub const SAMPLE_WARMUP_DIVISOR: usize = 10;
 pub const PACING_HOLD_RATIO: f64 = 0.90;
 
 /// The closed-loop throughput scenario must hold at least this fraction of its
-/// in-flight target on average; below it the harness, not the engine, is the
-/// limiter.
+/// in-flight target on average. Below it, the harness is the limiter.
 pub const INFLIGHT_HOLD_RATIO: f64 = 0.90;
 
 /// Activities in the replay history. `2n + 1` events, so 5 000 activities is
@@ -143,6 +157,9 @@ pub const REPLAY_EVENT_COUNT: usize = 2 * REPLAY_ACTIVITY_COUNT + 1;
 
 /// Workflow type name used by every database scenario.
 pub const BENCH_WORKFLOW: &str = "harvest_e2e_bench_wf";
+
+/// The zero-activity workflow of the `capacity_noop` arm.
+pub const BENCH_NOOP_WORKFLOW: &str = "harvest_e2e_bench_noop_wf";
 
 /// The workflow the signal scenario parks on `wait_for_signal`.
 pub const BENCH_SIGNAL_WORKFLOW: &str = "harvest_e2e_bench_signal_wf";
@@ -247,8 +264,8 @@ pub const SCENARIO_FILTER_ENV_VAR: &str = "HARVEST_BENCH_SCENARIOS";
 /// Override the closed-loop in-flight population per shard.
 ///
 /// The load level *is* the experiment for a closed-loop throughput measurement
-/// (throughput = concurrency / latency), so it is a documented knob rather than
-/// a buried constant: a reader can re-run at their own load level and see where
+/// (throughput = concurrency / latency). So it is a documented knob, not a
+/// buried constant. A reader can re-run at their own load level and see where
 /// their deployment saturates. The published numbers are taken at the default.
 pub const INFLIGHT_ENV_VAR: &str = "HARVEST_BENCH_INFLIGHT";
 
@@ -268,6 +285,17 @@ pub const CLAIM_LOOPS_ENV_VAR: &str = "HARVEST_BENCH_CLAIM_LOOPS";
 pub fn claim_loops_override(raw: Option<&str>) -> Option<usize> {
     raw.and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|v| *v > 0)
+}
+
+/// The most rows of one claim statement. Unset keeps one row per claim.
+pub const CLAIM_BATCH_ENV_VAR: &str = "HARVEST_BENCH_CLAIM_BATCH";
+
+/// The batch size that `raw` asks for, or `None` for one row per claim.
+#[must_use]
+pub fn claim_batch_override(raw: Option<&str>) -> Option<std::num::NonZeroU8> {
+    raw.and_then(|v| v.trim().parse::<u8>().ok())
+        .filter(|v| *v > 1)
+        .and_then(std::num::NonZeroU8::new)
 }
 
 /// Set to `1` to run the throughput scenario in owner mode (issue #2252).
@@ -488,9 +516,10 @@ pub fn stats_label(scenario: BenchScenario, shards: usize, shard: usize) -> Stri
 
 /// Parse a comma-separated scenario filter into the scenarios it selects.
 ///
-/// An empty or absent filter selects everything; an unrecognised id selects
-/// nothing *for that entry* and is reported by [`unknown_scenario_ids`], so a
-/// typo produces a named complaint rather than a silently empty run.
+/// An empty or absent filter selects the published matrix, [`BenchScenario::all`].
+/// A capacity arm runs only when a filter names it. An unknown id selects
+/// nothing for that entry. [`unknown_scenario_ids`] reports it, so a typo
+/// gives a named complaint and not a silently empty run.
 #[must_use]
 pub fn selected_scenarios(filter: Option<&str>) -> Vec<BenchScenario> {
     let Some(filter) = filter.map(str::trim).filter(|f| !f.is_empty()) else {
@@ -501,9 +530,9 @@ pub fn selected_scenarios(filter: Option<&str>) -> Vec<BenchScenario> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();
-    BenchScenario::all()
+    BenchScenario::known()
         .into_iter()
-        .filter(|s| wanted.contains(&s.as_str()))
+        .filter(|s| wanted.iter().any(|entry| s.matches_filter_entry(entry)))
         .collect()
 }
 
@@ -513,23 +542,26 @@ pub fn unknown_scenario_ids(filter: Option<&str>) -> Vec<String> {
     let Some(filter) = filter.map(str::trim).filter(|f| !f.is_empty()) else {
         return Vec::new();
     };
-    let known: Vec<&str> = BenchScenario::all().iter().map(|s| s.as_str()).collect();
     filter
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .filter(|s| !known.contains(s))
+        .filter(|s| {
+            !BenchScenario::known()
+                .iter()
+                .any(|known| known.matches_filter_entry(s))
+        })
         .map(str::to_owned)
         .collect()
 }
 
 /// Entries of a shard-count filter that name no published shard count.
 ///
-/// The counterpart of [`unknown_scenario_ids`]. Without it,
-/// `HARVEST_BENCH_SHARDS=1,3` silently runs only the 1-shard cells while
-/// appearing to have accepted the whole request, and `=3` runs nothing and then
-/// prints the unrelated "no Postgres" guidance -- a reproduction that looks
-/// like it succeeded and did not (Codex review, PR #1282).
+/// The counterpart of [`unknown_scenario_ids`] (PR #1282). Without it,
+/// `HARVEST_BENCH_SHARDS=1,3` silently runs only the 1-shard cells and appears
+/// to accept the whole request. `=3` runs nothing and then prints the
+/// unrelated "no Postgres" guidance. Such a reproduction looks like it
+/// succeeded and did not.
 #[must_use]
 pub fn unknown_shard_counts(filter: Option<&str>) -> Vec<String> {
     let Some(filter) = filter.map(str::trim).filter(|f| !f.is_empty()) else {
@@ -571,12 +603,14 @@ impl BenchScenario {
             Self::DispatchLatency => "dispatch_latency",
             Self::SignalRoundtrip => "signal_roundtrip",
             Self::ReplayThroughput => "replay_throughput",
+            Self::Capacity(CapacityArm::Noop) => "capacity_noop",
+            Self::Capacity(CapacityArm::Canonical) => "capacity_canonical",
         }
     }
 
-    /// Every scenario, in report order. Throughput leads because it is the
-    /// headline an evaluator reads first; replay trails because it is the
-    /// control rather than a claim about the engine's end-to-end capacity.
+    /// Every scenario, in report order. Throughput leads because an evaluator
+    /// reads it first. Replay trails because it is the control, not a claim
+    /// about the engine's end-to-end capacity.
     #[must_use]
     pub const fn all() -> [Self; 4] {
         [
@@ -585,6 +619,37 @@ impl BenchScenario {
             Self::SignalRoundtrip,
             Self::ReplayThroughput,
         ]
+    }
+
+    /// The opt-in capacity arms, in report order.
+    ///
+    /// They stay out of [`Self::all`]. A capacity ladder takes minutes per
+    /// cell, and it has no published baseline at every shard count.
+    #[must_use]
+    pub const fn capacity() -> [Self; 2] {
+        [
+            Self::Capacity(CapacityArm::Noop),
+            Self::Capacity(CapacityArm::Canonical),
+        ]
+    }
+
+    /// Every scenario a filter can name: the published matrix, then the
+    /// capacity arms.
+    #[must_use]
+    pub const fn known() -> [Self; 6] {
+        let [throughput, dispatch, signal, replay] = Self::all();
+        let [noop, canonical] = Self::capacity();
+        [throughput, dispatch, signal, replay, noop, canonical]
+    }
+
+    /// Whether a filter entry selects this scenario.
+    ///
+    /// An entry matches its own id. [`CAPACITY_FILTER_ALIAS`] also matches
+    /// each capacity arm.
+    #[must_use]
+    pub fn matches_filter_entry(self, entry: &str) -> bool {
+        entry == self.as_str()
+            || (entry == CAPACITY_FILTER_ALIAS && matches!(self, Self::Capacity(_)))
     }
 
     /// Whether the scenario needs a live Postgres. Replay is in-memory.
@@ -596,19 +661,21 @@ impl BenchScenario {
     /// Whether the scenario is paced at a fixed *rate*. `Throughput` is not:
     /// its load is bounded by population (a closed loop) rather than by rate,
     /// because the rate is the thing being measured. `ReplayThroughput` drives
-    /// no queue at all. Pacing the two latency scenarios is what keeps their
-    /// p99 a statement about the dispatch and signal paths rather than about
-    /// how deep the queue happened to be.
+    /// no queue at all. Pacing keeps the p99 of the two latency scenarios a
+    /// statement about the dispatch and signal paths, not about queue depth.
     #[must_use]
     pub const fn is_paced(self) -> bool {
-        matches!(self, Self::DispatchLatency | Self::SignalRoundtrip)
+        matches!(
+            self,
+            Self::DispatchLatency | Self::SignalRoundtrip | Self::Capacity(_)
+        )
     }
 }
 
 /// Size of the discarded warmup batch that runs before a measured batch.
 ///
-/// A fifth of the measured batch, but never zero for a non-empty one: the
-/// measured window must never be the window in which connection pools fill,
+/// A fifth of the measured batch, but never zero for a non-empty one. The
+/// measured window must not be the one in which connection pools fill,
 /// prepared statements are first planned and the worker's caches are cold.
 #[must_use]
 pub fn warmup_batch_for(measured: usize) -> usize {
@@ -621,10 +688,9 @@ pub fn warmup_batch_for(measured: usize) -> usize {
 /// Drop the leading tenth of a sample set as warmup, applied *after*
 /// collection so a run cut short still reports the samples it took.
 ///
-/// A set smaller than [`SAMPLE_WARMUP_DIVISOR`] survives intact: discarding
-/// every sample and then publishing a confident-looking `0.00 ms` is the
-/// failure this rule exists to prevent, and [`latency_soundness`] is what
-/// refuses to publish the thin set that results.
+/// A set smaller than [`SAMPLE_WARMUP_DIVISOR`] survives intact. This rule
+/// prevents a run that discards every sample and then publishes `0.00 ms`.
+/// [`latency_soundness`] refuses to publish the thin set that results.
 #[must_use]
 pub fn measured_samples(samples: &[f64]) -> &[f64] {
     let drop = samples.len() / SAMPLE_WARMUP_DIVISOR;
@@ -653,9 +719,9 @@ pub fn throughput_per_sec(completions: usize, window: Duration) -> Option<f64> {
 /// Three independent ways a percentile here can be a lie:
 ///
 /// * too few post-warmup samples to have a p99 at all;
-/// * **negative** samples, which only host-to-database clock skew can produce —
-///   reported rather than clamped to zero, because clamping would hide exactly
-///   the error term the reader needs (see the module docs on clocks);
+/// * **negative** samples, which only host-to-database clock skew can
+///   produce. They are reported, not clamped to zero. Clamping would hide the
+///   error term the reader needs (see the module docs on clocks);
 /// * task rows with a NULL `created_at` (the column is nullable for
 ///   pre-upgrade rows), which yield no sample and would otherwise silently
 ///   shrink the population.
@@ -690,10 +756,10 @@ pub fn latency_soundness(
 
 /// Reasons a throughput headline must not be published, empty when sound.
 ///
-/// A rate is only meaningful if the run actually drained what it was asked to
-/// drain, drained enough of it to be a rate rather than an anecdote, and used
-/// every shard it claims to be a number *for*. The last one is the guard
-/// against publishing a "4-shard" figure produced by two shards.
+/// A rate is meaningful only if the run drained what it was asked to drain.
+/// It must drain enough to be a rate, not an anecdote. It must also use every
+/// shard it claims to be a number *for*. The last rule stops a "4-shard"
+/// figure produced by two shards.
 #[must_use]
 pub fn throughput_soundness(
     requested: usize,
@@ -728,19 +794,18 @@ pub fn throughput_soundness(
 /// that a dispatch cell may publish through.
 ///
 /// The dispatch measurement is the one number here that spans two clocks. On a
-/// single host the offset is tens of microseconds against tens of milliseconds
-/// and this never binds; point the harness at a database on another machine and
-/// it is the whole ballgame. Refusing above 2% is what stops a 30 ms skew from
-/// being published as 30 ms of engine latency, with the offset printed
-/// helpfully in the notes beside it.
+/// single host the offset is tens of microseconds against tens of
+/// milliseconds, and this never binds. Against a database on another machine,
+/// the offset can dominate. The 2% cap stops a 30 ms skew from being
+/// published as 30 ms of engine latency. The notes print the offset beside it.
 pub const MAX_CLOCK_OFFSET_FRACTION_OF_P50: f64 = 0.02;
 
 /// Reasons a dispatch cell's two-clock measurement must not be published.
 ///
 /// Takes the offset probed *before* the measured window and the one probed
-/// after: a single probe cannot distinguish a steady offset (correctable in
-/// principle, and small enough to ignore in practice) from a drifting one
-/// (which contaminates the samples unevenly).
+/// after. A single probe cannot tell a steady offset from a drifting one. A
+/// steady offset is small enough to ignore in practice. A drifting one
+/// contaminates the samples unevenly.
 #[must_use]
 pub fn clock_offset_soundness(before: &[f64], after: &[f64], p50_ms: f64) -> Vec<String> {
     let mut reasons = Vec::new();
@@ -848,9 +913,9 @@ pub const REPLAY_CONTROL_DRIFT_PCT: f64 = 10.0;
 /// Peak-to-peak spread of the replay control across a sweep, in percent of the
 /// largest reading, or `None` when there is nothing to compare.
 ///
-/// This is the comparison that makes the control do its job: nothing else in
-/// the report looks at the three replay cells *against each other*, and each on
-/// its own always looks fine.
+/// This comparison makes the control do its job. Nothing else in the report
+/// compares the three replay cells *against each other*. Each one alone always
+/// looks fine.
 #[must_use]
 pub fn replay_control_drift_pct(readings: &[f64]) -> Option<f64> {
     if readings.len() < 2 {
@@ -873,8 +938,8 @@ pub enum Pacing {
 
 /// Compare an achieved start rate against the target it was paced at.
 ///
-/// A target of zero (or a non-finite one) is [`Pacing::Saturated`] rather than
-/// a division by zero: a scenario that paced at no rate at all held nothing.
+/// A zero or non-finite target is [`Pacing::Saturated`], not a division by
+/// zero. A scenario that paced at no rate held nothing.
 #[must_use]
 pub fn pacing_verdict(target_per_sec: f64, achieved_per_sec: f64) -> Pacing {
     if !target_per_sec.is_finite() || target_per_sec <= 0.0 || !achieved_per_sec.is_finite() {
@@ -889,11 +954,11 @@ pub fn pacing_verdict(target_per_sec: f64, achieved_per_sec: f64) -> Pacing {
 
 /// Whether a paced scenario held its target rate on **every** shard.
 ///
-/// An aggregate rate cannot answer this. A sender that drives shard 0 at four
-/// times the per-shard target while shards 1-3 idle, then moves on, achieves
-/// exactly the aggregate target and is nowhere near the intended load shape —
-/// so the percentiles it produces describe a saturated single shard rather than
-/// the unsaturated sweep the page claims. The weakest shard decides.
+/// An aggregate rate cannot answer this. A sender can drive shard 0 at four
+/// times the per-shard target while shards 1-3 idle, then move on. It achieves
+/// exactly the aggregate target, but not the intended load shape. Its
+/// percentiles describe a saturated single shard, not the unsaturated sweep the
+/// page claims. The weakest shard decides.
 #[must_use]
 pub fn per_shard_pacing_verdict(target_per_shard: f64, achieved_per_shard: &[f64]) -> Pacing {
     if achieved_per_shard.is_empty() {
@@ -946,12 +1011,11 @@ pub fn repro_verdict(measured: f64, baseline: f64, tolerance_pct: f64) -> ReproV
 /// on any common epoch.
 ///
 /// Takes the **middle half** of the drain: the rate between the 25th and 75th
-/// percentile completion. A whole-drain rate charges the measurement for the
-/// ramp-up (workers filling their concurrency slots) and the drain-down (the
-/// last few workflows finishing against an empty queue), neither of which is
-/// the sustained rate an operator sizes against. Returns `None` when the
-/// population is too thin to have a middle half or when that half took no
-/// measurable time.
+/// percentile completion. A whole-drain rate includes the ramp-up, while
+/// workers fill their concurrency slots. It also includes the drain-down, as
+/// the last workflows finish against an empty queue. Neither is the sustained
+/// rate an operator sizes against. Returns `None` when the population is too
+/// thin to have a middle half or when that half took no measurable time.
 #[must_use]
 pub fn steady_state_throughput(sorted_completion_secs: &[f64]) -> Option<f64> {
     let (lo, hi) = steady_state_window(sorted_completion_secs)?;
@@ -969,8 +1033,8 @@ pub fn steady_state_throughput(sorted_completion_secs: &[f64]) -> Option<f64> {
 /// [`steady_state_throughput`] measures over, in the same units as its input.
 ///
 /// Exposed so a runner can assert that seeding finished *before* the measured
-/// window opened: a window that overlaps seeding is measuring how fast the
-/// harness can insert rows, not how fast the engine drains them.
+/// window opened. A window that overlaps seeding measures how fast the harness
+/// inserts rows, not how fast the engine drains them.
 #[must_use]
 pub fn steady_state_window(sorted_completion_secs: &[f64]) -> Option<(f64, f64)> {
     let n = sorted_completion_secs.len();
@@ -1008,11 +1072,11 @@ pub fn mean_inflight(samples: &[usize]) -> Option<f64> {
 /// Reasons a closed-loop throughput figure is feeder-bound on **any** shard.
 ///
 /// The per-shard form of [`inflight_soundness`], and the same lesson the
-/// pacing gate learned one review round earlier (Codex, PR #1282): a mean over
-/// every shard's samples lets well-fed shards hide a starved one. Four shards
-/// at 32, 32, 32 and 28 average 31 against a floor of 28.8 and pass — while the
-/// shard that missed its target is the one bounding the aggregate rate the cell
-/// publishes. Each shard is judged against the target it was actually given.
+/// pacing gate learned earlier in PR #1282. A mean over every shard's samples
+/// lets well-fed shards hide a starved one. Four shards at 32, 32, 32 and 28
+/// average 31 against a floor of 28.8 and pass. But the shard that missed its
+/// target bounds the aggregate rate the cell publishes. Each shard is judged
+/// against the target it was actually given.
 #[must_use]
 pub fn per_shard_inflight_soundness(target: usize, per_shard_means: &[Option<f64>]) -> Vec<String> {
     if per_shard_means.is_empty() {
@@ -1030,10 +1094,10 @@ pub fn per_shard_inflight_soundness(target: usize, per_shard_means: &[Option<f64
 /// The middle half of an ordered observation series.
 ///
 /// The in-flight evidence must describe the same window the headline rate is
-/// computed over ([`steady_state_window`]). Averaging the whole loop instead
+/// computed over ([`steady_state_window`]). An average over the whole loop
 /// includes the drain-down tail, where the population decays to zero by
-/// construction — which both flatters nothing and, on a short run, fires
-/// [`inflight_soundness`] against a perfectly sound measurement.
+/// construction. On a short run, that tail fires [`inflight_soundness`]
+/// against a sound measurement.
 #[must_use]
 pub fn steady_state_slice<T>(samples: &[T]) -> &[T] {
     let n = samples.len();
@@ -1047,11 +1111,11 @@ pub fn steady_state_slice<T>(samples: &[T]) -> &[T] {
 /// engine-bound, empty when it is engine-bound.
 ///
 /// The throughput scenario holds a fixed number of workflows in flight and
-/// tops the population back up as runs complete. That only measures the engine
-/// while the harness can actually keep the target populated: if the feeder
-/// falls behind, the published rate is "how fast this harness starts
-/// workflows", which is not a fact about Harvest. The observed mean in-flight
-/// population is the evidence, and it is published next to the number.
+/// tops the population back up as runs complete. That measures the engine only
+/// while the harness keeps the target populated. If the feeder falls behind,
+/// the published rate is "how fast this harness starts workflows", which is
+/// not a fact about Harvest. The observed mean in-flight population is the
+/// evidence, and it is published next to the number.
 #[must_use]
 pub fn inflight_soundness(target: usize, mean: Option<f64>) -> Vec<String> {
     let Some(mean) = mean else {
@@ -1070,6 +1134,96 @@ pub fn inflight_soundness(target: usize, mean: Option<f64>) -> Vec<String> {
         )];
     }
     Vec::new()
+}
+
+// ── Host layout (pure) ─────────────────────────────────────────────────────
+
+/// Where a cell's shard databases run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostLayout {
+    /// Shards in the cell.
+    pub shards: usize,
+    /// Distinct database hosts, sorted.
+    pub hosts: Vec<String>,
+    /// Whether a database host is the bench host itself.
+    pub loopback: bool,
+}
+
+impl HostLayout {
+    /// Whether two or more shards share one database host.
+    #[must_use]
+    pub const fn shares_a_host(&self) -> bool {
+        self.hosts.len() < self.shards
+    }
+
+    /// The host-layout note a cell prints.
+    #[must_use]
+    pub fn note(&self) -> String {
+        let mut note = format!(
+            "host layout: {} shard(s) on {} database host(s) ({})",
+            self.shards,
+            self.hosts.len(),
+            self.hosts.join(", "),
+        );
+        if self.loopback {
+            note.push_str("; a database shares the bench host with the workers and the generator");
+        }
+        if self.shares_a_host() {
+            note.push_str("; the shards share a host, so this cell is not a scaling result");
+        }
+        note
+    }
+}
+
+/// The lowercase host of a Postgres URL. A URL with no host is a local
+/// socket and reads as `localhost`.
+#[must_use]
+pub fn database_host(url: &str) -> String {
+    let rest = url.split_once("://").map_or("", |(_, rest)| rest);
+    let authority = rest.split(['/', '?']).next().unwrap_or_default();
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = if host_port.starts_with('[') {
+        host_port
+            .split_once(']')
+            .map_or(host_port, |(inner, _)| &host_port[..=inner.len()])
+    } else {
+        host_port.split(':').next().unwrap_or_default()
+    };
+    if host.is_empty() {
+        "localhost".to_owned()
+    } else {
+        host.to_ascii_lowercase()
+    }
+}
+
+/// Whether `host` names the bench host itself.
+#[must_use]
+pub fn is_loopback(host: &str) -> bool {
+    host == "localhost" || host == "[::1]" || host.starts_with("127.")
+}
+
+/// The host layout of a set of shard URLs.
+#[must_use]
+pub fn host_layout<'a>(urls: impl IntoIterator<Item = &'a str>) -> HostLayout {
+    let mut shards = 0;
+    let mut hosts = std::collections::BTreeSet::new();
+    let mut loopback = false;
+    for url in urls {
+        shards += 1;
+        let host = database_host(url);
+        // Every spelling of the bench host is one host.
+        if is_loopback(&host) {
+            loopback = true;
+            hosts.insert("localhost".to_owned());
+        } else {
+            hosts.insert(host);
+        }
+    }
+    HostLayout {
+        shards,
+        hosts: hosts.into_iter().collect(),
+        loopback,
+    }
 }
 
 // ── Report model (pure) ────────────────────────────────────────────────────
@@ -1125,8 +1279,7 @@ pub fn render_value(value: Option<f64>) -> String {
 /// Render the scenario matrix as a Markdown table.
 ///
 /// The published results file is this function's output, not a hand-typed
-/// table: a number nobody could have produced by running the suite cannot get
-/// into the doc.
+/// table. So every number in the doc came from a run of the suite.
 #[must_use]
 pub fn render_matrix(reports: &[ScenarioReport]) -> String {
     let mut out = String::from("| scenario | shards | metric | value | sound |\n");
@@ -1150,11 +1303,11 @@ pub fn render_matrix(reports: &[ScenarioReport]) -> String {
 
 // ── Deployment configuration (published in `docs/benchmarks.md`) ──────────
 //
-// These live in the pure section rather than beside the code that uses them so
-// the docs-drift guard -- which runs on every OS with no `db` feature -- can pin
-// them into the published page. Issue #941 AC2 asks for "a documented
-// worker/concurrency configuration"; documented means a reader can see it on the
-// page, not only in the output of a run they have not done yet.
+// These live in the pure section, not beside the code that uses them. So the
+// docs-drift guard can pin them into the published page. That guard runs on
+// every OS with no `db` feature. Issue #941 AC2 asks for "a documented
+// worker/concurrency configuration". Documented means a reader can see it on
+// the page, not only in the output of a run they have not done yet.
 
 /// Worker tasks per shard. One worker per shard is the deployment shape the
 /// shard-count sweep is a statement about: adding a shard adds its worker.
@@ -1172,42 +1325,41 @@ pub const POOL_SIZE_PER_SHARD: usize = 32;
 /// Workflows completed per shard in the throughput scenario's measured
 /// population.
 pub const THROUGHPUT_WORKFLOWS_PER_SHARD: usize = 1_200;
-/// Workflows held in flight per shard by the closed-loop feeder: **four times**
-/// [`MAX_CONCURRENT_WORKFLOWS`], so the worker is never starved and the queue
-/// never becomes the measurement.
+/// Workflows the closed-loop feeder holds in flight per shard.
 ///
-/// Deliberately shallow. A pre-loaded backlog would instead measure the
-/// **claim-depth** curve — claim cost grows superlinearly with pending backlog
-/// depth, which is issue #786's published finding, not this suite's — and the
-/// resulting figure would depend on where in the drain you looked rather than
-/// on the engine's sustained capacity.
+/// **Four times** [`MAX_CONCURRENT_WORKFLOWS`]. So the worker is never starved,
+/// and the queue never becomes the measurement.
 ///
-/// Worth being exact about why this is not larger, because the larger number is
-/// more flattering. Calibration on the reference box measured ~23 workflows/s
-/// at 32 in flight and ~28/s at 128 — but 128 is *sixteen* times the worker's
-/// eight workflow slots, so it holds ~120 workflows **pending** per shard for
-/// the whole measured window. That extra ~20% is bought by measuring deeper
-/// into the very claim-depth curve this scenario was redesigned to stop
-/// re-publishing under an end-to-end label. The slower number is the honest
-/// one. (384 is refused outright: the feeder can no longer hold the
-/// population — see [`inflight_soundness`].)
+/// Deliberately shallow. A pre-loaded backlog would measure the
+/// **claim-depth** curve instead. Claim cost grows superlinearly with pending
+/// backlog depth, which is the published finding of issue #786. The figure
+/// would then depend on the point in the drain, not on sustained capacity.
 ///
-/// A reader who wants the deeper figure can have it —
-/// `HARVEST_BENCH_INFLIGHT=128` — and the report prints the population actually
-/// held beside the rate, so the two can never be confused.
+/// The larger number is more flattering, so the reason this is not larger
+/// matters. Calibration on the reference box measured ~23 workflows/s at 32 in
+/// flight and ~28/s at 128. But 128 is *sixteen* times the worker's eight
+/// workflow slots. It holds ~120 workflows **pending** per shard for the whole
+/// measured window. That extra ~20% comes from measuring deeper into the
+/// claim-depth curve. This scenario was redesigned to stop re-publishing that
+/// curve under an end-to-end label. The slower number is the honest one. 384
+/// is refused outright, because the feeder can no longer hold the population
+/// (see [`inflight_soundness`]).
+///
+/// A reader can get the deeper figure with `HARVEST_BENCH_INFLIGHT=128`. The
+/// report prints the population actually held beside the rate, so the two
+/// cannot be confused.
 pub const THROUGHPUT_INFLIGHT_PER_SHARD: usize = 4 * MAX_CONCURRENT_WORKFLOWS;
 /// Connections the feeder starts workflows over, per shard. One connection
-/// caps the feeder at roughly 285 starts/s, which is inside the range the
-/// engine can complete — so the harness would silently become the limiter.
+/// caps the feeder at roughly 285 starts/s. The engine can complete that many,
+/// so the harness would silently become the limiter.
 pub const FEEDER_CONNECTIONS_PER_SHARD: usize = 4;
 /// Target start rate for the paced scenarios, per shard.
 ///
 /// Roughly **30%** of the saturated rate the throughput scenario measures on
 /// the reference box, so the queue these latencies are measured against
 /// stays shallow. Pacing at 70% of capacity would publish a p99 that is
-/// mostly queueing; [`Pacing`] reports when the box could not hold the pace,
-/// but keeping the target well clear of saturation is what stops the
-/// question arising.
+/// mostly queueing. [`Pacing`] reports when the box could not hold the pace.
+/// A target well clear of saturation keeps that case from arising.
 pub const PACED_STARTS_PER_SEC_PER_SHARD: f64 = 8.0;
 /// Workflows started per shard in the dispatch-latency scenario.
 pub const DISPATCH_WORKFLOWS_PER_SHARD: usize = 400;
@@ -1284,9 +1436,9 @@ pub const SIGNAL_PARK_SETTLE: std::time::Duration = std::time::Duration::from_se
 
 /// Ceiling on any single read of the signal endpoint's socket, both ends.
 ///
-/// Generous relative to a loopback round trip measured in tens of
-/// milliseconds; its job is to turn "this will never answer" into a failed
-/// sample the report can name, instead of a parked scenario.
+/// Generous against a loopback round trip of tens of milliseconds. It turns
+/// "this will never answer" into a failed sample the report can name, not a
+/// parked scenario.
 pub const SIGNAL_SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 // ── HTTP framing (pure) ────────────────────────────────────────────────────
@@ -1336,11 +1488,10 @@ pub struct ParsedRequest {
 
 /// Outcome of parsing bytes read from a socket.
 ///
-/// The distinction is load-bearing, not cosmetic. A server that cannot tell
-/// "keep reading" from "this will never be valid" waits forever for bytes the
-/// peer will never send — and because the benchmark's client blocks in
-/// `read_to_end` with the request already written, that is a deadlock on both
-/// sides, not a slow request.
+/// The distinction is load-bearing. A server that cannot tell "keep reading"
+/// from "this will never be valid" waits forever for bytes the peer never
+/// sends. The benchmark's client blocks in `read_to_end` with the request
+/// already written. So that is a deadlock on both sides, not a slow request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HttpParse {
     /// A complete request.
@@ -1360,10 +1511,9 @@ pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 /// Parse an HTTP/1.1 request out of `buf`.
 ///
-/// Deliberately minimal: this endpoint serves exactly one route with a fixed
-/// request shape (see the module docs on why the harness does not pull in an
-/// HTTP stack), so it understands `Content-Length` bodies and nothing else — no
-/// chunked encoding, no keep-alive pipelining.
+/// Deliberately minimal. This endpoint serves exactly one route with a fixed
+/// request shape. So it understands `Content-Length` bodies only: no chunked
+/// encoding, no keep-alive pipelining.
 #[must_use]
 pub fn parse_http_request(buf: &[u8]) -> HttpParse {
     if buf.len() > MAX_REQUEST_BYTES {
@@ -1454,21 +1604,20 @@ pub struct Baseline {
 /// The numbers published in `docs/benchmarks/results-v<PUBLISHED_RESULTS_VERSION>.md`.
 ///
 /// These are the *headline* metrics only — the ones issue #941's success metric
-/// names. The report also prints context metrics (sample counts, achieved pace,
-/// the measured window) which are diagnostic rather than published claims, so
-/// they are deliberately absent here.
+/// names. The report also prints context metrics: sample counts, achieved pace
+/// and the measured window. They are diagnostics, not published claims, so they
+/// are absent here.
 ///
 /// `HARVEST_BENCH_CHECK=1` compares a fresh run against these at
 /// [`REPRO_TOLERANCE_PCT`]. That is a *report*, never a gate — see the module
 /// docs and `benchmarks_docs.rs`.
 ///
 /// **On the p99 entries.** The tail is the least reproducible number on the
-/// page, for the reason issue #786 derived at length before gating p50 rather
-/// than p99: a tail measured on a box that is also running the harness is
-/// partly a measurement of that box's run queue. They are published, and they
-/// are checked, because #941's success metric names them — but a p99 outside
-/// tolerance on a busy machine is the expected outcome, not a regression.
-/// `docs/benchmarks.md` says so where the numbers appear.
+/// page. Issue #786 derived why before it gated p50, not p99. A tail measured
+/// on a box that also runs the harness partly measures that box's run queue.
+/// The p99 entries are published and checked, because #941's success metric
+/// names them. But a p99 outside tolerance on a busy machine is expected, not
+/// a regression. `docs/benchmarks.md` says so where the numbers appear.
 pub const PUBLISHED_BASELINES: &[Baseline] = &[
     Baseline {
         scenario: BenchScenario::Throughput,
@@ -1622,7 +1771,7 @@ pub fn build_history(n: usize) -> (ExecutionId, Vec<WorkflowEvent>) {
 
     events.push(WorkflowEvent::WorkflowStarted {
         input: Value::from(n as u64),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -1652,15 +1801,13 @@ pub const REPLAY_WARMUP_ITERATIONS: usize = 5;
 
 /// **Scenario (d).** Replay throughput over the issue #135 history.
 ///
-/// In-memory and shard-invariant by construction — the replayer never opens a
-/// connection — so this row doubles as the run's **noise control**: it cannot
-/// legitimately move with shard count, and drift across the three shard counts
-/// bounds how loaded the reference box was while the other nine cells were
-/// measured.
+/// In-memory and shard-invariant by construction: the replayer never opens a
+/// connection. So this row doubles as the run's **noise control**. It cannot
+/// legitimately move with shard count. Its drift across the three shard counts
+/// bounds how loaded the reference box was during the other nine cells.
 ///
-/// It reports the same history #135 budgets (10 001 events, under 200 ms), so
-/// the number published here stays continuous with that budget rather than
-/// starting a second, unrelated replay series.
+/// It reports the same history #135 budgets (10 001 events, under 200 ms). So
+/// the number stays continuous with that budget, not a second replay series.
 #[cfg(feature = "testing")]
 pub async fn run_replay_throughput(shards: u32) -> ScenarioReport {
     use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
@@ -1859,13 +2006,12 @@ pub async fn wait_for_census_to_clear(census: &TaskCensus, bound: Duration) {
 
 #[cfg(test)]
 mod tests {
-    // Cargo sets `cfg(test)` for bench targets too, but a `harness = false`
-    // bench has no test harness, so rustc strips every `#[test]` fn from this
-    // module when it is compiled into `benches/e2e_bench.rs` — leaving this
-    // import genuinely unused *there* while it is used in the `integration`
-    // test binary. Same situation, same fix, as `claim_bench_support::pure_tests`.
-    // Scoped to this module so a real unused import elsewhere in the file still
-    // warns.
+    // Cargo sets `cfg(test)` for bench targets too. A `harness = false` bench
+    // has no test harness, so rustc strips every `#[test]` fn from this module
+    // in `benches/e2e_bench.rs`. This import is then unused *there*, but used
+    // in the `integration` test binary. `claim_bench_support::pure_tests` has
+    // the same fix. Scoped to this module so a real unused import elsewhere in
+    // the file still warns.
     #![allow(unused_imports)]
 
     use super::*;
@@ -1886,6 +2032,13 @@ mod tests {
         assert_eq!(claim_loops_override(Some("0")), None);
         assert_eq!(claim_loops_override(Some("two")), None);
         assert_eq!(claim_loops_override(None), None);
+        let rows = |raw| claim_batch_override(raw).map(std::num::NonZeroU8::get);
+        assert_eq!(rows(Some("8")), Some(8));
+        assert_eq!(rows(Some(" 4 ")), Some(4));
+        assert_eq!(rows(Some("1")), None);
+        assert_eq!(rows(Some("0")), None);
+        assert_eq!(rows(Some("many")), None);
+        assert_eq!(rows(None), None);
     }
 
     #[test]
@@ -2188,10 +2341,10 @@ mod tests {
             per_shard_pacing_verdict(8.0, &[8.0, 8.0, 8.0, 8.0]),
             Pacing::Held
         );
-        // The regression this exists to catch (Codex review, PR #1282): a sender
-        // that drives one shard at 4x the per-shard target while the rest idle
-        // hits the aggregate target exactly, and would have passed an aggregate
-        // check while publishing a saturated single shard's percentiles.
+        // The regression from PR #1282. A sender drives one shard at 4x the
+        // per-shard target while the rest idle. It hits the aggregate target
+        // exactly. An aggregate check passes it and publishes a saturated
+        // single shard's percentiles.
         assert_eq!(
             per_shard_pacing_verdict(8.0, &[32.0, 0.0, 0.0, 0.0]),
             Pacing::Saturated,
@@ -2362,9 +2515,9 @@ mod tests {
         assert_eq!(unknown_scenario_ids(None), [] as [std::string::String; 0]);
 
         // Shard counts get the same treatment. `1,3` used to run only the
-        // 1-shard cells while looking like it had accepted the whole request,
-        // and `3` ran nothing and then blamed a missing Postgres -- a
-        // reproduction that appears to have succeeded and has not.
+        // 1-shard cells and appear to accept the whole request. `3` ran
+        // nothing and then blamed a missing Postgres. Such a reproduction
+        // appears to succeed and does not.
         assert_eq!(unknown_shard_counts(Some("1,3")), vec!["3".to_owned()]);
         assert_eq!(
             unknown_shard_counts(Some("2,banana")),
@@ -2487,10 +2640,10 @@ mod tests {
 
     #[test]
     fn a_single_feeder_bound_shard_cannot_hide_behind_its_peers() {
-        // The regression this exists to catch (Codex review round 3, PR #1282):
-        // 32/32/32/28 averages 31 against a floor of 28.8, so a flattened mean
-        // passes while the starved shard is the one bounding the aggregate rate
-        // the cell publishes.
+        // The regression this exists to catch (PR #1282): 32/32/32/28 averages
+        // 31 against a floor of 28.8, so a flattened mean passes. But the
+        // starved shard is the one bounding the aggregate rate the cell
+        // publishes.
         let flattened = mean_inflight(&[32, 32, 32, 28]).expect("non-empty");
         assert!(
             inflight_soundness(32, Some(flattened)).is_empty(),
@@ -2530,10 +2683,9 @@ mod tests {
 
     #[test]
     fn a_drain_down_tail_no_longer_voids_a_sound_short_run() {
-        // The regression this slice exists to prevent: a 400-completion run at
-        // 128 in flight spends ~32% of its loop draining down, so a whole-loop
-        // mean falls under the 90% floor while the measured window was fully
-        // populated throughout.
+        // The regression this slice prevents. A 400-completion run at 128 in
+        // flight spends ~32% of its loop draining down. So a whole-loop mean
+        // falls under the 90% floor, but the measured window stayed full.
         let mut whole_loop: Vec<usize> = vec![128; 68];
         whole_loop.extend((0..32).rev().map(|i| i * 4));
         let whole_mean = mean_inflight(&whole_loop).expect("non-empty");
@@ -2620,10 +2772,10 @@ mod tests {
 
     #[test]
     fn a_permanently_malformed_request_is_rejected_rather_than_waited_on() {
-        // Each of these can never become valid by reading more bytes. Reporting
-        // them as `Incomplete` would park the server until the peer gave up --
-        // and the benchmark's own client never gives up, so it would deadlock
-        // both ends and burn the scenario budget.
+        // None of these can become valid by reading more bytes. As
+        // `Incomplete`, they would park the server until the peer gave up. The
+        // benchmark's own client never gives up. So both ends would deadlock
+        // and burn the scenario budget.
         for (label, raw) in [
             (
                 "a header line with no colon",
@@ -2783,15 +2935,71 @@ mod tests {
             assert_eq!(sweep_step(name), SweepStep::Skip, "{name}");
         }
     }
+
+    #[test]
+    fn a_url_host_is_parsed_without_credentials_or_port() {
+        assert_eq!(
+            database_host("postgres://u:p@DB-1.example:5432/postgres"),
+            "db-1.example"
+        );
+        assert_eq!(
+            database_host("postgresql://db2/postgres?sslmode=disable"),
+            "db2"
+        );
+        assert_eq!(database_host("postgres://u@[::1]:55432/x"), "[::1]");
+        assert_eq!(database_host("postgres:///postgres"), "localhost");
+        assert_eq!(database_host("postgres://u:p@:5432/x"), "localhost");
+    }
+
+    #[test]
+    fn shards_on_one_host_share_it_and_say_so() {
+        let layout = host_layout([
+            "postgres://u:p@localhost:55432/a",
+            "postgres://u:p@localhost:55433/b",
+        ]);
+        assert_eq!(layout.shards, 2);
+        assert_eq!(layout.hosts, vec!["localhost".to_owned()]);
+        assert!(layout.loopback);
+        assert!(layout.shares_a_host());
+        let note = layout.note();
+        assert!(note.contains("not a scaling result"), "{note}");
+        assert!(note.contains("bench host"), "{note}");
+    }
+
+    #[test]
+    fn shards_on_distinct_hosts_do_not_share_one() {
+        let layout = host_layout(["postgres://a.db/x", "postgres://b.db/x"]);
+        assert!(!layout.shares_a_host());
+        assert!(!layout.loopback);
+        assert!(!layout.note().contains("not a scaling result"));
+    }
+
+    #[test]
+    fn every_spelling_of_the_bench_host_is_one_host() {
+        let layout = host_layout([
+            "postgres://localhost:55432/a",
+            "postgres://127.0.0.1:55433/b",
+            "postgres://[::1]:55434/c",
+        ]);
+        assert_eq!(layout.hosts, vec!["localhost".to_owned()]);
+        assert!(layout.shares_a_host());
+    }
+
+    #[test]
+    fn one_shard_never_shares_a_host() {
+        let layout = host_layout(["postgres://127.0.0.1:5432/x"]);
+        assert!(!layout.shares_a_host());
+        assert!(layout.loopback, "127.0.0.1 is the bench host");
+    }
 }
 
 // ---------------------------------------------------------------------------
 // DB-backed section — requires the `db` feature and a reachable Postgres.
 //
-// Nothing in here is executed by a CI suite: no manifest row runs an end-to-end
-// scenario (issue #941 puts CI-gated end-to-end budgets out of scope, and
-// `benchmarks_docs.rs` asserts the absence). It is driven by
-// `benches/e2e_bench.rs`, which `cargo xtask bench run` invokes.
+// No CI suite runs anything in here: no manifest row runs an end-to-end
+// scenario. Issue #941 puts CI-gated end-to-end budgets out of scope, and
+// `benchmarks_docs.rs` asserts the absence. `benches/e2e_bench.rs` drives it,
+// and `cargo xtask bench run` invokes that bench.
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "db")]
@@ -2801,9 +3009,9 @@ pub mod db {
     use std::sync::{Arc, Mutex, OnceLock, PoisonError};
     use std::time::Instant;
 
-    use chrono::{DateTime, Utc};
     use diesel::QueryableByName;
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+    use jiff::Timestamp;
     use testcontainers::ContainerAsync;
     use testcontainers::ImageExt;
     use testcontainers_modules::postgres::Postgres;
@@ -2827,8 +3035,8 @@ pub mod db {
     use super::super::claim_bench_support::LatencyStats;
     use super::super::pg_stats_snapshot::ResetOutcome;
     use super::{
-        BENCH_ACTIVITIES, BENCH_QUEUE, BENCH_SIGNAL, BENCH_SIGNAL_WORKFLOW, BENCH_WORKFLOW,
-        BenchScenario, DISPATCH_WORKFLOWS_PER_SHARD, FEEDER_CONNECTIONS_PER_SHARD,
+        BENCH_ACTIVITIES, BENCH_NOOP_WORKFLOW, BENCH_QUEUE, BENCH_SIGNAL, BENCH_SIGNAL_WORKFLOW,
+        BENCH_WORKFLOW, BenchScenario, DISPATCH_WORKFLOWS_PER_SHARD, FEEDER_CONNECTIONS_PER_SHARD,
         MAX_CONCURRENT_ACTIVITIES, MAX_CONCURRENT_WORKFLOWS, Metric,
         PACED_STARTS_PER_SEC_PER_SHARD, POLL_INTERVAL_MS, POOL_SIZE_PER_SHARD, Pacing,
         SCENARIO_BUDGET_SECS, SHARD_URLS_ENV_VAR, SIGNAL_PARK_SETTLE, SIGNAL_SOCKET_TIMEOUT,
@@ -2860,7 +3068,7 @@ pub mod db {
         /// topology, and the shape Harvest's shard model describes.
         IndependentServers,
         /// One server, one database per shard. Cheap, but every "shard" then
-        /// contends for the same buffer cache, WAL writer and CPU, so a
+        /// contends for the same buffer cache, WAL writer and CPU. So a
         /// shard-count sweep taken this way is not a scale-out measurement.
         SharedServer,
     }
@@ -2903,13 +3111,12 @@ pub mod db {
 
     /// Swap the database component of a Postgres URL.
     ///
-    /// Delegates to the sibling harness's helper rather than a local
-    /// `rfind('/')`: that shortcut panics on a libpq keyword/value DSN
-    /// (`host=h port=5432 dbname=postgres`, a legal value for
-    /// `HARVEST_TEST_DATABASE_URL`) and silently corrupts a URL with no path
-    /// (`postgres://host:5432` becomes `postgres://<db_name>` — the host
-    /// replaced by the database). One definition of this across the two
-    /// benchmark harnesses.
+    /// Delegates to the sibling harness's helper, not a local `rfind('/')`.
+    /// That shortcut panics on a libpq keyword/value DSN such as
+    /// `host=h port=5432 dbname=postgres`, a legal value for
+    /// `HARVEST_TEST_DATABASE_URL`. It also corrupts a URL with no path:
+    /// `postgres://host:5432` becomes `postgres://<db_name>`. One definition
+    /// serves both benchmark harnesses.
     fn replace_database(url: &str, db_name: &str) -> Result<String, SkipReason> {
         super::super::claim_bench_support::with_db_name(url, db_name).map_err(|e| {
             SkipReason(format!(
@@ -2934,10 +3141,9 @@ pub mod db {
             };
             // `WITH (FORCE)` is PostgreSQL 13+, and the engine supports 12+
             // (README). On 12 it is a *syntax error*, and these failures are
-            // only recorded -- so every scenario would silently leak its
-            // databases against a documented-supported server. The sibling
-            // harness already solved this; reuse it rather than grow a second
-            // definition of "drop a database on every PostgreSQL we support".
+            // only recorded. So every scenario would silently leak its
+            // databases against a supported server. Reuse the sibling
+            // harness's version-neutral drop, not a second definition.
             super::super::claim_bench_support::db::drop_database_version_neutral(&mut admin, name)
                 .await;
             let still_there =
@@ -3299,16 +3505,35 @@ pub mod db {
         })
     }
 
-    fn build_pool(url: &str) -> DbPool {
+    /// Build the bench pool of one shard.
+    #[must_use]
+    pub fn build_pool(url: &str) -> DbPool {
+        build_pool_sized(url, POOL_SIZE_PER_SHARD)
+    }
+
+    /// Build a bench pool of `size` connections.
+    #[must_use]
+    pub fn build_pool_sized(url: &str, size: usize) -> DbPool {
         let manager = autumn_harvest::pool::engine_manager(url);
         autumn_harvest::pool::with_engine_timeouts(
-            deadpool::managed::Pool::builder(manager).max_size(POOL_SIZE_PER_SHARD),
+            deadpool::managed::Pool::builder(manager).max_size(size),
             autumn_harvest::pool::DbRole::Hot,
             &autumn_harvest::pool::EngineDbTimeouts::default(),
         )
         .expect("bench pool timeouts are valid")
         .build()
         .expect("bench pool build failed")
+    }
+
+    /// One lazy pool per shard URL. A pool opens no connection until a
+    /// caller checks one out.
+    #[must_use]
+    pub fn sharded_pool_from(urls: &BTreeMap<ShardId, String>) -> ShardedDbPool {
+        let pools: BTreeMap<ShardId, DbPool> = urls
+            .iter()
+            .map(|(shard, url)| (*shard, build_pool(url)))
+            .collect();
+        ShardedDbPool::from_map(pools, ShardId::new(0))
     }
 
     impl ShardCluster {
@@ -3319,12 +3544,13 @@ pub mod db {
 
         #[must_use]
         pub fn sharded_pool(&self) -> ShardedDbPool {
-            let pools: BTreeMap<ShardId, DbPool> = self
-                .urls
-                .iter()
-                .map(|(shard, url)| (*shard, build_pool(url)))
-                .collect();
-            ShardedDbPool::from_map(pools, ShardId::new(0))
+            sharded_pool_from(&self.urls)
+        }
+
+        /// Where this cell's shard databases run.
+        #[must_use]
+        pub fn host_layout(&self) -> super::HostLayout {
+            super::host_layout(self.urls.values().map(String::as_str))
         }
 
         #[must_use]
@@ -3335,11 +3561,11 @@ pub mod db {
 
         /// Drop every database this run created.
         ///
-        /// The suite provisions a fresh database per shard **per scenario**, so
-        /// a full 4x3 sweep against one operator-supplied server would otherwise
-        /// leave dozens of multi-thousand-row databases behind. Failures are
-        /// reported, never fatal: a benchmark that could not tidy up has still
-        /// produced its numbers.
+        /// The suite provisions a fresh database per shard **per scenario**.
+        /// Without teardown, a full 4x3 sweep against one operator-supplied
+        /// server leaves dozens of multi-thousand-row databases behind.
+        /// Failures are reported, never fatal: a benchmark that could not tidy
+        /// up has still produced its numbers.
         pub async fn teardown(mut self) -> Vec<String> {
             // Release our own backends first, or `DROP DATABASE` blocks on them.
             self.leases.clear();
@@ -3423,7 +3649,7 @@ pub mod db {
     pub struct BenchObservations {
         /// `(harvest_task_queue.id, handler-entry host clock)` for every
         /// dispatched activity.
-        activity_starts: Mutex<Vec<(Uuid, DateTime<Utc>)>>,
+        activity_starts: Mutex<Vec<(Uuid, Timestamp)>>,
         /// Execution id -> the first instant the workflow's own code ran past
         /// `wait_for_signal`. First-wins, so a later replay of the same code
         /// cannot move an already-recorded observation.
@@ -3438,7 +3664,7 @@ pub mod db {
 
     impl BenchObservations {
         #[must_use]
-        pub fn activity_starts(&self) -> Vec<(Uuid, DateTime<Utc>)> {
+        pub fn activity_starts(&self) -> Vec<(Uuid, Timestamp)> {
             self.activity_starts.lock().expect("poisoned").clone()
         }
 
@@ -3469,7 +3695,7 @@ pub mod db {
             self.activity_starts
                 .lock()
                 .expect("poisoned")
-                .push((task_id, Utc::now()));
+                .push((task_id, Timestamp::now()));
         }
 
         fn record_parked(&self, exec_id: Uuid) {
@@ -3530,6 +3756,12 @@ pub mod db {
             }
             Ok(serde_json::json!({ "ok": true }))
         })
+    }
+
+    /// The zero-activity workflow. It returns at once, so a run costs only the
+    /// engine's own start, claim and completion.
+    fn bench_noop_workflow(_ctx: &WorkflowContext, _input: serde_json::Value) -> BoxFut<'_> {
+        Box::pin(async move { Ok(serde_json::json!({ "ok": true })) })
     }
 
     /// Parks on a signal, then records the instant its own code resumed.
@@ -3966,6 +4198,7 @@ pub mod db {
             vec![
                 workflow_info(BENCH_WORKFLOW, bench_workflow),
                 workflow_info(BENCH_SIGNAL_WORKFLOW, bench_signal_workflow),
+                workflow_info(BENCH_NOOP_WORKFLOW, bench_noop_workflow),
             ],
             BENCH_ACTIVITIES.iter().map(|n| activity_info(n)).collect(),
             Arc::new(state),
@@ -4009,10 +4242,9 @@ pub mod db {
         ///
         /// `timeout(_, handle)` consumes the `JoinHandle` and dropping it
         /// *detaches* the task rather than stopping it. A detached worker keeps
-        /// claiming from a pool whose database the next line drops, and keeps
-        /// burning CPU through the remaining cells of a twelve-cell sweep --
-        /// perturbing the measurements those cells publish. So the handle is
-        /// kept and aborted.
+        /// claiming from a pool whose database the next line drops. It burns
+        /// CPU through the remaining cells of a twelve-cell sweep and perturbs
+        /// their measurements. So the handle is kept and aborted.
         pub async fn stop(mut self) {
             for worker in &self.workers {
                 worker.shutdown();
@@ -4031,13 +4263,12 @@ pub mod db {
 
     /// Abort every worker when a `Fleet` is dropped without [`Fleet::stop`].
     ///
-    /// The panic path (Codex review, PR #1282). `benches/e2e_bench.rs` runs each
-    /// cell in its own task so a panic fails that cell instead of aborting the
-    /// sweep -- but unwinding only *drops* the `Fleet`, and dropping a
-    /// `JoinHandle` detaches its task rather than stopping it. Those workers
-    /// then keep polling the abandoned databases for the remaining eleven
-    /// cells, consuming CPU and connections and perturbing exactly the
-    /// measurements the containment was supposed to protect.
+    /// The panic path (PR #1282). `benches/e2e_bench.rs` runs each cell in its
+    /// own task, so a panic fails that cell, not the sweep. But unwinding only
+    /// *drops* the `Fleet`, and dropping a `JoinHandle` detaches its task. Those
+    /// workers then keep polling the abandoned databases for the remaining
+    /// eleven cells. They consume CPU and connections and perturb the
+    /// measurements the containment protects.
     ///
     /// `abort()` is synchronous, so it works from `Drop` where an async
     /// shutdown cannot. On the ordinary path `stop` has already taken the
@@ -4051,6 +4282,39 @@ pub mod db {
                 handle.abort();
             }
         }
+    }
+
+    /// Build one bench worker pinned to `shard`.
+    ///
+    /// The in-process fleet and each capacity worker process build their
+    /// workers here, so both run the same configuration.
+    #[must_use]
+    pub fn build_worker(
+        shard: ShardId,
+        notification_urls: &[(ShardId, String)],
+        sharded: &ShardedDbPool,
+        registry: &Arc<HandlerRegistry>,
+        worker_id: String,
+    ) -> Arc<Worker> {
+        let worker_config = WorkerConfig::default()
+            .with_queues([BENCH_QUEUE])
+            .with_shard_assignments([shard])
+            .with_shard_notification_database_urls(notification_urls.to_vec());
+        let mut runtime: WorkerRuntimeConfig = worker_config.into();
+        runtime.worker_id = worker_id;
+        runtime.poll_interval = std::time::Duration::from_millis(POLL_INTERVAL_MS);
+        runtime.shutdown_timeout = std::time::Duration::from_secs(5);
+        runtime.max_concurrent_workflows = MAX_CONCURRENT_WORKFLOWS;
+        runtime.max_concurrent_activities = MAX_CONCURRENT_ACTIVITIES;
+        if let Some(loops) =
+            super::claim_loops_override(std::env::var(super::CLAIM_LOOPS_ENV_VAR).ok().as_deref())
+        {
+            runtime.max_concurrent_claims = loops;
+        }
+        runtime.claim_batch_max =
+            super::claim_batch_override(std::env::var(super::CLAIM_BATCH_ENV_VAR).ok().as_deref());
+        runtime.sharded_pool = Some(sharded.clone());
+        Arc::new(Worker::new(runtime, Arc::clone(registry)).expect("bench worker should build"))
     }
 
     /// Start [`WORKERS_PER_SHARD`] workers per shard, each pinned to its shard
@@ -4076,24 +4340,12 @@ pub mod db {
         let mut handles = Vec::new();
         for shard in cluster.shard_ids() {
             for replica in 0..WORKERS_PER_SHARD {
-                let worker_config = WorkerConfig::default()
-                    .with_queues([BENCH_QUEUE])
-                    .with_shard_assignments([shard])
-                    .with_shard_notification_database_urls(notification_urls.clone());
-                let mut runtime: WorkerRuntimeConfig = worker_config.into();
-                runtime.worker_id = format!("bench-s{}-{replica}", shard.as_i32());
-                runtime.poll_interval = std::time::Duration::from_millis(POLL_INTERVAL_MS);
-                runtime.shutdown_timeout = std::time::Duration::from_secs(5);
-                runtime.max_concurrent_workflows = MAX_CONCURRENT_WORKFLOWS;
-                runtime.max_concurrent_activities = MAX_CONCURRENT_ACTIVITIES;
-                if let Some(loops) = super::claim_loops_override(
-                    std::env::var(super::CLAIM_LOOPS_ENV_VAR).ok().as_deref(),
-                ) {
-                    runtime.max_concurrent_claims = loops;
-                }
-                runtime.sharded_pool = Some(sharded.clone());
-                let worker = Arc::new(
-                    Worker::new(runtime, Arc::clone(registry)).expect("bench worker should build"),
+                let worker = build_worker(
+                    shard,
+                    &notification_urls,
+                    sharded,
+                    registry,
+                    format!("bench-s{}-{replica}", shard.as_i32()),
                 );
                 let pool = sharded
                     .exact_pool_for(shard)
@@ -4113,7 +4365,9 @@ pub mod db {
 
     // ── Seeding ───────────────────────────────────────────────────────────
 
-    fn start_params<'a>(
+    /// The start parameters every bench seeder and generator uses.
+    #[must_use]
+    pub fn start_params<'a>(
         exec_id: ExecutionId,
         workflow_name: &'a str,
         workflow_id: &'a str,
@@ -4214,7 +4468,8 @@ pub mod db {
     #[derive(QueryableByName)]
     struct CompletionRow {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        completed_at: DateTime<Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        completed_at: Timestamp,
     }
 
     #[derive(QueryableByName)]
@@ -4222,13 +4477,15 @@ pub mod db {
         #[diesel(sql_type = diesel::sql_types::Uuid)]
         id: Uuid,
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-        created_at: Option<DateTime<Utc>>,
+        #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+        created_at: Option<Timestamp>,
     }
 
     #[derive(QueryableByName)]
     struct NowRow {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        now: DateTime<Utc>,
+        #[diesel(deserialize_as = jiff_diesel::Timestamp)]
+        now: Timestamp,
     }
 
     async fn completed_count(conn: &mut AsyncPgConnection, cohort: &str) -> i64 {
@@ -4243,7 +4500,7 @@ pub mod db {
         .n
     }
 
-    async fn completion_times(conn: &mut AsyncPgConnection, cohort: &str) -> Vec<DateTime<Utc>> {
+    async fn completion_times(conn: &mut AsyncPgConnection, cohort: &str) -> Vec<Timestamp> {
         diesel::sql_query(
             "SELECT completed_at FROM harvest_workflow_executions \
              WHERE state = 'COMPLETED' AND completed_at IS NOT NULL AND workflow_id LIKE $1 \
@@ -4260,24 +4517,26 @@ pub mod db {
 
     /// Median host-to-database clock offset, in milliseconds.
     ///
-    /// Published rather than assumed away: the activity-dispatch measurement
-    /// spans a database timestamp and a host timestamp, and a reader deserves
-    /// the size of that error term instead of a promise that it is zero.
+    /// Published, not assumed away. The activity-dispatch measurement spans a
+    /// database timestamp and a host timestamp. A reader gets the size of that
+    /// error term, not a promise that it is zero.
     pub async fn clock_offset_ms(conn: &mut AsyncPgConnection) -> f64 {
         let mut samples = Vec::new();
         for _ in 0..7 {
-            let before = Utc::now();
+            let before = Timestamp::now();
             let row = diesel::sql_query("SELECT now() AS now")
                 .get_result::<NowRow>(conn)
                 .await
                 .expect("probe database clock");
-            let after = Utc::now();
+            let after = Timestamp::now();
             let midpoint = before + (after - before) / 2;
             #[allow(
                 clippy::cast_precision_loss,
                 reason = "microsecond offsets on one host are far below 2^53"
             )]
-            let offset = (row.now - midpoint).num_microseconds().unwrap_or(0) as f64 / 1000.0;
+            let offset = autumn_harvest::time::num_microseconds(row.now - midpoint).unwrap_or(0)
+                as f64
+                / 1000.0;
             samples.push(offset);
         }
         samples.sort_by(f64::total_cmp);
@@ -4291,8 +4550,8 @@ pub mod db {
     ///
     /// This is **not** autumn-web's router: it carries no auth, tracing,
     /// rate-limit or payload-schema middleware. It exists so the published
-    /// round-trip includes a real loopback socket, real request framing and the
-    /// same `signal::send_signal` entry point the plugin route calls — see
+    /// round-trip includes a real loopback socket and real request framing. It
+    /// calls the same `signal::send_signal` entry point as the plugin route. See
     /// "Known limitations" in `docs/benchmarks.md`.
     pub struct SignalServer {
         pub addr: std::net::SocketAddr,
@@ -4303,9 +4562,8 @@ pub mod db {
         /// Stop accepting and abort every in-flight connection task.
         ///
         /// Aborting the accept loop drops its `JoinSet`, which aborts the
-        /// connection tasks with it — so no task can still be holding a pooled
-        /// connection when the caller drops the pool and `teardown` drops the
-        /// databases.
+        /// connection tasks with it. So no task still holds a pooled connection
+        /// when the caller drops the pool and `teardown` drops the databases.
         pub fn stop(&self) {
             self.handle.abort();
         }
@@ -4314,16 +4572,17 @@ pub mod db {
     /// Abort the accept loop when a `SignalServer` is dropped without
     /// [`SignalServer::stop`].
     ///
-    /// The panic path, one layer further out than `Fleet`'s (Codex review
-    /// round 4, PR #1282): if `run_signal_roundtrip` panics after the server is
-    /// spawned, unwinding merely *drops* this handle, and dropping a
-    /// `JoinHandle` detaches its task. The accept loop would keep running --
-    /// holding its `ShardedDbPool` clone and its idle connections -- through
-    /// every later cell of the sweep, which is exactly the per-cell containment
-    /// this and `Fleet`'s `Drop` exist to make real.
+    /// The panic path, one layer further out than `Fleet`'s (PR #1282).
+    /// `run_signal_roundtrip` can panic after the server is spawned. Then
+    /// unwinding merely *drops* this handle, and dropping a `JoinHandle`
+    /// detaches its task. The accept loop would keep running through every
+    /// later cell of the sweep. It would hold its `ShardedDbPool` clone and its
+    /// idle connections. This impl and `Fleet`'s `Drop` make per-cell
+    /// containment real.
     ///
-    /// `stop` consumes `self`, so on the ordinary path this runs immediately
-    /// after and aborts an already-aborted task, which is a no-op.
+    /// `stop` takes `&self`, so it does not drop the `SignalServer` value. On
+    /// the ordinary path, this impl runs later, when that value leaves scope.
+    /// It then aborts an already-aborted task, which is a no-op.
     impl Drop for SignalServer {
         fn drop(&mut self) {
             self.handle.abort();
@@ -4355,9 +4614,9 @@ pub mod db {
         let accept_loop_guard = census.enter();
         let handle = tokio::spawn(async move {
             let _accept_loop_guard = accept_loop_guard;
-            // Connection tasks are tracked rather than detached: `stop` must be
-            // able to guarantee no task is still holding a pooled connection
-            // when the caller drops the pool and drops the databases.
+            // Connection tasks are tracked, not detached. `stop` must guarantee
+            // that no task holds a pooled connection when the caller drops the
+            // pool and the databases.
             let mut connections = tokio::task::JoinSet::new();
             loop {
                 let accepted = tokio::select! {
@@ -4367,8 +4626,8 @@ pub mod db {
                     Some(_) = connections.join_next(), if !connections.is_empty() => continue,
                 };
                 // A transient accept error (EMFILE under load) must not retire
-                // the endpoint for the rest of the run: every subsequent signal
-                // would then be counted as a failure and the cell blamed on the
+                // the endpoint for the rest of the run. Every later signal
+                // would then count as a failure, and the cell would blame the
                 // engine.
                 let Ok((mut socket, _)) = accepted else {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -4461,9 +4720,9 @@ pub mod db {
             return (sent_at, None);
         }
         let mut response = Vec::with_capacity(128);
-        // Bounded: an unbounded `read_to_end` against a peer that never answers
-        // parks the whole scenario past its budget, and the signalling loop only
-        // checks the deadline between sends.
+        // Bounded. An unbounded `read_to_end` against a silent peer parks the
+        // whole scenario past its budget. The signalling loop checks the
+        // deadline only between sends.
         if tokio::time::timeout(SIGNAL_SOCKET_TIMEOUT, stream.read_to_end(&mut response))
             .await
             .is_err()
@@ -4479,23 +4738,22 @@ pub mod db {
         version: String,
     }
 
-    /// The `version()` of the server this run actually provisioned against.
+    /// Every DISTINCT server `version()` this run provisioned against.
     ///
     /// Recorded during provisioning rather than probed from an environment
-    /// variable, because on the testcontainer path there is no such variable:
-    /// the probe returned `None` and the published environment block simply
-    /// omitted the Postgres version for an otherwise perfectly good run (Codex
-    /// review round 3, PR #1282). `postgres:16` is a moving tag, and the doc
-    /// treats the exact version as reproduction metadata, so "unknown" is not
-    /// an acceptable answer for a run that had a server in front of it.
-    /// Every DISTINCT server version this run provisioned against.
+    /// variable, because on the testcontainer path there is no such variable
+    /// (PR #1282). The probe returned `None`. The published environment block
+    /// then simply omitted the Postgres version for an otherwise good run.
+    /// `postgres:16` is a moving tag, and the doc treats the exact version as
+    /// reproduction metadata. So "unknown" is not an acceptable answer for a
+    /// run that had a server in front of it.
     ///
-    /// A set rather than a single value (Codex review round 4, PR #1282): in
-    /// `HARVEST_BENCH_SHARD_URLS` mode the shards are independent servers and
+    /// A set rather than a single value (PR #1282). In
+    /// `HARVEST_BENCH_SHARD_URLS` mode the shards are independent servers, and
     /// nothing makes them the same build. Recording only the first would print
-    /// shard 0's version as though it described the whole sweep -- inaccurate
-    /// reproduction metadata on a page that treats the exact version as
-    /// load-bearing. A homogeneous topology still renders as one string.
+    /// shard 0's version as though it described the whole sweep. The page
+    /// treats the exact version as load-bearing. A homogeneous topology still
+    /// renders as one string.
     static PROVISIONED_VERSIONS: Mutex<std::collections::BTreeSet<String>> =
         Mutex::new(std::collections::BTreeSet::new());
 
@@ -4527,18 +4785,20 @@ pub mod db {
 
     // ── Scenario runners ──────────────────────────────────────────────────
 
-    fn scenario_deadline() -> Instant {
+    /// The cooperative deadline of one scenario, from now.
+    #[must_use]
+    pub fn scenario_deadline() -> Instant {
         Instant::now() + std::time::Duration::from_secs(SCENARIO_BUDGET_SECS)
     }
 
     /// Note the wall clock one cell took, and complain when it exhausted its
-    /// budget — a cell that ran out of time reported whatever it had collected,
+    /// budget. A cell that ran out of time reported whatever it had collected,
     /// which is not a published number.
-    fn budget_note(started: Instant, deadline: Instant, unsound: &mut Vec<String>) -> String {
+    pub fn budget_note(started: Instant, deadline: Instant, unsound: &mut Vec<String>) -> String {
         let elapsed = started.elapsed();
-        // Against the deadline itself, not against elapsed-since-the-cell-began:
-        // the deadline starts after provisioning, so a cell whose provisioning
-        // was slow but whose collection finished cleanly must not be refused.
+        // Against the deadline itself, not the time since the cell began. The
+        // deadline starts after provisioning. A cell with slow provisioning
+        // but a clean collection must not be refused.
         if Instant::now() >= deadline {
             unsound.push(format!(
                 "the {SCENARIO_BUDGET_SECS}s scenario budget was exhausted; this cell reports \
@@ -4580,10 +4840,11 @@ pub mod db {
         }
     }
 
-    /// Append a note when the run could not drop its own databases, so an
-    /// operator who supplied a shared server learns about the leftovers from
-    /// the report rather than from `\\l` a week later.
-    fn with_teardown_note(mut notes: Vec<String>, report: &TeardownReport) -> Vec<String> {
+    /// Append a note when the run could not drop its own databases.
+    ///
+    /// An operator who supplied a shared server then learns about the leftovers
+    /// from the report, not from `\\l` a week later.
+    pub fn with_teardown_note(mut notes: Vec<String>, report: &TeardownReport) -> Vec<String> {
         notes.extend(teardown_notes(report));
         notes
     }
@@ -4612,11 +4873,11 @@ pub mod db {
     /// canonical 3-activity workflow, under a bounded closed loop.
     ///
     /// A warmup population runs through the identical loop first and is
-    /// discarded, so pools are full and the planner has statistics on a
-    /// populated table; the headline is then the middle-half rate over the
-    /// measured population, which excludes both the ramp-up and the drain-down
-    /// tail. [`inflight_soundness`] is what stops a run the *harness* bounded
-    /// from being published as a fact about the engine.
+    /// discarded. So pools are full, and the planner has statistics on a
+    /// populated table. The headline is the middle-half rate over the measured
+    /// population, which excludes the ramp-up and the drain-down tail.
+    /// [`inflight_soundness`] stops a run the *harness* bounded from being
+    /// published as a fact about the engine.
     ///
     /// # Errors
     ///
@@ -4699,7 +4960,7 @@ pub mod db {
 
         // Completion instants come from the database clock (`completed_at`), so
         // the throughput headline carries no host-to-database skew term at all.
-        let mut completions: Vec<DateTime<Utc>> = Vec::new();
+        let mut completions: Vec<Timestamp> = Vec::new();
         let mut per_shard = Vec::new();
         for shard in &shards {
             let mut conn = cluster.connect(*shard).await;
@@ -4710,9 +4971,9 @@ pub mod db {
         completions.sort_unstable();
         let completed = completions.len();
 
-        // `completions[..]` rather than `.first()`: diesel's query DSL is in
-        // scope here, and probing `.first()` on a `Vec` sends the trait solver
-        // into overflow (the same E0275 `sharded_runtime_tests.rs` documents).
+        // A slice pattern, not `.first()`. Diesel's query DSL is in scope
+        // here, and `.first()` on a `Vec` overflows the trait solver. That is
+        // the E0275 that `sharded_runtime_tests.rs` documents.
         let epoch = match completions.as_slice() {
             [first, ..] => Some(*first),
             [] => None,
@@ -4726,7 +4987,7 @@ pub mod db {
                         reason = "a run lasts seconds; microsecond counts stay far below 2^53"
                     )]
                     {
-                        (*t - start).num_microseconds().unwrap_or(0) as f64 / 1e6
+                        autumn_harvest::time::num_microseconds(*t - start).unwrap_or(0) as f64 / 1e6
                     }
                 })
                 .collect()
@@ -4737,13 +4998,11 @@ pub mod db {
 
         // Per shard, and only over the window the headline is computed over.
         //
-        // Two separate corrections live in this one expression. The
-        // `steady_state_slice` keeps the evidence to the same middle-half window
-        // the rate uses -- the loop's drain-down tail decays to zero by
-        // construction, so a whole-loop mean measures the tail. And the
-        // per-shard grouping is retained rather than flattened, because a mean
-        // over every shard's samples lets three well-fed shards hide a fourth
-        // that the feeder could not keep up with.
+        // This expression holds two corrections. `steady_state_slice` keeps the
+        // evidence to the middle-half window the rate uses. The drain-down
+        // tail decays to zero by construction, so a whole-loop mean measures
+        // the tail. The per-shard grouping is kept, not flattened. A mean over
+        // every shard's samples lets three well-fed shards hide a starved one.
         let per_shard_flight: Vec<Option<f64>> = loops
             .iter()
             .map(|l| mean_inflight(steady_state_slice(&l.inflight_samples)))
@@ -4773,6 +5032,7 @@ pub mod db {
         );
         fleet.stop().await;
         let topology = cluster.topology;
+        let host_note = cluster.host_layout().note();
         drop(sharded);
         let teardown = cluster.teardown_with_stats(BenchScenario::Throughput).await;
         let wall_clock_note = budget_note(scenario_started, deadline, &mut unsound);
@@ -4798,6 +5058,7 @@ pub mod db {
                 vec![
                     shard_note(&per_shard),
                     format!("topology: {}", topology.as_str()),
+                    host_note,
                     resident_note,
                     decision_note,
                     format!("owner mode: {}", if owner_mode { "on" } else { "off" }),
@@ -4820,6 +5081,10 @@ pub mod db {
                     "the headline is the middle-half rate: the ramp-up and the drain-down tails \
                      are excluded, so it is a sustained rate rather than an average over a \
                      changing queue depth"
+                        .to_owned(),
+                    "a closed loop is latency-bound: this rate is the in-flight population \
+                     divided by the workflow latency, not the shard's capacity. The capacity \
+                     scenario measures capacity"
                         .to_owned(),
                     wall_clock_note,
                 ],
@@ -4850,21 +5115,21 @@ pub mod db {
         deadline: Instant,
         census: &super::TaskCensus,
     ) -> Vec<LoopOutcome> {
-        // A `JoinSet`, not loose `JoinHandle`s: if one shard's loop panics, the
-        // `expect` below unwinds and dropping loose handles would DETACH the
-        // siblings, leaving them inserting rows and holding connections until
-        // the 900s deadline while later cells of the sweep are being measured
-        // (Codex review round 3, PR #1282). Dropping a `JoinSet` aborts what it
-        // owns, so the containment in `benches/e2e_bench.rs` actually contains.
+        // A `JoinSet`, not loose `JoinHandle`s (PR #1282). If one shard's loop
+        // panics, the `expect` below unwinds. Dropping loose handles would
+        // then DETACH the siblings. They would keep inserting rows and holding
+        // connections until the 900s deadline, while later cells of the sweep
+        // are being measured. Dropping a `JoinSet` aborts what it owns, so the
+        // containment in `benches/e2e_bench.rs` actually contains.
         //
         // Each task also holds a `census` guard. Dropping the `JoinSet` on a
         // forced abort only requests cancellation, same as `Fleet`'s
         // handles. The caller needs the same way to learn once the feeder
         // connections these tasks own have actually closed.
         //
-        // Results come back in completion order, so each task carries its shard
-        // index and the outcomes are restored to shard order before returning --
-        // every per-shard verdict downstream is reported against a shard number.
+        // Results come back in completion order. So each task carries its
+        // shard index, and the outcomes return in shard order. Every per-shard
+        // verdict downstream is reported against a shard number.
         let mut tasks = tokio::task::JoinSet::new();
         for (idx, shard) in cluster.shard_ids().into_iter().enumerate() {
             let url = cluster.urls[&shard].clone();
@@ -5004,7 +5269,6 @@ pub mod db {
                 // exactly the saturation `pacing_verdict` exists to detect.
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 for i in 0..count {
-                    // The only measurement loop that used to run unbounded.
                     if Instant::now() >= deadline {
                         break;
                     }
@@ -5060,8 +5324,8 @@ pub mod db {
         let shards = cluster.shard_ids();
 
         // Probe the host-to-database offset BEFORE the window as well as after
-        // it: an offset measured only afterwards is not the offset that was in
-        // effect while the samples were taken.
+        // it. An offset measured only afterwards is not the one in effect
+        // during the samples.
         let mut offsets_before = Vec::new();
         for shard in &shards {
             let mut conn = cluster.connect(*shard).await;
@@ -5097,16 +5361,15 @@ pub mod db {
         let target = PACED_STARTS_PER_SEC_PER_SHARD * f64::from(shard_count);
 
         // FIRST-wins, matching the signal path's discipline. `collect()` into a
-        // map is last-wins, which would turn a re-delivered task row (a
-        // heartbeat-lease reclaim, a capability release) into a sample of the
-        // whole re-delivery delay -- a silently inflated tail with nothing to
-        // mark it. Duplicates are counted instead, and reported.
-        let mut starts: BTreeMap<Uuid, DateTime<Utc>> = BTreeMap::new();
+        // map is last-wins. A re-delivered task row (a heartbeat-lease reclaim,
+        // a capability release) would then sample the whole re-delivery delay.
+        // That silently inflates the tail. Duplicates are counted instead, and
+        // reported.
+        let mut starts: BTreeMap<Uuid, Timestamp> = BTreeMap::new();
         let mut redispatched = 0_usize;
         for (task_id, started) in observations.activity_starts() {
             if starts.insert(task_id, started).is_some() {
                 redispatched += 1;
-                // Keep the earliest.
                 let earliest = starts
                     .get(&task_id)
                     .copied()
@@ -5115,7 +5378,7 @@ pub mod db {
             }
         }
 
-        let mut samples: Vec<(DateTime<Utc>, f64)> = Vec::new();
+        let mut samples: Vec<(Timestamp, f64)> = Vec::new();
         let mut negative = 0_usize;
         let mut missing_created_at = 0_usize;
         let mut offsets = Vec::new();
@@ -5140,8 +5403,9 @@ pub mod db {
                         clippy::cast_precision_loss,
                         reason = "dispatch latencies are milliseconds, far below 2^53 microseconds"
                     )]
-                    let ms =
-                        (*started - created_at).num_microseconds().unwrap_or(0) as f64 / 1000.0;
+                    let ms = autumn_harvest::time::num_microseconds(*started - created_at)
+                        .unwrap_or(0) as f64
+                        / 1000.0;
                     if ms < 0.0 {
                         negative += 1;
                     }
@@ -5183,17 +5447,16 @@ pub mod db {
         let probe_notes = commit_probe_report(&cluster, "meas").await;
         fleet.stop().await;
         let topology = cluster.topology;
+        let host_note = cluster.host_layout().note();
         drop(sharded);
         let teardown = cluster
             .teardown_with_stats(BenchScenario::DispatchLatency)
             .await;
 
-        // NOT sorted. `offsets_before` is in shard order and both lists are
-        // rendered as per-shard in the notes, so sorting this one silently
-        // decouples the two -- and can contradict the shard-specific drift
-        // reason `clock_offset_soundness` produced from the same pair (Codex
-        // review, PR #1282). The sort was a leftover from when this was
-        // summarised as a single worst-case value.
+        // NOT sorted (PR #1282). `offsets_before` is in shard order, and the
+        // notes render both lists per shard. Sorting this one decouples the
+        // two. It can contradict the shard-specific drift reason that
+        // `clock_offset_soundness` produced from the same pair.
         let wall_clock_note = budget_note(scenario_started, deadline, &mut unsound);
         let publish = unsound.is_empty();
         #[allow(
@@ -5215,6 +5478,7 @@ pub mod db {
                 vec![
                     shard_note(&per_shard),
                     format!("topology: {}", topology.as_str()),
+                    host_note,
                     format!("target pace: {target:.1} workflow starts/s"),
                     format!(
                         "host-to-database clock offset before the window: {} ms (per shard, \
@@ -5251,24 +5515,23 @@ pub mod db {
     /// Returns the per-execution send instants, the achieved rate for each
     /// shard, and how many requests did not return 200.
     ///
-    /// One sender per shard rather than one over a flattened list is the whole
-    /// point (Codex review, PR #1282). A single sender walking a
-    /// shard-by-shard list at the aggregate rate drives shard 0 at
-    /// `8 * shards` signals/sec while its peers sit idle, then moves on to
-    /// shard 1. The aggregate pacing check still passes, and the multi-shard
-    /// percentiles it publishes are those of one *saturated* shard rather than
-    /// of the unsaturated sweep the page describes. The per-shard rates
-    /// returned here are what [`per_shard_pacing_verdict`] checks, so that
-    /// failure mode is caught rather than averaged away.
+    /// One sender per shard, not one over a flattened list, is the whole point
+    /// (PR #1282). A single sender walks a shard-by-shard list at the
+    /// aggregate rate. It drives shard 0 at `8 * shards` signals/sec while its
+    /// peers sit idle, then moves on to shard 1. The aggregate pacing check
+    /// still passes. But the multi-shard percentiles are those of one
+    /// *saturated* shard, not of the unsaturated sweep the page describes.
+    /// [`per_shard_pacing_verdict`] checks the per-shard rates returned here.
+    /// So that failure mode is caught, not averaged away.
     async fn paced_signals(
         addr: std::net::SocketAddr,
         by_shard: &[Vec<ExecutionId>],
         deadline: Instant,
     ) -> (Vec<(ExecutionId, Instant)>, Vec<f64>, usize) {
         let period = std::time::Duration::from_secs_f64(1.0 / PACED_STARTS_PER_SEC_PER_SHARD);
-        // `JoinSet` for the same reason as `run_closed_loop`, and indexed for the
-        // same reason: `achieved_per_shard` is reported and gated per shard, so
-        // completion order would mislabel which shard missed its pace.
+        // `JoinSet` and shard indexes for the same reasons as `run_closed_loop`.
+        // `achieved_per_shard` is reported and gated per shard. Completion
+        // order would mislabel which shard missed its pace.
         let mut tasks = tokio::task::JoinSet::new();
         for (idx, ids) in by_shard.iter().enumerate() {
             let ids = ids.clone();
@@ -5293,8 +5556,8 @@ pub mod db {
                     sent.push((exec_id, sent_at));
                 }
                 // `interval`'s first tick fires immediately, so n sends span
-                // n-1 periods; dividing by n would overstate the achieved rate
-                // and bias this gate in the optimistic direction.
+                // n-1 periods. Dividing by n would overstate the achieved rate
+                // and bias this gate towards a pass.
                 #[allow(
                     clippy::cast_precision_loss,
                     reason = "signal counts here are far below 2^53"
@@ -5351,10 +5614,10 @@ pub mod db {
         let server = match spawn_signal_server(sharded.clone(), census).await {
             Ok(server) => server,
             Err(e) => {
-                // Tear down before returning: `ShardCluster` has no `Drop`
-                // (dropping databases is async), so an early return that skips
-                // this leaves freshly migrated databases on the operator's
-                // server -- exactly what `teardown` exists to prevent.
+                // Tear down before returning. `ShardCluster` has no `Drop`,
+                // because dropping databases is async. An early return that
+                // skips this leaves freshly migrated databases on the
+                // operator's server.
                 fleet.stop().await;
                 drop(sharded);
                 let _ = cluster.teardown().await;
@@ -5363,11 +5626,8 @@ pub mod db {
         };
 
         let warm_per_shard = warmup_batch_for(SIGNAL_WORKFLOWS_PER_SHARD);
-        // Kept GROUPED BY SHARD, not flattened. Signalling a flat list from one
-        // paced sender drives shard 0 at the whole aggregate rate while its
-        // peers idle, then moves on to shard 1 -- the aggregate pace looks
-        // right and the load shape is nothing like the documented one, so the
-        // percentiles describe a saturated single shard. See `paced_signals`.
+        // Kept GROUPED BY SHARD, not flattened. One paced sender over a flat
+        // list saturates one shard at a time. See `paced_signals`.
         let mut warm_by_shard: Vec<Vec<ExecutionId>> = Vec::new();
         let mut measured_by_shard: Vec<Vec<ExecutionId>> = Vec::new();
         for shard in &shards {
@@ -5400,26 +5660,24 @@ pub mod db {
         // includes the workflow's own first dispatch instead of the round trip.
         //
         // The readiness signal is the handler reaching `wait_for_signal`, not
-        // anything in the task queue: parking a workflow task leaves the row in
-        // `RUNNING` with only `wake_requested` cleared (see
-        // `queue::park_workflow_task`), so "no RUNNING workflow tasks" is not a
-        // condition a parked population can ever satisfy — waiting for it would
-        // burn the whole scenario budget and then measure nothing.
+        // anything in the task queue. Parking a workflow task leaves the row in
+        // `RUNNING` and clears only `wake_requested` (see
+        // `queue::park_workflow_task`). So a parked population never satisfies
+        // "no RUNNING workflow tasks". A wait for it would burn the whole
+        // scenario budget and then measure nothing.
         while observations.parked_count() < total && Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         let parked = observations.parked_count();
-        // `record_parked` runs on entry to the handler; the suspension commits a
-        // moment later. Settle generously — the residual window is sub-millisecond
-        // and this is seconds — and see "Known limitations" in
-        // `docs/benchmarks.md`, which states the window rather than pretending it
-        // is closed.
+        // `record_parked` runs on entry to the handler. The suspension commits
+        // a moment later. Settle generously: the residual window is
+        // sub-millisecond, and this is seconds. "Known limitations" in
+        // `docs/benchmarks.md` states the window.
         tokio::time::sleep(SIGNAL_PARK_SETTLE).await;
 
         // Warmup cohort: signalled through the identical path, and every sample
-        // discarded. Keeping the two cohorts separate — rather than signalling
-        // one list and trimming a fraction off the front — is what makes "the
-        // published percentiles contain no warmup sample" true by construction.
+        // discarded. Separate cohorts, not one trimmed list, keep every warmup
+        // sample out of the published percentiles by construction.
         paced_signals(server.addr, &warm_by_shard, deadline).await;
         let warm_drained = wait_for_completions(&cluster, "warm", warm_count, deadline).await;
 
@@ -5486,6 +5744,7 @@ pub mod db {
         server.stop();
         fleet.stop().await;
         let topology = cluster.topology;
+        let host_note = cluster.host_layout().note();
         drop(sharded);
         let teardown = cluster
             .teardown_with_stats(BenchScenario::SignalRoundtrip)
@@ -5511,6 +5770,7 @@ pub mod db {
                 vec![
                     shard_note(&per_shard),
                     format!("topology: {}", topology.as_str()),
+                    host_note,
                     format!(
                         "target pace: {PACED_STARTS_PER_SEC_PER_SHARD:.1} signals/s per shard, \
                          one paced sender per shard running concurrently; achieved {}/s",

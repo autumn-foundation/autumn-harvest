@@ -18,6 +18,7 @@ categories = ["command-line-utilities", "asynchronous"]
 default-run = "harvest"
 
 [dependencies]
+jiff = { workspace = true }
 # `db` is enabled UNCONDITIONALLY (not behind a CLI Cargo feature) so every CI
 # lint/test leg covers `backup verify` (issue #943). Diesel's `postgres_backend`
 # and diesel-async/tokio-postgres are pure Rust, so the Windows/macOS CI legs
@@ -26,7 +27,7 @@ default-run = "harvest"
 # `tls` gives `harvest dr` and `harvest backup verify` the `pg_tls` connector,
 # so a managed Postgres that refuses plaintext is reachable. Its rustls crates
 # are the ones `harvest migrate` already uses.
-autumn-harvest = { version = "0.10.0", path = "../autumn-harvest", default-features = false, features = ["db", "testing", "debugger", "tls"] }
+autumn-harvest = { version = "0.11.0", path = "../autumn-harvest", default-features = false, features = ["db", "testing", "debugger", "tls"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 # `harvest migrate` builds its own Postgres connection so it can offer TLS,
 # which `AsyncPgConnection::establish` (NoTls) cannot -- a managed Harvest
@@ -60,9 +61,6 @@ name = "harvest-replay"
 path = "src/bin/harvest_replay.rs"
 
 [dev-dependencies]
-# Already in the graph via `autumn-harvest`; a dev-dep so the integration test
-# binaries can stamp a `RestoreVerifyReport::generated_at` directly.
-chrono = { workspace = true }
 tempfile = "3"
 
 [[test]]

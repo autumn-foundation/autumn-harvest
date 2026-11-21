@@ -17,8 +17,8 @@
 //!
 //! `check_and_report_unfinished_handlers_batch` replaces the loop with one
 //! `eq_any` query, [`autumn_harvest::store::load_histories_undecoded_batch`].
-//! It is backed by the same `idx_harvest_events_exec (workflow_exec_id,
-//! event_id)` index the single-execution loader already used, so the fix
+//! It is backed by the same `(workflow_exec_id, event_id)` unique key the
+//! single-execution loader already used, so the fix
 //! needs no schema change.
 //!
 //! Two tests:
@@ -71,24 +71,20 @@ impl MetricsRecorder for UnfinishedHandlerRecorder {
     }
 }
 
-/// A deterministic, moderate-depth history. It holds one `WorkflowStarted`,
-/// a run of `SignalReceived` filler events, and -- for a fraction of
-/// children -- a trailing `UpdateAdmitted` with no matching
-/// `UpdateCompleted`/`UpdateFailed`. `SignalReceived` is a real,
-/// minimal-field event type, not one invented for this fixture. The
-/// trailing shape is exactly what `unfinished_update_handler_count_at_end`
-/// exists to detect.
+/// A deterministic, moderate-depth history: one `WorkflowStarted`, then
+/// `SignalReceived` filler events. For a fraction of children, a trailing
+/// `UpdateAdmitted` has no matching `UpdateCompleted`/`UpdateFailed`. That
+/// trailing shape is what `unfinished_update_handler_count_at_end` detects.
+/// `SignalReceived` is a real, minimal-field event type.
 ///
-/// `events_per_child` mirrors a real, moderately active workflow's history
-/// depth, not a toy 1-2 event fixture. It is large enough that the
-/// per-child `SELECT` this test measures touches a realistic number of
-/// heap/index pages. A single-row lookup would understate the loop's real
-/// cost.
+/// `events_per_child` mirrors the history depth of a moderately active
+/// workflow. The per-child `SELECT` then touches a realistic number of
+/// heap/index pages. A single-row lookup would understate the loop's cost.
 fn history_for(i: usize, events_per_child: usize, unfinished: bool) -> Vec<WorkflowEvent> {
     let mut events = Vec::with_capacity(events_per_child);
     events.push(WorkflowEvent::WorkflowStarted {
         input: serde_json::json!({ "seed": i }),
-        timestamp: chrono::Utc::now(),
+        timestamp: jiff::Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -105,7 +101,7 @@ fn history_for(i: usize, events_per_child: usize, unfinished: bool) -> Vec<Workf
             update_id: UpdateId::new(),
             name: "pending_update".to_string(),
             input: serde_json::json!({ "child": i }),
-            timestamp: chrono::Utc::now(),
+            timestamp: jiff::Timestamp::now(),
         });
     } else {
         events.push(WorkflowEvent::WorkflowCompleted {

@@ -31,7 +31,7 @@
 //!
 //! # Nondeterminism
 //!
-//! `model_turn_in` reads `Utc::now`, and the turn body reads `Instant::now`.
+//! `model_turn_in` reads `Timestamp::now`, and the turn body reads `Instant::now`.
 //! `decide_calls` and each `tokio::time::timeout` read the tokio clock. The
 //! response cache stamps each entry with the system clock. The transcript
 //! store and the cache index are `HashMap`s with a random seed. No clock

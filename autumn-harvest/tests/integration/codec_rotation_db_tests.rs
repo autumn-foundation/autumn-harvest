@@ -8,8 +8,8 @@
 //!
 //! - **AC1** (`kid` in the envelope; kid-less rows resolve to the legacy key
 //!   id) — [`a_kidless_pre_upgrade_row_is_swept_onto_the_active_key`] proves the
-//!   stored-bytes half end to end; the envelope shape itself is pinned by
-//!   `payload_codec.rs`'s own unit tests.
+//!   stored-bytes half end to end. The unit tests in `payload_codec.rs` pin the
+//!   envelope shape.
 //! - **AC2** (a flip takes effect for all new writes, no restart window) —
 //!   [`new_writes_land_under_the_new_key_immediately_after_a_flip`].
 //! - **AC3** (decode resolves any registered key; mixed histories replay) —
@@ -51,7 +51,7 @@
 //!   [`an_ordinary_advancing_write_does_not_reset_the_revalidation_deadline`],
 //!   [`a_busy_shard_still_revalidates_once_the_deadline_is_due`],
 //!   [`a_fresh_pass_under_a_different_key_arms_its_own_deadline`], and
-//!   [`a_claimed_idle_revalidation_still_bumps_updated_at`] (Codex review).
+//!   [`a_claimed_idle_revalidation_still_bumps_updated_at`].
 //!
 //! # Issue #1244: the two structural fleet-wide preconditions
 //!
@@ -68,10 +68,11 @@
 //! - **Bounded staleness** —
 //!   [`refresh_active_codec_key_picks_up_a_fleet_wide_activation_from_another_process`].
 //!
-//! Runs against `HARVEST_TEST_DATABASE_URL` when set (each test gets its own
-//! throwaway database, because the rotation census is shard-wide by design),
-//! otherwise against a per-test Postgres container.
+//! Runs against `HARVEST_TEST_DATABASE_URL` when set, otherwise against a
+//! per-test Postgres container. Each test gets its own throwaway database,
+//! because the rotation census is shard-wide by design.
 
+use jiff_diesel::ToDiesel;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -96,9 +97,9 @@ use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics};
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest::types::{ExecutionId, ShardId};
 
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
@@ -124,8 +125,8 @@ async fn commit_as_erasure(conn: &mut AsyncPgConnection, row_id: i64, data: &Val
 
 // ── codecs ───────────────────────────────────────────────────────────────────
 
-/// Two instances differ only in key material — exactly the shape rotation has
-/// to cope with, and exactly why a key id cannot live in `codec_id`.
+/// Two instances differ only in key material. Rotation must cope with that
+/// shape, so a key id cannot live in `codec_id`.
 #[derive(Debug)]
 struct XorCodec(u8);
 
@@ -161,8 +162,8 @@ impl MetricsRecorder for CountingMetrics {
 
 /// A migrated Postgres that no other test shares.
 ///
-/// The rotation census counts every `harvest_events` row on the shard — that is
-/// the point of it — so these tests cannot share a database with anything else.
+/// The rotation census counts every `harvest_events` row on the shard. So these
+/// tests cannot share a database with anything else.
 async fn setup_isolated_db() -> (String, Option<ContainerAsync<Postgres>>) {
     if let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
         let db_name = format!("harvest_codec_rot_{}", Uuid::new_v4().simple());
@@ -290,7 +291,7 @@ async fn append_under_key(
 fn started(input: Value) -> WorkflowEvent {
     WorkflowEvent::WorkflowStarted {
         input,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -445,7 +446,6 @@ async fn a_kidless_pre_upgrade_row_is_swept_onto_the_active_key() {
         "the fixture really is a kid-less pre-upgrade row"
     );
 
-    // Rotate onto k2 and sweep.
     codecs
         .register_key("k2", Arc::new(XorCodec(0x22)))
         .expect("register k2");
@@ -627,15 +627,13 @@ async fn a_zero_batch_size_disables_the_sweep() {
 
 #[tokio::test]
 async fn a_converted_shard_stops_rewriting_its_cursor_every_tick() {
-    // Codex round 9 (P2). On a fully-converted shard the batch query returns
-    // nothing, the pass is already stamped complete, and the computed cursor is
-    // byte-identical to the stored one -- but the sweep upserted it anyway on
-    // every scanner tick. For a deployment that simply keeps a keyed codec
-    // configured that is unbounded WAL and dead tuples per shard, and an
-    // `updated_at` that reads as freshly active while no work is happening.
+    // On a fully-converted shard the batch query returns nothing. The pass is
+    // already stamped complete, and the computed cursor equals the stored one.
+    // The sweep still upserted it on every scanner tick. A deployment that
+    // keeps a keyed codec configured then gets unbounded WAL and dead tuples
+    // per shard. Its `updated_at` also reads as active while no work happens.
     //
-    // `updated_at` is the observable: it moves only when the row is actually
-    // written, so it is the thing to pin.
+    // `updated_at` moves only when the row is written, so the test pins it.
     let (url, _c) = setup_isolated_db().await;
     let mut conn = connect(&url).await;
     let codecs = two_key_registry();
@@ -1033,7 +1031,7 @@ async fn continue_as_new_decodes_the_carried_codec_envelope_before_reencoding_it
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: json!({}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: Some(secret_output.clone()),
             last_error: None,
             scheduled_time: None,
@@ -1046,7 +1044,7 @@ async fn continue_as_new_decodes_the_carried_codec_envelope_before_reencoding_it
 
     let mut enqueue = EnqueueParams::new("default", TaskType::Workflow, json!({}));
     enqueue.workflow_exec_id = Some(exec_id.as_uuid());
-    enqueue.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    enqueue.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     queue::enqueue(&mut conn, &enqueue)
         .await
         .expect("enqueue task");
@@ -1057,7 +1055,7 @@ async fn continue_as_new_decodes_the_carried_codec_envelope_before_reencoding_it
     .set((
         harvest_task_queue::state.eq("RUNNING"),
         harvest_task_queue::worker_id.eq(Some("worker-a")),
-        harvest_task_queue::started_at.eq(Some(Utc::now())),
+        harvest_task_queue::started_at.eq(Some(Timestamp::now()).to_diesel()),
     ))
     .execute(&mut conn)
     .await
@@ -1189,12 +1187,12 @@ async fn an_erasure_tombstone_committed_before_the_sweep_is_never_overwritten() 
 
 #[tokio::test]
 async fn a_stale_read_can_never_overwrite_a_committed_erasure() {
-    // The compare-and-swap guard itself, exercised directly. This is the
-    // interleaving the batch-oriented sweep entry point cannot express: the
-    // sweep reads a row, a PII erasure (#495) tombstones it and COMMITS, and
-    // only then does the sweep try to write its re-encrypted copy back.
-    // Without the CAS that write would resurrect payload data the erasure had
-    // just destroyed — the P1 this design exists to foreclose.
+    // The compare-and-swap guard itself, exercised directly. The batch sweep
+    // entry point cannot express this interleaving. The sweep reads a row. A
+    // PII erasure (#495) tombstones it and COMMITS. Only then does the sweep
+    // try to write its re-encrypted copy back. Without the CAS, that write
+    // resurrects payload data that the erasure just destroyed. The CAS exists
+    // to prevent exactly that.
     use autumn_harvest::codec_rotation::{compare_and_swap_event, reencrypt_event_payload_fields};
     use autumn_harvest::schema::harvest_events;
 
@@ -2193,10 +2191,10 @@ async fn the_sweep_records_the_reencrypted_metric() {
 
 #[tokio::test]
 async fn a_near_envelope_is_neither_counted_nor_swept() {
-    // The census SQL mirrors `codec_envelope_parts` exactly: a four-key object
+    // The census SQL mirrors `codec_envelope_parts` exactly. A four-key object
     // whose fourth key is not a string `kid` is not an envelope, in Postgres
-    // just as in Rust. If the two drifted, the retirement gate would either
-    // block forever or open early.
+    // and in Rust. If the two drifted, the retirement gate would either block
+    // forever or open early.
     use autumn_harvest::schema::harvest_events;
 
     let (url, _c) = setup_isolated_db().await;
@@ -2260,8 +2258,8 @@ async fn a_near_envelope_is_neither_counted_nor_swept() {
 }
 
 /// The SQL census must agree with Rust that a four-key **version 1** value is
-/// plaintext, not an envelope — otherwise it would count business data that the
-/// sweep can never convert and block retirement forever.
+/// plaintext, not an envelope. Otherwise it counts business data that the sweep
+/// can never convert, and blocks retirement forever.
 #[tokio::test]
 async fn a_four_key_version_1_payload_is_not_counted_by_the_census() {
     use autumn_harvest::schema::harvest_events;
@@ -2525,10 +2523,10 @@ async fn a_registry_with_no_keyed_codecs_sweeps_nothing_and_writes_no_cursor() {
 
 /// A rotation that is later ROLLED BACK must rescan the shard.
 ///
-/// The cursor deliberately carries the target key id as a column rather than as
-/// part of its key: resuming a rolled-back-to key's own already-completed pass
-/// would skip every row written under the key being rolled back FROM, and leave
-/// that key permanently unretirable.
+/// The cursor carries the target key id as a column, not as part of its key.
+/// Resuming the completed pass of the rolled-back-to key would skip every row
+/// written under the key being rolled back FROM. That key would then stay
+/// unretirable forever.
 #[tokio::test]
 async fn rolling_back_to_a_previous_key_rescans_the_shard() {
     let (url, _c) = setup_isolated_db().await;
@@ -2586,12 +2584,12 @@ async fn rolling_back_to_a_previous_key_rescans_the_shard() {
 
 /// A row the pass could not convert must not be abandoned behind the cursor.
 ///
-/// The failure this guards is a two-phase rollout that activates the new key
-/// before every process has the outgoing key registered: without the
-/// unresolved-row accounting the pass would log each undecodable row, march the
-/// cursor to the end of the shard, stamp itself complete, and leave those rows
-/// on the retired key forever — with a manual `DELETE` on the cursor table as
-/// the only recovery.
+/// The failure is a two-phase rollout that activates the new key before every
+/// process has the outgoing key registered. Without the unresolved-row
+/// accounting, the pass logs each undecodable row and moves the cursor to the
+/// end of the shard. It then stamps itself complete and leaves those rows on
+/// the retired key forever. A manual `DELETE` on the cursor table is then the
+/// only recovery.
 #[tokio::test]
 async fn an_unconvertible_row_is_retried_once_its_key_comes_back() {
     let (url, _c) = setup_isolated_db().await;
@@ -2701,8 +2699,8 @@ async fn retirement_fails_closed_when_a_shards_census_errors() {
     assert!(codecs.codec_for_key("k1").is_some());
 }
 
-/// Retirement must refuse a shard list that omits a shard this process can see:
-/// an omitted shard is never censused, so `Ok` for it would be vacuous.
+/// Retirement must refuse a shard list that omits a shard this process can see.
+/// An omitted shard is never censused, so `Ok` for it would be vacuous.
 #[tokio::test]
 async fn retirement_refuses_a_shard_list_that_omits_a_known_shard() {
     let (url, _c) = setup_isolated_db().await;
@@ -2755,19 +2753,19 @@ async fn retirement_refuses_an_unregistered_key_id() {
 /// actually run from `enforce_timeouts_once`, not only when called directly.
 #[tokio::test]
 async fn a_failing_sweep_does_not_strand_the_later_timeout_residents() {
-    // Codex round 5 (P1): the sweep runs before `reclaim_expired_leases_and_wake`
-    // in `enforce_timeouts_once`. Propagating its error would return from the
-    // pass early, so a PERSISTENT rotation failure -- missing grants on the
-    // cursor table or on `UPDATE harvest_events`, which repeat identically
-    // every tick -- would stop expired durable-mutex leases being reclaimed on
-    // that shard, stranding the workflows waiting on them. Rotation is new and
+    // The sweep runs before `reclaim_expired_leases_and_wake` in
+    // `enforce_timeouts_once`. Propagating its error would return from the
+    // pass early. Take a PERSISTENT rotation failure, such as missing grants on
+    // the cursor table or on `UPDATE harvest_events`. It repeats identically
+    // every tick. It would stop the reclaim of expired durable-mutex leases on
+    // that shard and strand the workflows waiting on them. Rotation is new and
     // optional; mutex reclamation is neither, and a new feature must not be
     // able to break an old one by failing.
     //
-    // Breaking the cursor table's SCHEMA (rather than dropping it) is what
-    // makes this test target the sweep alone: `cursor_table_present` still
-    // reports true, so the sweep proceeds and fails on the column, while every
-    // other resident of the pass is untouched.
+    // The test breaks the SCHEMA of the cursor table instead of dropping it.
+    // That targets the sweep alone. `cursor_table_present` still reports true,
+    // so the sweep proceeds and fails on the column. Every other resident of
+    // the pass is untouched.
     let (url, _c) = setup_isolated_db().await;
     let mut conn = connect(&url).await;
     let codecs = two_key_registry();
@@ -2857,10 +2855,9 @@ async fn the_sweep_runs_as_a_resident_of_the_timeout_scanner() {
 /// A `kid` read back out of STORAGE is untrusted input.
 ///
 /// On a deployment with no non-identity codec, a caller's workflow input is
-/// stored verbatim — so envelope-shaped input carrying an arbitrary `kid` would
-/// otherwise inject an attacker-chosen, unbounded key into the rotation census
-/// and keep `rows_remaining` permanently non-zero, denying the retirement
-/// procedure outright.
+/// stored verbatim. Envelope-shaped input with an arbitrary `kid` could then
+/// inject an attacker-chosen, unbounded key into the rotation census. That
+/// keeps `rows_remaining` non-zero forever and blocks the retirement procedure.
 #[tokio::test]
 async fn a_crafted_key_id_in_stored_input_is_not_counted() {
     use autumn_harvest::schema::harvest_events;
@@ -2924,14 +2921,13 @@ async fn a_crafted_key_id_in_stored_input_is_not_counted() {
 
 /// Every shard in one fan-out must classify against the **same** active key.
 ///
-/// `GET /admin/codec/rotation` reads each shard on its own connection, so a
-/// `set_active_key` landing mid-fan-out would otherwise have some shards
-/// classify their rows against the outgoing key (counting them as converted)
-/// and later shards against the incoming one (counting them as remaining) --
-/// with the response advertising whichever key was active when the aggregate
-/// was assembled. `rows_remaining_total: 0` under the *new* key, while rows
-/// under the old key are still out there, is exactly the reading the runbook
-/// tells an operator to treat as "safe to retire".
+/// `GET /admin/codec/rotation` reads each shard on its own connection. A
+/// `set_active_key` mid-fan-out could make some shards classify their rows
+/// against the outgoing key, as converted. Later shards then classify against
+/// the incoming key, as remaining. The response advertises the key that was
+/// active when the aggregate was assembled. It can show
+/// `rows_remaining_total: 0` under the *new* key while old-key rows remain.
+/// The runbook tells an operator to treat that reading as "safe to retire".
 ///
 /// This pins the mechanism the endpoint relies on: classification is against a
 /// caller-supplied key, so the caller can pin one for the whole fan-out.
@@ -2964,8 +2960,8 @@ async fn shard_progress_classifies_against_the_pinned_key_not_the_live_one() {
         "against the live key, the k1 row is outstanding"
     );
 
-    // Pinned to k1 -- the key that was active when an earlier shard in the same
-    // fan-out was read -- the very same row classifies as already converted.
+    // Pinned to k1, the key that was active for an earlier shard in the same
+    // fan-out, the same row classifies as already converted.
     let pinned = load_shard_rotation_progress_against(&mut conn, 0, &codecs, "k1")
         .await
         .expect("pinned progress");
@@ -3021,21 +3017,21 @@ async fn insert_event_at_id(
 /// A row that commits *below* the cursor must still be converted.
 ///
 /// `harvest_events.id` is a `BIGSERIAL`, so an INSERT allocates its id before it
-/// commits. A sweep running concurrently can scan past an id that is not yet
-/// visible, mark the pass complete, and leave that row behind the cursor once it
-/// does commit -- where `WHERE id > resume_from` never looks again.
+/// commits. A concurrent sweep can scan past an id that is not yet visible and
+/// mark the pass complete. Once that row commits, it is behind the cursor, where
+/// `WHERE id > resume_from` never looks again.
 ///
 /// The existing reset covers rows a pass *saw and failed to convert*
 /// (`unresolved_rows`). It cannot cover a row the pass never saw: nothing
 /// counted it, so the pass looked clean and recorded `completed_at`.
 ///
-/// The consequence is a deadlock of the procedure rather than data loss: the
-/// census keeps reporting the outgoing key, `retire_codec_key` keeps refusing,
-/// and rotation can never finish without someone resetting the cursor by hand.
+/// The consequence is a deadlock of the procedure, not data loss. The census
+/// keeps reporting the outgoing key, and `retire_codec_key` keeps refusing.
+/// Rotation cannot finish until someone resets the cursor by hand.
 ///
-/// This builds the end state directly -- a committed old-key row below a
-/// completed cursor -- rather than racing an uncommitted INSERT against the
-/// sweep, which would be timing-dependent and flaky in both directions.
+/// This builds the end state directly: a committed old-key row below a
+/// completed cursor. Racing an uncommitted INSERT against the sweep would be
+/// timing-dependent and flaky in both directions.
 #[tokio::test]
 async fn a_row_committing_below_the_cursor_is_still_converted() {
     let (url, _c) = setup_isolated_db().await;
@@ -3120,16 +3116,16 @@ async fn a_row_committing_below_the_cursor_is_still_converted() {
 /// A cursor belonging to a *different* key must not be reported as the active
 /// key's.
 ///
-/// `ShardRotationProgress::cursor` is documented as the resume cursor for the
-/// active key's pass, and the sweep already honours that: it filters a stored
-/// cursor by `active_key_id` before resuming, precisely so a rollback cannot
-/// resume a pass the rolled-back-to key finished long ago.
+/// `ShardRotationProgress::cursor` is the resume cursor for the pass of the
+/// active key. The sweep filters a stored cursor by `active_key_id` before it
+/// resumes. So a rollback cannot resume a pass that the rolled-back-to key
+/// finished long ago.
 ///
 /// The reporting path did not apply the same filter. Between a key flip and
-/// that shard's next sweep tick, `GET /admin/codec/rotation` would hand back
-/// the *previous* key's completed cursor beside the new `active_key_id` --
-/// which reads as "the new rotation is already done" to anyone consuming the
-/// endpoint, including the operator the runbook sends there.
+/// the next sweep tick of that shard, `GET /admin/codec/rotation` returned the
+/// completed cursor of the *previous* key beside the new `active_key_id`. Any
+/// consumer reads that as "the new rotation is already done". That includes
+/// the operator whom the runbook sends there.
 #[tokio::test]
 async fn a_cursor_from_another_key_is_not_reported_as_the_active_keys() {
     let (url, _c) = setup_isolated_db().await;
@@ -3179,14 +3175,14 @@ async fn a_cursor_from_another_key_is_not_reported_as_the_active_keys() {
 /// A converged shard keeps receiving new events. They arrive already under the
 /// active key, so there is nothing to convert -- but the sweep still reads and
 /// deserializes them. If the cursor does not advance past them, the next tick
-/// re-reads the same rows, and the one after that re-reads them plus whatever
-/// arrived since, until the batch limit or the five-minute revalidation clock
-/// finally moves it. On a continuously active shard at a 500 ms tick that is
-/// read amplification bounded only by `batch_limit`.
+/// re-reads the same rows. Each later tick re-reads them plus all new arrivals.
+/// That stops only when the batch limit or the five-minute revalidation clock
+/// moves the cursor. On an active shard at a 500 ms tick, only `batch_limit`
+/// bounds that read amplification.
 ///
-/// `highest_id` is the right value in both cases by construction: it is the max
-/// id examined, and falls back to the resume point when the batch was empty --
-/// so using it costs nothing in the steady state and fixes the active one.
+/// `highest_id` is correct in both cases by construction. It is the max id
+/// examined, and it falls back to the resume point when the batch is empty.
+/// So it costs nothing in the steady state and fixes the active one.
 #[tokio::test]
 async fn a_completed_cursor_advances_over_rows_it_has_examined() {
     let (url, _c) = setup_isolated_db().await;
@@ -3653,7 +3649,7 @@ async fn a_fresh_pass_under_a_different_key_arms_its_own_deadline() {
         .next_revalidation_at
         .expect("a completed pass must have an armed deadline");
     assert!(
-        deadline > Utc::now(),
+        deadline > Timestamp::now(),
         "a fresh pass under a different key must arm its own deadline, not \
          inherit the previous key's stale one; got {deadline:?}"
     );
@@ -3762,13 +3758,14 @@ const COLUMN_START_HEADERS: &str = "column-start-headers";
 const COLUMN_START_MEMO: &str = "column-start-memo";
 const COLUMN_TASK_HEADERS: &str = "column-task-headers";
 const COLUMN_ENTITY_STATE: &str = "column-entity-state";
+const COLUMN_SCHEDULE_OVERRIDE: &str = "column-schedule-override";
 
 /// The cells one [`seed_codec_columns`] call writes. A workflow task row and
 /// an activity task row each hold an input and an output. The activity row
 /// also holds a heartbeat. The event batch buffer holds one element, and the
 /// census counts its row once. Every other swept column holds one cell.
 /// `the_seed_covers_every_codec_column` pins this to `CODEC_COLUMNS`.
-const CELLS_PER_SEED: usize = 28;
+const CELLS_PER_SEED: usize = 29;
 
 /// Write one envelope under `key_id` into every swept codec column.
 async fn seed_codec_columns(
@@ -3986,6 +3983,17 @@ async fn seed_short_lived_columns(
     .execute(conn)
     .await
     .expect("insert entity state");
+
+    // The input of a schedule override.
+    diesel::sql_query(
+        "INSERT INTO harvest_schedule_overrides (kind, name, workflow_input, updated_by) \
+         VALUES ('workflow', $1, $2, 'test')",
+    )
+    .bind::<Text, _>(format!("column_rotation_{}", Uuid::new_v4().simple()))
+    .bind::<Jsonb, _>(cell(COLUMN_SCHEDULE_OVERRIDE))
+    .execute(conn)
+    .await
+    .expect("insert schedule override");
 }
 
 /// Insert one event batch row that buffers `elements` (issue #2043).
@@ -4069,6 +4077,8 @@ async fn codec_cells(conn: &mut AsyncPgConnection) -> Vec<(String, Value)> {
            UNION ALL SELECT 25, id::TEXT, 'batch_memo', start_options -> 'memo' \
              FROM harvest_event_batches WHERE start_options -> 'memo' IS NOT NULL \
            UNION ALL SELECT 26, id::TEXT, 'entity_state', snapshot FROM harvest_entity_state \
+           UNION ALL SELECT 27, id::TEXT, 'schedule_override', workflow_input \
+             FROM harvest_schedule_overrides WHERE workflow_input IS NOT NULL \
          ) c ORDER BY ord, row_id",
     )
     .load(conn)
@@ -4770,5 +4780,133 @@ async fn two_schemas_in_one_database_keep_separate_column_cursors() {
         total_b,
         2 * CELLS_PER_SEED,
         "schema tenant_b converts every cell"
+    );
+}
+
+/// AC2 of the schedule input override: a rotation moves the stored override
+/// input onto the active key. The plaintext stays the same, and the next fire
+/// still starts on it.
+#[tokio::test]
+async fn a_rotated_schedule_override_input_keeps_its_plaintext() {
+    use autumn_harvest::scheduler::{
+        WorkflowOverrideRequest, WorkflowSchedulePatch, update_code_declared_workflow_schedule,
+    };
+
+    #[derive(diesel::QueryableByName)]
+    struct Cell {
+        #[diesel(sql_type = diesel::sql_types::Jsonb)]
+        value: Value,
+    }
+    #[derive(diesel::QueryableByName)]
+    struct Id {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: Uuid,
+    }
+
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_aead_key_registry();
+    codecs.set_column_encoding(true);
+    let name = "rotated_override";
+    let mut code = autumn_harvest::WorkflowSchedule::new(
+        name,
+        autumn_harvest::Schedule::Interval(Duration::from_secs(3600)),
+    );
+    code.input = json!({"env": "A"});
+    autumn_harvest::register_workflow_schedules_with_codecs(
+        &mut conn,
+        std::slice::from_ref(&code),
+        &codecs,
+    )
+    .await
+    .expect("register");
+    let id: Id = diesel::sql_query("SELECT id FROM harvest_schedules WHERE workflow_name = $1")
+        .bind::<diesel::sql_types::Text, _>(name)
+        .get_result(&mut conn)
+        .await
+        .expect("schedule id");
+    let plaintext = json!({"env": "B"});
+    let patch = WorkflowSchedulePatch {
+        input: Some(plaintext.clone()),
+        ..WorkflowSchedulePatch::default()
+    };
+    let request = WorkflowOverrideRequest {
+        schedule_id: id.id,
+        code: &code,
+        patch: &patch,
+        clear: false,
+        actor: "ops",
+        reason: None,
+    };
+    update_code_declared_workflow_schedule(&mut conn, &request, &codecs)
+        .await
+        .expect("an input override is accepted");
+    let override_cell = async |conn: &mut AsyncPgConnection| -> Value {
+        let cell: Cell = diesel::sql_query(
+            "SELECT workflow_input AS value FROM harvest_schedule_overrides WHERE name = $1",
+        )
+        .bind::<diesel::sql_types::Text, _>(name)
+        .get_result(conn)
+        .await
+        .expect("override cell");
+        cell.value
+    };
+    let before = override_cell(&mut conn).await;
+    assert_eq!(
+        autumn_harvest::payload_codec::codec_envelope_key_id(&before),
+        Some("k1")
+    );
+
+    codecs.set_active_key("k2").expect("flip");
+    sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("sweep");
+    let after = override_cell(&mut conn).await;
+    assert_eq!(
+        autumn_harvest::payload_codec::codec_envelope_key_id(&after),
+        Some("k2"),
+        "the sweep moves the override input onto the active key"
+    );
+    assert_eq!(codecs.decode_column(&after).expect("decode"), plaintext);
+
+    diesel::sql_query(
+        "UPDATE harvest_schedules SET next_run_at = now() - interval '1 minute' \
+         WHERE workflow_name = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(name)
+    .execute(&mut conn)
+    .await
+    .expect("make it due");
+    let pool = deadpool::managed::Pool::builder(
+        diesel_async::pooled_connection::AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            &url,
+        ),
+    )
+    .max_size(4)
+    .build()
+    .expect("pool");
+    autumn_harvest::scheduler::tick_once(
+        pool,
+        Arc::new(
+            autumn_harvest::worker::HandlerRegistry::new(vec![], vec![])
+                .with_payload_codecs(codecs.clone()),
+        ),
+        Arc::new(autumn_harvest::DagCatalog::new()),
+        Arc::new(vec![code]),
+        autumn_harvest::SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("tick");
+    let run: Cell = diesel::sql_query(
+        "SELECT input AS value FROM harvest_workflow_executions WHERE workflow_name = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(name)
+    .get_result(&mut conn)
+    .await
+    .expect("the tick started a run");
+    assert_eq!(
+        codecs.decode_column(&run.value).expect("decode"),
+        plaintext,
+        "the next fire starts on the rotated override input"
     );
 }

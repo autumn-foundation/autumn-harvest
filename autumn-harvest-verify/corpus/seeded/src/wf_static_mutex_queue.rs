@@ -6,9 +6,9 @@
 //! other executions parked on this worker, and the workflow emits one
 //! `ScheduleActivity` per item.
 //!
-//! **Launder.** HVG007 is the only rule in either layer that mentions locking,
-//! and it requires the literal method name `lock` on an ALL-CAPS **path
-//! expression receiver inside the workflow body** — the receiver here is
+//! **Launder.** HVG007 is the only rule in either layer that mentions locking.
+//! It requires the literal method name `lock` on an ALL-CAPS **path
+//! expression receiver inside the workflow body**. The receiver here is
 //! `PENDING` in another crate, so the visitor never sees it. DET has no lock
 //! rule whatsoever. The `Vec` the workflow loops over is a perfectly ordinary
 //! local, so DET010/HVG011 have nothing to say either.

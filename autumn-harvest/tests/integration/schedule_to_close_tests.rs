@@ -16,12 +16,12 @@ use autumn_harvest::store;
 use autumn_harvest::timeout;
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
 use autumn_harvest::{RetryPolicy, TimeoutType};
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
+use jiff::Timestamp;
 use std::time::Duration;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -108,7 +108,7 @@ async fn scanner_times_out_pending_task_with_expired_schedule_to_close() {
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -206,7 +206,7 @@ async fn scanner_times_out_running_task_with_expired_schedule_to_close() {
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -297,7 +297,7 @@ async fn scanner_does_not_affect_tasks_without_schedule_to_close() {
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -367,14 +367,16 @@ async fn scanner_does_not_affect_tasks_without_schedule_to_close() {
 
 // ── Pre-retry deadline check ─────────────────────────────────────────────────
 
-/// When a task's `schedule_to_close_at` is already in the past at the point the
-/// worker computes the next retry delay, `record_schedule_to_close_activity_timeout`
-/// must be called instead of re-queuing. The task ends up FAILED and history
-/// carries `ActivityTimedOut { ScheduleToClose }`.
+/// A task whose `schedule_to_close_at` has passed must time out, not re-queue.
+///
+/// The deadline is checked when the worker computes the next retry delay. If it
+/// has passed, the worker calls `record_schedule_to_close_activity_timeout`
+/// instead of re-queuing. The task ends up FAILED and history carries
+/// `ActivityTimedOut { ScheduleToClose }`.
 ///
 /// This test sets up the scenario directly in the database (expired deadline +
-/// attempt 1 of 10) and confirms the scanner fires, which mirrors the pre-retry
-/// code path for the PENDING case.
+/// attempt 1 of 10). It confirms that the scanner fires. That mirrors the
+/// pre-retry code path for the PENDING case.
 #[tokio::test]
 async fn pre_retry_deadline_check_prevents_requeue_when_deadline_exceeded() {
     let (mut conn, _container) = setup_db().await;
@@ -385,7 +387,7 @@ async fn pre_retry_deadline_check_prevents_requeue_when_deadline_exceeded() {
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -475,9 +477,9 @@ async fn pre_retry_deadline_check_prevents_requeue_when_deadline_exceeded() {
 
 // ── schedule_to_close_at is persisted via EnqueueParams ─────────────────────
 
-/// Verify that `EnqueueParams::schedule_to_close_at` is correctly persisted to
-/// the `harvest_task_queue` table and that a task enqueued with a future deadline
-/// is NOT timed out by the scanner.
+/// `EnqueueParams::schedule_to_close_at` persists to `harvest_task_queue`.
+///
+/// The scanner does NOT time out a task enqueued with a future deadline.
 #[tokio::test]
 async fn enqueue_params_schedule_to_close_at_persisted_and_not_prematurely_fired() {
     let (mut conn, _container) = setup_db().await;
@@ -488,7 +490,7 @@ async fn enqueue_params_schedule_to_close_at_persisted_and_not_prematurely_fired
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -513,7 +515,7 @@ async fn enqueue_params_schedule_to_close_at_persisted_and_not_prematurely_fired
     .await
     .expect("append ActivityScheduled");
 
-    let future_deadline = Utc::now() + chrono::Duration::minutes(10);
+    let future_deadline = Timestamp::now() + jiff::SignedDuration::from_mins(10);
     let mut params = EnqueueParams::new("default", TaskType::Activity, serde_json::json!({}));
     params.workflow_exec_id = Some(exec_id.as_uuid());
     params.activity_name = Some("future_activity".to_string());
@@ -526,7 +528,7 @@ async fn enqueue_params_schedule_to_close_at_persisted_and_not_prematurely_fired
         .expect("enqueue");
 
     // Verify the deadline was written to the DB
-    let stored_deadline: Option<chrono::DateTime<Utc>> =
+    let stored_deadline: Option<jiff::Timestamp> =
         diesel::sql_query("SELECT schedule_to_close_at FROM harvest_task_queue WHERE id = $1")
             .bind::<diesel::sql_types::Uuid, _>(task_id)
             .get_result::<DeadlineRow>(&mut conn)
@@ -537,9 +539,7 @@ async fn enqueue_params_schedule_to_close_at_persisted_and_not_prematurely_fired
         stored_deadline.is_some(),
         "schedule_to_close_at must be persisted"
     );
-    let diff = (stored_deadline.unwrap() - future_deadline)
-        .num_seconds()
-        .abs();
+    let diff = (stored_deadline.unwrap() - future_deadline).as_secs().abs();
     assert!(diff < 2, "stored deadline must match the one passed in");
 
     // Scanner must NOT fire for this task (deadline is in the future)
@@ -626,5 +626,6 @@ struct TaskStateRow {
 #[derive(QueryableByName)]
 struct DeadlineRow {
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    schedule_to_close_at: Option<chrono::DateTime<Utc>>,
+    #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+    schedule_to_close_at: Option<jiff::Timestamp>,
 }

@@ -77,9 +77,19 @@ struct Model {
     probe_calls: AtomicUsize,
     /// Abort the process at the start of this probe call.
     abort_at: Option<usize>,
+    /// The model id that the cost ledger records.
+    id: Option<&'static str>,
 }
 
 impl AgentModel for Model {
+    fn model_id(&self) -> Option<&str> {
+        self.id
+    }
+
+    fn cost_usd_micros(&self, usage: &TokenUsage) -> Option<u64> {
+        self.id.map(|_| u64::from(usage.output_tokens))
+    }
+
     fn chat<'a>(
         &'a self,
         request: &'a ChatRequest,
@@ -260,8 +270,17 @@ async fn source(rt: &mut SqliteRuntime, kind: &str) -> ExecutionId {
     exec
 }
 
+/// Start `input` as a dry run. These tests check the loop, so each run ends
+/// before the adoption gate. `refine_gate.rs` checks the gate.
+fn start_dry(
+    rt: &mut SqliteRuntime,
+    input: &RefineInput,
+) -> autumn_harvest_sqlite::SqliteResult<ExecutionId> {
+    sqlite::start_refine(rt, &input.clone().dry_run())
+}
+
 async fn refine(rt: &mut SqliteRuntime, input: &RefineInput) -> RunState {
-    let exec = sqlite::start_refine(rt, input).unwrap();
+    let exec = start_dry(rt, input).unwrap();
     rt.run_until_blocked(exec).await.unwrap()
 }
 
@@ -582,7 +601,7 @@ async fn child_refines_until_it_crashes() {
         .unwrap()
         .parse()
         .unwrap();
-    let exec = sqlite::start_refine(
+    let exec = start_dry(
         &mut f.rt,
         &RefineInput::new(KIND, vec![run], 2, RefineMode::Parallel, 5),
     )
@@ -686,7 +705,7 @@ async fn the_spend_is_charged_to_the_refine_run_in_the_cost_ledger() {
     let run = source(&mut f.rt, KIND).await;
     let input = RefineInput::new(KIND, vec![run], 1, RefineMode::Parallel, 7)
         .budget(MeshBudget::daily("refine").max_tokens(1_000_000));
-    let exec = sqlite::start_refine(&mut f.rt, &input).unwrap();
+    let exec = start_dry(&mut f.rt, &input).unwrap();
     let report = report_of(f.rt.run_until_blocked(exec).await.unwrap());
     let rows = f.rt.llm_ledger(exec).unwrap();
     let tokens: u64 = rows
@@ -701,11 +720,153 @@ async fn the_spend_is_charged_to_the_refine_run_in_the_cost_ledger() {
     let spend = autumn_harvest_agent::mesh_control::MeshSpend::spent(
         &sqlite::LedgerSpend::open(&db),
         "refine",
-        autumn_harvest::chrono::DateTime::<autumn_harvest::chrono::Utc>::MIN_UTC,
+        jiff::Timestamp::MIN,
     )
     .await
     .unwrap();
     assert_eq!(spend.tokens, tokens);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_probe_ledger_row_names_the_model_of_its_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("a.db");
+    let model = Model {
+        tools: true,
+        id: Some("probe-model-1"),
+        ..Model::default()
+    };
+    let mut f = fixture(&db, Proposer::default(), Composer::default(), model);
+    let run = source(&mut f.rt, KIND).await;
+    let input = RefineInput::new(KIND, vec![run], 1, RefineMode::Parallel, 7);
+    let exec = start_dry(&mut f.rt, &input).unwrap();
+    let report = report_of(f.rt.run_until_blocked(exec).await.unwrap());
+    let rows: Vec<_> =
+        f.rt.llm_ledger(exec)
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.activity_name == "agent_refine_probe")
+            .collect();
+    // One row for each candidate turn, so each probe of two turns has two.
+    assert_eq!(rows.len(), f.model.probe_calls.load(Ordering::SeqCst));
+    assert_eq!(rows.len(), 2 * 3, "three probes of two turns each");
+    for row in &rows {
+        assert_eq!(row.model, "probe-model-1", "{row:?}");
+        assert_eq!(row.cost_usd_micros, Some(5), "{row:?}");
+    }
+    let probes: Vec<_> = report
+        .stages
+        .iter()
+        .filter_map(|stage| stage.probe.as_ref())
+        .collect();
+    let tokens: u64 = rows
+        .iter()
+        .map(|row| row.input_tokens + row.output_tokens)
+        .sum();
+    let probe_tokens: u64 = probes
+        .iter()
+        .map(|probe| u64::from(probe.usage.total()))
+        .sum();
+    assert_eq!(tokens, probe_tokens);
+    let cost: u64 = rows.iter().filter_map(|row| row.cost_usd_micros).sum();
+    let probe_cost: u64 = probes.iter().map(|probe| probe.cost_usd_micros).sum();
+    assert_eq!(cost, probe_cost);
+}
+
+/// Sources that read SQLite and log the fork key of each live re-probe.
+#[derive(Debug)]
+struct KeyLog {
+    inner: sqlite::Sources,
+    keys: std::sync::Mutex<Vec<Option<String>>>,
+}
+
+impl autumn_harvest_agent::refine::RefineSources for KeyLog {
+    fn source(
+        &self,
+        run: ExecutionId,
+    ) -> BoxFuture<'_, Result<Option<autumn_harvest_agent::refine::SourceRecord>, AgentError>> {
+        self.inner.source(run)
+    }
+
+    fn live_probe<'a>(
+        &'a self,
+        request: autumn_harvest_agent::refine::LiveRequest<'a>,
+    ) -> BoxFuture<
+        'a,
+        Result<autumn_harvest_agent::refine::LiveEnd, autumn_harvest_agent::refine::LiveProbeError>,
+    > {
+        self.keys
+            .lock()
+            .unwrap()
+            .push(request.fork_key.map(str::to_owned));
+        Box::pin(async {
+            Err(autumn_harvest_agent::refine::LiveProbeError::Unsupported(
+                "the key log",
+            ))
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_attempt_of_a_probe_gives_the_host_the_same_fork_key() {
+    use autumn_harvest::context::{ActivityContext, SharedStateMap};
+    use autumn_harvest_agent::refine::{ProbeRequest, agent_refine_probe_info};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("a.db");
+    let model = Model {
+        tools: true,
+        ..Model::default()
+    };
+    let mut f = fixture(&db, Proposer::default(), Composer::default(), model);
+    let run = source(&mut f.rt, KIND).await;
+    let log = Arc::new(KeyLog {
+        inner: sqlite::Sources::open(&db),
+        keys: std::sync::Mutex::new(Vec::new()),
+    });
+    let profile = AgentProfile::new(KIND).system(BASE).max_steps(20);
+    let lookup = FnTool::new(
+        "lookup",
+        "Look up a record.",
+        json!({"type": "object"}),
+        |input: serde_json::Value| async move { Ok(json!({ "found": input })) },
+    )
+    .effect(ToolEffect::ReadOnly)
+    .shared();
+    let harness = AgentHarness::new(Arc::clone(&f.model) as Arc<dyn AgentModel>)
+        .agent(profile.clone())
+        .tool(lookup)
+        .refine_sources(Arc::clone(&log) as Arc<dyn autumn_harvest_agent::refine::RefineSources>);
+    let request = ProbeRequest {
+        source: run,
+        overlay: ProfileOverlay {
+            system: Some(format!("{BASE}\nINV edit 1")),
+            ..ProfileOverlay::default()
+        },
+        ceilings: autumn_harvest_agent::Ceilings::from_profile(&profile),
+        effects: std::collections::BTreeSet::from([ToolEffect::ReadOnly]),
+    };
+    let attempt = |id: ActivityExecId, n: u32| {
+        let mut state: SharedStateMap = std::collections::HashMap::new();
+        state.insert(
+            std::any::TypeId::of::<AgentHarness>(),
+            Box::new(harness.clone()),
+        );
+        ActivityContext::new_test_with_state(Arc::new(state))
+            .with_idempotency_key(IdempotencyKey::from_activity_exec_id(id))
+            .with_attempt(n)
+    };
+    let handler = agent_refine_probe_info().handler;
+    let input = serde_json::to_value(&request).unwrap();
+    let probe = ActivityExecId::new();
+    let other = ActivityExecId::new();
+    for ctx in [attempt(probe, 1), attempt(probe, 2), attempt(other, 1)] {
+        handler(&ctx, input.clone()).await.unwrap();
+    }
+    let keys = log.keys.lock().unwrap().clone();
+    let probe_key = Some(probe.as_uuid().to_string());
+    let other_key = Some(other.as_uuid().to_string());
+    assert_eq!(keys, [probe_key.clone(), probe_key, other_key]);
 }
 
 /// What a test selector answers.
@@ -900,6 +1061,75 @@ async fn a_durable_agent_source_of_the_kind_is_refused_at_start() {
     assert_eq!(f.proposer.calls.load(Ordering::SeqCst), 0);
 }
 
+/// The newest `agent` run of the agent `id`.
+fn agent_run(rt: &SqliteRuntime, id: &autumn_harvest_agent::AgentId) -> ExecutionId {
+    let filter = autumn_harvest_sqlite::ExecutionFilter::new()
+        .workflow_name("agent")
+        .workflow_id(id.as_str());
+    rt.list_executions(&filter)
+        .unwrap()
+        .executions
+        .iter()
+        .find_map(autumn_harvest_sqlite::ExecutionSummary::execution_id)
+        .expect("an agent run")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_durable_agent_source_is_refused_before_the_kind_and_end_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut f = fixture(
+        &dir.path().join("a.db"),
+        Proposer::default(),
+        Composer::default(),
+        Model::default(),
+    );
+    // A live agent of another kind.
+    let other = autumn_harvest_agent::AgentId::new("billing", "acct-1").unwrap();
+    sqlite::send(
+        &mut f.rt,
+        &other,
+        &autumn_harvest_agent::AgentOp::message("hi"),
+        None,
+    )
+    .unwrap();
+    // A live agent of the kind. The end check would name the wrong cause.
+    let live = autumn_harvest_agent::AgentId::new(KIND, "acct-2").unwrap();
+    sqlite::send(
+        &mut f.rt,
+        &live,
+        &autumn_harvest_agent::AgentOp::message("hi"),
+        None,
+    )
+    .unwrap();
+    sqlite::drive(&mut f.rt, &live).await.unwrap();
+    // An ended agent of another kind. The kind check would name the wrong
+    // cause.
+    let ended = autumn_harvest_agent::AgentId::new("billing", "acct-3").unwrap();
+    sqlite::send(
+        &mut f.rt,
+        &ended,
+        &autumn_harvest_agent::AgentOp::message("hi"),
+        None,
+    )
+    .unwrap();
+    sqlite::delete(&mut f.rt, &ended, None).unwrap();
+    let state = sqlite::drive(&mut f.rt, &ended).await.unwrap();
+    assert!(
+        matches!(state, Some(RunState::Completed(_) | RunState::Failed(_))),
+        "{state:?}"
+    );
+    for id in [&other, &live, &ended] {
+        let run = agent_run(&f.rt, id);
+        let input = RefineInput::new(KIND, vec![run], 1, RefineMode::Parallel, 1);
+        assert_eq!(
+            error_type(&refine(&mut f.rt, &input).await),
+            "RefineSourceNotReplayable",
+            "{id}"
+        );
+    }
+    assert_eq!(f.proposer.calls.load(Ordering::SeqCst), 0);
+}
+
 /// A proposer that fails with a retryable kind on every call.
 #[derive(Debug, Default)]
 struct Flaky;
@@ -934,7 +1164,7 @@ async fn a_stage_that_fails_every_retry_falls_back_and_keeps_the_identity() {
     let mut rt = SqliteRuntime::open(&db).unwrap();
     sqlite::register(&mut rt, Arc::new(harness));
     let run = source(&mut rt, KIND).await;
-    let exec = sqlite::start_refine(
+    let exec = start_dry(
         &mut rt,
         &RefineInput::new(KIND, vec![run], 1, RefineMode::Sequential, 7),
     )
@@ -945,7 +1175,8 @@ async fn a_stage_that_fails_every_retry_falls_back_and_keeps_the_identity() {
         if !matches!(state, RunState::WaitingTimer) {
             break;
         }
-        let at = autumn_harvest::chrono::Utc::now() + autumn_harvest::chrono::Duration::hours(hour);
+        let at = autumn_harvest::jiff::Timestamp::now()
+            + autumn_harvest::jiff::SignedDuration::from_hours(hour);
         state = rt.run_until_blocked_as_of(exec, at).await.unwrap();
     }
     let report = report_of(state);
@@ -1037,7 +1268,7 @@ async fn a_failed_stage_keeps_the_spend_of_its_last_attempt() {
     let mut rt = SqliteRuntime::open(&db).unwrap();
     sqlite::register(&mut rt, Arc::new(harness));
     let run = source(&mut rt, KIND).await;
-    let exec = sqlite::start_refine(
+    let exec = start_dry(
         &mut rt,
         &RefineInput::new(KIND, vec![run], 1, RefineMode::Sequential, 7),
     )
@@ -1047,7 +1278,8 @@ async fn a_failed_stage_keeps_the_spend_of_its_last_attempt() {
         if !matches!(state, RunState::WaitingTimer) {
             break;
         }
-        let at = autumn_harvest::chrono::Utc::now() + autumn_harvest::chrono::Duration::hours(hour);
+        let at = autumn_harvest::jiff::Timestamp::now()
+            + autumn_harvest::jiff::SignedDuration::from_hours(hour);
         state = rt.run_until_blocked_as_of(exec, at).await.unwrap();
     }
     let report = report_of(state);

@@ -1,0 +1,17 @@
+sampled*nodes  samples  nodes/plan  never-exec/plan  statement
+     59772     293    204.0    109.5  WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) 
+      2055     411      5.0      0.6  WITH g AS MATERIALIZED (SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at,
+      1773     591      3.0      0.0  UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, started_at = NULL, attempt = GREATEST(attem
+      1287     626      2.1      0.0  SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_event
+      1240     543      2.3      0.0  SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_ex
+      1139      13     87.6      4.5  WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled
+       970     393      2.5      0.0  SELECT "harvest_workflow_executions"."state" FROM "harvest_workflow_executions" WHERE ("harvest_workflow_execu
+       959     137      7.0      0.0  WITH candidate AS ( SELECT id, wake_requested FROM harvest_task_queue WHERE id = $1 AND task_type = 'workflow'
+       840     280      3.0      0.0  SELECT "harvest_task_queue"."state", ((("harvest_task_queue"."state" = $1) AND ("harvest_task_queue"."worker_i
+       552     184      3.0      0.0  SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "harvest_timer
+       478     478      1.0      0.0  INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, 
+       393     131      3.0      0.0  SELECT COALESCE(SUM(pg_column_size(event_data)), 0)::bigint FROM "harvest_events" WHERE ((("harvest_events"."w
+       376      47      8.0      0.0  SELECT 0 AS part, lock_key FROM harvest_mutex_locks WHERE holder_exec_id = $1 UNION ALL SELECT DISTINCT 1 AS p
+       351      39      9.0      4.0  SELECT e.id, e.workflow_exec_id, e.event_id, e.event_type, e.event_data, e.timestamp FROM harvest_events e JOI
+       350     175      2.0      0.0  SELECT "harvest_signals"."id", "harvest_signals"."workflow_exec_id", "harvest_signals"."signal_name", "harvest
+       303     303      1.0      0.0  SELECT pg_try_advisory_xact_lock_shared($1, $2) AS acquired

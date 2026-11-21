@@ -426,6 +426,8 @@ pub use db::ScannerLease;
 mod db {
     use std::time::Duration;
 
+    use crate::cached_stmt::CachePreparedDsl as _;
+
     use diesel::QueryableByName;
     use diesel::sql_types::{BigInt, Double, Integer, Text};
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
@@ -535,6 +537,7 @@ mod db {
                     .bind::<Text, _>(&self.scanner)
                     .bind::<Text, _>(&self.holder)
                     .bind::<Double, _>(self.ttl.as_secs_f64())
+                    .cache_prepared()
                     .load(conn)
                     .await
                     .map_err(database_error)?;

@@ -1,10 +1,10 @@
 //! Checked-in allowlist (`harvest-verify.allow.toml`) — the AC5 escape hatch.
 //! A file rather than an attribute because AC7 forbids macro-path changes.
 //!
-//! The rules exist so the hatch cannot be used silently: every entry must carry
-//! a non-blank justification, an entry may not be listed twice, and an entry
-//! that no longer matches an analyzed workflow is reported (a warning by
-//! default, a failure under `--strict`). Every diagnostic names the offending
+//! The rules stop silent use of the hatch. Every entry must carry a non-blank
+//! justification, and an entry may not be listed twice. An entry that no
+//! longer matches an analyzed workflow is reported: a warning by default, a
+//! failure under `--strict`. Every diagnostic names the offending
 //! workflow, because "allowlist error" without a subject is unactionable.
 
 use std::collections::{BTreeSet, HashSet};

@@ -3,33 +3,33 @@
 //!
 //! ## The problem
 //!
-//! A workflow often needs to wait until an *absolute instant* — "24h before
-//! this subscription expires", "at midnight UTC", "until this coupon lapses" —
-//! not for a *relative* number of seconds. Today authors hand-roll it:
+//! A workflow often needs to wait until an *absolute instant*, not for a
+//! *relative* number of seconds. Examples are "24h before this subscription
+//! expires", "at midnight UTC" and "until this coupon lapses". Today authors
+//! hand-roll it:
 //!
 //! ```rust,ignore
-//! // Foot-guns: reaching for Utc::now() breaks replay (HVG001); a deadline
+//! // Foot-guns: reaching for Timestamp::now() breaks replay (HVG001); a deadline
 //! // already in the past underflows `as u64` into a multi-year sleep.
-//! let secs = (deadline - chrono::Utc::now()).num_seconds() as u64;
+//! let secs = (deadline - jiff::Timestamp::now()).as_secs() as u64;
 //! ctx.timer("wake", secs).await?;
 //! ```
 //!
 //! ## The solution: `ctx.sleep_until(id, deadline)`
 //!
-//! One call. The wall clock is captured once via the deterministic
-//! [`WorkflowContext::system_now`] (frozen into history as a
-//! `SideEffectRecorded` event — an existing variant, no new event, no
-//! migration), so every replay recomputes the identical remaining duration and
-//! resolves at the same instant on every worker. A past deadline clamps to zero
-//! and fires on the next poll; a sub-second remainder rounds up so the wait
-//! never resolves early.
+//! One call. The deterministic [`WorkflowContext::system_now`] captures the
+//! wall clock once. It is frozen into history as a `SideEffectRecorded` event,
+//! an existing variant, so there is no new event and no migration. Every replay
+//! recomputes the identical remaining duration and resolves at the same instant
+//! on every worker. A past deadline clamps to zero and fires on the next poll.
+//! A sub-second remainder rounds up, so the wait never resolves early.
 //!
 //! ```rust,ignore
 //! use autumn_harvest::prelude::*;
 //!
 //! #[workflow]
 //! async fn renewal_reminder(ctx: &WorkflowContext, sub: Subscription) -> Result<(), String> {
-//!     let remind_at = /* absolute expiry */ - chrono::Duration::hours(24);
+//!     let remind_at = /* absolute expiry */ - jiff::SignedDuration::from_hours(24);
 //!     ctx.sleep_until("remind", remind_at).await?;   // durable — survives worker restart
 //!     // ... send the reminder ...
 //!     Ok(())
@@ -43,7 +43,7 @@
 //! ```
 
 use autumn_harvest::prelude::*;
-use chrono::{DateTime, Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,16 +55,19 @@ pub struct Subscription {
 /// Waits until 24h before an absolute expiry instant, then "sends" a reminder.
 #[workflow]
 async fn renewal_reminder(ctx: &WorkflowContext, sub: Subscription) -> Result<String, String> {
-    let expiry = DateTime::<Utc>::from_timestamp_millis(sub.expires_at_millis)
-        .ok_or_else(|| "invalid expiry".to_string())?;
-    let remind_at = expiry - Duration::hours(24);
+    let expiry = Timestamp::from_millisecond(sub.expires_at_millis)
+        .map_err(|_| "invalid expiry".to_string())?;
+    let remind_at = expiry - SignedDuration::from_hours(24);
 
     // Durable absolute-deadline wait — replay-safe, survives worker restart.
     ctx.sleep_until("renewal-reminder", remind_at)
         .await
         .map_err(|e| e.to_string())?;
 
-    Ok(format!("reminder sent for expiry {}", expiry.to_rfc3339()))
+    Ok(format!(
+        "reminder sent for expiry {}",
+        autumn_harvest::time::rfc3339(expiry)
+    ))
 }
 
 fn main() {
@@ -77,9 +80,9 @@ fn main() {
     println!("  - lowers onto existing TimerStarted/TimerFired — no new event, no migration");
 }
 
-// Gated on the `testing` feature as well as `test`: the example must keep
-// building under `--no-default-features`, while `autumn_harvest::testing` only
-// exists for external consumers when the `testing` feature is enabled.
+// Gated on the `testing` feature as well as `test`. The example must keep
+// building under `--no-default-features`. `autumn_harvest::testing` exists
+// for an external consumer only when the `testing` feature is on.
 #[cfg(all(test, feature = "testing"))]
 mod tests {
     use super::*;
@@ -88,7 +91,7 @@ mod tests {
     use serde_json::json;
 
     fn expiry_30_days_out() -> i64 {
-        (Utc::now() + Duration::days(30)).timestamp_millis()
+        (Timestamp::now() + autumn_harvest::time::days(30)).as_millisecond()
     }
 
     #[tokio::test]
@@ -125,7 +128,8 @@ mod tests {
         // Expiry already in the past → the 24h-before deadline is also past →
         // zero-duration timer, no real sleep, run completes.
         let sub = Subscription {
-            expires_at_millis: (Utc::now() - Duration::days(365)).timestamp_millis(),
+            expires_at_millis: (Timestamp::now() - autumn_harvest::time::days(365))
+                .as_millisecond(),
         };
         let outcome = WorkflowTestEnv::new()
             .run(renewal_reminder_info().handler, json!(sub))

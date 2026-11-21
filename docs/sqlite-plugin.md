@@ -28,9 +28,9 @@ is [`DESIGN-2471.md`](design/DESIGN-2471.md).
 
 ```toml
 [dependencies]
-autumn-web = { version = "0.9", features = ["sqlite"] }
-autumn-harvest = { version = "0.10", default-features = false }
-autumn-harvest-plugin = { version = "0.10", features = ["sqlite"] }
+autumn-web = { version = "0.11", features = ["sqlite"] }
+autumn-harvest = { version = "0.11", default-features = false }
+autumn-harvest-plugin = { version = "0.11", features = ["sqlite"] }
 ```
 
 The feature is a backend flip, like `autumn-web/sqlite`, which it turns on.
@@ -77,7 +77,8 @@ of them. Each app in one process, as in a test binary, needs its own file.
 ```toml
 [harvest.sqlite]
 path = "/var/lib/app/harvest.db"
-# How often the driver fires due timers, retries and schedule slots.
+# How often the driver fires due timers, retries and schedule slots. The
+# tenant wake sweep runs on the same interval.
 tick_ms = 250
 ```
 
@@ -218,13 +219,163 @@ The auth layer and the #1802 mutation gate cover these routes too. The gate
 passes a read, and a read opens its tenant, which starts its driver. Put the
 API behind `api_with_auth` outside `dev`.
 
+### Waking a closed tenant
+
+The fleet closes an idle tenant, and a closed tenant runs no driver. So each
+tenant driver records when its Harvest file next has due work. A sweep opens
+the tenant at that time.
+
+```mermaid
+sequenceDiagram
+    participant D as tenant driver
+    participant B as wake book (memory)
+    participant S as wake sweep
+    participant C as control database
+    participant F as DatabaseFleet
+    D->>B: next_wake_at: when work starts, when idle, when it stops
+    loop each harvest.sqlite.tick_ms
+        S->>C: write the book
+        S->>C: read the due rows of the owned slot ranges
+        S->>F: closed: open in the background
+        S->>D: run until idle
+        S->>F: close it again
+    end
+```
+
+- **What is due.** `SqliteRuntime::next_wake_at()` gives the earliest of
+  these times: an unfired timer, a schedule slot, an activity retry, a run
+  backoff and a run deadline. A paused schedule and a disabled scheduler
+  give no slot. `None` means no deadline.
+- **Where it is kept.** The control database holds one row per tenant in
+  `harvest_tenant_wakes (tenant_key, routing_slot, next_wake_at, epoch)`. The boot
+  creates the table. `TENANT_WAKES_SCHEMA_SQL` holds its DDL.
+- **How late.** A due item fires within one tick, plus the time to open
+  the tenant. The sweep runs on `harvest.sqlite.tick_ms`.
+- **One host.** A host reads and wakes only the tenants of the slot ranges
+  that it owns, and writes only their rows. A slot of a closed tenant runs
+  once, not once per host.
+- **No eviction.** A wake is a background open. It never goes past
+  `max_open`, and a full fleet tries again on the next tick. The fleet
+  closes the tenant when no request used it meanwhile.
+- **A crash.** A driver records now when work starts. A crash during work
+  then leaves a due row, and the next owner finishes the work. A crash
+  loses at most one tick of other records.
+- **A stuck deadline.** A deadline that a drive cannot clear, such as a
+  timer of a run that fails on each drive, comes back once a minute. It
+  never hides a healthy deadline of the same tenant.
+- **A failed wake.** A tenant that cannot open or start, or whose file is
+  not on this host yet, is tried again a minute later. Only a fleet delete
+  removes a row.
+- **A long run.** A wake keeps its lease for at most five minutes while the
+  driver works. It then asks the fleet to close the tenant. A tenant that a
+  request uses stays open until the fleet closes it as idle.
+
 ### Limits
 
-- A closed tenant runs no timer, retry or activity. The next open resumes
-  its runs. The fleet sweeper wakes a tenant for outbox, hook and backfill
-  work only.
-- A fleet restore rolls back the tenant database, not its Harvest file.
-- Fleet replication does not ship Harvest files.
+- A closed tenant runs no timer, retry or activity until the wake sweep
+  opens it. An app with no control database runs no sweep: the next open
+  resumes the runs, and the boot logs a warning.
+- A tenant gets its first wake row when its driver starts. A tenant that
+  has not opened since this release waits for its next open.
+- A takeover loses the runs that the old owner did not ship: at most one
+  sync interval of work.
+- A direct `DatabaseFleet::restore` to a point in time restores the
+  Harvest file at its latest state. Use `HarvestFleet::restore` for one
+  target on both files.
+- An open of a tenant refuses in the short time between the publish of
+  its `HarvestFleet::restore` and the return. Open it again.
+- Do not run a direct restore of a tenant while a `HarvestFleet::restore`
+  of it runs. A direct restore that publishes just before the
+  `HarvestFleet::restore` returns can take its target.
+- On Unix the database identity is the device, the inode and the birth
+  time. A new file can reuse the inode of a removed file, and the birth
+  time tells them apart (issue #2721). A file system with no birth time
+  gives the device and inode only. Two direct restores before the next
+  open can then keep the old Harvest file, when the new file reuses the
+  inode of the recorded file. Elsewhere the identity is
+  the creation time, which Windows can keep across a rename. A direct
+  `DatabaseFleet::restore` on Windows can then keep the old Harvest file,
+  or the target of an earlier `HarvestFleet::restore`. Use
+  `HarvestFleet::restore` there: a finished restore binds its target to
+  the restored file, so the next open applies it.
+- An import or a re-create gives the tenant a new database file. A Harvest
+  file with no replica then goes aside, as `<file>.aside-<n>`. Its sidecars
+  go with it. When a file cannot move, each moved sidecar moves back and
+  the open refuses. The error names the file. On Windows another process
+  can hold a sidecar open. The next open tries again. When a move back
+  also fails, the error names the sidecar that stays aside. Move it back
+  before the next open (issue #2759).
+- Sidecars of a missing Harvest file go aside, as `<file>.aside-<n>-wal`.
+  So no open starts a new file beside an old WAL.
+- `DatabaseFleet::release_ownership` does not wait for a Harvest backlog.
+  The shutdown hook ships it within the fleet's final flush, and logs each
+  tenant that stays behind.
+
+### Replication
+
+When the fleet replicates (autumn ADR 0019 §5), each tenant Harvest file
+ships with its tenant database. It uses the same engine, destination and
+ownership epoch, under the tenant prefix:
+
+| Object | Prefix |
+| --- | --- |
+| The tenant database | `{root}/fleet/tenant/{id}/` |
+| Its Harvest file | `{root}/fleet/tenant/{id}/harvest/` |
+
+The plugin builds the destination from `[replication]`. App code that
+builds the fleet replication gives the same destination and settings to
+`HarvestPlugin::sqlite_tenant_replica(TenantReplica::new(destination,
+settings))`.
+
+```mermaid
+sequenceDiagram
+    participant F as DatabaseFleet
+    participant L as Harvest lifecycle
+    participant R as replica
+    F->>L: on_open(acme, epoch)
+    L->>R: restore a missing or stale acme.harvest.db
+    L->>L: open the file, record the epoch, start the driver
+    loop each sync interval
+        L->>R: ship, if this host holds the epoch
+    end
+    F->>L: on_close(acme): ship until caught up
+```
+
+- **A takeover keeps the runs up to the last ship.** A host that opens a
+  tenant restores a missing Harvest file before the driver starts, under
+  the fleet's `restore_missing`.
+- **The Harvest file follows its database.** The file records the identity
+  of its tenant database file. A restore gives a new database file. The
+  next open then restores the Harvest file from the replica.
+- **A stale file never opens.** The file records the newest epoch that it
+  opened under. When the replica holds a newer epoch of another owner, the
+  open replaces the local file first.
+- **A host that lost the range ships nothing.** Each tick checks the
+  ownership epoch. A close also reads the epochs at the destination. A
+  restore takes the newest epoch first, so a later file of an old owner
+  never wins.
+- **A delete covers both files.** The tombstone marker sits under the
+  tenant prefix, and the purge removes both replicas. A re-created tenant
+  gets no deleted run back.
+- **A restore covers both files.** `HarvestFleet::restore(key, target)`
+  restores the database. It keeps the target on disk, and the next open
+  restores the Harvest file to the same point. When the Harvest replica no
+  longer reaches the target, each open refuses until a new restore. An
+  open that does not refuse then removes the target. When it cannot, the
+  open refuses, and the error names the target file. A retry applies the
+  same target again, so the retry loses no run.
+- **A later restore supersedes the target.** The target names the
+  database file that its restore published. A direct
+  `DatabaseFleet::restore` before the next open replaces that file, so the
+  Harvest file goes to its latest state. A direct restore that fails keeps
+  the target. `formal/verus/src/restore_target.rs` proves the rule.
+- **One checkpointer.** A shipped file opens with
+  `wal_autocheckpoint = 0`. The replicator checkpoints only what it has
+  shipped.
+
+`HarvestFleet::tick_replicas()` ships once, for tests. It blocks, so call
+it on a blocking thread. `HarvestPlugin::sqlite_tenant_replica` needs
+`sqlite_per_tenant()`.
 
 ## How it runs
 
@@ -310,6 +461,60 @@ The handle has `start`, `signal_with_start`, `signal`,
 
 A violation is `HarvestSqliteError::InvalidInput` or `InvalidSignal`. Over
 HTTP it is the Postgres `400` with `violations`.
+
+## The durable agent
+
+`HarvestPlugin::agent(harness)` hosts the durable agent of
+`autumn-harvest-agent`. It calls `autumn_harvest_agent::register`, so the
+app needs no `SqliteRuntime` of its own. The driver gives the harness to
+each agent activity as state:
+
+```rust,ignore
+use autumn_harvest_agent::{AgentHarness, AgentId, AgentOp, Approval};
+use autumn_harvest_plugin::sqlite::{HarvestSqlite, agent};
+
+let plugin = HarvestPlugin::new()
+    .agent(AgentHarness::new(model).agent(profile))
+    .api("/harvest");
+
+// In a handler that takes `harvest: HarvestSqlite`:
+let id = AgentId::new("support", "acct-42")?;
+agent::send(&harvest, &id, &AgentOp::message("hello"), Some("m-1")).await?;
+let state = agent::state(&harvest, &id).await?;
+agent::decide(&harvest, &id, &signal, &Approval::Approve, Some("d-1")).await?;
+```
+
+The module `sqlite::agent` mirrors the durable agent calls of
+`autumn_harvest_agent::sqlite`:
+
+- `send` starts the agent when it has no run. A steer or an interrupt goes
+  first, to the running run.
+- `delete` ends the agent once its inbox is empty.
+- `current_run` and `state` read the running run. With no run they return
+  `None`.
+- `decide` sends a decision to the approval wait that its signal names. The
+  approval notice of the harness names the signal. For a one-shot
+  `agent_loop` run, call `HarvestSqlite::signal` with its execution id.
+- `reload_profiles` sends `Control::ReloadProfile` to each running agent
+  of a kind. Each agent then reads the profile of the harness again. Call
+  it after a restart with a new harness. An ended agent stays ended.
+
+No call drives the run. The driver runs each op, so a long model turn
+delays the next write. An activity runs on the driver task, so make these
+calls from app code. A call from an activity body can wait for its own
+driver and hang.
+
+SQLite keeps no run tenant, so an answer check admits the tenant that the
+task declares. The agent keys its memory and its workspace by agent id,
+with no tenant. So the build refuses `agent` with `sqlite_per_tenant()`.
+
+The agent reads its profile overlays through the store of the harness,
+such as `SqliteOverlayStore` in a file of its own. In a fleet database that
+a replicator checkpoints, open it with `SqliteOverlayStore::with_connector`.
+Each call then opens its own connection with the pragmas of the fleet. See
+the profile overlay section of `docs/agent-adapter.md`. The
+`/agents/{kind}/profile` routes still need Postgres, so the build refuses
+`agent_overlay_store`.
 
 ## The transactional outbox
 
@@ -496,7 +701,8 @@ HarvestPlugin::new()
   Catch-up is always off. The engine ignores the jitter of a code schedule,
   because one writer has no fleet to spread. The admin routes refuse a
   `jitter_secs` above zero.
-- **Not ported.** Backfill, `/runs`, `/decisions` and `/preview` answer
+- **Not ported.** Backfill, `/runs`, `/decisions`, `/preview` and the
+  [herd forecast](management-api.md#schedule-herd-forecast) (`/herd`) answer
   `501`.
 
 A tenant driver fires the schedules that its own file stores. Only the
@@ -547,6 +753,8 @@ ones.
   100 ms, because SQLite has no `LISTEN`. It sends a progress frame on each
   change of state. This backend stores no `current_details`, so a frame
   names the state, and `status` reads `current_details: null`.
+  The plugin needs its `mcp` feature and `.mcp_tools()`. Without them, the
+  plugin serves no tools and logs one `WARN` at build (issue #2609).
 - **MCP tasks.** A task reads its live run and its open signal waits from
   the file. An answer is delivered with its input key as the signal key, so
   a retried answer is a no-op. A start key in `Idempotency-Key` or the task
@@ -616,7 +824,10 @@ stay off. The pages hold no form that writes.
 - A run chain gives each run its execution id as `run_id`. This backend
   has no separate run id. A key with more than 256 runs answers the queried
   run alone, with `head_unknown: true`. Postgres reads the whole chain.
-- A stack has no external handoff and no worker id. A task stores no
+- The plugin does not serve the external activity routes, such as
+  `/activities/external/{token}/complete`. Call the `SqliteRuntime`
+  methods instead (issue #2607).
+- A stack lists no external handoff and has no worker id. A task stores no
   attempt start and no heartbeat time, so `start_to_close_deadline`,
   `heartbeat_deadline` and `last_heartbeat_at` are `null`. `scheduled_at`
   is the time that the next attempt may run, as on Postgres. For the same
@@ -688,7 +899,7 @@ SqliteAuthStore::open("app.harvest.db")?.insert_token(&NewToken {
     name: "bootstrap",
     token_hash: &autumn_harvest::api_token::hash_secret(&secret),
     scope: "admin",
-    created_at: chrono::Utc::now(),
+    created_at: jiff::Timestamp::now(),
     expires_at: None,
     created_by: "bootstrap",
     tenant: None,
@@ -719,11 +930,12 @@ no-op would let an app believe a protection or a feature is on.
 | --- | --- |
 | `decode_payloads_on_read`: this backend stores no codec envelope, so a read has nothing to decode | the epic |
 | `synthetic_canary`, `agent_overlay_store` | the epic |
+| `agent` with `sqlite_per_tenant()`: each tenant would share one agent memory | the epic: see [The durable agent](#the-durable-agent) |
 | `RetentionConfig::tenant_overrides`, `summary`, `payload_orphan_grace_secs` | the epic: see [Retention](#retention) |
 | A webhook or connector `queue`, and a `Starts` connector binding in `BrokerCoordinates` mode | the epic: see [MCP, webhooks and connectors](#mcp-webhooks-and-connectors) |
 | `harvest.sqlite.path` or `sqlite_per_tenant()` with `harvest.mode = "split"` / `"external"` | [#2472](https://github.com/autumn-foundation/autumn-harvest/issues/2472): no effect in that mode |
 | `sqlite_per_tenant()` in an app with no `[database.fleet]` | [#2472](https://github.com/autumn-foundation/autumn-harvest/issues/2472) |
-| `harvest.worker_enabled = false` | not planned: the app process is the only writer. The `web` role does not stop the driver either ([#2477](https://github.com/autumn-foundation/autumn-harvest/issues/2477)) |
+| `harvest.worker_enabled = false` | not planned: the app process is the only writer. A role that turns off `harvest.worker`, `web` included, does not stop the driver either ([#2477](https://github.com/autumn-foundation/autumn-harvest/issues/2477)) |
 | DAGs | an engine non-goal of the SQLite backend (#2019) |
 | `with_metrics_scrape` | the epic |
 
@@ -740,9 +952,10 @@ directory, with no Postgres and no Docker:
 ```bash
 cargo test -p autumn-harvest-plugin --features sqlite,oidc,mcp,webhooks,connectors --test sqlite_plugin
 cargo test -p autumn-harvest-plugin --features sqlite --test sqlite_plugin_fleet
+cargo test -p autumn-harvest-plugin --features sqlite --test sqlite_plugin_agent
 ```
 
-CI runs both in the `sqlite-plugin` job, with `oidc`, `mcp`, `webhooks` and
+CI runs each suite in the `sqlite-plugin` job, with `oidc`, `mcp`, `webhooks` and
 `connectors` on. One clippy step turns on `sqlite` alone, for the code that
 those features turn off. The
 `ops_parity` module covers schedules and retention. The `trigger_parity`
@@ -750,6 +963,9 @@ module covers MCP, webhooks and connectors, and runs only with those
 features. The
 fleet suite boots a tenant fleet. It covers each tenant's file and driver,
 the tenant routes, a close, a reopen and a delete.
+The agent suite runs the overlay read suite of the agent crate on the
+plugin, as a third backend. It covers ops, approvals and overlay reads
+through the handle.
 
 `tests/sqlite_plugin_split.rs` runs a SQLite app on a Postgres Harvest
 database in split and external mode. It starts a Postgres container, or

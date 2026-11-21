@@ -2,16 +2,16 @@
 //!
 //! **Mechanism.** `Value`. `helpers::next_seq()` performs
 //! `SEQ.fetch_add(1, Relaxed)` on a `static AtomicU64`. The returned ticket
-//! depends on how many other executions ran first in this process, so it
-//! differs between the original run and any replay; it is written verbatim into
-//! the activity's idempotency field, i.e. into the recorded command.
+//! depends on how many other executions ran first in this process. So it
+//! differs between the original run and any replay. It goes verbatim into the
+//! activity's idempotency field, i.e. into the recorded command.
 //!
-//! **Launder.** HVG007 is the *only* ambient-state rule in either layer, and it
-//! matches exclusively a literal `.lock()` method call whose receiver is an
+//! **Launder.** HVG007 is the *only* ambient-state rule in either layer. It
+//! matches only a literal `.lock()` method call whose receiver is an
 //! all-uppercase path expression **in the workflow body**. `fetch_add` is not
 //! `lock`, `SEQ` is not in this body, and the read is one crate away. DET005 is
-//! the nearest DET rule (process-global state) and its patterns are only
-//! `std::process::id(` / `process::id(` — and it is a `Warning`, which never
+//! the nearest DET rule (process-global state). Its only patterns are
+//! `std::process::id(` / `process::id(`, and it is a `Warning`, which never
 //! blocks a build. No other HVG or DET rule models statics or atomics at all.
 //!
 //! **Expected trace hops.** `wf_static_counter_in_helper` ⇒

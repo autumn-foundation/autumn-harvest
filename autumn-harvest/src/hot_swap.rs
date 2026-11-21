@@ -8,29 +8,33 @@
 //! # What it does
 //!
 //! A `#[workflow]` body normally reaches a worker as a `fn` pointer compiled
-//! into the binary, so shipping new workflow code means shipping a new binary
+//! into the binary. So shipping new workflow code means shipping a new binary
 //! and bouncing the fleet. This module lets a *running* worker acquire workflow
-//! logic as a WebAssembly module fetched from a Postgres registry, registered
-//! under an explicit **`BuildId`**, so a deploy is "publish a module" and a
-//! rollback is "repoint the ramp".
+//! logic as a WebAssembly module fetched from a Postgres registry. The module
+//! is registered under an explicit **`BuildId`**. A deploy is then "publish a
+//! module" and a rollback is "repoint the ramp".
 //!
 //! Everything that decides *which executions see which code* is already shipped
-//! and is consumed unchanged: percent ramp (issue #604) governs which new starts
-//! land on the swapped code, [`BuildCompatibilitySet`] + claim-time filtering
-//! (issue #171) governs which in-flight executions a module may process, and
-//! build reachability (issues #520/#535) answers when the old module is
-//! retirable. This module adds **no** safety machinery, and — see
-//! [`module_workflow_handler`] — **no replay surface**: no new
+//! and is consumed unchanged:
+//!
+//! * Percent ramp (issue #604) governs which new starts land on the swapped code.
+//! * [`BuildCompatibilitySet`] + claim-time filtering (issue #171) governs which
+//!   in-flight executions a module may process.
+//! * Build reachability (issues #520/#535) answers when the old module is
+//!   retirable.
+//!
+//! This module adds **no** safety machinery. It also adds **no replay
+//! surface** (see [`module_workflow_handler`]). There is no new
 //! [`WorkflowEvent`](crate::event::WorkflowEvent) variant, no change to event
-//! JSON, no change to `HistoryMatcher` or executor semantics.
+//! JSON, and no change to `HistoryMatcher` or executor semantics.
 //!
 //! [`BuildCompatibilitySet`]: crate::build_routing::BuildCompatibilitySet
 //!
 //! # The hosting boundary
 //!
-//! [`WorkflowHandlerFn`](crate::info::WorkflowHandlerFn) is a bare `fn` pointer
-//! (design decision #6 — it keeps [`WorkflowInfo`](crate::info::WorkflowInfo)
-//! `Sync` without an `Arc`), and no runtime-loaded module can mint one. The
+//! [`WorkflowHandlerFn`](crate::info::WorkflowHandlerFn) is a bare `fn` pointer.
+//! Design decision #6 chose that, so [`WorkflowInfo`](crate::info::WorkflowInfo)
+//! stays `Sync` without an `Arc`. No runtime-loaded module can mint one. The
 //! boundary this spike adopts sidesteps that entirely:
 //!
 //! * [`module_workflow_handler`] is **one statically-linked `fn`** — a
@@ -44,48 +48,48 @@
 //! ## Why the routing key is not `ctx.build_id()`
 //!
 //! [`WorkflowContext::build_id`](crate::context::WorkflowContext::build_id)
-//! reports the **worker's own configured build** — deliberately, since issue
-//! #798, so a pre-promotion replay gate can ask "what will the candidate do with
-//! these histories?". It is *not* the execution's `assigned_build_id`. Routing
-//! modules on it would hand a v1-assigned in-flight execution to v2 code the
-//! moment an operator relabelled the worker, which is precisely the divergence
-//! build routing exists to prevent. The binding therefore carries the
-//! execution's build, threaded by the worker seam from the execution row's
-//! **`assigned_build_id`** column — not the task row's denormalised
-//! `required_build_id` copy. They agree, but the execution row is the authority
-//! and is the value fixed at start time.
+//! reports the **worker's own configured build**. That is deliberate since
+//! issue #798. A pre-promotion replay gate can then ask "what will the
+//! candidate do with these histories?". It is *not* the execution's
+//! `assigned_build_id`. Suppose modules were routed on it, and an operator
+//! relabelled the worker. A v1-assigned in-flight execution would then go to v2
+//! code. That is precisely the divergence build routing exists to prevent. The
+//! binding therefore carries the execution's build. The worker seam threads it
+//! from the execution row's **`assigned_build_id`** column, not the task row's
+//! denormalised `required_build_id` copy. They agree, but the execution row is
+//! the authority and is the value fixed at start time.
 //!
 //! ## Why the guest runs inline and synchronously
 //!
 //! The executor classifies a `Poll::Pending` with a zero replay-significant
 //! command delta as a workflow *suspension* (see `executor::poll_query_step`).
-//! A host-side `.await` inside a handler — e.g. awaiting a
-//! `tokio::task::spawn_blocking` join handle — is therefore indistinguishable
-//! from a park, and would be misread. The guest is consequently invoked
+//! A host-side `.await` inside a handler is therefore indistinguishable from a
+//! park, and would be misread. One example is an await on a
+//! `tokio::task::spawn_blocking` join handle. The guest is consequently invoked
 //! synchronously on the decision-cycle thread.
 //!
 //! Two consequences follow, and both are engineered for rather than tolerated:
 //!
-//! * **Fuel, not the clock, is the operative budget.** A wall-clock ceiling that
-//!   could plausibly fire before fuel exhausts would make a run's terminal
-//!   outcome depend on host load — two workers replaying one history could
+//! * **Fuel, not the clock, is the operative budget.** Suppose a wall-clock
+//!   ceiling could plausibly fire before fuel exhausts. A run's terminal outcome
+//!   would then depend on host load. Two workers replaying one history could
 //!   disagree about whether it failed. [`DECIDE_MAX_WALL_CLOCK`] is therefore a
-//!   generous *backstop* for the one class fuel cannot bound (bulk-memory
-//!   instructions cost one fuel unit regardless of bytes moved), while
+//!   generous *backstop* for the one class fuel cannot bound. Bulk-memory
+//!   instructions cost one fuel unit regardless of bytes moved.
 //!   [`DECIDE_FUEL`] is the bound a well-behaved guest actually meets.
 //! * **A decision cycle memoises.** Under the oneshot suspension model (DD-1)
-//!   the workflow restarts at `step = 0` every cycle, so a naive loop would
-//!   re-invoke the guest once per already-resolved await — `O(n²)` guest calls
-//!   per run, all inside one `poll` with no yield point. The trampoline instead
-//!   caches `step -> DecideResponse` for the lifetime of one handler invocation,
-//!   which is sound *because* the guest is a pure function of
-//!   `(input, resolved)`, and yields between fresh decisions so the runtime can
+//!   the workflow restarts at `step = 0` every cycle. A naive loop would
+//!   re-invoke the guest once per already-resolved await. That is `O(n²)` guest
+//!   calls per run, all inside one `poll` with no yield point. The trampoline
+//!   instead caches `step -> DecideResponse` for the lifetime of one handler
+//!   invocation. That is sound *because* the guest is a pure function of
+//!   `(input, resolved)`. It yields between fresh decisions so the runtime can
 //!   preempt.
 //!
 //! # What is deliberately not here
 //!
-//! No dylib hosting. Rust has no stable ABI, `WorkflowContext` is not
-//! `#[repr(C)]`, and a `dlclose` while a suspended execution still holds module
+//! No dylib hosting. Rust has no stable ABI, and `WorkflowContext` is not
+//! `#[repr(C)]`. A `dlclose` while a suspended execution still holds module
 //! code is a use-after-free rather than a refcount decrement. See
 //! `docs/rnd/hot-code-swap.md` §3.
 
@@ -106,11 +110,12 @@ use crate::wasm_activities::{WasmCapabilities, WasmLimits, WasmModuleStore};
 /// Wire-format version of the decide-loop ABI.
 ///
 /// Deliberately **not** carried in [`DecideRequest`]. A per-decision version
-/// field invites a guest to branch on it, which would let a host upgrade change
-/// a module's command sequence while its build id — the value that is supposed
-/// to pin what the code means — stayed the same. That is an escape hatch
-/// straight out of build-id governance. The version is instead a property of the
-/// host binary: bumping it means republishing modules under a new build id.
+/// field invites a guest to branch on it. A host upgrade could then change a
+/// module's command sequence while its build id stayed the same. The build id
+/// is the value that is supposed to pin what the code means. That is an escape
+/// hatch straight out of build-id governance. The version is instead a
+/// property of the host binary: bumping it means republishing modules under a
+/// new build id.
 pub const DECIDE_ABI_VERSION: u32 = 1;
 
 /// Hard ceiling on how many decisions one execution may take.
@@ -120,19 +125,22 @@ pub const DECIDE_ABI_VERSION: u32 = 1;
 /// rather than a transient one.
 ///
 /// **A compile-time constant, deliberately not configurable.** An earlier cut
-/// exposed a per-[`ModuleHost`] override; that made an execution's terminal
-/// outcome a function of *which worker* claimed it, since a worker with a
-/// tighter cap fails a run another worker completes. A cap that can decide a
-/// terminal outcome must be uniform across the fleet, and the only way to
-/// guarantee that is to not let it vary.
+/// exposed a per-[`ModuleHost`] override. An execution's terminal outcome then
+/// depended on *which worker* claimed it. A worker with a tighter cap fails a
+/// run another worker completes. A cap that can decide a terminal outcome must
+/// be uniform across the fleet. The only way to guarantee that is to not let
+/// it vary.
 pub const MAX_DECIDE_STEPS: usize = 64;
 
 /// Hard ceiling on a published workflow module's byte length: 32 MiB.
 ///
-/// Enforced by [`verify_module_bytes`] before hashing or compilation, by
-/// [`publish_workflow_module`](crate::hot_swap_store::publish_workflow_module)
-/// before any database work, and by a `CHECK` constraint on the table itself so
-/// a direct `INSERT` cannot plant an oversized row for a worker to materialise.
+/// Enforced in three places:
+///
+/// * [`verify_module_bytes`], before hashing or compilation.
+/// * [`publish_workflow_module`](crate::hot_swap_store::publish_workflow_module),
+///   before any database work.
+/// * A `CHECK` constraint on the table itself. A direct `INSERT` cannot plant
+///   an oversized row for a worker to materialise.
 pub const MAX_WORKFLOW_MODULE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Hard ceiling on how many workflow names one build may register.
@@ -152,15 +160,15 @@ pub const MAX_WORKFLOW_NAMES_PER_BUILD: usize = 256;
 /// Wall-clock **backstop** for a single guest decision.
 ///
 /// Not the operative budget — see [`DECIDE_FUEL`]. It exists for the one class
-/// fuel provably cannot bound: bulk-memory instructions (`memory.fill`,
-/// `memory.copy`) cost one fuel unit regardless of how many bytes they move, so
+/// fuel provably cannot bound. Bulk-memory instructions (`memory.fill`,
+/// `memory.copy`) cost one fuel unit regardless of how many bytes they move. So
 /// a guest can burn real time inside a small fuel budget.
 ///
 /// Set generously *above* the time a fuel-bounded decision can take, so the two
 /// bounds do not race. A tight ceiling would make the terminal outcome of a run
-/// depend on host load: the same history would fail on a busy worker and succeed
-/// on an idle one, which is precisely the non-determinism this spike exists to
-/// avoid.
+/// depend on host load. The same history would fail on a busy worker and
+/// succeed on an idle one. That is precisely the non-determinism this spike
+/// exists to avoid.
 pub const DECIDE_MAX_WALL_CLOCK: Duration = Duration::from_secs(5);
 
 /// CPU fuel budget for a single guest decision — the operative bound.
@@ -177,12 +185,12 @@ pub const DECIDE_FUEL: u64 = 10_000_000;
 /// occupancy of a runtime worker thread. With memoisation a cycle performs
 /// one *new* decision, so a well-behaved guest never approaches it.
 ///
-/// Fuel, not the clock (issue #1345 finding 5). An earlier cut charged a
-/// cache HIT the wall-clock duration recorded when the decision was first
-/// computed. That duration varies with host load. The same run could pass on
-/// a busy host, where the recorded cost happened to still fit the budget.
-/// The same run could then fail on an idle host recomputing the same step
-/// fresh — or the reverse. Fuel is deterministic for a given guest and request, so the same
+/// Fuel, not the clock (issue #1345). An earlier cut charged a cache HIT the
+/// wall-clock duration recorded when the decision was first computed. That
+/// duration varies with host load. The same run could pass on a busy host,
+/// where the recorded cost happened to still fit the budget. The same run
+/// could then fail on an idle host recomputing the same step fresh — or the
+/// reverse. Fuel is deterministic for a given guest and request. So the same
 /// run always reaches the same verdict regardless of cache residency or host
 /// speed. Set to twice [`DECIDE_FUEL`], mirroring the margin the former
 /// wall-clock pair kept between the per-decision and cumulative ceilings.
@@ -193,9 +201,9 @@ pub const DECIDE_RUN_FUEL_BUDGET: u64 = DECIDE_FUEL * 2;
 /// [`DECIDE_RUN_FUEL_BUDGET`] is the operative cumulative bound. It is not
 /// sufficient alone, for the same reason [`DECIDE_MAX_WALL_CLOCK`] backs up
 /// [`DECIDE_FUEL`] at the per-decision level. Bulk-memory instructions cost
-/// one fuel unit regardless of bytes moved. A guest granted capabilities
-/// (finding 2) or one that defeats the decision cache recomputes every step
-/// fresh. Up to [`MAX_DECIDE_STEPS`] decisions could each spend close to
+/// one fuel unit regardless of bytes moved. A guest granted capabilities or
+/// one that defeats the decision cache recomputes every step fresh. Up to
+/// [`MAX_DECIDE_STEPS`] decisions could each spend close to
 /// [`DECIDE_MAX_WALL_CLOCK`] while staying under the fuel budget. That
 /// wedges a runtime worker for minutes — the exact hazard §8.6 of the
 /// report exists to close.
@@ -217,9 +225,9 @@ pub const DECIDE_MEMORY_BYTES: usize = 4 * 1024 * 1024;
 ///
 /// The request carries every previously-resolved activity output, so it grows
 /// with the run. Without a bound the host would allocate and serialize an
-/// ever-larger buffer and only discover the problem when the guest's `alloc`
-/// trapped against [`DECIDE_MEMORY_BYTES`] — after paying for all of it, and
-/// after the run had already performed real side effects.
+/// ever-larger buffer. It would only discover the problem when the guest's
+/// `alloc` trapped against [`DECIDE_MEMORY_BYTES`]. By then it has paid for all
+/// of it, and the run has already performed real side effects.
 pub const MAX_DECIDE_REQUEST_BYTES: usize = 1024 * 1024;
 
 /// Ceiling on guest-authored text the host will copy into an error message or a
@@ -242,9 +250,9 @@ pub const MAX_QUEUE_NAME_BYTES: usize = 200;
 
 /// Minimum module-signing key length, in bytes.
 ///
-/// HMAC accepts a key of any length, including empty — so a misconfigured or
-/// unset environment variable would otherwise yield a "signature" anyone can
-/// compute, silently, with no error anywhere.
+/// HMAC accepts a key of any length, including empty. A misconfigured or unset
+/// environment variable would otherwise yield a "signature" anyone can compute.
+/// That would happen silently, with no error anywhere.
 pub const MIN_SIGNING_KEY_BYTES: usize = 16;
 
 /// The per-decision resource budget: [`DECIDE_MEMORY_BYTES`], [`DECIDE_FUEL`],
@@ -277,12 +285,13 @@ fn bound_guest_text(text: &str) -> String {
 ///
 /// # Field order is load-bearing
 ///
-/// `step` serialises **first**, at a fixed byte offset, so a guest can read its
-/// step index without a JSON parser — the hand-written WAT guests in
+/// `step` serialises **first**, at a fixed byte offset. A guest can then read
+/// its step index without a JSON parser. The hand-written WAT guests in
 /// `autumn-harvest/examples/workflow-modules/` do exactly that. That only holds
-/// while the bytes carry this struct's declaration order, which is why
-/// [`encode_decide_request`] exists and why nothing here may round-trip through
-/// [`serde_json::Value`] (whose object is a `BTreeMap`, and would sort the keys).
+/// while the bytes carry this struct's declaration order. That is why
+/// [`encode_decide_request`] exists. It is also why nothing here may round-trip
+/// through [`serde_json::Value`], whose object is a `BTreeMap` that sorts the
+/// keys.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecideRequest {
     /// Zero-based index of this decision within the run. Always equals
@@ -309,13 +318,13 @@ pub enum DecideOutcome {
     },
     /// The activity failed after exhausting its retry policy.
     ///
-    /// Carries the engine's **stable** classification alongside the message: a
+    /// Carries the engine's **stable** classification alongside the message. A
     /// guest that branches on failure should match `error_type` (issue #227's
     /// low-cardinality class) or read `details`, never parse `error`. The
-    /// message is a `Display` whose format is not a compatibility surface, and
-    /// it embeds the attempt number, which differs between the inline and
-    /// replayed delivery paths — so a guest that branched on it would replay
-    /// differently than it ran.
+    /// message is a `Display` whose format is not a compatibility surface. It
+    /// embeds the attempt number, which differs between the inline and replayed
+    /// delivery paths. A guest that branched on it would replay differently than
+    /// it ran.
     Err {
         /// The engine's stable failure class, e.g. `"CircuitOpen"` or the
         /// `"Error"` fallback for an untyped `Err(String)` failure.
@@ -341,12 +350,13 @@ pub enum DecideResponse {
         input: Value,
         /// Queue override. Rejected unless the host opts in via
         /// [`ModuleHost::allowing_queue_override`]: letting a guest name any
-        /// queue in the shard is lateral movement, not configuration. `None`
-        /// (the normal case) uses the execution's own queue, which is what a
-        /// statically-linked handler calling
+        /// queue in the shard is lateral movement, not configuration.
+        ///
+        /// `None` (the normal case) uses the execution's own queue. A
+        /// statically-linked handler produces the same queue when it calls
         /// [`execute_activity_raw`](crate::context::WorkflowContext::execute_activity_raw)
-        /// with `ctx.queue_name()` produces — so a hosted run's
-        /// `ActivityScheduled` events are byte-identical to the native ones.
+        /// with `ctx.queue_name()`. So a hosted run's `ActivityScheduled` events
+        /// are byte-identical to the native ones.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         queue: Option<String>,
     },
@@ -367,9 +377,9 @@ pub enum DecideResponse {
 
 /// Every way loading a workflow module can be refused.
 ///
-/// Kept separate from [`HarvestError`] so the spike's failure modes are
-/// enumerable in one place for the safety analysis; `From<HotSwapError>` lowers
-/// into `HarvestError::Config` at the DB seam.
+/// Kept separate from [`HarvestError`], so the safety analysis can enumerate
+/// the spike's failure modes in one place. `From<HotSwapError>` lowers into
+/// `HarvestError::Config` at the DB seam.
 #[derive(Debug, thiserror::Error)]
 pub enum HotSwapError {
     /// The bytes are empty.
@@ -442,10 +452,10 @@ pub enum HotSwapError {
     },
     /// The build was unloaded while this load was compiling.
     ///
-    /// Without this check a retirement that raced a concurrent sync would be
-    /// silently undone: `unload_build` would report success while the in-flight
-    /// load re-inserted the binding afterwards, leaving a worker serving code
-    /// its operator believes is gone.
+    /// Without this check, a concurrent sync could silently undo a retirement
+    /// that raced it. `unload_build` would report success, and the in-flight
+    /// load would then re-insert the binding. The worker would serve code its
+    /// operator believes is gone.
     #[error(
         "build `{build_id}` was unloaded while its module for `{workflow_name}` was compiling; \
          re-sync if the build is still wanted"
@@ -484,12 +494,17 @@ const MODULE_SIGNATURE_DOMAIN: &[u8] = b"harvest-workflow-module-binding-v1";
 /// An earlier cut signed the content hash alone. That is sound as far as "these
 /// bytes were approved" goes, but it says nothing about *what those bytes were
 /// approved to be*. An attacker with `INSERT` on the registry could copy any
-/// existing row's `(hash, signature)` pair and re-bind it under a different
-/// build id or a different workflow name, and verification would pass — giving
-/// them a **downgrade** (resurrect a superseded but signed module under the
-/// build the ramp currently points at) and a **substitution** (run workflow A's
-/// module as workflow B, feeding it B's inputs). Signing the identity closes
-/// both, and costs nothing: a registry listing already carries all three fields.
+/// existing row's `(hash, signature)` pair. The attacker could re-bind it under
+/// a different build id or a different workflow name, and verification would
+/// pass. That gives two attacks:
+///
+/// * A **downgrade**: resurrect a superseded but signed module under the build
+///   the ramp currently points at.
+/// * A **substitution**: run workflow A's module as workflow B, feeding it B's
+///   inputs.
+///
+/// Signing the identity closes both, and costs nothing: a registry listing
+/// already carries all three fields.
 ///
 /// Each field is length-prefixed before hashing, so `("a", "bc")` and
 /// `("ab", "c")` cannot produce the same message.
@@ -501,8 +516,8 @@ const MODULE_SIGNATURE_DOMAIN: &[u8] = b"harvest-workflow-module-binding-v1";
 ///
 /// # Panics
 ///
-/// Never in practice: the only fallible step is HMAC key ingestion, and
-/// HMAC-SHA256 accepts a key of any length, so the `expect` is unreachable once
+/// Never in practice. The only fallible step is HMAC key ingestion, and
+/// HMAC-SHA256 accepts a key of any length. So the `expect` is unreachable once
 /// the length check above has passed.
 pub fn sign_module_binding(
     key: &[u8],
@@ -600,9 +615,9 @@ pub fn verify_module_bytes(
             build_id: build_id.to_string(),
             workflow_name: workflow_name.to_string(),
         };
-        // Compare decoded bytes, not hex text: it makes the check
-        // case-insensitive (an uppercase-hex tag is the same tag) and rejects
-        // malformed input as a bad signature rather than a length mismatch.
+        // Compare decoded bytes, not hex text. That makes the check
+        // case-insensitive, because an uppercase-hex tag is the same tag. It
+        // also rejects malformed input as a bad signature, not a length mismatch.
         let expected_tag = sign_module_binding(key, build_id, workflow_name, &actual)?;
         let (Some(expected_tag), Some(offered)) =
             (decode_hex(&expected_tag), decode_hex(signature))
@@ -746,14 +761,14 @@ pub struct ModuleRegistry {
     /// reproducible order for diagnostics and tests.
     bindings: RwLock<BTreeMap<(String, String), Arc<LoadedWorkflowModule>>>,
     /// Guest decisions already taken, shared by every task on this worker
-    /// (issue #967, Codex review round 2). See [`DecisionCache`] for why the
+    /// (issue #967). See [`DecisionCache`] for why the
     /// process is the right lifetime and why sharing is sound.
     decisions: Mutex<DecisionCache>,
     /// Bumped by every [`Self::unload_build`]. Paired with `unloaded_at` below
     /// to scope the race check to the build actually unloaded — see there.
     generation: AtomicU64,
     /// The registry generation at which each build id was most recently
-    /// unloaded (issue #1345 finding 7).
+    /// unloaded (issue #1345).
     ///
     /// `generation` alone cannot tell a commit which build raced it. One
     /// counter is shared by every build. Unloading `wf-v1` therefore also
@@ -826,9 +841,10 @@ impl ModuleRegistry {
         Self::with_store(Arc::new(WasmModuleStore::new()))
     }
 
-    /// Build a registry sharing an existing [`WasmModuleStore`] — e.g. the one
-    /// the worker already runs WASM *activities* on, so a process hosting both
-    /// has one engine and one epoch ticker rather than two.
+    /// Build a registry sharing an existing [`WasmModuleStore`].
+    ///
+    /// For example, pass the one the worker already runs WASM *activities* on.
+    /// A process hosting both then has one engine and one epoch ticker, not two.
     #[must_use]
     pub const fn with_store(store: Arc<WasmModuleStore>) -> Self {
         Self {
@@ -919,8 +935,8 @@ impl ModuleRegistry {
     /// Commit prepared bindings under one write lock, all or nothing.
     ///
     /// `generation_at_start` is the value the generation counter held before the
-    /// (slow, unlocked) compile step; a change means an `unload_build` ran in
-    /// the meantime and this load must not resurrect it.
+    /// (slow, unlocked) compile step. A change means an `unload_build` ran in
+    /// the meantime, and this load must not resurrect it.
     #[allow(
         clippy::significant_drop_tightening,
         reason = "holding the write guard across the WHOLE decision is the \
@@ -940,10 +956,9 @@ impl ModuleRegistry {
             .write()
             .unwrap_or_else(PoisonError::into_inner);
 
-        // Scoped to the builds THIS batch actually binds (issue #1345
-        // finding 7). A global generation bump would otherwise fail this
-        // commit for any unrelated build's unload, not just one racing this
-        // one.
+        // Scoped to the builds THIS batch actually binds (issue #1345). A
+        // global generation bump would otherwise fail this commit for any
+        // unrelated build's unload, not just one racing this one.
         {
             let unloaded_at = self
                 .unloaded_at
@@ -968,12 +983,12 @@ impl ModuleRegistry {
         //
         // Two checks, not one. The first compares each entry against what is
         // *already* bound. The second compares the entries against **each
-        // other** (issue #967, Codex review round 1): a batch carrying two
-        // different modules for one `(build_id, workflow_name)` passes the first
-        // check trivially when nothing is bound yet — `bindings` does not know
-        // about the batch — and the insert loop below would then let the last
-        // entry silently overwrite the first, which is precisely the immutable-
-        // binding guarantee this method exists to enforce. Rejecting it as a
+        // other** (issue #967). Take a batch carrying two different modules for
+        // one `(build_id, workflow_name)`. It passes the first check trivially
+        // when nothing is bound yet, because `bindings` does not know about the
+        // batch. The insert loop below would then let the last entry silently
+        // overwrite the first. That breaks the immutable-binding guarantee this
+        // method exists to enforce. Rejecting it as a
         // `DuplicateRegistration` keeps one answer to "what does this build id
         // mean for this workflow" regardless of how the modules were submitted.
         // Scoped so the borrows of `prepared` end before the insert loop moves it.
@@ -1014,13 +1029,14 @@ impl ModuleRegistry {
     /// Rebinding to *different* bytes is refused — see
     /// [`HotSwapError::DuplicateRegistration`].
     ///
-    /// Named `load_module` rather than `load` deliberately: `diesel_async`'s
+    /// Named `load_module` rather than `load` deliberately. `diesel_async`'s
     /// `RunQueryDsl` has a blanket `impl<T> RunQueryDsl for T` supplying a
-    /// `load` method, and a caller holding an `Arc<ModuleRegistry>` with that
-    /// trait in scope would resolve `registry.load(..)` to *diesel's* method
-    /// before auto-deref reached ours — producing a wall of unrelated
-    /// `QueryFragment` errors. Every DB-side caller here has `RunQueryDsl` in
-    /// scope, so the distinct name is load-bearing, not stylistic.
+    /// `load` method. Take a caller that holds an `Arc<ModuleRegistry>` with
+    /// that trait in scope. It would resolve `registry.load(..)` to *diesel's*
+    /// method before auto-deref reached this one. The result is a wall of
+    /// unrelated `QueryFragment` errors. Every DB-side caller here has
+    /// `RunQueryDsl` in scope, so the distinct name is load-bearing, not
+    /// stylistic.
     ///
     /// # Errors
     ///
@@ -1044,8 +1060,8 @@ impl ModuleRegistry {
     /// once** — or bind none of them.
     ///
     /// This is the property a whole-build sync needs and a per-module loop
-    /// cannot give: a build whose third module fails verification must not leave
-    /// the first two bound, because a worker advertising a build it can only
+    /// cannot give. A build whose third module fails verification must not
+    /// leave the first two bound. A worker advertising a build it can only
     /// half-serve claims executions it must then destroy.
     ///
     /// `batch` entries are `(build_id, workflow_name, bytes, verification)`.
@@ -1092,8 +1108,8 @@ impl ModuleRegistry {
     /// Pair with [`load_generation`](Self::load_generation) and
     /// [`commit_prepared`](Self::commit_prepared) to load a whole build
     /// atomically **without holding every module's source bytes at once**
-    /// (issue #967, Codex review round 2): fetch a payload, prepare it, drop the
-    /// payload, repeat, then commit. [`load_modules`](Self::load_modules) is the
+    /// (issue #967). Fetch a payload, prepare it, drop the payload, repeat,
+    /// then commit. [`load_modules`](Self::load_modules) is the
     /// convenience form for callers that already hold the whole batch.
     ///
     /// # Errors
@@ -1115,8 +1131,8 @@ impl ModuleRegistry {
     /// # Errors
     ///
     /// [`HotSwapError::DuplicateRegistration`] if any binding would change what
-    /// a `(build_id, workflow_name)` means — including two entries within this
-    /// batch disagreeing — and [`HotSwapError::UnloadedDuringLoad`] if the
+    /// a `(build_id, workflow_name)` means. That includes two entries within
+    /// this batch that disagree. [`HotSwapError::UnloadedDuringLoad`] if the
     /// registry's generation moved since `generation` was read.
     pub fn commit_prepared(
         &self,
@@ -1201,19 +1217,20 @@ impl ModuleRegistry {
 
 // ── the task-scoped host binding ──────────────────────────────────────────────
 
-/// The module-hosting context for one workflow task: which registry to resolve
-/// from, which **execution** build id to resolve for, and the policy the guest
-/// runs under.
+/// The module-hosting context for one workflow task.
+///
+/// It names the registry to resolve from, the **execution** build id to
+/// resolve for, and the policy the guest runs under.
 #[derive(Debug, Clone)]
 pub struct ModuleHost {
     /// The worker's loaded-module table.
     pub registry: Arc<ModuleRegistry>,
     /// The **execution's** assigned build id, threaded by the worker seam from
     /// the execution row's `assigned_build_id`. `None` means the execution
-    /// predates any build policy, in which case no module can be resolved for it
-    /// and the trampoline fails loudly rather than guessing a version.
+    /// predates any build policy. No module can then be resolved for it, and
+    /// the trampoline fails loudly rather than guessing a version.
     pub build_id: Option<String>,
-    /// Host capabilities granted to the guest. Deny-all by default: a decider
+    /// Host capabilities granted to the guest. Deny-all by default. A decider
     /// that could read a clock or draw randomness would be non-deterministic by
     /// construction, and no amount of build routing repairs that.
     pub capabilities: WasmCapabilities,
@@ -1223,8 +1240,8 @@ pub struct ModuleHost {
     /// Activity names the guest may schedule. `None` (the default) allows any
     /// registered activity.
     ///
-    /// `Await` is the guest's one host-side capability, and deny-all
-    /// [`WasmCapabilities`] does not constrain it at all: the sandbox governs
+    /// `Await` is the guest's one host-side capability. Deny-all
+    /// [`WasmCapabilities`] does not constrain it at all. The sandbox governs
     /// what the guest may *import*, not what the host will do on its behalf. A
     /// module can otherwise schedule any activity the worker registry knows,
     /// read its output, and return it to the caller. An allowlist is the control
@@ -1236,32 +1253,31 @@ pub struct ModuleHost {
     /// lateral movement, not configuration.
     pub allow_queue_override: bool,
     /// The binding the dispatch path already resolved, held for the life of the
-    /// invocation (issue #967, Codex review round 1).
+    /// invocation (issue #967).
     ///
-    /// The worker seam resolves the module *before* dispatch so a miss is a
-    /// typed capability miss rather than a terminal failure. Dropping that `Arc`
-    /// and looking the binding up a second time inside the trampoline would
-    /// reopen the window it was meant to close: an
+    /// The worker seam resolves the module *before* dispatch, so a miss is a
+    /// typed capability miss rather than a terminal failure. A second lookup
+    /// inside the trampoline would reopen the window that this closes. An
     /// [`unload_build`](ModuleRegistry::unload_build) landing between the two
-    /// lookups makes the second one miss, and *there* a miss is an
-    /// `Err(String)` — a terminal `WorkflowFailed` for an execution that had
-    /// already passed the capability check. Holding the `Arc` across dispatch is
-    /// what makes the documented "unloading is safe for in-flight invocations"
-    /// guarantee true rather than merely likely.
+    /// lookups makes the second one miss. *There* a miss is an `Err(String)`.
+    /// That is a terminal `WorkflowFailed` for an execution that had already
+    /// passed the capability check. Holding the `Arc` across dispatch makes the
+    /// documented "unloading is safe for in-flight invocations" guarantee true
+    /// rather than merely likely.
     pub pinned_module: Option<Arc<LoadedWorkflowModule>>,
 }
 
 /// Hard ceiling on the NUMBER of entries in a registry's decision cache.
 ///
 /// A count alone is **not** a memory bound, and reading it as one was a real bug
-/// (issue #967, Codex review round 3): the key is a 32-byte digest, but the
-/// *value* is a whole `DecideResponse`, which a guest may return at up to
+/// (issue #967). The key is a 32-byte digest. The *value* is a whole
+/// `DecideResponse`, which a guest may return at up to
 /// [`WASM_MAX_OUTPUT_BYTES`](crate::wasm_activities::WASM_MAX_OUTPUT_BYTES)
 /// — 4 MiB. A guest returning a distinct large response per request could
-/// therefore have filled 4096 entries with ~16 GiB and OOM'd the worker,
-/// walking straight past the per-invocation memory ceiling the sandbox
-/// enforces. [`MAX_CACHED_DECISION_BYTES`] is the bound that actually holds;
-/// this one just keeps the map's own overhead in check.
+/// therefore have filled 4096 entries with ~16 GiB and OOM'd the worker. That
+/// walks straight past the per-invocation memory ceiling the sandbox enforces.
+/// [`MAX_CACHED_DECISION_BYTES`] is the bound that actually holds; this one
+/// just keeps the map's own overhead in check.
 pub const MAX_CACHED_DECISIONS: usize = 4096;
 
 /// Total bytes of cached responses a registry will retain.
@@ -1273,34 +1289,33 @@ pub const MAX_CACHED_DECISION_BYTES: usize = 8 * 1024 * 1024;
 /// Largest single response the cache will retain.
 ///
 /// A decision is an activity name plus its input, or a final output; 64 KiB is
-/// already generous for one. Refusing to cache anything larger means a single
-/// fat response cannot evict the whole cache to make room for itself, and costs
-/// only the optimisation for that one step — the guest is still re-asked, which
-/// is exactly what happened before any cache existed.
+/// already generous for one. The cache refuses anything larger. So a single fat
+/// response cannot evict the whole cache to make room for itself. That costs
+/// only the optimisation for that one step. The guest is still re-asked,
+/// exactly as before any cache existed.
 pub const MAX_CACHED_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// A worker-process-lifetime cache of guest decisions, bounded and
-/// insertion-ordered (issue #967, Codex review round 2).
+/// insertion-ordered (issue #967).
 ///
 /// **Why the process and not the task.** The first cut of this cache lived on
-/// `ModuleHost`, installed fresh per workflow task. That is the wrong lifetime:
-/// an ordinary activity *ends* the task, and the workflow resumes in a new
-/// `process_workflow_task` call (only local activities re-drive in place), so
-/// the cache was reset on every durable cycle and the O(n²) it existed to remove
-/// survived untouched in production.
+/// `ModuleHost`, installed fresh per workflow task. That is the wrong lifetime.
+/// An ordinary activity *ends* the task, and the workflow resumes in a new
+/// `process_workflow_task` call. Only local activities re-drive in place. So
+/// the cache was reset on every durable cycle, and the O(n²) it existed to
+/// remove survived untouched in production.
 ///
 /// **Why sharing across executions is sound.** The guest is a pure function of
 /// its request, under deny-all capabilities — no clock, no randomness. Two calls
-/// with the same key are therefore two calls that must return the same answer,
-/// whoever is asking. The key is a digest of `(build_id, module_hash, request
-/// bytes)`, so an entry can only ever be reused for byte-identical input to
-/// byte-identical code; the module identity is load-bearing, since a
-/// `DecideRequest` carries no build id and v1/v2 of one workflow see identical
-/// input at step 0.
+/// with the same key therefore must return the same answer, whoever is asking.
+/// The key is a digest of `(build_id, module_hash, request bytes)`. So an entry
+/// is only ever reused for byte-identical input to byte-identical code. The
+/// module identity is load-bearing. A `DecideRequest` carries no build id, and
+/// v1/v2 of one workflow see identical input at step 0.
 ///
-/// Eviction is oldest-first rather than true LRU: a decision's value is
-/// concentrated in the cycles right after it is taken, and an insertion-ordered
-/// map keeps the implementation something a reader can check by eye.
+/// Eviction is oldest-first rather than true LRU. A decision's value is
+/// concentrated in the cycles right after it is taken. An insertion-ordered map
+/// keeps the implementation something a reader can check by eye.
 #[derive(Debug, Default)]
 pub struct DecisionCache {
     entries: BTreeMap<u64, CachedDecision>,
@@ -1318,12 +1333,12 @@ struct CachedDecision {
     response: DecideResponse,
     bytes: usize,
     /// Fuel the guest consumed to produce this decision when it was actually
-    /// computed (issue #967, Codex review rounds 4 and 6).
+    /// computed (issue #967).
     ///
     /// Charged to the run's budget again on every cache HIT, so the accounting
     /// is the same whether a step was recomputed or served from cache. Without
-    /// it a cache hit was free and a miss was not, which made the run's
-    /// *terminal outcome* depend on cache residency — on whether unrelated
+    /// it a cache hit was free and a miss was not. The run's *terminal outcome*
+    /// then depended on cache residency. It depended on whether unrelated
     /// executions had evicted the entry, or whether the response happened to
     /// exceed `MAX_CACHED_RESPONSE_BYTES`. That is exactly the class of defect
     /// `MAX_DECIDE_STEPS` is a compile-time constant to avoid.
@@ -1485,11 +1500,11 @@ impl ModuleHost {
 
     /// Tighten the per-decision resource budget.
     ///
-    /// Every field is clamped **down** against [`default_decide_limits`]: these
-    /// are safety ceilings, and an override exists to make a deployment stricter,
-    /// never to lift a bound the safety analysis relies on. (The fields are
-    /// `pub` for inspection; assigning them directly bypasses this clamp, which
-    /// is why [`module_workflow_handler`] re-clamps at dispatch.)
+    /// Every field is clamped **down** against [`default_decide_limits`]. These
+    /// are safety ceilings. An override exists to make a deployment stricter,
+    /// never to lift a bound the safety analysis relies on. The fields are
+    /// `pub` for inspection. Assigning them directly bypasses this clamp, so
+    /// [`module_workflow_handler`] re-clamps at dispatch.
     #[must_use]
     pub fn with_limits(mut self, limits: WasmLimits) -> Self {
         self.limits = clamp_decide_limits(limits);
@@ -1562,10 +1577,10 @@ pub fn clamp_decide_limits(limits: WasmLimits) -> WasmLimits {
 tokio::task_local! {
     /// The [`ModuleHost`] in scope for the current workflow task.
     ///
-    /// A task-local (not a thread-local) because a workflow future is polled
-    /// across `.await` points and may resume on a different runtime thread; and
-    /// not a process global because two builds' tasks run concurrently in one
-    /// process and each must see its own binding.
+    /// A task-local, not a thread-local: a workflow future is polled across
+    /// `.await` points and may resume on a different runtime thread. Not a
+    /// process global either: two builds' tasks run concurrently in one process,
+    /// and each must see its own binding.
     static MODULE_HOST: ModuleHost;
 }
 
@@ -1604,10 +1619,10 @@ pub fn is_module_hosted(handler: crate::info::WorkflowHandlerFn) -> bool {
 /// Serialize a [`DecideRequest`] into exactly the bytes the guest receives.
 ///
 /// Deliberately `serde_json::to_vec` on the **struct**, never a round trip
-/// through [`serde_json::Value`]: a `Value`'s object is a `BTreeMap`, so going
+/// through [`serde_json::Value`]. A `Value`'s object is a `BTreeMap`. Going
 /// through one would reorder the keys alphabetically and move `step` off the
-/// fixed offset the WAT guests read it from. This is the one function whose
-/// output the guests' fixed-offset assumption depends on, so it is public and
+/// fixed offset the WAT guests read it from. The guests' fixed-offset
+/// assumption depends on this one function's output. So it is public and
 /// pinned by `decide_request_serialises_step_first_so_a_wat_guest_can_read_it`.
 ///
 /// # Errors
@@ -1630,16 +1645,16 @@ pub fn encode_decide_request(request: &DecideRequest) -> Result<Vec<u8>, String>
 
 /// Invoke a guest for one decision, from an already-encoded request.
 ///
-/// Takes bytes rather than a [`DecideRequest`] because the caller encodes the
-/// request anyway — those exact bytes are the decision cache's key (see
-/// [`ModuleHost::decisions`]), so encoding once and passing it through keeps the
-/// cache key and the guest's input the same object by construction. `step` is
-/// carried alongside only for the error message.
+/// Takes bytes rather than a [`DecideRequest`], because the caller encodes the
+/// request anyway. Those exact bytes are the decision cache's key (see
+/// [`ModuleHost::decisions`]). Encoding once keeps the cache key and the
+/// guest's input the same object by construction. `step` is carried alongside
+/// only for the error message.
 ///
-/// Reuses the issue-#965 sandbox: same engine, same fresh per-invocation store,
-/// same fuel/epoch/memory bounding, same bounds-checked linear-memory ABI, same
-/// host-glue panic containment. The spike adds no second sandbox and no new
-/// `unsafe`.
+/// Reuses the issue-#965 sandbox. It keeps the same engine, the same fresh
+/// per-invocation store and the same fuel/epoch/memory bounding. It also keeps
+/// the same bounds-checked linear-memory ABI and host-glue panic containment.
+/// The spike adds no second sandbox and no new `unsafe`.
 fn decide_encoded(
     host: &ModuleHost,
     limits: &WasmLimits,
@@ -1678,10 +1693,10 @@ fn decide_encoded(
 ///
 /// Only a genuine activity outcome is the guest's business. A replay divergence
 /// or a cancellation is the **engine** telling the host that this run cannot
-/// continue, and handing it to the guest as ordinary data would let the guest
-/// answer `Complete` over a history it demonstrably diverged from — sealing the
-/// execution COMPLETED with a wrong result, and disabling the issue-#603
-/// ND-blocking net that every other part of this design leans on.
+/// continue. Handed to the guest as ordinary data, it would let the guest
+/// answer `Complete` over a history it demonstrably diverged from. That seals
+/// the execution COMPLETED with a wrong result. It also disables the
+/// issue-#603 ND-blocking net that every other part of this design leans on.
 ///
 /// `None` means "propagate this, it is not a step outcome".
 fn outcome_for_guest(err: &HarvestError) -> Option<DecideOutcome> {
@@ -1696,20 +1711,20 @@ fn outcome_for_guest(err: &HarvestError) -> Option<DecideOutcome> {
             error: bound_guest_text(&err.to_string()),
         }),
         // An activity-scoped timeout is an activity OUTCOME, not an engine
-        // failure (issue #967, Codex review round 2). `execute_activity_raw`
-        // produces it from `HistoryMatch::TimedOut`, so it is history-backed and
-        // replay-deterministic on exactly the same footing as `ActivityFailed` —
-        // and the engine itself pairs the two everywhere it classifies a step
+        // failure (issue #967). `execute_activity_raw` produces it from
+        // `HistoryMatch::TimedOut`. So it is history-backed and
+        // replay-deterministic on exactly the same footing as `ActivityFailed`.
+        // The engine itself pairs the two everywhere it classifies a step
         // result (`context.rs`, `dag.rs`). Withholding it gave a hosted workflow
-        // strictly less than its statically-linked twin: a timeout a native
+        // strictly less than its statically-linked twin. A timeout a native
         // handler can catch and recover from killed a hosted run outright.
         //
         // The `timeout_type` split is the part that matters, and is why this is
         // not simply "hand `Timeout` over". `WorkflowExecution` and
-        // `WorkflowChain` are the *run's* own deadline, not a step's; handing
-        // either to the guest would let a module answer `Complete` and carry on
-        // past the deadline the engine just enforced — the same shape of mistake
-        // as handing over a replay divergence.
+        // `WorkflowChain` are the *run's* own deadline, not a step's. Handed to
+        // the guest, either would let a module answer `Complete` and carry on
+        // past the deadline the engine just enforced. That is the same shape of
+        // mistake as handing over a replay divergence.
         HarvestError::Timeout {
             timeout_type:
                 timeout_type @ (TimeoutType::StartToClose
@@ -1734,9 +1749,9 @@ fn outcome_for_guest(err: &HarvestError) -> Option<DecideOutcome> {
 
 /// The run-scoped guest budget was exhausted.
 ///
-/// One constructor so the cached and recomputed paths report identically —
-/// a difference in the message would be a difference in the run's observable
-/// outcome, which is the very thing charging cache hits exists to prevent.
+/// One constructor, so the cached and recomputed paths report identically. A
+/// difference in the message would be a difference in the run's observable
+/// outcome. Charging cache hits exists to prevent exactly that.
 fn run_budget_exceeded(build_id: &str) -> String {
     format!(
         "workflow module for build `{build_id}` exceeded the {DECIDE_RUN_FUEL_BUDGET}-fuel \
@@ -1756,59 +1771,15 @@ fn run_wall_clock_backstop_exceeded(build_id: &str) -> String {
     )
 }
 
-/// The statically-linked [`WorkflowHandlerFn`](crate::info::WorkflowHandlerFn)
-/// that hosts a runtime-loaded module.
-///
-/// Register this as the `handler` of any [`WorkflowInfo`](crate::info::WorkflowInfo)
-/// whose body should come from a module instead of the binary. It is an ordinary
-/// `fn` pointer, so nothing about `WorkflowInfo`, the worker dispatch path, the
-/// executor or the replayer changes.
-///
-/// # What it does
-///
-/// Resolves the [`ModuleHost`] bound to the current task, resolves the module
-/// for `(host.build_id, ctx.workflow_type())`, then runs the decide loop:
-/// call the guest, await whatever activity it asks for through the ordinary
-/// [`WorkflowContext`] surface, feed the outcome back, repeat until the guest
-/// completes or fails.
-///
-/// # Determinism
-///
-/// The guest sees only its input and the outcomes of awaits it itself requested
-/// — every one of which is replayed from history on a replay. It is granted no
-/// clock and no randomness. So a hosted run emits exactly the command sequence
-/// its statically-linked twin does, and the recorded history is byte-identical.
-///
-/// "Its statically-linked twin" means one that **catches** activity failures: a
-/// failed activity is delivered to the guest as a [`DecideOutcome::Err`] and the
-/// guest decides what it means, rather than the host propagating it. A native
-/// handler using `?` is a *different* workflow, and its history differs on the
-/// failure path. A guest that wants propagation returns [`DecideResponse::Fail`].
-///
-/// An engine-level error — a replay divergence, a cancellation — is **not** an
-/// activity outcome and never reaches the guest; see [`outcome_for_guest`].
-///
-/// # Failure modes
-///
-/// All are returned as `Err(String)`, which the engine treats as an ordinary
-/// workflow failure: no module host bound, no module for this build, a guest
-/// trap or resource exhaustion, an unparseable or oversized response, a
-/// disallowed activity or queue, or more than [`MAX_DECIDE_STEPS`] decisions.
-///
-/// The *resolution* failures (no host, no build, no module) are pre-empted by
-/// the worker seam, which resolves the module before dispatch and releases the
-/// task as a capability miss instead — so in a worker they are defence in depth
-/// rather than the live path. They remain errors here for the test harness and
-/// the replayer, which have no seam.
 /// Resolve the queue an `Await` should schedule onto, applying the host's
 /// policy.
 ///
 /// # Errors
 ///
 /// A message naming the refusal when the guest asked to override the queue and
-/// the host does not allow it, or when the resolved queue is empty (no worker
-/// polls the empty queue, so the activity would sit until schedule-to-start
-/// expired instead of failing fast).
+/// the host does not allow it. Also a message when the resolved queue is empty.
+/// No worker polls the empty queue, so the activity would sit until
+/// schedule-to-start expired instead of failing fast.
 fn resolve_activity_queue(
     host: &ModuleHost,
     ctx: &WorkflowContext,
@@ -1859,8 +1830,8 @@ fn check_await_allowed(
 ) -> Result<(), String> {
     // Refuse the await the ceiling could not consume, BEFORE scheduling it.
     // Otherwise the last permitted step runs a real activity — money moved,
-    // mail sent — and the run is then failed for not terminating, having paid
-    // for a side effect it can never use.
+    // mail sent. The run then fails for not terminating, after it paid for a
+    // side effect it can never use.
     if step + 1 >= MAX_DECIDE_STEPS {
         return Err(format!(
             "workflow module for build `{build_id}` asked for another activity at step {step}, \
@@ -1879,6 +1850,55 @@ fn check_await_allowed(
     Ok(())
 }
 
+/// The statically-linked [`WorkflowHandlerFn`](crate::info::WorkflowHandlerFn)
+/// that hosts a runtime-loaded module.
+///
+/// Register this as the `handler` of any [`WorkflowInfo`](crate::info::WorkflowInfo)
+/// whose body should come from a module instead of the binary. It is an ordinary
+/// `fn` pointer, so nothing about `WorkflowInfo`, the worker dispatch path, the
+/// executor or the replayer changes.
+///
+/// # What it does
+///
+/// Resolves the [`ModuleHost`] bound to the current task, and resolves the
+/// module for `(host.build_id, ctx.workflow_type())`. Then it runs the decide
+/// loop. It calls the guest and awaits whatever activity the guest asks for,
+/// through the ordinary [`WorkflowContext`] surface. It feeds the outcome back,
+/// and repeats until the guest completes or fails.
+///
+/// # Determinism
+///
+/// The guest sees only its input and the outcomes of awaits it itself
+/// requested. A replay replays each of those from history. It is granted no
+/// clock and no randomness. So a hosted run emits exactly the command sequence
+/// its statically-linked twin does, and the recorded history is byte-identical.
+///
+/// "Its statically-linked twin" means one that **catches** activity failures.
+/// The host delivers a failed activity to the guest as a [`DecideOutcome::Err`]
+/// and does not propagate it. The guest decides what it means. A native
+/// handler using `?` is a *different* workflow, and its history differs on the
+/// failure path. A guest that wants propagation returns [`DecideResponse::Fail`].
+///
+/// An engine-level error — a replay divergence, a cancellation — is **not** an
+/// activity outcome and never reaches the guest; see `outcome_for_guest`.
+///
+/// # Failure modes
+///
+/// All are returned as `Err(String)`, which the engine treats as an ordinary
+/// workflow failure:
+///
+/// * no module host bound, or no module for this build;
+/// * a guest trap or resource exhaustion;
+/// * an unparseable or oversized response;
+/// * a disallowed activity or queue;
+/// * more than [`MAX_DECIDE_STEPS`] decisions.
+///
+/// The worker seam pre-empts the *resolution* failures (no host, no build, no
+/// module). It resolves the module before dispatch, and releases the task as a
+/// capability miss instead. So in a worker they are defence in depth rather
+/// than the live path. They remain errors here for the test harness and the
+/// replayer, which have no seam.
+///
 /// # Panics
 ///
 /// Never: the only `expect` converts the loop index to `u32`, and the index is
@@ -1925,13 +1945,13 @@ pub fn module_workflow_handler(
 
         // Under DD-1 the workflow restarts at step 0 on every decision cycle, so
         // the decisions for steps `0..n` are re-derived on every one of them.
-        // The cache that removes that quadratic lives on the *host* (task-local,
-        // one execution's drive) rather than in this future: a map created here
-        // is written and read in the same monotonically increasing pass and can
-        // never hit. See `ModuleHost::decisions`.
+        // The cache that removes that quadratic lives on the *registry*, for
+        // the whole worker process, not in this future. A map created here is
+        // written and read in the same monotonically increasing pass, so it
+        // can never hit. See `ModuleRegistry::decisions` and `DecisionCache`.
         //
         // The cache is skipped entirely when `host.capabilities` is not
-        // deny-all (issue #1345 finding 2). Its soundness rests on the guest
+        // deny-all (issue #1345). Its soundness rests on the guest
         // being a pure function of its request. That holds only under
         // deny-all. `with_capabilities` can grant a clock or randomness. A
         // guest granted either can answer differently on two calls with the
@@ -1963,11 +1983,11 @@ pub fn module_workflow_handler(
                 format!("failed to encode the decide request for step {step_index}: {why}")
             })?;
             // The cache key digests the request TOGETHER WITH the module
-            // identity. `DecideRequest` deliberately carries no build id — the
-            // guest has no business knowing which version it is — so the request
-            // bytes alone are ambiguous across builds: v1 and v2 of one workflow
-            // see byte-identical input at step 0, and a key without the identity
-            // would let v1's decision be served to v2, silently defeating the
+            // identity. `DecideRequest` deliberately carries no build id: the
+            // guest has no business knowing which version it is. So the request
+            // bytes alone are ambiguous across builds. v1 and v2 of one workflow
+            // see byte-identical input at step 0. A key without the identity
+            // would let v1's decision be served to v2. That silently defeats the
             // swap this whole spike is about.
             let key = DecisionCache::key(&build_id, &module.descriptor().module_hash, &encoded);
             let cached = if deny_all {
@@ -1979,30 +1999,29 @@ pub fn module_workflow_handler(
                 None
             };
             // The budget is charged for a step whether it was recomputed or
-            // served from cache (issue #967, Codex review round 4). A cache hit
-            // used to be free, which made the run's TERMINAL OUTCOME depend on
-            // cache residency: the same workflow, with the same history, would
-            // complete when its earlier decisions happened to still be resident
-            // and fail when unrelated executions had evicted them — or when one
-            // response exceeded `MAX_CACHED_RESPONSE_BYTES` and was never cached
-            // at all. That is precisely the class of defect `MAX_DECIDE_STEPS`
-            // is a compile-time constant to avoid, arriving through the
-            // optimisation instead. The cache is allowed to make a run
-            // *cheaper*; it is not allowed to change what the run *decides*.
+            // served from cache (issue #967). A cache hit used to be free. The
+            // run's TERMINAL OUTCOME then depended on cache residency. The same
+            // workflow, with the same history, would complete when its earlier
+            // decisions were still resident. It would fail when unrelated
+            // executions had evicted them. It would also fail when one response
+            // exceeded `MAX_CACHED_RESPONSE_BYTES` and was never cached at all.
+            // That is precisely the class of defect `MAX_DECIDE_STEPS` is a
+            // compile-time constant to avoid, arriving through the optimisation
+            // instead. The cache is allowed to make a run *cheaper*; it is not
+            // allowed to change what the run *decides*.
             // ONE order for both paths: charge the cost, check the budget, then
-            // act on the response (issue #967, Codex review round 5, correcting
-            // round 4). The first cut of this charged cache hits — which was the
-            // point — but kept the miss path's check *before* the decision and
-            // never re-checked after adding its cost. So a fresh decision that
-            // pushed the run over budget was accepted while the same total
-            // served from cache was rejected: the residency dependence survived
-            // its own fix, in the asymmetry of the fix.
+            // act on the response (issue #967). The first cut of this charged
+            // cache hits, which was the point. But it kept the miss path's check
+            // *before* the decision, and never re-checked after adding its cost.
+            // So a fresh decision that pushed the run over budget was accepted.
+            // The same total served from cache was rejected. The residency
+            // dependence survived its own fix, in the asymmetry of the fix.
             //
             // The post-charge check also has to come before the response is
             // *used*, not merely before the next iteration. An over-budget
-            // `Await` acted on optimistically schedules a real activity — a side
-            // effect the run then fails immediately after, which is the worst of
-            // both outcomes.
+            // `Await` acted on optimistically schedules a real activity. The run
+            // then fails immediately after that side effect, which is the worst
+            // of both outcomes.
             //
             // The pre-check is gone rather than duplicated. Every iteration
             // now returns as soon as the budget is reached. The loop
@@ -2175,9 +2194,9 @@ mod tests {
 
     #[test]
     fn the_cumulative_fuel_budget_sits_above_a_single_decisions_fuel_ceiling() {
-        // Issue #1345 finding 5. `DECIDE_RUN_FUEL_BUDGET` is now the
-        // OPERATIVE cumulative budget, replacing one that charged a cache
-        // hit the wall-clock duration recorded when the decision was first
+        // Issue #1345. `DECIDE_RUN_FUEL_BUDGET` is now the OPERATIVE
+        // cumulative budget. It replaces one that charged a cache hit the
+        // wall-clock duration recorded when the decision was first
         // computed. That charge varied with host load. A run's terminal
         // outcome would then depend on host load too. The same history
         // could fail on a busy worker and succeed on an idle one. Fuel is
@@ -2190,11 +2209,10 @@ mod tests {
 
     #[test]
     fn the_wall_clock_backstop_still_bounds_a_cheap_in_fuel_slow_guest() {
-        // Codex review of the finding-5 fix (issue #1345). Fuel alone does
-        // not bound a bulk-memory-heavy guest: such instructions cost one
-        // fuel unit regardless of bytes moved. A capability-enabled host
-        // (finding 2) or a cache miss recomputes every step fresh. Up to
-        // `MAX_DECIDE_STEPS` decisions could each spend close to
+        // Issue #1345: fuel alone does not bound a bulk-memory-heavy guest.
+        // Such instructions cost one fuel unit regardless of bytes moved. A
+        // capability-enabled host or a cache miss recomputes every step fresh.
+        // Up to `MAX_DECIDE_STEPS` decisions could each spend close to
         // `DECIDE_MAX_WALL_CLOCK` while staying under the fuel budget.
         // `DECIDE_RUN_WALL_CLOCK_BACKSTOP` must still be the looser bound
         // against a single decision's own wall-clock backstop, or one
@@ -2265,12 +2283,12 @@ mod tests {
 
     #[test]
     fn activity_scoped_timeouts_are_the_guests_business_but_run_scoped_ones_are_not() {
-        // Codex review round 2. `execute_activity_raw` builds this from
-        // `HistoryMatch::TimedOut`, so it is history-backed and replay-
-        // deterministic on the same footing as `ActivityFailed` — and the engine
-        // pairs the two everywhere it classifies a step result. Withholding it
-        // gave a hosted workflow strictly less than its statically-linked twin:
-        // a timeout a native handler can catch killed a hosted run outright.
+        // `execute_activity_raw` builds this from `HistoryMatch::TimedOut`. So
+        // it is history-backed and replay-deterministic on the same footing as
+        // `ActivityFailed`. The engine pairs the two everywhere it classifies a
+        // step result. Withholding it gave a hosted workflow strictly less than
+        // its statically-linked twin: a timeout a native handler can catch
+        // killed a hosted run outright.
         for timeout_type in [
             TimeoutType::StartToClose,
             TimeoutType::ScheduleToStart,
@@ -2293,10 +2311,10 @@ mod tests {
             }
         }
 
-        // The split that matters. These are the RUN's own deadline, not a step's
-        // — handing either to the guest would let a module answer `Complete` and
-        // carry on past the deadline the engine just enforced, which is the same
-        // shape of mistake as handing over a replay divergence.
+        // The split that matters. These are the RUN's own deadline, not a
+        // step's. Handed to the guest, either would let a module answer
+        // `Complete` and carry on past the deadline the engine just enforced.
+        // That is the same shape of mistake as handing over a replay divergence.
         for timeout_type in [TimeoutType::WorkflowExecution, TimeoutType::WorkflowChain] {
             assert!(
                 outcome_for_guest(&HarvestError::Timeout {

@@ -43,11 +43,13 @@ pub mod profile_read;
 pub mod wake;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::pin::Pin;
 use std::time::Duration;
 
 use autumn_harvest::entity::{ENTITY_OP_SIGNAL, Entity, EntityMessage, Wake};
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
+use autumn_harvest::time::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::consolidate::{
@@ -61,19 +63,21 @@ use crate::flow::Released;
 use crate::followup::{Followups, WAKE_MESSAGE};
 use crate::heartbeat::{DEFAULT_HEARTBEAT_PROMPT, HeartbeatTask};
 use crate::loop_guard::LoopGuard;
-use crate::memory::{EditKey, MemoryScope};
+use crate::memory::{EditKey, MemoryScope, READ_ONLY_SNAPSHOT_PATCH, SnapshotAccess};
 use crate::mesh::{Mandate, Refusal};
 use crate::message::{ChatMessage, ChatRole, RunId, SessionId};
+use crate::sampling::{OpSample, SampleFailure, sample_task};
 use crate::skill::SkillText;
 use crate::types::{AgentStop, AgentTask, DEFAULT_APPROVAL_TIMEOUT_SECS, DEFAULT_MAX_STEPS};
 use crate::workflow::{
-    Member, Outbox, Progress, Run, SteerBook, Tree, deliver, discover, harness, run_segment,
+    Member, Outbox, Progress, Run, SteerBook, Tree, boxed_run_segment, deliver, discover, harness,
 };
 use crate::workspace::{WorkspaceMount, WorkspaceRef};
+use autumn_harvest::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES;
 use dedupe::Inbound;
 use inbox::{Admit, InboxStatus, OpClass, admit};
 use overlay_store::OverlayVersion;
-use profile_read::{OverlayRead, ProfileRead, overlaid};
+use profile_read::{OverlayRead, ProfileRead, overlaid, reloaded};
 
 /// The registered workflow name of a durable agent.
 pub const AGENT_WORKFLOW_NAME: &str = "agent";
@@ -98,6 +102,14 @@ pub const PROFILE_VERSION_ATTR: &str = "agent_profile_version";
 /// The patch gate of the episode reset in `Control::ResetMemory` (issue
 /// #2454). A run recorded before it replays with no reset activity.
 const EPISODE_RESET_PATCH: &str = "agent_episode_reset";
+
+/// The patch gate of the lesson erase in `Control::ResetMemory`.
+const LESSON_ERASE_PATCH: &str = "agent_lesson_erase";
+
+/// The patch gate of the store counts in `Control::ResetMemory`. The memory
+/// reset counts its entries, and the transcript windows of the agent go. A
+/// run recorded before it replays the plain memory reset.
+const STORE_COUNTS_PATCH: &str = "agent_store_counts";
 
 /// The signal that interrupts the op that an agent runs (issue #2265).
 ///
@@ -235,6 +247,11 @@ pub struct UserMessage {
     /// How the message treats the op that runs.
     #[serde(default, skip_serializing_if = "Urgency::is_queue")]
     pub urgency: Urgency,
+    /// The strategy of the op. With one, the op runs its draws through the
+    /// core of `agent_sample`. The policy of the kind and the mandate of
+    /// the agent apply. A steer message with a strategy runs as its own op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample: Option<OpSample>,
 }
 
 /// The payload of [`STEER_SIGNAL`].
@@ -267,7 +284,8 @@ pub enum Control {
     },
     /// Run the held ops in order, then take new ones.
     Resume,
-    /// Clear the memory of the agent.
+    /// Clear the memory of the agent. Also remove each lesson of the kind
+    /// that names the agent, so a lesson that other agents share goes too.
     ResetMemory,
     /// Clear the transcript, its progress notes and its flow labels. The
     /// labels of the memory notes and of the workspace files stay.
@@ -281,6 +299,13 @@ pub enum Control {
         /// The new setting.
         setting: HeartbeatSetting,
     },
+    /// Read the profile of the kind again. A good read ends the run at a
+    /// checkpoint, so the next op runs on the profile that the next run
+    /// reads. A failed read keeps the run and names the error.
+    ///
+    /// A waiting op that does not fit the checkpoint input runs first, on
+    /// the old profile. Send this op only after every worker can decode it.
+    ReloadProfile,
 }
 
 /// The heartbeat of one agent (issue #2266).
@@ -465,7 +490,10 @@ pub struct PeerEnvelope {
     /// The task for the receiver.
     pub text: String,
     /// The authority of the receiver, from `Mandate::outbound`. The receiver
-    /// can only narrow it.
+    /// can only narrow it. It decodes strictly: an unknown key fails the
+    /// op, so a receiver never drops a cap that a newer sender adds. A held
+    /// message in the agent state reads the same way.
+    #[serde(deserialize_with = "crate::mesh::strict_mandate")]
     pub mandate: Mandate,
     /// The flow labels of the sender. They taint the receiver.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
@@ -480,6 +508,10 @@ pub struct PeerEnvelope {
     /// The mesh of the sender (issue #2272).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<String>,
+    /// The strategy of the op. The accepted mandate caps its draws, so a
+    /// receiver never runs more draws than its caller allows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample: Option<OpSample>,
 }
 
 /// The reply to a [`PeerEnvelope`]. It settles the promise of the sender.
@@ -571,6 +603,7 @@ impl AgentOp {
             text: text.into(),
             message_id: None,
             urgency: Urgency::Queue,
+            sample: None,
         })
     }
 
@@ -581,6 +614,7 @@ impl AgentOp {
             text: text.into(),
             message_id: Some(message_id.into()),
             urgency: Urgency::Queue,
+            sample: None,
         })
     }
 
@@ -601,7 +635,27 @@ impl AgentOp {
             text: text.into(),
             message_id: Some(message_id.into()),
             urgency,
+            sample: None,
         })
+    }
+
+    /// Run the op with the strategy `sample`.
+    ///
+    /// Only a message from a person or a peer carries a strategy. Each
+    /// other op stays as it is.
+    #[must_use]
+    pub fn with_sample(self, sample: OpSample) -> Self {
+        match self {
+            Self::UserMessage(mut message) => {
+                message.sample = Some(sample);
+                Self::UserMessage(message)
+            }
+            Self::PeerMessage(mut envelope) => {
+                envelope.sample = Some(sample);
+                Self::PeerMessage(envelope)
+            }
+            other => other,
+        }
     }
 
     /// The class of the op for the inbox kernel.
@@ -720,6 +774,10 @@ pub struct AgentProfile {
     /// [`context_reset`](crate::context_reset).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_reset: Option<ContextReset>,
+    /// The sweep tool setting of each op (issue #2716). See
+    /// [`sweep_tool`](crate::sweep_tool).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep: Option<Box<crate::sweep_tool::SweepTool>>,
     /// The text that replaces the description of each named tool (issue
     /// #2373). See [`AgentTask::tool_guidance`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -775,6 +833,7 @@ impl AgentProfile {
             stream: false,
             workspace: false,
             context_reset: None,
+            sweep: None,
             tool_guidance: BTreeMap::new(),
             skills: BTreeMap::new(),
             episodes: None,
@@ -794,6 +853,14 @@ impl AgentProfile {
     #[must_use]
     pub const fn context_reset(mut self, setting: ContextReset) -> Self {
         self.context_reset = Some(setting);
+        self
+    }
+
+    /// Let the agents of the kind sweep a list of sources with the `sweep`
+    /// tool. Each call spends at most the ceiling of `setting`.
+    #[must_use]
+    pub fn sweep(mut self, setting: crate::sweep_tool::SweepTool) -> Self {
+        self.sweep = Some(Box::new(setting));
         self
     }
 
@@ -986,6 +1053,7 @@ impl AgentProfile {
         task.memory_in_state = self.memory == AgentMemory::State;
         task.stream = self.stream;
         task.context_reset = self.context_reset;
+        task.sweep.clone_from(&self.sweep);
         task.tool_guidance.clone_from(&self.tool_guidance);
         task.skills.clone_from(&self.skills);
         if self.workspace {
@@ -1028,7 +1096,6 @@ enum Mode<'a> {
 }
 
 impl Mode<'_> {
-    /// The delivery source of the segment.
     const fn source(self) -> ReportSource {
         match self {
             Self::Attended => ReportSource::Run,
@@ -1174,10 +1241,28 @@ pub struct AgentState {
     /// erase` reads them from the final state.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub episode_reset: Option<EpisodeReset>,
+    /// The lessons of the kind that the last memory reset removed. A lesson
+    /// goes when a run of the agent is one of its sources. `harvest agents
+    /// erase` reads the count from the final state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lessons_removed: Option<u64>,
+    /// The memory entries that the last memory reset removed. `None` when
+    /// the agent has no memory scope. `harvest agents erase` reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_entries_erased: Option<u64>,
+    /// The transcript windows of the agent that the last memory reset
+    /// removed. `None` when the store cannot erase by session. `harvest
+    /// agents erase` reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcripts_erased: Option<u64>,
     /// The episode appends since the last pass that the agent ran (issue
     /// #2454). `ConsolidationTrigger::Every` reads it.
     #[serde(skip_serializing_if = "is_zero_u32")]
     pub appends_since_pass: u32,
+    /// Set by a good `Control::ReloadProfile`. The entity loop clears it and
+    /// takes a checkpoint after the op, so no snapshot holds it.
+    #[serde(skip)]
+    pub(crate) reload_requested: bool,
 }
 
 /// Whether `value` is 0. A serde skip predicate.
@@ -1273,14 +1358,15 @@ impl Agent {
     /// The extra signal that goes before `op`, if its urgency needs one.
     ///
     /// Send the signal first, then the op. A [`Urgency::Steer`] message with
-    /// no id needs no signal: it runs as a queued message.
+    /// no id needs no signal: it runs as a queued message. So does a steer
+    /// message with a strategy, because its draws cannot join a running op.
     #[must_use]
     pub fn urgency_signal(op: &AgentOp) -> Option<(&'static str, serde_json::Value)> {
         let AgentOp::UserMessage(message) = op else {
             return None;
         };
         match (message.urgency, &message.message_id) {
-            (Urgency::Steer, Some(id)) => Some((
+            (Urgency::Steer, Some(id)) if message.sample.is_none() => Some((
                 STEER_SIGNAL,
                 serde_json::json!(Steer {
                     text: message.text.clone(),
@@ -1298,15 +1384,17 @@ impl Agent {
     }
 }
 
+/// The state after one segment, with the stop and the answer of a segment
+/// that completed. `Err` is a refusal of a peer message.
+type SegmentEnd = (AgentState, Result<Option<(AgentStop, String)>, Refusal>);
+
 /// Handle one op of `run`.
 ///
 /// The handler closure returns this future, not the future of
 /// [`AgentRun::handle`]. harvest-verify reads a future type that names a
 /// lifetime, as `AgentRun<'_>` does, as one that can write through its
-/// fields. The future also stays unboxed, so harvest-verify can follow it.
-// The engine keeps the workflow future on the heap, so the size of this
-// inline future costs no stack.
-#[allow(clippy::large_futures)]
+/// fields. The handler closure returns this future unboxed, so harvest-verify
+/// can follow it. The entity loop puts it on the heap (issue #2752).
 async fn handle_op(
     run: &AgentRun<'_>,
     state: AgentState,
@@ -1329,24 +1417,13 @@ struct AgentRun<'a> {
     member: Option<Member>,
 }
 
-/// The durable agent workflow. The workflow id is the [`AgentId`].
+/// Read the profile of `id` and discover its peers, through recorded
+/// activities.
 ///
-/// Each op runs one segment of the agent loop. See the [module
-/// docs](self).
-///
-/// # Errors
-///
-/// Returns an engine error of the entity loop, for example a cancel.
-#[workflow]
-// The entity future holds the op future inline. The engine keeps the
-// workflow future on the heap, so a box here adds only an allocation.
-#[allow(clippy::large_futures)]
-pub async fn agent(ctx: &WorkflowContext, input: serde_json::Value) -> Result<AgentState, String> {
-    // `format!` and not `to_string`: harvest-verify trusts `format`, but not
-    // the blanket `ToString` impl on a type of this crate.
-    let id = AgentId::parse(ctx.workflow_id()).map_err(|err| format!("{err}"));
-    // A failed lookup fails each work op of this run with a named error. The
-    // run and its carried state stay, so the next run looks again.
+/// A failed read or a failed discovery gives an `Err` profile. Each work op
+/// of the run then fails with a named error. The run and its carried state
+/// stay, so the next run or a reload reads again.
+async fn load_run(ctx: &WorkflowContext, id: Result<AgentId, String>) -> AgentRun<'_> {
     let read = match &id {
         Ok(id) => lookup_profile(ctx, id).await.unwrap_or_else(Err),
         Err(err) => Err(err.clone()),
@@ -1366,13 +1443,42 @@ pub async fn agent(ctx: &WorkflowContext, input: serde_json::Value) -> Result<Ag
         },
         _ => None,
     };
-    let run = AgentRun {
+    AgentRun {
         ctx,
         id,
         profile,
         overlays,
         member,
-    };
+    }
+}
+
+/// [`load_run`] on the heap.
+///
+/// It makes its future in its own frame, as [`autumn_harvest::frame`]
+/// explains (issue #2752). The future names a lifetime, so a closure future
+/// would be a harvest-verify boundary. A named function is not.
+#[inline(never)]
+fn boxed_load_run(
+    ctx: &WorkflowContext,
+    id: Result<AgentId, String>,
+) -> Pin<Box<impl Future<Output = AgentRun<'_>>>> {
+    Box::pin(load_run(ctx, id))
+}
+
+/// The durable agent workflow. The workflow id is the [`AgentId`].
+///
+/// Each op runs one segment of the agent loop. See the [module
+/// docs](self).
+///
+/// # Errors
+///
+/// Returns an engine error of the entity loop, for example a cancel.
+#[workflow]
+pub async fn agent(ctx: &WorkflowContext, input: serde_json::Value) -> Result<AgentState, String> {
+    // `format!` and not `to_string`: harvest-verify trusts `format`, but not
+    // the blanket `ToString` impl on a type of this crate.
+    let id = AgentId::parse(ctx.workflow_id()).map_err(|err| format!("{err}"));
+    let run = boxed_load_run(ctx, id).await;
     let max_ops = run
         .profile
         .as_ref()
@@ -1384,19 +1490,45 @@ pub async fn agent(ctx: &WorkflowContext, input: serde_json::Value) -> Result<Ag
         None => entity,
     };
     let profile = run.profile.as_ref().ok();
+    // A good `Control::ReloadProfile` ends the run after its op. The next
+    // run then reads the profile at its start.
     entity
-        .run_with_wakes(
+        .run_with_wakes_and_checkpoints(
             |state, op: AgentOp| handle_op(&run, state, op),
             |state: &AgentState| {
                 let (at, op) = state.next_wake(profile)?;
-                Some(Wake::new(
-                    autumn_harvest::chrono::DateTime::from_timestamp_millis(at)?,
-                    op,
-                ))
+                Some(Wake::new(wake_time(at)?, op))
             },
+            |state: &mut AgentState| std::mem::take(&mut state.reload_requested),
         )
         .await
         .map_err(|err| err.to_string())
+}
+
+/// The first millisecond that `chrono` could hold, in the year -262143.
+const CHRONO_MIN_MS: i64 = -8_334_601_315_200_000;
+
+/// The last millisecond that `chrono` could hold, in the year 262142.
+const CHRONO_MAX_MS: i64 = 8_210_266_876_799_999;
+
+/// The time of a wake at `at_ms` epoch milliseconds.
+///
+/// Replay calls the wake hook again, so the hook must give a wake for each
+/// time that `chrono` gave one. A recorded run then keeps its clock reads
+/// and timers. `chrono` gave `None` outside its own range. Inside that
+/// range, a time past the range of jiff clamps to its first or last instant.
+fn wake_time(at_ms: i64) -> Option<Timestamp> {
+    (CHRONO_MIN_MS..=CHRONO_MAX_MS)
+        .contains(&at_ms)
+        .then(|| autumn_harvest::time::from_millisecond_clamped(at_ms))
+}
+
+/// Book the next heartbeat of `profile`. See [`wake::next_heartbeat`].
+fn schedule(state: &mut AgentState, profile: Option<&AgentProfile>, now: i64, ticked: bool) {
+    let every = state
+        .effective_heartbeat(profile)
+        .map(AgentHeartbeat::every_ms);
+    state.next_heartbeat_ms = wake::next_heartbeat(state.next_heartbeat_ms, every, now, ticked);
 }
 
 /// Read the profile of the kind of `id` through the recorded activity.
@@ -1422,13 +1554,17 @@ impl AgentRun<'_> {
             state.incarnation = self.ctx.new_uuid().to_string();
         }
         // One recorded clock read per op. Replay reads the same time.
-        let now = self.ctx.system_now().timestamp_millis();
-        self.publish(&state, "running", now);
+        let now = self.ctx.system_now().as_millisecond();
+        self.publish(&state, self.profile.as_ref().ok(), "running", now);
         let mut ticked = false;
+        let mut reload = None;
         match admit(state.status.inbox(), op.class()) {
             Admit::Apply => match op {
-                AgentOp::Control(control) => state = self.control(state, control).await,
-                AgentOp::Unpark => state = self.unpark(state).await,
+                AgentOp::Control(Control::ReloadProfile) => {
+                    reload = Some(self.boxed_reload_read().await);
+                }
+                AgentOp::Control(control) => state = self.boxed_control(state, control).await,
+                AgentOp::Unpark => state = self.boxed_unpark(state).await,
                 _ => {}
             },
             Admit::Hold => {
@@ -1438,7 +1574,7 @@ impl AgentRun<'_> {
             }
             Admit::Run => {
                 ticked = matches!(op, AgentOp::HeartbeatTick);
-                state = self.work(state, op).await;
+                state = self.boxed_work(state, op).await;
             }
             Admit::Skip => {}
         }
@@ -1446,14 +1582,125 @@ impl AgentRun<'_> {
         // longer than the interval then never makes the next one due at
         // once, so waiting ops run first.
         let booked_at = if ticked {
-            self.ctx.system_now().timestamp_millis()
+            self.ctx.system_now().as_millisecond()
         } else {
             now
         };
-        self.schedule(&mut state, booked_at, ticked);
+        // A good reload reads as the next run does. Its profile books the
+        // heartbeat and sets the search attributes of this op. A failed
+        // reload keeps the run profile, and the run goes on.
+        let mut profile = self.profile.as_ref().ok();
+        if let Some(read) = &reload {
+            let read = read.as_deref().map(Some).map_err(String::as_str);
+            let (next, error) = reloaded(profile, read);
+            if let Some(err) = error {
+                fail(&mut state, &format!("the profile reload failed: {err}"));
+            } else {
+                state.reload_requested = true;
+                // A new interval books a new tick, as `SetHeartbeat` does.
+                let every = |profile| {
+                    state
+                        .effective_heartbeat(profile)
+                        .map(AgentHeartbeat::every_ms)
+                };
+                if every(profile) != every(next) {
+                    state.next_heartbeat_ms = None;
+                }
+            }
+            profile = next;
+        }
+        schedule(&mut state, profile, booked_at, ticked);
         state.last_active_ms = Some(now);
-        self.publish(&state, state.status.name(), now);
+        self.publish(&state, profile, state.status.name(), now);
         Ok(state)
+    }
+
+    /// Read the profile of the kind again, as the next run reads it. A
+    /// failed read or a failed peer discovery gives the error.
+    async fn reload_read(&self) -> Result<Box<AgentProfile>, String> {
+        load_run(self.ctx, self.id.clone())
+            .await
+            .profile
+            .map(Box::new)
+    }
+
+    /// [`reload_read`](Self::reload_read) on the heap.
+    ///
+    /// Each `boxed_` function makes its future in its own frame, as
+    /// [`autumn_harvest::frame`] explains (issue #2752). Each future names a
+    /// lifetime, so a closure future would be a harvest-verify boundary.
+    #[inline(never)]
+    fn boxed_reload_read(
+        &self,
+    ) -> Pin<Box<impl Future<Output = Result<Box<AgentProfile>, String>> + '_>> {
+        Box::pin(self.reload_read())
+    }
+
+    /// [`work`](Self::work) on the heap.
+    #[inline(never)]
+    fn boxed_work(
+        &self,
+        state: AgentState,
+        op: AgentOp,
+    ) -> Pin<Box<impl Future<Output = AgentState> + '_>> {
+        Box::pin(self.work(state, op))
+    }
+
+    /// [`control`](Self::control) on the heap.
+    #[inline(never)]
+    fn boxed_control(
+        &self,
+        state: AgentState,
+        control: Control,
+    ) -> Pin<Box<impl Future<Output = AgentState> + '_>> {
+        Box::pin(self.control(state, control))
+    }
+
+    /// [`unpark`](Self::unpark) on the heap.
+    #[inline(never)]
+    fn boxed_unpark(&self, state: AgentState) -> Pin<Box<impl Future<Output = AgentState> + '_>> {
+        Box::pin(self.unpark(state))
+    }
+
+    /// [`sampled`](Self::sampled) on the heap.
+    #[inline(never)]
+    fn boxed_sampled<'s>(
+        &'s self,
+        state: AgentState,
+        input: &'s str,
+        sample: &'s OpSample,
+        mode: Mode<'s>,
+        peer: Option<PeerSegment<'s>>,
+    ) -> Pin<Box<impl Future<Output = SegmentEnd> + 's>> {
+        Box::pin(self.sampled(state, input, sample, mode, peer))
+    }
+
+    /// [`run_segment_as`](Self::run_segment_as) on the heap.
+    #[inline(never)]
+    fn boxed_run_segment_as<'s>(
+        &'s self,
+        state: AgentState,
+        input: &'s str,
+        mode: Mode<'s>,
+        peer: Option<PeerSegment<'s>>,
+    ) -> Pin<Box<impl Future<Output = SegmentEnd> + 's>> {
+        Box::pin(self.run_segment_as(state, input, mode, peer))
+    }
+
+    /// [`peer_message`](Self::peer_message) on the heap.
+    #[inline(never)]
+    fn boxed_peer_message(
+        &self,
+        state: AgentState,
+        envelope: PeerEnvelope,
+    ) -> Pin<Box<impl Future<Output = AgentState> + '_>> {
+        Box::pin(self.peer_message(state, envelope))
+    }
+
+    /// [`tick`](Self::tick) on the heap.
+    #[inline(never)]
+    fn boxed_tick(&self, state: AgentState) -> Pin<Box<impl Future<Output = AgentState> + '_>> {
+        Box::pin(self.tick(state))
     }
 
     /// The profile of one op and its overlay version (issue #2372).
@@ -1486,20 +1733,11 @@ impl AgentRun<'_> {
         Ok((op, read.overlay_version))
     }
 
-    /// Book the next heartbeat. See [`wake::next_heartbeat`].
-    fn schedule(&self, state: &mut AgentState, now: i64, ticked: bool) {
-        let every = state
-            .effective_heartbeat(self.profile.as_ref().ok())
-            .map(AgentHeartbeat::every_ms);
-        state.next_heartbeat_ms = wake::next_heartbeat(state.next_heartbeat_ms, every, now, ticked);
-    }
-
     /// Upsert the search attributes of the agent (issue #2267).
     ///
     /// A list query filters on them, for example by status and next wake.
     /// The upsert appends no event, so replay does not change.
-    fn publish(&self, state: &AgentState, status: &str, now: i64) {
-        let profile = self.profile.as_ref().ok();
+    fn publish(&self, state: &AgentState, profile: Option<&AgentProfile>, status: &str, now: i64) {
         let wake = state.next_wake(profile);
         let reason = wake.as_ref().map(|(_, op)| match op {
             AgentOp::FollowupDue => "followup",
@@ -1548,7 +1786,6 @@ impl AgentRun<'_> {
         }
     }
 
-    /// Apply one control op.
     async fn control(&self, mut state: AgentState, control: Control) -> AgentState {
         match control {
             Control::Pause { reason } => state.status = AgentStatus::Paused { reason },
@@ -1581,7 +1818,31 @@ impl AgentRun<'_> {
                         }
                     }
                 }
-                if let Err(err) = self.reset_memory().await {
+                if self.ctx.patched(LESSON_ERASE_PATCH) {
+                    match self.erase_lessons().await {
+                        Ok(removed) => state.lessons_removed = removed,
+                        Err(err) => {
+                            state.lessons_removed = None;
+                            fail(&mut state, &err);
+                        }
+                    }
+                }
+                if self.ctx.patched(STORE_COUNTS_PATCH) {
+                    match self.erase_memory().await {
+                        Ok(erased) => state.memory_entries_erased = erased,
+                        Err(err) => {
+                            state.memory_entries_erased = None;
+                            fail(&mut state, &err);
+                        }
+                    }
+                    match self.erase_transcripts().await {
+                        Ok(erased) => state.transcripts_erased = erased,
+                        Err(err) => {
+                            state.transcripts_erased = None;
+                            fail(&mut state, &err);
+                        }
+                    }
+                } else if let Err(err) = self.reset_memory().await {
                     fail(&mut state, &err);
                 }
             }
@@ -1592,6 +1853,8 @@ impl AgentRun<'_> {
                     fail(&mut state, &err);
                 }
             }
+            // `handle` takes this op before `control`, so this arm never runs.
+            Control::ReloadProfile => {}
             Control::ClearTranscript => {
                 state.transcript.clear();
                 // The notes stand in for dropped turns, so they go too.
@@ -1657,6 +1920,86 @@ impl AgentRun<'_> {
             .map_err(|err| err.to_string())
     }
 
+    /// Clear the memory scope of the agent, and count its entries. Returns
+    /// `None` when the agent has no memory scope.
+    ///
+    /// The count step records the entries first, so a retried clear keeps
+    /// the count. A failed count fails the reset after the clear.
+    async fn erase_memory(&self) -> Result<Option<u64>, String> {
+        let (Ok(id), Ok(profile)) = (&self.id, &self.profile) else {
+            return Ok(None);
+        };
+        let Some(scope) = profile.memory_scope(id) else {
+            return Ok(None);
+        };
+        // A failed count still clears, so a bad row never blocks an erase.
+        let held: Result<u64, String> = self
+            .ctx
+            .execute_activity(&agent_memory_count_info(), scope.clone())
+            .await
+            .map_err(|err| err.to_string());
+        let (): () = self
+            .ctx
+            .execute_activity(&agent_memory_reset_info(), scope)
+            .await
+            .map_err(|err| err.to_string())?;
+        held.map(Some)
+    }
+
+    /// Delete the transcript windows of the agent, and count them. Each turn
+    /// of the agent keeps its windows under the agent id as its session.
+    /// Returns `None` when the store cannot count or cannot erase.
+    ///
+    /// The count step records the windows first, so a retried erase keeps
+    /// the count.
+    async fn erase_transcripts(&self) -> Result<Option<u64>, String> {
+        let Ok(id) = &self.id else {
+            return Ok(None);
+        };
+        let session = SessionId::new(id.as_str());
+        let held: Option<u64> = self
+            .ctx
+            .execute_activity(&agent_transcript_count_info(), session.clone())
+            .await
+            .map_err(|err| err.to_string())?;
+        let erased: Option<u64> = self
+            .ctx
+            .execute_activity(&agent_transcript_erase_info(), session)
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok(erased.and(held))
+    }
+
+    /// Remove each lesson of the kind that names the agent, and count them.
+    /// Returns `None` when the harness has no memory store, or when the
+    /// agent id does not parse.
+    ///
+    /// The match step records the lessons first, so a retried removal
+    /// keeps the count.
+    async fn erase_lessons(&self) -> Result<Option<u64>, String> {
+        let Ok(id) = &self.id else {
+            return Ok(None);
+        };
+        let agent = id.as_str().to_owned();
+        let matched: Option<crate::refine::LessonMatch> = self
+            .ctx
+            .execute_activity(&crate::refine::agent_lesson_match_info(), agent.clone())
+            .await
+            .map_err(|err| format!("{err}"))?;
+        let Some(matched) = matched else {
+            return Ok(None);
+        };
+        let erase = crate::refine::LessonErase {
+            agent,
+            key: EditKey::new(format!("lessons:{}", self.ctx.new_uuid())),
+            matched,
+        };
+        self.ctx
+            .execute_activity(&crate::refine::agent_lesson_erase_info(), erase)
+            .await
+            .map_err(|err| format!("{err}"))
+    }
+
     /// Clear the episode scope of the agent, and count what it held (issue
     /// #2454). It runs whatever the profile says, so an erase also reaches
     /// the episodes of a kind that turned the setting off. Returns `None`
@@ -1703,7 +2046,7 @@ impl AgentRun<'_> {
             );
             return;
         }
-        let at_ms = self.ctx.system_now().timestamp_millis();
+        let at_ms = self.ctx.system_now().as_millisecond();
         let max_text = usize::try_from(settings.max_text_bytes).unwrap_or(usize::MAX);
         let append = EpisodeAppend {
             scope: episode_scope(id),
@@ -1808,7 +2151,7 @@ impl AgentRun<'_> {
         scope: &str,
     ) -> Result<u64, String> {
         self.workspace_floor(state, scope).await?;
-        let now = self.ctx.system_now().timestamp_millis();
+        let now = self.ctx.system_now().as_millisecond();
         state.workspace_generation = next_generation(state.workspace_generation, now);
         Ok(state.workspace_generation)
     }
@@ -1858,6 +2201,22 @@ impl AgentRun<'_> {
     async fn work(&self, mut state: AgentState, op: AgentOp) -> AgentState {
         match op {
             AgentOp::UserMessage(message) => {
+                if let Some(sample) = &message.sample {
+                    // A person is present, so a new follow-up chain starts.
+                    state.chain = 0;
+                    let (mut state, outcome) = self
+                        .boxed_sampled(state, &message.text, sample, Mode::Attended, None)
+                        .await;
+                    // A mesh budget refused each draw before it spent a
+                    // token. The message waits for the next period, first in
+                    // line.
+                    if matches!(outcome, Ok(Some((AgentStop::BudgetExceeded, ref answer))) if answer.is_empty())
+                        && matches!(state.status, AgentStatus::Parked { .. })
+                    {
+                        hold_first(&mut state, AgentOp::UserMessage(message));
+                    }
+                    return state;
+                }
                 if let (Urgency::Steer, Some(id)) = (message.urgency, message.message_id.clone()) {
                     // A running segment took the steer signal, so the op is done.
                     if SteerBook::take(&mut state.steer.steered, &id) {
@@ -1878,8 +2237,8 @@ impl AgentRun<'_> {
                 }
                 state
             }
-            AgentOp::PeerMessage(envelope) => self.peer_message(state, envelope).await,
-            AgentOp::HeartbeatTick => self.tick(state).await,
+            AgentOp::PeerMessage(envelope) => self.boxed_peer_message(state, envelope).await,
+            AgentOp::HeartbeatTick => self.boxed_tick(state).await,
             AgentOp::FollowupDue => {
                 if state.followup_due_ms.take().is_none() {
                     return state;
@@ -1924,13 +2283,29 @@ impl AgentRun<'_> {
                 );
                 let failures = state.failures;
                 let before = state.tokens_used;
+                // A cascade asks the model of each tier, never the model of
+                // the profile. The core checks the tier models.
+                let cascade = envelope.sample.as_ref().is_some_and(|sample| {
+                    matches!(
+                        sample.strategy,
+                        crate::sampling::SampleStrategy::Cascade { .. }
+                    )
+                });
                 let peer = PeerSegment {
                     member: &member,
                     waiting: &envelope.waiting,
+                    own_model: !cascade,
                 };
-                let (next, outcome) = self
-                    .run_segment_as(state, &input, Mode::Peer, Some(peer))
-                    .await;
+                let (next, outcome) = match &envelope.sample {
+                    Some(sample) => {
+                        self.boxed_sampled(state, &input, sample, Mode::Peer, Some(peer))
+                            .await
+                    }
+                    None => {
+                        self.boxed_run_segment_as(state, &input, Mode::Peer, Some(peer))
+                            .await
+                    }
+                };
                 state = next;
                 match outcome {
                     Err(refusal) => PeerReply {
@@ -2025,7 +2400,7 @@ impl AgentRun<'_> {
 
     /// Run one segment with `input` and fold it into `state`.
     async fn segment(&self, state: AgentState, input: &str, mode: Mode<'_>) -> AgentState {
-        self.run_segment_as(state, input, mode, None).await.0
+        self.boxed_run_segment_as(state, input, mode, None).await.0
     }
 
     /// Start one op: check the run, drain the stale interrupts, read the op
@@ -2051,7 +2426,7 @@ impl AgentRun<'_> {
         // Without a store, the run profile names the model, so the check
         // comes first, as before the op read.
         let forbids = |model: Option<&str>| {
-            peer.is_some_and(|peer| !peer.member.mandate().allows_model(model))
+            peer.is_some_and(|peer| peer.own_model && !peer.member.mandate().allows_model(model))
         };
         if !self.overlays {
             let model = self.profile.as_ref().ok().and_then(|p| p.model.as_deref());
@@ -2099,7 +2474,7 @@ impl AgentRun<'_> {
         input: &str,
         mode: Mode<'_>,
         peer: Option<PeerSegment<'_>>,
-    ) -> (AgentState, Result<Option<(AgentStop, String)>, Refusal>) {
+    ) -> SegmentEnd {
         let mut task = match self.open_op(&mut state, input, mode, peer.as_ref()).await {
             Ok(task) => task,
             Err(Some(refusal)) => return (state, Err(refusal)),
@@ -2145,7 +2520,8 @@ impl AgentRun<'_> {
             .map_or_else(Vec::new, |peer| peer.waiting.to_vec());
         let mut tree = segment_tree(&mut state, id, profile, run_id.clone(), waiting);
         if task.memory_in_state {
-            progress.memory = Some(open_memory(&mut state, &mut task, &mut tree));
+            let access = memory_access(self.ctx, task.memory_writable());
+            progress.memory = Some(open_memory(&mut state, &mut task, &mut tree, access));
         }
         open_notes(&mut task, &state, &mut progress, &mut tree);
         let run = Run {
@@ -2155,7 +2531,7 @@ impl AgentRun<'_> {
                 .map_or(self.member.as_ref(), |peer| Some(peer.member)),
             live: true,
         };
-        let result = run_segment(self.ctx, run, &mut progress, &mut tree, input).await;
+        let result = boxed_run_segment(self.ctx, run, &mut progress, &mut tree, input).await;
         fold_segment(&mut state, &mut progress, tree);
         let refused = refused_untouched(&state, rounds);
         if state.workspace != head {
@@ -2183,7 +2559,7 @@ impl AgentRun<'_> {
                 {
                     let delay =
                         i64::try_from(planned.delay_secs.saturating_mul(1_000)).unwrap_or(i64::MAX);
-                    let ended = self.ctx.system_now().timestamp_millis();
+                    let ended = self.ctx.system_now().as_millisecond();
                     state.followup_due_ms = Some(ended.saturating_add(delay));
                 }
                 if task.deliver {
@@ -2212,7 +2588,140 @@ impl AgentRun<'_> {
         (state, Ok(outcome))
     }
 
-    /// Send the answer of one segment to the delivery.
+    /// Run one op with a strategy, and fold the selected draw into
+    /// `state`.
+    ///
+    /// The op builds its task as a segment does. The task takes the
+    /// transcript as its history, the labels of the agent, and the mandate
+    /// of a peer message. The core of `agent_sample` then admits the draws
+    /// under that mandate and under the policy of the kind, before any
+    /// model call. A refusal or a failure keeps the transcript as it was.
+    ///
+    /// The selected draw gives the answer and the new transcript. The
+    /// tokens and the labels of each draw go into the state, selected or
+    /// not. A peer message gets `Err` for a refusal of its mandate.
+    async fn sampled(
+        &self,
+        mut state: AgentState,
+        input: &str,
+        sample: &OpSample,
+        mode: Mode<'_>,
+        peer: Option<PeerSegment<'_>>,
+    ) -> SegmentEnd {
+        let mut task = match self.open_op(&mut state, input, mode, peer.as_ref()).await {
+            Ok(task) => task,
+            Err(Some(refusal)) => return (state, Err(refusal)),
+            Err(None) => return (state, Ok(None)),
+        };
+        let (id, profile) = match (&self.id, &self.profile) {
+            (Ok(id), Ok(profile)) => (id, profile),
+            (Err(err), _) | (_, Err(err)) => {
+                fail(&mut state, err);
+                return (state, Ok(None));
+            }
+        };
+        let stream = task.stream;
+        // A draw has no `memory` tool, so it reads the snapshot only. The
+        // gate is asked only when the draw renders a snapshot. Otherwise the
+        // access is not read.
+        let access = if task.memory_in_state && !state.memory.is_empty() {
+            memory_access(self.ctx, false)
+        } else {
+            None
+        };
+        draw_op_task(&mut task, &state, profile, peer.as_ref(), access);
+        // Each draw carries the task in its input. A task over the input cap
+        // would fail the spawn after the policy read, so it fails here.
+        if crate::bounds::exceeds_bytes(&task, DEFAULT_MAX_WORKFLOW_INPUT_BYTES) {
+            let reason = format!(
+                "the transcript is too large for a strategy op: a draw input must fit {DEFAULT_MAX_WORKFLOW_INPUT_BYTES} bytes"
+            );
+            fail(&mut state, &reason);
+            return (state, Ok(None));
+        }
+        let report = match sample_task(self.ctx, id.kind(), sample, &task, true).await {
+            Ok(report) => report,
+            Err(SampleFailure::Refused(crate::sampling::Refusal::Mandate { mandate }))
+                if peer.is_some() =>
+            {
+                return (state, Err(mandate));
+            }
+            Err(failure) => {
+                fail(&mut state, &failure.text());
+                return (state, Ok(None));
+            }
+        };
+        state.tokens_used = state
+            .tokens_used
+            .saturating_add(u64::from(report.usage.total()));
+        state.flow_labels.extend(report.flow_labels.iter().cloned());
+        // A mesh budget that refused a draw parks the agent, as it does for
+        // a segment. The latest period end wins.
+        let parked = report
+            .draws
+            .iter()
+            .filter_map(|draw| draw.parked_until_ms)
+            .max();
+        if let Some(until_ms) = parked {
+            state.status = AgentStatus::Parked { until_ms };
+        }
+        let Some(selected) = report.selected else {
+            if parked.is_some() && report.usage.total() == 0 {
+                // No draw spent a token, so the op can wait for the next
+                // period. The caller holds a message from a person.
+                state.last_stop = Some(AgentStop::BudgetExceeded);
+                return (state, Ok(Some((AgentStop::BudgetExceeded, String::new()))));
+            }
+            let reason = format!(
+                "no_accepted_draw: no draw of the strategy passed the scorer; the run stopped with {}",
+                report.stopped.code()
+            );
+            fail(&mut state, &reason);
+            return (state, Ok(None));
+        };
+        let run_id = format!("{}:s{}", state.incarnation, state.segments);
+        state.segments = state.segments.saturating_add(1);
+        let messages = crate::types::without_system(&selected.messages);
+        let messages = crate::context_reset::without_restored(messages);
+        state.transcript = trim_window(messages, profile.window);
+        self.publish_selected(&mut state, stream, &task, &run_id, &selected);
+        let (stop, answer) = (selected.stop, selected.text);
+        state.last_stop = Some(stop);
+        state.last_answer = Some(answer.clone());
+        if task.deliver {
+            let sent = Sent {
+                source: mode.source(),
+                run_id: &run_id,
+                stop,
+                answer: &answer,
+            };
+            self.deliver(&mut state, &task, sent).await;
+        }
+        if task.memory_writable() {
+            self.keep_episode(&mut state, &run_id, stop, &answer).await;
+        }
+        (state, Ok(Some((stop, answer))))
+    }
+
+    /// Publish the selected answer of a strategy op on the durable stream
+    /// of the agent, when the op streams. The draws stream nothing, so a
+    /// reader sees only the answer that the run selected.
+    fn publish_selected(
+        &self,
+        state: &mut AgentState,
+        stream: bool,
+        task: &AgentTask,
+        run_id: &str,
+        selected: &crate::types::AgentReport,
+    ) {
+        let Some(record) = selected_turn(stream, task, run_id, selected) else {
+            return;
+        };
+        if let Err(err) = self.ctx.publish_durable_progress(record) {
+            fail(state, &format!("{err}"));
+        }
+    }
+
     async fn deliver(&self, state: &mut AgentState, task: &AgentTask, sent: Sent<'_>) {
         let Some(text) = report_text(sent.source, sent.stop, sent.answer) else {
             return;
@@ -2238,6 +2747,9 @@ struct PeerSegment<'a> {
     member: &'a Member,
     /// The workflow ids that wait on the message.
     waiting: &'a [String],
+    /// Whether the op asks the model of the profile. A cascade asks only
+    /// the models of its tiers.
+    own_model: bool,
 }
 
 /// The parts of one report.
@@ -2247,6 +2759,105 @@ struct Sent<'a> {
     run_id: &'a str,
     stop: AgentStop,
     answer: &'a str,
+}
+
+/// Give the task of a strategy op what each draw reads. That is the
+/// mandate of a peer message, the transcript and the progress notes. It is
+/// also the labels and the state memory.
+fn draw_op_task(
+    task: &mut AgentTask,
+    state: &AgentState,
+    profile: &AgentProfile,
+    peer: Option<&PeerSegment<'_>>,
+    access: Option<SnapshotAccess>,
+) {
+    if let Some(peer) = peer {
+        let mandate = peer.member.mandate();
+        task.mandate = Some(mandate.clone());
+        task.read_only |= mandate.read_only;
+        task.waiting = peer.waiting.to_vec();
+    }
+    // A draw saves no progress notes. Its notes would not reach the state,
+    // so the next op would restore stale ones.
+    task.context_reset = None;
+    // A draw streams nothing, because the run may not select its answer.
+    // The op publishes the selected answer itself.
+    task.stream = false;
+    task.history.clone_from(&state.transcript);
+    task.flow_labels = state
+        .flow_labels
+        .iter()
+        .chain(profile.mandate.iter().flat_map(|m| &m.flow_labels))
+        .cloned()
+        .collect();
+    // A draw reads the notes of the agent, as a segment does. The kept
+    // transcript drops the restored pair, and the state keeps its notes.
+    if let Some(notes) = &state.notes {
+        task.history
+            .extend(crate::context_reset::restored(&notes.text));
+        task.flow_labels.extend(notes.labels.iter().cloned());
+    }
+    if task.memory_in_state && !state.memory.is_empty() {
+        // A draw reads the state memory but cannot edit it.
+        let snapshot = render_state_memory(&state.memory, access);
+        task.system = Some(match task.system.take() {
+            Some(system) => format!("{system}\n\n{snapshot}"),
+            None => snapshot,
+        });
+        task.flow_labels
+            .extend(crate::memory::snapshot_labels(&state.memory));
+    }
+}
+
+/// The snapshot access of a state-memory segment that has the `memory`
+/// tool when `writable` is true.
+///
+/// The workflow renders this snapshot, so a replay rebuilds the prompt. A
+/// history from before the patch gate rendered the legacy edit head, and
+/// `None` keeps that head. The gate is asked at each render, so a writable
+/// segment keeps the old wording too.
+fn memory_access(ctx: &WorkflowContext, writable: bool) -> Option<SnapshotAccess> {
+    if !ctx.patched(READ_ONLY_SNAPSHOT_PATCH) {
+        None
+    } else if writable {
+        Some(SnapshotAccess::Edit)
+    } else {
+        Some(SnapshotAccess::Read)
+    }
+}
+
+/// Render the state memory under `access`. `None` renders the legacy head.
+fn render_state_memory(
+    blocks: &[crate::memory::MemoryBlock],
+    access: Option<SnapshotAccess>,
+) -> String {
+    access.map_or_else(
+        || crate::memory::render_legacy_snapshot(blocks),
+        |access| crate::memory::render_snapshot(blocks, access),
+    )
+}
+
+/// The durable record of the selected answer of a strategy op, or `None`
+/// when the op does not stream or the answer is empty.
+fn selected_turn(
+    stream: bool,
+    task: &AgentTask,
+    run_id: &str,
+    selected: &crate::types::AgentReport,
+) -> Option<crate::live::TurnText> {
+    if !stream || selected.text.is_empty() {
+        return None;
+    }
+    Some(crate::live::TurnText {
+        kind: "turn".to_owned(),
+        run_id: run_id.to_owned(),
+        step: selected.steps_used,
+        agent: task
+            .mandate
+            .as_ref()
+            .map(|mandate| mandate.holder().to_owned()),
+        text: selected.text.clone(),
+    })
 }
 
 /// The run tree of one segment of the agent `id`: the labels of the agent,
@@ -2355,11 +2966,12 @@ fn open_memory(
     state: &mut AgentState,
     task: &mut AgentTask,
     tree: &mut Tree,
+    access: Option<SnapshotAccess>,
 ) -> Vec<crate::memory::MemoryBlock> {
     if state.memory.is_empty() {
         state.memory = crate::memory::MemoryBlock::defaults();
     }
-    let snapshot = crate::memory::render_snapshot(&state.memory);
+    let snapshot = render_state_memory(&state.memory, access);
     task.system = Some(match task.system.take() {
         Some(system) => format!("{system}\n\n{snapshot}"),
         None => snapshot,
@@ -2521,6 +3133,53 @@ pub async fn agent_memory_reset(ctx: &ActivityContext, scope: MemoryScope) -> Re
     harness(ctx)?.memory_reset(scope).await
 }
 
+/// Count the entries of one memory scope, as an activity.
+///
+/// # Errors
+///
+/// Returns an error when no store is installed or the store fails.
+#[activity(
+    start_to_close = "1m",
+    retry = RetryPolicy::exponential(3, Duration::from_secs(1))
+)]
+pub async fn agent_memory_count(ctx: &ActivityContext, scope: MemoryScope) -> Result<u64, String> {
+    harness(ctx)?.memory_count(scope).await
+}
+
+/// Count the transcript windows of one session, as an activity. Returns
+/// `None` when the store cannot count.
+///
+/// # Errors
+///
+/// Returns an error when the store fails.
+#[activity(
+    start_to_close = "1m",
+    retry = RetryPolicy::exponential(3, Duration::from_secs(1))
+)]
+pub async fn agent_transcript_count(
+    ctx: &ActivityContext,
+    session: SessionId,
+) -> Result<Option<u64>, String> {
+    harness(ctx)?.transcript_count(session).await
+}
+
+/// Delete the transcript windows of one session and count them, as an
+/// activity. Returns `None` when the store cannot erase by session.
+///
+/// # Errors
+///
+/// Returns an error when the store fails.
+#[activity(
+    start_to_close = "1m",
+    retry = RetryPolicy::exponential(3, Duration::from_secs(1))
+)]
+pub async fn agent_transcript_erase(
+    ctx: &ActivityContext,
+    session: SessionId,
+) -> Result<Option<u64>, String> {
+    harness(ctx)?.transcript_erase(session).await
+}
+
 /// Delete the snapshots of the scope of `mount` that are older than its
 /// head, as an activity (issue #2274). Returns the number deleted.
 ///
@@ -2593,6 +3252,19 @@ mod tests {
     }
 
     #[test]
+    fn a_wake_exists_where_chrono_gave_one() {
+        assert_eq!(
+            wake_time(1_700_000_000_123),
+            Some(Timestamp::constant(1_700_000_000, 123_000_000))
+        );
+        assert_eq!(wake_time(CHRONO_MAX_MS), Some(Timestamp::MAX));
+        assert_eq!(wake_time(CHRONO_MIN_MS), Some(Timestamp::MIN));
+        assert_eq!(wake_time(CHRONO_MAX_MS + 1), None);
+        assert_eq!(wake_time(CHRONO_MIN_MS - 1), None);
+        assert_eq!(wake_time(i64::MAX), None);
+    }
+
+    #[test]
     fn an_id_is_a_kind_and_a_name() {
         let id = AgentId::new("support", "acct-42").unwrap();
         assert_eq!(id.as_str(), "support/acct-42");
@@ -2631,6 +3303,114 @@ mod tests {
         assert!(serde_json::from_value::<AgentId>(serde_json::json!("nope")).is_err());
     }
 
+    fn best_of(n: u32) -> crate::sampling::OpSample {
+        crate::sampling::OpSample::new(
+            crate::sampling::SampleStrategy::best_of_n(n),
+            crate::sampling::ScorerRef::deterministic("exact_match").unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_message_carries_a_sample_on_the_wire() {
+        let op = AgentOp::message("hi").with_sample(best_of(3));
+        let value = serde_json::to_value(&op).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "user_message",
+                "text": "hi",
+                "sample": {"strategy": {"best_of_n": {"n": 3}}, "scorer": {"id": "exact_match"}},
+            })
+        );
+        assert_eq!(serde_json::from_value::<AgentOp>(value).unwrap(), op);
+        let plain = serde_json::to_value(AgentOp::message("hi")).unwrap();
+        assert!(plain.get("sample").is_none(), "no sample sends no key");
+        let resume = AgentOp::Control(Control::Resume);
+        assert_eq!(resume.clone().with_sample(best_of(2)), resume);
+        let old: AgentOp =
+            serde_json::from_value(serde_json::json!({"type": "user_message", "text": "hi"}))
+                .unwrap();
+        assert_eq!(old, AgentOp::message("hi"), "an op with no sample decodes");
+    }
+
+    #[test]
+    fn a_sample_with_an_unknown_key_does_not_decode() {
+        let value = serde_json::json!({
+            "type": "user_message",
+            "text": "hi",
+            "sample": {"strategy": {"best_of_n": {"n": 3}}, "scorer": {"id": "x"}, "max_drawz": 9},
+        });
+        assert!(serde_json::from_value::<AgentOp>(value).is_err());
+    }
+
+    fn envelope_value() -> serde_json::Value {
+        serde_json::json!({
+            "type": "peer_message",
+            "from": "triage/t1@life",
+            "sender": "triage",
+            "seq": 1,
+            "text": "hi",
+            "mandate": {"chain": ["triage"], "max_depth": 3, "max_delegations": 4, "max_draws": 2},
+        })
+    }
+
+    #[test]
+    fn a_peer_envelope_with_an_unknown_mandate_key_fails_to_decode() {
+        let op: AgentOp = serde_json::from_value(envelope_value()).unwrap();
+        let AgentOp::PeerMessage(envelope) = op else {
+            panic!("a peer message decodes as one");
+        };
+        assert_eq!(envelope.mandate.max_draws, Some(2));
+        let mut value = envelope_value();
+        value["mandate"]["max_fan"] = serde_json::json!(1);
+        let err = serde_json::from_value::<AgentOp>(value).unwrap_err();
+        assert!(err.to_string().contains("max_fan"), "{err}");
+        // The strict read covers the envelope only. A typed mandate still
+        // drops an unknown key, so a stored task or profile reads.
+        let typed: Mandate = serde_json::from_value(serde_json::json!({
+            "chain": ["triage"], "max_depth": 3, "max_delegations": 4, "max_fan": 1,
+        }))
+        .unwrap();
+        assert_eq!(typed.chain, ["triage"]);
+    }
+
+    #[test]
+    fn a_streaming_op_publishes_only_the_selected_answer() {
+        let selected: crate::types::AgentReport = serde_json::from_value(serde_json::json!({
+            "stop": "completed",
+            "text": "b",
+            "steps_used": 2,
+            "tool_calls": 0,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "messages": [],
+        }))
+        .unwrap();
+        let task = AgentTask::new("x").mandate(Mandate::new("desk"));
+        let record = selected_turn(true, &task, "life:s4", &selected).unwrap();
+        assert_eq!(record.kind, "turn");
+        assert_eq!(record.run_id, "life:s4");
+        assert_eq!(record.step, 2);
+        assert_eq!(record.agent.as_deref(), Some("desk"));
+        assert_eq!(record.text, "b");
+        assert!(selected_turn(false, &task, "life:s4", &selected).is_none());
+        let empty = crate::types::AgentReport {
+            text: String::new(),
+            ..selected
+        };
+        assert!(selected_turn(true, &task, "life:s4", &empty).is_none());
+    }
+
+    #[test]
+    fn a_steer_message_with_a_sample_sends_no_steer_signal() {
+        let op = AgentOp::urgent("hi", "m-1", Urgency::Steer).with_sample(best_of(2));
+        assert!(
+            Agent::urgency_signal(&op).is_none(),
+            "it runs as its own op"
+        );
+        let interrupt = AgentOp::urgent("hi", "m-2", Urgency::Interrupt).with_sample(best_of(2));
+        assert!(Agent::urgency_signal(&interrupt).is_some());
+    }
+
     #[test]
     fn the_op_wire_form_is_tagged() {
         let op = AgentOp::message_with_id("hi", "m-1");
@@ -2646,6 +3426,12 @@ mod tests {
         assert_eq!(
             Agent::payload(&pause),
             serde_json::json!({"kind": "op", "op": {"type": "control", "action": "pause"}})
+        );
+        // `harvest agents reload` sends this form.
+        let reload = AgentOp::Control(Control::ReloadProfile);
+        assert_eq!(
+            Agent::payload(&reload),
+            serde_json::json!({"kind": "op", "op": {"type": "control", "action": "reload_profile"}})
         );
     }
 

@@ -47,15 +47,15 @@ fn test_havoc_exponential_retry_delay() {
 fn test_havoc_external_task_duration_panic() {
     let res = std::panic::catch_unwind(|| {
         let schedule_to_close_secs = u64::MAX;
-        let dur = chrono::Duration::try_seconds(
+        let dur = Some(jiff::SignedDuration::from_secs(
             i64::try_from(schedule_to_close_secs).unwrap_or(i64::MAX),
-        )
+        ))
         .ok_or_else(|| {
             autumn_harvest::error::HarvestError::Database("Duration out of bounds".to_string())
         });
 
         if let Ok(d) = dur {
-            let _schedule_to_close_at = chrono::Utc::now().checked_add_signed(d);
+            let _schedule_to_close_at = jiff::Timestamp::now().checked_add(d).ok();
         }
     });
     assert!(res.is_ok());

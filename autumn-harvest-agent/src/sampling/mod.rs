@@ -12,24 +12,36 @@
 //!   first model call.
 //! - [`agent_draws`] reads the policy once, admits the request and runs the
 //!   draws.
-//! - [`agent_sample`] runs best-of-N or rejection sampling. It scores each
-//!   draw and selects one (issue #2443).
+//! - [`agent_sample`] runs best-of-N, rejection sampling or a model
+//!   cascade. It scores each draw and selects one. It also runs a vote: it
+//!   keys each answer with an [`AnswerKey`], and the most common key wins.
+//! - [`agent_sample`] also runs step-level beam search. It scores each model
+//!   turn and keeps the best beams with [`beam_rank`].
 //! - [`admit_answer_check`] caps the answer check of a run (issue #2442).
+//! - [`OpSample`] lets a durable agent op run a strategy. The mandate of
+//!   the op caps its draws.
+//! - [`agent_sweep`] runs one strategy over a fixed set of inputs, and
+//!   keeps one row for each item.
 //!
 //! A run never carries a policy field. [`AgentTask`](crate::AgentTask),
 //! [`AgentOp`](crate::AgentOp), [`DrawsInput`] and [`SampleInput`] refuse
 //! each name in [`SAMPLING_POLICY_FIELDS`]. The design is in
-//! `docs/design/DESIGN-2439.md` and `docs/design/DESIGN-2443.md`.
+//! `docs/design/DESIGN-2439.md`, `docs/design/DESIGN-2443.md`,
+//! `docs/design/DESIGN-2444.md`, `docs/design/DESIGN-2446.md` and
+//! `docs/design/DESIGN-2448.md`.
 
 mod admit;
 mod draws;
 mod policy;
 mod sample;
 mod store;
+mod sweep;
+mod vote;
 
 pub use admit::{
-    Admission, Ask, DrawPlan, REFUSED_PREFIX, Refusal, SampleStep, admit, admit_answer_check,
-    answer_retry_cap, draw_plan, retry_after_reject, sample_step, wave_end,
+    Admission, Ask, CascadeStep, DrawPlan, REFUSED_PREFIX, Refusal, SampleStep, SweepPlan, admit,
+    admit_answer_check, admit_tiers, answer_retry_cap, beam_draws, beam_slots, cascade_step,
+    draw_plan, retry_after_reject, sample_step, sweep_plan, wave_end,
 };
 pub use draws::{
     DRAWS_WORKFLOW_NAME, DrawsInput, DrawsReport, agent_draws, agent_draws_info,
@@ -41,9 +53,11 @@ pub use policy::{
     ScorerRef, Scorers, Strategy,
 };
 pub use sample::{
-    SAMPLE_WORKFLOW_NAME, SampleDraw, SampleInput, SampleOutcome, SampleReport, SampleStop,
-    SampleStrategy, agent_sample, agent_sample_info,
+    BeamFate, BeamStep, OpSample, SAMPLE_WORKFLOW_NAME, SampleDraw, SampleInput, SampleOutcome,
+    SampleReport, SampleStop, SampleStrategy, SkippedTier, Tier, agent_sample, agent_sample_info,
+    beam_rank,
 };
+pub(crate) use sample::{SampleFailure, sample_task};
 #[cfg(feature = "postgres")]
 pub use store::PostgresSamplingPolicyStore;
 #[cfg(feature = "sqlite")]
@@ -51,4 +65,15 @@ pub use store::SqliteSamplingPolicyStore;
 pub use store::{
     InMemorySamplingPolicyStore, MAX_AUDIT_ROWS, PolicyAction, PolicyAudit, PolicyChange,
     PolicyRead, PolicyStoreError, SamplingPolicyStore,
+};
+pub use sweep::{
+    MAX_SWEEP_ANSWER_BYTES, MAX_SWEEP_ITEM_BYTES, MAX_SWEEP_ITEMS, MAX_SWEEP_LIST_BYTES,
+    MAX_SWEEP_PAGE_BYTES, MAX_SWEEP_REASON_BYTES, SWEEP_WORKFLOW_NAME, SweepInput, SweepItem,
+    SweepItemStatus, SweepItemStore, SweepItems, SweepItemsRef, SweepPage, SweepReport, SweepRow,
+    SweepStop, SweepTotals, agent_sweep, agent_sweep_info, agent_sweep_items,
+    agent_sweep_items_info,
+};
+pub use vote::{
+    AnswerKey, AnswerKeyFn, MAX_KEY_BYTES, Tally, VoteCount, VoteKeyReply, VoteKeyRequest,
+    agent_vote_key, agent_vote_key_info, run_vote_key, vote_settled,
 };

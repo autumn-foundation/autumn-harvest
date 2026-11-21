@@ -1,12 +1,16 @@
 //! End-to-end MCP tool integration tests (issue #597) — testcontainers.
 //!
 //! Drives the full agent flow against a real Postgres and the full
-//! plugin-wired app: `tools/call start_*` returns a durable handle
-//! immediately; `*_status` reflects the run; an mcp update executes
-//! synchronously; `*_watch` streams `notifications/progress` frames over
-//! streaming MCP; `signal_*` unblocks a `wait_for_signal`; and a workflow
-//! started via an MCP tool survives a simulated daemon restart (the first
-//! app is torn down and a second app on the same database finishes the run).
+//! plugin-wired app:
+//!
+//! - `tools/call start_*` returns a durable handle immediately.
+//! - `*_status` reflects the run.
+//! - An mcp update executes synchronously.
+//! - `*_watch` streams `notifications/progress` frames over streaming MCP.
+//! - `signal_*` unblocks a `wait_for_signal`.
+//! - A workflow started via an MCP tool survives a simulated daemon restart.
+//!   The first app is torn down, and a second app on the same database
+//!   finishes the run.
 //!
 //! Requires Docker. CI runs this suite from a `linux` manifest row (issue #1959).
 //! Each test uses a multi-thread runtime. `TestApp::plugin` blocks on plugin
@@ -81,9 +85,9 @@ fn validate_priority(input: &Value) -> Result<(), String> {
     Ok(())
 }
 
-/// Validator-bearing mcp update — used to prove `{wf}_update_{name}` rejects
-/// an invalid payload at admission time instead of durably admitting it and
-/// letting it run/fail inside the workflow (code-review fix, PR #908).
+/// Validator-bearing mcp update. It proves `{wf}_update_{name}` rejects an
+/// invalid payload at admission time (PR #908). The payload never becomes
+/// durable or runs inside the workflow.
 #[update(
     workflow = "agent_approval_flow",
     validator = validate_priority,
@@ -96,10 +100,9 @@ async fn set_priority_validated(
     Ok(format!("validated priority set to {}", req.level))
 }
 
-/// Continues itself exactly once, then completes — used to prove
+/// Continues itself exactly once, then completes. It proves that
 /// `{wf}_status`/`{wf}_watch` resolve the `ContinuedAsNew` chain to the
-/// successor's real outcome instead of surfacing the sealed predecessor's
-/// dead-end sentinel (code-review fix for issue #597).
+/// successor's real outcome, not the sealed predecessor's sentinel (issue #597).
 #[workflow(mcp, description = "Continues itself once, then completes")]
 async fn agent_relay_flow(ctx: &WorkflowContext, hop: u32) -> Result<String, String> {
     if hop == 0 {
@@ -111,10 +114,9 @@ async fn agent_relay_flow(ctx: &WorkflowContext, hop: u32) -> Result<String, Str
     Ok(format!("relay complete at hop {hop}"))
 }
 
-/// Continues itself once, then parks on a signal — used to prove
+/// Continues itself once, then parks on a signal. It proves that
 /// `signal_{wf}`/`{wf}_update_{name}` resolve the `ContinuedAsNew` chain to
-/// the live successor instead of delegating with the sealed predecessor's
-/// id (code-review fix, PR #908).
+/// the live successor, not the sealed predecessor's id (PR #908).
 #[workflow(mcp, description = "Continues itself once, then waits for a signal")]
 async fn agent_relay_signal_flow(ctx: &WorkflowContext, hop: u32) -> Result<String, String> {
     if hop == 0 {
@@ -358,10 +360,9 @@ async fn agent_drives_a_durable_workflow_via_mcp_tools() {
     assert_eq!(status["state"], "RUNNING");
     assert_eq!(status["is_terminal"], json!(false));
 
-    // Subscribe to streaming progress *before* the signal so the stream sees
-    // the remaining transitions live (initial frame + signal-driven events),
-    // and deliver the signal concurrently (the watch response body only
-    // completes once the run reaches a terminal state).
+    // Subscribe to streaming progress *before* the signal, so the stream sees
+    // the remaining transitions live. Deliver the signal concurrently, because
+    // the watch body completes only when the run is terminal.
     let listeners_before = count_listeners(&db).await;
     let watch_fut = post_sse(
         &client,
@@ -522,11 +523,10 @@ async fn handles_cannot_cross_workflow_tool_boundaries() {
     assert!(is_error, "cross-workflow signal must fail, got: {body}");
 }
 
-/// Code-review regression test (issue #597): `{wf}_status` and `{wf}_watch`
-/// must resolve a `ContinuedAsNew` chain to the successor's real outcome —
-/// before the fix, both surfaced the sealed predecessor's dead-end sentinel
-/// (`state: CONTINUED_AS_NEW`, `output: null`, `error: null`) for any run
-/// that continued itself, exactly like `agent_relay_flow` does once.
+/// Regression test (issue #597): `{wf}_status` and `{wf}_watch` must resolve a
+/// `ContinuedAsNew` chain to the successor's real outcome. Both once showed
+/// the sealed predecessor's sentinel (`state: CONTINUED_AS_NEW`,
+/// `output: null`, `error: null`) for a run that continued itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn status_and_watch_follow_the_continue_as_new_chain_to_the_real_result() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -701,12 +701,11 @@ async fn mcp_update_tools_run_the_handler_synchronously() {
     }
 }
 
-/// Code-review regression test (issue #597, PR #908): an mcp update declared
-/// with `validator = ...` must reject an invalid payload *before* admission
-/// -- `{wf}_update_{name}` previously delegated straight to `admit_update`,
-/// which never consulted the registered validator, so an invalid payload
-/// became durable history (`UpdateAdmitted`) instead of being rejected at
-/// the edge.
+/// Regression test (issue #597, PR #908): an mcp update declared with
+/// `validator = ...` must reject an invalid payload *before* admission.
+/// `{wf}_update_{name}` once delegated straight to `admit_update`, which
+/// skipped the validator. An invalid payload then became durable history
+/// (`UpdateAdmitted`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_update_tool_rejects_invalid_payload_via_registered_validator() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -788,15 +787,13 @@ async fn count_update_admitted(db: &TestPg, execution_id: &str) -> i64 {
     .n
 }
 
-/// Code-review regression test (issue #597, PR #908): `start_{wf}` must still
-/// reject input that violates the workflow's published issue #373 schema,
-/// with a real runtime installed. `start_tool` no longer duplicates this
-/// check itself (removed as a redundant, closure-captured-schema copy of the
-/// check `start_workflow` already performs against the live registry); the
-/// guarantee now depends entirely on `start_workflow`'s own validation, which
-/// only runs once `api_state.runtime()` resolves -- unreachable in the no-DB
-/// `tests/mcp_tools_http_tests.rs` harness. This test is that guarantee's
-/// only remaining coverage.
+/// Regression test (issue #597, PR #908): `start_{wf}` must still reject input
+/// that violates the workflow's published issue #373 schema, with a real
+/// runtime installed. `start_tool` does not repeat the check. The guarantee
+/// rests on `start_workflow`'s own validation against the live registry. That
+/// runs only once `api_state.runtime()` resolves, which the no-DB
+/// `tests/mcp_tools_http_tests.rs` harness never reaches. This test is the
+/// only coverage of that guarantee.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_start_tool_rejects_input_that_violates_the_published_schema() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -827,11 +824,12 @@ async fn mcp_start_tool_rejects_input_that_violates_the_published_schema() {
 
 /// A unified DAG's `start_{dag}` MCP tool must route through the real DAG
 /// trigger contract (`trigger_dag_run` -> `trigger_unified_dag`), not the
-/// generic `start_workflow` path -- proven end to end by: (1) the first start
-/// actually creates and runs a DAG execution that reaches `COMPLETED`, and
-/// (2) a second start fired while the first is still `RUNNING` is rejected by
-/// the DAG's `max_active_runs` admission gate (default 1), which
-/// `start_workflow` has no notion of and would have silently admitted.
+/// generic `start_workflow` path. Two facts prove it end to end:
+///
+/// 1. The first start creates a DAG execution that reaches `COMPLETED`.
+/// 2. A second start while the first is `RUNNING` is rejected by the DAG's
+///    `max_active_runs` admission gate (default 1). `start_workflow` has no
+///    such gate and would admit it.
 #[cfg(feature = "unified-dag-execution")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dag_start_tool_triggers_a_real_dag_run_and_enforces_max_active_runs() {
@@ -874,9 +872,9 @@ async fn dag_start_tool_triggers_a_real_dag_run_and_enforces_max_active_runs() {
     assert_eq!(status["state"], "COMPLETED");
 }
 
-/// A unified DAG never consumes signals (issue #601 follow-up): its tool set
-/// must not include `signal_{dag}` at all, so calling it is an unknown-tool
-/// error from autumn-web's own MCP dispatch, not a delegated handler call.
+/// A unified DAG never consumes signals (issue #601). Its tool set must not
+/// include `signal_{dag}`. A call to it is an unknown-tool error from
+/// autumn-web's MCP dispatch, not a delegated handler call.
 #[cfg(feature = "unified-dag-execution")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dag_tool_set_has_no_signal_tool() {

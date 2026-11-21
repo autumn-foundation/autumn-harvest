@@ -26,6 +26,7 @@ R&D decision record [`docs/rnd/sqlite-feasibility.md`](rnd/sqlite-feasibility.md
 7. [The drive model](#7-the-drive-model)
 8. [Signals, queries and updates](#8-signals-queries-and-updates)
 9. [Child workflows and commands between runs](#9-child-workflows-and-commands-between-runs)
+   - [9a. External activities](#9a-external-activities)
 10. [Durability and crash recovery](#10-durability-and-crash-recovery)
 11. [The single-writer / single-server contract](#11-the-single-writer--single-server-contract)
 12. [v0.1 non-goals and follow-ups](#12-v01-non-goals-and-follow-ups)
@@ -76,8 +77,8 @@ management routes on this backend: see [`sqlite-plugin.md`](sqlite-plugin.md)
 
 ```toml
 [dependencies]
-autumn-harvest = { version = "0.10", default-features = false }
-autumn-harvest-sqlite = "0.10"
+autumn-harvest = { version = "0.11", default-features = false }
+autumn-harvest-sqlite = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -329,6 +330,7 @@ match rt.run_until_blocked(exec).await? {
     RunState::Failed(err)       => println!("failed: {err}"),
     RunState::WaitingSignal(name) => println!("blocked on signal `{name}`"),
     RunState::WaitingTimer      => println!("blocked on a durable timer"),
+    RunState::WaitingExternal(token) => println!("blocked on external token {token}"),
     RunState::WaitingWorkflow(other) => println!("blocked on run {other}"),
     RunState::WaitingMutex(key) => println!("blocked on the `{key}` mutex"),
     RunState::Cancelled(reason) => println!("cancelled: {reason}"),
@@ -382,6 +384,22 @@ A live `ctx.system_now()` returns the clock of its decision cycle, as the
 timers do (issue #2276). A `run_until_blocked_as_of` drive therefore keeps one
 clock: the timers, the activities, the ledger rows and the clock reads all use
 the time that the call names.
+
+### The stack of the caller thread (issue #2752)
+
+The runtime polls each workflow on the thread that awaits the drive. A debug
+build makes large poll frames, so that thread needs room. The Windows main
+thread has 1 MiB, and a durable agent op overflowed it before issue #2752.
+
+The engine builds its large child futures on the heap, with
+[`autumn_harvest::frame::boxed`](../autumn-harvest/src/frame.rs). The
+`stack_budget` test of `autumn-harvest-agent` runs each agent workflow on a
+small fixed stack in Linux, macOS and Windows CI.
+
+A workflow of your own can still make large futures. If a debug build
+overflows, box its large child futures. The module docs of `frame` show the
+form that harvest-verify can follow. Or drive the runtime on a thread that
+you spawn with a larger stack, as `autumn-harvest-cli` does.
 
 ### Cancel and terminate
 
@@ -1151,6 +1169,68 @@ Each event is the same, and replay accepts both orders.
 
 ---
 
+## 9a. External activities
+
+An external (task-token) activity waits for a result from outside the
+runtime (issue #2607). harvest-camel uses it for request and reply. The
+body calls `ctx.execute_activity_external(name, input, queue, secs)`.
+
+1. The decision cycle records the handoff in one transaction. It appends
+   `ActivityAwaitingExternal`, inserts a `harvest_external_tasks` row and
+   arms a deadline timer.
+2. The drive returns `RunState::WaitingExternal(token)`. The fleet drivers
+   count the park as blocked, not as progress.
+3. A dispatcher reads the pending handoffs and sends each input out. A
+   pending row returns on each read until a settle. Keep the tokens in
+   flight, and send each input once.
+
+   ```rust
+   use autumn_harvest_sqlite::ExternalHandoffFilter;
+
+   let filter = ExternalHandoffFilter::pending().activity_name("bridge");
+   for handoff in rt.list_external_handoffs(&filter)? {
+       // Send handoff.input to the external system. Keep handoff.token.
+   }
+   ```
+
+4. The reply settles the token. `rt.complete_external(token, output)`
+   appends `ActivityCompletedExternally`, as Postgres
+   `complete_externally` does. `rt.fail_external(token, error, retryable)`
+   appends `ActivityFailedExternally`. The next drive resumes the body.
+
+The rules match Postgres:
+
+| Case | Result |
+|---|---|
+| A settle of a `PENDING` token of a running run | `Ok(true)` |
+| A second settle, or a settle after the run ends | `Ok(false)`, and no write |
+| An unknown token | `SqliteError::ExternalTaskNotFound` |
+| An output nested past `MAX_PAYLOAD_DEPTH` | The activity fails instead |
+| No settle before `schedule_to_close_secs` | `ActivityTimedOut { ScheduleToClose }` |
+| A settle or an extension after the deadline | The token times out first. A settle returns `Ok(false)` |
+| A settle or an extension that would reach a history cap | `SqliteError::ExternalHistoryCapReached`. The run ends at the cap, as for an update |
+| An external activity beside another awaitable, such as a `join!` | The run ends `FAILED` with `UnsupportedFeature` |
+| A marker, side effect or timer change recorded after a pending external activity | The run ends `FAILED` with `UnsupportedFeature`. Replay cannot read past the event |
+
+The read orders rows by deadline, then by the newest update, then by token.
+Unlike the Postgres operator row, a row carries the activity input, because
+a dispatcher on one file has no other read of it.
+
+The deadline is a `harvest_timers` row with the id
+`__external_deadline:<token>`. It fires in the worker pass, as any timer
+does, so an `_as_of` drive and a reopen need nothing more. A settle deletes
+the timer. `rt.extend_external_deadline(token, by)` moves it, and appends
+`ActivityExternalDeadlineExtended`.
+
+When a run ends, its `PENDING` tokens become `CANCELLED`. A dispatcher then
+never reads a handoff that no run waits on. This differs from Postgres,
+which leaves such a token `PENDING`.
+
+`HarvestPlugin` on SQLite does not serve the external activity routes.
+Call the runtime methods.
+
+---
+
 ## 10. Durability and crash recovery
 
 All durable state lives in the database. Dropping a runtime and re-`open`-ing the
@@ -1241,14 +1321,14 @@ silently dropped. A workflow reaching one of these surfaces
 `SqliteError::Unsupported` (or a setup-time panic at registration) naming the
 specific command/feature. The run then ends `FAILED` (see below):
 
-- **External / task-token activities**.
 - A **continue-as-new to a different type** (`continue_as_new_as_type`).
   The token is `ContinueAsNew.new_workflow_type`. A same-type
   `continue_as_new` is supported (see [§7](#7-the-drive-model)).
 - **Worker sessions** (`create_session`).
-- **A batch that breaks a solo rule**: a mutex acquire beside another
-  awaitable, or a local activity beside a durable awaitable or a second
-  local activity. The token is `AcquireMutex` or `RunLocalActivity`.
+- **A batch that breaks a solo rule**: a mutex acquire or an external
+  activity beside another awaitable, or a local activity beside a durable
+  awaitable or a second local activity. The token is `AcquireMutex`,
+  `ScheduleExternalActivity` or `RunLocalActivity`.
 
 Search attributes are supported since issue #2027. See
 [§8](#list-describe-and-search-attributes-issue-2027).

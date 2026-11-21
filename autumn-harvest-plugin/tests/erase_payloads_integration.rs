@@ -16,6 +16,7 @@
 #![allow(clippy::too_many_lines)]
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
+use jiff_diesel::ToDiesel;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,10 +40,10 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -99,6 +100,7 @@ fn build_worker(registry: Arc<HandlerRegistry>) -> Arc<Worker> {
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
+                gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
                 codec_rotation_batch_size: 0,
                 scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
@@ -109,6 +111,8 @@ fn build_worker(registry: Arc<HandlerRegistry>) -> Arc<Worker> {
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
                 max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
+                claim_slots_per_shard: None,
+                claim_batch_max: None,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -245,7 +249,7 @@ async fn mark_completed(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
         ))
         .execute(conn)
         .await
@@ -399,7 +403,7 @@ async fn seed_completion_delivery_with_pii(
                 "workflow_id": "erase-pii-wf",
                 "state": "COMPLETED",
                 "result": { "email": pii },
-                "completed_at": Utc::now().to_rfc3339(),
+                "completed_at": autumn_harvest::time::rfc3339(Timestamp::now()),
             }),
             max_attempts: 10,
             retry_policy: json!({
@@ -410,7 +414,7 @@ async fn seed_completion_delivery_with_pii(
                 "non_retryable_errors": [],
                 "jitter": "None"
             }),
-            next_attempt_at: Utc::now(),
+            next_attempt_at: Timestamp::now(),
         })
         .execute(conn)
         .await
@@ -492,12 +496,11 @@ async fn erase_tombstones_pii_in_events_row_and_signals() {
     );
 }
 
-/// Issue #605 / PR #921 review (Codex P1): a completion-callback delivery's
-/// frozen `payload` carries the workflow's own result/error, so it must be
-/// scrubbed by erasure exactly like events/execution row/signals -- and the
-/// delivery row itself (`state`/`attempt`/`next_attempt_at`) must be left alone
-/// so a still-pending delivery keeps its retry schedule (it will now just
-/// post the tombstone marker instead of the real data).
+/// Issue #605 / PR #921: a completion-callback delivery's frozen `payload`
+/// carries the workflow's own result or error. Erasure must scrub it like
+/// events, the execution row and signals. It must leave the delivery's
+/// `state`/`attempt`/`next_attempt_at` alone. A pending delivery then keeps its
+/// retry schedule and posts the tombstone marker instead of the real data.
 #[tokio::test]
 async fn erase_tombstones_pii_in_a_pending_completion_delivery_without_touching_its_schedule() {
     use autumn_harvest::schema::harvest_completion_deliveries;
@@ -568,14 +571,12 @@ async fn erase_tombstones_pii_in_a_pending_completion_delivery_without_touching_
     );
 }
 
-/// Issue #921 review (Codex P1, follow-up): a completion-callback delivery
-/// that exhausted retries writes a *second*, independent copy of the frozen
-/// envelope into `harvest_dead_letters.input`. Scrubbing
-/// `harvest_completion_deliveries.payload` alone (the prior fix, tested
-/// above) leaves that DLQ copy carrying the erased PII, so this test seeds
-/// a `task_type = "CALLBACK"` dead-letter row directly (mirroring what
-/// `apply_outcome`'s `OutcomeAction::DeadLetter` branch would insert) and
-/// asserts erasure scrubs it too.
+/// Issue #921: a completion-callback delivery that exhausted retries writes a
+/// *second* copy of the frozen envelope into `harvest_dead_letters.input`.
+/// A scrub of `harvest_completion_deliveries.payload` alone leaves the erased
+/// PII in that DLQ copy. This test seeds a `task_type = "CALLBACK"`
+/// dead-letter row, as `apply_outcome`'s `OutcomeAction::DeadLetter` branch
+/// would. It asserts that erasure scrubs it too.
 #[tokio::test]
 async fn erase_tombstones_pii_in_a_callback_dead_letter_row() {
     use autumn_harvest::dlq::{NewDeadLetterEntry, dead_letter};
@@ -606,7 +607,7 @@ async fn erase_tombstones_pii_in_a_callback_dead_letter_row() {
                 "workflow_id": "erase-pii-wf-cb-dlq",
                 "state": "COMPLETED",
                 "result": { "email": pii },
-                "completed_at": Utc::now().to_rfc3339(),
+                "completed_at": autumn_harvest::time::rfc3339(Timestamp::now()),
             }),
             error: "delivery exhausted 10 attempts".to_string(),
             attempts: 10,
@@ -718,7 +719,6 @@ async fn erase_is_idempotent() {
     let exec_id = seed_execution_with_pii(&mut conn, "erase-idempotent-wf", pii).await;
     mark_completed(&mut conn, exec_id).await;
 
-    // First erase.
     let (status1, body1) = post_json(
         &app,
         &format!("/workflows/{exec_id}/erase-payloads"),

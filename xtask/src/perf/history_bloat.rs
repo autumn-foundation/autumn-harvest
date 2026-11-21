@@ -411,7 +411,6 @@ fn run_in(ctx: &Ctx, admin: String, out_dir: &Path) -> Result<ExitCode> {
         Stdio::null(),
     )?);
 
-    // The admin URL, with the database segment swapped for the fresh database.
     let db_url = with_database(&admin, &db_name);
     let bench = Bench {
         admin,

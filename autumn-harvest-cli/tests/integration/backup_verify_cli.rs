@@ -1,12 +1,11 @@
 //! Integration tests for the `harvest backup verify` subcommand (issue #943).
 //!
-//! Black-box tests over the crate's public backup-verify surface: the pure
-//! guard/format/gate helpers. `run_backup_verify` itself needs a live database
-//! and is not exercised here; its parts (guard, format, gate) are, and the DB
-//! half is
-//! covered by the core crate's `backup_verify_tests` integration suite; these
-//! tests own the *operator-facing contract*: the scratch-DSN guard (AC4), the
-//! exit-code mapping (`AC2d`), and the machine-readable report shape.
+//! Black-box tests over the pure guard/format/gate helpers of backup verify.
+//! `run_backup_verify` needs a live database, so only its parts run here. The
+//! core crate's `backup_verify_tests` suite covers the database half.
+//!
+//! These tests own the *operator-facing contract*: the scratch-DSN guard (AC4),
+//! the exit-code mapping (`AC2d`), and the machine-readable report shape.
 
 use autumn_harvest::backup_verify::{
     Finding, FindingClass, ReplaySummary, RestoreVerifyReport, ShardVerifyReport, VerifyStatus,
@@ -38,7 +37,7 @@ fn shard(findings: Vec<Finding>) -> ShardVerifyReport {
 }
 
 fn report(findings: Vec<Finding>) -> RestoreVerifyReport {
-    RestoreVerifyReport::assemble(chrono::Utc::now(), vec![shard(findings)], Vec::new())
+    RestoreVerifyReport::assemble(jiff::Timestamp::now(), vec![shard(findings)], Vec::new())
 }
 
 // ── AC4: the scratch guard ─────────────────────────────────────────────────
@@ -178,10 +177,10 @@ fn an_empty_shard_list_is_rejected() {
 /// An `ExecutionId` carries its shard in the UUID's first two bytes as
 /// `shard & 0xFFFF`, and `0xFFFF` is the reserved `ShardId::UNENCODED`
 /// sentinel. A shard id outside `0..=0xFFFE` therefore does NOT survive the
-/// round trip: `65536` truncates to `0`, so every target id read out of the
-/// database the operator supplied under `65536=` decodes as shard `0`, is not
-/// found in the supplied map, and is written off as "on an uninspected shard"
-/// -- an advisory, exit 0, with the shard silently never checked.
+/// round trip: `65536` truncates to `0`. Every target id from the database
+/// supplied under `65536=` then decodes as shard `0` and misses the map. It is
+/// written off as "on an uninspected shard": an advisory, exit 0, with the
+/// shard silently never checked.
 ///
 /// Reject it at parse time with the same rule the shard router uses.
 #[test]
@@ -270,7 +269,7 @@ fn an_unavailable_report_exits_two_so_ci_can_tell_it_apart() {
         "connect failed".to_string(),
     );
     let r = RestoreVerifyReport::assemble(
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
         vec![shard(Vec::new()), unreachable],
         Vec::new(),
     );
@@ -294,9 +293,9 @@ fn a_clean_report_passes_the_gate() {
 
 #[test]
 fn json_output_says_whether_replay_actually_ran() {
-    // A JSON consumer must be able to tell "the data is coherent" from "your
-    // workflow code still replays it" WITHOUT re-deriving the rule -- the
-    // shipped CLI can never do the latter.
+    // A JSON consumer must tell "the data is coherent" from "your workflow
+    // code still replays it" WITHOUT re-deriving the rule. The shipped CLI
+    // can never check the latter.
     let mut s = shard(Vec::new());
     s.replay = ReplaySummary {
         sampled: 4,
@@ -306,7 +305,7 @@ fn json_output_says_whether_replay_actually_ran() {
         skipped_no_handler: 4,
         unreadable: 0,
     };
-    let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
+    let r = RestoreVerifyReport::assemble(jiff::Timestamp::now(), vec![s], Vec::new());
     let v: serde_json::Value =
         serde_json::from_str(&backup_verify_json(&r).expect("serialise")).expect("valid json");
     assert_eq!(
@@ -373,7 +372,7 @@ fn text_output_reports_replay_coverage_honestly() {
         skipped_no_handler: 5,
         unreadable: 0,
     };
-    let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
+    let r = RestoreVerifyReport::assemble(jiff::Timestamp::now(), vec![s], Vec::new());
     let text = format_backup_verify_text(&r);
     // `contains("skipped")` alone is not falsifiable -- the verified branch
     // prints that word too. Pin the verdict token that only the unverified
@@ -402,7 +401,7 @@ fn text_output_does_not_claim_partial_coverage_when_nothing_replayed_at_all() {
         skipped_no_handler: 0,
         unreadable: 2,
     };
-    let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
+    let r = RestoreVerifyReport::assemble(jiff::Timestamp::now(), vec![s], Vec::new());
     let text = format_backup_verify_text(&r);
     assert!(
         text.contains("NOT VERIFIED") && !text.contains("PARTIALLY VERIFIED"),
@@ -425,7 +424,7 @@ fn text_output_does_not_blame_handlers_when_every_history_is_unreadable() {
         skipped_no_handler: 0,
         unreadable: 2,
     };
-    let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
+    let r = RestoreVerifyReport::assemble(jiff::Timestamp::now(), vec![s], Vec::new());
     let text = format_backup_verify_text(&r);
     assert!(
         !text.contains("Register the workflow handlers"),
@@ -451,7 +450,7 @@ fn text_output_names_both_causes_when_unreadable_and_skipped_combine() {
         skipped_no_handler: 3,
         unreadable: 2,
     };
-    let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
+    let r = RestoreVerifyReport::assemble(jiff::Timestamp::now(), vec![s], Vec::new());
     let text = format_backup_verify_text(&r);
     assert!(
         text.contains("NOT VERIFIED") && !text.contains("PARTIALLY VERIFIED"),
@@ -485,7 +484,7 @@ fn text_output_reports_partial_coverage_even_when_skipped_is_also_present() {
         skipped_no_handler: 3,
         unreadable: 1,
     };
-    let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
+    let r = RestoreVerifyReport::assemble(jiff::Timestamp::now(), vec![s], Vec::new());
     let text = format_backup_verify_text(&r);
     assert!(
         text.contains("PARTIALLY VERIFIED") && !text.contains("NOT VERIFIED"),
@@ -504,7 +503,7 @@ fn text_output_reports_partial_coverage_when_some_unreadable_but_others_replayed
         skipped_no_handler: 0,
         unreadable: 1,
     };
-    let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
+    let r = RestoreVerifyReport::assemble(jiff::Timestamp::now(), vec![s], Vec::new());
     let text = format_backup_verify_text(&r);
     assert!(
         text.contains("PARTIALLY VERIFIED"),
@@ -523,7 +522,7 @@ fn text_output_does_not_claim_not_verified_when_replay_really_ran() {
         skipped_no_handler: 0,
         unreadable: 0,
     };
-    let r = RestoreVerifyReport::assemble(chrono::Utc::now(), vec![s], Vec::new());
+    let r = RestoreVerifyReport::assemble(jiff::Timestamp::now(), vec![s], Vec::new());
     let text = format_backup_verify_text(&r);
     assert!(
         !text.contains("NOT VERIFIED"),
@@ -537,11 +536,11 @@ fn the_default_output_format_is_text() {
     assert_eq!(BackupVerifyFormat::default(), BackupVerifyFormat::Text);
 }
 
-/// The regression the CLI smoke test caught: an unmigrated (empty) "restore"
-/// makes every probe fail, and folding that into an advisory reported
-/// `resumable_with_reclaim` + exit 0 — telling an operator to start workers
-/// against a database with no harvest schema. Must be exit 2, and the message
-/// must name the real cause (failed probes, not unreachable shards).
+/// Pins the regression the CLI smoke test caught. An unmigrated (empty)
+/// "restore" makes every probe fail. Folding that into an advisory reported
+/// `resumable_with_reclaim` + exit 0. That told an operator to start workers
+/// against a database with no harvest schema. It must be exit 2, and the
+/// message must name the real cause (failed probes, not unreachable shards).
 #[test]
 fn a_report_whose_probes_never_ran_exits_two_and_says_why() {
     let r = report(vec![Finding::new(

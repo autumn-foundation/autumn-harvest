@@ -136,36 +136,37 @@ pub fn tail(s: &str, index: usize) -> &str {
 }
 
 /// Python `repr` of a string.
+///
+/// Clone-class note: the non-printable escape tail below (everything past
+/// the shared [`crate::py_repr`] prefix) repeats verbatim in
+/// [`crate::audit::ledger_profiles::pyrepr::str_repr`]. Apply any change to
+/// the `0x20`/`0x7f` cutoff or the `is_control` branch to both copies.
+///
+/// Two instances only, both from the same `#2574` port. No missed-fix has
+/// occurred on either copy since. The merge-evidence bar (rule of three, or
+/// a missed-fix) is not met yet, so the duplication stays. Two other ports
+/// (`corpus_link_check::pycompat::repr`,
+/// `workflow_yaml_parse::pytext::repr_str`) use a stricter `is_printable`
+/// check here instead of `is_control`. They are not a third instance.
 pub fn repr(s: &str) -> String {
-    let quote = if s.contains('\'') && !s.contains('"') {
-        '"'
-    } else {
-        '\''
-    };
+    let quote = crate::py_repr::repr_quote(s);
     let mut out = String::new();
     out.push(quote);
     for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c == quote => {
-                out.push('\\');
-                out.push(c);
+        if crate::py_repr::push_common_repr_escape(&mut out, c, quote) {
+            continue;
+        }
+        if (c as u32) < 0x20 || c as u32 == 0x7f {
+            let _ = write!(out, "\\x{:02x}", c as u32);
+        } else if c.is_control() {
+            let code = c as u32;
+            if code <= 0xff {
+                let _ = write!(out, "\\x{code:02x}");
+            } else {
+                let _ = write!(out, "\\u{code:04x}");
             }
-            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
-                let _ = write!(out, "\\x{:02x}", c as u32);
-            }
-            c if c.is_control() => {
-                let code = c as u32;
-                if code <= 0xff {
-                    let _ = write!(out, "\\x{code:02x}");
-                } else {
-                    let _ = write!(out, "\\u{code:04x}");
-                }
-            }
-            c => out.push(c),
+        } else {
+            out.push(c);
         }
     }
     out.push(quote);
@@ -473,6 +474,13 @@ mod tests {
         assert_eq!(repr("it's"), "\"it's\"");
         assert_eq!(repr("a'b\"c"), "'a\\'b\"c'");
         assert_eq!(repr("x\ny"), "'x\\ny'");
+    }
+
+    #[test]
+    fn repr_escapes_cr_tab_and_a_bare_backslash() {
+        assert_eq!(repr("a\rb"), "'a\\rb'");
+        assert_eq!(repr("a\tb"), "'a\\tb'");
+        assert_eq!(repr("a\\b"), "'a\\\\b'");
     }
 
     #[test]

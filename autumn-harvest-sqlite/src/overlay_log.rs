@@ -4,19 +4,24 @@
 //! Postgres. Each kind has immutable versions and one active pointer. The
 //! typed store is `SqliteOverlayStore` in `autumn-harvest-agent`.
 //!
-//! [`SqliteOverlayLog`] opens its own connection. It can share the file of
-//! a [`SqliteRuntime`](crate::SqliteRuntime). WAL mode lets the two
+//! [`SqliteOverlayLog::open`] keeps its own connection. It can share the
+//! file of a [`SqliteRuntime`](crate::SqliteRuntime). WAL mode lets the two
 //! connections work side by side.
+//!
+//! [`SqliteOverlayLog::with_connector`] opens a new connection for each
+//! call, and drops it after the call. Use it in a database that a
+//! replicator checkpoints.
 
 use std::path::Path;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use autumn_harvest::overlay_log::{
     AUTHOR_AUTO, ActivateDecision, ActivateOutcome, ActivationRow, AutoAdoptRaw, AutoAdoptRequest,
     AutoMoveDecision, MoveRequest, OverlayRow, PolicyAppend, PolicyRow, PolicyWrite,
     decide_auto_move, logs_activation, next_overlay_version, policy_write_passes, utc_day,
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
+use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OptionalExtension as _, Row, TransactionBehavior, params};
 
 use crate::error::{SqliteError, SqliteResult};
@@ -124,6 +129,17 @@ BEGIN
 END;
 ";
 
+/// Opens one connection to the database of an overlay log.
+///
+/// Each call must open the same database. Set the pragmas of the app in
+/// the closure, such as `journal_mode`, `busy_timeout` and
+/// `wal_autocheckpoint`. The app uses the `rusqlite` version of this
+/// crate, so the `Connection` types match.
+///
+/// Return an error from the closure, not a panic. A panic unwinds into the
+/// caller of the store.
+pub type SqliteConnector = Arc<dyn Fn() -> rusqlite::Result<Connection> + Send + Sync>;
+
 /// The columns of one policy row.
 const POLICY_COLUMNS: &str = "seq, old_body, new_body, actor_kind, actor, changed_at_ms";
 
@@ -136,7 +152,15 @@ const ROW_COLUMNS: &str = "version, body, author_kind, author, created_at_ms";
 /// `autumn-harvest-agent`, which does.
 #[doc(hidden)]
 pub struct SqliteOverlayLog {
-    conn: Mutex<Connection>,
+    source: Mutex<Source>,
+}
+
+/// Where a call of the log gets its connection.
+enum Source {
+    /// One connection for the life of the log.
+    Held(Connection),
+    /// A new connection for each call.
+    Factory(SqliteConnector),
 }
 
 impl std::fmt::Debug for SqliteOverlayLog {
@@ -165,7 +189,32 @@ impl SqliteOverlayLog {
         Self::prepare(Connection::open_in_memory()?)
     }
 
-    fn prepare(conn: Connection) -> SqliteResult<Self> {
+    /// Open a log that gets a new connection from `connect` for each call.
+    ///
+    /// The log applies its schema through `connect`. Each later call opens
+    /// one connection, runs its statements and drops the connection. So the
+    /// log keeps no connection between calls. The log runs one call at a
+    /// time, so at most one of its connections is open.
+    ///
+    /// The log sets `foreign_keys = ON` on each connection, and no other
+    /// pragma. The app sets the rest in `connect`. The log also turns off
+    /// the checkpoint at the close of each connection. So a store
+    /// connection that closes last checkpoints nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] if `connect` fails or the schema
+    /// cannot be applied.
+    pub fn with_connector(connect: SqliteConnector) -> SqliteResult<Self> {
+        let mut conn = connect_once(&connect)?;
+        apply_schema(&mut conn)?;
+        drop(conn);
+        Ok(Self {
+            source: Mutex::new(Source::Factory(connect)),
+        })
+    }
+
+    fn prepare(mut conn: Connection) -> SqliteResult<Self> {
         // As in `SqliteRuntime::open`: wait for another writer, keep a commit
         // across a crash, and turn on the foreign key of the pointer.
         conn.execute_batch(
@@ -174,16 +223,27 @@ impl SqliteOverlayLog {
              PRAGMA synchronous = FULL;\n\
              PRAGMA foreign_keys = ON;",
         )?;
-        conn.execute_batch(OVERLAY_SCHEMA)?;
+        apply_schema(&mut conn)?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            source: Mutex::new(Source::Held(conn)),
         })
     }
 
-    /// Run `f` on the connection under its lock.
+    /// Run `f` on a connection under the lock of the log.
+    ///
+    /// A factory log opens the connection for this call only. The
+    /// connection closes before the lock is released.
     fn with_conn<T>(&self, f: impl FnOnce(&mut Connection) -> SqliteResult<T>) -> SqliteResult<T> {
-        let mut conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
-        f(&mut conn)
+        let mut source = self.source.lock().unwrap_or_else(PoisonError::into_inner);
+        match &mut *source {
+            Source::Held(conn) => f(conn),
+            Source::Factory(connect) => {
+                let mut conn = connect_once(connect)?;
+                let out = f(&mut conn);
+                drop(conn);
+                out
+            }
+        }
     }
 
     /// Append `body` as the next version of `kind`. Returns the stored row,
@@ -357,6 +417,28 @@ impl SqliteOverlayLog {
     }
 }
 
+/// One connection from `connect`, with the foreign key of the pointer on.
+///
+/// The connection does not checkpoint when it closes. So a store
+/// connection that closes last leaves every frame in the WAL.
+fn connect_once(connect: &SqliteConnector) -> SqliteResult<Connection> {
+    let conn = connect()?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    Ok(conn)
+}
+
+/// Apply [`OVERLAY_SCHEMA`] in one `DEFERRED` transaction.
+///
+/// A file that has the schema needs no write, so the transaction takes no
+/// write lock. The open then does not wait for another writer.
+fn apply_schema(conn: &mut Connection) -> SqliteResult<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    tx.execute_batch(OVERLAY_SCHEMA)?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// The body of [`SqliteOverlayLog::append`].
 fn append_in(
     conn: &mut Connection,
@@ -380,7 +462,7 @@ fn append_in(
     let Ok(stored) = i64::try_from(version) else {
         return Ok(None);
     };
-    let created_at = from_millis(Utc::now().timestamp_millis())?;
+    let created_at = from_millis(Timestamp::now().as_millisecond());
     tx.execute(
         "INSERT INTO harvest_agent_overlay_heads (kind, latest) VALUES (?1, ?2)
          ON CONFLICT (kind) DO UPDATE SET latest = excluded.latest",
@@ -396,7 +478,7 @@ fn append_in(
             body,
             author_kind,
             author,
-            created_at.timestamp_millis()
+            created_at.as_millisecond()
         ],
     )?;
     tx.commit()?;
@@ -442,7 +524,7 @@ fn append_policy_in(
         ));
     };
     let old_body = last.and_then(|row| row.new_body);
-    let changed_at = from_millis(Utc::now().timestamp_millis())?;
+    let changed_at = from_millis(Timestamp::now().as_millisecond());
     tx.execute(
         "INSERT INTO harvest_agent_refine_policies
              (kind, seq, old_body, new_body, actor_kind, actor, changed_at_ms)
@@ -454,7 +536,7 @@ fn append_policy_in(
             write.body,
             write.actor_kind,
             write.actor,
-            changed_at.timestamp_millis()
+            changed_at.as_millisecond()
         ],
     )?;
     tx.commit()?;
@@ -502,8 +584,8 @@ fn auto_adopt_in(
                 params![
                     kind,
                     AUTHOR_AUTO,
-                    start.timestamp_millis(),
-                    end.timestamp_millis()
+                    start.as_millisecond(),
+                    end.as_millisecond()
                 ],
                 |row| row.get(0),
             )?;
@@ -522,7 +604,7 @@ fn auto_adopt_in(
     let Ok(stored) = i64::try_from(version) else {
         return Ok(AutoAdoptRaw::Full);
     };
-    let created_at = from_millis(Utc::now().timestamp_millis())?;
+    let created_at = from_millis(Timestamp::now().as_millisecond());
     tx.execute(
         "INSERT INTO harvest_agent_overlay_heads (kind, latest) VALUES (?1, ?2)
          ON CONFLICT (kind) DO UPDATE SET latest = excluded.latest",
@@ -538,7 +620,7 @@ fn auto_adopt_in(
             request.body,
             AUTHOR_AUTO,
             request.actor,
-            created_at.timestamp_millis()
+            created_at.as_millisecond()
         ],
     )?;
     tx.execute(
@@ -556,7 +638,7 @@ fn auto_adopt_in(
             stored,
             AUTHOR_AUTO,
             request.actor,
-            request.at.timestamp_millis()
+            request.at.as_millisecond()
         ],
     )?;
     tx.commit()?;
@@ -604,9 +686,10 @@ fn activate_in(
         return Ok(ActivateOutcome::UnknownVersion);
     };
     let actual = active.map(to_version).transpose()?;
-    let last_seq = match request.after_seq {
-        Some(_) => last_move(&tx, kind)?.map(|row| row.seq),
-        None => None,
+    let last_seq = if request.needs_last_seq() {
+        last_move(&tx, kind)?.map(|row| row.seq)
+    } else {
+        None
     };
     let outcome = match request.decide(known, actual, last_seq) {
         ActivateDecision::UnknownVersion => ActivateOutcome::UnknownVersion,
@@ -629,7 +712,7 @@ fn activate_in(
                         stored,
                         request.actor_kind,
                         request.actor,
-                        Utc::now().timestamp_millis()
+                        Timestamp::now().as_millisecond()
                     ],
                 )?;
             }
@@ -645,16 +728,16 @@ fn activate_in(
 fn read_row(row: &Row<'_>) -> rusqlite::Result<SqliteResult<OverlayRow>> {
     let version: i64 = row.get(0)?;
     let created_at_ms: i64 = row.get(4)?;
-    let (version, created_at) = match (to_version(version), from_millis(created_at_ms)) {
-        (Ok(version), Ok(created_at)) => (version, created_at),
-        (Err(err), _) | (_, Err(err)) => return Ok(Err(err)),
+    let version = match to_version(version) {
+        Ok(version) => version,
+        Err(err) => return Ok(Err(err)),
     };
     Ok(Ok(OverlayRow {
         version,
         body: row.get(1)?,
         author_kind: row.get(2)?,
         author: row.get(3)?,
-        created_at,
+        created_at: from_millis(created_at_ms),
     }))
 }
 
@@ -670,10 +753,9 @@ fn read_move(row: &Row<'_>) -> rusqlite::Result<SqliteResult<ActivationRow>> {
             to_version(seq)?,
             from.map(to_version).transpose()?,
             to_version(to)?,
-            from_millis(activated_at_ms)?,
         ))
     })();
-    let (seq, from, to, activated_at) = match decoded {
+    let (seq, from, to) = match decoded {
         Ok(decoded) => decoded,
         Err(err) => return Ok(Err(err)),
     };
@@ -683,7 +765,7 @@ fn read_move(row: &Row<'_>) -> rusqlite::Result<SqliteResult<ActivationRow>> {
         to,
         actor_kind: row.get(3)?,
         actor: row.get(4)?,
-        activated_at,
+        activated_at: from_millis(activated_at_ms),
     }))
 }
 
@@ -692,9 +774,9 @@ fn read_move(row: &Row<'_>) -> rusqlite::Result<SqliteResult<ActivationRow>> {
 fn read_policy(row: &Row<'_>) -> rusqlite::Result<SqliteResult<PolicyRow>> {
     let seq: i64 = row.get(0)?;
     let changed_at_ms: i64 = row.get(5)?;
-    let (seq, changed_at) = match (to_version(seq), from_millis(changed_at_ms)) {
-        (Ok(seq), Ok(changed_at)) => (seq, changed_at),
-        (Err(err), _) | (_, Err(err)) => return Ok(Err(err)),
+    let seq = match to_version(seq) {
+        Ok(seq) => seq,
+        Err(err) => return Ok(Err(err)),
     };
     Ok(Ok(PolicyRow {
         seq,
@@ -702,7 +784,7 @@ fn read_policy(row: &Row<'_>) -> rusqlite::Result<SqliteResult<PolicyRow>> {
         new_body: row.get(2)?,
         actor_kind: row.get(3)?,
         actor: row.get(4)?,
-        changed_at,
+        changed_at: from_millis(changed_at_ms),
     }))
 }
 
@@ -711,7 +793,29 @@ fn to_version(stored: i64) -> SqliteResult<u64> {
         .map_err(|_| SqliteError::Unsupported(format!("overlay version {stored} is negative")))
 }
 
-fn from_millis(ms: i64) -> SqliteResult<DateTime<Utc>> {
-    DateTime::from_timestamp_millis(ms)
-        .ok_or_else(|| SqliteError::Unsupported(format!("overlay time {ms} is out of range")))
+/// Reads a stored time. A value past the jiff range clamps to its end, so
+/// a row that `chrono` wrote still loads.
+fn from_millis(ms: i64) -> Timestamp {
+    autumn_harvest::time::from_millisecond_clamped(ms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A factory connection gets the foreign key of the pointer, and no
+    /// checkpoint at its close.
+    #[test]
+    fn a_factory_connection_has_the_store_settings() {
+        let connect: SqliteConnector = Arc::new(Connection::open_in_memory);
+        let conn = connect_once(&connect).expect("connect");
+        let foreign_keys: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .expect("pragma");
+        assert_eq!(foreign_keys, 1);
+        assert!(
+            conn.db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE)
+                .expect("config")
+        );
+    }
 }

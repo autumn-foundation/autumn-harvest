@@ -382,7 +382,6 @@ async fn test_queue_and_task_eligibility_scenarios() {
     )
     .await;
 
-    // Set up API router
     let state = api_state(
         HarvestDbPool::from(pool.clone()),
         runtime_for(&["test-queue"], ShardRouter::single()),
@@ -399,8 +398,8 @@ async fn test_queue_and_task_eligibility_scenarios() {
     assert_eq!(body["pending_count"], 3); // A, B, C are pending
     assert!(body["oldest_pending_age_secs"].as_i64().is_some());
 
-    // Distinct build IDs across pending rows: "v2" and null (null should be absent or represented, required_build_ids is a list of strings)
-    // Distinct build IDs across pending rows: "v2" and null (null should be absent or represented, required_build_ids is a list of strings)
+    // The distinct build IDs of the pending rows are "v2" and null.
+    // `required_build_ids` is a list of strings, so only "v2" is checked.
     assert!(
         body["required_build_ids"]
             .as_array()
@@ -409,7 +408,8 @@ async fn test_queue_and_task_eligibility_scenarios() {
             .any(|v| v.as_str().unwrap() == "v2")
     );
 
-    // Eligible workers check: worker-eligible passes all gates for at least one task (specifically Task A and C, wait, Task C has concurrency key saturated, but Task A doesn't).
+    // Eligible workers check: worker-eligible passes all gates for at least one
+    // task. Task C has its concurrency key saturated, but Task A does not.
     let eligible_list = body["eligible_workers"].as_array().unwrap();
     let eligible_ids: Vec<&str> = eligible_list
         .iter()
@@ -434,7 +434,6 @@ async fn test_queue_and_task_eligibility_scenarios() {
     // worker-stale is offline, should not be in either list
     assert!(!eligible_ids.contains(&"worker-stale"));
 
-    // Ineligible workers check
     let ineligible_list = body["ineligible_workers"].as_array().unwrap();
     assert!(
         !ineligible_list
@@ -442,7 +441,6 @@ async fn test_queue_and_task_eligibility_scenarios() {
             .any(|w| w["worker_id"].as_str().unwrap() == "worker-stale")
     );
 
-    // Check wrong_queue_subscription
     let w_wrong_q = ineligible_list
         .iter()
         .find(|w| w["worker_id"] == "worker-wrong-queue")
@@ -455,7 +453,6 @@ async fn test_queue_and_task_eligibility_scenarios() {
             .any(|v| v.as_str().unwrap() == "wrong_queue_subscription")
     );
 
-    // Check wrong_shard_assignment
     let w_wrong_s = ineligible_list
         .iter()
         .find(|w| w["worker_id"] == "worker-wrong-shard")
@@ -468,7 +465,6 @@ async fn test_queue_and_task_eligibility_scenarios() {
             .any(|v| v.as_str().unwrap() == "wrong_shard_assignment")
     );
 
-    // Check worker_draining
     let w_drain = ineligible_list
         .iter()
         .find(|w| w["worker_id"] == "worker-draining")
@@ -481,7 +477,6 @@ async fn test_queue_and_task_eligibility_scenarios() {
             .any(|v| v.as_str().unwrap() == "worker_draining")
     );
 
-    // Check worker_stopped
     let w_stop = ineligible_list
         .iter()
         .find(|w| w["worker_id"] == "worker-stopped")
@@ -494,7 +489,7 @@ async fn test_queue_and_task_eligibility_scenarios() {
             .any(|v| v.as_str().unwrap() == "worker_stopped")
     );
 
-    // Check diagnosis is "healthy" since we have worker-eligible which is active, eligible, and has capacity
+    // worker-eligible is active, eligible and has capacity, so the diagnosis is "healthy".
     assert_eq!(body["summary"]["diagnosis"], "healthy");
 }
 
@@ -503,7 +498,6 @@ async fn test_task_eligibility_endpoints() {
     let (database_url, _container) = setup_database_url_with_migrations().await;
     let pool = build_test_pool(&database_url);
 
-    // Seed task requiring build v2
     let task_id = seed_task_detailed(&pool, "test-queue", Some("v2"), None, None, None, None).await;
 
     // Register active worker with incompatible build
@@ -606,9 +600,10 @@ async fn seed_task_with_rate_limit_and_date(
     id
 }
 
-/// Seed a claimable PENDING task with a caller-chosen `task_type` (a real
-/// circuit-breaker task is `task_type='activity'`, not `'workflow'`), naming an
-/// activity and optionally carrying a rate-limit key.
+/// Seed a claimable PENDING task with a caller-chosen `task_type`, an activity
+/// name and an optional rate-limit key.
+///
+/// A real circuit-breaker task is `task_type='activity'`, not `'workflow'`.
 async fn seed_typed_task(
     pool: &DbPool,
     queue_name: &str,
@@ -697,7 +692,6 @@ async fn test_eligibility_optimizations_and_resilience() {
     )
     .await;
 
-    // Register active worker for rate limit queue
     register_active_worker_with_build(
         &pool,
         "worker-rate-limited",
@@ -716,19 +710,17 @@ async fn test_eligibility_optimizations_and_resilience() {
     state.set_admin_auth_boundary(true);
     let app = harvest_api_router(state);
 
-    // Query queue eligibility
     let (status, body) =
         get_json_with_auth(&app, "/admin/queues/test-queue-rl/eligibility", true).await;
     assert_eq!(status, StatusCode::OK);
     // pending_count should be exactly 1 (only the rate-limited one is claimable; scheduled in future and expired are excluded)
     assert_eq!(body["pending_count"], 1);
 
-    // worker-rate-limited should be marked ineligible with reason "rate_limit_exhausted" (AC7a).
-    // The worker is otherwise perfectly eligible (right queue, shard, build, capacity),
-    // and the single claimable task's only impediment is the saturated rate-limit bucket
-    // (no concurrency key/cap, no circuit breaker), so the reason set is EXACTLY
-    // ["rate_limit_exhausted"] — asserting exact equality guards the success metric that a
-    // rate limit is never mislabeled as concurrency saturation.
+    // worker-rate-limited is ineligible with reason "rate_limit_exhausted" (AC7a).
+    // The worker passes every other gate (queue, shard, build, capacity). The
+    // one task has no concurrency cap and no circuit breaker, only the saturated
+    // bucket. So the reason set is EXACTLY ["rate_limit_exhausted"]. Exact
+    // equality guards that a rate limit is never labeled as concurrency saturation.
     let ineligible_list = body["ineligible_workers"].as_array().unwrap();
     let w_rl = ineligible_list
         .iter()
@@ -770,7 +762,8 @@ async fn test_eligibility_optimizations_and_resilience() {
     let (status_cap, body_cap) =
         get_json_with_auth(&app_cap, "/admin/queues/test-queue-cap/eligibility", true).await;
     assert_eq!(status_cap, StatusCode::OK);
-    // worker-at-capacity should be in eligible_workers, but because it's full, diagnosis should be "all_capacity_full"
+    // worker-at-capacity should be in eligible_workers. It is full, so the
+    // diagnosis should be "all_capacity_full"
     let eligible_cap = body_cap["eligible_workers"].as_array().unwrap();
     assert!(
         eligible_cap
@@ -833,7 +826,6 @@ async fn test_eligibility_optimizations_and_resilience() {
     state_sharded_healthy.set_admin_auth_boundary(true);
     let app_sharded_healthy = harvest_api_router(state_sharded_healthy);
 
-    // Seed task on "test-queue-multi"
     let _task_multi =
         seed_task_detailed(&pool, "test-queue-multi", None, None, None, None, None).await;
 
@@ -897,7 +889,6 @@ async fn test_eligibility_optimizations_and_resilience() {
     state_drain.set_admin_auth_boundary(true);
     let app_drain = harvest_api_router(state_drain);
 
-    // Seed task
     let _task_drain =
         seed_task_detailed(&pool, "test-queue-drain", None, None, None, None, None).await;
 
@@ -1004,7 +995,6 @@ async fn test_eligibility_optimizations_and_resilience() {
     )
     .await;
 
-    // Register active worker
     register_active_worker_with_build(
         &pool,
         "worker-mixed-cap",
@@ -1260,18 +1250,16 @@ fn cb_activity(name: &'static str, queue: &'static str) -> autumn_harvest::info:
 }
 
 // AC7(b): a task whose next activity is gated by an OPEN circuit breaker reports
-// `circuit_open` — never an empty impediment set — and the CB activity's
-// saturated rate-limit bucket is suppressed at the claim-time explainer (issue
-// #369), so the reason is `circuit_open` and not `rate_limit_exhausted`.
+// `circuit_open`, never an empty impediment set. The claim-time explainer
+// suppresses the saturated rate-limit bucket of the CB activity (issue #369).
+// So the reason is `circuit_open`, not `rate_limit_exhausted`.
 //
-// The suppression is proven end-to-end: a SECOND, non-CB task shares the same
-// rate-limit key and genuinely saturates it, so `saturated_rate_limits` really
-// does contain the key. The non-CB task's own eligibility reports
-// `rate_limit_exhausted` (proving the bucket is exhausted), while the CB task's
-// own eligibility reports `circuit_open` and never `rate_limit_exhausted`
-// (proving the #369 suppression, not a vacuously-empty saturated set). If the
-// helper's `!has_cb` guard were dropped, the CB task's per-task evaluation would
-// wrongly surface `rate_limit_exhausted` here.
+// A SECOND, non-CB task shares the rate-limit key and saturates it, so
+// `saturated_rate_limits` contains the key. The non-CB task reports
+// `rate_limit_exhausted`, which proves the bucket is exhausted. The CB task
+// reports `circuit_open` and never `rate_limit_exhausted`. This proves the #369
+// suppression is not vacuous. Without the `!has_cb` guard in the helper, the
+// CB task would report `rate_limit_exhausted` here.
 #[tokio::test]
 async fn test_open_circuit_reports_circuit_open() {
     let (database_url, _container) = setup_database_url_with_migrations().await;
@@ -1290,10 +1278,9 @@ async fn test_open_circuit_reports_circuit_open() {
         .circuit_breakers()
         .force_open("charge_card", std::time::Instant::now());
 
-    // The CB task: a real activity task naming the CB activity, carrying the
-    // shared saturated rate-limit key (Fix 5: task_type='activity', not
-    // 'workflow', so a future refactor gating the CB branch on task type cannot
-    // silently pass).
+    // The CB task: an activity task that names the CB activity and carries the
+    // shared saturated rate-limit key. It uses task_type='activity', so a
+    // refactor that gates the CB branch on task type cannot pass silently.
     let cb_task_id = seed_typed_task(
         &pool,
         "test-queue-cb",
@@ -1328,13 +1315,11 @@ async fn test_open_circuit_reports_circuit_open() {
     state.set_admin_auth_boundary(true);
     let app = harvest_api_router(state);
 
-    // Queue eligibility endpoint: worker-cb is ineligible and surfaces
-    // `circuit_open` (never an empty/unknown set), absent from the eligible
-    // list, diagnosis no_eligible_workers. Note: at the queue level the
-    // per-worker reason set is a UNION across every claimable task, so the
-    // sibling non-CB task legitimately adds `rate_limit_exhausted` here — the
-    // CB-activity suppression is asserted at the per-task endpoint below, where
-    // the CB task is evaluated in isolation.
+    // Queue eligibility endpoint: worker-cb is ineligible with `circuit_open`,
+    // absent from the eligible list, and the diagnosis is no_eligible_workers.
+    // At the queue level, the per-worker reason set is a UNION over every
+    // claimable task. So the non-CB sibling adds `rate_limit_exhausted` here.
+    // The per-task endpoint below checks the CB suppression in isolation.
     let (status, body) =
         get_json_with_auth(&app, "/admin/queues/test-queue-cb/eligibility", true).await;
     assert_eq!(status, StatusCode::OK);
@@ -1387,9 +1372,9 @@ async fn test_open_circuit_reports_circuit_open() {
         "rate-limit reason must be suppressed for a CB activity, got {cb_reasons:?}"
     );
 
-    // Per-task endpoint for the NON-CB task sharing the same key: it correctly
-    // reports `rate_limit_exhausted`, proving the shared bucket is genuinely
-    // saturated (so the CB suppression above is not vacuous).
+    // Per-task endpoint for the NON-CB task with the same key: it reports
+    // `rate_limit_exhausted`. So the shared bucket is saturated, and the CB
+    // suppression above is not vacuous.
     let (status_nc, body_nc) = get_json_with_auth(
         &app,
         format!("/admin/tasks/{noncb_task_id}/eligibility"),
@@ -1523,10 +1508,9 @@ async fn test_queue_paused_leads_the_final_reason_codes_over_another_impediment(
 
         // The operator's deliberate hold on the same queue.
         diesel::sql_query(
-            // `queue_name` is the PK, so stay re-run safe: every sibling test in
-            // this file seeds with generated ids and CI gives each test a fresh
-            // container, but a fixed PK would otherwise break a second run
-            // against a shared database.
+            // `queue_name` is the PK, so stay re-run safe. Sibling tests seed
+            // generated ids, and CI gives each test a fresh container. A fixed
+            // PK would break a second run against a shared database.
             "INSERT INTO harvest_queue_pauses (queue_name, reason, paused_by, paused_at) \
              VALUES ('test-queue-paused-prio', 'provider outage', 'alice', NOW()) \
              ON CONFLICT (queue_name) DO NOTHING",
@@ -1605,18 +1589,18 @@ async fn test_queue_paused_leads_the_final_reason_codes_over_another_impediment(
     );
 }
 
-// Issue #619 review: a queue pause must survive the worker-reason short-circuit.
+// Issue #619: a queue pause must survive the worker-reason short-circuit.
 //
-// A worker that is unsubscribed, assigned to another shard, draining, or stopped
-// is pushed straight into `ineligible_workers` carrying only its worker-specific
-// reasons and then `continue`s -- bypassing BOTH the shared pause impediment and
-// `sort_reason_codes`. The sibling test above only reaches the pause check
+// A worker that is unsubscribed, on another shard, draining, or stopped goes
+// straight into `ineligible_workers` with only its worker-specific reasons.
+// It then `continue`s, past the shared pause impediment and
+// `sort_reason_codes`. The sibling test above reaches the pause check only
 // because its worker is healthy.
 //
-// So when *every* online worker has one of those conditions -- e.g. a fleet
-// drained for the very outage the operator paused the queue for -- the response
-// never mentions `queue_paused` at all, and the deliberate hold is invisible on
-// the one surface built to answer "why is nothing dispatching?".
+// Suppose every online worker has one of those conditions, for example a
+// fleet drained for the outage the operator paused the queue for. Then the
+// response never mentions `queue_paused`. The hold is invisible on the one
+// surface built to answer "why is nothing dispatching?".
 #[tokio::test]
 async fn test_queue_paused_survives_the_worker_reason_short_circuit() {
     let (database_url, _container) = setup_database_url_with_migrations().await;
@@ -1714,17 +1698,16 @@ async fn test_queue_paused_survives_the_worker_reason_short_circuit() {
     );
 }
 
-// Issue #807: an activity held by an operator pause must surface as
-// `activity_paused` on the explainer, alongside — never instead of — every other
-// impediment that applies.
+// Issue #807: an activity held by an operator pause surfaces as
+// `activity_paused` on the explainer. It appears beside every other
+// impediment that applies, never in place of one.
 //
-// Without this the endpoint reports an EMPTY reason set for a held task: a
-// confident "no impediment" during exactly the incident the operator paused for,
-// on the one surface built to answer "why is nothing dispatching?". This test
-// drives the real endpoint with THREE simultaneous holds (activity pause, queue
-// pause, exhausted rate limit) because the interesting failure is not "the code
-// is missing" but "one hold masks another" — resuming the reported hold would
-// then leave the task still stuck with no remaining explanation.
+// Without this, the endpoint reports an EMPTY reason set for a held task. That
+// is a confident "no impediment" during the incident the operator paused for.
+// This test drives the real endpoint with THREE holds: activity pause, queue
+// pause and exhausted rate limit. The real failure is that one hold masks
+// another. Resuming the reported hold would leave the task stuck with no
+// explanation.
 #[tokio::test]
 async fn test_activity_paused_surfaces_and_composes_with_a_queue_pause() {
     let (database_url, _container) = setup_database_url_with_migrations().await;
@@ -1813,9 +1796,9 @@ async fn test_activity_paused_surfaces_and_composes_with_a_queue_pause() {
          the explainer answers \"why is nothing dispatching?\" with an \
          impediment set that omits the actual answer; got {reasons:?}"
     );
-    // Both deliberate holds are independent: an operator can pause a queue and
-    // an activity type during the same incident, and resuming the one that was
-    // reported must not leave the task silently stuck behind the other.
+    // The two holds are independent. An operator can pause a queue and an
+    // activity type in the same incident. Resuming the reported one must not
+    // leave the task silently stuck behind the other.
     assert!(
         reasons.contains(&"queue_paused"),
         "a co-occurring queue hold must survive alongside the activity hold, \
@@ -1844,13 +1827,12 @@ async fn test_activity_paused_surfaces_and_composes_with_a_queue_pause() {
 }
 
 // Issue #807: an activity pause must survive the worker-reason short-circuit,
-// for the same reason its queue-level sibling must (see the test above).
+// like its queue-level sibling (see the test above).
 //
-// A worker that is unsubscribed, off-shard, draining, or stopped is pushed
-// straight into `ineligible_workers` and `continue`s -- bypassing the per-task
-// loop where the pause impediment is computed. So a fleet drained for the very
-// outage the operator paused the activity for would never surface the hold at
-// all.
+// A worker that is unsubscribed, off-shard, draining, or stopped goes straight
+// into `ineligible_workers` and `continue`s. It skips the per-task loop that
+// computes the pause impediment. So a fleet drained for the outage the
+// operator paused the activity for would never show the hold.
 #[tokio::test]
 async fn test_activity_paused_survives_the_worker_reason_short_circuit() {
     let (database_url, _container) = setup_database_url_with_migrations().await;
@@ -1945,16 +1927,15 @@ async fn test_activity_paused_survives_the_worker_reason_short_circuit() {
     );
 }
 
-// Issue #807: the explainer must scope by `task_type` exactly as the claim gate
-// does, or it reports a hold that does not exist.
+// Issue #807: the explainer must scope by `task_type` like the claim gate, or
+// it reports a hold that does not exist.
 //
-// A **workflow** task can legitimately carry a non-NULL `activity_name`: the
-// engine stamps the `'mixed_signal_suspension'` sentinel into that column. The
-// claim gate is scoped by `task_type = 'activity'` precisely so pausing an
-// activity that happens to share that name cannot hold every mixed-signal
-// -suspended workflow task in the fleet. An explainer keyed on `activity_name`
-// alone would report `activity_paused` on a task the engine is perfectly willing
-// to dispatch -- sending an operator to resume a pause that was never the cause.
+// A **workflow** task can carry a non-NULL `activity_name`. The engine stamps
+// the `'mixed_signal_suspension'` sentinel into that column. The claim gate
+// scopes by `task_type = 'activity'`, so pausing an activity with that name
+// cannot hold every mixed-signal-suspended workflow task. An explainer keyed
+// on `activity_name` alone would report `activity_paused` on a dispatchable
+// task. It would send an operator to resume a pause that was never the cause.
 #[tokio::test]
 async fn test_activity_pause_never_reports_a_workflow_task_as_held() {
     let (database_url, _container) = setup_database_url_with_migrations().await;

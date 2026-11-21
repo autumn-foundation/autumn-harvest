@@ -1,0 +1,43 @@
+# Ledger profiles for `autumn-harvest/src/agent_store.rs`. See `docs/ledger/README.md`.
+
+["pg::count_agent_windows"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_agent_transcripts"]
+measured = "unmeasured"
+
+["pg::erase_agent_windows"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_agent_transcripts"]
+measured = "unmeasured"
+
+["pg::get_agent_window"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_agent_transcripts"]
+measured = "unmeasured"
+
+["pg::put_agent_window"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_agent_transcripts"]
+measured = "unmeasured"
+
+["pg::read_agent_doc"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_agent_store_docs"]
+measured = "unmeasured"
+
+["pg::swap_agent_doc"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_agent_store_docs"]
+measured = "unmeasured"

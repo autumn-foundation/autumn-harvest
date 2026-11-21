@@ -17,9 +17,9 @@
 //! keeps the samples apart. The [`episode`] log records each op, and
 //! [`consolidate`] turns the episodes into facts (issue #2454).
 //! [`consolidate_all`] starts the passes of many agents from one schedule
-//! (issue #2540). The [`recall`] module measures what an agent forgets across ops (issue
-//! #2455). The `eval` feature adds the `eval` module. That module re-drives
-//! a recorded run with a candidate model or prompt. The
+//! (issue #2540). The [`recall`] module measures what an agent forgets
+//! across ops (issue #2455). The `eval` feature adds the `eval` module. That
+//! module re-drives a recorded run with a candidate model or prompt. The
 //! `sandbox` feature adds the `sandbox` module. Its `SandboxTool` runs agent
 //! code in a sandbox.
 //!
@@ -42,7 +42,11 @@
 //! The crate depends on the core engine only, with no default features. It
 //! has no Autumn plugin dependency.
 //! An app implements [`AgentModel`] for its provider, or bridges a framework
-//! it already uses.
+//! it already uses. The `anthropic` feature adds the `anthropic` module. Its
+//! `ClaudeModel` is an [`AgentModel`] over the Anthropic Messages API. The
+//! `openai` feature adds the `openai` module. Its `OpenAiModel` is an
+//! [`AgentModel`] over any OpenAI-compatible Chat Completions API, at a base
+//! URL that the app sets.
 //!
 //! # Use it on SQLite
 //!
@@ -69,19 +73,16 @@
 //! The `postgres` feature adds the `postgres` module. It has the calls of
 //! the `sqlite` module, for an app whose workers run on Postgres.
 //!
-//! Register the workflows and the activities, and install the harness as
-//! worker state:
+//! [`register`] adds the workflows, the activities and the harness to a
+//! `HarvestBuilder`. It needs no backend feature. `HarvestPlugin::agent`
+//! calls it, on Postgres and on SQLite:
 //!
 //! ```
 //! # fn demo(model: std::sync::Arc<dyn autumn_harvest_agent::AgentModel>) {
 //! use autumn_harvest::builder::HarvestBuilder;
-//! use autumn_harvest_agent::{AgentHarness, activities, workflows};
+//! use autumn_harvest_agent::{AgentHarness, register};
 //!
-//! let built = HarvestBuilder::new()
-//!     .workflows(workflows())
-//!     .activities(activities())
-//!     .state(AgentHarness::new(model))
-//!     .build();
+//! let built = register(HarvestBuilder::new(), AgentHarness::new(model)).build();
 //! assert!(built.state::<AgentHarness>().is_some());
 //! # }
 //! ```
@@ -90,6 +91,8 @@
 
 pub mod agent;
 pub mod answer_check;
+#[cfg(feature = "anthropic")]
+pub mod anthropic;
 pub mod approval;
 pub mod bounds;
 pub mod consolidate;
@@ -113,9 +116,13 @@ pub mod mesh;
 pub mod mesh_control;
 pub mod message;
 pub mod model;
+#[cfg(feature = "openai")]
+pub mod openai;
 pub mod policy;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(any(feature = "anthropic", feature = "openai"))]
+pub mod provider;
 pub mod recall;
 pub mod refine;
 pub mod response_cache;
@@ -126,6 +133,9 @@ pub mod score;
 pub mod skill;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub mod stores;
+pub mod sweep_tool;
 pub mod tool;
 pub mod transcript;
 pub mod types;
@@ -138,20 +148,22 @@ pub use agent::overlay::{
 pub use agent::overlay_diff::{OverlayChange, diff as overlay_diff};
 #[cfg(feature = "postgres")]
 pub use agent::overlay_store::PostgresOverlayStore;
-#[cfg(feature = "sqlite")]
-pub use agent::overlay_store::SqliteOverlayStore;
 pub use agent::overlay_store::{
     Activation, AutoAdoptOutcome, InMemoryOverlayStore, MAX_AUTHOR_LEN, OverlayStoreError,
     OverlayValidator, OverlayVersion, PolicyLogEntry, PolicyState, ProfileOverlayStore, Provenance,
     Rollback, StoreClock, StoredOverlay,
 };
+#[cfg(feature = "sqlite")]
+pub use agent::overlay_store::{SqliteConnector, SqliteOverlayStore};
 pub use agent::profile_read::{OverlayRead, ProfileRead};
 pub use agent::{
     AGENT_WORKFLOW_NAME, Agent, AgentHeartbeat, AgentId, AgentIdError, AgentMemory, AgentOp,
     AgentProfile, AgentState, AgentStatus, Control, HeartbeatSetting, INTERRUPT_SIGNAL, Interrupt,
     PROFILE_VERSION_ATTR, PeerEnvelope, PeerReply, STEER_SIGNAL, Steer, Urgency, UserMessage,
-    agent, agent_info, agent_memory_reset, agent_memory_reset_info, agent_profile,
-    agent_profile_info, agent_profile_overlay, agent_profile_overlay_info, agent_workspace_floor,
+    agent, agent_info, agent_memory_count, agent_memory_count_info, agent_memory_reset,
+    agent_memory_reset_info, agent_profile, agent_profile_info, agent_profile_overlay,
+    agent_profile_overlay_info, agent_transcript_count, agent_transcript_count_info,
+    agent_transcript_erase, agent_transcript_erase_info, agent_workspace_floor,
     agent_workspace_floor_info, agent_workspace_reset, agent_workspace_reset_info,
     agent_workspace_retain, agent_workspace_retain_info,
 };
@@ -168,7 +180,7 @@ pub use consolidate_all::{
     agent_consolidate_all, agent_consolidate_all_info,
 };
 pub use context_reset::{ContextReset, ProgressNotes};
-pub use delivery::{Delivery, LogDelivery, Report, ReportSource};
+pub use delivery::{ApprovalNotice, Delivery, LogDelivery, ParkedCall, Report, ReportSource};
 pub use draw::{Draw, DrawId, run_draws};
 pub use episode::{
     Appended, Cleared, ConsolidationTrigger, Episode, EpisodeLog, EpisodeReset, EpisodeSettings,
@@ -209,22 +221,28 @@ pub use response_cache::{
     CacheIndex, CacheKey, CacheScope, InMemoryCacheIndex, KeyTenant, ResponseCache,
 };
 pub use score::{
-    ExactMatch, FiniteF64, JsonSchema, MAX_REJECT_REASON_BYTES, NonFinite, SampleScore,
+    Answered, ExactMatch, FiniteF64, JsonSchema, MAX_REJECT_REASON_BYTES, NonFinite, SampleScore,
     ScoreContext, ScoreInput, ScoreRequest, Scorer, ToolRecord, Verdict, agent_sample_score,
     agent_sample_score_info, agent_score, agent_score_info, select,
 };
 pub use skill::{LOAD_SKILL_TOOL, SkillText};
+#[cfg(feature = "postgres")]
+pub use stores::{PostgresEpisodeStore, PostgresMemoryStore, PostgresTranscriptStore};
+#[cfg(feature = "sqlite")]
+pub use stores::{SqliteEpisodeStore, SqliteMemoryStore, SqliteTranscriptStore};
+pub use sweep_tool::{SWEEP_TOOL, SweepSpend, SweepTool, SweepToolResult, SweepToolRow};
 pub use tool::{FnTool, Tool, ToolContext, ToolEffect};
-pub use transcript::{InMemoryTranscriptStore, PrefixRef, TranscriptStore};
+pub use transcript::{InMemoryTranscriptStore, PrefixRef, TranscriptStore, WindowOwner};
 pub use types::{
     AgentReport, AgentStop, AgentTask, MAX_PARALLEL_CHILDREN, ModelTurn, ModelTurnRequest,
     PROBE_EFFECT_REFUSED, Probe, RunIdSource, ToolCallRequest, ToolOutcome,
 };
 pub use workflow::{
-    WORKFLOW_NAME, activities, agent_deliver, agent_deliver_info, agent_discover_peers,
-    agent_discover_peers_info, agent_loop, agent_loop_info, agent_memory_snapshot,
-    agent_memory_snapshot_info, agent_model_turn, agent_model_turn_info, agent_precheck,
-    agent_precheck_info, agent_tool_call, agent_tool_call_info, workflows,
+    WORKFLOW_NAME, activities, agent_approval_notice, agent_approval_notice_info, agent_deliver,
+    agent_deliver_info, agent_discover_peers, agent_discover_peers_info, agent_loop,
+    agent_loop_info, agent_memory_snapshot, agent_memory_snapshot_info, agent_model_turn,
+    agent_model_turn_info, agent_precheck, agent_precheck_info, agent_tool_call,
+    agent_tool_call_info, register, workflows,
 };
 pub use workspace::{
     DirWorkspaceBlobs, InMemoryWorkspaceBlobs, Workspace, WorkspaceBlobs, WorkspaceFile,

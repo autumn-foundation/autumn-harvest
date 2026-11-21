@@ -3,8 +3,12 @@
 #[cfg(feature = "db")]
 mod active_workflow_gauge_tests;
 #[cfg(feature = "db")]
+mod activity_cap_override_db_tests;
+#[cfg(feature = "db")]
 mod activity_claim_epoch_tests;
 mod activity_default_floor_tests;
+#[cfg(feature = "testing")]
+mod activity_default_override_db_tests;
 #[cfg(feature = "db")]
 mod activity_default_timeout_tests;
 #[cfg(feature = "db")]
@@ -61,6 +65,8 @@ mod business_day_replay_tests;
 #[cfg(feature = "db")]
 mod business_day_timer_tests;
 mod cache_delta_load_tests;
+#[cfg(feature = "db")]
+mod cached_stmt_db_tests;
 mod calendars_docs;
 #[cfg(feature = "db")]
 mod canary_tests;
@@ -68,6 +74,8 @@ mod cancellation_scope_tests;
 mod cancellation_tests;
 #[cfg(feature = "db")]
 mod capability_miss_tests;
+mod capacity_bench_support;
+mod capacity_docs;
 #[cfg(feature = "db")]
 mod census_scan_index_tests;
 #[cfg(feature = "db")]
@@ -87,6 +95,8 @@ mod ci_nextest_archive;
 mod ci_run_coverage;
 mod circuit_breaker_wiring_tests;
 #[cfg(feature = "db")]
+mod claim_batch_db_tests;
+#[cfg(feature = "db")]
 mod claim_batched_tests;
 mod claim_bench_support;
 #[cfg(feature = "db")]
@@ -96,9 +106,13 @@ mod claim_concurrency_tests;
 #[cfg(feature = "db")]
 mod claim_continuation_priority_tests;
 #[cfg(feature = "db")]
+mod claim_recheck_pipeline_db_tests;
+#[cfg(feature = "db")]
 mod claim_run_deadline_tests;
 #[cfg(feature = "db")]
 mod claim_seek_tests;
+#[cfg(feature = "db")]
+mod claim_slot_tests;
 #[cfg(feature = "db")]
 mod codec_column_coverage_tests;
 #[cfg(all(feature = "db", feature = "testing"))]
@@ -109,6 +123,10 @@ mod completion_callback_tests;
 #[cfg(feature = "db")]
 mod completion_trigger_outbox_queue_perf;
 mod concurrency_key_tests;
+#[cfg(feature = "db")]
+mod concurrency_live_index_perf;
+#[cfg(feature = "db")]
+mod concurrency_live_index_tests;
 mod concurrency_model_ci;
 #[cfg(feature = "db")]
 mod concurrency_override_db_tests;
@@ -166,6 +184,7 @@ mod delayed_start_tests;
 mod det_check_tests;
 mod determinism_static_analysis_docs;
 mod dispatch_tests;
+mod dlq_depth_counter_tests;
 mod docs_guard_support;
 mod drain_release_tests;
 #[cfg(feature = "db")]
@@ -182,6 +201,7 @@ mod event_partitioning_tests;
 mod executor_span_tests;
 #[cfg(feature = "testing")]
 mod external_completion_tests;
+mod external_outbox_pending_tests;
 mod external_outbox_scan_tests;
 mod fairness_key_tests;
 mod fairness_key_worker_tests;
@@ -194,6 +214,7 @@ mod fork_tests;
 mod formal_models_coverage;
 mod formal_trace_coverage;
 mod fuzz_nightly_wiring;
+mod gauge_election_db_tests;
 mod group_commit_db_tests;
 mod guardrail_catalog_tests;
 mod havoc_reentrancy;
@@ -212,6 +233,8 @@ mod hot_code_swap_tests;
 mod idempotency_tests;
 mod integration_e2e;
 #[cfg(feature = "db")]
+mod keyed_claim_running_counts_tests;
+#[cfg(feature = "db")]
 mod late_signal_completion_tests;
 #[cfg(feature = "db")]
 mod legal_hold_tests;
@@ -221,6 +244,8 @@ mod lineage_store_tests;
 mod llm_budget_tests;
 #[cfg(all(feature = "db", feature = "testing"))]
 mod llm_ledger_tests;
+#[cfg(feature = "db")]
+mod llm_spend_tenant_window_perf;
 mod lock_order_docs;
 mod macros_activity;
 mod macros_collect;
@@ -245,6 +270,8 @@ mod mixed_suspension_tests;
 mod mixed_suspension_timer_batch_perf;
 #[cfg(feature = "db")]
 mod mutex_lease_reclaim_perf;
+#[cfg(feature = "db")]
+mod mutex_terminal_sweep_db_tests;
 #[cfg(feature = "db")]
 mod mutex_tests;
 mod nd_block_tests;
@@ -351,6 +378,8 @@ mod retry_now_tests;
 #[cfg(feature = "db")]
 mod retry_override_db_tests;
 mod retry_override_guard;
+#[cfg(feature = "db")]
+mod row_guard_plan_db_tests;
 mod run_defaults_chain_guard;
 #[cfg(feature = "db")]
 mod run_defaults_chain_tests;
@@ -358,6 +387,7 @@ mod run_defaults_chain_tests;
 mod run_defaults_db_tests;
 #[cfg(feature = "db")]
 mod run_defaults_start_paths_tests;
+mod run_defaults_timeout_guard;
 mod runtime_parameter_inventory_docs;
 mod safety_report_docs;
 mod saga_tests;
@@ -447,6 +477,8 @@ mod throttle_tests;
 mod throwaway_db;
 #[cfg(feature = "db")]
 mod timeout_refill_shared_page_perf;
+#[cfg(feature = "db")]
+mod timer_pending_exec_lookup_perf;
 // The recorder is used by the chaos suite only. Its unit tests run in
 // every build, so the exporter is checked on each PR (issue #2003).
 #[cfg_attr(not(feature = "chaos"), allow(dead_code))]
@@ -479,8 +511,12 @@ mod webhook_trigger_tests;
 #[cfg(feature = "db")]
 mod with_start_shared_tests;
 #[cfg(feature = "db")]
+mod worker_sampler_cadence_perf;
+#[cfg(feature = "db")]
 mod worker_saturation_metrics_tests;
 mod worker_session_tests;
+#[cfg(feature = "db")]
+mod worker_task_stats_prune_perf;
 mod workflow_backoff_requeue_tests;
 #[cfg(feature = "db")]
 mod workflow_handle_tests;

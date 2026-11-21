@@ -35,20 +35,23 @@
 //! ## What a workflow override can change
 //!
 //! A workflow override uses the field set of the #771 patch,
-//! [`WorkflowSchedulePatch`], except `input`. The input is a payload. It is
-//! stored through the payload codecs, and a codec key rotation rewrites it.
-//! An override of it would need the same treatment, so it is out of scope.
+//! [`WorkflowSchedulePatch`]. The input is a payload, so the store writes it
+//! through the payload codecs, as the schedule row stores its own input. The
+//! codec rotation sweep re-encodes it. The loaders take the codecs and return
+//! the plaintext.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
+use jiff_diesel::ToDiesel;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{HarvestError, HarvestResult};
+use crate::payload_codec::PayloadCodecs;
 use crate::policy::{
     CatchupPolicy, OverlapPolicy, RetryPolicy, Schedule, SkipPolicy, WorkflowSchedule,
 };
@@ -182,16 +185,15 @@ pub struct DagScheduleOverride {
     /// The actor that last changed the override.
     pub updated_by: String,
     /// When the override was first stored.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// When the override last changed.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 /// One stored override of a code-declared workflow schedule (issue #2386).
 ///
 /// `fields` uses the #771 patch shape. A field that is `None` inherits the
-/// code value. Its `input` is always `None`, because an override does not
-/// change the input.
+/// code value. Its `input` holds the decoded plaintext.
 #[derive(Debug, Clone)]
 pub struct WorkflowScheduleOverride {
     /// The workflow name of the schedule.
@@ -203,9 +205,9 @@ pub struct WorkflowScheduleOverride {
     /// The actor that last changed the override.
     pub updated_by: String,
     /// When the override was first stored.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// When the override last changed.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 pub use crate::schedule_patch::{
@@ -240,12 +242,14 @@ struct WorkflowFieldsJson {
         skip_serializing_if = "Option::is_none"
     )]
     consecutive_failure_limit: Option<Option<u32>>,
+    // `chrono` wrote this field. Its `serde` grammar reads a stored sentinel
+    // past the jiff range and clamps it.
     #[serde(
         default,
-        deserialize_with = "present",
+        deserialize_with = "crate::time::parse::de::tristate",
         skip_serializing_if = "Option::is_none"
     )]
-    end_at: Option<Option<DateTime<Utc>>>,
+    end_at: Option<Option<Timestamp>>,
     #[serde(
         default,
         deserialize_with = "present",
@@ -294,10 +298,14 @@ impl WorkflowFieldsJson {
         }
     }
 
-    fn into_fields(self, common: ScheduleOverrideFields) -> WorkflowSchedulePatch {
+    fn into_fields(
+        self,
+        common: ScheduleOverrideFields,
+        input: Option<serde_json::Value>,
+    ) -> WorkflowSchedulePatch {
         WorkflowSchedulePatch {
             schedule: common.schedule,
-            input: None,
+            input,
             queue_name: self.queue_name,
             catchup: common.catchup,
             max_active_runs: common.max_active_runs,
@@ -349,7 +357,7 @@ pub struct ScheduleOverrideView {
     /// The actor that last changed the override.
     pub updated_by: String,
     /// When the override last changed.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 impl From<&DagScheduleOverride> for ScheduleOverrideView {
@@ -374,6 +382,8 @@ impl From<&DagScheduleOverride> for ScheduleOverrideView {
 pub struct ScheduleOverrides {
     dags: HashMap<String, DagScheduleOverride>,
     workflows: HashMap<String, WorkflowScheduleOverride>,
+    /// Workflow names whose stored override input does not decode.
+    unreadable_inputs: HashSet<String>,
 }
 
 impl ScheduleOverrides {
@@ -397,6 +407,7 @@ impl ScheduleOverrides {
                 .map(|value| (value.dag_name.clone(), value))
                 .collect(),
             workflows: HashMap::new(),
+            unreadable_inputs: HashSet::new(),
         }
     }
 
@@ -414,10 +425,29 @@ impl ScheduleOverrides {
         self
     }
 
+    /// Mark workflow schedules whose stored override input does not decode.
+    ///
+    /// The tick then leaves each such schedule out of registration. Its row
+    /// keeps its last converged value, and the other schedules of the shard
+    /// still register and fire.
+    #[must_use]
+    pub fn with_unreadable_inputs(
+        mut self,
+        workflow_names: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.unreadable_inputs.extend(workflow_names);
+        self
+    }
+
+    /// The workflow names whose stored override input does not decode.
+    pub fn unreadable_inputs(&self) -> impl Iterator<Item = &str> {
+        self.unreadable_inputs.iter().map(String::as_str)
+    }
+
     /// Whether the set holds no override.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.dags.is_empty() && self.workflows.is_empty()
+        self.dags.is_empty() && self.workflows.is_empty() && self.unreadable_inputs.is_empty()
     }
 
     /// The override of one code-declared workflow schedule, if any.
@@ -467,6 +497,10 @@ impl ScheduleOverrides {
     ///
     /// An entry with no `dag_name` is a code-declared workflow schedule. It
     /// takes the workflow override of its workflow name (issue #2386).
+    ///
+    /// An entry whose stored override input does not decode is left out. A
+    /// convergence to the code value would undo the override, so its row
+    /// keeps its last converged value until the key returns or a clear.
     #[must_use]
     pub fn apply_to_workflow_schedules<'a>(
         &self,
@@ -476,7 +510,14 @@ impl ScheduleOverrides {
         if self.is_empty() {
             return Cow::Borrowed(schedules);
         }
-        let mut effective = schedules.to_vec();
+        let mut effective: Vec<WorkflowSchedule> = schedules
+            .iter()
+            .filter(|schedule| {
+                schedule.dag_name.is_some()
+                    || !self.unreadable_inputs.contains(&schedule.workflow_name)
+            })
+            .cloned()
+            .collect();
         for schedule in &mut effective {
             let Some(dag_name) = schedule.dag_name.as_deref() else {
                 if let Some(value) = self.workflows.get(&schedule.workflow_name) {
@@ -633,15 +674,12 @@ struct OverrideRow {
     buffer_all_max: Option<i32>,
     reason: Option<String>,
     updated_by: String,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp, deserialize_as = crate::time::sql::SqlTimestamp)]
+    created_at: Timestamp,
+    #[diesel(serialize_as = crate::time::sql::SqlTimestamp, deserialize_as = crate::time::sql::SqlTimestamp)]
+    updated_at: Timestamp,
     workflow_fields: serde_json::Value,
-}
-
-/// A decoded override row of either kind.
-enum DecodedOverride {
-    Dag(DagScheduleOverride),
-    Workflow(WorkflowScheduleOverride),
+    workflow_input: Option<serde_json::Value>,
 }
 
 impl OverrideRow {
@@ -659,23 +697,49 @@ impl OverrideRow {
         ))
     }
 
-    /// Decode a stored row of either kind.
-    fn decode_any(self) -> HarvestResult<DecodedOverride> {
-        match self.kind.as_str() {
-            KIND_DAG => self.decode().map(DecodedOverride::Dag),
-            KIND_WORKFLOW => self.decode_workflow().map(DecodedOverride::Workflow),
-            other => Err(self.corrupt("kind", &other)),
-        }
+    /// A config error for a stored input that does not decode.
+    ///
+    /// The message names the schedule and the column. It never holds the
+    /// payload.
+    fn undecodable_input(&self) -> HarvestError {
+        HarvestError::Config(format!(
+            "schedule override for workflow schedule '{}' holds a workflow_input that the \
+             registered payload codecs cannot decode; clear it through PATCH /schedules/{{id}}",
+            self.name
+        ))
+    }
+
+    /// The plaintext of the stored input, decoded with `codecs`.
+    fn decode_input(&self, codecs: &PayloadCodecs) -> HarvestResult<Option<serde_json::Value>> {
+        self.workflow_input
+            .as_ref()
+            .map(|stored| {
+                codecs
+                    .decode_column(stored)
+                    .map_err(|_| self.undecodable_input())
+            })
+            .transpose()
     }
 
     /// Decode a stored workflow row (issue #2386).
-    fn decode_workflow(self) -> HarvestResult<WorkflowScheduleOverride> {
+    ///
+    /// `codecs` decodes the stored input to its plaintext.
+    fn decode_workflow(self, codecs: &PayloadCodecs) -> HarvestResult<WorkflowScheduleOverride> {
+        let input = self.decode_input(codecs)?;
+        self.decode_workflow_with(input)
+    }
+
+    /// Decode a stored workflow row with its decoded `input`.
+    fn decode_workflow_with(
+        self,
+        input: Option<serde_json::Value>,
+    ) -> HarvestResult<WorkflowScheduleOverride> {
         let extra: WorkflowFieldsJson = serde_json::from_value(self.workflow_fields.clone())
             .map_err(|error| self.corrupt("workflow_fields", &error.to_string()))?;
         let common = self.decode_common()?;
         Ok(WorkflowScheduleOverride {
             workflow_name: self.name,
-            fields: extra.into_fields(common),
+            fields: extra.into_fields(common, input),
             reason: self.reason,
             updated_by: self.updated_by,
             created_at: self.created_at,
@@ -742,14 +806,23 @@ impl OverrideRow {
 /// Load every override stored on this shard, of both kinds.
 ///
 /// The scheduler calls this once per shard pass. The table holds one row per
-/// overridden schedule, so the read is small.
+/// overridden schedule, so the read is small. `codecs` decodes each stored
+/// input.
+///
+/// An input that does not decode, for example under a key that this process
+/// does not hold, fails one schedule only. The set marks that workflow name,
+/// see [`ScheduleOverrides::with_unreadable_inputs`]. The other schedules of
+/// the shard still register and fire.
 ///
 /// # Errors
 ///
 /// Returns [`HarvestError::Database`] when the read fails, and
-/// [`HarvestError::Config`] when a stored row does not decode. The caller
-/// skips the pass on either error. It never falls back to code values.
-pub async fn load_overrides(conn: &mut AsyncPgConnection) -> HarvestResult<ScheduleOverrides> {
+/// [`HarvestError::Config`] when another stored field does not decode. The
+/// caller skips the pass on either error. It never falls back to code values.
+pub async fn load_overrides(
+    conn: &mut AsyncPgConnection,
+    codecs: &PayloadCodecs,
+) -> HarvestResult<ScheduleOverrides> {
     use crate::schema::harvest_schedule_overrides::dsl;
 
     let rows: Vec<OverrideRow> = dsl::harvest_schedule_overrides
@@ -759,13 +832,20 @@ pub async fn load_overrides(conn: &mut AsyncPgConnection) -> HarvestResult<Sched
         .map_err(crate::error::database_error)?;
     let mut dags = Vec::new();
     let mut workflows = Vec::new();
+    let mut unreadable = Vec::new();
     for row in rows {
-        match row.decode_any()? {
-            DecodedOverride::Dag(value) => dags.push(value),
-            DecodedOverride::Workflow(value) => workflows.push(value),
+        match row.kind.as_str() {
+            KIND_DAG => dags.push(row.decode()?),
+            KIND_WORKFLOW => match row.decode_input(codecs) {
+                Ok(input) => workflows.push(row.decode_workflow_with(input)?),
+                Err(_) => unreadable.push(row.name),
+            },
+            other => return Err(row.corrupt("kind", &other)),
         }
     }
-    Ok(ScheduleOverrides::from_dag_overrides(dags).with_workflow_overrides(workflows))
+    Ok(ScheduleOverrides::from_dag_overrides(dags)
+        .with_workflow_overrides(workflows)
+        .with_unreadable_inputs(unreadable))
 }
 
 /// One stored override as an operator sees it (issue #2388).
@@ -785,9 +865,9 @@ pub struct OverrideSummary {
     /// The actor that last changed the override.
     pub updated_by: String,
     /// When the override was first stored.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// When the override last changed.
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
 }
 
 impl OverrideRow {
@@ -807,6 +887,8 @@ impl OverrideRow {
         set("jitter_secs", self.jitter_secs.map(Into::into));
         set("overlap_policy", self.overlap_policy.map(Into::into));
         set("buffer_all_max", self.buffer_all_max.map(Into::into));
+        // The stored form. Under an active codec it is ciphertext.
+        set("input", self.workflow_input);
         OverrideSummary {
             kind: self.kind,
             name: self.name,
@@ -906,26 +988,29 @@ async fn lock_dag_override(
     row.map(OverrideRow::decode).transpose()
 }
 
-/// Write the merged fields of one DAG override, or delete the row when the
-/// merge sets no field.
+/// Write the merged fields of one DAG override at `version`, or delete the
+/// row when the merge sets no field.
 async fn store_dag_override(
     conn: &mut AsyncPgConnection,
     dag_name: &str,
     fields: &ScheduleOverrideFields,
-    actor: &str,
-    reason: Option<&str>,
+    who: (&str, Option<&str>),
+    version: Timestamp,
 ) -> HarvestResult<()> {
     if fields.is_empty() {
         delete_override(conn, KIND_DAG, dag_name).await?;
         return Ok(());
     }
+    let (actor, reason) = who;
     let row = StoredOverride {
         kind: KIND_DAG,
         name: dag_name,
         fields,
         workflow_fields: serde_json::json!({}),
+        workflow_input: None,
         actor,
         reason,
+        updated_at: version,
     };
     upsert_override(conn, &row).await
 }
@@ -936,8 +1021,12 @@ struct StoredOverride<'a> {
     name: &'a str,
     fields: &'a ScheduleOverrideFields,
     workflow_fields: serde_json::Value,
+    /// The input in its stored form. Only a workflow row sets it.
+    workflow_input: Option<serde_json::Value>,
     actor: &'a str,
     reason: Option<&'a str>,
+    /// The version of the row. A DAG row takes [`next_version`].
+    updated_at: Timestamp,
 }
 
 /// Delete one override row. Returns whether a row was deleted.
@@ -959,7 +1048,6 @@ async fn delete_override(
     Ok(deleted > 0)
 }
 
-/// Insert or replace one override row.
 async fn upsert_override(
     conn: &mut AsyncPgConnection,
     row: &StoredOverride<'_>,
@@ -968,7 +1056,7 @@ async fn upsert_override(
 
     let fields = row.fields;
     let (actor, reason) = (row.actor, row.reason);
-    let now = Utc::now();
+    let now = row.updated_at.to_diesel();
     let schedule_expr = fields.schedule.as_ref().map(schedule_to_storage);
     let max_active_runs = fields.max_active_runs.map(saturating_i32);
     let jitter_secs = fields
@@ -991,6 +1079,7 @@ async fn upsert_override(
             dsl::created_at.eq(now),
             dsl::updated_at.eq(now),
             dsl::workflow_fields.eq(&row.workflow_fields),
+            dsl::workflow_input.eq(row.workflow_input.as_ref()),
         ))
         .on_conflict((dsl::kind, dsl::name))
         .do_update()
@@ -1005,6 +1094,7 @@ async fn upsert_override(
             dsl::updated_by.eq(actor),
             dsl::updated_at.eq(now),
             dsl::workflow_fields.eq(&row.workflow_fields),
+            dsl::workflow_input.eq(row.workflow_input.as_ref()),
         ))
         .execute(conn)
         .await
@@ -1059,10 +1149,19 @@ pub async fn update_dag_override(
         // be lost. A first override has no row to lock. The insert conflict
         // on the primary key then decides, and the later writer wins whole.
         let stored = lock_dag_override(conn, &dag_name).await?;
+        let retired = stored.as_ref().map(|value| value.updated_at);
         let base = stored.map(|value| value.fields).unwrap_or_default();
         let merged = patch.merge(&base);
         let effective = validate_effective(dag, &merged)?;
-        store_dag_override(conn, &dag_name, &merged, actor, reason).await?;
+        // Issue #2602: the write retires the stored version. The new version
+        // lies above the floor, so a carry never skips it.
+        let floor = raise_floor(conn, KIND_DAG, &dag_name, retired).await?;
+        let version = next_version(Timestamp::now(), floor);
+        if merged.is_empty() {
+            // A merge with no field is a clear. It takes a version too.
+            raise_floor(conn, KIND_DAG, &dag_name, Some(version)).await?;
+        }
+        store_dag_override(conn, &dag_name, &merged, (actor, reason), version).await?;
         let stored = get_dag_override(conn, &dag_name).await?;
         Ok(DagOverrideUpdate { stored, effective })
     }))
@@ -1070,6 +1169,11 @@ pub async fn update_dag_override(
 }
 
 /// Delete the override of one DAG. Returns whether a row was deleted.
+///
+/// The clear takes a new version, as a set does, and raises the floor of
+/// this shard to it (issue #2602). A clear of no row counts too. So no copy
+/// of an older version lands here later. A carry moves the floor to the
+/// owner, and there it removes an older row.
 ///
 /// # Errors
 ///
@@ -1083,83 +1187,333 @@ pub async fn clear_dag_override(
     Box::pin(conn.transaction(async |conn| {
         // As in `update_dag_override`.
         crate::scheduler::wait_for_registration_lock(conn).await?;
-        delete_override(conn, KIND_DAG, dag_name).await
+        let retired = delete_dag_override_returning(conn, dag_name).await?;
+        let floor = raise_floor(conn, KIND_DAG, dag_name, retired).await?;
+        let version = next_version(Timestamp::now(), floor);
+        raise_floor(conn, KIND_DAG, dag_name, Some(version)).await?;
+        Ok(retired.is_some())
     }))
     .await
 }
 
+/// Delete the override row of one DAG. Returns the version of the deleted
+/// row.
+async fn delete_dag_override_returning(
+    conn: &mut AsyncPgConnection,
+    dag_name: &str,
+) -> HarvestResult<Option<Timestamp>> {
+    use crate::schema::harvest_schedule_overrides::dsl;
+
+    diesel::delete(
+        dsl::harvest_schedule_overrides
+            .filter(dsl::kind.eq(KIND_DAG))
+            .filter(dsl::name.eq(dag_name)),
+    )
+    .returning(dsl::updated_at)
+    .get_result::<crate::time::sql::SqlTimestamp>(conn)
+    .await
+    .optional()
+    .map(|version| version.map(crate::time::sql::SqlTimestamp::to_jiff))
+    .map_err(crate::error::database_error)
+}
+
 /// Move the override of one DAG to the shard that now owns it (issue #2389).
 ///
-/// `from` holds the row, and `to` is the new owner. The copy commits on `to`
-/// before the delete runs on `from`. So a failure at either step leaves the
-/// override readable on at least one shard. The next scheduler pass retries
-/// the move.
+/// `from` holds the row on `from_shard`, and `to` is the new owner on
+/// `to_shard`. The copy commits on `to` before the delete commits on `from`.
+/// So a failure at either step leaves the override readable on at least one
+/// shard. The next scheduler pass retries the move.
 ///
-/// A row that `to` already holds wins. An operator who changes the DAG after
-/// the move writes to the new owner, and the move must not undo that change.
-/// The row moves as stored, with its reason, actor and timestamps. It is not
-/// decoded.
+/// The move holds the registration lock of both shards from its read to the
+/// end of its delete (issue #2602). It takes them in ascending shard order,
+/// so two opposite moves wait for each other and never both delete. Every
+/// override writer takes that lock, so no write lands between the copy and
+/// the delete either.
 ///
-/// The delete matches the `updated_at` of the copied row. A write on `from`
-/// after the copy then keeps its row, and the next pass moves it again.
+/// The `updated_at` of a row is its version. The copy writes nothing when the
+/// version is at or below the floor of `to`: `to` cleared or replaced that
+/// version, or a newer one. Otherwise the copy lands on an empty `to`, and it
+/// replaces an older row of `to`. The replaced row raises the floor. A newer
+/// or an equal row of `to` stays. The row moves as stored, with its reason,
+/// actor and timestamps. It is not decoded.
+///
+/// The floor of `from` moves too. It raises the floor of `to`, and it removes
+/// a row of `to` at or below it. So a clear on a shard that lost the DAG
+/// still reaches the owner. The delete matches the version of the copied row
+/// and of the moved floor.
+///
+/// Each transaction asserts the DR fence of its own shard before any lock or
+/// write. A process that lost authority on either shard then writes nothing.
+/// The caller also runs the move under the pass guards of both shards. Each
+/// transaction waits at most [`CARRY_LOCK_TIMEOUT_SQL`] for a lock. The
+/// guards hold off a bump while the move waits, so a long wait would delay a
+/// promotion.
 ///
 /// Never pass two shards of one pool. They share one table, so the delete
 /// would remove the only copy.
 ///
-/// Returns whether the row on `from` was deleted.
+/// Returns whether the row or the floor on `from` was deleted.
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Database`] when a read or write fails.
+/// Returns [`HarvestError::ShardFenced`] when this process lost authority on
+/// either shard, and [`HarvestError::Database`] when a read or write fails.
 pub async fn carry_dag_override(
     from: &mut AsyncPgConnection,
     to: &mut AsyncPgConnection,
+    from_shard: crate::types::ShardId,
+    to_shard: crate::types::ShardId,
     dag_name: &str,
 ) -> HarvestResult<bool> {
     use crate::schema::harvest_schedule_overrides::dsl;
     use diesel_async::AsyncConnection;
 
-    let row: Option<OverrideRow> = dsl::harvest_schedule_overrides
-        .filter(dsl::kind.eq(KIND_DAG))
-        .filter(dsl::name.eq(dag_name))
-        .select(OverrideRow::as_select())
-        .first(from)
-        .await
-        .optional()
-        .map_err(crate::error::database_error)?;
-    let Some(row) = row else {
-        return Ok(false);
-    };
-    // Each write takes the registration lock first, as every override
-    // writer does (issue #2386).
-    Box::pin(to.transaction(async |conn| {
-        crate::scheduler::wait_for_registration_lock(conn).await?;
-        diesel::insert_into(dsl::harvest_schedule_overrides)
-            .values(&row)
-            .on_conflict_do_nothing()
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)
-    }))
-    .await?;
-    let deleted = Box::pin(from.transaction(async |conn| {
-        crate::scheduler::wait_for_registration_lock(conn).await?;
-        diesel::delete(
-            dsl::harvest_schedule_overrides
+    Box::pin(from.transaction(async |from| {
+        bound_carry_lock_waits(from).await?;
+        crate::replication::assert_fence(from, from_shard).await?;
+        let copied = Box::pin(to.transaction(async |to| {
+            bound_carry_lock_waits(to).await?;
+            crate::replication::assert_fence(to, to_shard).await?;
+            if from_shard < to_shard {
+                crate::scheduler::wait_for_registration_lock(from).await?;
+                crate::scheduler::wait_for_registration_lock(to).await?;
+            } else {
+                crate::scheduler::wait_for_registration_lock(to).await?;
+                crate::scheduler::wait_for_registration_lock(from).await?;
+            }
+            let row: Option<OverrideRow> = dsl::harvest_schedule_overrides
                 .filter(dsl::kind.eq(KIND_DAG))
                 .filter(dsl::name.eq(dag_name))
-                .filter(dsl::updated_at.eq(row.updated_at)),
-        )
+                .select(OverrideRow::as_select())
+                .first(from)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+            let floor = read_floor(from, KIND_DAG, dag_name).await?;
+            if row.is_none() && floor.is_none() {
+                return Ok(None);
+            }
+            if floor.is_some() {
+                apply_floor(to, KIND_DAG, dag_name, floor).await?;
+            }
+            if let Some(row) = &row {
+                copy_newest(to, row).await?;
+            }
+            Ok::<_, HarvestError>(Some((row.map(|row| row.updated_at), floor)))
+        }))
+        .await?;
+        let Some((version, floor)) = copied else {
+            return Ok(false);
+        };
+        let mut deleted = 0;
+        if let Some(version) = version {
+            deleted += diesel::delete(
+                dsl::harvest_schedule_overrides
+                    .filter(dsl::kind.eq(KIND_DAG))
+                    .filter(dsl::name.eq(dag_name))
+                    .filter(dsl::updated_at.eq(version.to_diesel())),
+            )
+            .execute(from)
+            .await
+            .map_err(crate::error::database_error)?;
+        }
+        if let Some(floor) = floor {
+            deleted += drop_floor(from, KIND_DAG, dag_name, floor).await?;
+        }
+        Ok(deleted > 0)
+    }))
+    .await
+}
+
+/// Copy one override row to this shard when it is newer than all that this
+/// shard holds or retired. The caller holds the registration lock.
+async fn copy_newest(conn: &mut AsyncPgConnection, row: &OverrideRow) -> HarvestResult<()> {
+    use crate::schema::harvest_schedule_overrides::dsl;
+
+    let version = row.updated_at;
+    if read_floor(conn, &row.kind, &row.name)
+        .await?
+        .is_some_and(|floor| version <= floor)
+    {
+        return Ok(());
+    }
+    let held: Option<Timestamp> = dsl::harvest_schedule_overrides
+        .filter(dsl::kind.eq(&row.kind))
+        .filter(dsl::name.eq(&row.name))
+        .select(dsl::updated_at)
+        .first::<crate::time::sql::SqlTimestamp>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+        .map(crate::time::sql::SqlTimestamp::to_jiff);
+    match held {
+        Some(held) if held >= version => return Ok(()),
+        Some(held) => {
+            delete_override(conn, &row.kind, &row.name).await?;
+            raise_floor(conn, &row.kind, &row.name, Some(held)).await?;
+        }
+        None => {}
+    }
+    diesel::insert_into(dsl::harvest_schedule_overrides)
+        .values(row.clone())
         .execute(conn)
         .await
+        .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
+/// The longest wait of a carry transaction for one lock. It stays below the
+/// wait of a DR fence guard, so a move that meets a bump gives up first. A
+/// carry waits at four locks at most. A timeout stops its group, so the
+/// guards hold off a bump for one carry at most.
+const CARRY_LOCK_TIMEOUT_SQL: &str = "SET LOCAL lock_timeout = '1s'";
+
+/// Bound each lock wait of the carry transaction on `conn`.
+async fn bound_carry_lock_waits(conn: &mut AsyncPgConnection) -> HarvestResult<()> {
+    diesel::sql_query(CARRY_LOCK_TIMEOUT_SQL)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
+/// The version of a new override row (issue #2602).
+///
+/// It is the later of `now` and one microsecond above `floor`, in whole
+/// microseconds, as Postgres stores it. So a skewed clock never gives a
+/// version at or below the floor, and the new row stays near the wall clock.
+fn next_version(now: Timestamp, floor: Option<Timestamp>) -> Timestamp {
+    let whole_micros = jiff::TimestampRound::new()
+        .smallest(jiff::Unit::Microsecond)
+        .mode(jiff::RoundMode::Trunc);
+    let now = now.round(whole_micros).unwrap_or(now);
+    floor.map_or(now, |floor| {
+        now.max(floor + jiff::SignedDuration::from_micros(1))
+    })
+}
+
+/// The floor of one override on this shard: the newest version that this
+/// shard retired (issue #2602).
+async fn read_floor(
+    conn: &mut AsyncPgConnection,
+    kind: &str,
+    name: &str,
+) -> HarvestResult<Option<Timestamp>> {
+    use crate::schema::harvest_schedule_override_receipts::dsl;
+
+    dsl::harvest_schedule_override_receipts
+        .filter(dsl::kind.eq(kind))
+        .filter(dsl::name.eq(name))
+        .select(dsl::row_updated_at)
+        .first::<crate::time::sql::SqlTimestamp>(conn)
+        .await
+        .optional()
+        .map(|floor| floor.map(crate::time::sql::SqlTimestamp::to_jiff))
         .map_err(crate::error::database_error)
-    }))
-    .await?;
-    Ok(deleted > 0)
+}
+
+/// Raise the floor of one override on this shard to `retired`, and return
+/// the floor. A floor never falls. With no `retired` version, it returns the
+/// floor as it is.
+async fn raise_floor(
+    conn: &mut AsyncPgConnection,
+    kind: &str,
+    name: &str,
+    retired: Option<Timestamp>,
+) -> HarvestResult<Option<Timestamp>> {
+    use crate::schema::harvest_schedule_override_receipts::dsl;
+
+    let Some(retired) = retired else {
+        return read_floor(conn, kind, name).await;
+    };
+    diesel::insert_into(dsl::harvest_schedule_override_receipts)
+        .values((
+            dsl::kind.eq(kind),
+            dsl::name.eq(name),
+            dsl::row_updated_at.eq(retired.to_diesel()),
+            dsl::received_at.eq(diesel::dsl::now),
+        ))
+        .on_conflict((dsl::kind, dsl::name))
+        .do_update()
+        .set((
+            dsl::row_updated_at.eq(diesel::dsl::sql::<diesel::sql_types::Timestamptz>(
+                "GREATEST(harvest_schedule_override_receipts.row_updated_at, \
+                 excluded.row_updated_at)",
+            )),
+            dsl::received_at.eq(diesel::dsl::now),
+        ))
+        .returning(dsl::row_updated_at)
+        .get_result::<crate::time::sql::SqlTimestamp>(conn)
+        .await
+        .map(|floor| Some(floor.to_jiff()))
+        .map_err(crate::error::database_error)
+}
+
+/// Raise the floor of one override on this shard to `floor`, and delete a
+/// row at or below the new floor. The caller holds the registration lock.
+async fn apply_floor(
+    conn: &mut AsyncPgConnection,
+    kind: &str,
+    name: &str,
+    floor: Option<Timestamp>,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_schedule_overrides::dsl;
+
+    let Some(floor) = raise_floor(conn, kind, name, floor).await? else {
+        return Ok(());
+    };
+    diesel::delete(
+        dsl::harvest_schedule_overrides
+            .filter(dsl::kind.eq(kind))
+            .filter(dsl::name.eq(name))
+            .filter(dsl::updated_at.le(floor.to_diesel())),
+    )
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
+/// Delete the floor of one override on this shard when it still equals
+/// `floor`. Returns the deleted row count.
+async fn drop_floor(
+    conn: &mut AsyncPgConnection,
+    kind: &str,
+    name: &str,
+    floor: Timestamp,
+) -> HarvestResult<usize> {
+    use crate::schema::harvest_schedule_override_receipts::dsl;
+
+    diesel::delete(
+        dsl::harvest_schedule_override_receipts
+            .filter(dsl::kind.eq(kind))
+            .filter(dsl::name.eq(name))
+            .filter(dsl::row_updated_at.eq(floor.to_diesel())),
+    )
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)
+}
+
+/// The DAG names that hold a floor on this shard (issue #2602). The
+/// scheduler carries the floor of each DAG that this shard does not own.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] when the read fails.
+pub(crate) async fn dag_floor_names(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<String>> {
+    use crate::schema::harvest_schedule_override_receipts::dsl;
+
+    dsl::harvest_schedule_override_receipts
+        .filter(dsl::kind.eq(KIND_DAG))
+        .select(dsl::name)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)
 }
 
 /// Load the override of one code-declared workflow schedule, if any
-/// (issue #2386).
+/// (issue #2386). `codecs` decodes its stored input.
 ///
 /// # Errors
 ///
@@ -1167,8 +1521,9 @@ pub async fn carry_dag_override(
 pub async fn get_workflow_override(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
+    codecs: &PayloadCodecs,
 ) -> HarvestResult<Option<WorkflowScheduleOverride>> {
-    select_workflow_override(conn, workflow_name, false).await
+    select_workflow_override(conn, workflow_name, false, Some(codecs)).await
 }
 
 /// Lock and load the override of one workflow schedule, for a
@@ -1176,8 +1531,21 @@ pub async fn get_workflow_override(
 pub(crate) async fn lock_workflow_override(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
+    codecs: &PayloadCodecs,
 ) -> HarvestResult<Option<WorkflowScheduleOverride>> {
-    select_workflow_override(conn, workflow_name, true).await
+    select_workflow_override(conn, workflow_name, true, Some(codecs)).await
+}
+
+/// Lock and load the override of one workflow schedule, without its input.
+///
+/// A patch that sets a new input calls this. The merge replaces the stored
+/// input, so the call does not decode it. An input under a lost key then does
+/// not block the patch that replaces it.
+pub(crate) async fn lock_workflow_override_without_input(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+) -> HarvestResult<Option<WorkflowScheduleOverride>> {
+    select_workflow_override(conn, workflow_name, true, None).await
 }
 
 /// Lock the override row of one workflow schedule without decoding it.
@@ -1206,6 +1574,7 @@ async fn select_workflow_override(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
     for_update: bool,
+    codecs: Option<&PayloadCodecs>,
 ) -> HarvestResult<Option<WorkflowScheduleOverride>> {
     use crate::schema::harvest_schedule_overrides::dsl;
 
@@ -1220,17 +1589,27 @@ async fn select_workflow_override(
     }
     .optional()
     .map_err(crate::error::database_error)?;
-    row.map(OverrideRow::decode_workflow).transpose()
+    // With no codecs, the caller replaces the input, so the row decodes
+    // without it.
+    row.map(|row| match codecs {
+        Some(codecs) => row.decode_workflow(codecs),
+        None => row.decode_workflow_with(None),
+    })
+    .transpose()
 }
 
 /// Write the merged fields of one workflow override, or delete the row when
 /// the merge sets no field.
+///
+/// `codecs` encodes the input, as for `harvest_schedules.workflow_input`.
+/// With column encoding on, the stored input is ciphertext.
 pub(crate) async fn store_workflow_override(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
     fields: &WorkflowSchedulePatch,
     actor: &str,
     reason: Option<&str>,
+    codecs: &PayloadCodecs,
 ) -> HarvestResult<()> {
     if workflow_fields_are_empty(fields) {
         delete_override(conn, KIND_WORKFLOW, workflow_name).await?;
@@ -1238,14 +1617,17 @@ pub(crate) async fn store_workflow_override(
     }
     let workflow_fields = serde_json::to_value(WorkflowFieldsJson::from_fields(fields))
         .map_err(|error| HarvestError::Config(format!("workflow override fields: {error}")))?;
+    let workflow_input = codecs.encode_column_opt(fields.input.as_ref())?;
     let common = common_fields(fields);
     let row = StoredOverride {
         kind: KIND_WORKFLOW,
         name: workflow_name,
         fields: &common,
         workflow_fields,
+        workflow_input,
         actor,
         reason,
+        updated_at: Timestamp::now(),
     };
     upsert_override(conn, &row).await
 }
@@ -1271,6 +1653,21 @@ pub async fn effective_dag_from_db(
 mod tests {
     use super::*;
     use crate::dag::DagBuilder;
+
+    /// `chrono` wrote `end_at`. A stored sentinel past the jiff range clamps.
+    #[test]
+    fn workflow_fields_read_a_chrono_end_at_sentinel() {
+        let stored: WorkflowFieldsJson =
+            serde_json::from_value(serde_json::json!({"end_at": "9999-12-31T23:59:59Z"}))
+                .expect("a chrono sentinel loads");
+        assert_eq!(stored.end_at, Some(Some(Timestamp::MAX)));
+        let cleared: WorkflowFieldsJson =
+            serde_json::from_value(serde_json::json!({"end_at": null})).expect("null loads");
+        assert_eq!(cleared.end_at, Some(None));
+        let absent: WorkflowFieldsJson =
+            serde_json::from_value(serde_json::json!({})).expect("an absent key loads");
+        assert_eq!(absent.end_at, None);
+    }
 
     fn dag(name: &str, schedule: Option<Schedule>) -> RegisteredDag {
         RegisteredDag {
@@ -1307,8 +1704,8 @@ mod tests {
             fields,
             reason: None,
             updated_by: "ops".to_string(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
         }
     }
 
@@ -1496,8 +1893,8 @@ mod tests {
             fields,
             reason: None,
             updated_by: "ops".to_string(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
         }
     }
 
@@ -1544,10 +1941,11 @@ mod tests {
     }
 
     #[test]
-    fn workflow_merge_keeps_stored_fields_and_drops_input() {
+    fn workflow_merge_keeps_stored_fields_and_carries_the_input() {
         let stored = WorkflowSchedulePatch {
             schedule: Some(minutely()),
             calendar: Some(Some("holidays".to_string())),
+            input: Some(serde_json::json!({"env": "A"})),
             ..WorkflowSchedulePatch::default()
         };
         let patch = WorkflowSchedulePatch {
@@ -1560,9 +1958,55 @@ mod tests {
         assert_eq!(merged.schedule, Some(minutely()));
         assert_eq!(merged.calendar, Some(None));
         assert_eq!(merged.max_runs, Some(Some(5)));
-        assert!(merged.input.is_none());
+        assert_eq!(merged.input, Some(serde_json::json!({"env": "B"})));
         assert!(workflow_fields_are_empty(&WorkflowSchedulePatch::default()));
         assert!(!workflow_fields_are_empty(&merged));
+
+        // A patch that sets no input keeps the stored input.
+        let kept = merge_workflow_fields(&WorkflowSchedulePatch::default(), &stored);
+        assert_eq!(kept.input, Some(serde_json::json!({"env": "A"})));
+
+        // An input alone is an override.
+        let input_only = WorkflowSchedulePatch {
+            input: Some(serde_json::json!({"env": "B"})),
+            ..WorkflowSchedulePatch::default()
+        };
+        assert!(!workflow_fields_are_empty(&input_only));
+    }
+
+    #[test]
+    fn an_input_override_replaces_the_code_input_only() {
+        let mut code = WorkflowSchedule::new("nightly", hourly());
+        code.input = serde_json::json!({"env": "A"});
+        code.max_active_runs = 2;
+        let fields = WorkflowSchedulePatch {
+            input: Some(serde_json::json!({"env": "B"})),
+            ..WorkflowSchedulePatch::default()
+        };
+        let effective = effective_workflow_schedule(&code, &fields);
+        assert_eq!(effective.input, serde_json::json!({"env": "B"}));
+        assert_eq!(effective.schedule, code.schedule);
+        assert_eq!(effective.max_active_runs, 2);
+        let unset = effective_workflow_schedule(&code, &WorkflowSchedulePatch::default());
+        assert_eq!(unset.input, code.input, "no override keeps the code input");
+    }
+
+    #[test]
+    fn the_tick_applies_an_input_override_to_its_schedule() {
+        let catalog = DagCatalog::new();
+        let mut code = WorkflowSchedule::new("nightly", hourly());
+        code.input = serde_json::json!({"env": "A"});
+        let schedules = vec![code, WorkflowSchedule::new("hourly", hourly())];
+        let overrides = ScheduleOverrides::none().with_workflow_overrides([workflow_override(
+            "nightly",
+            WorkflowSchedulePatch {
+                input: Some(serde_json::json!({"env": "B"})),
+                ..WorkflowSchedulePatch::default()
+            },
+        )]);
+        let effective = overrides.apply_to_workflow_schedules(&schedules, &catalog);
+        assert_eq!(effective[0].input, serde_json::json!({"env": "B"}));
+        assert_eq!(effective[1].input, serde_json::Value::Null);
     }
 
     #[test]
@@ -1577,13 +2021,41 @@ mod tests {
     }
 
     #[test]
-    fn workflow_validation_rejects_an_input_and_a_bad_cadence() {
+    fn an_unreadable_input_leaves_out_its_own_schedule_only() {
+        let mut catalog = DagCatalog::new();
+        catalog.insert("nightly".to_string(), dag("nightly", Some(hourly())));
+        let schedules = vec![
+            WorkflowSchedule::new("nightly", hourly()),
+            WorkflowSchedule::new("hourly", hourly()),
+            lowered(&catalog["nightly"]),
+        ];
+        let overrides = ScheduleOverrides::none().with_unreadable_inputs(["nightly".to_string()]);
+        assert!(!overrides.is_empty());
+        assert_eq!(
+            overrides.unreadable_inputs().collect::<Vec<_>>(),
+            ["nightly"]
+        );
+        let effective = overrides.apply_to_workflow_schedules(&schedules, &catalog);
+        let names: Vec<(&str, bool)> = effective
+            .iter()
+            .map(|ws| (ws.workflow_name.as_str(), ws.dag_name.is_some()))
+            .collect();
+        assert_eq!(
+            names,
+            [("hourly", false), ("nightly", true)],
+            "a DAG of the same name keeps its lowered schedule"
+        );
+    }
+
+    #[test]
+    fn workflow_validation_accepts_an_input_and_rejects_a_bad_cadence() {
         let code = WorkflowSchedule::new("nightly", hourly());
         let with_input = WorkflowSchedulePatch {
-            input: Some(serde_json::Value::Null),
+            input: Some(serde_json::json!({"env": "B"})),
             ..WorkflowSchedulePatch::default()
         };
-        assert!(validate_effective_workflow(&code, &with_input).is_err());
+        let effective = validate_effective_workflow(&code, &with_input).expect("an input is valid");
+        assert_eq!(effective.input, serde_json::json!({"env": "B"}));
         let zero = WorkflowSchedulePatch {
             schedule: Some(Schedule::Interval(Duration::ZERO)),
             ..WorkflowSchedulePatch::default()
@@ -1596,7 +2068,7 @@ mod tests {
     fn workflow_fields_json_keeps_absent_and_null_apart() {
         let fields = WorkflowSchedulePatch {
             calendar: Some(None),
-            end_at: Some(Some(Utc::now())),
+            end_at: Some(Some(Timestamp::now())),
             skip_policy: Some(SkipPolicy::RunNextBusinessDay),
             catchup_policy: Some(Some(CatchupPolicy::Window(Duration::from_secs(600)))),
             retry_policy: Some(None),
@@ -1611,7 +2083,7 @@ mod tests {
             "an absent field is not stored"
         );
         let back: WorkflowFieldsJson = serde_json::from_value(stored).expect("deserialize");
-        let back = back.into_fields(ScheduleOverrideFields::default());
+        let back = back.into_fields(ScheduleOverrideFields::default(), None);
         assert_eq!(back.calendar, Some(None));
         assert_eq!(back.max_runs, None);
         assert_eq!(back.end_at, fields.end_at);
@@ -1640,5 +2112,34 @@ mod tests {
             assert_eq!(schedule_from_storage(&stored), Some(schedule), "{stored}");
         }
         assert_eq!(schedule_from_storage("bogus"), None);
+    }
+
+    fn at(micros: i64, nanos: u32) -> Timestamp {
+        Timestamp::from_microsecond(micros).expect("a valid time")
+            + jiff::SignedDuration::from_nanos(i64::from(nanos))
+    }
+
+    /// Issue #2602: with no floor, a version is the clock in whole
+    /// microseconds.
+    #[test]
+    fn a_version_with_no_floor_is_the_clock_in_microseconds() {
+        assert_eq!(next_version(at(1_000, 999), None), at(1_000, 0));
+    }
+
+    /// Issue #2602: a clock above the floor gives the clock.
+    #[test]
+    fn a_version_follows_a_clock_above_the_floor() {
+        assert_eq!(next_version(at(1_000, 0), Some(at(10, 0))), at(1_000, 0));
+    }
+
+    /// Issue #2602: a clock at or below the floor gives one microsecond above
+    /// the floor.
+    #[test]
+    fn a_version_lies_above_a_floor_that_the_clock_does_not_pass() {
+        let floor = at(1_000, 0);
+        let above = at(1_001, 0);
+        assert_eq!(next_version(at(10, 0), Some(floor)), above);
+        assert_eq!(next_version(floor, Some(floor)), above);
+        assert_eq!(next_version(at(1_000, 500), Some(floor)), above);
     }
 }

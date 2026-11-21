@@ -1,33 +1,35 @@
 //! Management read model for the per-tenant/per-workflow usage report (issue #596).
 //!
 //! The *historical* companion to the *point-in-time* `GET /admin/concurrency`
-//! endpoint (issue #247): `GET /admin/usage` answers "how much did tenant X
-//! actually consume between two dates?" by aggregating already-durable data
+//! endpoint (issue #247). `GET /admin/usage` answers "how much did tenant X
+//! actually consume between two dates?" It aggregates already-durable data
 //! (`harvest_workflow_executions` + `harvest_events`) over a caller-supplied
-//! `[from, to]` window, grouped by `workflow_name` (default) or by a
-//! `search_attrs` key (e.g. `search_attr:tenant_id`), fanned out across every
-//! shard with [`autumn_harvest::usage::load_usage_grouped`] and merged here.
+//! `[from, to]` window. Rows group by `workflow_name` (default) or by a
+//! `search_attrs` key (e.g. `search_attr:tenant_id`). The query fans out
+//! across every shard with [`autumn_harvest::usage::load_usage_grouped`], and
+//! this module merges the results.
 //!
 //! ## Partial answers
 //!
-//! Every shard the router knows about (`readable_shards`/`default_shard`),
-//! not just the ones with a live connection pool right now, is included in
-//! the fan-out via [`shard_fanout::expected_shards`]. When a shard is
-//! unreachable it is named in `unavailable_shards` (never silently dropped)
-//! and `status` becomes `partial` or `unavailable` — the call never fails
+//! The fan-out includes every shard the router knows about
+//! (`readable_shards`/`default_shard`) via [`shard_fanout::expected_shards`].
+//! That includes shards with no live connection pool right now. An
+//! unreachable shard is named in `unavailable_shards`, never silently dropped.
+//! `status` then becomes `partial` or `unavailable`. The call never fails
 //! wholesale.
 //!
 //! ## Bounded window
 //!
-//! `from`/`to` windows wider than a configurable ceiling (default 90 days,
-//! see [`autumn_harvest::usage::default_usage_window_ceiling`]) are rejected
-//! with a `400`-mappable error naming the ceiling, so an operator cannot
-//! accidentally trigger a full-table scan across every shard.
+//! A `from`/`to` window wider than a configurable ceiling is rejected. The
+//! default is 90 days (see
+//! [`autumn_harvest::usage::default_usage_window_ceiling`]). The
+//! `400`-mappable error names the ceiling. So an operator cannot accidentally
+//! trigger a full-table scan across every shard.
 //!
 //! ## No bounded-cardinality rollup
 //!
 //! Unlike `GET /workflows/count` (issue #544), this report does **not** roll
-//! a long tail into an `other` group: a chargeback report that silently
+//! a long tail into an `other` group. A chargeback report that silently
 //! drops low-volume tenants would be actively wrong. Operators choosing
 //! `search_attr:<key>` are responsible for using a bounded-cardinality key
 //! (a tenant id, not e.g. an execution id).
@@ -36,8 +38,8 @@ use std::collections::BTreeMap;
 
 use autumn_harvest::usage::{UsageGroupBy, UsageQuery, UsageShardRow};
 use autumn_harvest::worker::DbPool;
-use chrono::{DateTime, Utc};
 use futures::future::join_all;
+use jiff::Timestamp;
 use serde::Serialize;
 
 use crate::api::HarvestApiState;
@@ -45,9 +47,9 @@ use crate::shard_fanout::{self, FanoutStatus, ShardObservation};
 
 /// Cross-shard completeness of a usage report.
 ///
-/// A type alias onto the shared [`FanoutStatus`] (rather than its own enum)
-/// so the complete/partial/unavailable derivation rule lives in exactly one
-/// place, alongside `workflow_count`'s and `workflow_reachability`'s reports.
+/// A type alias onto the shared [`FanoutStatus`], not its own enum. So the
+/// complete/partial/unavailable rule lives in one place, shared with the
+/// `workflow_count` and `workflow_reachability` reports.
 pub type UsageReportStatus = FanoutStatus;
 
 /// One merged usage record: the fields of issue #596's AC, plus the agent
@@ -56,8 +58,10 @@ pub type UsageReportStatus = FanoutStatus;
 pub struct UsageGroupRecord {
     pub group: String,
     /// Count of `harvest_workflow_executions` rows whose `started_at` falls
-    /// in the window — including continue-as-new and auto-retry (issue
-    /// #523) successor rows, each counted as a separate, billable start.
+    /// in the window.
+    ///
+    /// Continue-as-new and auto-retry (issue #523) successor rows count too,
+    /// each as a separate, billable start.
     /// See `autumn_harvest::usage`'s module doc for full metric semantics.
     pub workflow_starts: i64,
     pub completed: i64,
@@ -87,9 +91,9 @@ pub struct UsageResponse {
     /// Cross-shard completeness of this report.
     pub status: UsageReportStatus,
     /// Inclusive lower bound of the aggregation window, as requested.
-    pub from: DateTime<Utc>,
+    pub from: Timestamp,
     /// Inclusive upper bound of the aggregation window, as requested.
-    pub to: DateTime<Utc>,
+    pub to: Timestamp,
     /// The grouping dimension actually used (wire form).
     pub group_by: String,
     /// Records, sorted by `group` ascending.
@@ -125,10 +129,11 @@ impl std::fmt::Display for UsageGroupCapExceeded {
 impl std::error::Error for UsageGroupCapExceeded {}
 
 /// Format a ceiling `Duration` for the window-exceeded error message
-/// (issue #596). Expresses `d` in the largest whole unit that evenly
-/// divides it — days, else hours, else seconds — so a 30-hour ceiling
-/// reports "30-hour" instead of being truncated to "1-day". Not a
-/// general-purpose duration formatter; kept local to this one use case.
+/// (issue #596).
+///
+/// Uses the largest whole unit that evenly divides `d`: days, else hours,
+/// else seconds. So a 30-hour ceiling reports "30-hour", not a truncated
+/// "1-day". Not a general-purpose duration formatter.
 fn format_ceiling(d: std::time::Duration) -> String {
     let secs = d.as_secs();
     if secs != 0 && secs.is_multiple_of(24 * 60 * 60) {
@@ -144,8 +149,8 @@ fn format_ceiling(d: std::time::Duration) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageParams {
     pub group_by: UsageGroupBy,
-    pub from: DateTime<Utc>,
-    pub to: DateTime<Utc>,
+    pub from: Timestamp,
+    pub to: Timestamp,
 }
 
 impl UsageParams {
@@ -157,17 +162,18 @@ impl UsageParams {
     ///
     /// # Errors
     ///
-    /// Returns a human-readable error message when `from`/`to` is missing or
-    /// malformed, `from` is after `to`, the window exceeds `ceiling` (the
-    /// message names the ceiling), or `group_by` is not a recognized
-    /// dimension.
+    /// Returns a human-readable error message when:
+    /// - `from`/`to` is missing or malformed;
+    /// - `from` is after `to`;
+    /// - the window exceeds `ceiling` (the message names the ceiling);
+    /// - `group_by` is not a recognized dimension.
     pub fn from_query_pairs(
         pairs: &[(String, String)],
-        now: DateTime<Utc>,
+        now: Timestamp,
         ceiling: std::time::Duration,
     ) -> Result<Self, String> {
-        let mut from: Option<DateTime<Utc>> = None;
-        let mut to: Option<DateTime<Utc>> = None;
+        let mut from: Option<Timestamp> = None;
+        let mut to: Option<Timestamp> = None;
         let mut group_by = UsageGroupBy::WorkflowName;
 
         for (key, value) in pairs {
@@ -189,9 +195,10 @@ impl UsageParams {
             ));
         }
 
-        let window = to.signed_duration_since(from);
-        let ceiling_chrono = chrono::Duration::from_std(ceiling).unwrap_or(chrono::Duration::MAX);
-        if window > ceiling_chrono {
+        let window = to.duration_since(from);
+        let ceiling_signed = autumn_harvest::time::from_std_bounded(ceiling)
+            .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION);
+        if window > ceiling_signed {
             let ceiling_label = format_ceiling(ceiling);
             return Err(format!(
                 "invalid window: 'to' - 'from' exceeds the {ceiling_label} usage window \
@@ -215,8 +222,8 @@ impl UsageParams {
 /// `max_groups`, checked after the cross-shard merge but before the
 /// response is constructed (no extra DB round-trip).
 pub fn build_usage_response(
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
+    from: Timestamp,
+    to: Timestamp,
     group_by: &UsageGroupBy,
     observations: Vec<ShardObservation<UsageShardRow>>,
     max_groups: usize,
@@ -289,15 +296,15 @@ pub fn build_usage_response(
 
 /// Query one shard for its grouped usage rows (issue #596).
 ///
-/// Returns a [`ShardObservation`] rather than propagating errors so a single
-/// unreachable shard never fails the whole fan-out — the caller folds it into
-/// `unavailable_shards` and a `partial`/`unavailable` status instead.
+/// Returns a [`ShardObservation`], not an error. So one unreachable shard
+/// never fails the whole fan-out. The caller folds it into
+/// `unavailable_shards` and a `partial`/`unavailable` status.
 ///
-/// `row_limit` bounds the shard query's `LIMIT` (issue #596 PR review: the
-/// group cap must bound the DB round-trip and memory, not just the response
-/// — passing this straight through to
-/// [`autumn_harvest::usage::load_usage_grouped`] instead of letting it fetch
-/// every row before `build_usage_response` checks the merged count).
+/// `row_limit` bounds the `LIMIT` of the shard query (issue #596). The group
+/// cap must bound the DB round-trip and memory, not just the response. So
+/// it passes straight through to [`autumn_harvest::usage::load_usage_grouped`].
+/// The shard never fetches every row before `build_usage_response` checks
+/// the merged count.
 async fn observe_shard(
     shard_id: i32,
     pool: Option<DbPool>,
@@ -316,11 +323,10 @@ async fn observe_shard(
 
 /// Build the usage report for `GET /admin/usage` (issue #596).
 ///
-/// Fans the query out across [`shard_fanout::expected_shards`] — every shard
-/// with a live pool *and* every shard the router already knows about — so a
-/// shard mid a shard-add rollout is reported `unavailable` rather than
-/// silently skipped, then queries all of them concurrently (`join_all`)
-/// rather than one at a time.
+/// Fans the query out across [`shard_fanout::expected_shards`]: every shard
+/// with a live pool *and* every shard the router already knows about. So a
+/// shard in the middle of a shard-add rollout is reported `unavailable`, not
+/// silently skipped. All shards are queried concurrently (`join_all`).
 ///
 /// Never fails outright for a partial/unreachable shard: that surfaces as
 /// `status: unavailable`/`partial` in the response. Does fail loudly (see
@@ -338,11 +344,11 @@ pub async fn build_usage_report(
     let pools = shard_fanout::pools_by_shard(api_state);
     let expected = shard_fanout::expected_shards(api_state, &pools);
     let max_groups = api_state.usage_max_groups();
-    // Bound each shard's own result set at the cap, not just the merged
-    // response: a `+1` (not the cap itself) so a shard sitting exactly at
-    // the cap still cleanly merges under it, while any shard that would
-    // exceed the cap on its own is truncated rather than materializing an
-    // unbounded row set (issue #596 PR review).
+    // Bound the result set of each shard at the cap, not just the merged
+    // response (issue #596). The bound is `+1`, not the cap itself. A shard
+    // exactly at the cap still merges cleanly under it. A shard that would
+    // exceed the cap on its own is truncated, and never materializes an
+    // unbounded row set.
     let row_limit = i64::try_from(max_groups.saturating_add(1)).unwrap_or(i64::MAX);
 
     let query = UsageQuery {
@@ -372,10 +378,10 @@ pub async fn build_usage_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone as _;
+    use jiff::Timestamp;
 
-    fn at(seconds: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(seconds, 0).unwrap()
+    fn at(seconds: i64) -> Timestamp {
+        Timestamp::new(seconds, 0).unwrap()
     }
 
     fn row(group: &str, starts: i64, completed: i64, failed: i64) -> UsageShardRow {
@@ -437,8 +443,6 @@ mod tests {
 
     const CEILING: std::time::Duration = std::time::Duration::from_hours(2160);
     const TEST_MAX_GROUPS: usize = 1000;
-
-    // ── UsageParams::from_query_pairs ──────────────────────────────────────
 
     #[test]
     fn params_requires_from() {
@@ -503,12 +507,13 @@ mod tests {
 
     #[test]
     fn params_accepts_window_exactly_at_ceiling() {
-        let from = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let to = from + chrono::Duration::from_std(CEILING).unwrap();
+        let from = "2026-01-01T00:00:00Z".parse::<Timestamp>().unwrap();
+        let to = from + jiff::SignedDuration::try_from(CEILING).unwrap();
         let params = UsageParams::from_query_pairs(
-            &pairs(&[("from", &from.to_rfc3339()), ("to", &to.to_rfc3339())]),
+            &pairs(&[
+                ("from", &autumn_harvest::time::rfc3339(from)),
+                ("to", &autumn_harvest::time::rfc3339(to)),
+            ]),
             at(0),
             CEILING,
         )
@@ -566,14 +571,12 @@ mod tests {
 
     #[test]
     fn params_accepts_relative_duration_since_now() {
-        let now = DateTime::parse_from_rfc3339("2026-02-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let now = "2026-02-01T00:00:00Z".parse::<Timestamp>().unwrap();
         let params =
             UsageParams::from_query_pairs(&pairs(&[("from", "24h"), ("to", "1h")]), now, CEILING)
                 .unwrap();
-        assert_eq!(params.to, now - chrono::Duration::hours(1));
-        assert_eq!(params.from, now - chrono::Duration::hours(24));
+        assert_eq!(params.to, now - jiff::SignedDuration::from_hours(1));
+        assert_eq!(params.from, now - jiff::SignedDuration::from_hours(24));
     }
 
     #[test]
@@ -633,8 +636,6 @@ mod tests {
         );
         assert!(!err.contains("1-day"), "must not mis-round to 1-day: {err}");
     }
-
-    // ── build_usage_response ───────────────────────────────────────────────
 
     #[test]
     fn sums_counts_across_shards() {

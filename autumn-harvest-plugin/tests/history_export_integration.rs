@@ -1,3 +1,5 @@
+use autumn_harvest::time::sql::ToPgInterval;
+use jiff_diesel::ToDiesel;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -20,10 +22,10 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{Duration, SecondsFormat, Utc};
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -236,14 +238,15 @@ async fn insert_execution(
     let completed_at = if state == "RUNNING" {
         None
     } else {
-        Some(Utc::now())
+        Some(Timestamp::now())
     };
     diesel::update(
         autumn_harvest::schema::harvest_workflow_executions::table.find(exec_id.as_uuid()),
     )
     .set((
         autumn_harvest::schema::harvest_workflow_executions::state.eq(state),
-        autumn_harvest::schema::harvest_workflow_executions::completed_at.eq(completed_at),
+        autumn_harvest::schema::harvest_workflow_executions::completed_at
+            .eq(completed_at.to_diesel()),
     ))
     .execute(&mut conn)
     .await
@@ -258,8 +261,8 @@ async fn insert_execution(
 async fn set_execution_and_event_times(
     database_url: &str,
     exec_id: ExecutionId,
-    row_time: chrono::DateTime<Utc>,
-    event_time: chrono::DateTime<Utc>,
+    row_time: jiff::Timestamp,
+    event_time: jiff::Timestamp,
 ) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
@@ -268,9 +271,10 @@ async fn set_execution_and_event_times(
         autumn_harvest::schema::harvest_workflow_executions::table.find(exec_id.as_uuid()),
     )
     .set((
-        autumn_harvest::schema::harvest_workflow_executions::started_at.eq(row_time),
-        autumn_harvest::schema::harvest_workflow_executions::created_at.eq(row_time),
-        autumn_harvest::schema::harvest_workflow_executions::completed_at.eq(Some(row_time)),
+        autumn_harvest::schema::harvest_workflow_executions::started_at.eq(row_time.to_diesel()),
+        autumn_harvest::schema::harvest_workflow_executions::created_at.eq(row_time.to_diesel()),
+        autumn_harvest::schema::harvest_workflow_executions::completed_at
+            .eq(Some(row_time).to_diesel()),
     ))
     .execute(&mut conn)
     .await
@@ -282,7 +286,7 @@ async fn set_execution_and_event_times(
                 autumn_harvest::schema::harvest_events::workflow_exec_id.eq(exec_id.as_uuid()),
             ),
         )
-        .set(autumn_harvest::schema::harvest_events::timestamp.eq(event_time))
+        .set(autumn_harvest::schema::harvest_events::timestamp.eq(event_time.to_diesel()))
         .execute(c)
         .await
     })
@@ -293,8 +297,8 @@ async fn set_execution_and_event_times(
 async fn set_running_execution_and_event_times(
     database_url: &str,
     exec_id: ExecutionId,
-    row_time: chrono::DateTime<Utc>,
-    event_time: chrono::DateTime<Utc>,
+    row_time: jiff::Timestamp,
+    event_time: jiff::Timestamp,
 ) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
@@ -304,10 +308,10 @@ async fn set_running_execution_and_event_times(
     )
     .set((
         autumn_harvest::schema::harvest_workflow_executions::state.eq("RUNNING"),
-        autumn_harvest::schema::harvest_workflow_executions::started_at.eq(row_time),
-        autumn_harvest::schema::harvest_workflow_executions::created_at.eq(row_time),
+        autumn_harvest::schema::harvest_workflow_executions::started_at.eq(row_time.to_diesel()),
+        autumn_harvest::schema::harvest_workflow_executions::created_at.eq(row_time.to_diesel()),
         autumn_harvest::schema::harvest_workflow_executions::completed_at
-            .eq(None::<chrono::DateTime<Utc>>),
+            .eq(None::<jiff_diesel::Timestamp>),
     ))
     .execute(&mut conn)
     .await
@@ -319,7 +323,7 @@ async fn set_running_execution_and_event_times(
                 autumn_harvest::schema::harvest_events::workflow_exec_id.eq(exec_id.as_uuid()),
             ),
         )
-        .set(autumn_harvest::schema::harvest_events::timestamp.eq(event_time))
+        .set(autumn_harvest::schema::harvest_events::timestamp.eq(event_time.to_diesel()))
         .execute(c)
         .await
     })
@@ -342,7 +346,7 @@ async fn single_full_history_export_returns_replay_fixture_shape() {
         vec![
             WorkflowEvent::WorkflowStarted {
                 input: json!({ "customer": "acme" }),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,
@@ -421,7 +425,7 @@ async fn batch_redacted_history_export_filters_and_reports_shard_coverage() {
         "COMPLETED",
         vec![WorkflowEvent::WorkflowStarted {
             input: json!({ "authorization": "Bearer do-not-export" }),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -436,7 +440,7 @@ async fn batch_redacted_history_export_filters_and_reports_shard_coverage() {
         "COMPLETED",
         vec![WorkflowEvent::WorkflowStarted {
             input: json!({ "not": "selected" }),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -478,7 +482,7 @@ async fn batch_limit_is_applied_after_global_history_timestamp_ordering() {
     else {
         return;
     };
-    let base = Utc::now() - Duration::days(7);
+    let base = Timestamp::now() - autumn_harvest::time::days(7);
     let older_shard0 = insert_execution(
         &shard0_url,
         ShardId::new(0),
@@ -487,7 +491,7 @@ async fn batch_limit_is_applied_after_global_history_timestamp_ordering() {
         "COMPLETED",
         vec![WorkflowEvent::WorkflowStarted {
             input: json!({ "case": "older-shard0" }),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -502,7 +506,7 @@ async fn batch_limit_is_applied_after_global_history_timestamp_ordering() {
         "COMPLETED",
         vec![WorkflowEvent::WorkflowStarted {
             input: json!({ "case": "newer-shard0" }),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -517,7 +521,7 @@ async fn batch_limit_is_applied_after_global_history_timestamp_ordering() {
         "COMPLETED",
         vec![WorkflowEvent::WorkflowStarted {
             input: json!({ "case": "newest-shard1" }),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -525,13 +529,18 @@ async fn batch_limit_is_applied_after_global_history_timestamp_ordering() {
     )
     .await;
     set_execution_and_event_times(&shard0_url, older_shard0, base, base).await;
-    set_execution_and_event_times(&shard0_url, newer_shard0, base, base + Duration::minutes(1))
-        .await;
+    set_execution_and_event_times(
+        &shard0_url,
+        newer_shard0,
+        base,
+        base + SignedDuration::from_mins(1),
+    )
+    .await;
     set_execution_and_event_times(
         &shard1_url,
         newest_shard1,
         base,
-        base + Duration::minutes(2),
+        base + SignedDuration::from_mins(2),
     )
     .await;
 
@@ -566,27 +575,25 @@ async fn batch_limit_is_applied_after_global_history_timestamp_ordering() {
 
 #[tokio::test]
 async fn batch_export_carries_deadline_metadata_for_replay() {
-    // Issue #772 (Codex Finding B): a batch history export of a deadline-aware
-    // workflow must carry `execution_timeout`/`deadline_at` at the top level so
-    // the exported JSON round-trips the continue-as-new deadline budget into the
-    // `replay_from_json` / `harvest-replay` path — exactly as the single-execution
-    // export already does. Before the fix, the batch candidate query did not
-    // SELECT those columns, so every batch export serialized them as `None`;
-    // replaying such a fixture disabled the deadline branch, left the recorded
-    // `SideEffectRecorded{Now}` deadline probe unconsumed, and false-reported
+    // Issue #772: a batch history export of a deadline-aware workflow must carry
+    // `execution_timeout`/`deadline_at` at the top level, like the
+    // single-execution export. The exported JSON then carries the
+    // continue-as-new deadline budget into `replay_from_json` / `harvest-replay`.
+    // The batch candidate query once omitted those columns, so they exported
+    // as `None`. A replay then disabled the deadline branch and left the
+    // `SideEffectRecorded{Now}` probe unconsumed. It reported false
     // non-determinism.
     let Some((database_url, _container)) = setup_database_url_with_migrations().await else {
         return;
     };
 
-    // A deadline-aware history whose recorded activity PINS the
-    // `should_continue_as_new()` decision: `checkpoint_now` was scheduled because
-    // the deadline branch tripped (27s of a 30s budget consumed => 0.9 >= 0.8).
-    // On replay WITHOUT the threaded deadline, the branch would instead schedule
-    // `keep_working` and diverge — so a clean replay proves the deadline metadata
-    // was carried, not merely that the export shape parsed.
-    let t0 = chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
-    let recorded_now = t0 + Duration::seconds(27);
+    // The recorded activity PINS the `should_continue_as_new()` decision.
+    // `checkpoint_now` was scheduled because the deadline branch tripped
+    // (27s of a 30s budget => 0.9 >= 0.8). A replay WITHOUT the deadline would
+    // schedule `keep_working` and diverge. So a clean replay proves the export
+    // carried the deadline metadata.
+    let t0 = jiff::Timestamp::from_millisecond(1_700_000_000_000).unwrap();
+    let recorded_now = t0 + SignedDuration::from_secs(27);
     let activity_id = ActivityExecId::new();
     let events = vec![
         WorkflowEvent::WorkflowStarted {
@@ -599,7 +606,7 @@ async fn batch_export_carries_deadline_metadata_for_replay() {
         WorkflowEvent::SideEffectRecorded {
             kind: autumn_harvest::SideEffectKind::Now,
             name: Some(autumn_harvest::DEADLINE_PROBE_SIDE_EFFECT_NAME.to_string()),
-            value: json!(recorded_now.timestamp_millis()),
+            value: json!(recorded_now.as_millisecond()),
         },
         WorkflowEvent::ActivityScheduled {
             activity_id,
@@ -626,8 +633,8 @@ async fn batch_export_carries_deadline_metadata_for_replay() {
     set_execution_deadline(
         &database_url,
         exec_id,
-        Duration::seconds(30),
-        t0 + Duration::seconds(30),
+        SignedDuration::from_secs(30),
+        t0 + SignedDuration::from_secs(30),
     )
     .await;
 
@@ -668,10 +675,10 @@ async fn batch_export_carries_deadline_metadata_for_replay() {
     );
 }
 
-/// Deadline-aware decision probe (issue #772): the `should_continue_as_new()`
-/// outcome selects which activity is scheduled, so a *wrong* decision (a
-/// disabled deadline branch) schedules the other activity and diverges on
-/// replay — making the batch-export deadline round-trip falsifiable.
+/// Deadline-aware decision probe (issue #772). The `should_continue_as_new()`
+/// outcome selects the scheduled activity. A *wrong* decision schedules the
+/// other activity and diverges on replay. That makes the batch-export deadline
+/// round-trip falsifiable.
 fn deadline_branch_probe_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -694,8 +701,8 @@ fn deadline_branch_probe_workflow<'a>(
 async fn set_execution_deadline(
     database_url: &str,
     exec_id: ExecutionId,
-    execution_timeout: Duration,
-    deadline_at: chrono::DateTime<Utc>,
+    execution_timeout: SignedDuration,
+    deadline_at: jiff::Timestamp,
 ) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
         .await
@@ -705,8 +712,9 @@ async fn set_execution_deadline(
     )
     .set((
         autumn_harvest::schema::harvest_workflow_executions::execution_timeout
-            .eq(Some(execution_timeout)),
-        autumn_harvest::schema::harvest_workflow_executions::deadline_at.eq(Some(deadline_at)),
+            .eq(Some(execution_timeout).to_pg_interval()),
+        autumn_harvest::schema::harvest_workflow_executions::deadline_at
+            .eq(Some(deadline_at).to_diesel()),
     ))
     .execute(&mut conn)
     .await
@@ -718,8 +726,8 @@ async fn batch_updated_window_uses_latest_history_event_timestamp() {
     let Some((database_url, _container)) = setup_database_url_with_migrations().await else {
         return;
     };
-    let old_row_time = Utc::now() - Duration::days(30);
-    let recent_event_time = Utc::now();
+    let old_row_time = Timestamp::now() - autumn_harvest::time::days(30);
+    let recent_event_time = Timestamp::now();
     let exec_id = insert_execution(
         &database_url,
         ShardId::new(0),
@@ -728,7 +736,7 @@ async fn batch_updated_window_uses_latest_history_event_timestamp() {
         "RUNNING",
         vec![WorkflowEvent::WorkflowStarted {
             input: json!({ "case": "recent-event-old-row" }),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -742,8 +750,11 @@ async fn batch_updated_window_uses_latest_history_event_timestamp() {
         HarvestDbPool::from(build_test_pool(&database_url)),
         ShardRouter::single(),
     );
-    let updated_after =
-        (recent_event_time - Duration::hours(1)).to_rfc3339_opts(SecondsFormat::Millis, true);
+    let updated_after = autumn_harvest::time::rfc3339_opts(
+        recent_event_time - SignedDuration::from_hours(1),
+        autumn_harvest::time::SecondsFormat::Millis,
+        true,
+    );
     let (status, json) = get_json(
         &app,
         format!(

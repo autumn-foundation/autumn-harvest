@@ -43,7 +43,6 @@ fn cfg_test_lines(text: &str) -> Vec<bool> {
     let mut i = 0;
     while i < lines.len() {
         if lines[i].trim_start().starts_with("#[cfg(test)]") {
-            // Find the `{` that opens the module/block and brace-match to its close.
             let mut depth = 0_i32;
             let mut started = false;
             let mut j = i;

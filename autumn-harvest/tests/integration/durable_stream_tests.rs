@@ -15,9 +15,9 @@ use autumn_harvest::queue::{self, EnqueueParams, TaskType};
 use autumn_harvest::store::{self, DURABLE_STREAM_TRUNCATION_OFFSET, DurableStreamChunk};
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::HandlerRegistry;
-use chrono::Utc;
 use diesel::sql_types::{Text, Uuid as SqlUuid};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -700,7 +700,7 @@ async fn run_workflow(
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -712,7 +712,7 @@ async fn run_workflow(
 
     let mut params = EnqueueParams::new("default", TaskType::Workflow, input);
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    params.scheduled_at = Timestamp::now() - jiff::SignedDuration::from_secs(5);
     queue::enqueue(conn, &params).await.expect("enqueue");
 
     let registry = HandlerRegistry::new(vec![workflow_info(workflow_name, handler)], vec![]);

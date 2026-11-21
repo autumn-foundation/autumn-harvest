@@ -1,11 +1,11 @@
 //! Text and JSON rendering plus the exit-code contract.
 //!
-//! Two rules shape the text format. Every verdict is printed with the model
-//! version it was computed under, and every run ends with the list of analysis
-//! boundaries the tool does not see through (D9) — a `proven-deterministic`
-//! that does not say what it was proven *modulo* is a claim the analyzer cannot
-//! support. And an allowlisted workflow prints the justification that suppressed
-//! it, so the escape hatch is visible in the same output as the findings.
+//! Two rules shape the text format. First, every verdict is printed with the
+//! model version it was computed under. Every run ends with the list of analysis
+//! boundaries the tool does not see through (D9). A `proven-deterministic` that
+//! does not say what it was proven *modulo* is a claim the analyzer cannot
+//! support. Second, an allowlisted workflow prints the justification that
+//! suppressed it. So the escape hatch is visible in the same output as the findings.
 
 use std::fmt::Write as _;
 
@@ -26,10 +26,10 @@ pub struct Report {
     pub warnings: Vec<String>,
     /// True when the run discovered no `#[workflow]` entry point at all.
     ///
-    /// `analyzed 0` is not a clean result, it is an absent one — a marker the
-    /// MIR parser could not read, a target that was never built, a `--package`
-    /// that selected the wrong crate. It warns by default and fails under
-    /// `--strict`, so a CI gate cannot go green on a run that verified nothing.
+    /// `analyzed 0` is not a clean result, it is an absent one. Causes include a
+    /// marker the MIR parser could not read, a target that was never built, or a
+    /// `--package` that selected the wrong crate. It warns by default and fails
+    /// under `--strict`. So a CI gate cannot go green on a run that verified nothing.
     #[serde(default)]
     pub discovery_failed: bool,
     /// The call graph of each workflow (issue #1995). `--emit-structure`
@@ -49,9 +49,10 @@ pub struct Summary {
 }
 
 impl Report {
-    /// Count the verdicts. An allowlisted workflow counts as `allowed` only —
-    /// it is deliberately not also counted as `found`, so the metric triple
-    /// reads as "what this run is telling you to fix".
+    /// Count the verdicts.
+    ///
+    /// An allowlisted workflow counts as `allowed` only, never also as `found`.
+    /// So the metric triple reads as "what this run is telling you to fix".
     #[must_use]
     pub fn summary(&self) -> Summary {
         let mut summary = Summary {
@@ -76,9 +77,9 @@ impl Report {
     /// Exit code: 0 clean; 1 any `nondeterminism-found` (or, under `strict`, any `unknown`,
     /// any unused allowlist entry, or a run that discovered no workflow at all).
     ///
-    /// The last of those is [`Report::discovery_failed`]: a run that analyzed no
-    /// entry point verified nothing, and under `--strict` "nothing to report"
-    /// must not be spelled the same way as "nothing to fix".
+    /// The last of those is [`Report::discovery_failed`]. A run that analyzed no
+    /// entry point verified nothing. Under `--strict`, "nothing to report" must
+    /// not be spelled the same way as "nothing to fix".
     #[must_use]
     pub fn exit_code(&self, strict: bool) -> i32 {
         let summary = self.summary();
@@ -145,9 +146,9 @@ impl Report {
     ///
     /// An entry whose path is not in the run is a rename, a deletion or a typo.
     /// An entry on a workflow that is *now* `proven-deterministic` is the good
-    /// case: the flow it was written for is gone, and saying "no analyzed
-    /// workflow has that path" about a workflow that is right there in the same
-    /// report would send the reader looking for a rename that never happened.
+    /// case: the flow it was written for is gone. Here "no analyzed workflow has
+    /// that path" would be wrong, because the workflow is in the same report. It
+    /// would send the reader looking for a rename that never happened.
     fn why_unused(&self, entry: &str) -> &'static str {
         let proven = self
             .workflows

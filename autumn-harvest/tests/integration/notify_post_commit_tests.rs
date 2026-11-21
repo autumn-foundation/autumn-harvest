@@ -84,7 +84,6 @@ async fn insert_execution(conn: &mut AsyncPgConnection) -> ExecutionId {
     exec_id
 }
 
-/// Count the stored events of one execution.
 async fn event_count(url: &str, exec_id: ExecutionId) -> i64 {
     #[derive(diesel::QueryableByName)]
     struct Count {
@@ -100,7 +99,6 @@ async fn event_count(url: &str, exec_id: ExecutionId) -> i64 {
         .n
 }
 
-/// Count the queued tasks with one id.
 async fn task_count(url: &str, task_id: Uuid) -> i64 {
     #[derive(diesel::QueryableByName)]
     struct Count {
@@ -116,7 +114,6 @@ async fn task_count(url: &str, task_id: Uuid) -> i64 {
         .n
 }
 
-/// Count the `PENDING` tasks with one id.
 async fn pending_count(url: &str, task_id: Uuid) -> i64 {
     #[derive(diesel::QueryableByName)]
     struct Count {
@@ -137,7 +134,7 @@ async fn pending_count(url: &str, task_id: Uuid) -> i64 {
 fn started() -> WorkflowEvent {
     WorkflowEvent::WorkflowStarted {
         input: serde_json::json!({}),
-        timestamp: chrono::Utc::now(),
+        timestamp: jiff::Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -207,7 +204,7 @@ async fn park_task(url: &str) -> (ExecutionId, Uuid) {
     let mut conn = AsyncPgConnection::establish(url).await.expect("connect");
     let exec_id = insert_execution(&mut conn).await;
     let mut params = enqueue_params("default", exec_id);
-    params.scheduled_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+    params.scheduled_at = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1);
     let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
     let queues = vec!["default".to_string()];
     let claimed = queue::claim_task(&mut conn, &queues, "notify-test", "", None, &[], &[])
@@ -566,9 +563,61 @@ async fn a_registered_pool_wakes_after_commit_and_not_before() {
     wake_of(&mut listener, exec_id).await;
 }
 
+/// A tick holds a committed note and an open one. The read sends nothing,
+/// because one note is open. The second statement sends the committed wake.
+/// The open wake comes only after its commit.
+#[tokio::test]
+async fn a_committed_and_an_open_note_send_only_the_committed_wake() {
+    let (url, _container) = setup().await;
+    let pool = build_pool(&url);
+    assert!(
+        autumn_harvest::notify::register_pool(&pool)
+            .wait_ready(READY)
+            .await,
+        "the sender must become ready"
+    );
+    let mut open_conn = pool.get().await.expect("pool connection");
+    let mut done_conn = pool.get().await.expect("pool connection");
+    let open_exec = insert_execution(&mut open_conn).await;
+    let done_exec = insert_execution(&mut done_conn).await;
+    let mut listener = WorkflowEventListener::connect(&url)
+        .await
+        .expect("listener");
+
+    Box::pin(open_conn.transaction::<(), HarvestError, _>(async |conn| {
+        store::append_events(conn, open_exec, &[started()], 0).await?;
+        store::append_events(&mut done_conn, done_exec, &[started()], 0).await?;
+        loop {
+            match listener
+                .wait_for_notification_timeout(WAIT)
+                .await
+                .expect("payload parses")
+            {
+                WorkflowEventWaitOutcome::Notification(p)
+                    if p.workflow_exec_id == done_exec.as_uuid() =>
+                {
+                    break;
+                }
+                WorkflowEventWaitOutcome::Notification(p) => {
+                    assert_ne!(
+                        p.workflow_exec_id,
+                        open_exec.as_uuid(),
+                        "no wake may arrive before commit"
+                    );
+                }
+                other => panic!("no wake for the committed write: {other:?}"),
+            }
+        }
+        Ok(())
+    }))
+    .await
+    .expect("append");
+
+    wake_of(&mut listener, open_exec).await;
+}
+
 // ── A stamped write sends no stage probe (issue #2125) ─────────────────
 
-/// The backend pid of `conn`.
 async fn backend_pid(conn: &mut AsyncPgConnection) -> i32 {
     #[derive(diesel::QueryableByName)]
     struct Pid {

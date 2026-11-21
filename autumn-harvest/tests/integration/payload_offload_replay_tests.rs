@@ -1,10 +1,9 @@
 //! Replay-fidelity test for large-payload offloading (issue #524).
 //!
-//! Demonstrates that a recorded history whose payloads were offloaded to an
-//! external [`PayloadStore`] replays with 100% byte fidelity once a
-//! [`PayloadOffloader`] is attached to the [`WorkflowReplayer`]: the stored
-//! event stays tiny (a reference envelope) while replay reconstructs the exact
-//! original bytes by fetching from the store.
+//! A history with payloads offloaded to an external [`PayloadStore`] replays
+//! with 100% byte fidelity when a [`PayloadOffloader`] is attached to the
+//! [`WorkflowReplayer`]. The stored event stays a tiny reference envelope.
+//! Replay fetches the exact original bytes from the store.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -19,7 +18,7 @@ use autumn_harvest::payload_store::{
 use autumn_harvest::telemetry::NoOpMetrics;
 use autumn_harvest::testing::{HistorySnapshot, ReplayStatus, WorkflowReplayer};
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::Value;
 
 /// In-memory content-addressed payload store for the test.
@@ -113,7 +112,7 @@ async fn offloaded_history_replays_with_full_byte_fidelity() {
     let original_events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,

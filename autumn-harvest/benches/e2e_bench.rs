@@ -10,6 +10,17 @@
 //! | `signal_roundtrip` | HTTP signal -> the workflow observes it, p50/p99 |
 //! | `replay_throughput` | events/sec over the issue #135 10 001-event history |
 //!
+//! Two opt-in capacity arms run only when `HARVEST_BENCH_SCENARIOS` names
+//! them, or names `capacity` for both:
+//!
+//! | scenario | headline |
+//! |:--|:--|
+//! | `capacity_noop` | the highest offered start rate a shard sustains, zero-activity workflow |
+//! | `capacity_canonical` | the same, for the canonical 3-activity workflow |
+//!
+//! A capacity cell starts worker processes. Each one is this binary again,
+//! run with `HARVEST_BENCH_CAPACITY_CHILD` set.
+//!
 //! # Running
 //!
 //! ```text
@@ -32,7 +43,7 @@
 //! ```
 //!
 //! With none of those and no Docker daemon, the suite prints a skip notice and
-//! exits 0 — `cargo bench` on a laptop without Postgres is not a failure.
+//! exits 0. `cargo bench` on a laptop without Postgres is not a failure.
 //!
 //! # Why not criterion
 //!
@@ -40,13 +51,13 @@
 //! signal, a completed execution. Criterion's statistical machinery re-runs the
 //! measured closure thousands of times, which for all three database scenarios
 //! would end up timing an empty queue. Same reason `benches/claim_bench.rs`
-//! (issue #786) is hand-rolled. Replay is the one criterion-shaped scenario and
-//! `benches/replay_bench.rs` still benches it that way; this suite reports its
-//! throughput from the *same* history builder so the two cannot drift.
+//! (issue #786) is hand-rolled. Replay is the one criterion-shaped scenario.
+//! `benches/replay_bench.rs` still benches it that way. This suite reports its
+//! throughput from the *same* history builder, so the two cannot drift.
 //!
-//! A partial run is a first-class mode: `HARVEST_BENCH_SCENARIOS` and
-//! `HARVEST_BENCH_SHARDS` narrow the matrix, so a reader reproducing one
-//! published headline does not have to sit through all twelve cells.
+//! A partial run is a first-class mode. `HARVEST_BENCH_SCENARIOS` and
+//! `HARVEST_BENCH_SHARDS` narrow the matrix. A reader who reproduces one
+//! published headline need not run all twelve cells.
 //!
 //! # Scope
 //!
@@ -57,11 +68,12 @@
 //! and the only performance gate CI does run — is issue #786's
 //! `benches/claim_bench.rs` and `docs/performance.md`.
 
-// The harness is shared with `benches/replay_bench.rs` (the history builder) and
-// with the docs-drift guard, so the published numbers, the #135 budget bench and
-// the doc can never be produced by three different definitions of the same
-// thing. It lives under `tests/` because that is where a shared harness lives in
-// this repo (see `claim_bench_support.rs`, issue #786).
+// `benches/replay_bench.rs` (the history builder) and the docs-drift guard share
+// this harness. So the published numbers, the #135 budget bench and the doc use
+// one definition. A shared harness lives under `tests/` in this repo (see
+// `claim_bench_support.rs`, issue #786).
+#[path = "../tests/integration/capacity_bench_support.rs"]
+mod capacity_bench_support;
 #[path = "../tests/integration/claim_bench_support.rs"]
 mod claim_bench_support;
 #[path = "../tests/integration/e2e_bench_support.rs"]
@@ -83,6 +95,20 @@ fn main() {
         .enable_all()
         .build()
         .expect("build the benchmark runtime");
+    // A capacity cell runs this binary again as a worker process.
+    let spec = match capacity_bench_support::db::child_spec_from_env() {
+        Ok(spec) => spec,
+        Err(reason) => {
+            // A broken child must never run the benchmark itself.
+            eprintln!("worker process: {reason}");
+            std::process::exit(2);
+        }
+    };
+    if let Some(spec) = spec {
+        let code = runtime.block_on(capacity_bench_support::db::run_worker_child(spec));
+        // Exit at once. A blocked stdin reader must not hold the process.
+        std::process::exit(code);
+    }
     runtime.block_on(run());
 }
 
@@ -96,7 +122,7 @@ async fn run() {
         println!(
             "\n> `{SCENARIO_FILTER_ENV_VAR}` names no such scenario: {}. Known scenarios: {}.\n",
             unknown.join(", "),
-            BenchScenario::all()
+            BenchScenario::known()
                 .iter()
                 .map(|s| s.as_str())
                 .collect::<Vec<_>>()
@@ -137,10 +163,13 @@ async fn run() {
         return;
     }
 
-    // After the sweep, not before: the Postgres version is only known once
-    // something has been provisioned, and on the testcontainer path there is no
-    // environment variable to read it from ahead of time.
-    print_environment();
+    // After the sweep, not before: the Postgres version is known only after
+    // provisioning. On the testcontainer path no environment variable holds it.
+    print_environment(
+        reports
+            .iter()
+            .any(|r| matches!(r.scenario, BenchScenario::Capacity(_))),
+    );
 
     println!("\n## Results\n");
     println!("{}", render_matrix(&reports));
@@ -170,6 +199,7 @@ async fn run() {
     }
 
     print_replay_control(&reports);
+    print_shard_scaling(&reports);
 
     let unsound: Vec<String> = reports
         .iter()
@@ -190,10 +220,9 @@ async fn run() {
 /// one and printing a notice otherwise.
 ///
 /// Each cell runs in its own task, so a panic in one becomes a `JoinError`
-/// rather than unwinding out of `main`. Without this a single unlucky
-/// database error aborts the whole sweep, discards every cell already
-/// measured, and skips teardown for the databases the remaining cells would
-/// have created.
+/// rather than unwinding out of `main`. Without this, one database error
+/// aborts the whole sweep and discards every cell already measured. It also
+/// skips teardown for the databases the remaining cells would have created.
 ///
 /// `await_cell` adds a hard wall-clock ceiling on top. `SCENARIO_BUDGET_SECS`
 /// is only a *cooperative* deadline; the scenario checks it between its own
@@ -272,10 +301,29 @@ async fn run_scenario(
         BenchScenario::ReplayThroughput => {
             Ok(e2e_bench_support::run_replay_throughput(shards).await)
         }
+        BenchScenario::Capacity(arm) => {
+            capacity_bench_support::db::run_capacity(arm, shards, census).await
+        }
     }
 }
 
-fn print_environment() {
+/// Print the shard-scaling lines of the capacity cells.
+///
+/// A ratio appears only for a sound cell with one database host and one
+/// worker host per shard. A co-located cell never enters a scaling claim.
+fn print_shard_scaling(reports: &[ScenarioReport]) {
+    let lines = capacity_bench_support::scaling_lines(reports);
+    if lines.is_empty() {
+        return;
+    }
+    println!("\n## Shard scaling\n");
+    for line in lines {
+        println!("* {line}");
+    }
+    println!();
+}
+
+fn print_environment(capacity_ran: bool) {
     println!("## Environment\n");
     println!("| | |");
     println!("|:--|:--|");
@@ -292,7 +340,8 @@ fn print_environment() {
     println!("| Profile | `bench` (release) |");
     println!("| Harness | `autumn-harvest/tests/integration/e2e_bench_support.rs` |");
     println!(
-        "| Workers | {} per shard, {} concurrent workflows, {} concurrent activities |",
+        "| Workers | {} per shard in the matrix cells, {} concurrent workflows, {} concurrent \
+         activities |",
         e2e_bench_support::WORKERS_PER_SHARD,
         e2e_bench_support::MAX_CONCURRENT_WORKFLOWS,
         e2e_bench_support::MAX_CONCURRENT_ACTIVITIES,
@@ -302,9 +351,19 @@ fn print_environment() {
         e2e_bench_support::POLL_INTERVAL_MS
     );
     println!(
-        "| Pool size | {} per shard |",
+        "| Pool size | {} per shard, and per worker process in a capacity cell |",
         e2e_bench_support::POOL_SIZE_PER_SHARD
     );
+    if capacity_ran {
+        println!(
+            "| Capacity | {} worker process(es) per shard, {} generator connections per shard, \
+             {:.0}s steps x{} |",
+            capacity_bench_support::db::worker_processes_per_shard(),
+            capacity_bench_support::CAPACITY_GENERATOR_CONNECTIONS_PER_SHARD,
+            capacity_bench_support::CAPACITY_STEP_SECS,
+            capacity_bench_support::CAPACITY_RATE_MULTIPLIER,
+        );
+    }
     println!(
         "| Postgres | {} |",
         e2e_bench_support::db::provisioned_postgres_version()
@@ -317,9 +376,8 @@ fn print_environment() {
 ///
 /// Replay is in-memory and cannot legitimately move with shard count, so any
 /// spread across the three cells is the reference box, not the engine. Nothing
-/// else in the report compares those cells *against each other* — and each one
-/// on its own always looks fine — so without this the control cannot actually
-/// signal anything.
+/// else in the report compares those cells *against each other*. Each one on
+/// its own always looks fine, so without this the control signals nothing.
 fn print_replay_control(reports: &[ScenarioReport]) {
     let readings: Vec<f64> = reports
         .iter()

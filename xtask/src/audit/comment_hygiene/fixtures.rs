@@ -543,6 +543,16 @@ pub const RULE_TESTS: &[RuleCase] = &[
         name: "a narrative aside survives a typographic apostrophe",
     },
     RuleCase {
+        source: "// Parse the id first (issue #777, Codex P2).\n",
+        expected: &[("CH005", 1)],
+        name: "a Codex tag with no round number is archaeology",
+    },
+    RuleCase {
+        source: "/// Match the `Codex` literal in the reviewer column.\n",
+        expected: &[],
+        name: "but the word inside a code span is a literal",
+    },
+    RuleCase {
         source: "/// ```foo`bar TODO: remove this\n",
         expected: &[("CH002", 1)],
         name: "an invalid fence opener is scanned, not exempted",
@@ -839,7 +849,7 @@ pub const RULE_TESTS: &[RuleCase] = &[
     },
     RuleCase {
         source: "/// Parse the `let's` token from the input.\n",
-        expected: &[("CH006", 1)],
+        expected: &[],
         name: "a narrative phrase inside a code span is a literal",
     },
     RuleCase {

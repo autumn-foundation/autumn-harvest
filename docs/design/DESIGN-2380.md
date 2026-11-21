@@ -35,7 +35,8 @@ pub struct RefineInput {
 2. `agent_refine_start` reads each source run through the installed
    `RefineSources`. It checks each run in this order:
    1. The run exists.
-   2. It is an `agent_loop` or `agent` run.
+   2. It is an `agent_loop` run. A durable `agent` run fails here with
+      `RefineSourceNotReplayable`, of any kind and in any state (#2577).
    3. It ended.
    4. It is of `kind`. An `agent_loop` run names its kind in
       `AgentTask::kind`. A run with no kind fails this check.
@@ -72,7 +73,8 @@ pub struct RefineInput {
 4. One probe for each candidate composition.
 5. `agent_refine_select` picks one composition by its opaque id. The
    selector reads the overlays and the pool under those ids. With no
-   candidate, the source keeps the current overlay.
+   candidate, the source keeps the current overlay. The pick is never a
+   live failure (#2579).
 
 The stages of one round are independent. The workflow still runs them
 one after another, so the history order is fixed and the budget check
@@ -80,7 +82,8 @@ runs between any two steps.
 
 **Sequential mode.** For each source, k steps. Each step runs INV, DOM,
 their probes, one composition over those two probes, and its probe. A
-candidate composition becomes the current overlay of the next step.
+candidate composition becomes the current overlay of the next step. A
+composition that failed its live re-probe does not (#2579).
 
 ### The probe
 
@@ -88,9 +91,12 @@ candidate composition becomes the current overlay of the next step.
 recorded source. The base rollout is the recorded source, so it costs no
 call. When `stubbed_tool_calls > 0`, the probe asks the host for a live
 re-probe (#2378) with `RefinePolicy::probe_effects`. The Postgres host
-forks the source and waits for the fork. The SQLite host has no fork. The
+forks the source and waits for the fork. The fork id comes from the
+idempotency key of the probe activity, so a retry finds the fork of the
+first attempt and forks nothing (#2577). The SQLite host has no fork. The
 probe then records `LiveReprobe::Skipped` with the reason, and the stage
-notes say so.
+notes say so. The composer, the selector and the rule read the live end of
+each probe. [`DESIGN-2579.md`](DESIGN-2579.md) gives the rule.
 
 ### The budget identity
 
@@ -114,6 +120,8 @@ each plan meets it for each k and each run of stage outcomes.
   `ProposeContext::charge`. `ModelProposer` charges each model call.
 - Each probe sums the usage and cost of its candidate turns. A live
   re-probe adds the spend from the report of a completed fork.
+- Each probe writes one cost ledger row for each candidate turn that
+  called a model. The row names the model id of the turn (#2577).
 - A failed stage reports the spend of its last attempt in its failure
   details, and the run counts it.
 - Each activity writes its calls to the cost ledger. The rows key on the
@@ -201,17 +209,15 @@ guard.
 
 ## Limits
 
-- The start step refuses an `agent` run of the kind with
-  `SourceNotReplayable`. `eval` replays `agent_loop` runs only.
+- The start step refuses each `agent` run with `SourceNotReplayable`.
+  `eval` replays `agent_loop` runs only.
 - A live re-probe records its cost ledger rows under the fork execution.
   The refine ledger counts the spend of a completed fork from its report.
   A fork that fails, or that the probe cancels, adds none.
-- A worker crash during the wait of a live re-probe starts a second fork
-  on the retry.
 - The engine keeps no ledger row of a failed attempt. An attempt that
   fails before a later attempt succeeds is in neither ledger.
-- A probe writes one cost ledger row under the unknown model id. An
-  `Evaluation` holds the sum of its turns, not the model of each turn.
+  [`DESIGN-2577.md`](DESIGN-2577.md) states why the refine ledger cannot
+  hold it.
 - On Postgres, a live re-probe names its fork in the report. Two runs then
   differ in that id.
 - An older worker cannot decode a `ProposeRequest` with a `sample` above

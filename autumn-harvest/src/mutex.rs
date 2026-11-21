@@ -1,84 +1,85 @@
 //! Durable mutual-exclusion locks for workflow code (issue #691).
 //!
-//! This module is the DB-helper layer behind `ctx.mutex(key).acquire()` — a
-//! `WorkflowContext` author primitive that durably suspends the calling workflow
-//! until it holds exclusive access to `key`. It owns the raw-SQL access to the
-//! two backing tables (`harvest_mutex_locks`, `harvest_mutex_waiters`) and the
-//! `harvest_mutex_lock_seq` fencing sequence; the author-facing handle/guard API
+//! This module is the DB-helper layer behind `ctx.mutex(key).acquire()`. That
+//! `WorkflowContext` primitive durably suspends the calling workflow until it
+//! holds exclusive access to `key`. This module owns the raw SQL for the two
+//! backing tables (`harvest_mutex_locks`, `harvest_mutex_waiters`) and the
+//! `harvest_mutex_lock_seq` fencing sequence. The author-facing handle/guard API
 //! and the executor/worker suspension wiring land in later milestones.
 //!
 //! # Shard-local scope
 //!
-//! Mutex coordination is **shard-local**: the lock row and the FIFO waiter rows
-//! live on the contending workflows' own shard, exactly like per-key concurrency
-//! limits (issue #247). Two workflows that must exclude one another therefore
-//! have to resolve to the **same** shard. Cross-shard global locks are out of
-//! scope — there is no cross-shard coordination here.
+//! Mutex coordination is **shard-local**. The lock row and the FIFO waiter rows
+//! live on the contending workflows' own shard, like per-key concurrency limits
+//! (issue #247). Two workflows that must exclude one another therefore have to
+//! resolve to the **same** shard. Cross-shard global locks are out of scope —
+//! there is no cross-shard coordination here.
 //!
 //! # Lease contract (the honest caveat)
 //!
 //! Crash safety rests on two mechanisms: a `lease_expires_at` TTL backstop and a
 //! monotonic `lock_seq` **fencing token**. If a holder crashes (or its worker
 //! stops renewing), the lease scanner reclaims the expired lease and wakes the
-//! next waiter. `lock_seq` fences the lock **table**: release/reclaim match on
-//! `(holder_exec_id, lock_seq)`, so a reclaimed-then-resumed stale holder's
-//! release is a 0-row no-op and the table can never be corrupted.
+//! next waiter. `lock_seq` fences the lock **table**. Release and reclaim match
+//! on `(holder_exec_id, lock_seq)`. A reclaimed-then-resumed stale holder's
+//! release is then a 0-row no-op, so the table can never be corrupted.
 //!
 //! What the engine cannot fence is the **author's external side effects**. The
-//! lease TTL must exceed the worst-case wall-clock time a workflow spends inside
-//! a single held step — concretely, the **interval between the lease-renewing
-//! decision cycles** of the holder. Renewal happens per decision cycle (and on
-//! resume from pause); a lock held across a **single long region that spans no
-//! such cycle** — one long-running activity, a child workflow, or an nd-block
-//! backoff longer than the TTL — can have its lease expire and be reclaimed by
-//! a waiter while the original holder still believes it holds the lock,
-//! admitting a second holder that runs concurrently against whatever external
-//! resource the lock was protecting. Hold locks across **short** critical
-//! regions; if a region must span a long durable step, raise the TTL above that
-//! step's worst-case duration. This is the standard lease-lock trade-off. See
-//! [`DEFAULT_MUTEX_LEASE_TTL`] (60s default).
+//! lease TTL must exceed the worst-case wall-clock time of a single held step.
+//! That step is the **interval between the lease-renewing decision cycles** of
+//! the holder. Renewal happens per decision cycle and on resume from pause.
+//! Some regions span no such cycle: one long-running activity, a child
+//! workflow, or an nd-block backoff longer than the TTL. A lock held across
+//! such a **single long region** can lose its lease to a waiter. The original
+//! holder then still believes it holds the lock. So two holders can run
+//! concurrently against the external resource the lock protects. Hold locks
+//! across **short** critical regions. If a region must span a long durable
+//! step, raise the TTL above that step's worst-case duration. This is the
+//! standard lease-lock trade-off. See [`DEFAULT_MUTEX_LEASE_TTL`] (60s default).
 //!
 //! # Behavior notes
 //!
 //! - **Held-duration metric.** `harvest.mutex.held_duration` is measured on
-//!   **explicit guard drop / `.release()`** (a normal region exit). A lock held
-//!   all the way to a terminal state is freed by the **terminal sweep**, which
-//!   does not measure held-duration, so a lock never explicitly released does
-//!   not contribute to this histogram.
-//! - **No mixed suspension batch.** `acquire()` is its own suspension shape;
-//!   `tokio::join!(ctx.mutex(k).acquire(), <other await>)` (racing an acquire
-//!   against another durable await in one decision cycle) is **rejected** — the
-//!   worker fails the mixed suspension batch loud rather than silently
+//!   **explicit guard drop / `.release()`** (a normal region exit). The
+//!   **terminal sweep** frees a lock held all the way to a terminal state. The
+//!   sweep does not measure held-duration, so such a lock does not contribute
+//!   to this histogram.
+//! - **No mixed suspension batch.** `acquire()` is its own suspension shape.
+//!   The worker **rejects** `tokio::join!(ctx.mutex(k).acquire(), <other await>)`,
+//!   which races an acquire against another durable await in one decision
+//!   cycle. It fails the mixed suspension batch loud rather than silently
 //!   corrupting. Acquire the lock in its own suspension, then do the other work.
 //! - **`ctx.race()` interop (known limitation).** Calling
 //!   `ctx.mutex(k).acquire()` in the **same decision cycle** immediately after
 //!   `ctx.race()` can nd-block when a race loser is still in-flight at
 //!   resolution. This is a **pre-existing `ctx.race()` (issue #600)
-//!   replay-consumption limitation** affecting **any** follow-on durable command
-//!   (a plain activity as much as an acquire), not something specific to mutex.
-//!   Until #600 is fixed, interpose a state-consulting call between the race and
-//!   the acquire, or await the race in a **prior** cycle before acquiring.
+//!   replay-consumption limitation**, not something specific to mutex. It
+//!   affects **any** follow-on durable command, a plain activity as much as an
+//!   acquire. Until #600 is fixed, interpose a state-consulting call between
+//!   the race and the acquire, or await the race in a **prior** cycle before
+//!   acquiring.
 //!
 //! # Advisory-first lock ordering (deadlock avoidance)
 //!
 //! Every acquire / release / reclaim / sweep transaction takes a
 //! `pg_advisory_xact_lock(hashtext(key))` **first**, before touching any lock or
 //! waiter row. This uniform ordering prevents an ABBA deadlock with the terminal
-//! auto-release sweep, which runs *inside* the workflow's terminal-transition
-//! commit: if the sweep took a row lock before the advisory lock while acquire
-//! took them in the opposite order, a deadlock would roll the terminal commit
-//! back. Advisory-first everywhere removes the inversion by construction.
+//! auto-release sweep. That sweep runs *inside* the workflow's
+//! terminal-transition commit. Suppose the sweep took a row lock before the
+//! advisory lock while acquire took them in the opposite order. A deadlock
+//! would then roll the terminal commit back. Advisory-first everywhere removes
+//! the inversion by construction.
 //!
 //! `hashtext` produces a 32-bit hash, so two distinct keys can (rarely) collide
 //! onto the same advisory-lock slot and be briefly, harmlessly serialized
-//! against each other. This never affects correctness: every row operation still
-//! matches `lock_key` **exactly**, so a collision only costs a little needless
-//! serialization, never a wrong grant or release.
+//! against each other. This never affects correctness. Every row operation
+//! still matches `lock_key` **exactly**. A collision only costs a little
+//! needless serialization, never a wrong grant or release.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use crate::types::ExecutionId;
 
@@ -93,10 +94,11 @@ pub const DEFAULT_MUTEX_LEASE_TTL: Duration = Duration::from_secs(60);
 /// [`MUTEX_LEASE_TTL_SECS_BITS`] (`Duration::as_secs_f64` is not `const`).
 const DEFAULT_LEASE_TTL_SECS_F64: f64 = 60.0;
 
-/// Process-global effective mutex lease TTL, in **seconds**, stored as the bit
-/// pattern of an `f64` ([`f64::to_bits`]) so it carries sub-second precision
-/// (mirrors `start_idempotency`'s purge-window static and the
-/// `GLOBAL_DEFAULT_WORKFLOW_QUEUE` process-global idiom).
+/// Process-global effective mutex lease TTL, in **seconds**.
+///
+/// It holds the bit pattern of an `f64` ([`f64::to_bits`]), so it carries
+/// sub-second precision. It mirrors `start_idempotency`'s purge-window static
+/// and the `GLOBAL_DEFAULT_WORKFLOW_QUEUE` process-global idiom.
 ///
 /// Set once at worker startup from the configured `WorkerConfig::mutex_lease_ttl`
 /// via [`set_mutex_lease_ttl`] (the `From<WorkerConfig>` path), read by the
@@ -107,9 +109,9 @@ static MUTEX_LEASE_TTL_SECS_BITS: AtomicU64 = AtomicU64::new(DEFAULT_LEASE_TTL_S
 /// Set the process-global mutex lease TTL (issue #691).
 ///
 /// Called at worker startup from `WorkerConfig::mutex_lease_ttl`. A degenerate
-/// duration (non-positive or non-finite) is **ignored**: the previous (or
-/// default) value is kept and a warning is logged, rather than storing a `0`
-/// TTL that would let the scanner reclaim every lock instantly.
+/// duration (non-positive or non-finite) is **ignored**. The previous (or
+/// default) value stays and a warning is logged. A stored `0` TTL would let
+/// the scanner reclaim every lock instantly.
 pub fn set_mutex_lease_ttl(ttl: Duration) {
     let secs = ttl.as_secs_f64();
     if !(secs.is_finite() && secs > 0.0) {
@@ -136,7 +138,7 @@ pub fn effective_mutex_lease_ttl() -> Duration {
 /// Whether a lease has elapsed relative to `now` (pure; the scanner's reclaim
 /// predicate). A lease is expired the instant `now` reaches `lease_expires_at`.
 #[must_use]
-pub fn lease_expired(lease_expires_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+pub fn lease_expired(lease_expires_at: Timestamp, now: Timestamp) -> bool {
     now >= lease_expires_at
 }
 
@@ -215,8 +217,10 @@ pub const fn grant_lock_stmt() -> &'static str {
      RETURNING lock_seq"
 }
 
-/// Read-only "would a grant to `$2` succeed right now?" check: `$2` is the head
-/// of line AND the key is either free or its lease has expired.
+/// Read-only check that a grant to `$2` would succeed right now.
+///
+/// It is true when `$2` is the head of line AND the key is either free or its
+/// lease has expired.
 ///
 /// `$1` = `lock_key`, `$2` = `waiter_exec_id`. Returns one `grantable` bool row.
 #[must_use]
@@ -250,7 +254,7 @@ pub const fn release_lock_stmt() -> &'static str {
 }
 
 /// Release by `(key, holder)` with **no** `lock_seq` fence — for the terminal
-/// sweep / release-all path where the seq isn't threaded. `$1` = `lock_key`,
+/// sweep / release-all path where the seq is not threaded. `$1` = `lock_key`,
 /// `$2` = `holder_exec_id`. `RETURNING acquired_at`.
 #[must_use]
 pub const fn release_lock_by_holder_key_stmt() -> &'static str {
@@ -275,6 +279,19 @@ pub const fn held_keys_for_holder_stmt() -> &'static str {
 #[must_use]
 pub const fn waiter_keys_for_holder_stmt() -> &'static str {
     "SELECT DISTINCT lock_key FROM harvest_mutex_waiters WHERE waiter_exec_id = $1 ORDER BY lock_key"
+}
+
+/// Every key of `$1` in one read.
+///
+/// The keys that it holds come first (`part` 0), then the distinct keys that
+/// it waits on (`part` 1). Each part is ordered by key, as
+/// [`held_keys_for_holder_stmt`] and [`waiter_keys_for_holder_stmt`] order it.
+#[must_use]
+pub const fn terminal_keys_for_holder_stmt() -> &'static str {
+    "SELECT 0 AS part, lock_key FROM harvest_mutex_locks WHERE holder_exec_id = $1 \
+     UNION ALL \
+     SELECT DISTINCT 1 AS part, lock_key FROM harvest_mutex_waiters WHERE waiter_exec_id = $1 \
+     ORDER BY part, lock_key"
 }
 
 /// Candidate expired leases whose holder is not `PAUSED` (unlocked SELECT — the
@@ -383,17 +400,52 @@ pub const fn holder_holds_any_stmt() -> &'static str {
 
 /// Best-effort grant metrics for `$2` (`waiter_exec_id`) on key `$1`.
 ///
-/// Reads the
-/// waiter's `requested_at` (for the wait-duration histogram) and the current
-/// total waiter-queue depth for the key (for the contention gauge). The waiter
-/// row still exists at grant time — [`grant_lock_stmt`] does not delete it, only
-/// the eventual fenced release does — so this reads it directly. Returns at most
-/// one row.
+/// Reads the waiter's `requested_at` (for the wait-duration histogram) and the
+/// current total waiter-queue depth for the key (for the contention gauge). The
+/// waiter row still exists at grant time, so this reads it directly.
+/// [`grant_lock_stmt`] does not delete it; only the eventual fenced release
+/// does. Returns at most one row.
 #[must_use]
 pub const fn waiter_wait_metrics_stmt() -> &'static str {
     "SELECT requested_at, \
             (SELECT count(*) FROM harvest_mutex_waiters WHERE lock_key = $1) AS depth \
      FROM harvest_mutex_waiters WHERE lock_key = $1 AND waiter_exec_id = $2"
+}
+
+/// Whether `history` records a mutex grant to its execution (issue #2651).
+///
+/// A decision renews the leases of its execution only when this is true.
+/// Two statements per decision then go away for a workflow that never takes
+/// a mutex: the table probe and an `UPDATE` of zero rows.
+///
+/// # Why a history with no grant holds no lock
+///
+/// One statement inserts a `harvest_mutex_locks` row: [`grant_lock_stmt`].
+/// One function runs it: `try_grant_or_enqueue`. One caller calls that
+/// function: the mutex park of the worker, in the decision of the holder.
+/// That transaction also appends [`WorkflowEvent::MutexGranted`] to the
+/// history of the holder. So a lock row of an execution implies a
+/// `MutexGranted` event in its committed history.
+///
+/// A decision loads its history before it renews. Only one decision of an
+/// execution runs at a time, and only that decision can grant. So no grant
+/// can commit between the load and the renewal. A history with no
+/// `MutexGranted` therefore proves that the renewal would change no row.
+///
+/// The test is one-way. A release appends no event, so a history with a
+/// grant can belong to an execution that holds nothing now. The renewal
+/// then runs and changes no row, as before.
+///
+/// `the_grant_has_one_caller_and_it_appends_the_event` guards the premise.
+/// A second writer of lock rows must append the event too, or this test
+/// must go.
+///
+/// [`WorkflowEvent::MutexGranted`]: crate::event::WorkflowEvent::MutexGranted
+#[must_use]
+pub fn history_records_a_grant(history: &[crate::event::WorkflowEvent]) -> bool {
+    history
+        .iter()
+        .any(|event| matches!(event, crate::event::WorkflowEvent::MutexGranted { .. }))
 }
 
 // ── DB-backed operations (advisory-first; to_regclass-guarded entry points) ──
@@ -405,13 +457,15 @@ mod db_ops {
         enqueue_waiter_stmt, expired_leases_stmt, grant_lock_stmt, head_of_line_stmt,
         held_keys_for_holder_stmt, holder_holds_any_stmt, is_grantable_head_stmt,
         reclaim_expired_lock_and_wake_target_stmt, release_lock_by_holder_key_stmt,
-        release_lock_stmt, renew_leases_for_holder_stmt, waiter_keys_for_holder_stmt,
+        release_lock_stmt, renew_leases_for_holder_stmt, terminal_keys_for_holder_stmt,
+        waiter_keys_for_holder_stmt,
     };
+    use crate::cached_stmt::CachePreparedDsl as _;
     use crate::error::{HarvestResult, database_error};
     use crate::types::ExecutionId;
-    use chrono::{DateTime, Utc};
     use diesel::OptionalExtension;
     use diesel_async::{AsyncPgConnection, RunQueryDsl};
+    use jiff::Timestamp;
     use std::time::Duration;
 
     #[derive(diesel::QueryableByName)]
@@ -428,6 +482,15 @@ mod db_ops {
 
     #[derive(diesel::QueryableByName)]
     struct KeyRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        lock_key: String,
+    }
+
+    /// One row of [`terminal_keys_for_holder_stmt`].
+    #[derive(diesel::QueryableByName)]
+    struct PartKeyRow {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        part: i32,
         #[diesel(sql_type = diesel::sql_types::Text)]
         lock_key: String,
     }
@@ -451,7 +514,8 @@ mod db_ops {
     #[derive(diesel::QueryableByName)]
     struct AcquiredAtRow {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        acquired_at: DateTime<Utc>,
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+        acquired_at: Timestamp,
     }
 
     #[derive(diesel::QueryableByName)]
@@ -463,7 +527,8 @@ mod db_ops {
     #[derive(diesel::QueryableByName)]
     struct WaitMetricsRow {
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        requested_at: DateTime<Utc>,
+        #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+        requested_at: Timestamp,
         #[diesel(sql_type = diesel::sql_types::BigInt)]
         depth: i64,
     }
@@ -481,6 +546,7 @@ mod db_ops {
     pub async fn table_present(conn: &mut AsyncPgConnection) -> HarvestResult<bool> {
         let exists: TableExists =
             diesel::sql_query("SELECT to_regclass('harvest_mutex_locks') IS NOT NULL AS present")
+                .cache_prepared()
                 .get_result(conn)
                 .await
                 .map_err(database_error)?;
@@ -492,6 +558,7 @@ mod db_ops {
     async fn advisory_lock(conn: &mut AsyncPgConnection, key: &str) -> HarvestResult<()> {
         diesel::sql_query(advisory_lock_stmt())
             .bind::<diesel::sql_types::Text, _>(key)
+            .cache_prepared()
             .execute(conn)
             .await
             .map(|_| ())
@@ -505,6 +572,7 @@ mod db_ops {
     ) -> HarvestResult<Option<ExecutionId>> {
         let row: Option<WaiterRow> = diesel::sql_query(head_of_line_stmt())
             .bind::<diesel::sql_types::Text, _>(key)
+            .cache_prepared()
             .get_result(conn)
             .await
             .optional()
@@ -532,6 +600,7 @@ mod db_ops {
         diesel::sql_query(enqueue_waiter_stmt())
             .bind::<diesel::sql_types::Text, _>(key)
             .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .cache_prepared()
             .execute(conn)
             .await
             .map_err(database_error)?;
@@ -540,6 +609,7 @@ mod db_ops {
             .bind::<diesel::sql_types::Text, _>(key)
             .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
             .bind::<diesel::sql_types::Double, _>(ttl.as_secs_f64())
+            .cache_prepared()
             .get_result(conn)
             .await
             .optional()
@@ -557,7 +627,7 @@ mod db_ops {
     ///
     /// Feeds the `harvest.mutex.wait_duration`
     /// and `harvest.mutex.contention_depth` metrics. Returns `None` if the
-    /// waiter row is gone (shouldn't happen at grant time). **Not**
+    /// waiter row is gone (should not happen at grant time). **Not**
     /// `table_present`-guarded — called only on the acquire/grant path.
     ///
     /// # Errors
@@ -566,10 +636,11 @@ mod db_ops {
         conn: &mut AsyncPgConnection,
         key: &str,
         exec_id: ExecutionId,
-    ) -> HarvestResult<Option<(DateTime<Utc>, i64)>> {
+    ) -> HarvestResult<Option<(Timestamp, i64)>> {
         let row: Option<WaitMetricsRow> = diesel::sql_query(super::waiter_wait_metrics_stmt())
             .bind::<diesel::sql_types::Text, _>(key)
             .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .cache_prepared()
             .get_result(conn)
             .await
             .optional()
@@ -590,6 +661,7 @@ mod db_ops {
         let row: Grantable = diesel::sql_query(is_grantable_head_stmt())
             .bind::<diesel::sql_types::Text, _>(key)
             .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .cache_prepared()
             .get_result(conn)
             .await
             .map_err(database_error)?;
@@ -609,13 +681,14 @@ mod db_ops {
         key: &str,
         holder: ExecutionId,
         lock_seq: i64,
-    ) -> HarvestResult<Option<DateTime<Utc>>> {
+    ) -> HarvestResult<Option<Timestamp>> {
         advisory_lock(conn, key).await?;
 
         let released: Option<AcquiredAtRow> = diesel::sql_query(release_lock_stmt())
             .bind::<diesel::sql_types::Text, _>(key)
             .bind::<diesel::sql_types::Uuid, _>(holder.as_uuid())
             .bind::<diesel::sql_types::BigInt, _>(lock_seq)
+            .cache_prepared()
             .get_result(conn)
             .await
             .optional()
@@ -628,6 +701,7 @@ mod db_ops {
         diesel::sql_query(delete_holder_waiter_for_key_stmt())
             .bind::<diesel::sql_types::Text, _>(key)
             .bind::<diesel::sql_types::Uuid, _>(holder.as_uuid())
+            .cache_prepared()
             .execute(conn)
             .await
             .map_err(database_error)?;
@@ -657,17 +731,34 @@ mod db_ops {
 
         let keys: Vec<KeyRow> = diesel::sql_query(held_keys_for_holder_stmt())
             .bind::<diesel::sql_types::Uuid, _>(holder.as_uuid())
+            .cache_prepared()
             .load(conn)
             .await
             .map_err(database_error)?;
 
-        for k in keys {
-            advisory_lock(conn, &k.lock_key).await?;
+        free_held_keys(conn, holder, keys.into_iter().map(|k| k.lock_key)).await?;
+        Ok(())
+    }
+
+    /// Free each of `keys` that `holder` still holds, and wake its new head
+    /// of line. Returns the keys that it freed.
+    ///
+    /// A freed key also loses the waiter row of `holder`, so the waiter sweep
+    /// skips it.
+    async fn free_held_keys(
+        conn: &mut AsyncPgConnection,
+        holder: ExecutionId,
+        keys: impl IntoIterator<Item = String>,
+    ) -> HarvestResult<Vec<String>> {
+        let mut freed = Vec::new();
+        for key in keys {
+            advisory_lock(conn, &key).await?;
 
             let released: Option<AcquiredAtRow> =
                 diesel::sql_query(release_lock_by_holder_key_stmt())
-                    .bind::<diesel::sql_types::Text, _>(&k.lock_key)
+                    .bind::<diesel::sql_types::Text, _>(&key)
                     .bind::<diesel::sql_types::Uuid, _>(holder.as_uuid())
+                    .cache_prepared()
                     .get_result(conn)
                     .await
                     .optional()
@@ -675,25 +766,27 @@ mod db_ops {
 
             if released.is_some() {
                 diesel::sql_query(delete_holder_waiter_for_key_stmt())
-                    .bind::<diesel::sql_types::Text, _>(&k.lock_key)
+                    .bind::<diesel::sql_types::Text, _>(&key)
                     .bind::<diesel::sql_types::Uuid, _>(holder.as_uuid())
+                    .cache_prepared()
                     .execute(conn)
                     .await
                     .map_err(database_error)?;
 
-                if let Some(head) = head_of_line(conn, &k.lock_key).await? {
+                if let Some(head) = head_of_line(conn, &key).await? {
                     crate::queue::wake_workflow_task(conn, head).await?;
                 }
+                freed.push(key);
             }
         }
 
-        Ok(())
+        Ok(freed)
     }
 
     /// Remove every waiter row for `exec_id` across all keys and wake each key's
     /// new head of line.
     ///
-    /// Guarded. A spurious wake (the exec wasn't actually the
+    /// Guarded. A spurious wake (the exec was not actually the
     /// head) is safe — the woken task simply re-parks.
     ///
     /// # Errors
@@ -708,21 +801,33 @@ mod db_ops {
 
         let keys: Vec<KeyRow> = diesel::sql_query(waiter_keys_for_holder_stmt())
             .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .cache_prepared()
             .load(conn)
             .await
             .map_err(database_error)?;
 
-        for k in keys {
-            advisory_lock(conn, &k.lock_key).await?;
+        drop_waiter_keys(conn, exec_id, keys.into_iter().map(|k| k.lock_key)).await
+    }
+
+    /// Remove the waiter row of `exec_id` on each of `keys`, and wake the new
+    /// head of line of each key.
+    async fn drop_waiter_keys(
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+        keys: impl IntoIterator<Item = String>,
+    ) -> HarvestResult<()> {
+        for key in keys {
+            advisory_lock(conn, &key).await?;
 
             diesel::sql_query(delete_holder_waiter_for_key_stmt())
-                .bind::<diesel::sql_types::Text, _>(&k.lock_key)
+                .bind::<diesel::sql_types::Text, _>(&key)
                 .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+                .cache_prepared()
                 .execute(conn)
                 .await
                 .map_err(database_error)?;
 
-            if let Some(head) = head_of_line(conn, &k.lock_key).await? {
+            if let Some(head) = head_of_line(conn, &key).await? {
                 crate::queue::wake_workflow_task(conn, head).await?;
             }
         }
@@ -748,6 +853,7 @@ mod db_ops {
         }
 
         let keys: Vec<KeyRow> = diesel::sql_query(expired_leases_stmt())
+            .cache_prepared()
             .load(conn)
             .await
             .map_err(database_error)?;
@@ -765,6 +871,7 @@ mod db_ops {
             let row: ReclaimAndWakeTargetRow =
                 diesel::sql_query(reclaim_expired_lock_and_wake_target_stmt())
                     .bind::<diesel::sql_types::Text, _>(&k.lock_key)
+                    .cache_prepared()
                     .get_result(conn)
                     .await
                     .map_err(database_error)?;
@@ -796,6 +903,7 @@ mod db_ops {
         diesel::sql_query(renew_leases_for_holder_stmt())
             .bind::<diesel::sql_types::Uuid, _>(holder.as_uuid())
             .bind::<diesel::sql_types::Double, _>(ttl.as_secs_f64())
+            .cache_prepared()
             .execute(conn)
             .await
             .map(|_| ())
@@ -808,6 +916,15 @@ mod db_ops {
     /// Guarded. Folded into the
     /// terminal-transition chokepoint in a later milestone.
     ///
+    /// One table probe and one key read cover both sweeps. A run with no lock
+    /// and no waiter row thus costs two statements. The waiter sweep skips
+    /// each key that the lock sweep freed, because that free also deleted the
+    /// waiter row. So it does the same work as
+    /// [`release_all_locks_for_holder`] then [`delete_waiters_for_holder`].
+    ///
+    /// The read does not need the history of the run. A run that never took
+    /// a mutex can still hold a waiter row, so each terminal path sweeps.
+    ///
     /// # Errors
     /// Returns `HarvestError` if a database query fails.
     pub async fn sweep_terminal_holder_and_wake(
@@ -817,9 +934,20 @@ mod db_ops {
         if !table_present(conn).await? {
             return Ok(());
         }
-        release_all_locks_for_holder(conn, exec_id).await?;
-        delete_waiters_for_holder(conn, exec_id).await?;
-        Ok(())
+        let rows: Vec<PartKeyRow> = diesel::sql_query(terminal_keys_for_holder_stmt())
+            .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .cache_prepared()
+            .load(conn)
+            .await
+            .map_err(database_error)?;
+        let (held, waits): (Vec<PartKeyRow>, Vec<PartKeyRow>) =
+            rows.into_iter().partition(|row| row.part == 0);
+        let freed = free_held_keys(conn, exec_id, held.into_iter().map(|r| r.lock_key)).await?;
+        let waits = waits
+            .into_iter()
+            .map(|r| r.lock_key)
+            .filter(|key| !freed.contains(key));
+        drop_waiter_keys(conn, exec_id, waits).await
     }
 
     /// Any lock key `exec_id` currently holds (for the reset-reject check), or
@@ -836,6 +964,7 @@ mod db_ops {
         }
         let row: Option<KeyRow> = diesel::sql_query(holder_holds_any_stmt())
             .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+            .cache_prepared()
             .get_result(conn)
             .await
             .optional()
@@ -857,7 +986,7 @@ mod pure_tests {
     use super::*;
 
     /// Serializes the mutex-lease-TTL global setter tests against each other so
-    /// they don't race in the shared lib-test binary (mirrors
+    /// they do not race in the shared lib-test binary (mirrors
     /// `start_idempotency::PURGE_WINDOW_TEST_LOCK`).
     static LEASE_TTL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -873,7 +1002,6 @@ mod pure_tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Whole and sub-second values round-trip.
         set_mutex_lease_ttl(Duration::from_secs(120));
         assert_eq!(effective_mutex_lease_ttl(), Duration::from_secs(120));
 
@@ -885,23 +1013,19 @@ mod pure_tests {
         set_mutex_lease_ttl(Duration::ZERO);
         assert!((effective_mutex_lease_ttl().as_secs_f64() - 1.5).abs() < 1e-9);
 
-        // Restore the default so ordering-independent test runs don't leak state.
+        // Restore the default so ordering-independent test runs do not leak state.
         set_mutex_lease_ttl(DEFAULT_MUTEX_LEASE_TTL);
         assert_eq!(effective_mutex_lease_ttl(), DEFAULT_MUTEX_LEASE_TTL);
     }
 
     #[test]
     fn lease_expired_truth_table() {
-        let base = DateTime::parse_from_rfc3339("2026-07-20T12:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let before = base - chrono::Duration::seconds(1);
-        let after = base + chrono::Duration::seconds(1);
-        // Not yet expired.
+        let base = "2026-07-20T12:00:00Z".parse::<Timestamp>().unwrap();
+        let before = base - jiff::SignedDuration::from_secs(1);
+        let after = base + jiff::SignedDuration::from_secs(1);
         assert!(!lease_expired(base, before));
         // Expired exactly at the deadline (>=).
         assert!(lease_expired(base, base));
-        // Expired past the deadline.
         assert!(lease_expired(base, after));
     }
 
@@ -1018,6 +1142,92 @@ mod pure_tests {
         assert!(reclaim.contains("lease_expires_at < now()"));
         assert!(reclaim.contains("e.state = 'PAUSED'"));
         assert!(reclaim.contains("RETURNING holder_exec_id"));
+    }
+
+    #[test]
+    fn a_history_with_no_grant_records_none() {
+        use crate::event::WorkflowEvent;
+        let history = vec![WorkflowEvent::TimerFired {
+            timer_id: crate::types::TimerId::new("t-1"),
+        }];
+        assert!(!history_records_a_grant(&[]));
+        assert!(!history_records_a_grant(&history));
+    }
+
+    #[test]
+    fn a_grant_anywhere_in_the_history_is_found() {
+        use crate::event::WorkflowEvent;
+        let grant = WorkflowEvent::MutexGranted {
+            key: "account-1".to_string(),
+            lock_seq: 7,
+            acquired_at: jiff::Timestamp::now(),
+        };
+        let other = || WorkflowEvent::TimerFired {
+            timer_id: crate::types::TimerId::new("t-1"),
+        };
+        assert!(history_records_a_grant(std::slice::from_ref(&grant)));
+        assert!(history_records_a_grant(&[other(), grant.clone()]));
+        assert!(history_records_a_grant(&[grant, other()]));
+    }
+
+    /// Check the premise of [`history_records_a_grant`] on the two sources.
+    ///
+    /// One statement inserts a lock row, one function runs it, and its one
+    /// caller appends `MutexGranted` in the same transaction.
+    ///
+    /// A Windows checkout can hold CRLF line endings, and one needle spans
+    /// two lines. So each source is normalized first, as `queue.rs` does for
+    /// its own source scans.
+    fn assert_grant_premise(mutex_source: &str, worker_source: &str) {
+        let mutex = mutex_source.replace("\r\n", "\n");
+        let worker = worker_source.replace("\r\n", "\n");
+
+        let production = mutex.split("mod pure_tests").next().expect("production");
+        assert_eq!(
+            production
+                .matches("INSERT INTO harvest_mutex_locks")
+                .count(),
+            1,
+            "a second statement inserts a lock row"
+        );
+        assert_eq!(
+            production.matches("sql_query(grant_lock_stmt())").count(),
+            1,
+            "a second function runs the grant statement"
+        );
+
+        let call = "crate::mutex::try_grant_or_enqueue(";
+        assert_eq!(
+            worker.matches(call).count(),
+            1,
+            "a second caller grants a lock"
+        );
+        let after = &worker[worker.find(call).expect("the grant call")..];
+        let transaction_end = after
+            .find(".await?;\n\n    for start in deferred")
+            .expect("the grant transaction ends before the deferred starts");
+        let granted_arm = &after[..transaction_end];
+        assert!(
+            granted_arm.contains("WorkflowEvent::MutexGranted {")
+                && granted_arm.contains("store::append_single_event(conn, exec_id, granted_event)"),
+            "the grant transaction no longer appends MutexGranted"
+        );
+    }
+
+    #[test]
+    fn the_grant_has_one_caller_and_it_appends_the_event() {
+        assert_grant_premise(include_str!("mutex.rs"), include_str!("worker.rs"));
+    }
+
+    /// The Windows job checks the sources out with CRLF line endings. This
+    /// test gives the guard such text on every platform.
+    #[test]
+    fn the_grant_premise_check_reads_crlf_sources() {
+        let crlf = |source: &str| source.replace("\r\n", "\n").replace('\n', "\r\n");
+        let mutex = crlf(include_str!("mutex.rs"));
+        let worker = crlf(include_str!("worker.rs"));
+        assert!(worker.contains("\r\n"));
+        assert_grant_premise(&mutex, &worker);
     }
 
     #[test]

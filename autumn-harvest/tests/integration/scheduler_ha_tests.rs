@@ -2,13 +2,15 @@
 //! HA scheduler tests — issue #350.
 //!
 //! Verifies that concurrent scheduler ticks on the same Postgres instance are
-//! safe: exactly one replica claims and fires each due schedule slot, and the
-//! `harvest.schedule.fire_attempts` metric is emitted with the correct outcome
-//! labels so operators can observe contention in production.
+//! safe. Exactly one replica claims and fires each due schedule slot. The
+//! `harvest.schedule.fire_attempts` metric carries the correct outcome labels,
+//! so operators can observe contention in production.
 //!
 //! The tests use a real Postgres container (testcontainers) to exercise the
 //! claim path end-to-end.
 
+use autumn_harvest::time::sql::SqlTimestamp;
+use jiff_diesel::ToDiesel;
 use std::sync::{Arc, Mutex};
 
 use autumn_harvest::info::WorkflowInfo;
@@ -16,13 +18,13 @@ use autumn_harvest::schema::{harvest_schedules, harvest_workflow_executions};
 use autumn_harvest::telemetry::{METRIC_SCHEDULE_FIRE_ATTEMPTS, MetricsRecorder};
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::{DagCatalog, SchedulerMonitor, WorkflowContext, tick_once};
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -158,7 +160,7 @@ fn make_pool(url: &str) -> DbPool {
 /// Insert a due schedule row in the DB and return its ID.
 async fn insert_due_schedule(conn: &mut AsyncPgConnection, wf_name: &str) -> Uuid {
     use autumn_harvest::schema::harvest_schedules::dsl;
-    let now = Utc::now();
+    let now = Timestamp::now();
     let id = Uuid::new_v4();
     diesel::insert_into(harvest_schedules::table)
         .values((
@@ -170,7 +172,7 @@ async fn insert_due_schedule(conn: &mut AsyncPgConnection, wf_name: &str) -> Uui
             dsl::max_active_runs.eq(10),
             dsl::is_paused.eq(false),
             // Due 5 seconds ago.
-            dsl::next_run_at.eq(now - chrono::Duration::seconds(5)),
+            dsl::next_run_at.eq((now - jiff::SignedDuration::from_secs(5)).to_diesel()),
             dsl::jitter_secs.eq(0_i64),
             dsl::overlap_policy.eq("skip"),
             dsl::buffered_runs.eq(serde_json::json!([])),
@@ -208,9 +210,10 @@ fn metrics_recorder_has_fire_attempt_method() {
     assert_eq!(got[1].outcome, "lost_race");
 }
 
-/// A due schedule whose claim token is live (`fire_claimed_until` in the future)
-/// must NOT be fired by a second tick — the claim is respected and no execution
-/// is created.
+/// A second tick must NOT fire a due schedule whose claim token is live.
+///
+/// The token is live while `fire_claimed_until` is in the future. The claim is
+/// respected and no execution is created.
 #[tokio::test]
 async fn test_live_claim_prevents_double_fire() {
     let (mut conn, _url, _c) = setup_db().await;
@@ -220,19 +223,19 @@ async fn test_live_claim_prevents_double_fire() {
 
     // Simulate another replica holding a live claim (expires 60 s from now).
     let claim_token = Uuid::new_v4();
-    let claim_until = Utc::now() + chrono::Duration::seconds(60);
+    let claim_until = Timestamp::now() + jiff::SignedDuration::from_secs(60);
     diesel::sql_query(
         "UPDATE harvest_schedules SET fire_claim_token = $1, fire_claimed_until = $2 WHERE id = $3",
     )
     .bind::<diesel::sql_types::Uuid, _>(claim_token)
-    .bind::<diesel::sql_types::Timestamptz, _>(claim_until)
+    .bind::<diesel::sql_types::Timestamptz, _>(claim_until.to_diesel())
     .bind::<diesel::sql_types::Uuid, _>(sched_id)
     .execute(&mut conn)
     .await
     .expect("set pre-existing claim");
 
     // Confirm the claim is in place.
-    let row: (Option<Uuid>, Option<chrono::DateTime<Utc>>) = harvest_schedules::table
+    let row: (Option<Uuid>, Option<SqlTimestamp>) = harvest_schedules::table
         .find(sched_id)
         .select((
             harvest_schedules::dsl::fire_claim_token,
@@ -284,12 +287,12 @@ async fn test_expired_claim_is_overridden_for_crash_recovery() {
 
     // Simulate a crashed replica: claim token set, but fire_claimed_until 10 s ago.
     let stale_token = Uuid::new_v4();
-    let expired_until = Utc::now() - chrono::Duration::seconds(10);
+    let expired_until = Timestamp::now() - jiff::SignedDuration::from_secs(10);
     diesel::sql_query(
         "UPDATE harvest_schedules SET fire_claim_token = $1, fire_claimed_until = $2 WHERE id = $3",
     )
     .bind::<diesel::sql_types::Uuid, _>(stale_token)
-    .bind::<diesel::sql_types::Timestamptz, _>(expired_until)
+    .bind::<diesel::sql_types::Timestamptz, _>(expired_until.to_diesel())
     .bind::<diesel::sql_types::Uuid, _>(sched_id)
     .execute(&mut conn)
     .await
@@ -339,9 +342,11 @@ async fn test_expired_claim_is_overridden_for_crash_recovery() {
     );
 }
 
-/// Two concurrent `tick_once` calls against the same Postgres must produce
-/// exactly one `harvest_workflow_executions` row — even when both replicas
-/// observe the same due schedule row before either has fired it.
+/// Two concurrent `tick_once` calls against one Postgres create exactly one
+/// `harvest_workflow_executions` row.
+///
+/// This holds even when both replicas observe the same due schedule row before
+/// either has fired it.
 ///
 /// This is the core AC for issue #350: N replicas, one schedule row, one fire.
 #[tokio::test]
@@ -403,7 +408,7 @@ async fn test_ha_concurrent_tick_produces_exactly_one_execution() {
 async fn insert_buffered_schedule(
     conn: &mut AsyncPgConnection,
     wf_name: &str,
-    slot: chrono::DateTime<Utc>,
+    slot: jiff::Timestamp,
 ) -> Uuid {
     use autumn_harvest::schema::harvest_schedules::dsl;
     let id = Uuid::new_v4();
@@ -416,10 +421,11 @@ async fn insert_buffered_schedule(
             dsl::catchup.eq(false),
             dsl::max_active_runs.eq(10),
             dsl::is_paused.eq(false),
-            dsl::next_run_at.eq(Utc::now() + chrono::Duration::hours(1)),
+            dsl::next_run_at
+                .eq((Timestamp::now() + jiff::SignedDuration::from_hours(1)).to_diesel()),
             dsl::jitter_secs.eq(0_i64),
             dsl::overlap_policy.eq("buffer_one"),
-            dsl::buffered_runs.eq(serde_json::json!([slot.to_rfc3339()])),
+            dsl::buffered_runs.eq(serde_json::json!([autumn_harvest::time::rfc3339(slot)])),
             dsl::buffer_all_max.eq(100),
             dsl::skip_policy.eq("skip"),
         ))
@@ -515,7 +521,7 @@ async fn tick(url: &str, wf_name: &'static str) {
 async fn test_live_claim_blocks_buffered_drain() {
     let (mut conn, url, _c) = setup_db().await;
     let wf_name = "ha_drain_live_claim_wf";
-    let slot = Utc::now() - chrono::Duration::seconds(30);
+    let slot = Timestamp::now() - jiff::SignedDuration::from_secs(30);
     let sched_id = insert_buffered_schedule(&mut conn, wf_name, slot).await;
     let peer_token = Uuid::new_v4();
     set_claim(&mut conn, sched_id, peer_token, 60.0).await;
@@ -530,7 +536,7 @@ async fn test_live_claim_blocks_buffered_drain() {
     let (buffered, runs_started, token) = schedule_state(&mut conn, sched_id).await;
     assert_eq!(
         buffered,
-        serde_json::json!([slot.to_rfc3339()]),
+        serde_json::json!([autumn_harvest::time::rfc3339(slot)]),
         "the buffered slot must stay for the claim holder"
     );
     assert_eq!(runs_started, 0, "runs_started must not change");
@@ -551,7 +557,7 @@ async fn test_live_claim_blocks_buffered_drain() {
 async fn test_concurrent_drains_start_each_buffered_run_once() {
     let (mut conn, url, _c) = setup_db().await;
     let wf_name = "ha_drain_concurrent_wf";
-    let slot = Utc::now() - chrono::Duration::minutes(1);
+    let slot = Timestamp::now() - jiff::SignedDuration::from_mins(1);
     let sched_id = insert_buffered_schedule(&mut conn, wf_name, slot).await;
 
     let mut locker = AsyncPgConnection::establish(&url)
@@ -628,7 +634,7 @@ async fn lock_waiters(conn: &mut AsyncPgConnection) -> i64 {
 async fn test_drain_that_lost_its_claim_does_not_write() {
     let (mut conn, url, _c) = setup_db().await;
     let wf_name = "ha_drain_lost_claim_wf";
-    let slot = Utc::now() - chrono::Duration::seconds(30);
+    let slot = Timestamp::now() - jiff::SignedDuration::from_secs(30);
     let sched_id = insert_buffered_schedule(&mut conn, wf_name, slot).await;
     let peer_token = Uuid::new_v4();
     conn.batch_execute(&format!(
@@ -655,7 +661,7 @@ async fn test_drain_that_lost_its_claim_does_not_write() {
     let (buffered, runs_started, token) = schedule_state(&mut conn, sched_id).await;
     assert_eq!(
         buffered,
-        serde_json::json!([slot.to_rfc3339()]),
+        serde_json::json!([autumn_harvest::time::rfc3339(slot)]),
         "the late write must not change the buffer"
     );
     assert_eq!(runs_started, 0, "the late write must not count the run");
@@ -670,7 +676,7 @@ async fn test_drain_that_lost_its_claim_does_not_write() {
 async fn test_buffered_drain_releases_its_claim() {
     let (mut conn, url, _c) = setup_db().await;
     let wf_name = "ha_drain_release_wf";
-    let slot = Utc::now() - chrono::Duration::seconds(30);
+    let slot = Timestamp::now() - jiff::SignedDuration::from_secs(30);
     let sched_id = insert_buffered_schedule(&mut conn, wf_name, slot).await;
 
     tick(&url, wf_name).await;
@@ -682,11 +688,13 @@ async fn test_buffered_drain_releases_its_claim() {
     assert_eq!(token, None, "the claim must be released after a dispatch");
 
     // The first run is still RUNNING, so a limit of one leaves no capacity.
-    let next_slot = slot + chrono::Duration::seconds(10);
+    let next_slot = slot + jiff::SignedDuration::from_secs(10);
     diesel::sql_query(
         "UPDATE harvest_schedules SET max_active_runs = 1, buffered_runs = $1 WHERE id = $2",
     )
-    .bind::<diesel::sql_types::Jsonb, _>(serde_json::json!([next_slot.to_rfc3339()]))
+    .bind::<diesel::sql_types::Jsonb, _>(serde_json::json!([autumn_harvest::time::rfc3339(
+        next_slot
+    )]))
     .bind::<diesel::sql_types::Uuid, _>(sched_id)
     .execute(&mut conn)
     .await
@@ -698,7 +706,7 @@ async fn test_buffered_drain_releases_its_claim() {
     let (buffered, _, token) = schedule_state(&mut conn, sched_id).await;
     assert_eq!(
         buffered,
-        serde_json::json!([next_slot.to_rfc3339()]),
+        serde_json::json!([autumn_harvest::time::rfc3339(next_slot)]),
         "the slot must wait for capacity"
     );
     assert_eq!(token, None, "the claim must be released with no capacity");
@@ -709,7 +717,7 @@ async fn test_buffered_drain_releases_its_claim() {
 async fn test_expired_claim_does_not_block_buffered_drain() {
     let (mut conn, url, _c) = setup_db().await;
     let wf_name = "ha_drain_expired_claim_wf";
-    let slot = Utc::now() - chrono::Duration::seconds(30);
+    let slot = Timestamp::now() - jiff::SignedDuration::from_secs(30);
     let sched_id = insert_buffered_schedule(&mut conn, wf_name, slot).await;
     set_claim(&mut conn, sched_id, Uuid::new_v4(), -10.0).await;
 

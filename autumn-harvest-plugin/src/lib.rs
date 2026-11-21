@@ -6,6 +6,8 @@
 // attribute with its reason.
 #![warn(clippy::expect_used, clippy::unwrap_used)]
 
+/// `GET` and `PATCH /admin/activity-types/{activity_name}/defaults`.
+mod activity_defaults_api;
 pub mod api;
 /// Optional per-client rate limiting for the management API (issue #1827).
 pub mod api_rate_limit;
@@ -31,6 +33,8 @@ pub mod audit_sink;
 /// AWS KMS binding for the core AES-256-GCM payload codec (issue #1825).
 #[cfg(feature = "aws-kms")]
 pub mod aws_kms;
+/// Harvest runtimes as Autumn background tasks.
+mod background;
 /// Startup and shutdown steps that `HarvestPlugin` and `HarvestEmbedding`
 /// share (issue #1613).
 mod boot;
@@ -49,9 +53,9 @@ pub mod dag_retry;
 /// Zero-setup local dev runtime (issue #525).
 ///
 /// Provisions an ephemeral PostgreSQL, applies the ordinary embedded
-/// migrations, runs a worker and serves the management API + Vantage UI — with
-/// no Docker, no `compose.yaml`, no `DATABASE_URL` and no `diesel migration
-/// run`. Development and evaluation only; see the module docs.
+/// migrations, runs a worker and serves the management API + Vantage UI. It
+/// needs no Docker, no `compose.yaml`, no `DATABASE_URL` and no `diesel
+/// migration run`. Development and evaluation only; see the module docs.
 #[cfg(feature = "dev-runtime")]
 pub mod dev;
 /// Durable routes: an Autumn route that runs as a keyed Harvest workflow.
@@ -62,6 +66,7 @@ pub mod embedding;
 #[cfg(all(test, any(feature = "aws-kms", feature = "vault-transit")))]
 mod kms_conformance;
 pub mod lineage;
+mod mcp_unserved;
 #[cfg(feature = "object-store")]
 pub mod object_store;
 /// OIDC login for Vantage and the management API (issue #1978).
@@ -99,6 +104,10 @@ pub mod status_summary;
 pub mod strict_query;
 /// Tenant binding for the management API (issue #1977).
 pub mod tenant;
+/// Test-only keepers that keep the tracing callsite cache stable (issue
+/// #2762).
+#[cfg(test)]
+mod trace_keepers;
 pub mod ui;
 pub mod usage;
 #[cfg(feature = "vault-transit")]

@@ -238,7 +238,6 @@ async fn test_request_specified_batch_size_flush() {
     let app = build_app(&pool);
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
 
-    // First start request -> should accumulate and return 202 Accepted
     let (status1, body1) = post_json(
         &app,
         "/workflows/test_batch_request/start",
@@ -257,7 +256,6 @@ async fn test_request_specified_batch_size_flush() {
     assert_eq!(body1["pending_count"], 1);
     assert_eq!(body1["max_size"], 3);
 
-    // Second start request -> accumulates and returns 202 Accepted
     let (status2, body2) = post_json(
         &app,
         "/workflows/test_batch_request/start",
@@ -273,7 +271,7 @@ async fn test_request_specified_batch_size_flush() {
     assert_eq!(status2, StatusCode::ACCEPTED, "body: {body2:?}");
     assert_eq!(body2["pending_count"], 2);
 
-    // Third start request -> reaches max_size (3), flushes immediately and returns 201 Created
+    // The third start reaches `batch_max_size`, so the batch flushes at once.
     let (status3, body3) = post_json(
         &app,
         "/workflows/test_batch_request/start",
@@ -291,7 +289,7 @@ async fn test_request_specified_batch_size_flush() {
     assert_eq!(body3["flushed"], true);
     let exec_id = body3["execution_id"].as_str().unwrap();
 
-    // Verify workflow execution row is created and input is a JSON array of all 3 payloads in arrival order
+    // The run input holds the three payloads in arrival order.
     let input_val: Value = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::id.eq(uuid::Uuid::parse_str(exec_id).unwrap()))
         .select(harvest_workflow_executions::input)
@@ -316,8 +314,7 @@ async fn test_macro_configured_batch_time_flush() {
     let app = build_app(&pool);
     let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
 
-    // Macro policy uses key_expr "tenant".
-    // Start first request -> returns 202 Accepted.
+    // The macro policy keys each batch on `tenant`.
     let (status1, body1) = post_json(
         &app,
         "/workflows/test_batch_macro/start",
@@ -331,7 +328,6 @@ async fn test_macro_configured_batch_time_flush() {
     assert_eq!(body1["batch_key"], "acme-corp");
     assert_eq!(body1["pending_count"], 1);
 
-    // Call GET /batches/pending visibility endpoint
     let (p_status, p_body) = get_json(&app, "/batches/pending").await;
     assert_eq!(p_status, StatusCode::OK, "body: {p_body:?}");
     assert!(p_body.is_array());
@@ -342,7 +338,7 @@ async fn test_macro_configured_batch_time_flush() {
     assert_eq!(list[0]["current_size"], 1);
     assert_eq!(list[0]["max_size"], 2);
 
-    // Now, force-expire the batch by updating its `fire_at` to the past
+    // Expire the batch: move its `fire_at` into the past.
     let rows_updated =
         diesel::sql_query("UPDATE harvest_event_batches SET fire_at = NOW() - INTERVAL '1 minute'")
             .execute(&mut conn)
@@ -350,18 +346,15 @@ async fn test_macro_configured_batch_time_flush() {
             .unwrap();
     assert_eq!(rows_updated, 1);
 
-    // Trigger fire_due_event_batches background sweep
     let fired = fire_due_event_batches(&mut conn, &None, &[], &NoOpMetrics)
         .await
         .unwrap();
     assert_eq!(fired, 1);
 
-    // Verify list is now empty
     let (p_status2, p_body2) = get_json(&app, "/batches/pending").await;
     assert_eq!(p_status2, StatusCode::OK);
     assert_eq!(p_body2.as_array().unwrap().len(), 0);
 
-    // Verify workflow execution exists with single-item payload array
     let exec_row: (uuid::Uuid, Value) = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq("test_batch_macro"))
         .select((
@@ -386,7 +379,7 @@ async fn test_batch_and_debounce_mutually_exclusive() {
     let pool = build_pool(&url);
     let app = build_app(&pool);
 
-    // Start request triggers both debounce and batch -> should return 400 Bad Request
+    // This start triggers both debounce and batching.
     let (status, body) = post_json(
         &app,
         "/workflows/test_batch_and_debounce/start",

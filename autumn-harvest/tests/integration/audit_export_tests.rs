@@ -21,8 +21,8 @@
 //!   `the_same_batch_is_retried_after_a_failure` — AC2's "never advances past
 //!   the failure".
 //! - `records_committed_after_a_batch_are_never_skipped` — the property that
-//!   rules out a `BIGSERIAL`: a row that becomes visible after an export tick
-//!   gets a LATER sequence and is still delivered.
+//!   rules out a `BIGSERIAL`. A row visible only after an export tick gets a
+//!   LATER sequence and is still delivered.
 //! - `a_crash_between_delivery_and_acknowledgement_redelivers` — AC9's restart
 //!   survival: at-least-once, and the cursor never skipped.
 //! - `a_stale_claim_cannot_acknowledge_over_a_fresher_one` — the claim-epoch
@@ -61,6 +61,7 @@
 //!   timeout checker's cadence and connection. A shard pool sized for one
 //!   connection can still export.
 
+use jiff_diesel::ToDiesel;
 use std::sync::{Arc, Mutex};
 
 use autumn_harvest::audit::{
@@ -77,6 +78,7 @@ use autumn_harvest::models::NewAuditRecord;
 use autumn_harvest::schema::harvest_audit_log;
 use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics};
+use autumn_harvest::time::sql::SqlTimestamp;
 use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::DbPool;
 
@@ -91,8 +93,8 @@ use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
-// `GLOBAL_AUDIT_EXPORT_CONFIG` is a process-wide static (by design — it mirrors
-// `GLOBAL_CALLBACK_CONFIG`'s "set once at startup" contract in production), so
+// `GLOBAL_AUDIT_EXPORT_CONFIG` is a process-wide static by design. It mirrors
+// `GLOBAL_CALLBACK_CONFIG`'s "set once at startup" contract in production. So
 // every test that installs one must serialize against the others.
 static TEST_SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
@@ -341,7 +343,7 @@ async fn unconfigured_export_never_touches_anything() {
         "no sequence may be assigned when no sink is configured"
     );
     assert_eq!(
-        export_status(&mut conn, 0, chrono::Utc::now())
+        export_status(&mut conn, 0, jiff::Timestamp::now())
             .await
             .expect("status query"),
         None,
@@ -605,7 +607,7 @@ async fn a_failing_sink_never_advances_the_cursor() {
         "the batch was attempted; it simply was not acknowledged"
     );
 
-    let status = export_status(&mut conn, 0, chrono::Utc::now())
+    let status = export_status(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("status")
         .expect("cursor exists");
@@ -630,7 +632,7 @@ async fn the_same_batch_is_retried_after_a_failure() {
     {
         use autumn_harvest::schema::harvest_audit_export_cursor::dsl as cur;
         diesel::update(cur::harvest_audit_export_cursor.find(0))
-            .set(cur::next_attempt_at.eq(chrono::Utc::now()))
+            .set(cur::next_attempt_at.eq(jiff::Timestamp::now().to_diesel()))
             .execute(&mut conn)
             .await
             .expect("clear backoff");
@@ -668,10 +670,10 @@ async fn records_committed_after_a_batch_are_never_skipped() {
         .await
         .expect("first tick");
 
-    // A record that becomes visible only AFTER the first export tick. With a
-    // pre-commit BIGSERIAL it could have taken a sequence below the cursor and
-    // been skipped forever; with exporter-assigned sequences it is simply
-    // still NULL and gets a later one.
+    // A record that becomes visible only AFTER the first export tick. A
+    // pre-commit BIGSERIAL could give it a sequence below the cursor, and it
+    // would be skipped forever. With exporter-assigned sequences it is still
+    // NULL and gets a later one.
     insert_audit_rows(&mut conn, 2).await;
     let processed = fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
         .await
@@ -717,7 +719,7 @@ async fn a_crash_between_delivery_and_acknowledgement_redelivers() {
         0,
         100,
         std::time::Duration::from_secs(0),
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await
     .expect("claim")
@@ -729,7 +731,7 @@ async fn a_crash_between_delivery_and_acknowledgement_redelivers() {
         0,
         claim.records[0].seq,
         claim.records[claim.records.len() - 1].seq,
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     );
     let batch = AuditBatch {
         shard: 0,
@@ -791,7 +793,7 @@ async fn a_stale_claim_cannot_acknowledge_over_a_fresher_one() {
         0,
         100,
         std::time::Duration::from_secs(0),
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await
     .expect("first claim")
@@ -803,7 +805,7 @@ async fn a_stale_claim_cannot_acknowledge_over_a_fresher_one() {
         0,
         100,
         std::time::Duration::from_secs(60),
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await
     .expect("second claim")
@@ -820,7 +822,7 @@ async fn a_stale_claim_cannot_acknowledge_over_a_fresher_one() {
             through_seq: 2,
             status: 200,
         },
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await
     .expect("apply");
@@ -836,7 +838,7 @@ async fn a_stale_claim_cannot_acknowledge_over_a_fresher_one() {
             through_seq: 2,
             status: 200,
         },
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await
     .expect("apply");
@@ -858,7 +860,7 @@ async fn redrive_re_exports_byte_identical_records() {
     assert_eq!(cursor_acked(&mut conn, 0).await, 5);
 
     // The SIEM lost everything after seq 2.
-    let outcome = rewind_cursor(&mut conn, 0, RewindRequest::Seq(2), chrono::Utc::now())
+    let outcome = rewind_cursor(&mut conn, 0, RewindRequest::Seq(2), jiff::Timestamp::now())
         .await
         .expect("rewind");
     assert_eq!(outcome, RewindOutcome::Rewound { from: 5, to: 2 });
@@ -901,7 +903,7 @@ async fn redrive_refuses_to_move_the_cursor_forward() {
         .expect("tick");
     let _ = &sink;
 
-    let outcome = rewind_cursor(&mut conn, 0, RewindRequest::Seq(99), chrono::Utc::now())
+    let outcome = rewind_cursor(&mut conn, 0, RewindRequest::Seq(99), jiff::Timestamp::now())
         .await
         .expect("rewind");
     uninstall();
@@ -921,7 +923,7 @@ async fn redrive_of_a_shard_that_never_exported_is_reported_not_configured() {
     let _guard = TEST_SERIAL.lock().await;
     uninstall();
     let (mut conn, _c) = make_conn().await;
-    let outcome = rewind_cursor(&mut conn, 7, RewindRequest::Seq(0), chrono::Utc::now())
+    let outcome = rewind_cursor(&mut conn, 7, RewindRequest::Seq(0), jiff::Timestamp::now())
         .await
         .expect("rewind");
     assert_eq!(outcome, RewindOutcome::NotConfigured);
@@ -935,7 +937,7 @@ async fn redrive_by_timestamp_re_exports_from_that_instant() {
     insert_audit_rows(&mut conn, 3).await;
     // A clock boundary between the first three records and the next three.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let boundary = chrono::Utc::now();
+    let boundary = jiff::Timestamp::now();
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     insert_audit_rows(&mut conn, 3).await;
 
@@ -948,7 +950,7 @@ async fn redrive_by_timestamp_re_exports_from_that_instant() {
         &mut conn,
         0,
         RewindRequest::Before(boundary),
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await
     .expect("rewind");
@@ -980,7 +982,7 @@ async fn an_in_flight_acknowledgement_cannot_undo_a_redrive() {
         0,
         100,
         std::time::Duration::from_secs(60),
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await
     .expect("claim")
@@ -993,14 +995,14 @@ async fn an_in_flight_acknowledgement_cannot_undo_a_redrive() {
             through_seq: 5,
             status: 200,
         },
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await
     .expect("first ack");
     assert_eq!(cursor_acked(&mut conn, 0).await, 5);
 
     // ...an operator redrives...
-    let redrive = rewind_cursor(&mut conn, 0, RewindRequest::Seq(1), chrono::Utc::now())
+    let redrive = rewind_cursor(&mut conn, 0, RewindRequest::Seq(1), jiff::Timestamp::now())
         .await
         .expect("rewind");
     assert_eq!(redrive, RewindOutcome::Rewound { from: 5, to: 1 });
@@ -1015,7 +1017,7 @@ async fn an_in_flight_acknowledgement_cannot_undo_a_redrive() {
             through_seq: 5,
             status: 200,
         },
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await
     .expect("stale ack");
@@ -1039,7 +1041,7 @@ async fn redrive_recoverable_count_matches_the_full_window_when_nothing_was_purg
         .expect("tick");
     uninstall();
 
-    let outcome = rewind_cursor(&mut conn, 0, RewindRequest::Seq(0), chrono::Utc::now())
+    let outcome = rewind_cursor(&mut conn, 0, RewindRequest::Seq(0), jiff::Timestamp::now())
         .await
         .expect("rewind");
     assert_eq!(outcome, RewindOutcome::Rewound { from: 5, to: 0 });
@@ -1109,7 +1111,10 @@ async fn redrive_recoverable_count_falls_short_when_a_purge_already_removed_part
 
     // Records 1-3 are old enough to purge; 4-5 are not.
     diesel::update(harvest_audit_log::table.filter(harvest_audit_log::export_seq.le(3)))
-        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows 1-3");
@@ -1120,7 +1125,7 @@ async fn redrive_recoverable_count_falls_short_when_a_purge_already_removed_part
     uninstall();
 
     // An operator, unaware of the purge, redrives everything back to the start.
-    let outcome = rewind_cursor(&mut conn, 0, RewindRequest::Seq(0), chrono::Utc::now())
+    let outcome = rewind_cursor(&mut conn, 0, RewindRequest::Seq(0), jiff::Timestamp::now())
         .await
         .expect("rewind");
     assert_eq!(
@@ -1163,7 +1168,10 @@ async fn age_rows(conn: &mut diesel_async::AsyncPgConnection, lo: i64, hi: i64, 
             .filter(harvest_audit_log::export_seq.gt(lo))
             .filter(harvest_audit_log::export_seq.le(hi)),
     )
-    .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(days)))
+    .set(
+        harvest_audit_log::occurred_at
+            .eq((jiff::Timestamp::now() - autumn_harvest::time::days(days)).to_diesel()),
+    )
     .execute(conn)
     .await
     .expect("age rows");
@@ -1191,8 +1199,8 @@ async fn before_redrive_flags_a_prefix_retention_already_purged() {
     assert_eq!(deleted, 3, "records 1-3 are aged and acknowledged");
 
     // The instant names all five records. Three are gone.
-    let request = RewindRequest::Before(chrono::Utc::now() - chrono::Duration::days(400));
-    let outcome = rewind_cursor(&mut conn, 0, request, chrono::Utc::now())
+    let request = RewindRequest::Before(jiff::Timestamp::now() - autumn_harvest::time::days(400));
+    let outcome = rewind_cursor(&mut conn, 0, request, jiff::Timestamp::now())
         .await
         .expect("rewind");
     assert_eq!(outcome, RewindOutcome::Rewound { from: 5, to: 3 });
@@ -1212,8 +1220,8 @@ async fn before_redrive_flags_a_refusal_when_every_matching_record_was_purged() 
         .await
         .expect("purge");
 
-    let request = RewindRequest::Before(chrono::Utc::now() - chrono::Duration::days(400));
-    let outcome = rewind_cursor(&mut conn, 0, request, chrono::Utc::now())
+    let request = RewindRequest::Before(jiff::Timestamp::now() - autumn_harvest::time::days(400));
+    let outcome = rewind_cursor(&mut conn, 0, request, jiff::Timestamp::now())
         .await
         .expect("rewind");
     assert!(matches!(outcome, RewindOutcome::NoOp { .. }));
@@ -1229,8 +1237,8 @@ async fn before_redrive_is_not_flagged_when_nothing_was_purged() {
     let (mut conn, _c) = make_conn().await;
     export_all(&mut conn, 5).await;
 
-    let request = RewindRequest::Before(chrono::Utc::now() - chrono::Duration::days(400));
-    let outcome = rewind_cursor(&mut conn, 0, request, chrono::Utc::now())
+    let request = RewindRequest::Before(jiff::Timestamp::now() - autumn_harvest::time::days(400));
+    let outcome = rewind_cursor(&mut conn, 0, request, jiff::Timestamp::now())
         .await
         .expect("rewind");
     assert_eq!(outcome, RewindOutcome::Rewound { from: 5, to: 0 });
@@ -1248,8 +1256,8 @@ async fn before_redrive_is_not_flagged_when_the_instant_is_after_every_purged_re
         .expect("purge");
 
     // Records 4-5 are recent. The purged records predate this instant.
-    let request = RewindRequest::Before(chrono::Utc::now() - chrono::Duration::days(30));
-    let outcome = rewind_cursor(&mut conn, 0, request, chrono::Utc::now())
+    let request = RewindRequest::Before(jiff::Timestamp::now() - autumn_harvest::time::days(30));
+    let outcome = rewind_cursor(&mut conn, 0, request, jiff::Timestamp::now())
         .await
         .expect("rewind");
     assert_eq!(outcome, RewindOutcome::Rewound { from: 5, to: 3 });
@@ -1267,7 +1275,7 @@ async fn seq_redrive_is_never_flagged() {
         .expect("purge");
 
     let request = RewindRequest::Seq(0);
-    let outcome = rewind_cursor(&mut conn, 0, request, chrono::Utc::now())
+    let outcome = rewind_cursor(&mut conn, 0, request, jiff::Timestamp::now())
         .await
         .expect("rewind");
     assert!(
@@ -1291,7 +1299,7 @@ async fn the_purge_watermark_never_moves_backwards() {
         .await
         .expect("second purge");
 
-    let request = RewindRequest::Before(chrono::Utc::now() - chrono::Duration::days(150));
+    let request = RewindRequest::Before(jiff::Timestamp::now() - autumn_harvest::time::days(150));
     let outcome = RewindOutcome::Rewound { from: 4, to: 3 };
     assert!(window_truncated(&mut conn, request, outcome).await);
 }
@@ -1303,7 +1311,10 @@ async fn purging_unsequenced_records_leaves_no_watermark() {
     let (mut conn, _c) = make_conn().await;
     insert_audit_rows(&mut conn, 3).await;
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -1313,20 +1324,21 @@ async fn purging_unsequenced_records_leaves_no_watermark() {
     assert_eq!(deleted, 3, "export never ran, so nothing protects the rows");
 
     // A `before` request never sees an unsequenced record, so none can be lost.
-    let request = RewindRequest::Before(chrono::Utc::now() - chrono::Duration::days(400));
+    let request = RewindRequest::Before(jiff::Timestamp::now() - autumn_harvest::time::days(400));
     let outcome = RewindOutcome::Rewound { from: 1, to: 0 };
     assert!(!window_truncated(&mut conn, request, outcome).await);
 }
 
-async fn watermark_row(
-    conn: &mut diesel_async::AsyncPgConnection,
-) -> Vec<(chrono::DateTime<chrono::Utc>, i64)> {
+async fn watermark_row(conn: &mut diesel_async::AsyncPgConnection) -> Vec<(jiff::Timestamp, i64)> {
     use autumn_harvest::schema::harvest_audit_purge_watermark::dsl as mark;
     mark::harvest_audit_purge_watermark
         .select((mark::max_purged_occurred_at, mark::purged_records))
-        .load(conn)
+        .load::<(SqlTimestamp, i64)>(conn)
         .await
         .expect("watermark rows")
+        .into_iter()
+        .map(|(at, records)| (at.to_jiff(), records))
+        .collect()
 }
 
 #[tokio::test]
@@ -1342,9 +1354,9 @@ async fn one_purge_records_the_latest_occurred_at_it_removed() {
 
     let rows = watermark_row(&mut conn).await;
     assert_eq!(rows.len(), 1, "the table holds one row");
-    let expected = chrono::Utc::now() - chrono::Duration::days(100);
+    let expected = jiff::Timestamp::now() - autumn_harvest::time::days(100);
     assert!(
-        (rows[0].0 - expected).num_seconds().abs() < 60,
+        (rows[0].0 - expected).as_secs().abs() < 60,
         "the watermark is the LATEST purged instant, not the earliest"
     );
     assert_eq!(rows[0].1, 2);
@@ -1378,7 +1390,7 @@ async fn a_purge_with_nothing_eligible_returns_zero_and_writes_no_watermark() {
     assert_eq!(deleted, 0);
     assert_eq!(
         watermark_row(&mut conn).await,
-        [] as [(chrono::DateTime<chrono::Utc>, i64); 0]
+        [] as [(jiff::Timestamp, i64); 0]
     );
 }
 
@@ -1387,10 +1399,10 @@ async fn the_flag_includes_the_exact_watermark_instant() {
     let _guard = TEST_SERIAL.lock().await;
     let (mut conn, _c) = make_conn().await;
     export_all(&mut conn, 2).await;
-    let t = chrono::Utc::now() - chrono::Duration::days(365);
-    let t = chrono::DateTime::from_timestamp_micros(t.timestamp_micros()).expect("instant");
+    let t = jiff::Timestamp::now() - autumn_harvest::time::days(365);
+    let t = jiff::Timestamp::from_microsecond(t.as_microsecond()).expect("instant");
     diesel::update(harvest_audit_log::table.filter(harvest_audit_log::export_seq.eq(1)))
-        .set(harvest_audit_log::occurred_at.eq(t))
+        .set(harvest_audit_log::occurred_at.eq(t.to_diesel()))
         .execute(&mut conn)
         .await
         .expect("age row");
@@ -1400,7 +1412,7 @@ async fn the_flag_includes_the_exact_watermark_instant() {
 
     let outcome = RewindOutcome::Rewound { from: 2, to: 1 };
     assert!(window_truncated(&mut conn, RewindRequest::Before(t), outcome).await);
-    let later = t + chrono::Duration::microseconds(1);
+    let later = t + jiff::SignedDuration::from_micros(1);
     assert!(!window_truncated(&mut conn, RewindRequest::Before(later), outcome).await);
 }
 
@@ -1413,7 +1425,8 @@ async fn a_record_the_purge_spares_never_moves_the_watermark() {
     diesel::update(harvest_audit_log::table.filter(harvest_audit_log::export_seq.eq(1)))
         .set((
             harvest_audit_log::operation.eq(audit::OP_AUDIT_EXPORT_DECOMMISSION),
-            harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(300)),
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(300)).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -1425,7 +1438,7 @@ async fn a_record_the_purge_spares_never_moves_the_watermark() {
     assert_eq!(deleted, 1, "only record 2 goes");
 
     // Record 1 sits at 300 days. The purged record 2 sits at 365 days.
-    let request = RewindRequest::Before(chrono::Utc::now() - chrono::Duration::days(330));
+    let request = RewindRequest::Before(jiff::Timestamp::now() - autumn_harvest::time::days(330));
     let outcome = RewindOutcome::Rewound { from: 2, to: 0 };
     assert!(!window_truncated(&mut conn, request, outcome).await);
 }
@@ -1439,7 +1452,7 @@ async fn an_unconfigured_shard_is_never_flagged() {
     purge_old_audit_records(&mut conn, 90, false, &[0], &[])
         .await
         .expect("purge");
-    let request = RewindRequest::Before(chrono::Utc::now() - chrono::Duration::days(400));
+    let request = RewindRequest::Before(jiff::Timestamp::now() - autumn_harvest::time::days(400));
     assert!(!window_truncated(&mut conn, request, RewindOutcome::NotConfigured).await);
 }
 
@@ -1458,7 +1471,7 @@ async fn export_status_reports_cursor_lag_and_state() {
         .expect("tick");
 
     // A batch size of 2 leaves a backlog after one tick.
-    let status = export_status(&mut conn, 0, chrono::Utc::now())
+    let status = export_status(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("status")
         .expect("cursor");
@@ -1493,7 +1506,7 @@ async fn export_status_reports_cursor_lag_and_state() {
         > 0
     {}
     uninstall();
-    let status = export_status(&mut conn, 0, chrono::Utc::now())
+    let status = export_status(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("status")
         .expect("cursor");
@@ -1521,7 +1534,10 @@ async fn retention_never_purges_an_unexported_record() {
         .expect("tick");
     assert_eq!(cursor_acked(&mut conn, 0).await, 2);
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -1560,7 +1576,10 @@ async fn retention_is_unchanged_when_export_is_unconfigured() {
     let (mut conn, _c) = make_conn().await;
     insert_audit_rows(&mut conn, 5).await;
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -1589,13 +1608,13 @@ async fn a_failure_schedules_a_future_retry_without_moving_the_cursor() {
         0,
         10,
         std::time::Duration::from_secs(60),
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await
     .expect("claim")
     .expect("claimable");
 
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let outcome = classify_export_outcome(
         &SinkAttempt::transport_error("connection refused".to_string()),
         1,
@@ -1609,7 +1628,7 @@ async fn a_failure_schedules_a_future_retry_without_moving_the_cursor() {
             .expect("apply")
     );
 
-    let status = export_status(&mut conn, 0, chrono::Utc::now())
+    let status = export_status(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("status")
         .expect("cursor");
@@ -1625,7 +1644,7 @@ async fn a_failure_schedules_a_future_retry_without_moving_the_cursor() {
         0,
         10,
         std::time::Duration::from_secs(60),
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await
     .expect("claim");
@@ -1634,10 +1653,10 @@ async fn a_failure_schedules_a_future_retry_without_moving_the_cursor() {
 
 // ── The lag gauge measures the OLDEST unacknowledged record ─────────────────
 
-// The feature's central SLO signal. Defined against the *newest* unexported
-// record instead, this gauge would read ~0 under sustained load during exactly
-// the outage an operator needs to see, because a stuck exporter always has a
-// brand-new unexported record.
+// The feature's central SLO signal. Suppose it measured the *newest*
+// unexported record instead. A stuck exporter always has a brand-new
+// unexported record. So the gauge would read ~0 under sustained load, during
+// exactly the outage an operator needs to see.
 #[tokio::test]
 async fn lag_is_the_age_of_the_oldest_unacknowledged_record_not_the_newest() {
     let _guard = TEST_SERIAL.lock().await;
@@ -1653,14 +1672,18 @@ async fn lag_is_the_age_of_the_oldest_unacknowledged_record_not_the_newest() {
         .await
         .expect("first row");
     diesel::update(harvest_audit_log::table.filter(harvest_audit_log::id.eq(oldest_id)))
-        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::seconds(120)))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(120)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("backdate");
 
-    let lag = autumn_harvest::audit_export::export_lag_seconds(&mut conn, 0, chrono::Utc::now())
-        .await
-        .expect("lag query");
+    let lag =
+        autumn_harvest::audit_export::export_lag_seconds(&mut conn, 0, jiff::Timestamp::now())
+            .await
+            .expect("lag query");
     assert!(
         lag > 100.0,
         "lag must track the OLDEST unacknowledged record (~120s); a \
@@ -1670,7 +1693,7 @@ async fn lag_is_the_age_of_the_oldest_unacknowledged_record_not_the_newest() {
 
     // The admin view's O(backlog) variant must agree with the cheap one.
     let (pending, admin_lag) =
-        autumn_harvest::audit_export::pending_and_lag(&mut conn, 0, chrono::Utc::now())
+        autumn_harvest::audit_export::pending_and_lag(&mut conn, 0, jiff::Timestamp::now())
             .await
             .expect("admin lag");
     assert_eq!(pending, 2);
@@ -1689,7 +1712,10 @@ async fn lag_covers_records_that_are_sequenced_but_not_yet_acknowledged() {
     let (mut conn, _c) = make_conn().await;
     insert_audit_rows(&mut conn, 2).await;
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::seconds(90)))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(90)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -1702,7 +1728,7 @@ async fn lag_covers_records_that_are_sequenced_but_not_yet_acknowledged() {
     uninstall();
 
     let lag =
-        autumn_harvest::audit_export::export_lag_seconds(&mut conn, acked, chrono::Utc::now())
+        autumn_harvest::audit_export::export_lag_seconds(&mut conn, acked, jiff::Timestamp::now())
             .await
             .expect("lag");
     assert!(
@@ -1742,7 +1768,8 @@ async fn lag_is_not_fooled_by_a_late_committing_row_with_a_lower_sequence() {
     // because it became visible to the exporter later.
     diesel::update(harvest_audit_log::table.filter(harvest_audit_log::id.eq(old_row)))
         .set((
-            harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::seconds(200)),
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(200)).to_diesel()),
             harvest_audit_log::export_seq.eq(2),
         ))
         .execute(&mut conn)
@@ -1752,16 +1779,18 @@ async fn lag_is_not_fooled_by_a_late_committing_row_with_a_lower_sequence() {
     // The short transaction: recent `occurred_at`, LOWER sequence.
     diesel::update(harvest_audit_log::table.filter(harvest_audit_log::id.eq(new_row)))
         .set((
-            harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::seconds(5)),
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - jiff::SignedDuration::from_secs(5)).to_diesel()),
             harvest_audit_log::export_seq.eq(1),
         ))
         .execute(&mut conn)
         .await
         .expect("sequence the short transaction");
 
-    let lag = autumn_harvest::audit_export::export_lag_seconds(&mut conn, 0, chrono::Utc::now())
-        .await
-        .expect("lag query");
+    let lag =
+        autumn_harvest::audit_export::export_lag_seconds(&mut conn, 0, jiff::Timestamp::now())
+            .await
+            .expect("lag query");
     assert!(
         lag > 150.0,
         "the oldest pending record is ~200s old even though it holds the \
@@ -1771,7 +1800,7 @@ async fn lag_is_not_fooled_by_a_late_committing_row_with_a_lower_sequence() {
 
     // The admin view's O(backlog) variant must agree with the bounded one.
     let (pending, admin_lag) =
-        autumn_harvest::audit_export::pending_and_lag(&mut conn, 0, chrono::Utc::now())
+        autumn_harvest::audit_export::pending_and_lag(&mut conn, 0, jiff::Timestamp::now())
             .await
             .expect("admin lag");
     assert_eq!(pending, 2);
@@ -1822,9 +1851,10 @@ async fn lag_window_still_catches_skew_at_its_last_covered_position() {
     .await
     .expect("insert the skewed row");
 
-    let lag = autumn_harvest::audit_export::export_lag_seconds(&mut conn, 0, chrono::Utc::now())
-        .await
-        .expect("lag query");
+    let lag =
+        autumn_harvest::audit_export::export_lag_seconds(&mut conn, 0, jiff::Timestamp::now())
+            .await
+            .expect("lag query");
     assert!(
         lag > 400.0,
         "the skewed row sits at the last position the window covers and \
@@ -1868,9 +1898,10 @@ async fn lag_window_does_not_reach_skew_just_beyond_it() {
     .await
     .expect("insert the skewed row");
 
-    let lag = autumn_harvest::audit_export::export_lag_seconds(&mut conn, 0, chrono::Utc::now())
-        .await
-        .expect("lag query");
+    let lag =
+        autumn_harvest::audit_export::export_lag_seconds(&mut conn, 0, jiff::Timestamp::now())
+            .await
+            .expect("lag query");
     assert!(
         lag < 30.0,
         "the skewed row sits one position past the window and is not, by \
@@ -1889,7 +1920,7 @@ async fn a_live_lease_blocks_a_second_claim_until_it_expires() {
     insert_audit_rows(&mut conn, 3).await;
     ensure_cursor_row(&mut conn, 0).await.expect("cursor row");
 
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let lease = std::time::Duration::from_secs(60);
     let first = claim_shard(&mut conn, 0, 100, lease, now)
         .await
@@ -1913,7 +1944,7 @@ async fn a_live_lease_blocks_a_second_claim_until_it_expires() {
             0,
             100,
             lease,
-            now + chrono::Duration::seconds(59)
+            now + jiff::SignedDuration::from_secs(59)
         )
         .await
         .expect("claim")
@@ -1927,7 +1958,7 @@ async fn a_live_lease_blocks_a_second_claim_until_it_expires() {
         0,
         100,
         lease,
-        now + chrono::Duration::seconds(61),
+        now + jiff::SignedDuration::from_secs(61),
     )
     .await
     .expect("claim")
@@ -1996,7 +2027,7 @@ async fn a_non_default_shard_labels_its_own_records_and_keeps_its_own_cursor() {
     assert_eq!(header, "3");
     assert_eq!(cursor_acked(&mut conn, 3).await, 3);
     assert_eq!(
-        export_status(&mut conn, 0, chrono::Utc::now())
+        export_status(&mut conn, 0, jiff::Timestamp::now())
             .await
             .expect("status"),
         None,
@@ -2011,9 +2042,9 @@ async fn the_exported_record_carries_both_the_source_shard_and_the_rows_own_shar
     let _guard = TEST_SERIAL.lock().await;
     let sink = install(Arc::new(RecordingSink::new(200)), 100);
     let (mut conn, _c) = make_conn().await;
-    // A control-plane mutation records the shard it acted on while its audit
-    // row lands on the default shard — the two genuinely differ, and a
-    // receiver correlating them must see both.
+    // A control-plane mutation records the shard it acted on. Its audit row
+    // lands on the default shard. The two differ, and a receiver correlating
+    // them must see both.
     let record = NewAuditRecord {
         actor: "alice",
         operation: "audit_export.redrive",
@@ -2063,7 +2094,10 @@ async fn retention_purges_nothing_when_export_is_configured_but_has_not_run_yet(
     let (mut conn, _c) = make_conn().await;
     insert_audit_rows(&mut conn, 5).await;
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -2097,16 +2131,19 @@ async fn removing_the_sink_alone_does_not_resume_retention() {
         .expect("tick");
 
     // The operator removes the sink from THIS process and stops there. That is
-    // deliberately not enough: the guard keys on the shard's live cursor row,
-    // not on process-local configuration, precisely so a worker outage cannot
-    // let a web process delete the records that outage stranded. Retiring the
-    // cursor is the second, explicit step -- see
+    // deliberately not enough. The guard keys on the shard's live cursor row,
+    // not on process-local configuration. So a worker outage cannot let a web
+    // process delete the records that outage stranded. Retiring the cursor is
+    // the second, explicit step -- see
     // `retention_resumes_only_after_the_cursor_is_decommissioned` and the
     // escalation section of `docs/runbooks/harvest-alerts.md`.
     uninstall();
     insert_audit_rows(&mut conn, 2).await;
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -2130,9 +2167,9 @@ async fn removing_the_sink_alone_does_not_resume_retention() {
     assert_eq!(remaining, 2);
 }
 
-// A retired shard's status must not keep reporting a growing backlog: no
-// exporter owes those records, so an alert on `pending_records` there could
-// never be cleared by any action.
+// A retired shard's status must not keep reporting a growing backlog. No
+// exporter owes those records. No action could clear an alert on
+// `pending_records` there.
 #[tokio::test]
 async fn a_retired_shard_reports_no_backlog() {
     let _guard = TEST_SERIAL.lock().await;
@@ -2144,14 +2181,14 @@ async fn a_retired_shard_reports_no_backlog() {
         .expect("tick");
     uninstall();
 
-    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, chrono::Utc::now())
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("decommission");
 
     // Audited operations keep happening after the retirement.
     insert_audit_rows(&mut conn, 4).await;
 
-    let status = autumn_harvest::audit_export::export_status(&mut conn, 0, chrono::Utc::now())
+    let status = autumn_harvest::audit_export::export_status(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("status")
         .expect("a retired cursor is still reported");
@@ -2171,10 +2208,10 @@ async fn a_retired_shard_reports_no_backlog() {
 }
 
 // Retiring a cursor must invalidate a delivery already in flight. `apply_outcome`
-// is guarded on (shard, claim_epoch) alone, so without an epoch bump an attempt
-// claimed before the retirement lands after it -- moving a cursor the status
-// route now reports as a frozen RETIRED snapshot, and racing retention, which
-// is free to purge the shard the moment it is retired.
+// is guarded on (shard, claim_epoch) alone. Without an epoch bump, an attempt
+// claimed before the retirement lands after it. It moves a cursor that the
+// status route reports as a frozen RETIRED snapshot. It also races retention,
+// which may purge the shard the moment it is retired.
 #[tokio::test]
 async fn retiring_a_cursor_invalidates_a_delivery_already_in_flight() {
     let _guard = TEST_SERIAL.lock().await;
@@ -2189,7 +2226,7 @@ async fn retiring_a_cursor_invalidates_a_delivery_already_in_flight() {
         0,
         100,
         std::time::Duration::from_secs(60),
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await
     .expect("claim")
@@ -2197,7 +2234,7 @@ async fn retiring_a_cursor_invalidates_a_delivery_already_in_flight() {
     assert_eq!(claim.records.len(), 3);
 
     // The operator retires the cursor while that delivery is outstanding.
-    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, chrono::Utc::now())
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("decommission");
 
@@ -2210,7 +2247,7 @@ async fn retiring_a_cursor_invalidates_a_delivery_already_in_flight() {
             through_seq: 3,
             status: 200,
         },
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await
     .expect("apply is not an error, it simply matches nothing");
@@ -2223,7 +2260,7 @@ async fn retiring_a_cursor_invalidates_a_delivery_already_in_flight() {
          retention may already have purged those records"
     );
 
-    let status = autumn_harvest::audit_export::export_status(&mut conn, 0, chrono::Utc::now())
+    let status = autumn_harvest::audit_export::export_status(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("status")
         .expect("row");
@@ -2234,10 +2271,10 @@ async fn retiring_a_cursor_invalidates_a_delivery_already_in_flight() {
     );
 }
 
-// The other half of the epoch bump: a retirement that commits between
-// `ensure_cursor_row` and the claim's locked read must stop the scanner taking
-// a NEW claim, not merely invalidate the old one. Retention may purge the
-// shard's records the moment it is retired.
+// The other half of the epoch bump. A retirement may commit between
+// `ensure_cursor_row` and the claim's locked read. It must stop the scanner
+// taking a NEW claim, not merely invalidate the old one. Retention may purge
+// the shard's records the moment it is retired.
 #[tokio::test]
 async fn a_retired_cursor_cannot_be_claimed() {
     let _guard = TEST_SERIAL.lock().await;
@@ -2252,7 +2289,7 @@ async fn a_retired_cursor_cannot_be_claimed() {
         0,
         100,
         std::time::Duration::from_secs(60),
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await
     .expect("claim")
@@ -2265,12 +2302,12 @@ async fn a_retired_cursor_cannot_be_claimed() {
             through_seq: 3,
             status: 200,
         },
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await
     .expect("ack");
 
-    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, chrono::Utc::now())
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("decommission");
     insert_audit_rows(&mut conn, 2).await;
@@ -2282,7 +2319,7 @@ async fn a_retired_cursor_cannot_be_claimed() {
         0,
         100,
         std::time::Duration::from_secs(60),
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await
     .expect("claim query succeeds");
@@ -2303,16 +2340,16 @@ async fn a_retired_cursor_cannot_be_claimed() {
     assert_eq!(unsequenced, 2, "a refused claim must assign no sequences");
 }
 
-// The sibling invariant -- a resident of `enforce_timeouts_once` that fails on
-// every tick must not stop audit export, and an export failure must not stop
-// timeout enforcement -- is guarded in
+// The sibling invariant has its guard in
 // `autumn_harvest::timeout::tests::audit_export_runs_before_the_first_fallible_resident`.
+// A resident of `enforce_timeouts_once` that fails on every tick must not stop
+// audit export. An export failure must not stop timeout enforcement.
 //
-// It lives there as a source-order assertion rather than here as a DB test
-// because the scenario cannot be seeded: `harvest_task_queue.workflow_exec_id`
-// is a foreign key, so a task naming a nonexistent execution is rejected by the
-// schema, and an unregistered payload codec decodes to the `undecodable_marker`
-// instead of erroring (issue #608). No supported insert produces a
+// It is a source-order assertion there, not a DB test here, because the
+// scenario cannot be seeded. `harvest_task_queue.workflow_exec_id` is a
+// foreign key, so the schema rejects a task naming a nonexistent execution.
+// An unregistered payload codec decodes to the `undecodable_marker` instead of
+// erroring (issue #608). No supported insert produces a
 // deterministically-failing resident.
 
 // ── Redrive edge cases ──────────────────────────────────────────────────────
@@ -2331,8 +2368,8 @@ async fn redrive_before_an_instant_predating_every_record_re_exports_everything(
     let outcome = rewind_cursor(
         &mut conn,
         0,
-        RewindRequest::Before(chrono::Utc::now() - chrono::Duration::days(365)),
-        chrono::Utc::now(),
+        RewindRequest::Before(jiff::Timestamp::now() - autumn_harvest::time::days(365)),
+        jiff::Timestamp::now(),
     )
     .await
     .expect("rewind");
@@ -2359,8 +2396,8 @@ async fn redrive_before_a_future_instant_is_refused_rather_than_skipping_records
     let outcome = rewind_cursor(
         &mut conn,
         0,
-        RewindRequest::Before(chrono::Utc::now() + chrono::Duration::days(1)),
-        chrono::Utc::now(),
+        RewindRequest::Before(jiff::Timestamp::now() + autumn_harvest::time::days(1)),
+        jiff::Timestamp::now(),
     )
     .await
     .expect("rewind");
@@ -2652,10 +2689,10 @@ async fn a_dedicated_export_tasks_unsharded_fallback_labels_the_pools_default_sh
 // `enforce_timeouts_once` is a `pub` primitive an embedder may drive by hand,
 // and nothing inside it can verify which database `conn` points at. An earlier
 // revision inferred from `shard_assignments.len() == 1` that `conn` belonged
-// to that shard and exported through it directly; this pins the reason that
-// inference is gone. Getting it wrong is silent cross-shard corruption of the
-// `(shard, seq)` identity the whole feature rests on, whereas acquiring the
-// exact pool can at worst skip a shard, loudly.
+// to that shard and exported through it directly. This pins the reason that
+// inference is gone. A wrong guess silently corrupts, across shards, the
+// `(shard, seq)` identity the whole feature rests on. Acquiring the exact pool
+// can at worst skip a shard, loudly.
 #[tokio::test]
 async fn a_mismatched_connection_never_stamps_another_shards_rows() {
     let _guard = TEST_SERIAL.lock().await;
@@ -2663,8 +2700,8 @@ async fn a_mismatched_connection_never_stamps_another_shards_rows() {
     let (mut conn, container) = make_conn().await;
     insert_audit_rows(&mut conn, 3).await;
 
-    // The sharded pool maps shard 0 to this same database, but we claim the
-    // assignment is shard 7 -- the shape a hand-driving embedder can produce.
+    // The sharded pool maps shard 0 to this same database. The test passes an
+    // assignment of shard 7, a shape a hand-driving embedder can produce.
     let pool = single_connection_pool(&container).await;
     let sharded = autumn_harvest::shard::ShardedDbPool::single(pool);
 
@@ -2708,8 +2745,8 @@ async fn a_mismatched_connection_never_stamps_another_shards_rows() {
 //
 // Split web/worker deployment: only the worker configures the sink, and the
 // web app runs the retention sweep. The sweeping process therefore answers
-// "is export configured?" with `false`, so the guard has to come from durable,
-// shared state — the exporter's heartbeat on the cursor row.
+// "is export configured?" with `false`. So the guard comes from durable,
+// shared state: the exporter's heartbeat on the cursor row.
 #[tokio::test]
 async fn retention_respects_a_live_exporter_heartbeat_from_another_process() {
     let _guard = TEST_SERIAL.lock().await;
@@ -2723,7 +2760,10 @@ async fn retention_respects_a_live_exporter_heartbeat_from_another_process() {
         .expect("tick");
     assert_eq!(cursor_acked(&mut conn, 0).await, 2);
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -2747,9 +2787,9 @@ async fn retention_respects_a_live_exporter_heartbeat_from_another_process() {
 }
 
 // The other half of the same knob. Retiring export is an EXPLICIT operator
-// action, never an inferred one: an earlier revision expired the guard 24h
-// after the last heartbeat, which meant a worker outage longer than a day
-// deleted the very records the outage had stranded.
+// action, never an inferred one. An earlier revision expired the guard 24h
+// after the last heartbeat. A worker outage longer than a day then deleted
+// the very records the outage had stranded.
 #[tokio::test]
 async fn retention_resumes_only_after_the_cursor_is_decommissioned() {
     let _guard = TEST_SERIAL.lock().await;
@@ -2762,7 +2802,10 @@ async fn retention_resumes_only_after_the_cursor_is_decommissioned() {
     uninstall();
 
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -2772,7 +2815,10 @@ async fn retention_resumes_only_after_the_cursor_is_decommissioned() {
     {
         use autumn_harvest::schema::harvest_audit_export_cursor::dsl as cur;
         diesel::update(cur::harvest_audit_export_cursor.find(0))
-            .set(cur::updated_at.eq(chrono::Utc::now() - chrono::Duration::days(400)))
+            .set(
+                cur::updated_at
+                    .eq((jiff::Timestamp::now() - autumn_harvest::time::days(400)).to_diesel()),
+            )
             .execute(&mut conn)
             .await
             .expect("age heartbeat");
@@ -2788,7 +2834,7 @@ async fn retention_resumes_only_after_the_cursor_is_decommissioned() {
 
     // Only an explicit decommission lifts the guard.
     assert_eq!(
-        autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, chrono::Utc::now())
+        autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, jiff::Timestamp::now())
             .await
             .expect("decommission"),
         autumn_harvest::audit_export::DecommissionOutcome::Retired,
@@ -2818,7 +2864,10 @@ async fn retention_protects_unexported_audit_when_configured_with_no_cursor_and_
     let (mut conn, _c) = make_conn().await;
     insert_audit_rows(&mut conn, 5).await;
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -2864,11 +2913,14 @@ async fn retention_decommission_alone_does_not_resume_purging_while_the_flag_is_
     assert_eq!(cursor_acked(&mut conn, 0).await, 2);
     uninstall();
 
-    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, chrono::Utc::now())
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("decommission");
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -2916,7 +2968,7 @@ async fn decommission_releases_its_shards_backlog_even_while_export_stays_config
         .expect("tick");
     assert_eq!(cursor_acked(&mut conn, 0).await, 2);
 
-    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, chrono::Utc::now())
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("decommission");
 
@@ -2929,7 +2981,10 @@ async fn decommission_releases_its_shards_backlog_even_while_export_stays_config
     );
 
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -2961,7 +3016,7 @@ async fn retention_protects_a_shard_being_re_enabled_after_decommission() {
     fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
         .await
         .expect("tick");
-    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, chrono::Utc::now())
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("decommission");
     uninstall();
@@ -2971,7 +3026,10 @@ async fn retention_protects_a_shard_being_re_enabled_after_decommission() {
     // happening regardless.
     insert_audit_rows(&mut conn, 3).await;
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -3002,10 +3060,9 @@ async fn retention_protects_a_shard_being_re_enabled_after_decommission() {
 
 // `is_configured()` alone, with no explicit `protect_unexported_audit`, is
 // NOT enough to protect a re-enabling shard's own rows while its cursor
-// stays retired (issue #1273). An earlier round of this PR fixed a Codex
-// review finding. It had the per-row pending check's retired-cursor
-// override trust `is_configured()` the same way it trusts the explicit
-// flag. Reconciling with issue #1273's authoritative-cursor rule reverts
+// stays retired (issue #1273). An earlier fix had the per-row pending
+// check's retired-cursor override trust `is_configured()` the same way it
+// trusts the explicit flag. Issue #1273's authoritative-cursor rule reverts
 // that. `is_configured()` is process-wide. It cannot tell two cases
 // apart. One case: this shard's export was just re-enabled. The other
 // case: some other colocated shard's sink happens to be configured while
@@ -3023,7 +3080,7 @@ async fn is_configured_alone_does_not_protect_a_re_enabling_shards_retired_curso
     fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
         .await
         .expect("tick");
-    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, chrono::Utc::now())
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("decommission");
 
@@ -3032,7 +3089,10 @@ async fn is_configured_alone_does_not_protect_a_re_enabling_shards_retired_curso
     // cursor stays retired. New audit activity keeps happening regardless.
     insert_audit_rows(&mut conn, 3).await;
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -3050,7 +3110,7 @@ async fn is_configured_alone_does_not_protect_a_re_enabling_shards_retired_curso
     );
 }
 
-// Codex review, PR #1504. The outer "export may be live" gate's
+// PR #1504. The outer "export may be live" gate's
 // zero-cursor arm checked whether the whole `harvest_audit_export_cursor`
 // table was empty, not whether an *expected* shard lacked a row. A
 // retired shard's own leftover cursor row made that check false for
@@ -3072,7 +3132,7 @@ async fn retention_protects_a_bootstrapping_colocated_shard_despite_another_shar
     fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
         .await
         .expect("tick");
-    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, chrono::Utc::now())
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("decommission");
 
@@ -3081,7 +3141,10 @@ async fn retention_protects_a_bootstrapping_colocated_shard_despite_another_shar
     // for it exists at all.
     insert_audit_rows(&mut conn, 3).await;
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -3107,7 +3170,7 @@ async fn retention_protects_a_bootstrapping_colocated_shard_despite_another_shar
     assert_eq!(remaining, 5);
 }
 
-// Codex review, PR #1504. A split deployment has two processes, each
+// PR #1504. A split deployment has two processes, each
 // with its own partial view of which shards share a physical database.
 // This call's own `colocated_shard_ids` can therefore omit a shard
 // whose cursor genuinely lives in this same database. The pending
@@ -3131,7 +3194,10 @@ async fn retention_protects_a_row_a_live_unlisted_shards_cursor_has_not_acknowle
     ensure_cursor_row(&mut conn, 1).await.expect("cursor row");
 
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -3183,7 +3249,10 @@ async fn retention_protects_a_stamped_row_when_its_cursor_row_is_gone() {
         .await
         .expect("delete cursor");
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -3213,7 +3282,10 @@ async fn retention_still_purges_acknowledged_rows_when_protect_unexported_audit_
         .expect("tick");
     assert_eq!(cursor_acked(&mut conn, 0).await, 2);
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -3253,7 +3325,10 @@ async fn retention_protects_rows_until_every_colocated_shard_has_a_cursor() {
     assert_eq!(cursor_acked(&mut conn, 0).await, 2);
     uninstall();
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -3302,12 +3377,15 @@ async fn retention_ignores_an_unrelated_shards_lingering_cursor_row() {
     // Shard 2 was removed from the fleet entirely. Decommissioning
     // retires its cursor row rather than deleting it.
     ensure_cursor_row(&mut conn, 2).await.expect("cursor row");
-    autumn_harvest::audit_export::decommission_cursor(&mut conn, 2, chrono::Utc::now())
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 2, jiff::Timestamp::now())
         .await
         .expect("decommission");
 
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -3353,12 +3431,15 @@ async fn retention_ignores_an_excluded_shards_stale_acknowledgment() {
             .await
             .expect("stamp stale ack");
     }
-    autumn_harvest::audit_export::decommission_cursor(&mut conn, 1, chrono::Utc::now())
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 1, jiff::Timestamp::now())
         .await
         .expect("decommission");
 
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -3377,8 +3458,8 @@ async fn retention_ignores_an_excluded_shards_stale_acknowledgment() {
 }
 
 // An exempted shard's own unacknowledged rows must stay protected while
-// its cursor is still live -- a Codex review finding on this fix (issue
-// #1266). `excluding_shard_from_protect_unexported_audit`'s own doc
+// its cursor is still live (issue #1266).
+// `excluding_shard_from_protect_unexported_audit`'s own doc
 // comment says to call it "for a shard being decommissioned", but the
 // config change and the `decommission_cursor` call need not land
 // atomically. Unlike the test above, this shard's cursor is never
@@ -3396,7 +3477,10 @@ async fn retention_still_protects_an_exempted_shards_own_unacknowledged_rows_bef
     uninstall();
 
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -3427,7 +3511,7 @@ async fn retention_still_protects_an_exempted_shards_own_unacknowledged_rows_bef
 }
 
 // A `decommission_cursor` (or `reactivate_cursor`) audit row must never be
-// purged, on ANY shard, live or retired (issue #1273, Codex review P1). In
+// purged, on ANY shard, live or retired (issue #1273). In
 // a single-shard deployment the shard an operator decommissions is the only
 // shard there is. Its own exporter is exactly what the call just stopped,
 // so its audit record can never reach the SIEM. Per the retention fix
@@ -3443,7 +3527,7 @@ async fn a_decommission_audit_record_survives_purge_even_on_its_own_now_retired_
     insert_audit_rows(&mut conn, 2).await;
     ensure_cursor_row(&mut conn, 0).await.expect("cursor");
 
-    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, chrono::Utc::now())
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("decommission");
 
@@ -3468,7 +3552,10 @@ async fn a_decommission_audit_record_survives_purge_even_on_its_own_now_retired_
         .expect("audit insert");
 
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -3536,12 +3623,15 @@ async fn retention_resumes_purging_once_a_colocated_shard_is_decommissioned_unde
             .await
             .expect("stamp stale ack");
     }
-    autumn_harvest::audit_export::decommission_cursor(&mut conn, 1, chrono::Utc::now())
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 1, jiff::Timestamp::now())
         .await
         .expect("decommission");
 
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -3588,12 +3678,15 @@ async fn retention_still_waits_on_a_decommissioned_shards_ack_while_the_flag_pro
     // off-by-one artifact of that comparison. Zero has no such edge:
     // every positive `export_seq` compares strictly greater than it.
     ensure_cursor_row(&mut conn, 1).await.expect("cursor row");
-    autumn_harvest::audit_export::decommission_cursor(&mut conn, 1, chrono::Utc::now())
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 1, jiff::Timestamp::now())
         .await
         .expect("decommission");
 
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -3622,9 +3715,9 @@ async fn every_tick_refreshes_the_exporter_heartbeat() {
         .expect("idle tick");
 
     use autumn_harvest::schema::harvest_audit_export_cursor::dsl as cur;
-    let stale = chrono::Utc::now() - chrono::Duration::days(3);
+    let stale = jiff::Timestamp::now() - autumn_harvest::time::days(3);
     diesel::update(cur::harvest_audit_export_cursor.find(0))
-        .set(cur::updated_at.eq(stale))
+        .set(cur::updated_at.eq(stale.to_diesel()))
         .execute(&mut conn)
         .await
         .expect("age heartbeat");
@@ -3634,12 +3727,13 @@ async fn every_tick_refreshes_the_exporter_heartbeat() {
         .expect("second idle tick");
     uninstall();
 
-    let refreshed: chrono::DateTime<chrono::Utc> = cur::harvest_audit_export_cursor
+    let refreshed = cur::harvest_audit_export_cursor
         .find(0)
         .select(cur::updated_at)
-        .first(&mut conn)
+        .first::<SqlTimestamp>(&mut conn)
         .await
-        .expect("cursor row");
+        .expect("cursor row")
+        .to_jiff();
     assert!(
         refreshed > stale,
         "a tick that claims nothing must still refresh the heartbeat: an idle \
@@ -3649,10 +3743,10 @@ async fn every_tick_refreshes_the_exporter_heartbeat() {
     );
 }
 
-// Decommissioning must be reversible without corrupting the sequence. If a
-// recreated cursor restarted at 0, the next records would take `(shard, seq)`
-// pairs that already name DIFFERENT records -- and a receiver deduping on that
-// pair, exactly as this feature instructs, would discard the new ones.
+// Decommissioning must be reversible without corrupting the sequence. A
+// recreated cursor that restarted at 0 would give the next records
+// `(shard, seq)` pairs that already name DIFFERENT records. A receiver that
+// dedupes on that pair, as this feature instructs, would discard the new ones.
 #[tokio::test]
 async fn a_recreated_cursor_continues_the_sequence_it_left_off_at() {
     let _guard = TEST_SERIAL.lock().await;
@@ -3667,14 +3761,14 @@ async fn a_recreated_cursor_continues_the_sequence_it_left_off_at() {
     uninstall();
 
     // The operator retires export; the four stamped rows stay in the table.
-    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, chrono::Utc::now())
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("decommission");
 
     // Later, an operator explicitly reactivates the shard. Issue #1273: this
     // no longer happens as a side effect of the next scanner tick. New
     // audited operations arrive after that.
-    autumn_harvest::audit_export::reactivate_cursor(&mut conn, 0, chrono::Utc::now())
+    autumn_harvest::audit_export::reactivate_cursor(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("reactivate");
     let sink2 = Arc::new(RecordingSink::new(200));
@@ -3726,11 +3820,14 @@ async fn the_sequence_survives_a_decommission_that_purges_every_stamped_row() {
 
     // Operator retires export to relieve disk pressure, exactly as the runbook
     // describes, and retention then purges the whole aged window.
-    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, chrono::Utc::now())
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("decommission");
     diesel::update(harvest_audit_log::table)
-        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .set(
+            harvest_audit_log::occurred_at
+                .eq((jiff::Timestamp::now() - autumn_harvest::time::days(365)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("age rows");
@@ -3751,7 +3848,7 @@ async fn the_sequence_survives_a_decommission_that_purges_every_stamped_row() {
 
     // Export is re-enabled later, by an explicit operator reactivation
     // (issue #1273). The SIEM still holds records at seq 1-3.
-    autumn_harvest::audit_export::reactivate_cursor(&mut conn, 0, chrono::Utc::now())
+    autumn_harvest::audit_export::reactivate_cursor(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("reactivate");
     let sink2 = Arc::new(RecordingSink::new(200));
@@ -3774,8 +3871,8 @@ async fn the_sequence_survives_a_decommission_that_purges_every_stamped_row() {
 
 // Retiring the cursor keeps the row (for its sequence high-water mark), so the
 // redrive must check `retired_at` explicitly. Otherwise it answers 200
-// "rewound" for a shard whose records retention is free to purge and where no
-// exporter is running -- a promise the system cannot keep.
+// "rewound" for a shard that retention may purge and no exporter serves. The
+// system cannot keep that promise.
 #[tokio::test]
 async fn a_retired_shard_cannot_be_redriven() {
     let _guard = TEST_SERIAL.lock().await;
@@ -3793,14 +3890,14 @@ async fn a_retired_shard_cannot_be_redriven() {
             &mut conn,
             0,
             RewindRequest::Seq(1),
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         )
         .await
         .expect("rewind"),
         RewindOutcome::Rewound { from: 3, to: 1 },
     );
 
-    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, chrono::Utc::now())
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("decommission");
 
@@ -3811,7 +3908,7 @@ async fn a_retired_shard_cannot_be_redriven() {
             &mut conn,
             0,
             RewindRequest::Seq(0),
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
         )
         .await
         .expect("rewind"),
@@ -3848,7 +3945,7 @@ async fn a_redrive_and_its_audit_record_land_together_on_the_target_shard() {
                 conn,
                 0,
                 RewindRequest::Seq(1),
-                chrono::Utc::now(),
+                jiff::Timestamp::now(),
             )
             .await?;
             let record = NewAuditRecord {
@@ -3874,8 +3971,8 @@ async fn a_redrive_and_its_audit_record_land_together_on_the_target_shard() {
     assert_eq!(outcome, RewindOutcome::Rewound { from: 4, to: 1 });
     assert_eq!(cursor_acked(&mut conn, 0).await, 1);
 
-    // The audit row landed on the SAME shard as the cursor it describes, so it
-    // is picked up by that shard's own exporter like any other audit record.
+    // The audit row landed on the SAME shard as the cursor it describes. So
+    // that shard's own exporter picks it up like any other audit record.
     let redrive_rows: i64 = harvest_audit_log::table
         .filter(harvest_audit_log::operation.eq(autumn_harvest::audit::OP_AUDIT_EXPORT_REDRIVE))
         .count()
@@ -3900,7 +3997,7 @@ async fn a_failed_audit_write_rolls_the_rewind_back() {
         0,
         100,
         std::time::Duration::from_secs(60),
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await
     .expect("claim")
@@ -3913,7 +4010,7 @@ async fn a_failed_audit_write_rolls_the_rewind_back() {
             through_seq: 3,
             status: 200,
         },
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await
     .expect("ack");
@@ -3929,7 +4026,7 @@ async fn a_failed_audit_write_rolls_the_rewind_back() {
                 conn,
                 0,
                 RewindRequest::Seq(0),
-                chrono::Utc::now(),
+                jiff::Timestamp::now(),
             )
             .await?;
             diesel::sql_query(
@@ -3975,7 +4072,7 @@ async fn ensure_cursor_row_never_revives_a_retired_cursor() {
     insert_audit_rows(&mut conn, 2).await;
     ensure_cursor_row(&mut conn, 0).await.expect("cursor");
 
-    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, chrono::Utc::now())
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("decommission");
 
@@ -3986,7 +4083,7 @@ async fn ensure_cursor_row_never_revives_a_retired_cursor() {
         .await
         .expect("ensure_cursor_row on a retired shard must not error");
 
-    let status = export_status(&mut conn, 0, chrono::Utc::now())
+    let status = export_status(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("status")
         .expect("row");
@@ -4010,7 +4107,7 @@ async fn a_scanner_tick_after_decommission_does_not_revive_the_cursor() {
         .expect("tick");
     assert_eq!(sink.all_seqs(), vec![1, 2]);
 
-    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, chrono::Utc::now())
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("decommission");
 
@@ -4030,7 +4127,7 @@ async fn a_scanner_tick_after_decommission_does_not_revive_the_cursor() {
         "a tick after decommission must not deliver the new records: the \
          shard is retired and no exporter owes it anything"
     );
-    let status = export_status(&mut conn, 0, chrono::Utc::now())
+    let status = export_status(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("status")
         .expect("row");
@@ -4063,7 +4160,7 @@ async fn a_decommission_and_its_audit_record_land_together_on_the_target_shard()
                 let outcome = autumn_harvest::audit_export::decommission_cursor_locked(
                     conn,
                     0,
-                    chrono::Utc::now(),
+                    jiff::Timestamp::now(),
                 )
                 .await?;
                 let record = NewAuditRecord {
@@ -4111,7 +4208,7 @@ async fn a_reactivate_and_its_audit_record_land_together_on_the_target_shard() {
     let (mut conn, _c) = make_conn().await;
     insert_audit_rows(&mut conn, 2).await;
     ensure_cursor_row(&mut conn, 0).await.expect("cursor");
-    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, chrono::Utc::now())
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("decommission");
 
@@ -4122,7 +4219,7 @@ async fn a_reactivate_and_its_audit_record_land_together_on_the_target_shard() {
                 let outcome = autumn_harvest::audit_export::reactivate_cursor_locked(
                     conn,
                     0,
-                    chrono::Utc::now(),
+                    jiff::Timestamp::now(),
                 )
                 .await?;
                 let record = NewAuditRecord {
@@ -4148,7 +4245,7 @@ async fn a_reactivate_and_its_audit_record_land_together_on_the_target_shard() {
 
     assert_eq!(outcome, ReactivateOutcome::Reactivated);
 
-    let status = export_status(&mut conn, 0, chrono::Utc::now())
+    let status = export_status(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("status")
         .expect("row");
@@ -4182,8 +4279,12 @@ async fn a_failed_audit_write_rolls_the_decommission_back() {
     use diesel_async::AsyncConnection as _;
     let result = Box::pin(
         conn.transaction::<(), autumn_harvest::error::HarvestError, _>(async |conn| {
-            autumn_harvest::audit_export::decommission_cursor_locked(conn, 0, chrono::Utc::now())
-                .await?;
+            autumn_harvest::audit_export::decommission_cursor_locked(
+                conn,
+                0,
+                jiff::Timestamp::now(),
+            )
+            .await?;
             // A NULL `operation` violates the table's NOT NULL, standing in
             // for any reason the audit write could fail.
             diesel::sql_query(
@@ -4203,7 +4304,7 @@ async fn a_failed_audit_write_rolls_the_decommission_back() {
         result.is_err(),
         "the audit insert must fail this transaction"
     );
-    let status = export_status(&mut conn, 0, chrono::Utc::now())
+    let status = export_status(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("status")
         .expect("row");
@@ -4222,14 +4323,14 @@ async fn a_failed_audit_write_rolls_the_reactivate_back() {
     let (mut conn, _c) = make_conn().await;
     insert_audit_rows(&mut conn, 1).await;
     ensure_cursor_row(&mut conn, 0).await.expect("cursor");
-    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, chrono::Utc::now())
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("decommission");
 
     use diesel_async::AsyncConnection as _;
     let result = Box::pin(
         conn.transaction::<(), autumn_harvest::error::HarvestError, _>(async |conn| {
-            autumn_harvest::audit_export::reactivate_cursor_locked(conn, 0, chrono::Utc::now())
+            autumn_harvest::audit_export::reactivate_cursor_locked(conn, 0, jiff::Timestamp::now())
                 .await?;
             diesel::sql_query(
                 "INSERT INTO harvest_audit_log (actor, operation, target_type, \
@@ -4248,7 +4349,7 @@ async fn a_failed_audit_write_rolls_the_reactivate_back() {
         result.is_err(),
         "the audit insert must fail this transaction"
     );
-    let status = export_status(&mut conn, 0, chrono::Utc::now())
+    let status = export_status(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("status")
         .expect("row");
@@ -4266,7 +4367,7 @@ async fn decommissioning_a_shard_that_never_exported_reports_not_configured() {
     uninstall();
     let (mut conn, _c) = make_conn().await;
     assert_eq!(
-        autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, chrono::Utc::now())
+        autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, jiff::Timestamp::now())
             .await
             .expect("decommission"),
         DecommissionOutcome::NotConfigured
@@ -4281,13 +4382,13 @@ async fn decommissioning_an_already_retired_shard_is_reported_idempotently() {
     insert_audit_rows(&mut conn, 1).await;
     ensure_cursor_row(&mut conn, 0).await.expect("cursor");
     assert_eq!(
-        autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, chrono::Utc::now())
+        autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, jiff::Timestamp::now())
             .await
             .expect("decommission"),
         DecommissionOutcome::Retired
     );
     assert_eq!(
-        autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, chrono::Utc::now())
+        autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, jiff::Timestamp::now())
             .await
             .expect("decommission"),
         DecommissionOutcome::AlreadyRetired,
@@ -4304,7 +4405,7 @@ async fn reactivating_an_active_shard_is_reported_idempotently() {
     insert_audit_rows(&mut conn, 1).await;
     ensure_cursor_row(&mut conn, 0).await.expect("cursor");
     assert_eq!(
-        autumn_harvest::audit_export::reactivate_cursor(&mut conn, 0, chrono::Utc::now())
+        autumn_harvest::audit_export::reactivate_cursor(&mut conn, 0, jiff::Timestamp::now())
             .await
             .expect("reactivate"),
         ReactivateOutcome::AlreadyActive
@@ -4317,7 +4418,7 @@ async fn reactivating_a_shard_that_never_exported_reports_not_configured() {
     uninstall();
     let (mut conn, _c) = make_conn().await;
     assert_eq!(
-        autumn_harvest::audit_export::reactivate_cursor(&mut conn, 0, chrono::Utc::now())
+        autumn_harvest::audit_export::reactivate_cursor(&mut conn, 0, jiff::Timestamp::now())
             .await
             .expect("reactivate"),
         ReactivateOutcome::NotConfigured
@@ -4347,7 +4448,7 @@ async fn a_reactivate_does_not_reopen_a_claim_fenced_by_the_prior_decommission()
         0,
         100,
         std::time::Duration::from_secs(60),
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await
     .expect("claim")
@@ -4356,10 +4457,10 @@ async fn a_reactivate_does_not_reopen_a_claim_fenced_by_the_prior_decommission()
 
     // The operator retires the cursor while that delivery is outstanding,
     // then reactivates it -- both bump the epoch.
-    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, chrono::Utc::now())
+    autumn_harvest::audit_export::decommission_cursor(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("decommission");
-    autumn_harvest::audit_export::reactivate_cursor(&mut conn, 0, chrono::Utc::now())
+    autumn_harvest::audit_export::reactivate_cursor(&mut conn, 0, jiff::Timestamp::now())
         .await
         .expect("reactivate");
 
@@ -4373,7 +4474,7 @@ async fn a_reactivate_does_not_reopen_a_claim_fenced_by_the_prior_decommission()
             through_seq: 3,
             status: 200,
         },
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await
     .expect("apply is not an error, it simply matches nothing");
@@ -4390,13 +4491,13 @@ async fn a_reactivate_does_not_reopen_a_claim_fenced_by_the_prior_decommission()
 // ── The issue's success metric, at CI-affordable scale ─────────────────────
 //
 // The issue asks for receiver-side `(shard, seq)` accounting over >= 100k
-// records with a forced restart mid-stream and a 10-minute sink outage,
-// proving 0 lost records and 0 gaps. That volume and those wall-clock
-// durations are not a CI test; this encodes the same *shape* at 5,000 records,
-// with the restart and the outage injected deterministically rather than
-// waited out. What it proves is exactly what the metric asks: every sequence
-// arrives at least once, the set is contiguous with no hole, and the cursor
-// never moved past a record the sink had not acknowledged.
+// records. It adds a forced restart mid-stream and a 10-minute sink outage,
+// and expects 0 lost records and 0 gaps. That volume and duration do not fit
+// a CI test. This test encodes the same *shape* at 5,000 records. It injects
+// the restart and the outage deterministically rather than waiting them out.
+// It proves exactly what the metric asks. Every sequence arrives at least
+// once, and the set has no hole. The cursor never moved past a record the
+// sink had not acknowledged.
 //
 // Run the full-scale version against a real sink before claiming the metric;
 // this is the regression guard that keeps the mechanism honest between runs.
@@ -4446,7 +4547,7 @@ async fn receiver_side_accounting_survives_a_restart_and_a_sink_outage() {
         0,
         BATCH,
         std::time::Duration::from_secs(0),
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await
     .expect("claim")
@@ -4458,7 +4559,7 @@ async fn receiver_side_accounting_survives_a_restart_and_a_sink_outage() {
         0,
         claim.records[0].seq,
         claim.records[claim.records.len() - 1].seq,
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     );
     let crashed_batch = AuditBatch {
         shard: 0,
@@ -4479,9 +4580,8 @@ async fn receiver_side_accounting_survives_a_restart_and_a_sink_outage() {
     );
 
     // ── Phase 3: a sink outage ──────────────────────────────────────────────
-    // Ten minutes of 503s, compressed: three failing ticks with the backoff
-    // deadline cleared between them, which is what a long outage looks like to
-    // the cursor.
+    // Ten minutes of 503s, compressed: three failing ticks, with the backoff
+    // deadline cleared between them. A long outage looks like that to the cursor.
     sink.set_status(503);
     for _ in 0..3 {
         fire_due_audit_exports(&mut conn, &None, &[], &NoOpMetrics)
@@ -4544,7 +4644,7 @@ async fn receiver_side_accounting_survives_a_restart_and_a_sink_outage() {
     assert_eq!(cursor_acked(&mut conn, 0).await, RECORDS);
     // And nothing is left pending.
     let (pending, _) =
-        autumn_harvest::audit_export::pending_and_lag(&mut conn, RECORDS, chrono::Utc::now())
+        autumn_harvest::audit_export::pending_and_lag(&mut conn, RECORDS, jiff::Timestamp::now())
             .await
             .expect("pending");
     assert_eq!(pending, 0);
@@ -4555,15 +4655,14 @@ async fn receiver_side_accounting_survives_a_restart_and_a_sink_outage() {
 async fn clear_backoff(conn: &mut diesel_async::AsyncPgConnection) {
     use autumn_harvest::schema::harvest_audit_export_cursor::dsl as cur;
     diesel::update(cur::harvest_audit_export_cursor.find(0))
-        .set(cur::next_attempt_at.eq(chrono::Utc::now()))
+        .set(cur::next_attempt_at.eq(jiff::Timestamp::now().to_diesel()))
         .execute(conn)
         .await
         .expect("clear backoff");
 }
 
-/// Compile-time proof that an embedder can supply a sink with no HTTP client
-/// anywhere in sight (AC1: the trait lives in core with no `reqwest`
-/// dependency).
+/// Compile-time proof that an embedder can supply a sink with no HTTP client.
+/// AC1: the trait lives in core with no `reqwest` dependency.
 #[test]
 fn an_embedder_sink_needs_no_http_client() {
     struct FileSink;
@@ -4629,7 +4728,7 @@ async fn enforce_timeouts_once_no_longer_exports_audit_records() {
          dedicated export task claims and stamps audit rows now"
     );
     assert_eq!(
-        export_status(&mut conn, 0, chrono::Utc::now())
+        export_status(&mut conn, 0, jiff::Timestamp::now())
             .await
             .expect("status query"),
         None,
@@ -4738,7 +4837,7 @@ async fn an_unconfigured_dedicated_task_never_attempts_a_connection_checkout() {
 
 /// The registered staleness threshold must track the CURRENTLY configured
 /// export lease. It must not just track the one in effect at spawn time
-/// (Codex review on PR #1520, follow-up P2).
+/// (PR #1520).
 ///
 /// A later runtime can publish a longer lease at any point
 /// (`fence_against_sink_swap`'s doc comment documents that this is
@@ -4805,8 +4904,7 @@ async fn audit_export_checker_re_registers_when_the_configured_lease_grows() {
 
     // The registered interval must grow to match, without restarting the
     // task. It sums the poll interval, the checkout bound, and the lease,
-    // not their max (Codex review on PR #1520, follow-up P2, second
-    // round). See `audit_export_liveness_interval`.
+    // not their max (PR #1520). See `audit_export_liveness_interval`.
     let expected_interval =
         poll_interval + autumn_harvest::audit_export::SHARD_ACQUIRE_BOUND + long_lease;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -4828,11 +4926,11 @@ async fn audit_export_checker_re_registers_when_the_configured_lease_grows() {
     uninstall();
 }
 
-/// The property this issue's fix rests on. Codex review rounds 15/18 on PR
-/// #1261 named the specific old hazard. The multi-shard fan-out arm of
-/// `fire_due_audit_exports` ran inline while the timeout checker's own
-/// connection from the same pool was still held. It tried to acquire a
-/// SECOND connection from a `max_size(1)` pool and could never succeed.
+/// The property this issue's fix rests on. PR #1261 named the specific old
+/// hazard. The multi-shard fan-out arm of `fire_due_audit_exports` ran
+/// inline while the timeout checker's own connection from the same pool was
+/// still held. It tried to acquire a SECOND connection from a `max_size(1)`
+/// pool and could never succeed.
 ///
 /// This test does not re-drive that exact inline call site -- it is gone,
 /// and `enforce_timeouts_once_no_longer_exports_audit_records` above pins
@@ -5001,10 +5099,10 @@ async fn an_in_flight_slow_delivery_never_blocks_the_timeout_checker_on_a_size_o
     uninstall();
 }
 
-/// Graceful shutdown must not wait for an in-flight delivery (Codex review
-/// on PR #1520, follow-up P1). Both worker shutdown paths join every
-/// export task's `JoinHandle`. Without a fix, a slow or blackholed sink
-/// would hold up shutdown for as long as the claim lease allows.
+/// Graceful shutdown must not wait for an in-flight delivery (PR #1520).
+/// Both worker shutdown paths join every export task's `JoinHandle`.
+/// Without a fix, a slow or blackholed sink would hold up shutdown for as
+/// long as the claim lease allows.
 #[tokio::test]
 async fn graceful_shutdown_does_not_wait_for_an_in_flight_delivery() {
     let _guard = TEST_SERIAL.lock().await;
@@ -5130,7 +5228,7 @@ async fn the_delivery_deadline_reserves_time_for_the_acknowledgement() {
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
     loop {
-        let status = export_status(&mut conn, 0, chrono::Utc::now())
+        let status = export_status(&mut conn, 0, jiff::Timestamp::now())
             .await
             .expect("status query");
         if status.is_some_and(|s| s.consecutive_failures >= 1) {
@@ -5197,7 +5295,7 @@ async fn a_short_lease_still_keeps_a_positive_delivery_window() {
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        let status = export_status(&mut conn, 0, chrono::Utc::now())
+        let status = export_status(&mut conn, 0, jiff::Timestamp::now())
             .await
             .expect("status query");
         if status.is_some_and(|s| s.cursor_seq >= 1) {

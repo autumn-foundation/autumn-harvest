@@ -60,8 +60,11 @@ child workflows, idempotency, and operating the service — read
 [`docs/getting-started/`](docs/getting-started/).
 
 Upgrading an existing deployment? See the
-[0.9.0 → 0.10.0 upgrade guide](docs/upgrading/0.10.0.md) — the previous
-[0.8.0 → 0.9.0 upgrade guide](docs/upgrading/0.9.0.md) covers the hop before that.
+[0.10.0 → 0.11.0 upgrade guide](docs/upgrading/0.11.0.md) — the previous
+[0.9.0 → 0.10.0 upgrade guide](docs/upgrading/0.10.0.md) covers the hop before that.
+
+Which releases get fixes, and for how long, is in the
+[support window](docs/upgrading/README.md#support-window).
 
 Working on the engine itself? [`docs/architecture.md`](docs/architecture.md) is
 the workspace, design-decision, module and macro reference, and
@@ -81,6 +84,9 @@ Need a real reference instead of the tiny hello-world path? See:
   Docker. Each model call and tool call is an activity, a workspace write parks on an
   approval signal with a deadline, and killing the daemon mid-session resumes by replay instead
   of paying for completed turns twice. It runs with no API key (a scripted offline model).
+- [`examples/rhai-scripts/`](examples/rhai-scripts/) for durable scripts. A plain `.rhai` file
+  runs on the embedded SQLite backend, and each `sh`, file step, `sleep` and `wait_for` is saved.
+  A `kill -9` mid-run resumes after the last saved step. smop runs the shell steps.
 - [`examples/autoresearch/`](examples/autoresearch/) for Karpathy's autoresearch loop as durable
   workflows: an agent edits `train.py`, a trainer runs it, and a keep rule decides, all night. It is
   the capstone of the agent primitives and of most of the engine surface. It uses child workflows, a
@@ -672,6 +678,8 @@ re-evaluated on the next poll — no dedicated worker process, no extra table, n
 background coordinator. The partial index
 `harvest_task_queue_concurrency_key_running` makes the saturation check O(log n)
 on RUNNING rows with a non-NULL key; activities without a cap pay zero overhead.
+The partial index `idx_harvest_tq_concurrency_live` holds the live rows with a
+key and a cap. The concurrency gauges read it, not the whole task queue.
 
 Inspect live stats with the CLI:
 
@@ -1126,7 +1134,7 @@ The embedded Vantage UI (`harvest_ui_router`, typically mounted at `/api/harvest
 
 ## Status
 
-Version 0.10.0 builds on the Phase 4 surface (see
+Version 0.11.0 builds on the Phase 4 surface (see
 [`CHANGELOG.md`](CHANGELOG.md) for this release's full entry list). The core
 surface is broad: DAG scheduling, `#[dag]`, trigger rules, signal delivery,
 `ctx.wait_for_signal`, query registration/dispatch, the management API,
@@ -1260,7 +1268,7 @@ replay-safe against recorded production histories using `WorkflowReplayer`
 
 ```toml
 # Cargo.toml — in your app's dev-dependencies
-autumn-harvest = { version = "0.10", features = ["testing"] }
+autumn-harvest = { version = "0.11", features = ["testing"] }
 ```
 
 ```rust

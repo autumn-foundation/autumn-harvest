@@ -1,0 +1,17 @@
+item|value
+runs|200004
+runs RUNNING|342
+runs with a quota key|179984
+ledger rows|6259787
+ledger rows in the window|295423
+ledger heap pages|94480
+ledger all-visible pages|90023
+scope large: runs in the window|571
+scope large: ledger rows of those runs|36229
+scope large: ledger rows in the window|18420
+scope medium: runs in the window|154
+scope medium: ledger rows in the window|5157
+scope medium: ledger rows of those runs|11969
+scope small: runs in the window|79
+scope small: ledger rows in the window|1991
+scope small: ledger rows of those runs|2714

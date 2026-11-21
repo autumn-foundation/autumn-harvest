@@ -12,7 +12,7 @@ pub enum RedisAdapterError {
     Serialization(#[from] serde_json::Error),
 
     /// A duration value was outside the supported range when converting between
-    /// `std::time::Duration` and `chrono::Duration`.
+    /// `std::time::Duration` and `jiff::SignedDuration`.
     #[error("duration out of range: {0}")]
     DurationOutOfRange(String),
 

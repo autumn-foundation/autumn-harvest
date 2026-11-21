@@ -1,40 +1,45 @@
 //! CI run-step coverage guard — no DB, no feature gate.
 //!
 //! Purpose: catch the "silently-never-run DB test" class of gap. A DB-gated
-//! integration test (core or plugin) can *compile* in CI — via `--no-run` and
-//! clippy — yet never be *executed* against a live Postgres, so any real
-//! runtime failure stays invisible. `workflow_retry_tests` is a live example:
-//! six of its nine DB tests never ran in CI (the run step is limited to a
-//! `::workflow_typed` sub-filter), hiding three genuine workflow-level-retry
-//! bugs.
+//! integration test (core or plugin) can *compile* in CI via `--no-run` and
+//! clippy. It can still never *run* against a live Postgres. Then any real
+//! runtime failure stays invisible. `workflow_retry_tests` is a live example.
+//! Six of its nine DB tests never ran in CI, because the run step is limited
+//! to a `::workflow_typed` sub-filter. That hid three real
+//! workflow-level-retry bugs.
 //!
-//! This is a *run-coverage* guard, deliberately distinct from *migration
-//! drift* (a hand-rolled migration bundle missing a migration, which would
-//! fail `column/relation ... does not exist` at runtime). Drift is guarded
-//! separately in `migration_hygiene.rs`; this guard only answers "is every
-//! DB-gated test actually RUN by some CI step?" — never whether its schema
-//! bundle is complete.
+//! This is a *run-coverage* guard, distinct from *migration drift* on purpose.
+//! Drift is a hand-rolled migration bundle that misses a migration. It fails
+//! with `column/relation ... does not exist` at runtime. `migration_hygiene.rs`
+//! guards drift. This guard only answers "does some CI step RUN every
+//! DB-gated test?". It never checks whether a schema bundle is complete.
 //!
 //! Source of truth: the per-suite CI runs are now DATA in the manifest
 //! `.github/ci/integration-suites.txt`. They are not copy-pasted `cargo test`
 //! steps in `ci.yml`. `cargo xtask ci run-suites` executes the manifest, and
-//! the `test` job invokes it. This guard parses that structured manifest instead of scraping
-//! `run:` lines — the columns are already split, so the old `--test-threads=1`
-//! special-casing, `--no-run` string-grepping, and `module::filter`
-//! re-tokenization are gone. A target is NOT credited as run when its manifest
-//! row is `compileonly` (an explicit column, never a `--no-run` grep), when the
-//! row selects only a `module::filter` sub-slice (the `::workflow_typed` trap),
-//! or when every one of its `#[test]`/`#[tokio::test]` fns is `#[ignore]`d (a
-//! run then executes nothing). Every DB-gated test must either have a covering
-//! `linux`/`allos` manifest row or be listed — with a reason — in `ALLOWLIST`.
-//! `ALLOWLIST` is fail-closed debt to SHRINK by adding manifest rows, not to
-//! grow. A hard ratchet holds its cap equal to its length (see below).
+//! the `test` job invokes it. This guard parses that structured manifest
+//! instead of scraping `run:` lines. The columns are already split. So the old
+//! `--test-threads=1` special-casing, `--no-run` string-grepping and
+//! `module::filter` re-tokenization are gone. A target is NOT credited as run
+//! in three cases:
 //!
-//! A NEW assertion guards against the manifest being silently ignored: `ci.yml`
-//! must actually invoke the runner against the manifest, else the guard would
-//! read a manifest CI never executes (green-but-not-run). A second NEW assertion
-//! keeps the `merge=union` manifest sorted + unique (a union-merge artifact is a
-//! benign, one-command-fix CI failure, never a conflict).
+//! - its manifest row is `compileonly` (an explicit column, never a
+//!   `--no-run` grep);
+//! - the row selects only a `module::filter` sub-slice (the
+//!   `::workflow_typed` trap);
+//! - every one of its `#[test]`/`#[tokio::test]` fns is `#[ignore]`d, so a
+//!   run executes nothing.
+//!
+//! Every DB-gated test needs a covering `linux`/`allos` manifest row, or an
+//! `ALLOWLIST` entry with a reason. `ALLOWLIST` is fail-closed debt to SHRINK
+//! by adding manifest rows, not to grow. A hard ratchet holds its cap equal
+//! to its length (see below).
+//!
+//! One assertion guards against CI silently ignoring the manifest. `ci.yml`
+//! must invoke the runner against the manifest. Otherwise the guard reads a
+//! manifest CI never executes (green-but-not-run). A second assertion keeps
+//! the `merge=union` manifest sorted and unique. A union-merge artifact is
+//! then a benign CI failure with a one-command fix, never a conflict.
 //!
 //! A third assertion (issue #1790) parses every workflow file. It also checks
 //! that each workflow that an `ALLOWLIST` or `FEATURE_GATE_EXEMPT` reason cites
@@ -67,10 +72,10 @@ const CORE_MOD_RS: &str = include_str!("mod.rs");
 ///   * the classic testcontainers style (`with_init_sql(` / `Postgres::default(`)
 ///     and the `HARVEST_TEST_DATABASE_URL` opt-in override, and
 ///   * the paved `autumn_web::test::TestDb` + `run_pending(MIGRATIONS)` harness
-///     (`run_pending(` / `TestDb` / a real `testcontainers` import), which the
-///     original three-token list missed — so `mcp_tools_integration`,
-///     `webhook_receiver_integration`, and `webhook_durable_integration` evaded
-///     classification entirely (fail-open). Broadened here so they are caught.
+///     (`run_pending(` / `TestDb` / a real `testcontainers` import). The
+///     original three-token list missed it. So `mcp_tools_integration`,
+///     `webhook_receiver_integration` and `webhook_durable_integration` evaded
+///     classification (fail-open). The broader list catches them.
 ///
 /// A third family calls a *shared* fixture helper instead of building the
 /// container itself: `integration_e2e::setup_test_database_url` and
@@ -78,13 +83,17 @@ const CORE_MOD_RS: &str = include_str!("mod.rs");
 /// above, so the caller was fail-open. The two helper names are tokens as
 /// well, which classifies every caller of the shared fixture.
 ///
-/// Matching is against comment-stripped code only (see [`strip_line_comments`]):
-/// several genuinely no-DB HTTP tests reference their sibling `testcontainers`
-/// suite in `//!` prose, and the deliberately env-gated `status_summary_localpg`
-/// mentions `testcontainers` only in a doc comment — none of these must be
-/// misclassified. A file that no-ops unless `DATABASE_URL` is set (its only
-/// container mention being prose) is therefore left unmatched: it never runs in
-/// CI and cannot be a run-coverage gap.
+/// The decision owner suites call `OwnDb::new()` from
+/// `decision_owner_claim_tests`. That helper wraps the shared fixture, so its
+/// callers carry no other token. `OwnDb::new(` is a token for that reason
+/// (issue #2723).
+///
+/// Matching uses comment-stripped code only (see [`strip_line_comments`]).
+/// Several no-DB HTTP tests name their sibling `testcontainers` suite in `//!`
+/// prose. The env-gated `status_summary_localpg` names `testcontainers` only in
+/// a doc comment. None of these may be misclassified. A file that no-ops
+/// unless `DATABASE_URL` is set, with only prose container mentions, stays
+/// unmatched. It never runs in CI and cannot be a run-coverage gap.
 const LIVE_DB_TOKENS: &[&str] = &[
     "with_init_sql(",
     "Postgres::default(",
@@ -95,13 +104,14 @@ const LIVE_DB_TOKENS: &[&str] = &[
     "setup_test_database_url(",
     "setup_test_database_url_or_env(",
     "FixtureServer::start(",
+    "OwnDb::new(",
 ];
 
 /// Drop whole-line comments (`//`, `///`, `//!`) so container tokens that
-/// appear only in prose don't classify a no-DB test as needing a live DB. A
-/// leading-`//` check is enough: every observed false positive lives in a
-/// `//!` doc-comment block, and stripping only leading-comment lines never
-/// mangles mid-line code such as a `postgres://…` URL literal.
+/// appear only in prose do not classify a no-DB test as needing a live DB. A
+/// leading-`//` check is enough. Every observed false positive lives in a
+/// `//!` doc-comment block. Stripping only leading-comment lines never mangles
+/// mid-line code such as a `postgres://…` URL literal.
 fn strip_line_comments(source: &str) -> String {
     source
         .lines()
@@ -116,10 +126,11 @@ fn needs_live_db(source: &str) -> bool {
 }
 
 /// True when a file declares `#[test]`/`#[tokio::test]` fns but every one is
-/// `#[ignore]`d, so a run targeting it executes nothing and must NOT be
-/// credited as covering it (the target must be allowlisted instead). Counts
-/// `#[ignore]` against the total test count; a file with no tests is not
-/// "all-ignored".
+/// `#[ignore]`d.
+///
+/// A run that targets such a file executes nothing. So it must NOT be credited
+/// as coverage, and the target must be allowlisted instead. Counts `#[ignore]`
+/// against the total test count. A file with no tests is not "all-ignored".
 ///
 /// The count is taken over comment-stripped code (see [`strip_line_comments`]).
 /// A module doc comment can name an `#[ignore]`d case in prose. Such prose
@@ -133,20 +144,19 @@ fn all_tests_ignored(source: &str) -> bool {
 }
 
 /// Meta-test files that are not DB tests but mention the classifier tokens as
-/// string literals (this guard defines `LIVE_DB_TOKENS`), so they'd otherwise
-/// be misclassified as needing a live DB.
+/// string literals (this guard defines `LIVE_DB_TOKENS`). Without this list they
+/// are misclassified as needing a live DB.
 const SELF_EXCLUDE: &[&str] = &["ci_run_coverage", "migration_hygiene"];
 
-/// True when a file carries live-DB machinery but declares no test that could
-/// execute it — i.e. it is a shared **harness** consumed by a real suite, not a
-/// suite itself.
+/// True when a file carries live-DB machinery but no test that could run it.
 ///
+/// Such a file is a shared **harness** that a real suite consumes, not a suite.
 /// Every DB-backed suite in this tree drives its database from an async test
 /// (`#[tokio::test]`) or an explicit `block_on`. A file with neither cannot run
-/// a DB test no matter how it is invoked, so requiring a manifest row for it
-/// would demand a CI step that executes nothing — the inverse of what this
-/// guard exists to prevent. Its DB code is covered transitively by whichever
-/// suite consumes it (which does need, and has, its own row).
+/// a DB test, however it is invoked. A manifest row for it would add a CI step
+/// that executes nothing, the inverse of what this guard prevents. The suite
+/// that consumes it covers its DB code transitively. That suite needs, and
+/// has, its own row.
 ///
 /// Deliberately narrow: the moment such a file gains a `#[tokio::test]` or a
 /// `block_on` it stops being a harness and the guard demands coverage again.
@@ -207,10 +217,10 @@ const ALLOWLIST: &[(&str, &str)] = &[
         ALLOWLIST_PERF_EVIDENCE_REASON,
     ),
     ("plugin:sqlite_plugin_split", ALLOWLIST_SQLITE_SPLIT_REASON),
-    // `webhook_receiver_integration` is intentionally absent: its current-thread
-    // `TestApp::plugin` deadlock was fixed (multi-thread flavor) and its tests
-    // un-ignored, so it is now wired to a covering `linux` manifest row and runs
-    // for real against Docker Postgres in CI.
+    // `webhook_receiver_integration` is absent on purpose. Its current-thread
+    // `TestApp::plugin` deadlock is fixed (multi-thread flavor), and its tests
+    // are un-ignored. A covering `linux` manifest row now runs it for real
+    // against Docker Postgres in CI.
 ];
 
 /// Hard ratchet: the cap must equal `ALLOWLIST.len()` (issue #1799).
@@ -262,12 +272,12 @@ struct SuiteRow {
 impl SuiteRow {
     /// Rows that CREDIT a suite as covered.
     ///
-    /// `linuxpart` deliberately does NOT: it re-runs a suite against the
-    /// opt-in partitioned layout (issue #958), which is *additional* evidence,
-    /// never a substitute for running against the layout every deployment
-    /// actually has. A suite listed only as `linuxpart` would otherwise satisfy
-    /// this guard while never running on the default layout at all — the exact
-    /// silently-never-run gap the guard exists to catch, in a new disguise.
+    /// `linuxpart` does NOT, on purpose. It re-runs a suite against the opt-in
+    /// partitioned layout (issue #958). That is *additional* evidence. It never
+    /// replaces a run against the layout every deployment has. Otherwise a
+    /// suite listed only as `linuxpart` would satisfy this guard and never run
+    /// on the default layout. That is the silently-never-run gap this guard
+    /// catches, in a new disguise.
     fn runs(&self) -> bool {
         self.osclass == "linux" || self.osclass == "allos"
     }
@@ -447,10 +457,11 @@ fn plugin_required_features(source: &str) -> Vec<String> {
     feats
 }
 
-/// A plugin test file is covered iff an executing (`linux`/`allos`) manifest row
-/// targets it whole (`filter == "-"` — a positional filter would slice it, the
-/// mirror of the core partial-filter guard) and lists every required feature.
-/// `compileonly` rows never cover.
+/// A plugin test file is covered iff an executing (`linux`/`allos`) manifest
+/// row targets it whole and lists every required feature.
+///
+/// "Whole" means `filter == "-"`. A positional filter would slice it, which
+/// mirrors the core partial-filter guard. `compileonly` rows never cover.
 fn plugin_covered(rows: &[SuiteRow], stem: &str, required: &[String]) -> bool {
     rows.iter().any(|r| {
         r.krate == "autumn-harvest-plugin" && r.target == stem && r.runs() && r.filter == "-" && {
@@ -703,6 +714,25 @@ fn shared_fixture_callers_are_classified_as_db_gated() {
     }
 }
 
+/// Each suite gets its database from `OwnDb::new()`. The two callers carry
+/// no other token, so the guard missed them (issue #2723).
+/// `decision_owner_claim_tests` defines the helper and is a control.
+#[test]
+fn own_db_callers_are_classified_as_db_gated() {
+    let dir = core_integration_dir();
+    for stem in [
+        "decision_owner_claim_tests",
+        "owner_decider_tests",
+        "owner_failover_tests",
+    ] {
+        let src = read_source(&dir.join(format!("{stem}.rs")));
+        assert!(
+            needs_live_db(&src),
+            "{stem} calls `OwnDb::new()` and must classify as DB-gated"
+        );
+    }
+}
+
 #[test]
 fn all_tests_ignored_counts_code_and_not_prose() {
     let source = "//! - [`zz_evidence`] -- `#[ignore]`d prose.\n                  #[tokio::test]\nasync fn live() {}\n                  #[tokio::test]\n#[ignore = \"slow\"]\nasync fn evidence() {}\n";
@@ -720,9 +750,9 @@ fn all_tests_ignored_counts_code_and_not_prose() {
 #[test]
 fn env_gated_and_no_db_http_tests_are_not_classified() {
     let dir = plugin_tests_dir();
-    // `status_summary_localpg` is a no-op unless `DATABASE_URL` is set and only
-    // mentions `testcontainers` in prose — it must stay excluded (verifies the
-    // deliberate DATABASE_URL-only exclusion holds after broadening the tokens).
+    // `status_summary_localpg` is a no-op unless `DATABASE_URL` is set. It
+    // mentions `testcontainers` only in prose, so it must stay excluded. This
+    // verifies that the DATABASE_URL-only exclusion survives the broader tokens.
     // The two `*_http_tests` are genuinely no-DB harnesses whose only container
     // reference is a `//!` pointer to their sibling suite.
     for stem in [
@@ -1174,8 +1204,8 @@ fn strip_line_comments_drops_prose_container_tokens() {
         !code.contains("testcontainers"),
         "leading `//!` line must be dropped"
     );
-    // A trailing inline comment survives (its line isn't a leading comment), but
-    // that's fine: real code markers are function calls / types, not prose.
+    // A trailing inline comment survives (its line is not a leading comment).
+    // That is fine: real code markers are function calls / types, not prose.
     assert!(code.contains("code();"));
 }
 
@@ -1332,9 +1362,8 @@ fn every_db_gated_test_has_a_ci_run_step_or_is_allowlisted() {
         if !needs_live_db(&src) {
             continue;
         }
-        // A shared harness (DB machinery, no test that could run it) is covered
-        // transitively by the suite that consumes it; demanding its own manifest
-        // row would add a CI step that executes nothing.
+        // The suite that consumes a shared harness covers it transitively. Its
+        // own manifest row would add a CI step that executes nothing.
         if is_db_harness_only(&src) {
             continue;
         }
@@ -1383,7 +1412,7 @@ fn every_db_gated_test_has_a_ci_run_step_or_is_allowlisted() {
         let key = format!("plugin:{stem}");
         live_db_keys.insert(key.clone());
         let req = plugin_required_features(&src);
-        // A covering run can't credit an all-`#[ignore]`d target — it runs
+        // A covering run cannot credit an all-`#[ignore]`d target — it runs
         // nothing — so force it uncovered (→ must be allowlisted).
         let covered = plugin_covered(&rows, &stem, &req) && !all_tests_ignored(&src);
         if covered {
@@ -1747,6 +1776,215 @@ fn every_feature_gated_core_suite_executes_in_some_row() {
         "FEATURE_GATE_EXEMPT has entries that now execute or are no longer gated; remove them:\n  {}",
         stale.join("\n  ")
     );
+}
+
+/// True when the code of `source` names `feature = "<feat>"` as a gate.
+///
+/// A gate on a file, an item or a statement counts. A whole-line `//`
+/// comment does not count. A trailing comment or a block comment still
+/// counts. A negated `not(feature = "<feat>")` does not count, because a row
+/// without `feat` compiles that code in.
+fn names_feature(source: &str, feat: &str) -> bool {
+    let code = strip_line_comments(source);
+    let needle = format!("feature = \"{feat}\"");
+    code.match_indices(&needle)
+        .any(|(idx, _)| !code[..idx].ends_with("not("))
+}
+
+/// True when the `mod.rs` cfg or a `#![cfg]` file gate of a module needs
+/// `feat`. A row without `feat` then compiles the whole module out, and it
+/// runs nothing from that module.
+fn module_gated_on(mod_cfg: &str, source: &str, feat: &str) -> bool {
+    core_required_features(mod_cfg, source).contains(feat)
+}
+
+/// True when a `linux` row runs all of `module` and lists `feat`.
+///
+/// The coverage nightly runs each row with the features of that row only. The
+/// PR job builds one archive with the union of all rows. So only the row
+/// itself proves that the nightly compiles `feat` in.
+fn live_db_row_enables(rows: &[SuiteRow], module: &str, feat: &str) -> bool {
+    rows.iter().any(|r| {
+        r.krate == "autumn-harvest"
+            && r.target == "integration"
+            && r.runs()
+            && r.is_live_db()
+            && filter_runs_whole_module(&r.filter, module)
+            && r.feature_set().contains(feat)
+    })
+}
+
+/// The filters of the `linux` rows that select some test of `module` but do
+/// not list `feat`.
+///
+/// libtest matches a filter as a substring of `module::test_fn`. A row
+/// selects tests of `module` when its filter is `-`, occurs in the module
+/// name, or starts with `module::`. Such a row compiles a gated statement of
+/// `module` out in the nightly, so the test races there.
+fn live_db_rows_without(rows: &[SuiteRow], module: &str, feat: &str) -> Vec<String> {
+    let slice = format!("{module}::");
+    rows.iter()
+        .filter(|r| {
+            r.krate == "autumn-harvest"
+                && r.target == "integration"
+                && r.runs()
+                && r.is_live_db()
+                && (filter_runs_whole_module(&r.filter, module) || r.filter.starts_with(&slice))
+                && !r.feature_set().contains(feat)
+        })
+        .map(|r| r.filter.clone())
+        .collect()
+}
+
+/// A live-DB suite can gate an item or a statement on `testing`. A row
+/// without `testing` compiles it out. A gated test then never runs, and a
+/// gated wait lets its test race. Issue #2723 was such a race:
+/// `owner_decider_tests` skipped its rank wait in the coverage nightly.
+/// `every_feature_gated_core_suite_executes_in_some_row` reads file gates
+/// only, so it did not see the statement gate.
+///
+/// Two rules follow. A `linux` row with `testing` must run the whole suite.
+/// When the gate is not on the whole module, no `linux` row without `testing`
+/// may select the suite.
+///
+/// The guard reads the suite file only. A gate in a helper module that the
+/// suite imports is out of scope, and so is a harness-only file.
+#[test]
+fn every_live_db_suite_that_names_testing_runs_with_testing() {
+    let rows = parse_manifest();
+    let core_dir = core_integration_dir();
+    let mut missing = Vec::new();
+    for m in parse_core_modules() {
+        let path = core_dir.join(format!("{}.rs", m.name));
+        if !path.is_file() || SELF_EXCLUDE.contains(&m.name.as_str()) {
+            continue;
+        }
+        let src = read_source(&path);
+        if !needs_live_db(&src) || is_db_harness_only(&src) || all_tests_ignored(&src) {
+            continue;
+        }
+        if !names_feature(&m.cfg, "testing") && !names_feature(&src, "testing") {
+            continue;
+        }
+        if allowlisted(&format!("core:{}", m.name)) {
+            continue;
+        }
+        if !live_db_row_enables(&rows, &m.name, "testing") {
+            missing.push(format!(
+                "{name} (add `testing` to its `linux` row in .github/ci/integration-suites.txt)",
+                name = m.name
+            ));
+        }
+        if !module_gated_on(&m.cfg, &src, "testing") {
+            for filter in live_db_rows_without(&rows, &m.name, "testing") {
+                missing.push(format!(
+                    "{name} (the `linux` row `{filter}` selects it without `testing`)",
+                    name = m.name
+                ));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "these live-DB suites name the `testing` feature, but a `linux` row runs them \
+         without it. The coverage nightly then compiles the gated code out:\n  {}",
+        missing.join("\n  ")
+    );
+}
+
+#[test]
+fn names_feature_reads_code_and_skips_comment_lines() {
+    let statement_gate = "fn t() {\n    #[cfg(feature = \"testing\")]\n    wait();\n}\n";
+    assert!(names_feature(statement_gate, "testing"));
+    assert!(!names_feature(statement_gate, "chaos"));
+    let negated = "#[cfg(not(feature = \"testing\"))]\nfn t() {}\n";
+    assert!(
+        !names_feature(negated, "testing"),
+        "a negated gate is not a gate"
+    );
+    let both =
+        "#[cfg(not(feature = \"testing\"))]\nfn a() {}\n#[cfg(feature = \"testing\")]\nfn b() {}\n";
+    assert!(names_feature(both, "testing"));
+    let prose = "//! Run with `--features testing` (`feature = \"testing\"`).\nfn t() {}\n";
+    assert!(
+        !names_feature(prose, "testing"),
+        "a comment line is not a gate"
+    );
+}
+
+#[test]
+fn live_db_row_enables_needs_a_linux_row_with_the_feature() {
+    let row = |osclass: &str, features: &str, filter: &str| SuiteRow {
+        osclass: osclass.into(),
+        krate: "autumn-harvest".into(),
+        target: "integration".into(),
+        features: features.into(),
+        filter: filter.into(),
+    };
+    let module = "owner_decider_tests";
+    assert!(live_db_row_enables(
+        &[row("linux", "testing", module)],
+        module,
+        "testing"
+    ));
+    for (rows, why) in [
+        (row("linux", "-", module), "a row without the feature"),
+        (
+            row("allos", "testing", "-"),
+            "an `allos` row has no live DB",
+        ),
+        (
+            row("linuxpart", "testing", module),
+            "`linuxpart` never credits",
+        ),
+        (
+            row("linux", "testing", "owner_decider_tests::one"),
+            "a sub-filter runs a slice",
+        ),
+    ] {
+        assert!(!live_db_row_enables(&[rows], module, "testing"), "{why}");
+    }
+}
+
+#[test]
+fn live_db_rows_without_finds_every_row_that_drops_the_feature() {
+    let row = |osclass: &str, features: &str, filter: &str| SuiteRow {
+        osclass: osclass.into(),
+        krate: "autumn-harvest".into(),
+        target: "integration".into(),
+        features: features.into(),
+        filter: filter.into(),
+    };
+    let module = "replay_canary_tests";
+    let rows = [
+        row("linux", "testing", module),
+        row("linux", "-", "canary_tests"),
+        row("linux", "-", "replay_canary_tests::one"),
+        row("linux", "-", "other_tests"),
+        row("allos", "-", "canary_tests"),
+        row("linuxpart", "-", module),
+    ];
+    assert_eq!(
+        live_db_rows_without(&rows, module, "testing"),
+        vec![
+            "canary_tests".to_string(),
+            "replay_canary_tests::one".to_string()
+        ],
+        "a substring filter and a slice select the module; the others do not"
+    );
+}
+
+#[test]
+fn module_gated_on_reads_the_mod_cfg_and_the_file_gate_only() {
+    let file_gate = "#![cfg(all(feature = \"db\", feature = \"testing\"))]\nfn a() {}";
+    assert!(module_gated_on("", file_gate, "testing"));
+    assert!(module_gated_on(
+        "#[cfg(feature = \"testing\")]",
+        "",
+        "testing"
+    ));
+    let item_gate = "#[cfg(feature = \"testing\")]\nmod replay {}";
+    assert!(!module_gated_on("", item_gate, "testing"));
 }
 
 #[test]

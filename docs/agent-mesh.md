@@ -60,6 +60,13 @@ fn planner(
 A harness takes each tool as an `Arc<dyn Tool>`. `FnTool::new` wraps an async
 function, and `shared` returns it as an `Arc<dyn Tool>`. Section 7 shows both.
 
+The roster keys each peer by its name. If two peers have the same name, the
+harness keeps the peer added last. A peer needs a valid agent name (section
+4). The peer lookup leaves out a peer with an invalid name. It logs a
+warning. A mandate that names such a peer is not valid. A root run with that
+mandate fails at the start, and a durable agent with it fails each op. So no
+run reaches the peer.
+
 The planner sees one more tool, `delegate`. Its input is `agent`, one of the
 peer names, and `task`, the text for the peer. The tool description lists
 each peer with its description. A run with a mandate reserves the name
@@ -79,6 +86,39 @@ The `stop` field tells the parent model how the child ended. The
 The parent model reads both and decides what to do. A durable peer result
 also has `error`.
 
+### Run a small mesh
+
+The example `sqlite_mesh` needs no API key and no network. A planner
+delegates a question to a read-only researcher. It then delegates to a
+publisher. Its mandate does not name the publisher, so the harness refuses
+the delegation. Last, the planner asks to write the plan and waits for
+approval. The example then stands in for a restart. It drops the runtime
+and opens the file again. It approves the write, and the run finishes:
+
+```sh
+cargo run -p autumn-harvest-agent --features sqlite --example sqlite_mesh
+```
+
+```text
+process 1: start the planner
+  waiting on tool_approval:3:0:write_1
+process 2: open the file again and approve
+  stop:   completed
+  answer: The plan is saved. Publishing is not allowed.
+model calls: 5 before the restart, 1 after it
+tool runs: lookup_fact 1, write_plan 1
+delegations:
+  planner -> researcher: completed, 40 tokens, 1 tool call(s)
+  planner -> publisher: refused, not_permitted (this agent may not delegate to "publisher")
+```
+
+The wait name holds `write_1`, the call id of `write_plan`. Before the
+restart, the run sends five model calls: three for the planner and two for
+the researcher. After the restart, the run sends one model call only.
+History answers the delegation, the refusal and each recorded turn. The last three lines show
+`AgentReport::delegations`. A test of the example fails when this block
+differs from the real output.
+
 ## 3. What the child gets
 
 The child sees nothing of the parent transcript. Put every fact it needs in
@@ -89,15 +129,24 @@ the task.
 | System prompt | `Peer::system` |
 | Input | The `task` argument |
 | Transcript | Fresh |
-| Run id | `{root run id}:d{n}`. `n` counts the delegations that ran in the tree, from 1. A refusal takes no number. |
+| Run id | One form for each mode (see Run ids, below) |
 | Tools | The meet of the parent mandate and `Peer::tools` |
 | Steps | `Peer::max_steps` (default `DEFAULT_MAX_STEPS`) |
 | Model | `Peer::model`, else the model of the parent (section 14) |
 | Token cap | The smaller of `Peer::max_total_tokens` and the parent remainder |
 | Read-only | On when the parent, the peer or the mandate is read-only |
-| Memory, follow-ups, delivery | Off |
+| Memory, follow-ups, delivery | Off. A child never edits the memory of its parent. |
+| Workspace | None. A workspace tool in a child gets no workspace. So two children never write one workspace at the same time. |
+| Tool guidance, skills | None. The peer has its own prompt. |
+| Answer check | Off. Only the root runs the answer check. |
+| Kind | None. A peer does not take the kind of its parent. |
+| Flow labels | An inline child shares the label set of the tree (section 7). A fan-out child starts with the labels of the tree. Its labels join the tree when the batch ends. |
+| Failure report | Off. A fan-out child turns it on (section 15). Then the parent keeps the usage of a failed child. A run recorded before the flag keeps it off. |
+| Draw | The child keeps the draw id of the parent. It drops the draw root, so it has its own run id. |
 | Session, tenant, output cap, unattended flag | As the parent |
 | Loop guard, approval timeout, request cap | As the parent |
+| Streaming, parallel-children bound | As the parent |
+| Effect allowlist, probe, context reset, mesh | As the parent |
 | Answer | Cut to `Peer::answer_limit`, else to `AgentHarness::tool_output_limit` (default 8 000 characters). |
 
 The same limit applies to an inline child, a fan-out child (section 15) and
@@ -109,12 +158,43 @@ tokens. Keep the limit inside the context window of your model.
 A cut answer ends with `…[truncated]`. The result also has
 `"truncated": true`, the report sets `DelegationRecord::answer_truncated`,
 and the worker logs a warning. The peer lookup records the limit, so replay
-cuts each answer as the live run did. A run recorded before issue #2481
+cuts each answer as the live run did. A run recorded before 0.10.0
 keeps its old cut of 8 000 characters and has no `truncated` field.
 
 Tools key idempotency on `(run_id, step, call_id)`. A child has its own run
 id, so its keys never collide with the parent keys. A child of a run whose
 run id is the workflow id skips the response cache, as its parent does.
+
+### Run ids
+
+The run id of a child depends on how it runs:
+
+| Mode | Run id of the child |
+|---|---|
+| Inline child | `{root run id}:d{n}`. An inline child of an inline child uses the same root. |
+| Fan-out child (section 15) | The execution id of the child run. That run is a new root. Its inline children get `{its execution id}:d{n}`. |
+| Durable peer (section 13) | The peer runs the task under its own run id, `<incarnation>:s<n>`. `DelegationRecord::run_id` holds the workflow id of the peer, its `AgentId`, such as `research/r1`. |
+
+The root run id is the run id of the root agent:
+
+- A one-shot run uses its execution id. A run recorded with
+  `RunIdSource::WorkflowId` keeps its workflow id.
+- A draw of a strategy uses `{root}:s{n}`.
+- A segment of a durable agent uses `<incarnation>:s<n>`.
+
+`n` is the delegation count of the tree after the delegation. Other
+delegations add to the count too, so `n` can skip a number:
+
+- A fan-out child adds one when it starts. When it ends, each delegation
+  that ran under it adds one, plus its draw units.
+- A message to a durable peer adds one before the send. A refused send keeps
+  that unit.
+- A strategy ask adds its draw cap once the message is out. A beam adds
+  none.
+- A refusal before a child run starts, or before a message counts, adds
+  nothing.
+
+Do not parse a run id to find the agent. Read `DelegationRecord::chain`.
 
 ## 4. Mandates
 
@@ -130,6 +210,7 @@ A mandate holds the authority of one agent:
 | `read_only` | Refuse every write and external call. | off |
 | `flow_labels` | The labels that a caller in another process sends. | none |
 | `models` | The harness models that the subtree may use. `None` means every model. | `None` |
+| `max_draws` | The most draws of one strategy run in the subtree. `None` leaves the cap to the sampling policy. | `None` |
 
 A mandate bounds its holder too. A root mandate with `tools(["lookup"])`
 gives the root agent only `lookup`.
@@ -141,6 +222,9 @@ gives the root agent only `lookup`.
 - `tools` is the meet of the parent tools and `Peer::tools`.
 - `max_depth` and `max_delegations` stay the same. They never grow.
 - `models` stays the same. `Mandate::accept` takes the meet of both lists.
+- `max_draws` is the smaller of the parent cap and `Peer::max_draws`.
+  `Mandate::accept` takes the smaller of both caps. No cap on both sides is
+  no cap.
 - `read_only` stays on once it is on.
 
 Property tests prove each rule (`a_delegation_never_widens_authority`).
@@ -157,8 +241,9 @@ start, before any model call.
 
 ## 5. Refusals
 
-A refused delegation does not run. The model reads an error result with the
-verdict, and the report lists it:
+A refused delegation does not run. A `reply_*` verdict is the exception:
+its message went out. The model reads an error result with the verdict, and
+the report lists it:
 
 ```json
 {"error": "\"researcher\" is already in the delegation chain", "verdict": "cycle"}
@@ -167,7 +252,7 @@ verdict, and the report lists it:
 | Verdict | Cause |
 |---|---|
 | `invalid_arguments` | The `delegate` call does not have exactly the arguments `agent` and `task`. |
-| `not_permitted` | The mandate does not name the peer. |
+| `not_permitted` | The mandate does not name the peer. Or a run with an effect allowlist or a probe asks a durable peer. |
 | `unknown_peer` | The mandate names the peer, but the roster has no valid peer of that name. |
 | `cycle` | The peer is already in the chain. |
 | `depth_exceeded` | The delegation passes `max_depth`. |
@@ -177,12 +262,32 @@ verdict, and the report lists it:
 | `invalid_mandate` | `Mandate::accept` got a malformed mandate. |
 | `deadlock` | The durable peer waits on this agent, so it would never reply (section 13). |
 | `peer_unavailable` | The durable peer has no running run, or the roster names no valid agent id for it. |
+| `draws_exceeded` | A strategy run asks for more draws than `max_draws`. |
+| `strategy_needs_durable_peer` | A `delegate` call asks an inline peer for a strategy. |
+| `reply_timeout` | The message to a durable peer went out, but no reply came before the deadline. |
+| `reply_rejected` | The message to a durable peer went out, but a caller rejected the reply promise, or resolved it with a value that is not a reply. |
+| `reply_interrupted` | The message to a durable peer went out, but a person interrupted the wait. |
 
-A delegation runs the first eight checks in the order of the table.
+A delegation runs the first eight checks in the order of the table. A
+durable peer then checks `peer_unavailable`, `not_permitted`, `deadlock` and
+`invalid_mandate`, in this order. A strategy ask then checks `draws_exceeded`
+and `fan_out_exhausted`. Last, a send that finds no running peer returns
+`peer_unavailable`. `a_durable_peer_runs_the_mandate_checks_before_its_own`
+proves that the mandate checks run first.
+
 `Mandate::accept` returns `invalid_mandate`, `cycle` or `depth_exceeded`. A
 durable receiver returns `model_forbidden` when the accepted mandate does
 not allow its own model. Only a send to a durable peer returns `deadlock` or
 `peer_unavailable`.
+Only a durable peer with no reply returns `reply_timeout`,
+`reply_rejected` or `reply_interrupted`. `Refusal::unanswered` is `true`
+for these three. The peer can still apply the message, so section 13 says
+how to ask again.
+A strategy run returns `draws_exceeded`, then `fan_out_exhausted`, before
+its first draw. Each draw of best-of-N, rejection or a vote, and each tier
+of a cascade, counts as one delegation. The draws split the delegations left
+with `sibling_cap`. A beam checks `max_draws` only, because it counts its
+delegations per path.
 `Refusal` implements `std::error::Error`.
 
 The report keeps a peer name only when it is a valid agent name. Any other
@@ -212,7 +317,7 @@ order each ended:
 | Field | Meaning |
 |---|---|
 | `chain` | The agents from the root to the delegate |
-| `run_id` | The child run id. `None` for a refusal. |
+| `run_id` | The child run id (section 3). `None` for a refusal before the message went out, a refused send included. A sent message keeps the workflow id of the peer, also with no reply or a refusal by the peer. |
 | `stop` | How the child ended. `None` for a refusal. |
 | `refusal` | The verdict of a refused delegation |
 | `usage` | Tokens of the child and of every agent under it |
@@ -360,6 +465,12 @@ A gated call in a child waits on a signal, as in a root run. The name is
 of the whole tree, so a parent and a child never share a name. A run with no
 delegation keeps the names it had before.
 
+In an inline child, `round` is not the step of the child. An inline child
+at its first step can wait on `tool_approval:1:0:c1`
+(`a_gated_call_in_a_child_waits_on_a_tree_unique_name`). A fan-out child is
+its own run. Its rounds start at 0, and it waits on the child run (section
+15).
+
 Read the name from the wait. On SQLite, `RunState::WaitingSignal` holds it.
 On Postgres, the deadline timer of the wait is
 `__signal_timeout:<seq>:<signal name>`.
@@ -413,7 +524,7 @@ fn receive(meta: &Map<String, Value>, text: &str)
 
 | In flight at the crash | On resume |
 |---|---|
-| A peer lookup | That lookup runs again. |
+| A peer lookup | That lookup runs again. A finished lookup does not run again. Replay reads its answer from history. |
 | A child model call | The worker sends that one call again. |
 | A child tool call | That one call runs again, with the same idempotency key. |
 | A child approval wait | The wait resumes. Its deadline is durable. |
@@ -494,8 +605,52 @@ fn mesh(model: Arc<dyn AgentModel>) -> Result<AgentHarness, AgentIdError> {
   reply after the deadline is not read. The receiver still applies the
   message once. When the sender asks again, the task runs twice, so give a
   slow peer a longer deadline.
+- A delegation with no reply has a verdict (issue #2484): `reply_timeout`,
+  `reply_rejected` or `reply_interrupted`. Its record keeps the `run_id`
+  of the peer, so it still counts one delegation and its draws. Only a
+  durable agent races an interrupt, and it keeps no records. So only its
+  model reads `reply_interrupted`.
+- Each record of a sent message holds `idempotency_key`, the key
+  `<from>:<seq>` of the message. A refusal before the send holds none. A
+  new ask gets a new key, so the receiver does not dedupe it. Before you
+  ask again, read the state of the peer that `run_id` names.
+  `AgentState::inbound.applied_key` is `true` when the receiver took the
+  message. A `false` can also mean that its bound dropped the sender or
+  the number. The model does not see the key.
+- A run that started before this change keeps the old record and the old
+  text. An older worker cannot decode a report with a new verdict. So
+  upgrade every worker before a run can record one.
 - A durable peer runs on its own worker, in its own history, under its own
   profile budget. Its tokens are not added to the budget of the sender.
+
+### Ask a durable peer for a strategy
+
+The `delegate` call can carry a `sample`, an `OpSample`. The peer runs the
+message as a strategy op and replies with the selected answer.
+
+```json
+{
+  "agent": "researcher",
+  "task": "Name the year the treaty was signed.",
+  "sample": {
+    "strategy": {"best_of_n": {"n": 3}},
+    "scorer": {"id": "exact_match"}
+  }
+}
+```
+
+| Rule | What happens |
+|---|---|
+| Cap | The cap of a call is the smaller of the caller `max_draws` and the `Peer::max_draws` of the peer role. With neither, the call admits one draw. Each hop can only narrow a cap, so the caller holds the lowest cap of the chain above it. |
+| Tool | The tool shows `sample` only when a durable peer has a cap of 2 or more. |
+| Fan-out | The delegation takes one unit of `max_delegations`, and each draw takes one more once the message is out. A best-of-3 needs 4 units. A beam checks `max_draws` only. A fan-out parent and a beam count the draw units of each nested record. |
+| Order | The usual delegation checks run first. Then the caller checks `draws_exceeded`, then `fan_out_exhausted`, before the send. The tool result and `DelegationRecord::refusal` name each refusal. |
+| Receiver | The receiver checks its accepted mandate and the sampling policy of its kind again. A policy refusal comes back in the `error` of the tool result. |
+| Inline peer | An inline peer refuses a strategy with `strategy_needs_durable_peer`. No sampling policy covers a role. A call with `sample` never joins a batch. |
+| Strict mandate | The receiver decodes the envelope mandate strictly. An unknown key fails the op, so a receiver never drops a cap that a newer sender adds. The sender then waits for its reply deadline. A held message in the agent state reads the same way. |
+
+A worker from before strategies drops `sample` and runs one plain segment.
+The design is in [`DESIGN-2610.md`](design/DESIGN-2610.md).
 
 ## 14. A model per agent (issue #2271)
 

@@ -1,0 +1,18 @@
+# Six alternating pairs of the `throughput` cell, 1 shard (issue #2651).
+# base = trunk-dev at 05e0013. new = this change. One box, 2026-11-11.
+# pg_stat_statements.track_planning = off, no commit probe.
+# backend_memory_median_bytes: the median "Grand total" of
+# pg_log_backend_memory_contexts over 12 worker backends, 13 s into the run.
+# replay_events_per_sec is the in-memory noise control of the bench.
+base_1 workflows_per_sec=43.95 replay_events_per_sec=9919934.30 backend_memory_median_bytes=6762976
+new_1 workflows_per_sec=78.70 replay_events_per_sec=10425288.39 backend_memory_median_bytes=7879856
+new_2 workflows_per_sec=83.80 replay_events_per_sec=9045963.37 backend_memory_median_bytes=10203656
+base_2 workflows_per_sec=49.95 replay_events_per_sec=9460439.92 backend_memory_median_bytes=6793648
+base_3 workflows_per_sec=47.14 replay_events_per_sec=6374940.32 backend_memory_median_bytes=6816368
+new_3 workflows_per_sec=80.59 replay_events_per_sec=6794526.88 backend_memory_median_bytes=7905696
+new_4 workflows_per_sec=83.56 replay_events_per_sec=9054464.40 backend_memory_median_bytes=8065768
+base_4 workflows_per_sec=48.53 replay_events_per_sec=9953452.36 backend_memory_median_bytes=6843344
+base_5 workflows_per_sec=47.15 replay_events_per_sec=9535205.22 backend_memory_median_bytes=6842120
+new_5 workflows_per_sec=78.62 replay_events_per_sec=7953562.20 backend_memory_median_bytes=7840376
+new_6 workflows_per_sec=83.41 replay_events_per_sec=10158270.34 backend_memory_median_bytes=7876040
+base_6 workflows_per_sec=49.26 replay_events_per_sec=9927910.72 backend_memory_median_bytes=6820936

@@ -17,6 +17,11 @@
 //!    [`RefineStatus::BudgetExhausted`], with no chosen overlay.
 //! 5. A run that ran its whole plan checks its counts with
 //!    [`RefineLedger::check`].
+//! 6. A run that chose an overlay runs the adoption gate of
+//!    [`gate`](super::gate). A dry run ends before it.
+//! 7. A run that adopted an overlay adds one lesson to the library of
+//!    [`lessons`](super::lessons). A failed write is a note. The adoption
+//!    stands.
 //!
 //! Each stage, probe and selection is one recorded activity. A crash
 //! re-runs only the step in flight.
@@ -27,7 +32,7 @@ use std::time::Duration;
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
-use autumn_harvest::types::ExecutionId;
+use autumn_harvest::types::{ExecutionId, IdempotencyKey};
 use serde::{Deserialize, Serialize};
 
 use super::adopt::RefineStatus;
@@ -35,7 +40,13 @@ use super::compose::{
     ComposeRequest, Composition, ProbedCandidate, SelectRequest, SelectedBy, Selection,
     agent_refine_compose_info, agent_refine_select_info, source_events,
 };
+use super::gate::{Gate, GateRecord, set_failed, set_status};
 use super::ledger::{MAX_REFINE_K, MAX_SOURCE_RUNS, RefineError, RefineLedger, RefineMode};
+use super::lessons::{
+    LESSON_PATCH, Lesson, LessonOutcome, LessonRequest, agent_refine_lesson_info, lesson_scope,
+    writes_lesson,
+};
+use super::meter::Charge;
 use super::policy::{PolicyCeilings, RefinePolicy};
 use super::policy_read::read_refine_policy;
 use super::propose::{
@@ -44,11 +55,15 @@ use super::propose::{
 };
 use super::sources::{LiveEnd, LiveProbeError, LiveRequest};
 use crate::agent::overlay::{Ceilings, ProfileOverlay};
+use crate::agent::overlay_store::{OverlayVersion, StoredOverlay};
 use crate::agent::{AGENT_WORKFLOW_NAME, AgentId, AgentProfile};
 use crate::eval::anon::AnonId;
-use crate::eval::evidence::render_source;
-use crate::eval::{Candidate, Evaluation, RunEnd, check_source, evaluate_routed, task_of};
+use crate::eval::evidence::{render_source, source_labels};
+use crate::eval::{
+    Candidate, Evaluation, LiveCheck, RunEnd, check_source, evaluate_routed, task_of,
+};
 use crate::harness::{AgentHarness, truncate};
+use crate::memory::MemorySnapshot;
 use crate::mesh_control::{MESH_ATTR, MeshBudget};
 use crate::message::TokenUsage;
 use crate::tool::ToolEffect;
@@ -56,6 +71,15 @@ use crate::workflow::WORKFLOW_NAME;
 
 /// The registered workflow name of a refine run.
 pub const REFINE_WORKFLOW_NAME: &str = "agent_refine";
+
+/// The patch of the live rule. A run that started before it keeps the old
+/// fallback rule on replay. It carries each pick and each composition,
+/// whatever its live end. Its inputs hold no live end.
+pub(crate) const LIVE_RULE_PATCH: &str = "agent_refine_live_rule";
+
+/// The note of a stage that the run does not carry, because its live
+/// re-probe failed.
+const LIVE_REFUSED: &str = "the live run did not complete, so the run keeps the current overlay";
 
 /// The most characters of a stage error or a note in the report.
 const MAX_NOTE_CHARS: usize = 500;
@@ -92,6 +116,10 @@ pub struct RefineInput {
     /// The cap on the spend of the run. `None` sets no cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<MeshBudget>,
+    /// End after the loop with the chosen overlay. A dry run stores no
+    /// version and opens no gate.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dry_run: bool,
 }
 
 impl RefineInput {
@@ -111,7 +139,16 @@ impl RefineInput {
             mode,
             seed,
             budget: None,
+            dry_run: false,
         }
+    }
+
+    /// Make the run a dry run. It ends with the chosen overlay, stores no
+    /// version and opens no gate.
+    #[must_use]
+    pub const fn dry_run(mut self) -> Self {
+        self.dry_run = true;
+        self
     }
 
     /// Cap the spend of the run with `budget`.
@@ -169,6 +206,15 @@ pub struct SourceBrief {
     /// The profile of the recorded task. A probe applies each overlay to
     /// it, so each stage of the source checks its replies against it too.
     pub profile: AgentProfile,
+    /// The flow labels that the source recorded. A record of an older
+    /// release has none, so its run writes no lesson.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<BTreeSet<String>>,
+    /// The agents of the kind that the source names. A run names the agent
+    /// of its workflow id, of its memory scope `agent:<id>` and of its
+    /// mandate chain.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub agents: BTreeSet<String>,
 }
 
 /// The input of [`agent_refine_start`].
@@ -196,6 +242,23 @@ pub struct RefineStart {
     pub selector: bool,
     /// The policy ceilings, resolved against the base profile.
     pub ceilings: Ceilings,
+    /// The version that was active at the start. An approval of the gate
+    /// expects it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<OverlayVersion>,
+    /// `true` when the step read [`Self::active`]. A record of an older
+    /// release has no such field. Its run then ends with the chosen overlay
+    /// and opens no gate, as that release did.
+    #[serde(default)]
+    pub active_read: bool,
+    /// The lesson library of the kind. Each proposer stage reads it. `None`
+    /// when the worker has no memory store, the library is empty, or the
+    /// read failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lessons: Option<MemorySnapshot>,
+    /// The agents that the lessons of [`Self::lessons`] name.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub lesson_agents: BTreeSet<String>,
 }
 
 /// The part of the loop that a stage plays.
@@ -239,6 +302,31 @@ pub enum LiveReprobe {
     },
     /// The re-probe ran on a fork.
     Ran(LiveEnd),
+}
+
+impl LiveReprobe {
+    /// `true` for a live failure: a fork that did not complete. It failed,
+    /// ended in another state, or did not end in time. A failed fork or wait
+    /// is no live failure. It says nothing about the overlay.
+    #[must_use]
+    pub const fn failed(&self) -> bool {
+        matches!(self, Self::Ran(end) if !end.completed)
+    }
+}
+
+impl From<&LiveReprobe> for LiveCheck {
+    /// The live end with no fork id, no tokens, no cost and no host error.
+    fn from(live: &LiveReprobe) -> Self {
+        match live {
+            LiveReprobe::NotNeeded => Self::NotNeeded,
+            LiveReprobe::Skipped { .. } => Self::Skipped,
+            LiveReprobe::Failed { .. } => Self::NoEnd,
+            LiveReprobe::Ran(end) if end.completed => Self::Completed,
+            LiveReprobe::Ran(end) => Self::Failed {
+                error: end.error.clone(),
+            },
+        }
+    }
 }
 
 /// The input of [`agent_refine_probe`].
@@ -351,9 +439,15 @@ pub struct SelectionRecord {
     pub id: Option<AnonId>,
     /// Who made the pick.
     pub by: SelectedBy,
-    /// Why the rule replaced the pick of the installed selector.
+    /// Why the rule picked in place of the selector, or why it picked none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Why the selector picked the id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+    /// What the pick teaches the next refine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lesson: Option<String>,
 }
 
 /// The output of [`agent_refine`].
@@ -372,8 +466,9 @@ pub struct RefineReport {
     pub seed: u64,
     /// The source runs, in input order.
     pub source_runs: Vec<ExecutionId>,
-    /// How the run ended: [`RefineStatus::Chosen`],
-    /// [`RefineStatus::Unchanged`] or [`RefineStatus::BudgetExhausted`].
+    /// How the run ended. The loop gives [`RefineStatus::Unchanged`] or
+    /// [`RefineStatus::BudgetExhausted`]. A dry run gives
+    /// [`RefineStatus::Chosen`]. The gate gives each other status.
     pub status: RefineStatus,
     /// The chosen overlay. `None` when the run changed nothing or spent its
     /// budget.
@@ -384,6 +479,18 @@ pub struct RefineReport {
     pub selections: Vec<SelectionRecord>,
     /// The counts and the spend.
     pub ledger: RefineLedger,
+    /// The adoption gate. `None` when the run chose no overlay, when the
+    /// store found no change, when the pointer moved before the gate, and
+    /// for a dry run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<GateRecord>,
+    /// The flow labels of the run: the labels of each source and of the
+    /// lessons that the run read.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_labels: BTreeSet<String>,
+    /// The lesson write. `None` when the run adopted nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lesson: Option<LessonOutcome>,
 }
 
 /// A failure payload of `err` with its name.
@@ -393,16 +500,99 @@ fn failure(err: &RefineError) -> String {
         .into_error_payload()
 }
 
-/// The kind of the source `record`, or `None` when it names none.
+/// The kind of the `agent_loop` source `record`, or `None` when it names
+/// none.
 fn kind_of(record: &super::sources::SourceRecord) -> Result<Option<String>, String> {
-    if record.workflow_name == AGENT_WORKFLOW_NAME {
-        return Ok(AgentId::parse(&record.workflow_id)
-            .ok()
-            .map(|id| id.kind().to_owned()));
-    }
     task_of(&record.events)
         .map(|task| task.kind)
         .map_err(|err| err.to_string())
+}
+
+/// The active version of `kind`, or `None` with no store.
+async fn active_of(harness: &AgentHarness, kind: &str) -> Result<Option<StoredOverlay>, String> {
+    match harness.overlays() {
+        None => Ok(None),
+        Some(store) => store
+            .active(kind)
+            .await
+            .map_err(|err| format!("the overlay store failed: {err}")),
+    }
+}
+
+/// Check one source `record` of `kind`, and read its brief.
+///
+/// # Errors
+///
+/// Returns the failure payload of a [`RefineError`].
+fn brief_of(
+    run: ExecutionId,
+    record: &super::sources::SourceRecord,
+    kind: &str,
+) -> Result<SourceBrief, String> {
+    let name = run.to_string();
+    if record.workflow_name != WORKFLOW_NAME && record.workflow_name != AGENT_WORKFLOW_NAME {
+        return Err(failure(&RefineError::SourceNotAgentRun {
+            run: name,
+            workflow: truncate(&record.workflow_name, crate::mesh::MAX_NAME_LEN),
+        }));
+    }
+    // The replay probe reads one task. A durable agent runs many ops in one
+    // history, so no probe can read it. The refusal comes before the end
+    // and kind checks, so each agent run gets this error.
+    if record.workflow_name == AGENT_WORKFLOW_NAME {
+        return Err(failure(&RefineError::SourceNotReplayable {
+            run: name,
+            reason: "the replay probe reads agent_loop runs only, not a durable agent run"
+                .to_owned(),
+        }));
+    }
+    if !record.ended {
+        return Err(failure(&RefineError::SourceInFlight { run: name }));
+    }
+    let found = kind_of(record).map_err(|reason| {
+        failure(&RefineError::SourceNotReplayable {
+            run: name.clone(),
+            reason,
+        })
+    })?;
+    if found.as_deref() != Some(kind) {
+        return Err(failure(&RefineError::SourceOtherKind {
+            run: name,
+            kind: kind.to_owned(),
+            found: found.map(|kind| truncate(&kind, crate::mesh::MAX_NAME_LEN)),
+        }));
+    }
+    let not_replayable = |reason: String| {
+        failure(&RefineError::SourceNotReplayable {
+            run: name.clone(),
+            reason,
+        })
+    };
+    check_source(&record.events).map_err(|err| not_replayable(err.to_string()))?;
+    let evidence = render_source(&record.events).map_err(|err| not_replayable(err.to_string()))?;
+    let labels = source_labels(&record.events).map_err(|err| not_replayable(err.to_string()))?;
+    let task = task_of(&record.events).map_err(|err| not_replayable(err.to_string()))?;
+    let mut source_profile = crate::eval::source_profile(&task);
+    kind.clone_into(&mut source_profile.kind);
+    let scope_agent = task
+        .memory_scope
+        .as_ref()
+        .and_then(|scope| scope.as_str().strip_prefix("agent:"));
+    let chain = task.mandate.iter().flat_map(|mandate| mandate.chain.iter());
+    let agents = std::iter::once(record.workflow_id.as_str())
+        .chain(scope_agent)
+        .chain(chain.map(String::as_str))
+        .filter_map(|name| AgentId::parse(name).ok())
+        .filter(|id| id.kind() == kind)
+        .map(|id| id.as_str().to_owned())
+        .collect();
+    Ok(SourceBrief {
+        run,
+        evidence,
+        profile: source_profile,
+        labels: Some(labels),
+        agents,
+    })
 }
 
 /// Check every source of `input`, then read the base profile, the active
@@ -427,58 +617,16 @@ pub(crate) async fn run_start(
     })?;
     let mut briefs = Vec::with_capacity(input.source_runs.len());
     for &run in &input.source_runs {
-        let name = run.to_string();
         let record = sources
             .source(run)
             .await
             .map_err(|err| format!("the source read failed: {err}"))?
-            .ok_or_else(|| failure(&RefineError::SourceNotFound { run: name.clone() }))?;
-        if record.workflow_name != WORKFLOW_NAME && record.workflow_name != AGENT_WORKFLOW_NAME {
-            return Err(failure(&RefineError::SourceNotAgentRun {
-                run: name,
-                workflow: truncate(&record.workflow_name, crate::mesh::MAX_NAME_LEN),
-            }));
-        }
-        if !record.ended {
-            return Err(failure(&RefineError::SourceInFlight { run: name }));
-        }
-        let found = kind_of(&record).map_err(|reason| {
-            failure(&RefineError::SourceNotReplayable {
-                run: name.clone(),
-                reason,
-            })
-        })?;
-        if found.as_deref() != Some(input.kind.as_str()) {
-            return Err(failure(&RefineError::SourceOtherKind {
-                run: name,
-                kind: input.kind.clone(),
-                found: found.map(|kind| truncate(&kind, crate::mesh::MAX_NAME_LEN)),
-            }));
-        }
-        if record.workflow_name == AGENT_WORKFLOW_NAME {
-            return Err(failure(&RefineError::SourceNotReplayable {
-                run: name,
-                reason: "the replay probe reads agent_loop runs only, not a durable agent run"
-                    .to_owned(),
-            }));
-        }
-        let not_replayable = |reason: String| {
-            failure(&RefineError::SourceNotReplayable {
-                run: name.clone(),
-                reason,
-            })
-        };
-        check_source(&record.events).map_err(|err| not_replayable(err.to_string()))?;
-        let evidence =
-            render_source(&record.events).map_err(|err| not_replayable(err.to_string()))?;
-        let task = task_of(&record.events).map_err(|err| not_replayable(err.to_string()))?;
-        let mut source_profile = crate::eval::source_profile(&task);
-        source_profile.kind.clone_from(&input.kind);
-        briefs.push(SourceBrief {
-            run,
-            evidence,
-            profile: source_profile,
-        });
+            .ok_or_else(|| {
+                failure(&RefineError::SourceNotFound {
+                    run: run.to_string(),
+                })
+            })?;
+        briefs.push(brief_of(run, &record, &input.kind)?);
     }
     let profile = harness.agent_profile(&input.kind).ok_or_else(|| {
         failure(&RefineError::InvalidInput(format!(
@@ -487,15 +635,11 @@ pub(crate) async fn run_start(
         )))
     })?;
     let ceilings = ceilings.resolve(&profile);
-    let current = match harness.overlays() {
-        None => ProfileOverlay::default(),
-        Some(store) => store
-            .active(&input.kind)
-            .await
-            .map_err(|err| format!("the overlay store failed: {err}"))?
-            .map(|stored| stored.overlay().clone())
-            .unwrap_or_default(),
-    };
+    let active = active_of(harness, &input.kind).await?;
+    let current = active
+        .as_ref()
+        .map(|stored| stored.overlay().clone())
+        .unwrap_or_default();
     // Each stage and probe of a source starts from `current` on the source
     // profile. A source that the ceilings refuse would fail its first stage
     // after earlier sources spent, so the start step refuses it now.
@@ -508,13 +652,43 @@ pub(crate) async fn run_start(
             }));
         }
     }
+    let (lessons, lesson_agents) = lessons_of(harness, &input.kind).await.unzip();
     Ok(RefineStart {
         profile,
         current,
         sources: briefs,
         selector: harness.overlay_selector().is_some(),
         ceilings,
+        active: active.as_ref().map(StoredOverlay::version),
+        active_read: true,
+        lessons,
+        lesson_agents: lesson_agents.unwrap_or_default(),
     })
+}
+
+/// The snapshot of the lesson library of `kind`, and the agents that it
+/// names. `None` with no memory store.
+///
+/// A failed read gives `None` and a warning. The proposers then read no
+/// lesson, so the run takes no lesson label. A store fault never fails the
+/// start step.
+async fn lessons_of(
+    harness: &AgentHarness,
+    kind: &str,
+) -> Option<(MemorySnapshot, BTreeSet<String>)> {
+    let store = harness.memory_store().ok()?;
+    let read = tokio::time::timeout(harness.hook_limit(), store.load(&lesson_scope(kind))).await;
+    match read {
+        Ok(Ok(blocks)) => super::lessons::snapshot(&blocks),
+        Ok(Err(err)) => {
+            tracing::warn!(error = %err, "the lesson library was not read");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("the lesson library read timed out");
+            None
+        }
+    }
 }
 
 /// The start step of a refine run, as an activity. See [`run_start`].
@@ -543,6 +717,7 @@ pub async fn agent_refine_start(
 pub(crate) async fn run_probe(
     harness: &AgentHarness,
     request: ProbeRequest,
+    fork_key: Option<&str>,
 ) -> Result<ProbeResult, String> {
     let events = source_events(harness, request.source).await?;
     let candidate = Candidate::new(harness.clone())
@@ -571,6 +746,7 @@ pub(crate) async fn run_probe(
                 overlay: &request.overlay,
                 effects: &request.effects,
                 ceilings: &request.ceilings,
+                fork_key,
             })
             .await;
         match ran {
@@ -603,27 +779,56 @@ pub async fn agent_refine_probe(
     ctx: &ActivityContext,
     request: ProbeRequest,
 ) -> Result<ProbeResult, String> {
-    let result = run_probe(crate::workflow::harness(ctx)?, request).await?;
+    // The key is the same for each attempt, so a retry finds its fork.
+    let key = ctx.idempotency_key().ok().map(IdempotencyKey::as_str);
+    let result = run_probe(crate::workflow::harness(ctx)?, request, key).await?;
     super::propose::record_calls(ctx, probe_calls(&result));
     Ok(result)
 }
 
-/// The cost ledger call of one probe. The probe records one row for the
-/// sum of its candidate turns, under the unknown model id.
+/// The cost ledger calls of one probe: one call for each candidate turn
+/// that called a model. Each call names the model of its turn.
+///
+/// An attempt takes at most `MAX_LLM_CALLS_PER_ATTEMPT` calls. A longer
+/// probe gives one call for each model, with the sums of its turns. So the
+/// rows still hold the whole spend.
 pub(crate) fn probe_calls(result: &ProbeResult) -> Vec<autumn_harvest::llm_ledger::LlmCall> {
-    let evaluation = &result.evaluation;
-    if evaluation.candidate_usage == TokenUsage::default() {
-        return Vec::new();
+    let charges = &result.evaluation.candidate_calls;
+    if charges.len() <= autumn_harvest::llm_ledger::MAX_LLM_CALLS_PER_ATTEMPT {
+        return charges.iter().map(Charge::ledger_call).collect();
     }
-    let mut call = autumn_harvest::llm_ledger::LlmCall::new(
-        crate::model::UNKNOWN_MODEL_ID,
-        u64::from(evaluation.candidate_usage.input_tokens),
-        u64::from(evaluation.candidate_usage.output_tokens),
-    );
-    if evaluation.candidate_cost_usd_micros > 0 {
-        call = call.with_cost_usd_micros(evaluation.candidate_cost_usd_micros);
+    let mut by_model: std::collections::BTreeMap<Option<&str>, Charge> =
+        std::collections::BTreeMap::new();
+    for charge in charges {
+        let sum = by_model
+            .entry(charge.model_id.as_deref())
+            .or_insert_with(|| Charge::new(charge.model_id.as_deref(), TokenUsage::default()));
+        sum.usage = sum.usage.saturating_add(charge.usage);
+        sum.cost_usd_micros = match (sum.cost_usd_micros, charge.cost_usd_micros) {
+            (None, None) => None,
+            (sum, cost) => Some(sum.unwrap_or(0).saturating_add(cost.unwrap_or(0))),
+        };
     }
-    vec![call]
+    by_model.values().map(Charge::ledger_call).collect()
+}
+
+/// The position in `probes` of the pick of the fallback rule. A stage
+/// with no probe is no candidate. With `live_rule`, a live failure is out
+/// of the pick. A run of an older release replays without it.
+fn fallback_pick(probes: &[Option<&ProbeRecord>], live_rule: bool) -> Option<usize> {
+    let candidates: Vec<(usize, &ProbeRecord)> = probes
+        .iter()
+        .enumerate()
+        .filter_map(|(at, probe)| Some((at, (*probe)?)))
+        .collect();
+    let pick = super::rule::rule_pick(candidates.iter().map(|(_, probe)| {
+        (
+            live_rule && probe.live.failed(),
+            probe.completed,
+            probe.stubbed_tool_calls,
+        )
+    }))?;
+    candidates.get(pick).map(|(at, _)| *at)
 }
 
 /// The state of one refine run.
@@ -644,8 +849,15 @@ struct Refine<'a> {
     probes: Vec<Option<ProbedCandidate>>,
     selections: Vec<SelectionRecord>,
     exhausted: bool,
-    /// Whether the worker has a selector.
     selector: bool,
+    /// The lesson library that each proposer stage reads.
+    lessons: Option<&'a MemorySnapshot>,
+    /// The `why` and `lesson` text of the selection that set the current
+    /// overlay.
+    reason: (Option<String>, Option<String>),
+    /// `true` when the run took [`LIVE_RULE_PATCH`]. A live failure is then
+    /// out of the fallback pick, and neither mode carries it.
+    live_rule: bool,
 }
 
 /// Whether a stage that failed with `err` falls back to the current
@@ -743,6 +955,7 @@ impl Refine<'_> {
             attempts: self.attempts,
             sample,
             others: self.others(source),
+            lessons: self.lessons.cloned(),
         };
         let stage: Stage = match self
             .ctx
@@ -901,6 +1114,9 @@ impl Refine<'_> {
                 overlay,
                 evaluation: result.evaluation,
                 routes: result.routes,
+                // A run of an older release recorded its inputs with no live
+                // end. A strict replay compares each input.
+                live: self.live_rule.then_some(result.live),
             });
             probed.push(at);
         }
@@ -938,19 +1154,20 @@ impl Refine<'_> {
             id: selection.id,
             by: selection.by,
             note: selection.note,
+            why: selection.why,
+            lesson: selection.lesson,
         });
         Ok(stage)
     }
 
-    /// The pick of a select step that failed with `err`: a completed probe
-    /// first, then the fewest stubbed tool calls, then the first stage.
+    /// The pick of a select step that failed with `err`, by the rule of
+    /// [`fallback_pick`]. The first stage wins a tie.
     fn rule_of(&self, stages: &[usize], err: &HarvestError) -> Selection {
-        let index = stages
+        let probes: Vec<Option<&ProbeRecord>> = stages
             .iter()
-            .enumerate()
-            .filter_map(|(index, &at)| Some((index, self.stages.get(at)?.probe.as_ref()?)))
-            .min_by_key(|(index, probe)| (!probe.completed, probe.stubbed_tool_calls, *index))
-            .map(|(index, _)| index);
+            .map(|&at| self.stages.get(at).and_then(|stage| stage.probe.as_ref()))
+            .collect();
+        let index = fallback_pick(&probes, self.live_rule);
         let spent = spent_of(err);
         Selection {
             index,
@@ -960,12 +1177,35 @@ impl Refine<'_> {
             cost_usd_micros: spent.cost_usd_micros,
             note: Some(truncate(
                 &format!(
-                    "the select step failed, so the rule picked: {}",
+                    "the select step failed, so the rule picked{}: {}",
+                    if index.is_none() && !probes.is_empty() {
+                        " none"
+                    } else {
+                        ""
+                    },
                     error_text(err)
                 ),
                 MAX_NOTE_CHARS,
             )),
+            why: None,
+            lesson: None,
         }
+    }
+
+    /// Whether the run refuses to carry stage `at`, because its probe is a
+    /// live failure. A refusal adds a note to the stage. The select step
+    /// never picks a live failure, but a select step of an older worker can.
+    fn refused_live(&mut self, at: usize) -> bool {
+        let failed = self.live_rule
+            && self
+                .stages
+                .get(at)
+                .and_then(|stage| stage.probe.as_ref())
+                .is_some_and(|probe| probe.live.failed());
+        if failed {
+            self.stages[at].notes.push(LIVE_REFUSED.to_owned());
+        }
+        failed
     }
 
     /// The overlay of the candidate stage `at`.
@@ -1011,9 +1251,15 @@ impl Refine<'_> {
             return Ok(false);
         }
         if let Some(chosen) = self.select(source, &composed).await?
+            && !self.refused_live(chosen)
             && let Some(overlay) = self.overlay_of(chosen)
         {
             self.current = overlay;
+            self.reason = self
+                .selections
+                .last()
+                .map(|pick| (pick.why.clone(), pick.lesson.clone()))
+                .unwrap_or_default();
         }
         Ok(true)
     }
@@ -1040,8 +1286,11 @@ impl Refine<'_> {
             if self.probe_all(source, &[composition]).await?.is_none() {
                 return Ok(false);
             }
-            if let Some(overlay) = self.overlay_of(composition) {
+            if !self.refused_live(composition)
+                && let Some(overlay) = self.overlay_of(composition)
+            {
                 self.current = overlay;
+                self.reason = (None, None);
             }
         }
         Ok(true)
@@ -1072,12 +1321,8 @@ pub async fn agent_refine(
         .execute_activity(&agent_refine_start_info(), request)
         .await
         .map_err(|err| start_failure(&err))?;
-    if let Some(budget) = &input.budget
-        && let Err(err) =
-            ctx.upsert_search_attrs([(MESH_ATTR.to_owned(), Some(serde_json::json!(budget.mesh)))])
-    {
-        tracing::warn!(error = %err, "the refine mesh attribute was not set");
-    }
+    set_mesh(ctx, &input);
+    let live_rule = ctx.patched(LIVE_RULE_PATCH);
     let mut run = Refine {
         ctx,
         input: &input,
@@ -1093,6 +1338,9 @@ pub async fn agent_refine(
         selections: Vec::new(),
         exhausted: false,
         selector: start.selector,
+        lessons: start.lessons.as_ref(),
+        reason: (None, None),
+        live_rule,
     };
     for source in &start.sources {
         let more = match input.mode {
@@ -1123,6 +1371,18 @@ pub async fn agent_refine(
             (RefineStatus::Chosen, Some(run.current.clone()))
         }
     };
+    let (status, gate) = gate_of(ctx, &input, &start, &policy, status, chosen.as_ref()).await?;
+    set_status(ctx, &input.kind, status);
+    let flow_labels = run_labels(&start);
+    let adopted = gate.as_ref().and_then(|gate| gate.adopted);
+    let lesson = Ended {
+        status,
+        adopted,
+        input: &input,
+        start: &start,
+    }
+    .lesson(ctx, run.reason.clone(), flow_labels.clone())
+    .await?;
     Ok(RefineReport {
         kind: input.kind.clone(),
         mode: input.mode,
@@ -1134,7 +1394,157 @@ pub async fn agent_refine(
         stages: run.stages,
         selections: run.selections,
         ledger: run.ledger,
+        gate,
+        flow_labels: flow_labels.unwrap_or_default(),
+        lesson,
     })
+}
+
+/// How a refine run ended, as its lesson write reads it.
+struct Ended<'a> {
+    status: RefineStatus,
+    /// The version that went live, if any.
+    adopted: Option<OverlayVersion>,
+    input: &'a RefineInput,
+    start: &'a RefineStart,
+}
+
+impl Ended<'_> {
+    /// Write the lesson of an adoption. Returns `None` when the run adopted
+    /// nothing, or when its history predates the lesson write.
+    ///
+    /// `reason` holds the `why` and `lesson` text of the selection that set
+    /// the chosen overlay.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`write_lesson`].
+    async fn lesson(
+        &self,
+        ctx: &WorkflowContext,
+        (why, lesson): (Option<String>, Option<String>),
+        labels: Option<BTreeSet<String>>,
+    ) -> Result<Option<LessonOutcome>, String> {
+        let Some(version) = self.adopted else {
+            return Ok(None);
+        };
+        if !writes_lesson(self.status) || !ctx.patched(LESSON_PATCH) {
+            return Ok(None);
+        }
+        let lesson = Lesson {
+            version,
+            why: why.unwrap_or_default(),
+            lesson: lesson.unwrap_or_default(),
+            sources: self.input.source_runs.clone(),
+            agents: self
+                .start
+                .sources
+                .iter()
+                .flat_map(|source| source.agents.iter().cloned())
+                .chain(self.start.lesson_agents.iter().cloned())
+                .collect(),
+        };
+        write_lesson(ctx, &self.input.kind, lesson, labels)
+            .await
+            .map(Some)
+    }
+}
+
+/// The flow labels of a run: the labels of each source and of the lessons
+/// that it read. `None` when a source of an older release has no labels.
+fn run_labels(start: &RefineStart) -> Option<BTreeSet<String>> {
+    let mut labels = start
+        .lessons
+        .as_ref()
+        .map(MemorySnapshot::labels)
+        .unwrap_or_default();
+    for source in &start.sources {
+        labels.extend(source.labels.as_ref()?.iter().cloned());
+    }
+    Some(labels)
+}
+
+/// Add the lesson of an adoption. A failed or timed-out step is a note, so
+/// the adoption stands.
+///
+/// # Errors
+///
+/// Returns any other engine error, such as a cancel, as a run failure.
+async fn write_lesson(
+    ctx: &WorkflowContext,
+    kind: &str,
+    lesson: Lesson,
+    labels: Option<BTreeSet<String>>,
+) -> Result<LessonOutcome, String> {
+    let Some(labels) = labels else {
+        return Ok(LessonOutcome::Failed {
+            error: "a source of an older release holds no flow labels, so the run writes no lesson"
+                .to_owned(),
+        });
+    };
+    let request = LessonRequest {
+        kind: kind.to_owned(),
+        run: ctx.execution_id(),
+        lesson,
+        labels,
+    };
+    match ctx
+        .execute_activity(&agent_refine_lesson_info(), request)
+        .await
+    {
+        Ok(outcome) => Ok(outcome),
+        Err(err @ (HarvestError::ActivityFailed { .. } | HarvestError::Timeout { .. })) => {
+            Ok(LessonOutcome::Failed {
+                error: error_text(&err),
+            })
+        }
+        Err(err) => Err(step_failure("the lesson step failed", &err)),
+    }
+}
+
+/// Run the adoption gate of a run that chose `chosen`. A dry run, a run
+/// that chose nothing and a start record of an older release keep
+/// `status`, with no gate.
+///
+/// # Errors
+///
+/// Returns the failure of the gate. The run then gets `refine_status =
+/// failed`.
+async fn gate_of(
+    ctx: &WorkflowContext,
+    input: &RefineInput,
+    start: &RefineStart,
+    policy: &RefinePolicy,
+    status: RefineStatus,
+    chosen: Option<&ProfileOverlay>,
+) -> Result<(RefineStatus, Option<GateRecord>), String> {
+    match chosen {
+        Some(overlay) if status == RefineStatus::Chosen && !input.dry_run && start.active_read => {
+            let gate = Gate {
+                ctx,
+                kind: &input.kind,
+                chosen: overlay,
+                expected: start.active,
+                policy,
+                ceilings: &start.ceilings,
+            };
+            gate.run()
+                .await
+                .inspect_err(|_| set_failed(ctx, &input.kind))
+        }
+        _ => Ok((status, None)),
+    }
+}
+
+/// Set the search attribute `agent_mesh` of a run with a budget to the
+/// mesh of the budget. A failure writes a warning.
+fn set_mesh(ctx: &WorkflowContext, input: &RefineInput) {
+    if let Some(budget) = &input.budget
+        && let Err(err) =
+            ctx.upsert_search_attrs([(MESH_ATTR.to_owned(), Some(serde_json::json!(budget.mesh)))])
+    {
+        tracing::warn!(error = %err, "the refine mesh attribute was not set");
+    }
 }
 
 /// The run failure of a start step that failed with `err`. A named
@@ -1196,10 +1606,212 @@ mod tests {
     }
 
     #[test]
+    fn a_start_record_of_an_older_release_opens_no_gate() {
+        let start = RefineStart {
+            profile: AgentProfile::new("support"),
+            current: ProfileOverlay::default(),
+            sources: Vec::new(),
+            selector: false,
+            ceilings: Ceilings::from_profile(&AgentProfile::new("support")),
+            active: None,
+            active_read: true,
+            lessons: None,
+            lesson_agents: BTreeSet::new(),
+        };
+        let mut old = serde_json::to_value(&start).unwrap();
+        old.as_object_mut().unwrap().remove("active_read");
+        let read: RefineStart = serde_json::from_value(old).unwrap();
+        assert!(!read.active_read);
+        let again: RefineStart =
+            serde_json::from_value(serde_json::to_value(&start).unwrap()).unwrap();
+        assert!(again.active_read);
+    }
+
+    #[test]
+    fn a_source_of_an_older_release_gives_no_run_labels() {
+        let brief = |labels: Option<&[&str]>| SourceBrief {
+            run: ExecutionId::new(),
+            evidence: String::new(),
+            profile: AgentProfile::new("support"),
+            labels: labels.map(|items| items.iter().map(|item| (*item).to_owned()).collect()),
+            agents: BTreeSet::new(),
+        };
+        let mut start = RefineStart {
+            profile: AgentProfile::new("support"),
+            current: ProfileOverlay::default(),
+            sources: vec![brief(Some(&["a"])), brief(Some(&["b"]))],
+            selector: false,
+            ceilings: Ceilings::from_profile(&AgentProfile::new("support")),
+            active: None,
+            active_read: true,
+            lessons: Some(MemorySnapshot::Labelled {
+                text: String::new(),
+                labels: BTreeSet::from(["c".to_owned()]),
+            }),
+            lesson_agents: BTreeSet::new(),
+        };
+        let all: BTreeSet<String> = ["a", "b", "c"].map(str::to_owned).into();
+        assert_eq!(run_labels(&start), Some(all));
+        start.sources.push(brief(None));
+        assert_eq!(run_labels(&start), None, "an old source holds no labels");
+        // An old brief decodes with no labels and no agents.
+        let mut old = serde_json::to_value(brief(Some(&["a"]))).unwrap();
+        old.as_object_mut().unwrap().remove("labels");
+        let read: SourceBrief = serde_json::from_value(old).unwrap();
+        assert_eq!(read.labels, None);
+    }
+
+    #[test]
     fn an_input_with_an_unknown_key_does_not_decode() {
         let mut value = serde_json::to_value(input(1, 1)).unwrap();
         value["probe_effects"] = serde_json::json!(["write"]);
         assert!(serde_json::from_value::<RefineInput>(value).is_err());
+    }
+
+    /// A probe result whose candidate turns are `charges`.
+    fn probed(charges: Vec<Charge>) -> ProbeResult {
+        let mut evaluation: Evaluation = serde_json::from_value(serde_json::json!({
+            "turns": [],
+            "first_divergence": null,
+            "recorded": {"end": "failed", "detail": "x"},
+            "candidate": {"end": "failed", "detail": "x"},
+            "end_diverged": false,
+            "replayed_tool_calls": 0,
+            "stubbed_tool_calls": 0,
+            "turn_cap_reached": false,
+        }))
+        .unwrap();
+        evaluation.candidate_calls = charges;
+        ProbeResult {
+            evaluation,
+            live: LiveReprobe::NotNeeded,
+            routes: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn each_probe_turn_gives_one_call_that_names_its_model() {
+        let calls = probe_calls(&probed(vec![
+            Charge::new(Some("a"), TokenUsage::new(3, 1)).cost(2),
+            Charge::new(None, TokenUsage::new(5, 0)),
+        ]));
+        let models: Vec<&str> = calls
+            .iter()
+            .map(autumn_harvest::llm_ledger::LlmCall::model)
+            .collect();
+        assert_eq!(models, ["a", crate::model::UNKNOWN_MODEL_ID]);
+        assert_eq!(calls[0].cost_usd_micros(), Some(2));
+        assert_eq!(calls[1].cost_usd_micros(), None);
+    }
+
+    #[test]
+    fn a_probe_past_the_call_cap_gives_one_call_for_each_model() {
+        let cap = autumn_harvest::llm_ledger::MAX_LLM_CALLS_PER_ATTEMPT;
+        let charges: Vec<Charge> = (0..cap + 44)
+            .map(|n| {
+                let model = if n % 2 == 0 { "a" } else { "b" };
+                Charge::new(Some(model), TokenUsage::new(2, 1)).cost(3)
+            })
+            .collect();
+        let calls = probe_calls(&probed(charges.clone()));
+        assert_eq!(calls.len(), 2, "one call for each model");
+        let tokens: u64 = calls
+            .iter()
+            .map(|call| call.input_tokens() + call.output_tokens())
+            .sum();
+        assert_eq!(tokens, 3 * u64::try_from(charges.len()).unwrap());
+        let cost: u64 = calls
+            .iter()
+            .filter_map(autumn_harvest::llm_ledger::LlmCall::cost_usd_micros)
+            .sum();
+        assert_eq!(cost, 3 * u64::try_from(charges.len()).unwrap());
+        // At the cap, each turn keeps its own call.
+        let at_cap = probe_calls(&probed(charges[..cap].to_vec()));
+        assert_eq!(at_cap.len(), cap);
+    }
+
+    fn live_end(completed: bool) -> LiveEnd {
+        LiveEnd {
+            exec_id: "fork-1".to_owned(),
+            completed,
+            error: (!completed).then(|| "tool refused".to_owned()),
+            usage: TokenUsage::new(3, 1),
+            cost_usd_micros: 9,
+        }
+    }
+
+    #[test]
+    fn each_live_reprobe_maps_to_a_check_with_no_identity() {
+        let cases = [
+            (LiveReprobe::NotNeeded, LiveCheck::NotNeeded),
+            (
+                LiveReprobe::Skipped {
+                    reason: "SQLite has no fork".to_owned(),
+                },
+                LiveCheck::Skipped,
+            ),
+            (
+                LiveReprobe::Failed {
+                    error: "the wait failed".to_owned(),
+                },
+                LiveCheck::NoEnd,
+            ),
+            (LiveReprobe::Ran(live_end(true)), LiveCheck::Completed),
+            (
+                LiveReprobe::Ran(live_end(false)),
+                LiveCheck::Failed {
+                    error: Some("tool refused".to_owned()),
+                },
+            ),
+        ];
+        for (live, check) in cases {
+            assert_eq!(live.failed(), check.failed(), "{live:?}");
+            assert_eq!(LiveCheck::from(&live), check);
+        }
+    }
+
+    fn record(completed: bool, stubbed: u32, live: LiveReprobe) -> ProbeRecord {
+        ProbeRecord {
+            overlay_digest: "sha256:d".to_owned(),
+            first_divergence: None,
+            end_diverged: false,
+            completed,
+            replayed_tool_calls: 0,
+            stubbed_tool_calls: stubbed,
+            turn_cap_reached: false,
+            live,
+            usage: TokenUsage::default(),
+            cost_usd_micros: 0,
+        }
+    }
+
+    #[test]
+    fn the_fallback_rule_skips_a_live_failure_under_the_patch() {
+        let failed = record(true, 0, LiveReprobe::Ran(live_end(false)));
+        let worse = record(false, 3, LiveReprobe::Ran(live_end(true)));
+        let probes = [None, Some(&failed), Some(&worse)];
+        assert_eq!(fallback_pick(&probes, true), Some(2));
+        // A run of an older release keeps the old rule on replay.
+        assert_eq!(fallback_pick(&probes, false), Some(1));
+        assert_eq!(fallback_pick(&[Some(&failed)], true), None);
+        assert_eq!(fallback_pick(&[None, None], true), None);
+    }
+
+    #[test]
+    fn a_probed_candidate_of_an_older_release_decodes_with_no_live_end() {
+        let candidate = ProbedCandidate {
+            overlay: ProfileOverlay::default(),
+            evaluation: probed(Vec::new()).evaluation,
+            routes: BTreeSet::new(),
+            live: Some(LiveReprobe::NotNeeded),
+        };
+        let mut old = serde_json::to_value(&candidate).unwrap();
+        old.as_object_mut().unwrap().remove("live");
+        let read: ProbedCandidate = serde_json::from_value(old).unwrap();
+        assert_eq!(read.live, None);
+        let again: ProbedCandidate =
+            serde_json::from_value(serde_json::to_value(&candidate).unwrap()).unwrap();
+        assert_eq!(again, candidate);
     }
 
     #[test]

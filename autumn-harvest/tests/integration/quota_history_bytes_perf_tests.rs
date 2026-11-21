@@ -4,37 +4,34 @@
 //!
 //! # Workload
 //!
-//! [`crate::quota::load_quota_usage`] runs once per admission attempt for
-//! *every* fresh start and every spawned child of a workflow type with a
-//! declared [`crate::quota::QuotaPolicy`] (`execution::enforce_quota_admission`,
-//! inside the same transaction as the per-key advisory lock). Its
-//! `history_bytes` counter is an exact `SUM(pg_column_size(event_data))`
-//! over every event belonging to the resolved key's currently-active
-//! (`RUNNING`/`PAUSED`) executions.
+//! [`crate::quota::load_quota_usage`] runs once per admission attempt. That
+//! covers *every* fresh start and every spawned child of a workflow type with
+//! a declared [`crate::quota::QuotaPolicy`]. It runs in
+//! `execution::enforce_quota_admission`, inside the transaction that holds
+//! the per-key advisory lock. Its `history_bytes` counter is an exact
+//! `SUM(pg_column_size(event_data))` over every event of the resolved key's
+//! active (`RUNNING`/`PAUSED`) executions.
 //!
 //! # Profile
 //!
-//! This is opt-in: a deployment with no `QuotaPolicy` pays nothing (AC9), and
-//! `enforce_quota_admission` also skips this query when the policy has no
-//! cap or the admission's input resolves no quota key. Within that scope,
-//! the trigger is `QuotaPolicy::has_any_cap()` — any declared cap — not
-//! specifically `max_history_bytes`: `load_quota_usage` computes all three
-//! counters in one round trip by design, so a workflow type declaring only
-//! `max_active_executions` or only `max_dead_letters` pays this same
-//! `history_bytes` cost on every key-resolved admission too. This pass
-//! measures that cost
-//! as the target tenant's own accumulated active-execution footprint grows,
-//! and as the total `harvest_events` table (shared with every other tenant)
-//! grows around it.
+//! This is opt-in. A deployment with no `QuotaPolicy` pays nothing (AC9).
+//! The `enforce_quota_admission` function also skips this query when the
+//! policy has no cap or the input resolves no quota key. Within that scope,
+//! the trigger is `QuotaPolicy::has_any_cap()`, not `max_history_bytes`
+//! alone. By design, `load_quota_usage` computes all three counters in one
+//! round trip. So a type that declares only `max_active_executions` or only
+//! `max_dead_letters` pays this `history_bytes` cost on each key-resolved
+//! admission too. This pass measures that cost as the target tenant's
+//! active-execution footprint grows. It also measures it as the shared
+//! `harvest_events` table grows around that tenant.
 //!
 //! # Fixture
 //!
-//! Seeded, deterministic (no `random()`), production-shaped: one target
-//! tenant (`workflow_name = 'order_saga'`, `quota_key = 'acme'`) with 1,000
-//! active executions whose event-history length is skewed by execution
-//! index rather than uniform — most workflows short, a tail long-running —
-//! so the aggregate is dominated by a realistic minority of large
-//! histories, not by a uniform average:
+//! Seeded, deterministic (no `random()`) and production-shaped. One target
+//! tenant (`workflow_name = 'order_saga'`, `quota_key = 'acme'`) has 1,000
+//! active executions. The execution index skews each event-history length:
+//! most workflows are short, and a tail runs long. So a realistic minority
+//! of large histories dominates the aggregate, not a uniform average:
 //!
 //! | share of 1,000 | events per execution | mechanism |
 //! |---:|---:|---|
@@ -42,16 +39,17 @@
 //! | 20% (i % 20 in 1..=4) | 202-285 | medium workflow |
 //! | 75% | 16-30 | typical short workflow |
 //!
-//! This totals 178,000 events / ~80.2 MB of history for the target tenant --
-//! the seeded fixture itself reproduces byte-for-byte on every run, though
-//! downstream `EXPLAIN`/`pg_stat_statements` output does not (wall-clock timing,
-//! cache-dependent hit/read splits, and ANALYZE's statistical row estimates
-//! all vary run to run; only buffer totals are stable). [`NOISE_SWEEP`] scales
-//! *background* tenants sharing the same tables — other `quota_key`s, each
-//! with a light uniform history — independently of the target's own
-//! footprint, matching how `harvest_events` actually grows in production
-//! (more tenants over time, not one tenant's history growing without
-//! bound): 205k / 313k / 1.08M total table rows.
+//! This totals 178,000 events / ~80.2 MB of history for the target tenant.
+//! The seeded fixture reproduces byte-for-byte on every run. The
+//! `EXPLAIN`/`pg_stat_statements` output does not. Wall-clock timing,
+//! cache-dependent hit/read splits and ANALYZE row estimates vary run to
+//! run. Only buffer totals are stable.
+//!
+//! [`NOISE_SWEEP`] scales *background* tenants that share the same tables.
+//! Each is another `quota_key` with a light uniform history. They grow
+//! independently of the target's own footprint. That matches production:
+//! `harvest_events` grows by more tenants, not by one unbounded history.
+//! Total table rows: 205k / 313k / 1.08M.
 //!
 //! The evidence-capture test below is ignored by default: a one-shot tool,
 //! not a repeatable CI assertion. Run via
@@ -67,9 +65,10 @@ use diesel_async::RunQueryDsl;
 use super::claim_bench_support::db;
 use autumn_harvest::quota::{load_quota_usage, quota_usage_query};
 
-/// Background-tenant multiplier at each measured point: total `harvest_events`
-/// rows in the fixture land at roughly 205k / 313k / 1.08M while the target
-/// tenant's own 1,000-execution / 178,000-event footprint stays fixed.
+/// Background-tenant multiplier at each measured point.
+///
+/// Total `harvest_events` rows land at roughly 205k / 313k / 1.08M. The
+/// target tenant's 1,000-execution / 178,000-event footprint stays fixed.
 const NOISE_SWEEP: [i64; 3] = [3, 15, 100];
 
 const TARGET_ACTIVE: i64 = 1_000;
@@ -269,11 +268,13 @@ async fn explain_quota_usage_query(conn: &mut diesel_async::AsyncPgConnection) -
         .join("\n")
 }
 
-/// The negative-result variant tested and rejected: forces the intended
-/// per-tenant index-bounded plan structurally via a `LATERAL` per-active-row
-/// correlated aggregate, instead of relying on the planner's own cost-based
-/// choice between that shape and a full `Seq Scan`. Measured worse at every
-/// scale tried -- see `docs/performance-quota-history-bytes.md`.
+/// The negative-result variant, tested and rejected.
+///
+/// A `LATERAL` per-active-row correlated aggregate forces the intended
+/// per-tenant index-bounded plan structurally. It does not rely on the
+/// planner's cost-based choice between that shape and a full `Seq Scan`.
+/// It measured worse at every scale tried. See
+/// `docs/performance-quota-history-bytes.md`.
 async fn explain_lateral_variant(conn: &mut diesel_async::AsyncPgConnection) -> String {
     let sql = "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) \
         WITH active AS ( \
@@ -356,10 +357,9 @@ async fn zz_capture_quota_history_bytes_evidence() {
         eprintln!("wrote {file_name}");
 
         if noise_mult == NOISE_SWEEP[0] {
-            // Negative-result capture: only at the smallest size, which is
-            // where the unmodified query currently picks the Seq Scan and
-            // therefore where a forced-plan-shape fix would matter most, if
-            // it helped.
+            // Capture the negative result at the smallest size only. There
+            // the unmodified query picks the Seq Scan. So a forced plan
+            // shape would matter most there, if it helped.
             let lateral_text = explain_lateral_variant(&mut conn).await;
             std::fs::write(
                 out_dir.join("lateral-variant-negative-result.explain.txt"),
@@ -379,23 +379,21 @@ async fn zz_capture_quota_history_bytes_evidence() {
         ));
     }
 
-    // `pg_stat_statements` snapshot from the REAL `load_quota_usage()` calls
-    // (not the literal EXPLAIN text above), at the largest fixture, where
-    // the query is on its natural Nested-Loop-plus-index plan.
+    // A `pg_stat_statements` snapshot of the REAL `load_quota_usage()`
+    // calls, not of the EXPLAIN text above. It runs at the largest fixture,
+    // where the query is on its natural Nested-Loop-plus-index plan.
     //
-    // Two independent ways this can be unusable on an external
-    // `HARVEST_TEST_DATABASE_URL` server, both degrading to the same skip of
-    // just this secondary snapshot rather than a panic -- the EXPLAIN
-    // artifacts above, which are this page's primary evidence, are already
-    // written either way:
-    // 1. `shared_preload_libraries = 'pg_stat_statements'` was never set --
-    //    `CREATE EXTENSION` alone cannot enable it retroactively. Caught by
-    //    the availability probe below.
-    // 2. The connected role can read `pg_stat_statements` but lacks
-    //    permission to call `pg_stat_statements_reset()`, which defaults to
-    //    superuser-only (or an explicit `GRANT EXECUTE`) -- a realistic
-    //    external-admin configuration distinct from (1), so it needs its own
-    //    check rather than assuming the probe above already covered it.
+    // Two independent causes can make it unusable on an external
+    // `HARVEST_TEST_DATABASE_URL` server. Each skips only this secondary
+    // snapshot and does not panic. The EXPLAIN artifacts above are the
+    // primary evidence, and they are already written either way:
+    // 1. `shared_preload_libraries = 'pg_stat_statements'` was never set.
+    //    `CREATE EXTENSION` alone cannot enable it retroactively. The
+    //    availability probe below catches this.
+    // 2. The role can read `pg_stat_statements` but cannot call
+    //    `pg_stat_statements_reset()`. That function defaults to
+    //    superuser-only (or an explicit `GRANT EXECUTE`). This realistic
+    //    external-admin setup differs from (1), so it needs its own check.
     let _ = diesel::sql_query("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
         .execute(&mut conn)
         .await;
@@ -452,22 +450,22 @@ async fn zz_capture_quota_history_bytes_evidence() {
                 .expect("load_quota_usage");
         }
 
-        // Scoped to THIS database's oid on both ends: the reset above already
-        // was, but an earlier revision's follow-up SELECT was not, so on a
-        // shared cluster it also returned other databases' (including stale,
-        // already-dropped ephemeral benchmark databases') rows for the same
-        // query text -- confirmed by that revision's committed artifact,
-        // which showed five distinct "calls=20" rows for what this run
-        // drives as one. Every statement between the reset and this SELECT
-        // ran on this same connection/database, so the current-dbid scope
-        // alone now makes the match exact -- asserted, not just hoped, via
-        // the exact `calls` check below.
-        // A fourth way this can fail, distinct from the three below: PG12
-        // (this crate's stated minimum -- see README's "Postgres 12+") names
-        // this column `mean_time`, renamed to `mean_exec_time` only in PG13.
+        // Scope to THIS database's oid on both ends. The reset above already
+        // was scoped, but an earlier revision's follow-up SELECT was not. On
+        // a shared cluster it then returned other databases' rows for the
+        // same query text. Those included stale, already-dropped ephemeral
+        // benchmark databases. That revision's committed artifact showed five
+        // distinct "calls=20" rows for what this run drives as one. Every
+        // statement between the reset and this SELECT ran on this same
+        // connection and database. So the current-dbid scope alone makes the
+        // match exact. The exact `calls` check below asserts it.
+        //
+        // A fourth way this can fail is distinct from the other three. PG12
+        // (this crate's stated minimum, see README's "Postgres 12+") names
+        // this column `mean_time`. Only PG13 renames it to `mean_exec_time`.
         // Queried as `Result` rather than a version probe, so it folds into
-        // the same skip path as the others instead of adding a second way to
-        // detect "can't get this snapshot here".
+        // the same skip path as the others. A version probe would add a second
+        // way to detect "cannot get this snapshot here".
         let stats_result: Result<Vec<StatRow>, _> = diesel::sql_query(
             "SELECT calls, shared_blks_hit, shared_blks_read, \
                     (shared_blks_hit + shared_blks_read) AS total_buffers, mean_exec_time \
@@ -481,14 +479,14 @@ async fn zz_capture_quota_history_bytes_evidence() {
 
         if matches!(&stats_result, Ok(s) if s.is_empty()) {
             // A third way the secondary snapshot can be unavailable, distinct
-            // from "unpreloaded" and "unauthorized to reset": an external
+            // from "unpreloaded" and "unauthorized to reset". An external
             // server with `pg_stat_statements.track = 'none'` lets the probe
-            // and the reset both succeed, but records no row at all for the
-            // 20 real calls just driven. Treated the same as the other two --
-            // a skip of just this snapshot, not a panic -- while a
-            // **multiple**-row result still asserts below, since that would
-            // mean the dbid scope failed to isolate the production statement
-            // and the evidence cannot be trusted silently.
+            // and the reset succeed. It then records no row for the 20 real
+            // calls just driven. Like the other two, this skips only this
+            // snapshot and does not panic. A **multiple**-row result still
+            // asserts below. That result means the dbid scope failed to
+            // isolate the production statement, so the evidence is not
+            // trusted silently.
             let reason = "pg_stat_statements recorded no row for the driven calls \
                            (the server likely has pg_stat_statements.track = 'none')";
             eprintln!(
@@ -572,12 +570,11 @@ async fn zz_capture_quota_history_bytes_evidence() {
 /// matching `generate_series(1, TARGET_ACTIVE)`).
 ///
 /// A pure Rust mirror of the `CASE` expression and `generate_series(0, upper)`
-/// event-count formula in `seed_fixture`'s SQL string — kept here so the
-/// module doc's per-bucket ranges are a checked regression, not a hand
-/// re-derivation that can silently drift from the SQL the way the doc page
-/// itself did (see PR #1276 review). If `seed_fixture`'s `CASE` changes,
-/// this must change with it, or [`event_count_ranges_match_documentation`]
-/// below will fail.
+/// event-count formula in the SQL of `seed_fixture`. It makes the module
+/// doc's per-bucket ranges a checked regression. A hand re-derivation can
+/// silently drift from the SQL, as the doc page itself did (PR #1276). If
+/// the `CASE` in `seed_fixture` changes, change this too, or
+/// [`event_count_ranges_match_documentation`] fails.
 #[allow(dead_code)] // exercised only by the test below
 const fn event_count_for_index(i: i64) -> i64 {
     let r = i % 20;
@@ -591,16 +588,17 @@ const fn event_count_for_index(i: i64) -> i64 {
     upper + 1 // generate_series(0, upper) is inclusive
 }
 
-/// Locks in the exact per-bucket event-count ranges the module doc and
-/// `docs/performance-quota-history-bytes.md` publish (2,001-2,481 /
-/// 202-285 / 16-30), so a future edit to the fixture's skew formula that
-/// silently changes those bounds fails a fast, no-database test instead of
-/// only being caught by a slow manual review of a committed artifact.
+/// Locks in the per-bucket event-count ranges that the docs publish.
 ///
-/// No live Postgres required — pure arithmetic over [`event_count_for_index`]
-/// — but it lives in this `#[cfg(feature = "db")]` module because it exists
-/// to guard the DB-backed fixture this file seeds, and splitting it into a
-/// separate always-on file would separate the guard from the code it guards.
+/// The module doc and `docs/performance-quota-history-bytes.md` publish
+/// 2,001-2,481 / 202-285 / 16-30. An edit to the skew formula that changes
+/// those bounds then fails a fast, no-database test. A slow manual review of
+/// a committed artifact no longer has to catch it.
+///
+/// No live Postgres is required. This is pure arithmetic over
+/// [`event_count_for_index`]. It lives in this `#[cfg(feature = "db")]`
+/// module because it guards the DB-backed fixture that this file seeds. A
+/// separate always-on file would split the guard from the code it guards.
 #[test]
 fn event_count_ranges_match_documentation() {
     let (mut long, mut medium, mut short) = (

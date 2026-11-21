@@ -1,5 +1,4 @@
 #![cfg(feature = "db")]
-// Test-code style lints (consistent with the other integration test files).
 #![allow(
     clippy::doc_markdown,
     clippy::cast_possible_wrap,
@@ -41,8 +40,6 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use uuid::Uuid;
 
-// ── DB setup ──────────────────────────────────────────────────────────────────
-
 async fn connect(url: &str) -> AsyncPgConnection {
     <AsyncPgConnection as diesel_async::AsyncConnection>::establish(url)
         .await
@@ -68,8 +65,6 @@ async fn setup_db_url() -> (String, Option<ContainerAsync<Postgres>>) {
         .expect("migrations");
     (url, Some(container))
 }
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn unique_queue(prefix: &str) -> String {
     format!("{prefix}-{}", Uuid::new_v4().simple())
@@ -135,7 +130,7 @@ struct TaskRow {
     state: String,
     attempt: i32,
     worker_id: Option<String>,
-    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    started_at: Option<jiff::Timestamp>,
 }
 
 async fn load_task(conn: &mut AsyncPgConnection, id: Uuid) -> TaskRow {
@@ -149,7 +144,8 @@ async fn load_task(conn: &mut AsyncPgConnection, id: Uuid) -> TaskRow {
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
         worker_id: Option<String>,
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-        started_at: Option<chrono::DateTime<chrono::Utc>>,
+        #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+        started_at: Option<jiff::Timestamp>,
     }
     let row: Row = diesel::sql_query(
         "SELECT state, attempt, worker_id, started_at FROM harvest_task_queue WHERE id = $1",
@@ -165,8 +161,6 @@ async fn load_task(conn: &mut AsyncPgConnection, id: Uuid) -> TaskRow {
         started_at: row.started_at,
     }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 /// A claim that beat the pause must be released once a fresh statement sees
 /// the pause. Its `attempt` must be restored: no retry budget is consumed.
@@ -188,7 +182,7 @@ async fn a_claim_that_beat_the_workflow_pause_is_released_with_its_attempt_resto
     // re-check is reached with when a claim's snapshot predates the pause.
     pause(&mut conn, exec_id).await;
 
-    let released = release_claim_if_workflow_paused(&mut conn, task_id, "w1")
+    let released = release_claim_if_workflow_paused(&conn, task_id, "w1")
         .await
         .expect("release");
     assert!(
@@ -222,7 +216,7 @@ async fn an_ordinary_claim_is_not_released_when_the_workflow_is_not_paused() {
     let task_id = enqueue_workflow_task(&mut conn, &q, exec_id, None).await;
     assert_eq!(claim_one(&mut conn, &q).await, Some(task_id));
 
-    let released = release_claim_if_workflow_paused(&mut conn, task_id, "w1")
+    let released = release_claim_if_workflow_paused(&conn, task_id, "w1")
         .await
         .expect("release");
     assert!(
@@ -256,7 +250,7 @@ async fn an_activity_task_of_a_paused_workflow_is_not_held_by_this_recheck() {
         "a workflow pause must not collaterally hold the execution's activity tasks"
     );
 
-    let released = release_claim_if_workflow_paused(&mut conn, task_id, "w1")
+    let released = release_claim_if_workflow_paused(&conn, task_id, "w1")
         .await
         .expect("release");
     assert!(

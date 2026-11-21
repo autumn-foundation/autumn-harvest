@@ -20,10 +20,10 @@ use autumn_harvest::store;
 use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics, TelemetryConfig};
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -68,6 +68,7 @@ async fn connect(url: &str) -> AsyncPgConnection {
 
 fn worker_config() -> WorkerRuntimeConfig {
     WorkerRuntimeConfig {
+        gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
         codec_rotation_batch_size: 0,
         scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
         dr: autumn_harvest::replication::DrConfig::default(),
@@ -77,6 +78,8 @@ fn worker_config() -> WorkerRuntimeConfig {
         max_concurrent_workflows: 2,
         max_concurrent_activities: 2,
         max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
+        claim_slots_per_shard: None,
+        claim_batch_max: None,
         poll_interval: Duration::from_millis(25),
         shutdown_timeout: Duration::from_secs(1),
         cancellation_grace_period: Duration::from_secs(1),
@@ -162,7 +165,7 @@ async fn seed_portable_run(
         exec_id,
         &[WorkflowEvent::WorkflowStarted {
             input: input.clone(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,

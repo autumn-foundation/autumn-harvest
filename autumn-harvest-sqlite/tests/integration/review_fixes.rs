@@ -6,22 +6,21 @@
 //! - **B2** a benign `SetCurrentDetails` does not wedge an in-subset workflow.
 //! - **B3** retry-exhaustion / terminal-failure paths.
 //! - **B4** an unsupported command mid-batch rolls the whole cycle back.
-//! - **timer-id reuse** (Codex round-5): a re-armed timer id fires again.
+//! - **timer-id reuse**: a re-armed timer id fires again.
 //! - **m7** multi-execution `run_until_idle`.
 
-// The `#[workflow]` macro references the workflow's input parameter, so a
-// deliberately-unused param reads as a "used underscore binding" through the
-// expansion.
+// The `#[workflow]` macro references the workflow's input parameter, so an
+// unused param reads as a "used underscore binding" through the expansion.
 #![allow(clippy::used_underscore_binding)]
-// Some regression workflows deliberately have no suspension (`just_uuid`,
-// `direct_fail`) to exercise the terminal-only / direct-error paths — they are
-// `async` because `#[workflow]` requires it, but hold no `.await`.
+// Some regression workflows have no suspension (`just_uuid`, `direct_fail`).
+// They cover the terminal-only and direct-error paths. `#[workflow]` needs
+// `async`, but they hold no `.await`.
 #![allow(clippy::unused_async)]
 
 use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest_sqlite::{ActivitySpec, ExecutionOutcome, RunState, SqliteError, SqliteRuntime};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::json;
 
 fn temp_db() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -38,10 +37,9 @@ fn echo_activity() -> ActivitySpec {
 
 // ── B1(a): a side effect in a no-suspension terminal cycle is persisted ────────
 
-/// Mints a UUID and returns immediately — there is NO suspension at all, so the
-/// `RecordSideEffect` command lives only in the terminal (Completed) drain. Before
-/// the fix it was dropped and the history failed the core replayer with
-/// `SideEffectDrift`.
+/// Mints a UUID and returns at once, with NO suspension. So the
+/// `RecordSideEffect` command lives only in the terminal (Completed) drain.
+/// The bug dropped it, and the core replayer failed with `SideEffectDrift`.
 #[workflow]
 async fn just_uuid(ctx: &WorkflowContext, _n: i64) -> Result<serde_json::Value, String> {
     let id = ctx.new_uuid().to_string();
@@ -146,7 +144,7 @@ async fn set_current_details_does_not_wedge_completion() {
     rt.register_activity_raw("work", echo_activity());
     let exec = rt.start_workflow("status_workflow", json!(9)).unwrap();
 
-    // Must NOT return Err(Unsupported("SetCurrentDetails")).
+    // The bug returned `Err(Unsupported("SetCurrentDetails"))` here.
     let state = rt.run_until_blocked(exec).await.unwrap();
     assert!(
         matches!(state, RunState::Completed(ref v) if v.as_i64() == Some(18)),
@@ -247,20 +245,19 @@ async fn direct_error_return_fails_terminally() {
 
 // ── B4: an unsupported command mid-batch rolls the WHOLE cycle back ────────────
 
-/// Records a side effect (supported) and then schedules an external activity
+/// Records a side effect (supported) and then acquires a worker session
 /// (unsupported) in the SAME suspending batch. The whole `apply_commands`
 /// transaction must roll back — the side-effect event must NOT persist.
 #[workflow]
-async fn side_effect_then_external(
+async fn side_effect_then_session(
     ctx: &WorkflowContext,
     _n: i64,
 ) -> Result<serde_json::Value, String> {
     let _id = ctx.new_uuid().to_string();
-    let r = ctx
-        .execute_activity_external("external", json!({}), "default", 60)
+    ctx.create_session(SessionOptions::new("gpu"))
         .await
         .map_err(|e| e.to_string())?;
-    Ok(r)
+    Ok(serde_json::Value::Null)
 }
 
 #[tokio::test]
@@ -269,21 +266,25 @@ async fn unsupported_command_rolls_the_whole_cycle_back() {
     let exec;
     {
         let mut rt = SqliteRuntime::open(&path).unwrap();
-        rt.register_workflow(&side_effect_then_external_info());
+        rt.register_workflow(&side_effect_then_session_info());
         exec = rt
-            .start_workflow("side_effect_then_external", json!(0))
+            .start_workflow("side_effect_then_session", json!(0))
             .unwrap();
 
         let err = rt.run_until_blocked(exec).await.unwrap_err();
         assert!(
-            matches!(err, SqliteError::Unsupported(ref c) if c == "ScheduleExternalActivity"),
-            "expected Unsupported(ScheduleExternalActivity), got {err}"
+            matches!(
+                err,
+                SqliteError::Unsupported(ref c)
+                    if c.starts_with("ScheduleActivity.schedule_to_start_override")
+            ),
+            "expected Unsupported(ScheduleActivity.schedule_to_start_override), got {err}"
         );
     } // "crash".
 
-    // Reopen: the side-effect event must NOT have persisted (the cycle's tx,
-    // which appended SideEffectRecorded before hitting the unsupported command,
-    // rolled back as a whole).
+    // Reopen: the side-effect event did NOT persist. The cycle transaction
+    // appended SideEffectRecorded before the unsupported command, and it
+    // rolled back as a whole.
     let rt2 = SqliteRuntime::open(&path).unwrap();
     let history = rt2.load_history(exec).unwrap();
     assert!(
@@ -299,12 +300,12 @@ async fn unsupported_command_rolls_the_whole_cycle_back() {
     assert!(matches!(history[1], WorkflowEvent::WorkflowFailed { .. }));
 }
 
-// ── Timer-id reuse: a re-armed timer id fires again (Codex round-5) ────────────
+// ── Timer-id reuse: a re-armed timer id fires again ────────────────────────────
 
 /// Arms the SAME timer id twice in sequence (the poll-loop idiom). The core
-/// supports this via cursor-based per-id FIFO pairing; the backend must create a
-/// fresh unfired row for the second arm rather than wedging on the first arm's
-/// spent row.
+/// pairs arms per id in FIFO order with a cursor. The backend must create a
+/// fresh unfired row for the second arm. It must not wedge on the spent row
+/// of the first arm.
 #[workflow]
 async fn double_timer_same_id(ctx: &WorkflowContext, _n: i64) -> Result<String, String> {
     ctx.timer("tick", 5).await.map_err(|e| e.to_string())?;
@@ -315,7 +316,7 @@ async fn double_timer_same_id(ctx: &WorkflowContext, _n: i64) -> Result<String, 
 #[tokio::test]
 async fn reused_timer_id_fires_again_after_a_prior_fire() {
     let (_dir, path) = temp_db();
-    let t0: DateTime<Utc> = DateTime::from_timestamp(3_000_000, 0).unwrap();
+    let t0: Timestamp = Timestamp::from_second(3_000_000).unwrap();
 
     let exec;
     {
@@ -330,7 +331,7 @@ async fn reused_timer_id_fires_again_after_a_prior_fire() {
         // Fire the first timer; the SECOND arm of "tick" is created (deadline
         // t0+10+5 = t0+15, not yet due at t0+10) and the run blocks again.
         let state = rt
-            .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(10))
+            .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(10))
             .await
             .unwrap();
         assert!(
@@ -343,7 +344,7 @@ async fn reused_timer_id_fires_again_after_a_prior_fire() {
     let mut rt2 = SqliteRuntime::open(&path).unwrap();
     rt2.register_workflow(&double_timer_same_id_info());
     let state = rt2
-        .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(20))
+        .run_until_blocked_as_of(exec, t0 + jiff::SignedDuration::from_secs(20))
         .await
         .unwrap();
     assert!(
@@ -351,7 +352,6 @@ async fn reused_timer_id_fires_again_after_a_prior_fire() {
         "the re-armed timer must fire and the workflow complete, got {state:?}"
     );
 
-    // History carries TWO arms and TWO fires of the same id.
     let history = rt2.load_history(exec).unwrap();
     let started = history
         .iter()

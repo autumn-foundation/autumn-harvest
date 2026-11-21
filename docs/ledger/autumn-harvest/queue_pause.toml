@@ -49,11 +49,11 @@ measured = "unmeasured"
 plan = "docs/ledger/plans/autumn-harvest/queue_pause.md"
 
 ["paused_queue_names"]
-driver = "per_task"
+driver = "per_tick"
 backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_queue_pauses"]
-measured = "unmeasured"
+measured = "docs/performance-gauge-sample-interval.md"
 plan = "docs/ledger/plans/autumn-harvest/queue_pause.md"
 
 ["resume_queue"]

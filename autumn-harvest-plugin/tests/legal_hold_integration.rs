@@ -6,13 +6,14 @@
 //! erase-while-held 409 interaction.
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
-//! against it directly (run this file `--test-threads=1`, since the tests scrub
-//! shared tables); otherwise a fresh testcontainers Postgres is booted with
+//! against it directly. Run this file with `--test-threads=1`, because the
+//! tests scrub shared tables. Otherwise a testcontainers Postgres boots with
 //! the full migration set (requires Docker).
 
 #![allow(clippy::similar_names)]
 #![allow(clippy::too_many_lines)]
 
+use jiff_diesel::ToDiesel;
 use std::sync::Arc;
 
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
@@ -26,11 +27,11 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use diesel::sql_types::{Text, Timestamptz};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -164,7 +165,7 @@ async fn seed_completed(
         #[diesel(sql_type = diesel::sql_types::Uuid)]
         id: uuid::Uuid,
     }
-    let now = Utc::now();
+    let now = Timestamp::now();
     let id: uuid::Uuid = diesel::sql_query(
         "INSERT INTO harvest_workflow_executions
             (workflow_name, workflow_id, shard_id, state, input, started_at, completed_at)
@@ -173,7 +174,7 @@ async fn seed_completed(
     )
     .bind::<Text, _>(workflow_name)
     .bind::<Text, _>(workflow_id)
-    .bind::<Timestamptz, _>(now)
+    .bind::<Timestamptz, _>(now.to_diesel())
     .get_result::<IdRow>(conn)
     .await
     .expect("insert execution")
@@ -215,7 +216,6 @@ async fn set_describe_and_release_round_trip() {
 
     let exec_id = seed_completed(&mut conn, "lh_wf", "lh-http-1").await;
 
-    // Set the hold.
     let (status, body) = post_json_admin(
         &app,
         &format!("/workflows/{exec_id}/legal-hold"),
@@ -247,7 +247,6 @@ async fn set_describe_and_release_round_trip() {
         "raw hold columns surfaced under execution"
     );
 
-    // Release the hold.
     let (status, body) = post_json_admin(
         &app,
         &format!("/workflows/{exec_id}/legal-hold/release"),
@@ -297,11 +296,11 @@ async fn past_hold_until_returns_400() {
     scrub(&mut conn).await;
 
     let exec_id = seed_completed(&mut conn, "lh_wf", "lh-http-past").await;
-    let past: DateTime<Utc> = Utc::now() - chrono::Duration::hours(1);
+    let past: Timestamp = Timestamp::now() - jiff::SignedDuration::from_hours(1);
     let (status, body) = post_json_admin(
         &app,
         &format!("/workflows/{exec_id}/legal-hold"),
-        json!({ "reason": "x", "hold_until": past.to_rfc3339() }),
+        json!({ "reason": "x", "hold_until": autumn_harvest::time::rfc3339(past) }),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");

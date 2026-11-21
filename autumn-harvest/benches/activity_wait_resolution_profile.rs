@@ -119,11 +119,11 @@
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::types::ActivityExecId;
 use autumn_harvest::worker::any_activity_wait_already_resolved;
-use chrono::{DateTime, TimeZone, Utc};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
-fn now() -> DateTime<Utc> {
-    Utc.timestamp_opt(1_800_000_000, 0).unwrap()
+fn now() -> Timestamp {
+    Timestamp::new(1_800_000_000, 0).unwrap()
 }
 
 const ACTIVITY_NAMES: [&str; 4] = [
@@ -147,13 +147,13 @@ fn payload(i: usize) -> Value {
 /// `activity_waits` set a `join!`/`race()` fan-out re-parks on.
 fn build_workload(
     n: usize,
-    start: DateTime<Utc>,
-) -> (Vec<(DateTime<Utc>, WorkflowEvent)>, Vec<ActivityExecId>) {
-    let mut rows: Vec<(DateTime<Utc>, WorkflowEvent)> = Vec::with_capacity(n * 2);
+    start: Timestamp,
+) -> (Vec<(Timestamp, WorkflowEvent)>, Vec<ActivityExecId>) {
+    let mut rows: Vec<(Timestamp, WorkflowEvent)> = Vec::with_capacity(n * 2);
     let mut open_ids: Vec<ActivityExecId> = Vec::with_capacity(n / 10 + 1);
     let mut t = start;
     let mut tick = || {
-        t += chrono::Duration::milliseconds(50);
+        t += jiff::SignedDuration::from_millis(50);
         t
     };
 

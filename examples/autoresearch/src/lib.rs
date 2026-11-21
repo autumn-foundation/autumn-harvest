@@ -14,7 +14,6 @@
 
 pub mod activities;
 pub mod agent;
-pub mod claude;
 pub mod inbox;
 pub mod lab;
 pub mod results;

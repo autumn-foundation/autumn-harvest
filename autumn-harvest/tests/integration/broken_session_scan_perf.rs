@@ -210,9 +210,9 @@ async fn seed_fixture(conn: &mut AsyncPgConnection, n: i64) {
         };
         let expires_at = match shape {
             Shape::LeaseExpired | Shape::LeaseExpiredRunning => {
-                chrono::Utc::now() - chrono::Duration::hours(1)
+                jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1)
             }
-            _ => chrono::Utc::now() + chrono::Duration::hours(1),
+            _ => jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
         };
         let exec_id = insert_execution(conn, i).await;
         let members: u128 = if i % 2 == 1 { 2 } else { 1 };
@@ -222,7 +222,7 @@ async fn seed_fixture(conn: &mut AsyncPgConnection, n: i64) {
             exec_id,
             &[WorkflowEvent::WorkflowStarted {
                 input: serde_json::Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,

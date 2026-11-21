@@ -99,8 +99,8 @@ schedule every 30m ─► agent_heartbeat (precheck: a new crash streak) ─► 
 - [`src/rules.rs`](src/rules.rs): the keep rule, one pure function.
 - [`src/runtime.rs`](src/runtime.rs): registration, the drive, the inbox
   commands, `verify`, `eval`, the schedules and the Postgres registration.
-- [`src/scripted.rs`](src/scripted.rs) and [`src/claude.rs`](src/claude.rs):
-  the two models.
+- [`src/scripted.rs`](src/scripted.rs): the scripted model. The Claude model
+  is `autumn_harvest_agent::anthropic::ClaudeModel`.
 
 Two sessions can share one lab. The session holds the mutex `lab:<path>` for
 each experiment, so the sessions take turns. Each experiment checks out its
@@ -206,6 +206,17 @@ effort, automatic prompt caching and the server-side refusal fallback. The
 key comes from the environment only. The agent adapter keeps text and tool
 calls, but the API wants each thinking block back. So the model keeps each
 raw turn in `.autoresearch/claude-turns` and sends it back unchanged.
+
+`--model openai` runs the agents on any OpenAI-compatible server.
+`--base-url` names it, and `--openai-model` names the model. The key comes
+from the variable of a known host: `OPENAI_API_KEY` or `OPENROUTER_API_KEY`.
+For another host, `--api-key-env` names the variable. For example, a local
+Ollama, which needs no key:
+
+```bash
+cargo run -p autoresearch -- run --lab ~/autoresearch --tag local \
+  --model openai --base-url http://localhost:11434/v1 --openai-model qwen2.5:7b
+```
 
 `serve` runs the nightly schedule and the heartbeat instead of one night.
 

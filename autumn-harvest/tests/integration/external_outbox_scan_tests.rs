@@ -9,30 +9,26 @@
 //! request row from `harvest_events`, acts on it, and loops until its outbox
 //! is empty.
 //!
-//! Two independent defects made that loop read the whole event table:
+//! Three defects made that loop expensive:
 //!
 //! 1. No index served `event_type = 'External<X>Requested'`, so the outer
 //!    scan read every row of the largest table in the engine to return one.
 //! 2. The paired `NOT EXISTS` resolution check was unindexed too, and it
 //!    costs more. It is correlated per execution, so each probe re-read every
 //!    event of the owning execution.
+//! 3. A request row stays in `harvest_events` after it resolves. The indexed
+//!    outer scan walked each request of the history, also with no backlog.
 //!
-//! The fix pairs four partial indexes
-//! (`20260911213344_harvest_external_outbox_scan_indexes`) with a query
-//! rewrite that pins the outer scan and the executions join. The indexes do
-//! most of the work. The rewrite matters when the planner's row estimate goes
-//! stale, which is what a drained outage backlog leaves behind.
+//! Four partial indexes
+//! (`20260911213344_harvest_external_outbox_scan_indexes`) fix the first two.
+//! The pending table (`20261119232545` and `20261120004046`) fixes
+//! the third: the claim reads one row for each unresolved request.
+//! `external_outbox_pending_tests` gates that table and the idle claim cost.
 //!
-//! Which gate covers which half is worth stating, because they are not
-//! symmetric:
-//!
-//! - [`outbox_claim_plans_are_index_only`] gates the MIGRATION. The legacy
-//!   query also produces an all-index plan once these indexes exist, so this
-//!   one passes with the rewrite reverted. Its `Anti Join` assertion is the
-//!   exception, and guards one specific regression the rewrite could
-//!   reintroduce.
-//! - [`outbox_claim_plans_survive_a_stale_row_estimate`] gates the REWRITE.
-//!   With the rewrite reverted the legacy form degrades to a `Seq Scan` here.
+//! - [`outbox_claim_plans_are_index_only`] gates the plan shape: the pending
+//!   table outside, a key probe for each event, and an anti-join inside.
+//! - [`outbox_claim_plans_survive_a_stale_row_estimate`] gates the pins. A
+//!   drained outage backlog leaves the estimate far too high.
 //! - [`outbox_claim_queries_match_the_legacy_anti_join`] guards the result
 //!   set, against the exact SQL this rewrite replaced.
 //! - [`outbox_claim_returns_the_oldest_pending_request_first`] guards the
@@ -75,12 +71,18 @@ const EVENTS_PER_EXEC: usize = 60;
 /// statement.
 const BULK_EXECUTIONS: usize = 1_000;
 
-/// The one partial index that serves all three outer scans.
+/// The partial index over each request row in `harvest_events`.
 ///
-/// Its leading `event_type` column turns each scanner's single-type equality
-/// into a prefix lookup. Its `(timestamp, id)` columns supply the order the
-/// rewrite asks for.
-const PENDING_INDEX: &str = "idx_harvest_events_external_outbox_pending";
+/// It holds the whole request history, resolved or not. A claim must not
+/// read it, or its cost grows with that history again.
+const HISTORY_INDEX: &str = "idx_harvest_events_external_outbox_pending";
+
+/// The index on the pending table that serves all three outer scans.
+///
+/// Its leading `request_type` column turns each scanner's single-type
+/// equality into a prefix lookup. Its `(requested_at, event_row_id)` columns
+/// supply the drain order.
+const CLAIM_INDEX: &str = "idx_harvest_external_outbox_pending_claim";
 
 /// One outbox family: the request type, the two events that resolve it, and
 /// the payload key that correlates them.
@@ -386,10 +388,11 @@ async fn selected_ids(conn: &mut AsyncPgConnection, sql: &str, scope: &str) -> V
 // Plan-shape gates
 // ---------------------------------------------------------------------------
 
-/// Every node of every claim plan reads through an index.
+/// Every claim plan reads the pending table, and each event by key.
 ///
-/// This is the issue's headline defect. The outer scan read 1.02M rows to
-/// return one, on every claim of every drain loop, on every worker tick.
+/// The first defect was a `Seq Scan`: the outer scan read 1.02M rows to
+/// return one. The second was the request history: an indexed walk of each
+/// request the deployment ever made. Neither may come back.
 #[tokio::test]
 async fn outbox_claim_plans_are_index_only() {
     let bench = plan_gate_db().await;
@@ -426,8 +429,16 @@ async fn outbox_claim_plans_are_index_only() {
             "{tag}: the claim must not scan the event table\n{plan}"
         );
         assert!(
-            plan.contains(PENDING_INDEX),
-            "{tag}: the outer scan must read through {PENDING_INDEX}\n{plan}"
+            plan.contains("on harvest_external_outbox_pending p"),
+            "{tag}: the outer scan must read the pending table\n{plan}"
+        );
+        assert!(
+            !plan.contains(HISTORY_INDEX),
+            "{tag}: the claim must not walk the request history\n{plan}"
+        );
+        assert!(
+            plan.contains("harvest_events_pkey"),
+            "{tag}: the event lookup must be by primary key\n{plan}"
         );
         assert!(
             plan.contains(family.resolved_index),
@@ -436,26 +447,15 @@ async fn outbox_claim_plans_are_index_only() {
         );
         assert!(
             !plan.contains("Materialize"),
-            "{tag}: the resolution check must stay correlated, not materialised\n{plan}"
+            "{tag}: each probe must stay correlated, not materialised\n{plan}"
         );
-        // The resolution check must remain an anti-join, and this is the one
-        // assertion that is about cost rather than correctness.
-        //
-        // `harvest_events` is append-only, so a resolved request stays in the
-        // pending index and every later claim walks past it. An anti-join
-        // lets the planner discard such a row before the executions probe,
-        // which then runs once. Written as an outer join the check cannot be
-        // reordered, so both probes run for every discarded row. An earlier
-        // revision of this change did exactly that, and measured twice the
-        // buffers over a backlog of 8,000 resolved requests.
+        // The resolution check stays an anti-join. Written as an outer join
+        // it cannot be reordered, so each probe runs for each discarded row.
+        // An earlier revision did that, and measured twice the buffers over
+        // a scan of 8,000 resolved requests.
         assert!(
             plan.contains("Anti Join"),
-            "{tag}: the resolution check must be an anti-join, so a discarded \
-             candidate does not also pay the executions probe\n{plan}"
-        );
-        assert!(
-            !plan.contains("Sort"),
-            "{tag}: the index must supply the order, so no sort is needed\n{plan}"
+            "{tag}: the resolution check must be an anti-join\n{plan}"
         );
     }
 }
@@ -466,22 +466,27 @@ async fn outbox_claim_plans_are_index_only() {
 /// meets in practice. An outage fills the outbox, `ANALYZE` records the
 /// backlog, and the backlog drains. The stored estimate is then orders of
 /// magnitude above the truth. A plan that depends on it reverts to a `Seq
-/// Scan`, or walks `harvest_events_pkey` and filters every unrelated event.
+/// Scan`, or sorts each pending row before it returns one.
 ///
-/// The `ORDER BY e.timestamp, e.id` pin removes the dependency. No other
-/// index supplies that order, so every competing plan needs a sort. A sort
-/// under `LIMIT 1` must read every candidate before it returns one.
+/// The `ORDER BY p.requested_at, p.event_row_id` pin removes the dependency.
+/// Only the claim index supplies that order, so every competing plan needs a
+/// sort. A sort under `LIMIT 1` must read every candidate before it returns
+/// one. The event lookup is a `LATERAL` probe by key, so no estimate can turn
+/// it into a walk of the request history.
 #[tokio::test]
 async fn outbox_claim_plans_survive_a_stale_row_estimate() {
     let bench = plan_gate_db().await;
     let mut conn = claim_bench_db::connect(&bench.url).await;
 
-    // This gate deletes about 12,000 rows, then reads the plan the STALE
+    // This gate resolves about 12,000 requests, then reads the plan the STALE
     // statistics produce. Autoanalyze would refresh them mid-test, so turn it
     // off rather than race it.
-    conn.batch_execute("ALTER TABLE harvest_events SET (autovacuum_enabled = false)")
-        .await
-        .expect("pin the statistics this gate is about");
+    conn.batch_execute(
+        "ALTER TABLE harvest_events SET (autovacuum_enabled = false); \
+         ALTER TABLE harvest_external_outbox_pending SET (autovacuum_enabled = false);",
+    )
+    .await
+    .expect("pin the statistics this gate is about");
 
     seed_bulk_history(&mut conn, "outbox_stale_wf", BULK_EXECUTIONS).await;
 
@@ -506,13 +511,23 @@ async fn outbox_claim_plans_survive_a_stale_row_estimate() {
     }
     analyze(&mut conn).await;
 
-    // The backlog drains. Autovacuum has not re-analysed, so the estimate
-    // stays at the burst size while the real count falls to one.
-    for family in &FAMILIES {
+    // The backlog drains: a resolution for each request. Autovacuum has not
+    // re-analysed, so the estimate stays at the burst size while the real
+    // count falls to one.
+    for (slot, family) in FAMILIES.iter().enumerate() {
+        let band = 95_000 + slot * 10;
         conn.batch_execute(&format!(
-            "DELETE FROM harvest_events \
-             WHERE event_type = '{}' AND event_data->'data'->>'{}' LIKE 'burst-%';",
-            family.requested, family.id_key
+            "INSERT INTO harvest_events (workflow_exec_id, event_id, event_type, event_data, timestamp) \
+             SELECT r.workflow_exec_id, {band} + (r.event_id % 10), '{resolved}', \
+                    jsonb_build_object('type', '{resolved}', \
+                                       'data', jsonb_build_object('{key}', r.event_data->'data'->>'{key}')), \
+                    NOW() \
+             FROM harvest_events r \
+             WHERE r.event_type = '{requested}' \
+               AND r.event_data->'data'->>'{key}' LIKE 'burst-%';",
+            requested = family.requested,
+            resolved = family.resolved[0],
+            key = family.id_key
         ))
         .await
         .expect("drain the outage backlog");
@@ -543,8 +558,16 @@ async fn outbox_claim_plans_survive_a_stale_row_estimate() {
             "{tag}: a stale row estimate must not cost the index plan\n{plan}"
         );
         assert!(
-            plan.contains(PENDING_INDEX),
-            "{tag}: the outer scan must still read through {PENDING_INDEX}\n{plan}"
+            plan.contains(CLAIM_INDEX),
+            "{tag}: the outer scan must still read through {CLAIM_INDEX}\n{plan}"
+        );
+        assert!(
+            !plan.contains(HISTORY_INDEX),
+            "{tag}: the claim must not walk the request history\n{plan}"
+        );
+        assert!(
+            !plan.contains("Sort"),
+            "{tag}: the claim index must supply the order\n{plan}"
         );
     }
 }

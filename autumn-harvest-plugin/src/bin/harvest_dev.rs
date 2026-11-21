@@ -15,10 +15,10 @@
 //! # Logging
 //!
 //! This binary deliberately installs **no** tracing subscriber. `autumn-web`
-//! installs its own during boot, and a `tracing` global can only be set once —
-//! setting one here made that fail fatally, so the app never started and the
-//! runtime timed out waiting for a server that had already given up. Verbosity
-//! is `RUST_LOG`, exactly as it is for any Autumn app.
+//! installs its own during boot, and a `tracing` global can be set only once.
+//! A subscriber set here made that fail fatally. The app never started, and
+//! the runtime timed out waiting for a server that had already given up.
+//! Verbosity is `RUST_LOG`, as for any Autumn app.
 
 use std::path::PathBuf;
 

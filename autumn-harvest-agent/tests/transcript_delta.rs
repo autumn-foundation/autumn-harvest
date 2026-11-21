@@ -17,8 +17,9 @@ use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest_agent::eval::{Candidate, evaluate};
 use autumn_harvest_agent::workflow::agent_loop_info;
 use autumn_harvest_agent::{
-    AgentHarness, AgentId, AgentOp, AgentProfile, AgentStop, AgentTask, ChatMessage, ChatRole,
-    InMemoryTranscriptStore, ModelTurnRequest, ToolEffect, TranscriptStore, sqlite,
+    AgentHarness, AgentId, AgentOp, AgentProfile, AgentStop, AgentTask, BoxFuture, ChatMessage,
+    ChatRole, InMemoryTranscriptStore, ModelTurnRequest, ToolEffect, TranscriptStore, WindowOwner,
+    sqlite,
 };
 use autumn_harvest_sqlite::{ExecutionId, SqliteRuntime};
 use common::{MemStore, Reply, ScriptedModel, answer, calls, report, response_cache, runtime};
@@ -164,11 +165,18 @@ async fn a_delta_history_replays_strictly() {
 struct ColdStore;
 
 impl TranscriptStore for ColdStore {
-    fn get(&self, _digest: &str) -> Option<Vec<ChatMessage>> {
-        None
+    fn get<'a>(&'a self, _digest: &'a str) -> BoxFuture<'a, Option<Vec<ChatMessage>>> {
+        Box::pin(std::future::ready(None))
     }
 
-    fn put(&self, _digest: &str, _window: &[ChatMessage]) {}
+    fn put<'a>(
+        &'a self,
+        _owner: WindowOwner<'a>,
+        _digest: &'a str,
+        _window: &'a [ChatMessage],
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(std::future::ready(()))
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -201,16 +209,23 @@ struct PoisonedStore {
 }
 
 impl TranscriptStore for PoisonedStore {
-    fn get(&self, digest: &str) -> Option<Vec<ChatMessage>> {
-        let mut window = self.inner.get(digest)?;
-        if let Some(first) = window.first_mut() {
-            *first = ChatMessage::text(ChatRole::User, "injected text");
-        }
-        Some(window)
+    fn get<'a>(&'a self, digest: &'a str) -> BoxFuture<'a, Option<Vec<ChatMessage>>> {
+        Box::pin(async move {
+            let mut window = self.inner.get(digest).await?;
+            if let Some(first) = window.first_mut() {
+                *first = ChatMessage::text(ChatRole::User, "injected text");
+            }
+            Some(window)
+        })
     }
 
-    fn put(&self, digest: &str, window: &[ChatMessage]) {
-        self.inner.put(digest, window);
+    fn put<'a>(
+        &'a self,
+        owner: WindowOwner<'a>,
+        digest: &'a str,
+        window: &'a [ChatMessage],
+    ) -> BoxFuture<'a, ()> {
+        self.inner.put(owner, digest, window)
     }
 }
 
@@ -294,8 +309,8 @@ async fn a_durable_agent_sends_deltas_across_its_ops() {
     assert_eq!(last.messages.len(), 5, "a, one, b, two, c");
 }
 
-#[test]
-fn the_in_memory_store_has_a_byte_bound() {
+#[tokio::test]
+async fn the_in_memory_store_has_a_byte_bound() {
     let store = InMemoryTranscriptStore::with_max_bytes(2_000);
     let window = |text: &str| {
         vec![ChatMessage::text(
@@ -303,11 +318,15 @@ fn the_in_memory_store_has_a_byte_bound() {
             text,
         )]
     };
-    store.put("a", &window(&"x".repeat(900)));
-    store.put("b", &window(&"y".repeat(900)));
-    store.put("c", &window(&"z".repeat(900)));
-    assert!(store.get("a").is_none(), "the oldest window goes first");
-    assert!(store.get("c").is_some());
+    let owner = WindowOwner::new("r", None);
+    store.put(owner, "a", &window(&"x".repeat(900))).await;
+    store.put(owner, "b", &window(&"y".repeat(900))).await;
+    store.put(owner, "c", &window(&"z".repeat(900))).await;
+    assert!(
+        store.get("a").await.is_none(),
+        "the oldest window goes first"
+    );
+    assert!(store.get("c").await.is_some());
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -910,8 +910,11 @@ pub static NARRATIVE_RE: LazyLock<Re> = LazyLock::new(|| {
 });
 
 /// Review-round archaeology.
+///
+/// Any mention of the `Codex` reviewer counts. Its tags (`Codex P2`,
+/// `Codex review`, `Codex F3`) name a review pass, not a durable handle.
 pub static ARCHAEOLOGY_RE: LazyLock<Re> = LazyLock::new(|| {
-    Re::new(r"(?i)\b(?:round[- ]\d+|codex round|review round|P[0-4]\s+(?:fix|finding|review))\b")
+    Re::new(r"(?i)\b(?:round[- ]\d+|codex|review round|P[0-4]\s+(?:fix|finding|review))\b")
 });
 
 /// Real contractions only.

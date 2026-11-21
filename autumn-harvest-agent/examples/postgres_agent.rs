@@ -127,7 +127,6 @@ fn harness(model: Arc<OfflineModel>) -> AgentHarness {
         .agent(AgentProfile::new("support").system("You answer support mail."))
 }
 
-/// A pool of connections to `url`.
 fn pool(url: &str) -> Result<DbPool, Box<dyn std::error::Error>> {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
     Ok(deadpool::managed::Pool::builder(manager)

@@ -27,8 +27,8 @@ use axum::extract::{Path, RawQuery, State};
 use axum::http::HeaderMap;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use chrono::{DateTime, Utc};
 use futures::SinkExt as _;
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 use super::api::{ApiState, NameParams, SignalParams, UpdateParams, map_error};
@@ -65,9 +65,9 @@ pub struct Run {
     /// The error of a failed run.
     pub error: Option<String>,
     /// The start time. A row from before issue #2027 reads the epoch.
-    pub started_at: DateTime<Utc>,
+    pub started_at: Timestamp,
     /// The close time of a terminal run.
-    pub completed_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<Timestamp>,
 }
 
 impl Run {
@@ -88,7 +88,7 @@ impl Run {
                 .started_at
                 .value()
                 .copied()
-                .unwrap_or(DateTime::UNIX_EPOCH),
+                .unwrap_or(Timestamp::UNIX_EPOCH),
             completed_at: row.summary.closed_at.value().copied(),
         }
     }
@@ -325,11 +325,11 @@ pub async fn watch_tool(
 #[derive(Debug, Clone, Default)]
 pub struct Waits {
     /// The id and the append time of the last history event.
-    pub head: Option<(i32, DateTime<Utc>)>,
+    pub head: Option<(i32, Timestamp)>,
     /// The signal names that the replay finds parked, in order.
     pub names: Vec<String>,
     /// The staged signals: name and the time of the oldest.
-    pub queued: Vec<(String, DateTime<Utc>)>,
+    pub queued: Vec<(String, Timestamp)>,
 }
 
 /// The id and the append time of the last history event of `exec`.
@@ -339,7 +339,7 @@ pub struct Waits {
 pub async fn history_head(
     handle: &HarvestSqlite,
     exec: ExecutionId,
-) -> Result<Option<(i32, DateTime<Utc>)>, HarvestSqliteError> {
+) -> Result<Option<(i32, Timestamp)>, HarvestSqliteError> {
     handle
         .read(move |reader| {
             let events = reader.timed_history(exec)?;
@@ -349,7 +349,7 @@ pub async fn history_head(
             let position = i32::try_from(events.len() - 1).unwrap_or(i32::MAX);
             Ok(Some((
                 position,
-                last.recorded_at.unwrap_or(DateTime::UNIX_EPOCH),
+                last.recorded_at.unwrap_or(Timestamp::UNIX_EPOCH),
             )))
         })
         .await
@@ -359,7 +359,7 @@ pub async fn history_head(
 pub async fn queued_signals(
     handle: &HarvestSqlite,
     exec: ExecutionId,
-) -> Result<Vec<(String, DateTime<Utc>)>, HarvestSqliteError> {
+) -> Result<Vec<(String, Timestamp)>, HarvestSqliteError> {
     handle
         .read(move |reader| {
             Ok(reader
@@ -432,8 +432,8 @@ mod tests {
             state: "COMPLETED".into(),
             output: Some(json!(3)),
             error: None,
-            started_at: DateTime::UNIX_EPOCH,
-            completed_at: Some(DateTime::UNIX_EPOCH),
+            started_at: Timestamp::UNIX_EPOCH,
+            completed_at: Some(Timestamp::UNIX_EPOCH),
         };
         let body = run.status_body();
         for field in [

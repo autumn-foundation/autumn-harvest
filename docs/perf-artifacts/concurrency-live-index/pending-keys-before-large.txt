@@ -1,0 +1,26 @@
+                                                                                     QUERY PLAN
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ HashAggregate (actual time=123.479..125.476 rows=40 loops=1)
+   Group Key: concurrency_key, task_type
+   Batches: 1  Memory Usage: 24kB
+   Buffers: shared read=20154
+   ->  Gather (actual time=123.321..125.442 rows=120 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared read=20154
+         ->  HashAggregate (actual time=120.618..120.624 rows=40 loops=3)
+               Group Key: concurrency_key, task_type
+               Batches: 1  Memory Usage: 24kB
+               Buffers: shared read=20154
+               Worker 0:  Batches: 1  Memory Usage: 24kB
+               Worker 1:  Batches: 1  Memory Usage: 24kB
+               ->  Parallel Seq Scan on harvest_task_queue (actual time=0.258..120.435 rows=247 loops=3)
+                     Filter: ((concurrency_key IS NOT NULL) AND (concurrency_cap IS NOT NULL) AND (state = 'PENDING'::text) AND (scheduled_at <= now()) AND (queue_name = ANY ($1)))
+                     Rows Removed by Filter: 209753
+                     Buffers: shared read=20154
+ Planning:
+   Buffers: shared hit=411 read=82
+ Planning Time: 2.850 ms
+ Execution Time: 125.546 ms
+(22 rows)
+

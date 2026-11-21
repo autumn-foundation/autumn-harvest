@@ -31,14 +31,16 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use autumn_harvest::ExecutionId;
-use autumn_harvest::chrono::{DateTime, Utc};
 use autumn_harvest::overlay_log::{
     AUTHOR_AUTO, AUTHOR_OPERATOR, AUTHOR_REFINE, ActivateDecision, ActivateOutcome, AutoAdoptRaw,
-    AutoMoveDecision, MoveRequest, OverlayRow, PolicyExpect, decide_auto_move, logs_activation,
-    next_overlay_version, policy_write_passes, rollback_target, utc_day,
+    AutoMoveDecision, MoveRequest, OverlayRow, PolicyExpect, ReadHead, decide_auto_move,
+    logs_activation, next_overlay_version, policy_write_passes, rollback_target, utc_day,
 };
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 use autumn_harvest::overlay_log::{AutoAdoptRequest, PolicyAppend, PolicyRow, PolicyWrite};
+use autumn_harvest::time::Timestamp;
+#[cfg(feature = "sqlite")]
+pub use autumn_harvest_sqlite::SqliteConnector;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -61,11 +63,10 @@ pub const MAX_OVERLAY_BYTES: usize = 64 * 1024;
 ///
 /// The embedder sets it, never a caller of a store method. So a refine run
 /// cannot pick the day of its cap. A test sets a fixed clock.
-pub type StoreClock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
+pub type StoreClock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
 
-/// The system clock.
 fn system_clock() -> StoreClock {
-    Arc::new(Utc::now)
+    Arc::new(Timestamp::now)
 }
 
 /// The number of one overlay version of a kind. The first version is 1.
@@ -217,7 +218,7 @@ pub struct StoredOverlay {
     bytes: Vec<u8>,
     overlay: ProfileOverlay,
     provenance: Provenance,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
 }
 
 impl StoredOverlay {
@@ -253,7 +254,7 @@ impl StoredOverlay {
 
     /// The time of the put.
     #[must_use]
-    pub const fn created_at(&self) -> DateTime<Utc> {
+    pub const fn created_at(&self) -> Timestamp {
         self.created_at
     }
 
@@ -284,7 +285,7 @@ pub struct Activation {
     from: Option<OverlayVersion>,
     to: OverlayVersion,
     actor: Provenance,
-    activated_at: DateTime<Utc>,
+    activated_at: Timestamp,
 }
 
 impl Activation {
@@ -320,7 +321,7 @@ impl Activation {
 
     /// The time of the move.
     #[must_use]
-    pub const fn activated_at(&self) -> DateTime<Utc> {
+    pub const fn activated_at(&self) -> Timestamp {
         self.activated_at
     }
 
@@ -363,7 +364,7 @@ pub struct PolicyLogEntry {
     old: Option<RefinePolicy>,
     new: Option<RefinePolicy>,
     actor: Provenance,
-    changed_at: DateTime<Utc>,
+    changed_at: Timestamp,
 }
 
 impl PolicyLogEntry {
@@ -399,7 +400,7 @@ impl PolicyLogEntry {
 
     /// The time of the change.
     #[must_use]
-    pub const fn changed_at(&self) -> DateTime<Utc> {
+    pub const fn changed_at(&self) -> Timestamp {
         self.changed_at
     }
 
@@ -681,6 +682,35 @@ pub trait ProfileOverlayStore: Send + Sync + std::fmt::Debug {
         expected_active: Option<OverlayVersion>,
         actor: Provenance,
     ) -> BoxFuture<'a, Result<(), OverlayStoreError>>;
+
+    /// As [`activate`](Self::activate), when the last move of the pointer
+    /// of `kind` is also the one that the caller read. `head` is its `seq`,
+    /// or `None` for no move. A move after the read gives
+    /// [`OverlayStoreError::Conflict`], also when the pointer came back.
+    ///
+    /// Each store of this crate checks `head` in the swap transaction. The
+    /// default checks it before the swap, so a move in between can pass.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`activate`](Self::activate).
+    fn activate_guarded<'a>(
+        &'a self,
+        kind: &'a str,
+        version: OverlayVersion,
+        expected_active: Option<OverlayVersion>,
+        head: Option<u64>,
+        actor: Provenance,
+    ) -> BoxFuture<'a, Result<(), OverlayStoreError>> {
+        Box::pin(async move {
+            let last = self.last_activation(kind).await?;
+            if last.as_ref().map(Activation::seq) != head {
+                let actual = self.active(kind).await?.map(|stored| stored.version());
+                return Err(OverlayStoreError::Conflict { actual });
+            }
+            self.activate(kind, version, expected_active, actor).await
+        })
+    }
 
     /// The last move of the pointer of `kind`, or `None`.
     ///
@@ -1066,6 +1096,7 @@ const fn move_request<'b>(
     actor: &Provenance,
     author: &'b str,
     after_seq: Option<u64>,
+    head: Option<ReadHead>,
 ) -> MoveRequest<'b> {
     MoveRequest {
         version: version.get(),
@@ -1076,6 +1107,7 @@ const fn move_request<'b>(
         actor_kind: actor.author_kind(),
         actor: author,
         after_seq,
+        head,
     }
 }
 
@@ -1184,7 +1216,32 @@ impl ProfileOverlayStore for InMemoryOverlayStore {
         Box::pin(async move {
             activate_checked(self, &*self.validator, kind, version, &actor, || async {
                 let author = actor.author();
-                let request = move_request(version, expected_active, &actor, &author, None);
+                let request = move_request(version, expected_active, &actor, &author, None, None);
+                Ok(self.swap_now(kind, &request, &actor))
+            })
+            .await
+        })
+    }
+
+    fn activate_guarded<'a>(
+        &'a self,
+        kind: &'a str,
+        version: OverlayVersion,
+        expected_active: Option<OverlayVersion>,
+        head: Option<u64>,
+        actor: Provenance,
+    ) -> BoxFuture<'a, Result<(), OverlayStoreError>> {
+        Box::pin(async move {
+            activate_checked(self, &*self.validator, kind, version, &actor, || async {
+                let author = actor.author();
+                let request = move_request(
+                    version,
+                    expected_active,
+                    &actor,
+                    &author,
+                    None,
+                    Some(ReadHead { seq: head }),
+                );
                 Ok(self.swap_now(kind, &request, &actor))
             })
             .await
@@ -1205,7 +1262,7 @@ impl ProfileOverlayStore for InMemoryOverlayStore {
                 actor,
                 |to, from, seq| async move {
                     let author = actor.author();
-                    let request = move_request(to, Some(from), actor, &author, Some(seq));
+                    let request = move_request(to, Some(from), actor, &author, Some(seq), None);
                     Ok(self.swap_now(kind, &request, actor))
                 },
             )
@@ -1383,7 +1440,7 @@ impl InMemoryOverlayStore {
             body: bytes,
             author_kind: provenance.author_kind().to_owned(),
             author: provenance.author(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
         };
         let stored = StoredOverlay::from_row(kind, row)?;
         let version = stored.version;
@@ -1415,7 +1472,7 @@ impl InMemoryOverlayStore {
             old: last.and_then(|last| last.new.clone()),
             new: policy.cloned(),
             actor,
-            changed_at: Utc::now(),
+            changed_at: Timestamp::now(),
         };
         log.policies.push(entry.clone());
         drop(kinds);
@@ -1465,7 +1522,7 @@ impl InMemoryOverlayStore {
             body: bytes,
             author_kind: provenance.author_kind().to_owned(),
             author: provenance.author(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
         };
         let stored = StoredOverlay::from_row(kind, row.clone())?;
         let seq = log.moves.last().map_or(1, |last| last.seq + 1);
@@ -1512,7 +1569,7 @@ impl InMemoryOverlayStore {
                                 from: log.active,
                                 to: version,
                                 actor: actor.clone(),
-                                activated_at: Utc::now(),
+                                activated_at: Timestamp::now(),
                             });
                             log.active = Some(version);
                         }
@@ -1527,9 +1584,12 @@ impl InMemoryOverlayStore {
 
 /// A [`ProfileOverlayStore`] in a `SQLite` file.
 ///
-/// It opens its own connection. It can share the file of a
-/// `SqliteRuntime`. A call runs its statements on the polling thread, and a
-/// busy file can hold that thread for up to 5 seconds.
+/// [`open`](Self::open) keeps its own connection. It can share the file of
+/// a `SqliteRuntime`. [`with_connector`](Self::with_connector) opens a new
+/// connection for each call. A call runs its statements on the polling
+/// thread. With `open`, a busy file can hold that thread for up to 5
+/// seconds. With `with_connector`, the `busy_timeout` of the factory sets
+/// the wait.
 #[cfg(feature = "sqlite")]
 pub struct SqliteOverlayStore {
     log: autumn_harvest_sqlite::SqliteOverlayLog,
@@ -1556,6 +1616,41 @@ impl SqliteOverlayStore {
         validator: Arc<dyn OverlayValidator>,
     ) -> Result<Self, OverlayStoreError> {
         let log = autumn_harvest_sqlite::SqliteOverlayLog::open(path).map_err(backend)?;
+        Ok(Self {
+            log,
+            validator,
+            clock: system_clock(),
+        })
+    }
+
+    /// Open the store on the connections that `connect` opens.
+    ///
+    /// Use it in a database that a replicator checkpoints, such as the
+    /// tenant database of an autumn-web fleet.
+    ///
+    /// - The store applies its schema through `connect`.
+    /// - Each call opens one connection, runs its statements and drops the
+    ///   connection. So the store keeps no connection between calls.
+    /// - The store runs one call at a time.
+    /// - The store sets `foreign_keys = ON` on each connection, and no
+    ///   other pragma. Set the pragmas of the app in `connect`, such as
+    ///   `wal_autocheckpoint = 0` and `busy_timeout`.
+    /// - A store connection does not checkpoint when it closes.
+    /// - Open a connection in `connect` only while another connection of
+    ///   the app stays open. Then a store connection never closes last.
+    ///
+    /// The guards of the tables do not change.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OverlayStoreError::Backend`] when `connect` fails or the
+    /// schema cannot be applied.
+    pub fn with_connector(
+        connect: SqliteConnector,
+        validator: Arc<dyn OverlayValidator>,
+    ) -> Result<Self, OverlayStoreError> {
+        let log =
+            autumn_harvest_sqlite::SqliteOverlayLog::with_connector(connect).map_err(backend)?;
         Ok(Self {
             log,
             validator,
@@ -1615,7 +1710,32 @@ impl ProfileOverlayStore for SqliteOverlayStore {
         Box::pin(async move {
             activate_checked(self, &*self.validator, kind, version, &actor, || async {
                 let author = actor.author();
-                let request = move_request(version, expected_active, &actor, &author, None);
+                let request = move_request(version, expected_active, &actor, &author, None, None);
+                self.log.activate(kind, &request).map_err(backend)
+            })
+            .await
+        })
+    }
+
+    fn activate_guarded<'a>(
+        &'a self,
+        kind: &'a str,
+        version: OverlayVersion,
+        expected_active: Option<OverlayVersion>,
+        head: Option<u64>,
+        actor: Provenance,
+    ) -> BoxFuture<'a, Result<(), OverlayStoreError>> {
+        Box::pin(async move {
+            activate_checked(self, &*self.validator, kind, version, &actor, || async {
+                let author = actor.author();
+                let request = move_request(
+                    version,
+                    expected_active,
+                    &actor,
+                    &author,
+                    None,
+                    Some(ReadHead { seq: head }),
+                );
                 self.log.activate(kind, &request).map_err(backend)
             })
             .await
@@ -1636,7 +1756,7 @@ impl ProfileOverlayStore for SqliteOverlayStore {
                 actor,
                 |to, from, seq| async move {
                     let author = actor.author();
-                    let request = move_request(to, Some(from), actor, &author, Some(seq));
+                    let request = move_request(to, Some(from), actor, &author, Some(seq), None);
                     self.log.activate(kind, &request).map_err(backend)
                 },
             )
@@ -1887,7 +2007,32 @@ impl ProfileOverlayStore for PostgresOverlayStore {
         Box::pin(async move {
             activate_checked(self, &*self.validator, kind, version, &actor, || async {
                 let author = actor.author();
-                let request = move_request(version, expected_active, &actor, &author, None);
+                let request = move_request(version, expected_active, &actor, &author, None, None);
+                self.swap(kind, &request).await
+            })
+            .await
+        })
+    }
+
+    fn activate_guarded<'a>(
+        &'a self,
+        kind: &'a str,
+        version: OverlayVersion,
+        expected_active: Option<OverlayVersion>,
+        head: Option<u64>,
+        actor: Provenance,
+    ) -> BoxFuture<'a, Result<(), OverlayStoreError>> {
+        Box::pin(async move {
+            activate_checked(self, &*self.validator, kind, version, &actor, || async {
+                let author = actor.author();
+                let request = move_request(
+                    version,
+                    expected_active,
+                    &actor,
+                    &author,
+                    None,
+                    Some(ReadHead { seq: head }),
+                );
                 self.swap(kind, &request).await
             })
             .await
@@ -1908,7 +2053,7 @@ impl ProfileOverlayStore for PostgresOverlayStore {
                 actor,
                 |to, from, seq| async move {
                     let author = actor.author();
-                    let request = move_request(to, Some(from), actor, &author, Some(seq));
+                    let request = move_request(to, Some(from), actor, &author, Some(seq), None);
                     self.swap(kind, &request).await
                 },
             )
@@ -2094,7 +2239,6 @@ impl PostgresOverlayStore {
     }
 }
 
-/// Decode one stored row of `kind`.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 fn decode_one(
     kind: &str,
@@ -2104,7 +2248,6 @@ fn decode_one(
         .transpose()
 }
 
-/// Decode the stored rows of `kind`.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 fn decode_all(kind: &str, rows: Vec<OverlayRow>) -> Result<Vec<StoredOverlay>, OverlayStoreError> {
     rows.into_iter()
@@ -2224,7 +2367,7 @@ mod tests {
             body: body.to_vec(),
             author_kind: author_kind.to_owned(),
             author: author.to_owned(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
         };
         for bad in [
             row(0, b"{}", AUTHOR_OPERATOR, "ops"),

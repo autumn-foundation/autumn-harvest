@@ -164,12 +164,20 @@ async fn serve_app(db: &TestDb) -> Served {
         ..Default::default()
     };
     let pool = pool(&db.url);
-    let router = TestApp::new()
-        .config(config)
-        .plugin(plugin)
-        .with_db(pool.clone())
-        .build()
-        .into_router();
+    // The client owns the Autumn background tasks, the Harvest worker among
+    // them. Dropping it stops them, so the server keeps it and forwards each
+    // request to it.
+    let client = std::sync::Arc::new(
+        TestApp::new()
+            .config(config)
+            .plugin(plugin)
+            .with_db(pool.clone())
+            .build(),
+    );
+    let router = autumn_web::reexports::axum::Router::new().fallback(move |request| {
+        let client = std::sync::Arc::clone(&client);
+        async move { forward(&client, request).await }
+    });
     tokio::spawn(async move {
         autumn_web::reexports::axum::serve(listener, router)
             .await
@@ -181,6 +189,40 @@ async fn serve_app(db: &TestDb) -> Served {
         transport,
         pool,
     }
+}
+
+/// Send one HTTP request through `client`, and return its response.
+async fn forward(
+    client: &autumn_web::test::TestClient,
+    request: autumn_web::reexports::axum::extract::Request,
+) -> autumn_web::reexports::axum::response::Response {
+    use autumn_web::reexports::axum::body::{Body, to_bytes};
+    use autumn_web::reexports::axum::http::Method;
+
+    let (parts, body) = request.into_parts();
+    let uri = parts.uri.to_string();
+    let mut builder = match parts.method {
+        Method::GET => client.get(&uri),
+        Method::POST => client.post(&uri),
+        Method::PUT => client.put(&uri),
+        Method::DELETE => client.delete(&uri),
+        Method::PATCH => client.patch(&uri),
+        Method::HEAD => client.head(&uri),
+        _ => client.options(&uri),
+    };
+    for (name, value) in &parts.headers {
+        if let Ok(value) = value.to_str() {
+            builder = builder.header(name.as_str(), value);
+        }
+    }
+    let bytes = to_bytes(body, usize::MAX).await.expect("request body");
+    let response = builder.body(bytes).send().await;
+    let mut out =
+        autumn_web::reexports::axum::response::Response::builder().status(response.status);
+    for (name, value) in &response.headers {
+        out = out.header(name, value);
+    }
+    out.body(Body::from(response.body)).expect("response")
 }
 
 async fn start_caller(served: &Served, month: &str) -> String {

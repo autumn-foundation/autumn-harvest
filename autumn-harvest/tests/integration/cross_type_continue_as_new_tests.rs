@@ -2,9 +2,9 @@
 //! Worker-driven integration tests for cross-type continue-as-new — issue #803.
 //!
 //! `ctx.continue_as_new_as_type(target, input)` continues an entity run as a
-//! *different* registered workflow type while keeping the same logical
-//! `workflow_id`, so each lifecycle phase gets its own focused, replay-safe
-//! handler instead of one ever-branching function.
+//! *different* registered workflow type with the same logical `workflow_id`.
+//! So each lifecycle phase gets its own focused, replay-safe handler instead of
+//! one ever-branching function.
 //!
 //! Coverage map (acceptance criteria from the issue):
 //!
@@ -13,9 +13,9 @@
 //! - **AC3** — the transition is recorded on the existing
 //!   `WorkflowContinuedAsNew` event via the additive `new_workflow_type` field.
 //! - **AC4** — the successor's `execution_timeout` / `sla` / concurrency /
-//!   ops-metadata / retry policy come from the **new type's** `WorkflowInfo`,
-//!   while the #617 chain cap is still carried verbatim (a type change must not
-//!   be an escape hatch from a runaway-loop budget).
+//!   ops-metadata / retry policy come from the **new type's** `WorkflowInfo`.
+//!   The #617 chain cap is still carried verbatim. A type change must not be an
+//!   escape hatch from a runaway-loop budget.
 //! - **AC5** — continuing into an unregistered type fails the predecessor
 //!   terminally and creates no successor.
 //! - **AC7** — carryover is type-agnostic: unconsumed signals reassign to the
@@ -34,6 +34,8 @@
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
 use autumn_harvest::table_split::SetExt;
+use autumn_harvest::time::sql::ToPgInterval;
+use jiff_diesel::ToDiesel;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -50,9 +52,9 @@ use autumn_harvest::types::{
 };
 use autumn_harvest::worker::{HandlerRegistry, NO_CAPABLE_WORKER_PREFIX};
 use autumn_harvest::{ActivityContext, WorkflowContext, WorkflowInfo};
-use chrono::{Duration as ChronoDuration, Utc};
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::{SignedDuration, Timestamp};
 use uuid::Uuid;
 
 use crate::integration_e2e::{
@@ -263,9 +265,9 @@ async fn start_root(
         .exec_id
 }
 
-/// Address an entity by `(workflow_name, workflow_id)` and deliver a signal,
-/// starting a fresh run only if that pair has no live execution — the exact
-/// call an external caller makes after a phase transition.
+/// Address an entity by `(workflow_name, workflow_id)` and deliver a signal.
+/// Start a fresh run only if that pair has no live execution. An external
+/// caller makes this exact call after a phase transition.
 async fn signal_with_start(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
@@ -341,16 +343,15 @@ async fn recorded_transition(url: &str, predecessor: ExecutionId) -> (ExecutionI
         .expect("predecessor history must contain WorkflowContinuedAsNew")
 }
 
-/// Open an explicit transaction on `conn` holding `exec_id`'s execution row,
-/// so a concurrent writer of that row parks until `COMMIT` — the repo's
-/// established choreography for reproducing a commit-window race
-/// deterministically (see `pause_tests`).
+/// Open an explicit transaction on `conn` holding `exec_id`'s execution row.
+/// A concurrent writer of that row then parks until `COMMIT`. This reproduces
+/// a commit-window race deterministically (see `pause_tests`).
 ///
-/// `FOR NO KEY UPDATE`, not `FOR UPDATE`: the worker's seal is an ordinary
-/// non-key `UPDATE` (which itself takes `FOR NO KEY UPDATE`) so it still
-/// blocks, while a foreign-key check from an insert into `harvest_signals`
-/// only needs `FOR KEY SHARE` — which `FOR UPDATE` would block and deadlock
-/// this test against its own held lock.
+/// `FOR NO KEY UPDATE`, not `FOR UPDATE`. The worker's seal is an ordinary
+/// non-key `UPDATE`, which takes `FOR NO KEY UPDATE`, so it still blocks. A
+/// foreign-key check from an insert into `harvest_signals` needs only
+/// `FOR KEY SHARE`. `FOR UPDATE` would block it and deadlock this test against
+/// its own held lock.
 /// Returns the holder's backend pid so [`wait_for_a_blocked_writer`] can
 /// require that *this* connection is the blocker.
 async fn hold_execution_row_lock(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> i32 {
@@ -372,15 +373,15 @@ async fn hold_execution_row_lock(conn: &mut AsyncPgConnection, exec_id: Executio
     pid.pid
 }
 
-/// Block until a backend is genuinely waiting on **`holder`'s** lock — the
-/// precise signal that the worker's persist transaction has reached its seal
-/// UPDATE (a fixed sleep would be a race in either direction).
+/// Block until a backend is genuinely waiting on **`holder`'s** lock. That
+/// signals that the worker's persist transaction reached its seal UPDATE. A
+/// fixed sleep would be a race in either direction.
 ///
-/// Scoped to the holder's pid *and* the current database on purpose: an
-/// unscoped `cardinality(pg_blocking_pids(pid)) > 0` is satisfied by **any**
-/// blocked backend anywhere on the cluster — including a concurrent suite on
-/// the shared test Postgres — which would release the lock before the worker
-/// ever reached the seal and let the test pass vacuously.
+/// The check is scoped to the holder's pid *and* the current database. An
+/// unscoped `cardinality(pg_blocking_pids(pid)) > 0` matches **any** blocked
+/// backend on the cluster, such as a concurrent suite on the shared test
+/// Postgres. The test would then release the lock before the worker reached the
+/// seal and pass vacuously.
 async fn wait_for_a_blocked_writer(conn: &mut AsyncPgConnection, holder: i32) {
     #[derive(diesel::QueryableByName)]
     struct Blocked {
@@ -467,9 +468,9 @@ async fn successor_runs_as_the_named_type_keeping_workflow_id_shard_and_queue() 
     assert_eq!(after.queue_name, before.queue_name, "same queue");
     assert_ne!(successor, predecessor, "a fresh execution id");
 
-    // AC2: "its input is the provided payload" — `phase_one` hands the
-    // transition `{"phase": "two"}`, which must be the successor's input on
-    // both the row and its own `WorkflowStarted`.
+    // AC2: "its input is the provided payload". `phase_one` hands the
+    // transition `{"phase": "two"}`. It must be the successor's input on both
+    // the row and its own `WorkflowStarted`.
     let expected_input = serde_json::json!({"phase": "two"});
     assert_eq!(
         after.input, expected_input,
@@ -516,19 +517,22 @@ async fn successor_resolves_lifecycle_defaults_from_the_new_type() {
 
     // Give the PREDECESSOR row lifecycle values that differ from the target
     // type's declared defaults, plus a chain cap to pin the #617 interaction.
-    let frozen_chain_deadline = Utc::now() + ChronoDuration::hours(6);
+    let frozen_chain_deadline = Timestamp::now() + SignedDuration::from_hours(6);
     diesel::update(harvest_workflow_executions::table.find(predecessor.as_uuid()))
         .set((
-            harvest_workflow_executions::execution_timeout.eq(Some(ChronoDuration::seconds(600))),
-            harvest_workflow_executions::sla.eq(Some(ChronoDuration::seconds(300))),
+            harvest_workflow_executions::execution_timeout
+                .eq(Some(SignedDuration::from_secs(600)).to_pg_interval()),
+            harvest_workflow_executions::sla
+                .eq(Some(SignedDuration::from_secs(300)).to_pg_interval()),
             harvest_workflow_executions::owner.eq(Some("growth-team")),
             harvest_workflow_executions::severity.eq(Some("SEV3")),
             SetExt(
                 harvest_workflow_executions_ext::chain_execution_timeout
-                    .eq(Some(ChronoDuration::days(7))),
+                    .eq(Some(autumn_harvest::time::days(7)).to_pg_interval()),
             ),
             SetExt(
-                harvest_workflow_executions_ext::chain_deadline_at.eq(Some(frozen_chain_deadline)),
+                harvest_workflow_executions_ext::chain_deadline_at
+                    .eq(Some(frozen_chain_deadline).to_diesel()),
             ),
         ))
         .execute(&mut conn)
@@ -548,12 +552,12 @@ async fn successor_resolves_lifecycle_defaults_from_the_new_type() {
 
     assert_eq!(
         after.execution_timeout,
-        Some(ChronoDuration::seconds(7_200)),
+        Some(SignedDuration::from_secs(7_200)),
         "execution_timeout must come from the NEW type (#243), not the predecessor's 600s"
     );
     assert_eq!(
         after.sla,
-        Some(ChronoDuration::seconds(1_800)),
+        Some(SignedDuration::from_secs(1_800)),
         "sla must come from the NEW type (#487), not the predecessor's 300s"
     );
     assert_eq!(
@@ -566,7 +570,7 @@ async fn successor_resolves_lifecycle_defaults_from_the_new_type() {
     // Per-run deadline re-anchored from the NEW type's budget.
     let deadline = after.deadline_at.expect("successor deadline_at");
     assert!(
-        deadline > Utc::now() + ChronoDuration::seconds(7_000),
+        deadline > Timestamp::now() + SignedDuration::from_secs(7_000),
         "deadline must re-anchor to now + the new type's 7200s budget, got {deadline}"
     );
 
@@ -574,25 +578,23 @@ async fn successor_resolves_lifecycle_defaults_from_the_new_type() {
     // hatch from the #617 runaway-loop budget.
     assert_eq!(
         after.chain_execution_timeout,
-        Some(ChronoDuration::days(7)),
+        Some(autumn_harvest::time::days(7)),
         "chain cap duration carried verbatim across a type change"
     );
     let chain_deadline = after
         .chain_deadline_at
         .expect("successor chain_deadline_at");
     assert!(
-        (chain_deadline - frozen_chain_deadline)
-            .num_milliseconds()
-            .abs()
+        autumn_harvest::time::num_milliseconds(chain_deadline - frozen_chain_deadline).abs()
             < 1_000,
         "chain_deadline_at must be the predecessor's ABSOLUTE value ({frozen_chain_deadline}), \
          not re-anchored — got {chain_deadline}"
     );
 }
 
-/// A target type declaring no lifecycle defaults must CLEAR them rather than
-/// silently inheriting the predecessor's — otherwise the successor runs under a
-/// timeout its own type never declared.
+/// A target type declaring no lifecycle defaults must CLEAR them, not inherit
+/// the predecessor's. Otherwise the successor runs under a timeout its own type
+/// never declared.
 #[tokio::test]
 async fn successor_without_declared_defaults_does_not_inherit_the_predecessors() {
     let (url, _c) = setup_test_database_url_or_env().await;
@@ -611,7 +613,8 @@ async fn successor_without_declared_defaults_does_not_inherit_the_predecessors()
     .await;
     diesel::update(harvest_workflow_executions::table.find(predecessor.as_uuid()))
         .set((
-            harvest_workflow_executions::execution_timeout.eq(Some(ChronoDuration::seconds(600))),
+            harvest_workflow_executions::execution_timeout
+                .eq(Some(SignedDuration::from_secs(600)).to_pg_interval()),
             harvest_workflow_executions::owner.eq(Some("growth-team")),
         ))
         .execute(&mut conn)
@@ -844,7 +847,7 @@ async fn a_cap_redirected_transition_still_records_its_abandoned_dispatch() {
 }
 
 /// A cap-rejected transition on a SCHEDULED run must increment the
-/// schedule's consecutive-failure counter (Codex P2 on PR #1399). The
+/// schedule's consecutive-failure counter (PR #1399). The
 /// predecessor's real outcome is a terminal failure, not a continuation.
 /// Leaving the counter untouched would let a schedule whose target
 /// deterministically rejects every fire evade failure-based auto-pausing.
@@ -879,7 +882,8 @@ async fn a_cap_rejected_transition_increments_the_schedules_failure_counter() {
             harvest_schedules::dsl::catchup.eq(false),
             harvest_schedules::dsl::max_active_runs.eq(10),
             harvest_schedules::dsl::is_paused.eq(false),
-            harvest_schedules::dsl::next_run_at.eq(Utc::now() - ChronoDuration::seconds(5)),
+            harvest_schedules::dsl::next_run_at
+                .eq((Timestamp::now() - SignedDuration::from_secs(5)).to_diesel()),
             harvest_schedules::dsl::jitter_secs.eq(0_i64),
             harvest_schedules::dsl::overlap_policy.eq("skip"),
             harvest_schedules::dsl::buffered_runs.eq(serde_json::json!([])),
@@ -980,8 +984,8 @@ async fn a_widened_target_cap_admits_a_transition_the_floor_alone_would_reject()
 // ---------------------------------------------------------------------------
 
 /// Park a prior run of the target type on the same `workflow_id` in `state`,
-/// with no task-queue row, so it is a stable slot occupant the worker will
-/// never claim and never transition.
+/// with no task-queue row. It is a stable slot occupant that the worker never
+/// claims or transitions.
 async fn park_occupant(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
@@ -994,11 +998,11 @@ async fn park_occupant(
         .execute(conn)
         .await
         .expect("detach the occupant from the queue");
-    let completed_at = autumn_harvest::erase::is_terminal_state(state).then(Utc::now);
+    let completed_at = autumn_harvest::erase::is_terminal_state(state).then(Timestamp::now);
     diesel::update(harvest_workflow_executions::table.find(occupant.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq(state),
-            harvest_workflow_executions::completed_at.eq(completed_at),
+            harvest_workflow_executions::completed_at.eq(completed_at.to_diesel()),
         ))
         .execute(conn)
         .await
@@ -1008,18 +1012,22 @@ async fn park_occupant(
 
 /// A terminal prior run of the target phase (the win-back shape
 /// `churned -> trial -> churned`) still *occupies* the successor's uniqueness
-/// slot — the partial index excludes only `CONTINUED_AS_NEW` / `TERMINATED` —
-/// and the transition is REJECTED rather than releasing it.
+/// slot. The partial index excludes only `CONTINUED_AS_NEW` / `TERMINATED`.
+/// The transition is REJECTED; it does not release the slot.
 ///
 /// An earlier cut released the slot by re-stating that run `CONTINUED_AS_NEW`.
-/// Two Codex P1s on PR #1159 showed that is unsafe: `CONTINUED_AS_NEW` is read
-/// as a *link*, so `await_external_workflow` (#757) on the old id parks forever
-/// and `/result` (#527) stops reporting its outcome; and a schedule-attributed
-/// run dropped out of #488 carryover would roll an incremental cursor backward
-/// (a rule `execution.rs`'s re-run path already spells out). A terminal run is
-/// a durable record callers may hold an id for, so this path does not rewrite
-/// it — the operator resets/erases it, or continues under a different
-/// `workflow_id`.
+/// PR #1159 showed that is unsafe:
+///
+/// - `CONTINUED_AS_NEW` reads as a *link*, so `await_external_workflow` (#757)
+///   on the old id parks forever.
+/// - For the same reason, `/result` (#527) stops reporting its outcome.
+/// - A schedule-attributed run dropped out of #488 carryover rolls an
+///   incremental cursor backward. The re-run path in `execution.rs` spells out
+///   that rule.
+///
+/// A terminal run is a durable record that callers may hold an id for, so this
+/// path does not rewrite it. The operator resets or erases it, or continues
+/// under a different `workflow_id`.
 #[tokio::test]
 async fn a_terminal_prior_run_of_the_target_type_blocks_the_transition() {
     let (url, _c) = setup_test_database_url_or_env().await;
@@ -1157,11 +1165,11 @@ async fn a_reconciled_migrated_occupant_of_the_target_type_frees_the_slot() {
     );
 }
 
-/// Naming your OWN type is a supported request — unlike the legacy
-/// `continue_as_new`, it re-resolves *that type's* declared defaults, and it is
-/// what the natural typed form `continue_as_new_as(&own_info(), input)`
-/// produces. The predecessor occupies the very slot it is about to vacate, so
-/// the occupant check must not read it as blocking itself.
+/// Naming the run's OWN type is a supported request. Unlike the legacy
+/// `continue_as_new`, it re-resolves *that type's* declared defaults. The
+/// natural typed form `continue_as_new_as(&own_info(), input)` produces it. The
+/// predecessor occupies the very slot it is about to vacate, so the occupant
+/// check must not read it as blocking itself.
 #[tokio::test]
 async fn naming_the_current_type_continues_normally_instead_of_self_blocking() {
     let (url, _c) = setup_test_database_url_or_env().await;
@@ -1179,7 +1187,10 @@ async fn naming_the_current_type_continues_normally_instead_of_self_blocking() {
     )
     .await;
     diesel::update(harvest_workflow_executions::table.find(predecessor.as_uuid()))
-        .set(harvest_workflow_executions::execution_timeout.eq(Some(ChronoDuration::seconds(600))))
+        .set(
+            harvest_workflow_executions::execution_timeout
+                .eq(Some(SignedDuration::from_secs(600)).to_pg_interval()),
+        )
         .execute(&mut conn)
         .await
         .expect("stamp a per-start override the type never declared");
@@ -1221,9 +1232,9 @@ async fn naming_the_current_type_continues_normally_instead_of_self_blocking() {
 }
 
 /// A *live* run of the target type already owns `(target, workflow_id)`.
-/// Harvest admits exactly one active run per pair, so the transition must fail
-/// the predecessor terminally with an actionable message — never cancel the
-/// bystander, and never leave a half-written successor.
+/// Harvest admits exactly one active run per pair. So the transition must fail
+/// the predecessor terminally with an actionable message. It must never cancel
+/// the bystander or leave a half-written successor.
 #[tokio::test]
 async fn a_live_run_of_the_target_type_blocks_the_transition_terminally() {
     let (url, _c) = setup_test_database_url_or_env().await;
@@ -1287,30 +1298,29 @@ async fn a_live_run_of_the_target_type_blocks_the_transition_terminally() {
 // ---------------------------------------------------------------------------
 
 /// Issue #804 reclassified the *first* claim by a worker lacking the target
-/// handler: rather than sealing the predecessor immediately, that worker now
-/// RELEASES the task so a capable peer can run the transition (the canonical
-/// rolling-deploy shape, where the old pod runs the source phase and only the
-/// new peer registers the target phase). See
+/// handler. That worker no longer seals the predecessor at once. It RELEASES
+/// the task so a capable peer can run the transition. This is the canonical
+/// rolling-deploy shape: the old pod runs the source phase, and only the new
+/// peer registers the target phase. See
 /// `capability_miss_tests::cross_type_continue_as_new_missing_target_is_released_for_a_capable_peer`.
 ///
-/// #803's AC5 still holds, and is what this test now pins: with **no** capable
-/// peer the release is bounded, and once the budget is spent the predecessor is
-/// failed terminally — with a `no_capable_worker:` reason naming the missing
-/// type — and **no** successor row is ever created. The budget is set to 1 so
-/// the escalation lands inside the default wait rather than paying the default
-/// 31s of backoff dwell for real.
+/// #803's AC5 still holds, and this test pins it. With **no** capable peer, the
+/// release is bounded. Once the budget is spent, the predecessor fails
+/// terminally with a `no_capable_worker:` reason naming the missing type. **No**
+/// successor row is ever created. The budget is 1, so the escalation lands
+/// inside the default wait and does not pay the default 31s of backoff dwell.
 ///
 /// "No capable peer" has to be true of the *registry*, not just of this test's
-/// intent. `live_workers_on_queue_query` deliberately selects on heartbeat
-/// freshness alone (a `Draining` worker is a rollback away from being capable,
-/// so excluding it could fabricate an escalation), and every worker this module
-/// runs shares the `default` queue. A sibling test's worker therefore stays
-/// "live" for the whole freshness window after it stops — far longer than the
-/// gap between two tests — and reads as an untried peer that may hold the
-/// handler, which correctly *withholds* the escalation bound (issue #804,
-/// round-38 P1). In production those pods are gone and age out on their own;
-/// here the shared database keeps their last heartbeat, so the fleet is cleared
-/// explicitly to leave the single incapable worker this test is written for.
+/// intent. `live_workers_on_queue_query` selects on heartbeat freshness alone.
+/// A `Draining` worker is a rollback away from being capable, so excluding it
+/// could fabricate an escalation. Every worker this module runs shares the
+/// `default` queue. So a sibling test's worker stays "live" for the whole
+/// freshness window after it stops. That is far longer than the
+/// gap between two tests. The worker reads as an untried peer that may hold the
+/// handler, which correctly *withholds* the escalation bound (issue #804).
+/// In production those pods are gone and age out on their own. Here the shared
+/// database keeps their last heartbeat. So the test clears the fleet
+/// explicitly, to leave the single incapable worker it is written for.
 #[tokio::test]
 async fn continuing_into_an_unregistered_type_fails_terminally_without_a_successor() {
     let (url, _c) = setup_test_database_url_or_env().await;
@@ -1394,9 +1404,9 @@ async fn continuing_into_an_unregistered_type_fails_terminally_without_a_success
 // AC7 — carryover is type-agnostic
 // ---------------------------------------------------------------------------
 
-/// Scheduled carryover (#488) and schedule lineage (#534) are copied onto the
-/// successor by code that never consults the workflow type, so they must
-/// survive a *cross-type* transition byte-for-byte.
+/// The code that copies scheduled carryover (#488) and schedule lineage (#534)
+/// onto the successor never consults the workflow type. So they must survive a
+/// *cross-type* transition byte-for-byte.
 #[tokio::test]
 async fn scheduled_carryover_and_lineage_survive_a_type_change() {
     let (url, _c) = setup_test_database_url_or_env().await;
@@ -1443,8 +1453,8 @@ async fn scheduled_carryover_and_lineage_survive_a_type_change() {
         "schedule lineage must survive a type change"
     );
     assert_eq!(
-        after.scheduled_for.map(|s| s.timestamp_millis()),
-        Some(slot.timestamp_millis()),
+        after.scheduled_for.map(jiff::Timestamp::as_millisecond),
+        Some(slot.as_millisecond()),
         "the logical slot must survive a type change"
     );
 
@@ -1490,17 +1500,17 @@ async fn scheduled_carryover_and_lineage_survive_a_type_change() {
     );
 }
 
-/// A signal that lands **while the transitioning task is committing** is
-/// reassigned to the successor rather than stranded on the sealed predecessor —
-/// the `consumed = false` reassignment in `persist_workflow_continue_as_new`,
-/// which is unconditional and therefore type-agnostic.
+/// A signal that lands **while the transitioning task is committing** moves to
+/// the successor. It is not stranded on the sealed predecessor. The
+/// `consumed = false` reassignment in `persist_workflow_continue_as_new` does
+/// this. It is unconditional and so type-agnostic.
 ///
-/// That window is the *only* one in which a signal is genuinely unconsumed at
-/// transition time: every workflow-task pickup ingests all pending signals into
-/// history first (`ingest_due_timers_and_signals` marks them `consumed`). It is
-/// reproduced deterministically with the repo's established row-lock
-/// choreography — hold `FOR UPDATE` on the predecessor so the worker's persist
-/// transaction blocks on its seal UPDATE, insert the signal, then release.
+/// Only in that window is a signal genuinely unconsumed at transition time.
+/// Every workflow-task pickup ingests all pending signals into history first
+/// (`ingest_due_timers_and_signals` marks them `consumed`). The test
+/// reproduces the window with the row-lock choreography. It holds `FOR UPDATE`
+/// on the predecessor, so the worker's persist transaction blocks on its seal
+/// UPDATE. It inserts the signal, then releases the lock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_signal_landing_mid_transition_reassigns_to_the_cross_type_successor() {
     let (url, _c) = setup_test_database_url_or_env().await;
@@ -1529,11 +1539,11 @@ async fn a_signal_landing_mid_transition_reassigns_to_the_cross_type_successor()
 
     wait_for_a_blocked_writer(&mut conn, holder_pid).await;
 
-    // The signal arrives in the window the reassignment exists for. Inserted
-    // directly rather than through `send_signal`, whose target validation
-    // (issue #753) takes the execution row `FOR UPDATE` — it would queue behind
-    // the very lock this test is holding and deadlock. The row shape is what
-    // matters here: an unconsumed signal against the predecessor.
+    // The signal arrives in the window the reassignment exists for. The test
+    // inserts it directly, not through `send_signal`. Its target validation
+    // (issue #753) takes the execution row `FOR UPDATE`. It would queue behind
+    // the lock this test holds and deadlock. The row shape is what matters here:
+    // an unconsumed signal against the predecessor.
     diesel::sql_query(
         "INSERT INTO harvest_signals (id, workflow_exec_id, signal_name, payload, consumed) \
          VALUES ($1, $2, 'late_arrival', '{\"n\": 1}'::jsonb, false)",
@@ -1640,10 +1650,10 @@ async fn signal_with_start_naming_the_new_type_attaches_to_the_live_successor() 
 }
 
 /// The documented **addressing consequence**: harvest's active-run identity is
-/// `(workflow_name, workflow_id)`, so a caller still naming the OLD type after a
+/// `(workflow_name, workflow_id)`. A caller that names the OLD type after a
 /// transition starts a *fresh* run of that old type. It coexists with the live
-/// successor rather than attaching to it — the two occupy different uniqueness
-/// slots. Pinned so the contract is explicit rather than folklore.
+/// successor, because the two occupy different uniqueness slots. This test
+/// makes the contract explicit.
 #[tokio::test]
 async fn signal_with_start_naming_the_old_type_starts_a_separate_run() {
     let (url, _c) = setup_test_database_url_or_env().await;
@@ -1841,9 +1851,9 @@ async fn a_child_workflow_rejected_continue_as_new_still_records_its_abandoned_d
     );
 }
 
-/// Concurrency (#247) is re-resolved against the TARGET type's policy: a target
-/// declaring none must clear the predecessor's key rather than keep governing
-/// the successor under a policy that belongs to a different type.
+/// Concurrency (#247) is re-resolved against the TARGET type's policy. A target
+/// declaring none must clear the predecessor's key. A policy of a different
+/// type must not keep governing the successor.
 #[tokio::test]
 async fn successor_concurrency_key_is_resolved_from_the_new_type() {
     let (url, _c) = setup_test_database_url_or_env().await;
@@ -1896,9 +1906,9 @@ async fn successor_concurrency_key_is_resolved_from_the_new_type() {
     assert_eq!(keys.concurrency_cap, Some(7));
 }
 
-/// A same-type `continue_as_new` still behaves exactly as before (AC1): the
+/// A same-type `continue_as_new` still behaves exactly as before (AC1). The
 /// successor keeps the predecessor's name and carries its lifecycle columns
-/// verbatim, including an execution timeout the type itself never declared.
+/// verbatim. That includes an execution timeout the type never declared.
 #[tokio::test]
 async fn same_type_continue_as_new_is_unchanged() {
     let (url, _c) = setup_test_database_url_or_env().await;
@@ -1918,7 +1928,8 @@ async fn same_type_continue_as_new_is_unchanged() {
     // verbatim, which is exactly what distinguishes the same-type path.
     diesel::update(harvest_workflow_executions::table.find(predecessor.as_uuid()))
         .set((
-            harvest_workflow_executions::execution_timeout.eq(Some(ChronoDuration::seconds(900))),
+            harvest_workflow_executions::execution_timeout
+                .eq(Some(SignedDuration::from_secs(900)).to_pg_interval()),
             harvest_workflow_executions::owner.eq(Some("growth-team")),
         ))
         .execute(&mut conn)
@@ -1937,7 +1948,7 @@ async fn same_type_continue_as_new_is_unchanged() {
     assert_eq!(after.workflow_name, name);
     assert_eq!(
         after.execution_timeout,
-        Some(ChronoDuration::seconds(900)),
+        Some(SignedDuration::from_secs(900)),
         "the per-start override must still be carried verbatim"
     );
     assert_eq!(after.owner.as_deref(), Some("growth-team"));
@@ -1967,7 +1978,7 @@ fn same_type_loop<'a>(
 /// exact values written.
 struct CarriedColumns {
     schedule_id: Uuid,
-    slot: chrono::DateTime<Utc>,
+    slot: jiff::Timestamp,
     memo: serde_json::Value,
     search_attrs: serde_json::Value,
     headers: serde_json::Value,
@@ -1987,7 +1998,7 @@ async fn stamp_type_agnostic_carryover(
 ) -> CarriedColumns {
     let carried = CarriedColumns {
         schedule_id: Uuid::new_v4(),
-        slot: Utc::now() - ChronoDuration::minutes(5),
+        slot: Timestamp::now() - SignedDuration::from_mins(5),
         memo: serde_json::json!({"tier": "trial"}),
         search_attrs: serde_json::json!({"customer": "acme", "region": "eu"}),
         headers: serde_json::json!({"traceparent": "00-abc-def-01"}),
@@ -2008,7 +2019,9 @@ async fn stamp_type_agnostic_carryover(
     diesel::update(harvest_workflow_executions::table.find(predecessor.as_uuid()))
         .set((
             harvest_workflow_executions::schedule_id.eq(Some(carried.schedule_id)),
-            SetExt(harvest_workflow_executions_ext::scheduled_for.eq(Some(carried.slot))),
+            SetExt(
+                harvest_workflow_executions_ext::scheduled_for.eq(Some(carried.slot).to_diesel()),
+            ),
             SetExt(harvest_workflow_executions_ext::memo.eq(Some(carried.memo.clone()))),
             harvest_workflow_executions::search_attrs.eq(Some(carried.search_attrs.clone())),
             SetExt(

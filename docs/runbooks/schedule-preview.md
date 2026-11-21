@@ -239,3 +239,4 @@ The preview endpoints are read-only and require the same auth posture as `GET /a
 - [`schedule-trigger-now.md`](schedule-trigger-now.md) — manually fire a schedule once.
 - [`synthetic-incident-drills.md`](synthetic-incident-drills.md) — MTTR drill playbook.
 - [`harvest-alerts.md`](harvest-alerts.md) — alert conditions for `schedule.runs` / `schedule.skipped`.
+- [Schedule herd forecast](../management-api.md#schedule-herd-forecast) — the fleet view: which schedules start runs at the same moment. `harvest schedule herd` prints the herds and the schedules to move first. Pass `--output json` for the raw body.

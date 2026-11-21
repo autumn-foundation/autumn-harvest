@@ -4,9 +4,9 @@
 //!
 //! Exercises the tuner end-to-end against a real Postgres container: the
 //! tuner spawn wiring in `Worker::run`, the dispatch-path permit-wait
-//! accumulator, and the `harvest.worker.slot_target` telemetry — none of
-//! which the pure/`#[tokio::test]` unit tests in `slot_tuner.rs` can reach
-//! on their own, since those never construct a real `Worker`.
+//! accumulator, and the `harvest.worker.slot_target` telemetry. The unit tests
+//! in `slot_tuner.rs` never construct a real `Worker`, so they reach none of
+//! these.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -170,6 +170,7 @@ fn build_registry(telemetry: Arc<TelemetryConfig>) -> Arc<HandlerRegistry> {
 
 fn runtime_config(worker_id: &str, slot_tuner: Option<SlotTunerConfig>) -> WorkerRuntimeConfig {
     WorkerRuntimeConfig {
+        gauge_sample_interval: autumn_harvest::worker::DEFAULT_GAUGE_SAMPLE_INTERVAL,
         codec_rotation_batch_size: 0,
         scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
         dr: autumn_harvest::replication::DrConfig::default(),
@@ -182,6 +183,8 @@ fn runtime_config(worker_id: &str, slot_tuner: Option<SlotTunerConfig>) -> Worke
         // default 50ms grow threshold.
         max_concurrent_activities: 4,
         max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
+        claim_slots_per_shard: None,
+        claim_batch_max: None,
         poll_interval: Duration::from_millis(50),
         shutdown_timeout: Duration::from_secs(5),
         cancellation_grace_period: Duration::from_secs(1),
@@ -305,11 +308,13 @@ async fn wait_for_state(database_url: &str, exec_id: ExecutionId, state: &str) {
 // Tests
 // -------------------------------------------------------------------------
 
-/// Under a burst of slow activities that saturates the initial dispatch
-/// target, the tuner grows the activity semaphore above its starting point
-/// (AC: default controller reacts to slot utilization + permit-wait), and a
-/// graceful shutdown still drains every in-flight activity to completion
-/// (AC: a shrink/tuned worker never cancels in-flight work).
+/// The tuner grows under load, and a graceful shutdown still drains cleanly.
+///
+/// A burst of slow activities saturates the initial dispatch target. The tuner
+/// grows the activity semaphore above its starting point (AC: default
+/// controller reacts to slot utilization + permit-wait). A graceful shutdown
+/// still drains every in-flight activity to completion (AC: a shrink/tuned
+/// worker never cancels in-flight work).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tuner_grows_under_load_and_drains_cleanly() {
     let (db_url, _container) = setup_test_db().await;
@@ -392,8 +397,10 @@ async fn tuner_grows_under_load_and_drains_cleanly() {
 }
 
 /// With no tuner configured, the worker never emits `slot_target` samples
-/// and dispatches normally — the opt-in default is inert (AC: `None` is
-/// byte-for-byte identical to today's fixed-concurrency behaviour).
+/// and dispatches normally.
+///
+/// The opt-in default is inert. AC: `None` is byte-for-byte identical to the
+/// fixed-concurrency behaviour.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tuner_unset_is_inert() {
     let (db_url, _container) = setup_test_db().await;

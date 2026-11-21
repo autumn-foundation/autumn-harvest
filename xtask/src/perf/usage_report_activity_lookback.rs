@@ -1,4 +1,5 @@
-//! `cargo xtask perf usage-report-activity-lookback`: the port of `autumn-harvest/scripts/usage_report_activity_lookback_perf_repro.sh`.
+//! `cargo xtask perf usage-report-activity-lookback`: the port of
+//! `autumn-harvest/scripts/usage_report_activity_lookback_perf_repro.sh`.
 //!
 //! The reproduction harness for the usage-report activity-lookback index
 //! (issue #596, Ledger perf pass).

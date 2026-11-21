@@ -14,7 +14,7 @@
 
 // The `#[workflow]` macro references its input param through expansion.
 #![allow(clippy::used_underscore_binding)]
-// `schedules_external_then_completes` and `healthy` hold no `.await`; each ends in one cycle.
+// `acquires_session_then_completes` and `healthy` hold no `.await`; each ends in one cycle.
 #![allow(clippy::unused_async)]
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -26,30 +26,35 @@ use autumn_harvest_sqlite::{
 };
 use serde_json::json;
 
-/// Counts runs of `runs_external_counted` only. Other tests run in parallel in
-/// this binary, so they use `runs_external` and never touch this counter.
+/// The stable token that names a rejected worker-session acquire.
+const SESSION_ACQUIRE: &str = "ScheduleActivity.schedule_to_start_override";
+
+/// The terminal drain rejects the acquire by its command name, not by its field.
+const TERMINAL_ACQUIRE: &str = "ScheduleActivity";
+
+/// Counts runs of `acquires_session_counted` only. Other tests run in parallel
+/// in this binary, so they use `acquires_session` and never touch this counter.
 static COUNTED_RUNS: AtomicU32 = AtomicU32::new(0);
 
-/// An external activity is still outside the subset. Child workflows (issue
-/// #2026) and local activities (issue #2029) are supported, so neither serves
-/// as the example.
+/// A worker session is still outside the subset. This backend runs child
+/// workflows, local activities and external activities, so none of them
+/// serves as the example.
 #[workflow]
-async fn runs_external_counted(
-    ctx: &WorkflowContext,
-    _n: i64,
-) -> Result<serde_json::Value, String> {
+async fn acquires_session_counted(ctx: &WorkflowContext, _n: i64) -> Result<(), String> {
     COUNTED_RUNS.fetch_add(1, Ordering::SeqCst);
-    ctx.execute_activity_external("external", json!({}), "default", 60)
+    ctx.create_session(SessionOptions::new("gpu"))
         .await
+        .map(drop)
         .map_err(|e| e.to_string())
 }
 
 #[workflow]
-async fn runs_external(ctx: &WorkflowContext, _n: i64) -> Result<serde_json::Value, String> {
+async fn acquires_session(ctx: &WorkflowContext, _n: i64) -> Result<(), String> {
     // A side effect in the same cycle. The rejected cycle must not keep it.
     let _id = ctx.new_uuid();
-    ctx.execute_activity_external("external", json!({}), "default", 60)
+    ctx.create_session(SessionOptions::new("gpu"))
         .await
+        .map(drop)
         .map_err(|e| e.to_string())
 }
 
@@ -72,18 +77,17 @@ async fn uses_a_session(ctx: &WorkflowContext, _n: i64) -> Result<(), String> {
     Ok(())
 }
 
-/// Completes, but its last cycle also schedules an external activity. The
-/// terminal drain rejects that command. A search-attribute upsert (issue
-/// #2027) and a detached spawn (issue #2026) were the examples until each
-/// became supported.
+/// Completes, but its last cycle also starts a worker-session acquire. The
+/// terminal drain rejects that command. A search-attribute upsert, a
+/// detached spawn and an external activity were the examples until this
+/// backend ran each one.
 #[workflow]
-async fn schedules_external_then_completes(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
-    // Poll the external activity once, so its command joins the last batch,
+async fn acquires_session_then_completes(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+    // Poll the session acquire once, so its command joins the last batch,
     // then return without awaiting it.
-    let mut external =
-        std::pin::pin!(ctx.execute_activity_external("external", json!({}), "default", 60));
+    let mut session = std::pin::pin!(ctx.create_session(SessionOptions::new("gpu")));
     let _ = std::future::Future::poll(
-        external.as_mut(),
+        session.as_mut(),
         &mut std::task::Context::from_waker(std::task::Waker::noop()),
     );
     Ok(n)
@@ -135,17 +139,17 @@ fn assert_sealed_unsupported(rt: &SqliteRuntime, exec: ExecutionId, feature: &st
 }
 
 #[tokio::test]
-async fn an_external_activity_ends_failed_with_a_typed_reason() {
+async fn a_rejected_cycle_ends_failed_and_keeps_no_side_effect() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    rt.register_workflow(&runs_external_info());
-    let exec = rt.start_workflow("runs_external", json!(0)).unwrap();
+    rt.register_workflow(&acquires_session_info());
+    let exec = rt.start_workflow("acquires_session", json!(0)).unwrap();
 
     let err = rt.run_until_blocked(exec).await.unwrap_err();
     assert!(
-        matches!(err, SqliteError::Unsupported(ref c) if c == "ScheduleExternalActivity"),
+        matches!(err, SqliteError::Unsupported(ref c) if c.starts_with(SESSION_ACQUIRE)),
         "the sealing drive still reports the reason: {err}"
     );
-    assert_sealed_unsupported(&rt, exec, "ScheduleExternalActivity");
+    assert_sealed_unsupported(&rt, exec, SESSION_ACQUIRE);
 
     // The rejected cycle rolled back as a whole: no side effect survives.
     let history = rt.load_history(exec).unwrap();
@@ -156,16 +160,16 @@ async fn an_external_activity_ends_failed_with_a_typed_reason() {
 #[tokio::test]
 async fn a_sealed_execution_is_not_driven_again() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    rt.register_workflow(&runs_external_counted_info());
+    rt.register_workflow(&acquires_session_counted_info());
     let exec = rt
-        .start_workflow("runs_external_counted", json!(0))
+        .start_workflow("acquires_session_counted", json!(0))
         .unwrap();
     let _ = rt.run_until_blocked(exec).await.unwrap_err();
     let runs = COUNTED_RUNS.load(Ordering::SeqCst);
 
     let state = rt.run_until_blocked(exec).await.unwrap();
     assert!(
-        matches!(state, RunState::Failed(ref m) if m.contains("ScheduleExternalActivity")),
+        matches!(state, RunState::Failed(ref m) if m.contains(SESSION_ACQUIRE)),
         "a later drive reports the terminal state: {state:?}"
     );
     assert_eq!(
@@ -197,20 +201,20 @@ async fn a_worker_session_ends_failed_with_a_typed_reason() {
 
     let err = rt.run_until_blocked(exec).await.unwrap_err();
     assert!(matches!(err, SqliteError::Unsupported(_)), "{err}");
-    assert_sealed_unsupported(&rt, exec, "ScheduleActivity.schedule_to_start_override");
+    assert_sealed_unsupported(&rt, exec, SESSION_ACQUIRE);
 }
 
 #[tokio::test]
 async fn an_unsupported_command_in_the_terminal_cycle_ends_failed() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    rt.register_workflow(&schedules_external_then_completes_info());
+    rt.register_workflow(&acquires_session_then_completes_info());
     let exec = rt
-        .start_workflow("schedules_external_then_completes", json!(7))
+        .start_workflow("acquires_session_then_completes", json!(7))
         .unwrap();
 
     let err = rt.run_until_blocked(exec).await.unwrap_err();
     assert!(matches!(err, SqliteError::Unsupported(_)), "{err}");
-    assert_sealed_unsupported(&rt, exec, "ScheduleExternalActivity");
+    assert_sealed_unsupported(&rt, exec, TERMINAL_ACQUIRE);
     assert!(
         !rt.load_history(exec)
             .unwrap()
@@ -223,14 +227,14 @@ async fn an_unsupported_command_in_the_terminal_cycle_ends_failed() {
 #[tokio::test]
 async fn the_fleet_stops_reporting_a_sealed_execution() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    rt.register_workflow(&runs_external_info());
+    rt.register_workflow(&acquires_session_info());
     rt.register_workflow(&healthy_info());
-    let broken = rt.start_workflow("runs_external", json!(0)).unwrap();
+    let broken = rt.start_workflow("acquires_session", json!(0)).unwrap();
     let ok = rt.start_workflow("healthy", json!(4)).unwrap();
 
     let err = rt.poll_once().await.unwrap_err();
     assert!(matches!(err, SqliteError::Unsupported(_)), "{err}");
-    assert_sealed_unsupported(&rt, broken, "ScheduleExternalActivity");
+    assert_sealed_unsupported(&rt, broken, SESSION_ACQUIRE);
     assert!(matches!(
         rt.outcome(ok).unwrap(),
         ExecutionOutcome::Completed(ref v) if v.as_i64() == Some(8)
@@ -247,14 +251,14 @@ async fn the_sealed_state_survives_a_reopen() {
     let path = dir.path().join("harvest.sqlite3");
     let exec = {
         let mut rt = SqliteRuntime::open(&path).unwrap();
-        rt.register_workflow(&runs_external_info());
-        let exec = rt.start_workflow("runs_external", json!(0)).unwrap();
+        rt.register_workflow(&acquires_session_info());
+        let exec = rt.start_workflow("acquires_session", json!(0)).unwrap();
         let _ = rt.run_until_blocked(exec).await.unwrap_err();
         exec
     };
 
     let rt = SqliteRuntime::open(&path).unwrap();
-    assert_sealed_unsupported(&rt, exec, "ScheduleExternalActivity");
+    assert_sealed_unsupported(&rt, exec, SESSION_ACQUIRE);
 }
 
 /// Only an unsupported feature seals. A missing registration is fixable in
@@ -283,17 +287,17 @@ async fn an_unregistered_activity_does_not_seal_the_run() {
 }
 
 /// Races a quick activity against a long timer. The activity wins, and the
-/// same cycle meets an unsupported external activity. The cycle's loser
+/// same cycle meets an unsupported worker-session acquire. The cycle's loser
 /// cancellation rolls back with it, so only the seal can remove the timer row.
 #[workflow]
-async fn races_then_runs_external(ctx: &WorkflowContext, _n: i64) -> Result<(), String> {
+async fn races_then_acquires_session(ctx: &WorkflowContext, _n: i64) -> Result<(), String> {
     ctx.race()
         .activity_raw("quick", json!(1), "default")
         .timer(std::time::Duration::from_secs(3600))
         .run()
         .await
         .map_err(|e| e.to_string())?;
-    ctx.execute_activity_external("external", json!({}), "default", 60)
+    ctx.create_session(SessionOptions::new("gpu"))
         .await
         .map(drop)
         .map_err(|e| e.to_string())
@@ -307,15 +311,15 @@ async fn sealing_removes_the_runs_outstanding_rows() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("harvest.sqlite3");
     let mut rt = SqliteRuntime::open(&path).unwrap();
-    rt.register_workflow(&races_then_runs_external_info());
+    rt.register_workflow(&races_then_acquires_session_info());
     rt.register_activity_raw("quick", ActivitySpec::new(1, Ok));
     let exec = rt
-        .start_workflow("races_then_runs_external", json!(0))
+        .start_workflow("races_then_acquires_session", json!(0))
         .unwrap();
 
     let err = rt.run_until_blocked(exec).await.unwrap_err();
     assert!(matches!(err, SqliteError::Unsupported(_)), "{err}");
-    assert_sealed_unsupported(&rt, exec, "ScheduleExternalActivity");
+    assert_sealed_unsupported(&rt, exec, SESSION_ACQUIRE);
 
     let inspector = rusqlite::Connection::open(&path).unwrap();
     let count = |sql: &str| -> i64 {

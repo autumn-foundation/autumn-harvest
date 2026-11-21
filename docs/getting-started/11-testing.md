@@ -84,12 +84,12 @@ async fn billing_cycle(ctx: &WorkflowContext, _input: ()) -> Result<BillingOutpu
     ctx.timer("month1", 30 * 24 * 3600)
         .await
         .map_err(|e| e.to_string())?;
-    let charge1_date = ctx.now().format("%Y-%m-%d").to_string();
+    let charge1_date = ctx.now().strftime("%Y-%m-%d").to_string();
 
     ctx.timer("month2", 30 * 24 * 3600)
         .await
         .map_err(|e| e.to_string())?;
-    let charge2_date = ctx.now().format("%Y-%m-%d").to_string();
+    let charge2_date = ctx.now().strftime("%Y-%m-%d").to_string();
 
     Ok(BillingOutput { charge1_date, charge2_date })
 }
@@ -106,10 +106,10 @@ async fn billing_cycle_dates_advance() {
     assert!(output.charge1_date < output.charge2_date);
 
     // outcome.elapsed() = sum of all TimerStarted duration_secs = 60 days.
-    assert_eq!(outcome.elapsed().num_days(), 60);
+    assert_eq!(autumn_harvest::time::num_days(outcome.elapsed()), 60);
 
     // outcome.final_now() = construction time + 60 days.
-    assert_eq!(outcome.final_now(), env.now() + chrono::Duration::days(60));
+    assert_eq!(outcome.final_now(), env.now() + autumn_harvest::time::days(60));
 
     // Wall-clock: no real sleeping — completes in milliseconds.
 }
@@ -123,7 +123,7 @@ accessors:
 | Accessor | Returns |
 |----------|---------|
 | `outcome.final_now()` | Construction-time `start_time` + Σ `duration_secs` of every `TimerStarted` event along the taken execution path |
-| `outcome.elapsed()` | `outcome.final_now() - start_time` as a `chrono::Duration` |
+| `outcome.elapsed()` | `outcome.final_now() - start_time` as a `jiff::SignedDuration` |
 
 These accessors compute from the recorded event history — signal-preempted timers
 produce no `TimerStarted` event and therefore contribute nothing to the sum,
@@ -139,7 +139,7 @@ let env = WorkflowTestEnv::new()
 
 let outcome = env.run(approval_workflow_handler, ()).await;
 // Signal fired first — no TimerStarted recorded — clock unchanged.
-assert_eq!(outcome.elapsed().num_seconds(), 0);
+assert_eq!(outcome.elapsed().as_secs(), 0);
 ```
 
 ### 365-day sleep in under 50 ms
@@ -154,7 +154,7 @@ async fn year_of_timers_is_fast() {
     let env = WorkflowTestEnv::new();
     let outcome = env.run(yearly_schedule_handler, ()).await;
 
-    assert_eq!(outcome.final_now(), env.now() + chrono::Duration::days(365));
+    assert_eq!(outcome.final_now(), env.now() + autumn_harvest::time::days(365));
     assert!(start.elapsed().as_millis() < 50, "time-skipping must be fast");
 }
 ```

@@ -1,0 +1,4 @@
+dl_new wal_bytes=51117824
+idx_new wal_bytes=49072544
+dl_new wal_bytes=51198400
+idx_new wal_bytes=49093816

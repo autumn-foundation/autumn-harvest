@@ -8,7 +8,7 @@ use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::prelude::*;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest::types::ActivityExecId;
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
@@ -96,7 +96,7 @@ async fn happy_path_mapped_dag_execution() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -167,7 +167,7 @@ async fn empty_upstream_collection_mapping() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -178,13 +178,11 @@ async fn empty_upstream_collection_mapping() {
             input: dag_task_input("list_items"),
             queue: "default".into(),
         },
-        // Upstream output is empty array
         WorkflowEvent::ActivityCompleted {
             activity_id: id_list,
             output: json!([]),
         },
         // process_item is skipped (N = 0).
-        // aggregate_items receives an empty array []
         WorkflowEvent::ActivityScheduled {
             activity_id: id_agg,
             name: "aggregate_items".into(),
@@ -220,7 +218,7 @@ async fn fail_fast_mapped_dag_execution() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -290,7 +288,7 @@ async fn collect_all_mapped_dag_execution() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -369,7 +367,7 @@ async fn replay_detects_width_n_mismatch() {
     let history = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,

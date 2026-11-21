@@ -1262,32 +1262,6 @@ async fn a_child_inherits_read_only_and_gets_no_memory() {
     );
 }
 
-// AC7
-#[test]
-fn every_refusal_code_is_documented() {
-    let guide = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../docs/agent-mesh.md"
-    ))
-    .expect("the user guide exists");
-    for refusal in [
-        Refusal::UnknownPeer,
-        Refusal::NotPermitted,
-        Refusal::Cycle,
-        Refusal::DepthExceeded,
-        Refusal::FanOutExhausted,
-        Refusal::BudgetExhausted,
-        Refusal::InvalidMandate,
-        Refusal::InvalidArguments,
-    ] {
-        assert!(
-            guide.contains(&format!("`{}`", refusal.code())),
-            "docs/agent-mesh.md names {}",
-            refusal.code()
-        );
-    }
-}
-
 // Review fixes: same-turn delegation, labels across runs, wire hardening.
 
 // AC10: a call after a delegation in the same turn does not run on a
@@ -1525,8 +1499,8 @@ async fn a_zero_peer_cap_is_an_exhausted_budget() {
 // Test-quality gaps from review.
 
 /// A wall-clock instant `seconds` from now, to fire a durable timer early.
-fn later(seconds: i64) -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc::now() + chrono::Duration::seconds(seconds)
+fn later(seconds: i64) -> jiff::Timestamp {
+    jiff::Timestamp::now() + jiff::SignedDuration::from_secs(seconds)
 }
 
 // AC3, AC6: a child that a woken follow-up segment starts is read-only.

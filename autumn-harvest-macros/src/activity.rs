@@ -157,11 +157,11 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
             let value: LitStr = meta.value()?.parse()?;
             let key = value.value();
             // The `dyn-rate:` (issue #699) and `start-throttle:` (issue #607)
-            // prefixes namespace the caller-keyed bucket families; a static key
-            // beginning with either could collide with a generated bucket, and
-            // since issue #1127 would additionally be collectable by the
-            // idle-bucket GC with nothing to re-register it before the next
-            // worker startup. Reject at compile time. Mirrors
+            // prefixes namespace the caller-keyed bucket families. A static key
+            // with either prefix could collide with a generated bucket. Since
+            // issue #1127, the idle-bucket GC could also collect it, and nothing
+            // re-registers it before the next worker startup. Reject at compile
+            // time. Mirrors
             // `autumn_harvest::builder::RESERVED_RATE_LIMIT_KEY_PREFIXES`.
             if key.starts_with("dyn-rate:") || key.starts_with("start-throttle:") {
                 return Err(meta.error(
@@ -278,11 +278,10 @@ fn duration_expr(s: &str) -> TokenStream {
 /// Returns `true` when the function's return type is `Result<_, ActivityFailure>`
 /// (with or without a path prefix like `failure::` or `autumn_harvest::failure::`).
 ///
-/// Used to opt into the typed-failure encoding without breaking activities
-/// that return `Result<T, String>`, `HarvestResult<T>`, or a custom error
-/// enum.  Users who alias `ActivityFailure` to another name fall back to the
-/// `.to_string()` path — the typed JSON encoding can still be obtained by
-/// calling `.into_error_payload()` manually.
+/// Opts into the typed-failure encoding without breaking activities that
+/// return `Result<T, String>`, `HarvestResult<T>`, or a custom error enum. An
+/// alias of `ActivityFailure` falls back to the `.to_string()` path. Call
+/// `.into_error_payload()` manually to get the typed JSON encoding.
 fn activity_returns_activity_failure(output: &syn::ReturnType) -> bool {
     let syn::ReturnType::Type(_, ty) = output else {
         return false;
@@ -468,17 +467,15 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let params: Vec<_> = input_fn.sig.inputs.iter().skip(1).collect();
     let param_names: Vec<_> = crate::attr_util::param_idents(&params);
 
-    // Encode the activity's error.
+    // Backward-compat: the default is the original `ToString`-bounded
+    // `.to_string()` path. So an activity that returns `Result<T, String>`,
+    // `Result<T, HarvestError>`, or a custom `thiserror` enum still compiles
+    // and behaves the same.
     //
-    // Backward-compat: by default we use `.to_string()` (the original
-    // `ToString`-bounded path) so every activity that returns
-    // `Result<T, String>`, `Result<T, HarvestError>`, or a custom
-    // `thiserror` enum continues to compile and behave identically.
-    //
-    // Issue #227: when the user opts into the typed surface by returning
-    // `Result<T, ActivityFailure>` (recognized syntactically below), we
-    // route through `ActivityFailure`'s `IntoActivityErrorString` impl so
-    // the JSON payload carries `error_type` and `non_retryable`.
+    // Issue #227: a return type of `Result<T, ActivityFailure>` opts into the
+    // typed surface. It is recognized syntactically. The error then goes
+    // through `ActivityFailure`'s `IntoActivityErrorString` impl, so the JSON
+    // payload carries `error_type` and `non_retryable`.
     let returns_activity_failure = activity_returns_activity_failure(&input_fn.sig.output);
     let encode_err = if returns_activity_failure {
         quote! {
@@ -513,10 +510,10 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let rate_limit_burst_expr = attrs
         .rate_limit_burst
         .map_or_else(|| quote! { None }, |n| quote! { Some(#n) });
-    // Static rate-limit bucket key (`ActivityInfo.rate_limit_key`). When a
-    // dynamic per-key expression is present (issue #699) the static default is
-    // suppressed so the enqueue path resolves the key from the workflow input
-    // instead of bucketing every execution under the activity name.
+    // Static rate-limit bucket key (`ActivityInfo.rate_limit_key`). A dynamic
+    // per-key expression (issue #699) suppresses the static default. The
+    // enqueue path then resolves the key from the workflow input, and does not
+    // bucket every execution under the activity name.
     let static_rate_limit_key_expr = match attrs.rate_limit_key.as_deref() {
         Some(key) => quote! { Some(#key) },
         None => {

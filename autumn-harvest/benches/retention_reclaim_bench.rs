@@ -40,10 +40,10 @@
 //! # What it does not establish
 //!
 //! The numbers are single-sample, taken on whatever host runs them, with the
-//! concurrent load being one connection rather than a fleet. They are evidence
-//! about the *shape* of the two layouts' costs — zero row-deletes versus
-//! millions, a bounded partition drop versus a cascade proportional to the
-//! corpus — not a throughput SLO. The dead-tuple ratio in particular is read
+//! concurrent load being one connection rather than a fleet. They show the
+//! *shape* of the two layouts' costs, not a throughput SLO. That shape is zero
+//! row-deletes versus millions, and a bounded partition drop versus a cascade
+//! proportional to the corpus. The dead-tuple ratio in particular is read
 //! deliberately before autovacuum runs: it measures the debt the DELETE path
 //! creates, not a steady state.
 
@@ -78,10 +78,9 @@ mod runner {
 
     /// Create, migrate and (optionally) partition a uniquely-named database.
     ///
-    /// A fresh database per arm is not tidiness: the two arms measure
-    /// `pg_stat` counters and dead-tuple ratios, which are per-database and
-    /// cumulative, so sharing one would make the second arm read the first
-    /// arm's debt.
+    /// A fresh database per arm is not tidiness. Both arms measure `pg_stat`
+    /// counters and dead-tuple ratios, which are per-database and cumulative.
+    /// A shared database would make the second arm read the first arm's debt.
     async fn fresh_database(admin_url: &str, partitioned: bool) -> String {
         let name = format!(
             "harvest_bench_{}_{}",

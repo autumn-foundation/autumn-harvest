@@ -179,7 +179,7 @@ async fn token(State(idp): State<Idp>, Form(form): Form<HashMap<String, String>>
         Ok(plan) => plan,
         Err(reason) => return (StatusCode::BAD_REQUEST, reason).into_response(),
     };
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
     let mut claims = json!({
         "iss": idp.issuer,
         "sub": "user-42",
@@ -454,7 +454,6 @@ pub async fn round_trip_logs_in_maps_claims_and_enforces_roles(backend: &impl Oi
     let api = browser.get(&format!("{MOUNT}/workflows")).await;
     assert_eq!(api.status, StatusCode::UNAUTHORIZED);
 
-    // The round trip.
     let done = browser.login().await;
     assert_eq!(done.status, StatusCode::SEE_OTHER, "{}", done.body);
     assert_eq!(done.location.as_deref(), Some("/api/harvest/ui"));
@@ -684,7 +683,7 @@ pub async fn a_token_with_a_wrong_nonce_is_refused(backend: &impl OidcBackend) {
 
 pub async fn an_expired_id_token_is_refused(backend: &impl OidcBackend) {
     let idp = start_idp().await;
-    let past = chrono::Utc::now().timestamp() - 600;
+    let past = jiff::Timestamp::now().as_second() - 600;
     set_claims(
         &idp,
         json!({ "groups": ["harvest-admins"], "exp": past, "iat": past - 300 }),

@@ -41,8 +41,8 @@ fn fresh_db() -> (tempfile::TempDir, std::path::PathBuf) {
 }
 
 /// A wall-clock instant `seconds` from now, to fire a durable timer early.
-fn later(seconds: i64) -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc::now() + chrono::Duration::seconds(seconds)
+fn later(seconds: i64) -> jiff::Timestamp {
+    jiff::Timestamp::now() + jiff::SignedDuration::from_secs(seconds)
 }
 
 /// A delivery that keeps every report.
@@ -52,6 +52,24 @@ struct Inbox(Mutex<Vec<Report>>);
 impl Delivery for Inbox {
     fn deliver<'a>(&'a self, report: &'a Report) -> BoxFuture<'a, Result<(), AgentError>> {
         self.0.lock().unwrap().push(report.clone());
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// A delivery that keeps every approval notice.
+#[derive(Debug, Default)]
+struct Pager(Mutex<Vec<autumn_harvest_agent::delivery::ApprovalNotice>>);
+
+impl Delivery for Pager {
+    fn deliver<'a>(&'a self, _report: &'a Report) -> BoxFuture<'a, Result<(), AgentError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn notify_approval<'a>(
+        &'a self,
+        notice: &'a autumn_harvest_agent::delivery::ApprovalNotice,
+    ) -> BoxFuture<'a, Result<(), AgentError>> {
+        self.0.lock().unwrap().push(notice.clone());
         Box::pin(async { Ok(()) })
     }
 }
@@ -347,6 +365,106 @@ async fn no_report_is_delivered_during_evaluation() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn no_approval_notice_is_sent_during_evaluation() {
+    let source = one_lookup().await;
+    // The candidate policy gates every read, so its call parks.
+    let model = ScriptedModel::new(vec![
+        calls(&[("c1", "lookup", json!({"q": "x"}))], 5),
+        answer("done", 5),
+    ]);
+    let (harness, _) = candidate(model);
+    let pager = Arc::new(Pager::default());
+    let gate = ToolRules::new().effect(ToolEffect::ReadOnly, Rule::Ask);
+    let harness = harness.policy(Arc::new(gate)).delivery(pager.clone());
+
+    let evaluation = evaluate(&source, &Candidate::new(harness)).await.unwrap();
+
+    let RunEnd::Completed(report) = &evaluation.candidate else {
+        panic!("the candidate completes: {:?}", evaluation.candidate);
+    };
+    assert!(tool_results(report)[0].contains("no approval arrived"));
+    assert!(pager.0.lock().unwrap().is_empty(), "no notice leaves");
+}
+
+/// A delivery that fails its first approval notice, then takes each one.
+#[derive(Debug, Default)]
+struct FlakyPager {
+    seen: Mutex<Vec<autumn_harvest_agent::delivery::ApprovalNotice>>,
+    failed: std::sync::atomic::AtomicBool,
+}
+
+impl Delivery for FlakyPager {
+    fn deliver<'a>(&'a self, _report: &'a Report) -> BoxFuture<'a, Result<(), AgentError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn notify_approval<'a>(
+        &'a self,
+        notice: &'a autumn_harvest_agent::delivery::ApprovalNotice,
+    ) -> BoxFuture<'a, Result<(), AgentError>> {
+        self.seen.lock().unwrap().push(notice.clone());
+        let first = !self.failed.swap(true, Ordering::SeqCst);
+        Box::pin(async move {
+            if first {
+                Err(AgentError::new(
+                    ErrorKind::Unavailable,
+                    "the chat API is down",
+                ))
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_approval_sent_during_the_notice_is_sent_again() {
+    // The source parks one gated `pay` call. The app approves from the
+    // first notice, before the wait opens, so the source records no
+    // deadline timer for that wait.
+    let (_dir, db) = fresh_db();
+    let gate = || Arc::new(ToolRules::new().effect(ToolEffect::Write, Rule::Ask));
+    let replies = || {
+        vec![
+            calls(&[("p1", "pay", json!({"amount": 5}))], 1),
+            answer("paid", 1),
+        ]
+    };
+    let pager = Arc::new(FlakyPager::default());
+    let source_tools = Arc::new(Recorder::default());
+    let harness = AgentHarness::new(ScriptedModel::new(replies()))
+        .tool(recorded_tool("pay", ToolEffect::Write, &source_tools))
+        .policy(gate())
+        .delivery(pager.clone());
+    let mut rt = runtime(&db, harness);
+    let exec = sqlite::start(&mut rt, &AgentTask::new("pay it")).unwrap();
+    let start = jiff::Timestamp::now();
+    let mut state = rt.run_until_blocked_as_of(exec, start).await.unwrap();
+    assert!(matches!(state, RunState::WaitingTimer), "{state:?}");
+    let signal = pager.seen.lock().unwrap()[0].call.signal.clone();
+    sqlite::decide(&mut rt, exec, &signal, &Approval::Approve).unwrap();
+    for pass in 1..=10 {
+        if !matches!(state, RunState::WaitingTimer) {
+            break;
+        }
+        let at = start + jiff::SignedDuration::from_secs(pass * 5);
+        state = rt.run_until_blocked_as_of(exec, at).await.unwrap();
+    }
+    assert_eq!(report(state).text, "paid");
+    assert_eq!(source_tools.runs().len(), 1);
+    let source = rt.load_history(exec).unwrap();
+
+    let (harness, recorder) = candidate(ScriptedModel::new(replies()));
+    let evaluation = evaluate(&source, &Candidate::new(harness.policy(gate())))
+        .await
+        .unwrap();
+
+    assert!(!evaluation.diverged(), "{evaluation:#?}");
+    assert_eq!(evaluation.replayed_tool_calls, 1, "{evaluation:#?}");
+    assert_eq!(recorder.runs(), Vec::<Value>::new(), "no tool runs live");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn an_erased_source_is_refused() {
     let mut source = one_lookup().await;
     for event in &mut source {
@@ -367,7 +485,7 @@ async fn an_erased_source_is_refused() {
 async fn a_history_that_is_not_an_agent_run_is_refused() {
     let source = vec![WorkflowEvent::WorkflowStarted {
         input: json!({"order": 7}),
-        timestamp: chrono::Utc::now(),
+        timestamp: jiff::Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -396,7 +514,7 @@ async fn a_current_thread_runtime_is_refused() {
     let source = vec![
         WorkflowEvent::WorkflowStarted {
             input: serde_json::to_value(AgentTask::new("hi")).unwrap(),
-            timestamp: chrono::Utc::now(),
+            timestamp: jiff::Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -604,7 +722,7 @@ async fn a_redriven_source_that_has_not_ended_is_refused() {
     let redriven = json!({
         "type": "WorkflowRedriven",
         "data": {
-            "redriven_at": chrono::Utc::now(),
+            "redriven_at": jiff::Timestamp::now(),
             "dead_letter_id": "00000000-0000-0000-0000-000000000000",
         },
     });
@@ -2516,6 +2634,8 @@ async fn the_report_keeps_every_field_that_is_not_an_identity() {
             candidate_usage,
             // A price names a model, so the cost is an identity.
             candidate_cost_usd_micros: _,
+            // Each call names its model and its price.
+            candidate_calls: _,
         } = alone;
         let kept = report
             .pool
@@ -2871,6 +2991,62 @@ async fn a_recorded_peer_route_and_its_model_id_are_redacted() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn each_candidate_turn_names_its_model_and_spend() {
+    let source = one_lookup().await;
+    let model = ScriptedModel::named(
+        "model-a",
+        vec![
+            calls(&[("c1", "lookup", json!({"q": "x"}))], 5),
+            answer("done", 7),
+        ],
+    );
+    let (harness, _) = candidate(model);
+    let evaluation = evaluate(&source, &Candidate::new(harness)).await.unwrap();
+    let models: Vec<_> = evaluation
+        .candidate_calls
+        .iter()
+        .map(|call| call.model_id.as_deref())
+        .collect();
+    assert_eq!(models, [Some("model-a"), Some("model-a")]);
+    let sum = evaluation
+        .candidate_calls
+        .iter()
+        .fold(autumn_harvest_agent::TokenUsage::default(), |sum, call| {
+            sum.saturating_add(call.usage)
+        });
+    assert_eq!(sum, evaluation.candidate_usage);
+    // An evaluation of an older release decodes with no turn spend.
+    let mut old = serde_json::to_value(&evaluation).unwrap();
+    old.as_object_mut().unwrap().remove("candidate_calls");
+    let decoded: Evaluation = serde_json::from_value(old).unwrap();
+    assert_eq!(decoded.candidate_calls, Vec::new());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_routed_turn_names_the_model_of_its_route() {
+    let source = one_lookup().await;
+    // The default model must not answer. The route answers each turn.
+    let (harness, _) = candidate(ScriptedModel::named("model-default", Vec::new()));
+    let routed = ScriptedModel::named(
+        "model-routed",
+        vec![
+            calls(&[("c1", "lookup", json!({"q": "x"}))], 5),
+            answer("done", 7),
+        ],
+    );
+    let harness = harness.model_named("fast", routed);
+    let evaluation = evaluate(&source, &Candidate::new(harness).model("fast"))
+        .await
+        .unwrap();
+    let models: Vec<_> = evaluation
+        .candidate_calls
+        .iter()
+        .map(|call| call.model_id.as_deref())
+        .collect();
+    assert_eq!(models, [Some("model-routed"), Some("model-routed")]);
+}
+
 // ── Scored evaluations (issue #2447) ────────────────────────────────────────
 
 /// The golden JSON of an evaluation with no scorer. The code from before
@@ -2928,6 +3104,8 @@ async fn with_no_scorer_the_report_keeps_its_json() {
         None,
         "an unpriced model"
     );
+    let calls = spend.remove("candidate_calls").expect("two model calls");
+    assert_eq!(calls.as_array().map(Vec::len), Some(2), "{calls}");
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(NO_SCORER_GOLDEN);
     if std::env::var_os("UPDATE_GOLDEN").is_some() {
         let text = serde_json::to_string_pretty(&value).unwrap();
@@ -2941,6 +3119,7 @@ async fn with_no_scorer_the_report_keeps_its_json() {
     let decoded: Evaluation = serde_json::from_value(golden).unwrap();
     let mut expected = evaluation;
     expected.candidate_usage = autumn_harvest_agent::TokenUsage::default();
+    expected.candidate_calls = Vec::new();
     assert_eq!(decoded, expected);
 }
 

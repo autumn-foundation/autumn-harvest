@@ -1,25 +1,23 @@
 #![cfg(feature = "db")]
 // Issue #751: workflow_id-targeted in-workflow signal and cancel primitives.
 //
-// This file proves the DB-level behaviour of the two new primitives —
+// This file proves the DB-level behaviour of two new primitives end to end:
 // `WorkflowContext::signal_external_workflow_by_id[_with_idempotency]` and
-// `request_cancel_external_workflow_by_id` — end to end, plus the lower-level
-// resolver functions (`signal::resolve_and_signal_by_workflow_id`,
-// `execution::resolve_and_cancel_by_workflow_id`) they are built on, which had
-// no DB-level test coverage prior to this file.
+// `request_cancel_external_workflow_by_id`. It also covers the resolver
+// functions under them (`signal::resolve_and_signal_by_workflow_id`,
+// `execution::resolve_and_cancel_by_workflow_id`).
 //
 // Structure, cheapest-and-most-decisive first:
-//   1. Resolver-level tests (no worker needed) — direct proof of the outcome
-//      matrix (`ByIdSignalOutcome` / `ByIdCancelOutcome`), including a
-//      deterministic, lock-choreographed proof of the exact continue-as-new
-//      race window (AC2/AC3 "closed by construction").
+//   1. Resolver-level tests (no worker needed) prove the outcome matrix
+//      (`ByIdSignalOutcome` / `ByIdCancelOutcome`). They include a
+//      lock-choreographed proof of the exact continue-as-new race window
+//      (AC2/AC3 "closed by construction").
 //   2. Randomized race tests (AC3 headline: N >= 100 randomized interleavings,
-//      0 misdeliveries) — genuinely concurrent tokio tasks racing a real
+//      0 misdeliveries) use concurrent tokio tasks. Each races a real
 //      continue-as-new against a real by-id delivery attempt.
-//   3. End-to-end tests through a real `Worker` — proving the actual public
-//      `WorkflowContext` API is wired correctly through the whole pipeline
-//      (inline dispatch, the outbox scanner, cross-shard routing, grace
-//      window, and self-targeting rejection).
+//   3. End-to-end tests through a real `Worker` prove the public
+//      `WorkflowContext` API. They cover inline dispatch, the outbox scanner,
+//      cross-shard routing, the grace window, and self-targeting rejection.
 
 use autumn_harvest::error::HarvestError;
 use autumn_harvest::event::WorkflowEvent;
@@ -37,6 +35,7 @@ use autumn_harvest::{
     HarvestBuilder, StartWorkflowParams, WorkerConfig, WorkflowContext,
     start_or_load_workflow_execution,
 };
+use jiff_diesel::ToDiesel;
 
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
@@ -137,8 +136,8 @@ async fn load_execution_from_url(database_url: &str, exec_id: ExecutionId) -> Wo
         .expect("failed to reload workflow execution")
 }
 
-/// Insert a bare `RUNNING` execution row directly (no worker, no handler
-/// needed) for resolver-level tests that only exercise the resolution SQL.
+/// Insert a bare `RUNNING` execution row for resolver-level tests, with no
+/// worker or handler.
 async fn insert_running_row(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
@@ -191,21 +190,19 @@ async fn insert_running_row(
 }
 
 /// Atomically seal `pred` to `CONTINUED_AS_NEW` and insert a fresh `RUNNING`
-/// successor under the same `(workflow_name, workflow_id)` — the same
-/// commit-atomicity guarantee the real continue-as-new persistence path
-/// provides (predecessor-seal + successor-insert in ONE transaction), which
-/// is the entire foundation of the "closed by construction" race-safety
-/// claim: a concurrent resolver can only ever observe the whole-transaction
-/// pre-image or post-image, never a torn state.
+/// successor under the same `(workflow_name, workflow_id)`.
 ///
-/// The seal is guarded on `pred` still being `RUNNING` at UPDATE time,
-/// mirroring the real production invariant: a continue-as-new is issued by
-/// the SAME decision cycle that is processing `pred`, so it can never race
-/// against — and blindly overwrite — an externally-issued terminal
-/// transition (e.g. a concurrent cancel) that reached `pred` first. A guard-
-/// less unconditional `UPDATE` would let this test helper itself introduce a
-/// "misdelivery" that the real engine does not have. Returns whether the
-/// seal (and therefore the successor insert) actually happened.
+/// The real continue-as-new path gives the same guarantee: the predecessor
+/// seal and the successor insert commit in ONE transaction. The "closed by
+/// construction" race-safety claim rests on it. A concurrent resolver sees
+/// only the whole pre-image or post-image, never a torn state.
+///
+/// The seal requires `pred` to be `RUNNING` at UPDATE time, as in production.
+/// The SAME decision cycle that processes `pred` issues its continue-as-new.
+/// So it never overwrites an external terminal transition, such as a
+/// concurrent cancel, that reached `pred` first. An unguarded `UPDATE` would
+/// let this helper cause a "misdelivery" that the real engine does not have.
+/// Returns whether the seal, and so the successor insert, happened.
 async fn continue_as_new_atomically(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
@@ -224,9 +221,8 @@ async fn continue_as_new_atomically(
         .await
         .map_err(autumn_harvest::error::database_error)?;
         if sealed == 0 {
-            // `pred` was no longer RUNNING (e.g. a concurrent cancel already
-            // committed) — a real continue-as-new would likewise never
-            // proceed past this point.
+            // `pred` is no longer RUNNING, for example after a concurrent
+            // cancel. A real continue-as-new stops here too.
             return Ok::<bool, HarvestError>(false);
         }
 
@@ -325,7 +321,7 @@ async fn resolver_signal_delivers_to_running_predecessor() {
     .expect("resolve+signal should succeed");
     assert_eq!(outcome, ByIdSignalOutcome::Delivered);
 
-    let pending = signal::load_pending_signals(&mut conn, pred)
+    let pending = signal::load_pending_signals(&conn, pred)
         .await
         .expect("load pending signals");
     assert_eq!(pending.len(), 1, "signal must be queued against pred");
@@ -356,14 +352,14 @@ async fn resolver_signal_delivers_to_successor_after_can() {
     .expect("resolve+signal should succeed");
     assert_eq!(outcome, ByIdSignalOutcome::Delivered);
 
-    let pending_pred = signal::load_pending_signals(&mut conn, pred)
+    let pending_pred = signal::load_pending_signals(&conn, pred)
         .await
         .expect("load pending signals for pred");
     assert!(
         pending_pred.is_empty(),
         "the stale predecessor must never receive the signal"
     );
-    let pending_succ = signal::load_pending_signals(&mut conn, succ)
+    let pending_succ = signal::load_pending_signals(&conn, succ)
         .await
         .expect("load pending signals for succ");
     assert_eq!(
@@ -420,7 +416,7 @@ async fn resolver_signal_terminal_current_run_is_not_running() {
     .expect("resolve+signal should succeed");
     assert_eq!(outcome, ByIdSignalOutcome::NotRunning);
 
-    let pending = signal::load_pending_signals(&mut conn, exec_id)
+    let pending = signal::load_pending_signals(&conn, exec_id)
         .await
         .expect("load pending signals");
     assert!(pending.is_empty(), "no signal should ever be queued");
@@ -428,17 +424,15 @@ async fn resolver_signal_terminal_current_run_is_not_running() {
 
 #[tokio::test]
 async fn resolver_signal_keyed_retry_after_target_went_terminal_is_delivered_not_not_running() {
-    // Code review finding (PR #1145, issue #751): in the cross-shard outbox
-    // path, the TARGET-shard signal insert can commit while the CALLER-shard
-    // transaction fails before appending `ExternalSignalDelivered` -- so the
-    // outbox retries the same keyed request. If the target finishes
-    // (completes) before that retry runs, an early `is_terminal_state` check
-    // BEFORE ever attempting delivery would report `NotRunning` for a signal
-    // that was, in fact, already delivered -- denying
-    // `send_signal_idempotent`'s own "insert before validate" dedup (issue
-    // #521) the chance to ever observe the existing key collision. A keyed
-    // retry that already landed must dedupe to `Delivered`, not
-    // `NotRunning`, regardless of the target's current state.
+    // Regression (PR #1145, issue #751). In the cross-shard outbox path, the
+    // TARGET-shard signal insert can commit while the CALLER-shard transaction
+    // fails before it appends `ExternalSignalDelivered`. The outbox then
+    // retries the same keyed request. Suppose the target completes before that
+    // retry. An `is_terminal_state` check BEFORE delivery would then report
+    // `NotRunning` for a signal that already landed. That check denies the
+    // "insert before validate" dedup of `send_signal_idempotent` (issue #521)
+    // any chance to see the key collision. A keyed retry that already landed
+    // must dedupe to `Delivered`, whatever the target's current state.
     let _guard = TEST_MUTEX.lock().await;
     let (url, _c) = setup_test_database_url().await;
     let mut conn = connect(&url).await;
@@ -460,7 +454,7 @@ async fn resolver_signal_keyed_retry_after_target_went_terminal_is_delivered_not
     assert_eq!(first, ByIdSignalOutcome::Delivered);
 
     // The target processes the signal and completes before the caller-side
-    // outbox retry runs -- the exact race the review describes.
+    // outbox retry runs.
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set(harvest_workflow_executions::state.eq("COMPLETED"))
         .execute(&mut conn)
@@ -487,7 +481,7 @@ async fn resolver_signal_keyed_retry_after_target_went_terminal_is_delivered_not
          the target has since gone terminal"
     );
 
-    let pending = signal::load_pending_signals(&mut conn, exec_id)
+    let pending = signal::load_pending_signals(&conn, exec_id)
         .await
         .expect("load pending signals");
     assert_eq!(
@@ -499,19 +493,17 @@ async fn resolver_signal_keyed_retry_after_target_went_terminal_is_delivered_not
 
 #[tokio::test]
 async fn resolver_signal_keyed_retry_after_continue_as_new_does_not_double_deliver() {
-    // Code review finding (PR #1145, issue #751): when a cross-shard delivery
-    // commits on run A but the caller-side outcome append rolls back, and A
-    // continues-as-new to B before the retry, a naive retry would resolve to
-    // B (the new current run) and attempt a FRESH insert there --
-    // `send_signal_idempotent`'s dedup is scoped to (workflow_exec_id,
-    // idempotency_key), so a key already used against A's exec_id does not
-    // collide against B's. That produces TWO SignalReceived events for one
-    // logical request, contrary to the `_with_idempotency` operation's
-    // exactly-once contract. The dedup identity must survive execution
-    // rotation: reusing `execution::lookup_idempotent_signal_dedupe` (the same
-    // (workflow_name, workflow_id, idempotency_key)-scoped lookup
-    // `signal_with_start` already uses, issue #244) before attempting fresh
-    // delivery closes this.
+    // Regression (PR #1145, issue #751). A cross-shard delivery commits on run
+    // A, but the caller-side outcome append rolls back. A then continues as new
+    // to B before the retry. A naive retry resolves to B, the new current run,
+    // and attempts a FRESH insert there. The dedup of `send_signal_idempotent`
+    // is scoped to (workflow_exec_id, idempotency_key). So a key used against
+    // A's exec_id does not collide against B's. That yields TWO SignalReceived
+    // events for one logical request. It breaks the exactly-once contract of
+    // `_with_idempotency`. The dedup identity must survive execution rotation.
+    // A call to `execution::lookup_idempotent_signal_dedupe` before a fresh
+    // delivery closes this. `signal_with_start` uses the same lookup (issue
+    // #244), scoped to (workflow_name, workflow_id, idempotency_key).
     let _guard = TEST_MUTEX.lock().await;
     let (url, _c) = setup_test_database_url().await;
     let mut conn = connect(&url).await;
@@ -556,7 +548,7 @@ async fn resolver_signal_keyed_retry_after_continue_as_new_does_not_double_deliv
          predecessor execution in the same (workflow_name, workflow_id) chain"
     );
 
-    let pending_succ = signal::load_pending_signals(&mut conn, succ)
+    let pending_succ = signal::load_pending_signals(&conn, succ)
         .await
         .expect("load pending signals for succ");
     assert!(
@@ -569,28 +561,26 @@ async fn resolver_signal_keyed_retry_after_continue_as_new_does_not_double_deliv
 
 #[tokio::test]
 async fn resolver_picks_most_recent_of_multiple_terminal_runs() {
-    // No run in this file's other tests has more than one terminal row under
-    // a given (workflow_name, workflow_id); this proves the live SQL
-    // `ORDER BY started_at DESC` fallback genuinely picks the most-recently
-    // STARTED terminal row -- not the most-recently-inserted one, and not
-    // just whichever the pure `select_resolved_run` merge function would
-    // pick against fabricated structs.
+    // No other test here has more than one terminal row per (workflow_name,
+    // workflow_id). This proves that the live SQL `ORDER BY started_at DESC`
+    // fallback picks the most-recently STARTED terminal row. It must not pick
+    // the most-recently-inserted one. A check of the pure `select_resolved_run`
+    // merge function against fabricated structs cannot prove that.
     //
     // Only ONE row per (workflow_name, workflow_id) may ever hold a state
-    // OUTSIDE {CONTINUED_AS_NEW, TERMINATED} -- that's the DB-level partial
-    // unique index every OTHER helper in this file already relies on. So
-    // "genuinely multiple terminal candidates" is modelled the way it
-    // actually arises in production: a continue-as-new chain (each
-    // predecessor released to CONTINUED_AS_NEW) ending in one real terminal
-    // row. The chain is inserted in a DELIBERATELY non-chronological
-    // started_at order (the OLDEST-by-wall-clock-insert row is given the
-    // LARGEST started_at) so a resolver that used insertion/row-id order
-    // instead of `started_at` would pick the wrong row.
+    // OUTSIDE {CONTINUED_AS_NEW, TERMINATED}. That is the DB-level partial
+    // unique index every OTHER helper in this file already relies on. So the
+    // test models multiple terminal candidates as production does: a
+    // continue-as-new chain that ends in one real terminal row. Each
+    // predecessor in it is released to CONTINUED_AS_NEW. The chain goes in
+    // with a DELIBERATELY non-chronological started_at order. The OLDEST
+    // inserted row gets the LARGEST started_at. So a resolver that used
+    // insertion or row-id order instead of `started_at` picks the wrong row.
     let _guard = TEST_MUTEX.lock().await;
     let (url, _c) = setup_test_database_url().await;
     let mut conn = connect(&url).await;
 
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let workflow_id = "res-multi-terminal";
 
     let predecessor_a = ExecutionId::new_for_shard(ShardId::new(0)); // inserted 1st, started_at newest -- must win
@@ -601,7 +591,8 @@ async fn resolver_picks_most_recent_of_multiple_terminal_runs() {
     diesel::update(harvest_workflow_executions::table.find(predecessor_a.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"),
-            harvest_workflow_executions::started_at.eq(now - chrono::Duration::hours(1)),
+            harvest_workflow_executions::started_at
+                .eq((now - jiff::SignedDuration::from_hours(1)).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -611,7 +602,8 @@ async fn resolver_picks_most_recent_of_multiple_terminal_runs() {
     diesel::update(harvest_workflow_executions::table.find(predecessor_b.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"),
-            harvest_workflow_executions::started_at.eq(now - chrono::Duration::hours(3)),
+            harvest_workflow_executions::started_at
+                .eq((now - jiff::SignedDuration::from_hours(3)).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -621,7 +613,8 @@ async fn resolver_picks_most_recent_of_multiple_terminal_runs() {
     diesel::update(harvest_workflow_executions::table.find(terminus.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("FAILED"),
-            harvest_workflow_executions::started_at.eq(now - chrono::Duration::hours(5)),
+            harvest_workflow_executions::started_at
+                .eq((now - jiff::SignedDuration::from_hours(5)).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -642,7 +635,7 @@ async fn resolver_picks_most_recent_of_multiple_terminal_runs() {
     assert_eq!(resolved.state, "CONTINUED_AS_NEW");
 }
 
-/// Issue #1317 review, P1 follow-up: a reconciled `MIGRATED` seal
+/// Issue #1317: a reconciled `MIGRATED` seal
 /// (`migrated_run_terminal_at` set) no longer represents anything current
 /// for this business key. It must be excluded from the terminal fallback
 /// outright, not merely lose an ordinary `started_at` tie-break. The seal
@@ -661,8 +654,11 @@ async fn resolver_never_returns_a_reconciled_seal() {
         .set((
             harvest_workflow_executions::state.eq("MIGRATED"),
             SetExt(harvest_workflow_executions_ext::migrated_to_shard.eq(1)),
-            SetExt(harvest_workflow_executions_ext::migrated_at.eq(chrono::Utc::now())),
-            harvest_workflow_executions::migrated_run_terminal_at.eq(chrono::Utc::now()),
+            SetExt(
+                harvest_workflow_executions_ext::migrated_at.eq(jiff::Timestamp::now().to_diesel()),
+            ),
+            harvest_workflow_executions::migrated_run_terminal_at
+                .eq(jiff::Timestamp::now().to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -682,13 +678,13 @@ async fn resolver_never_returns_a_reconciled_seal() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resolver_signal_races_to_successor_exactly_mid_delivery() {
-    // Deterministic, lock-choreographed proof of the exact race window (AC3):
-    // hold the predecessor row lock so `resolve_and_signal_by_workflow_id`'s
-    // resolve step sees it RUNNING, queue the real continue-as-new behind the
-    // lock, release the lock (letting the CAN commit), then let the delivery
-    // attempt proceed. The delivery attempt's own internal check must detect
-    // the mid-flight seal and report `RacedToSuccessor` — never a stale
-    // `Delivered` against the now-superseded predecessor.
+    // Deterministic, lock-choreographed proof of the race window (AC3). Hold
+    // the predecessor row lock, so the resolve step of
+    // `resolve_and_signal_by_workflow_id` sees it RUNNING. Queue the real
+    // continue-as-new behind the lock. Release the lock so the CAN commits,
+    // then let the delivery attempt proceed. Its internal check must detect
+    // the mid-flight seal and report `RacedToSuccessor`. It must never report
+    // a stale `Delivered` against the superseded predecessor.
     let _guard = TEST_MUTEX.lock().await;
     let (url, _c) = setup_test_database_url().await;
     let mut conn = connect(&url).await;
@@ -740,8 +736,8 @@ async fn resolver_signal_races_to_successor_exactly_mid_delivery() {
          never a false Delivered"
     );
 
-    let mut verify_conn = connect(&url).await;
-    let pending_pred = signal::load_pending_signals(&mut verify_conn, pred)
+    let verify_conn = connect(&url).await;
+    let pending_pred = signal::load_pending_signals(&verify_conn, pred)
         .await
         .expect("load pending signals for pred");
     assert!(
@@ -771,8 +767,8 @@ async fn resolver_cancel_delivers_to_running_predecessor() {
 
 #[tokio::test]
 async fn resolver_cancel_already_terminal_current_run_is_noop() {
-    // AC5: cancel to a workflow_id whose current run is already terminal is
-    // a no-op success (the goal — "the run is not active" — is already met).
+    // AC5: a cancel to a workflow_id whose current run is already terminal is
+    // a no-op success. Its goal, "the run is not active", is already met.
     let _guard = TEST_MUTEX.lock().await;
     let (url, _c) = setup_test_database_url().await;
     let mut conn = connect(&url).await;
@@ -882,11 +878,10 @@ async fn randomized_signal_by_id_continue_as_new_race_zero_misdeliveries() {
     let (url, _c) = setup_test_database_url().await;
     let semaphore = Arc::new(tokio::sync::Semaphore::new(RACE_CONCURRENCY));
 
-    // Insert all N predecessor rows up front on one shared connection, then
-    // race each pair's CAN against its by-id resolve+signal concurrently
-    // with a random micro-delay before each side, so real Tokio task
-    // scheduling — racing against the SAME live Postgres instance — decides
-    // which side actually wins the transaction-commit race for each trial.
+    // Insert all N predecessor rows up front on one shared connection. Then
+    // race each pair's CAN against its by-id resolve+signal, with a random
+    // micro-delay before each side. Real Tokio scheduling against the SAME
+    // live Postgres then decides which side wins the commit race per trial.
     let mut setup_conn = connect(&url).await;
     let mut pairs = Vec::with_capacity(RACE_TRIALS);
     for i in 0..RACE_TRIALS {
@@ -933,14 +928,12 @@ async fn randomized_signal_by_id_continue_as_new_race_zero_misdeliveries() {
                 (outcome, conn_resolve)
             });
 
-            // Nothing besides this CAN ever mutates `pred`'s state in the
-            // signal-race scenario (signaling only inserts into
-            // `harvest_signals`; it never changes execution state), so the
-            // CAN's `WHERE state = 'RUNNING'` guard can never be declined
-            // here. Assert that invariant explicitly rather than silently
-            // relying on it — a future change to the signal-delivery path
-            // that starts touching execution state would otherwise silently
-            // invalidate this test's assumption that `succ` always exists.
+            // Only this CAN mutates `pred`'s state in the signal race.
+            // Signaling only inserts into `harvest_signals`. So the CAN's
+            // `WHERE state = 'RUNNING'` guard is never declined here. Assert
+            // that invariant explicitly. A future signal-delivery change that
+            // touches execution state would otherwise break, unseen, the
+            // assumption that `succ` always exists.
             let can_succeeded = can_task.await.expect("can task should not panic");
             assert!(
                 can_succeeded,
@@ -951,10 +944,10 @@ async fn randomized_signal_by_id_continue_as_new_race_zero_misdeliveries() {
                 resolve_task.await.expect("resolve task should not panic");
             let outcome = outcome.expect("resolve+signal should not error");
 
-            // If the delivery attempt raced, retry now that the CAN has
-            // definitely committed (both tasks were awaited above) — this
-            // proves eventual, exactly-once delivery after the documented
-            // "leave pending, retry" contract for `RacedToSuccessor`.
+            // If the delivery attempt raced, retry now. Both tasks were
+            // awaited above, so the CAN has committed. This proves eventual,
+            // exactly-once delivery under the "leave pending, retry" contract
+            // of `RacedToSuccessor`.
             let retried = if matches!(outcome, ByIdSignalOutcome::RacedToSuccessor) {
                 Some(
                     signal::resolve_and_signal_by_workflow_id(
@@ -976,16 +969,16 @@ async fn randomized_signal_by_id_continue_as_new_race_zero_misdeliveries() {
         }));
     }
 
-    let mut verify_conn = connect(&url).await;
+    let verify_conn = connect(&url).await;
     let mut delivered_to_pred = 0usize;
     let mut delivered_to_succ = 0usize;
     let mut raced_then_retried = 0usize;
     for (i, h) in handles.into_iter().enumerate() {
         let (pred, succ, outcome, retried) = h.await.expect("trial task should not panic");
-        let pred_pending = signal::load_pending_signals(&mut verify_conn, pred)
+        let pred_pending = signal::load_pending_signals(&verify_conn, pred)
             .await
             .expect("load pred pending signals");
-        let succ_pending = signal::load_pending_signals(&mut verify_conn, succ)
+        let succ_pending = signal::load_pending_signals(&verify_conn, succ)
             .await
             .expect("load succ pending signals");
 
@@ -1005,16 +998,13 @@ async fn randomized_signal_by_id_continue_as_new_race_zero_misdeliveries() {
                 }
             }
             ByIdSignalOutcome::RacedToSuccessor => {
-                // NOTE: by the time this loop runs, the spawned trial task
-                // has ALREADY performed its inline retry (the retry runs
-                // sequentially inside the task, before it returns) — so
-                // `succ_pending`, loaded above before this match, may
-                // already reflect the post-retry delivery. Only assert the
-                // invariant that is stable regardless of retry timing: the
-                // sealed predecessor must NEVER receive a signal, before or
-                // after the retry. The settled, exactly-once-on-the-
-                // successor invariant is verified below via
-                // `succ_pending_after`.
+                // The spawned trial task has ALREADY run its inline retry
+                // before it returned. So `succ_pending`, loaded before this
+                // match, may already show the post-retry delivery. Assert
+                // only the invariant that holds whatever the retry timing:
+                // the sealed predecessor NEVER receives a signal. The
+                // `succ_pending_after` check below verifies exactly-once
+                // delivery on the successor.
                 assert!(
                     pred_pending.is_empty(),
                     "trial {i}: RacedToSuccessor must never queue a signal \
@@ -1026,10 +1016,10 @@ async fn randomized_signal_by_id_continue_as_new_race_zero_misdeliveries() {
                     "trial {i}: retrying after RacedToSuccessor must deliver, \
                      got {retried:?}"
                 );
-                let pred_pending_after = signal::load_pending_signals(&mut verify_conn, pred)
+                let pred_pending_after = signal::load_pending_signals(&verify_conn, pred)
                     .await
                     .expect("load pred pending signals after retry");
-                let succ_pending_after = signal::load_pending_signals(&mut verify_conn, succ)
+                let succ_pending_after = signal::load_pending_signals(&verify_conn, succ)
                     .await
                     .expect("load succ pending signals after retry");
                 assert!(
@@ -1058,9 +1048,9 @@ async fn randomized_signal_by_id_continue_as_new_race_zero_misdeliveries() {
         RACE_TRIALS,
         "every trial must resolve to exactly one accounted-for outcome"
     );
-    // The success metric names randomized interleavings, not a specific mix;
-    // require the fixture actually exercised BOTH sides of the "who commits
-    // first" race so this isn't a vacuously-passing test.
+    // The success metric names randomized interleavings, not a specific mix.
+    // Require that the fixture exercised BOTH sides of the "who commits
+    // first" race, so this is not a vacuously-passing test.
     assert!(
         delivered_to_pred > 0,
         "fixture must exercise resolve-wins-the-race at least once"
@@ -1123,14 +1113,12 @@ async fn randomized_cancel_by_id_continue_as_new_race_zero_misdeliveries() {
                 (outcome, conn_resolve)
             });
 
-            // Unlike the signal race, the cancel race CAN be genuinely
-            // declined: a `resolve_and_cancel_by_workflow_id` that wins the
-            // race commits `pred`'s state to CANCELLED, which makes the
-            // CAN's guarded `WHERE state = 'RUNNING'` UPDATE match 0 rows —
-            // and when that happens `succ`'s row is NEVER inserted. Capture
-            // the real, directly-observed outcome instead of re-deriving
-            // "did the CAN happen" from `succ`'s (possibly-nonexistent) row
-            // state further down.
+            // Unlike the signal race, the cancel race can decline the CAN. A
+            // winning `resolve_and_cancel_by_workflow_id` commits `pred` to
+            // CANCELLED. The CAN's guarded `WHERE state = 'RUNNING'` UPDATE
+            // then matches 0 rows, and `succ`'s row is NEVER inserted. So
+            // capture the observed outcome here. Do not re-derive it later
+            // from the row of `succ`, which may not exist.
             let can_succeeded = can_task.await.expect("can task should not panic");
             let (outcome, mut conn_resolve) =
                 resolve_task.await.expect("resolve task should not panic");
@@ -1165,19 +1153,15 @@ async fn randomized_cancel_by_id_continue_as_new_race_zero_misdeliveries() {
 
         match outcome {
             ByIdCancelOutcome::Cancelled { .. } => {
-                // Branch on the DIRECTLY-OBSERVED `can_succeeded` bool
-                // rather than re-deriving "did the CAN happen" from row
-                // state: when the CAN was declined, `succ`'s row was NEVER
-                // inserted, so calling `load_state(&mut verify_conn, succ)`
-                // in that case would panic on a nonexistent row.
+                // Branch on the observed `can_succeeded`, not on row state.
+                // A declined CAN never inserts the row of `succ`, so
+                // `load_state(&mut verify_conn, succ)` would then panic.
                 let pred_state = load_state(&mut verify_conn, pred).await;
                 if can_succeeded {
-                    // The CAN fully committed. A direct `Cancelled` outcome
-                    // here is only reachable when the resolve step observed
-                    // `succ` as current from the very start (it ran
-                    // entirely after the CAN's commit) — a resolve that
-                    // simply never raced at all, never passing through the
-                    // `RacedToSuccessor` window.
+                    // The CAN committed. A direct `Cancelled` outcome is then
+                    // reachable only when the resolve step ran entirely after
+                    // the CAN's commit and saw `succ` as current. That resolve
+                    // never passed through the `RacedToSuccessor` window.
                     assert_eq!(
                         pred_state, "CONTINUED_AS_NEW",
                         "trial {i}: once the CAN succeeds, pred must be \
@@ -1192,10 +1176,9 @@ async fn randomized_cancel_by_id_continue_as_new_race_zero_misdeliveries() {
                     );
                     cancelled_succ_directly += 1;
                 } else {
-                    // The CAN was declined — the only way that happens is
-                    // the cancel's own write beating it to pred's row,
-                    // forcing the CAN's guarded UPDATE to match 0 rows. pred
-                    // must be the one actually cancelled.
+                    // The CAN was declined. Only the cancel's own write on
+                    // pred's row causes that, because the CAN's guarded
+                    // UPDATE then matches 0 rows. So pred is the cancelled run.
                     assert_eq!(
                         pred_state, "CANCELLED",
                         "trial {i}: when the CAN is declined, the cancel \
@@ -1217,11 +1200,10 @@ async fn randomized_cancel_by_id_continue_as_new_race_zero_misdeliveries() {
                     "trial {i}: RacedToSuccessor must leave the predecessor \
                      exactly as the CAN sealed it, never cancelled"
                 );
-                // NOTE: by the time this loop runs, the spawned trial task
-                // has ALREADY performed its inline retry — so `succ`'s state
-                // here already reflects the post-retry cancellation. Only
-                // the settled invariant (checked via `retried` and
-                // `succ_state_after` below) is meaningful at this point.
+                // The spawned trial task has ALREADY run its inline retry, so
+                // `succ`'s state here shows the post-retry cancellation. Only
+                // the settled invariant, checked via `retried` and
+                // `succ_state_after` below, means anything here.
                 match retried {
                     Some(ByIdCancelOutcome::Cancelled { .. }) => {}
                     other => panic!(
@@ -1263,11 +1245,11 @@ async fn randomized_cancel_by_id_continue_as_new_race_zero_misdeliveries() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// 3. End-to-end tests through a real `Worker` — proving the public
+// 3. End-to-end tests through a real `Worker`. They prove the public
 //    `WorkflowContext` API (`signal_external_workflow_by_id[_with_idempotency]`,
-//    `request_cancel_external_workflow_by_id`) is wired correctly through the
-//    whole pipeline: inline dispatch, the outbox scanner, cross-shard
-//    routing, the grace window, and self-targeting rejection.
+//    `request_cancel_external_workflow_by_id`) through the whole pipeline.
+//    That covers inline dispatch, the outbox scanner, cross-shard routing, the
+//    grace window, and self-targeting rejection.
 // ─────────────────────────────────────────────────────────────────────────
 
 fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn) -> WorkflowInfo {
@@ -1386,9 +1368,9 @@ fn by_id_instant_complete_workflow<'a>(
     Box::pin(async move { Ok(serde_json::json!({"status": "done"})) })
 }
 
-// Target that continues-as-new exactly once (predecessor phase), then the
-// successor parks on the same plain signal wait as `by_id_signal_target_workflow`
-// (AC2 end-to-end: resolution must follow to the live successor).
+// Target that continues-as-new exactly once. The successor then parks on the
+// same plain signal wait as `by_id_signal_target_workflow`. AC2 end to end:
+// resolution must follow to the live successor.
 fn by_id_can_target_workflow<'a>(
     ctx: &'a WorkflowContext,
     input: serde_json::Value,
@@ -1410,9 +1392,9 @@ fn by_id_can_target_workflow<'a>(
 }
 
 // Caller that signals a target addressed purely by `(workflow_name,
-// workflow_id)`, surfacing the typed outcome/reason_code in its own output
-// rather than propagating the error, so the test can assert on a terminal
-// COMPLETED state either way.
+// workflow_id)`. It returns the typed outcome or reason_code in its output
+// instead of an error. So the test can assert a terminal COMPLETED state
+// either way.
 fn by_id_signaller_workflow<'a>(
     ctx: &'a WorkflowContext,
     input: serde_json::Value,
@@ -1444,9 +1426,9 @@ fn by_id_signaller_workflow<'a>(
     })
 }
 
-// Same shape as `by_id_signaller_workflow`, but targets ITSELF — proving
-// self-targeting rejection (AC6) end to end through the real worker, with no
-// DB round trip needed for the rejection itself.
+// Same shape as `by_id_signaller_workflow`, but targets ITSELF. It proves
+// self-targeting rejection (AC6) end to end through the real worker. The
+// rejection itself needs no DB round trip.
 fn by_id_self_signaller_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: serde_json::Value,
@@ -1512,13 +1494,13 @@ fn by_id_self_canceller_workflow<'a>(
     })
 }
 
-/// Build a single-shard test worker registered with `infos`, matching the
-/// existing `cross_workflow_*_tests.rs` convention. Always (re-)installs a
-/// clean single-shard global router first: `GLOBAL_SHARD_ROUTER` is a
-/// process-global static shared across every test in this compiled test
-/// binary, and any earlier test (in this file or another) that installed a
-/// different topology would otherwise silently corrupt `WorkflowId`
-/// resolution for this test's by-id deliveries.
+/// Build a single-shard test worker registered with `infos`, as in
+/// `cross_workflow_*_tests.rs`.
+///
+/// It always installs a clean single-shard global router first.
+/// `GLOBAL_SHARD_ROUTER` is a process-global static, shared by every test in
+/// this test binary. An earlier test that installed another topology would
+/// otherwise corrupt `WorkflowId` resolution for the by-id deliveries here.
 fn build_e2e_worker(
     pool: &DbPool,
     infos: Vec<WorkflowInfo>,
@@ -1701,12 +1683,10 @@ async fn worker_signal_external_workflow_by_id_reaches_live_successor_after_cont
     .await
     .unwrap();
 
-    // Wait until the predecessor has fully continued-as-new AND the
-    // successor is confirmed parked before starting the signaller — this
-    // isolates "does resolution correctly find the live successor" (the
-    // property this test exists to prove) from the race-timing concerns
-    // already exhaustively covered by the resolver-level and randomized
-    // tests above.
+    // Wait until the predecessor has continued-as-new AND the successor is
+    // parked, then start the signaller. This isolates the property under
+    // test, that resolution finds the live successor, from race timing. The
+    // resolver-level and randomized tests above cover race timing.
     let successor_exec_id = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Ok(Some(resolved)) = execution::resolve_execution_id_by_workflow_id(
@@ -1869,9 +1849,9 @@ async fn worker_request_cancel_external_workflow_by_id_reaches_running_target() 
     let _ = handle.await;
 }
 
-// 4. AC4 end-to-end: a signal to a `workflow_id` that has NEVER been started
-//    is never silently dropped — it fails with a typed `target_unknown`
-//    reason once the (shortened, for test speed) grace window elapses.
+// 4. AC4 end-to-end: a signal to a never-started `workflow_id` is never
+//    silently dropped. It fails with a typed `target_unknown` reason once the
+//    grace window elapses. The test shortens that window for speed.
 #[tokio::test]
 async fn worker_signal_by_id_fails_target_unknown_after_grace_window() {
     let _guard = TEST_MUTEX.lock().await;
@@ -1936,8 +1916,8 @@ async fn worker_signal_by_id_fails_target_unknown_after_grace_window() {
 }
 
 // 5. AC5 end-to-end: a cancel to a `workflow_id` whose current run is
-//    already terminal is a no-op success — never a failure, never a
-//    mutation of the (already-terminal) target.
+//    already terminal is a no-op success. It never fails and never mutates
+//    the terminal target.
 #[tokio::test]
 async fn worker_cancel_by_id_already_terminal_is_noop_success() {
     let _guard = TEST_MUTEX.lock().await;
@@ -2044,12 +2024,10 @@ async fn worker_cancel_by_id_already_terminal_is_noop_success() {
     let _ = handle.await;
 }
 
-// 6/7 shared setup: pick two shard ids such that the by-id rendezvous hash
-// for the target's business key resolves to a DIFFERENT shard than the
-// caller's, mirroring exactly how a real deployment's `start_or_load` would
-// have placed the target — so the outbox's same-pool/cross-pool check
-// genuinely exercises the cross-pool branch rather than relying on a
-// coincidence.
+// 6/7 shared setup: pick two shard ids so the by-id rendezvous hash of the
+// target's business key resolves to a DIFFERENT shard than the caller's. A
+// real deployment's `start_or_load` places the target the same way. So the
+// outbox's same-pool/cross-pool check really exercises the cross-pool branch.
 fn e2e_cross_shard_ids(
     router: &autumn_harvest::shard::ShardRouter,
     target_workflow_name: &str,
@@ -2094,12 +2072,11 @@ async fn worker_cross_shard_signal_external_workflow_by_id() {
         "test setup must guarantee a genuine cross-shard pairing"
     );
 
-    // Both logical shards point at the same physical Postgres instance (a
-    // mock of two shards, matching `test_cross_shard_cancel_via_outbox`'s
-    // established pattern) — the point of this test is that the OUTBOX
+    // Both logical shards point at the same physical Postgres, as in
+    // `test_cross_shard_cancel_via_outbox`. The test proves that the OUTBOX
     // routing decision (same-pool vs cross-pool, driven by
-    // `external_target_owning_shard`) takes the cross-pool branch, not that
-    // the shards are physically distinct databases.
+    // `external_target_owning_shard`) takes the cross-pool branch. It does
+    // not need physically distinct databases.
     let mut pools = std::collections::BTreeMap::new();
     pools.insert(ShardId::new(0), pool.clone());
     pools.insert(ShardId::new(1), pool.clone());
@@ -2120,11 +2097,11 @@ async fn worker_cross_shard_signal_external_workflow_by_id() {
     // The outbox scanner (`enforce_external_signals_outbox`) filters candidate
     // *caller* executions by `execs.shard_id = ANY(shard_assignments)`,
     // defaulting to `[0]` when empty (see `timeout.rs`). Both mock shards are
-    // physically the same Postgres instance here, but the caller's
-    // `ExecutionId` is genuinely encoded with shard 0 or 1 (whichever is NOT
-    // the target's rendezvous-hashed shard) — so the single worker must be
-    // assigned both shards or it will never see a caller row encoded on the
-    // shard it isn't watching, and the request stays pending forever.
+    // physically the same Postgres instance here. But the caller's
+    // `ExecutionId` is genuinely encoded with shard 0 or 1, whichever is NOT
+    // the target's rendezvous-hashed shard. So the single worker must be
+    // assigned both shards. Otherwise it never sees a caller row encoded on the
+    // shard it is not watching, and the request stays pending forever.
     runtime_config.shard_assignments = vec![ShardId::new(0), ShardId::new(1)];
     let worker =
         Arc::new(Worker::new(runtime_config, Arc::new(registry)).expect("worker should build"));
@@ -2237,10 +2214,10 @@ async fn worker_cross_shard_cancel_external_workflow_by_id() {
     runtime_config.worker_id = "worker-e2e-cross-can-1".to_string();
     runtime_config.poll_interval = Duration::from_millis(50);
     runtime_config.shutdown_timeout = Duration::from_secs(2);
-    // See the identical comment in `worker_cross_shard_signal_external_workflow_by_id`:
-    // the outbox scanner filters caller executions by `shard_assignments`,
-    // which must cover both mock shards or a caller encoded on shard 1 is
-    // never scanned.
+    // See the identical comment in `worker_cross_shard_signal_external_workflow_by_id`.
+    // The outbox scanner filters caller executions by `shard_assignments`. That
+    // must cover both mock shards, or a caller encoded on shard 1 is never
+    // scanned.
     runtime_config.shard_assignments = vec![ShardId::new(0), ShardId::new(1)];
     let worker =
         Arc::new(Worker::new(runtime_config, Arc::new(registry)).expect("worker should build"));
@@ -2327,21 +2304,19 @@ impl autumn_harvest::telemetry::MetricsRecorder for UnfinishedHandlerRecorder {
     }
 }
 
-// 7b. Issue #751 code review (round 2, P2): a cross-shard cancel's deferred
+// 7b. Issue #751: a cross-shard cancel's deferred
 //     unfinished-update-handler check must run against the connection that
-//     actually owns the checked execution id, not unconditionally against
-//     the caller's own shard connection -- otherwise the check silently sees
-//     zero events (the target's rows simply are not on that physical
-//     database) and never reports a genuinely unfinished update handler.
+//     actually owns the checked execution id. It must not run unconditionally
+//     against the caller's own shard connection. Otherwise the check silently
+//     sees zero events, because the target's rows are not on that physical
+//     database. It then never reports a genuinely unfinished update handler.
 //
-//     Unlike the other `worker_cross_shard_*` tests in this file, this test
-//     deliberately uses TWO GENUINELY SEPARATE physical databases (two
-//     independent `setup_test_database_url()` calls) rather than one
-//     Postgres instance shared by two logical shard ids: the bug only
-//     manifests when the wrong connection cannot physically see the
-//     target's rows at all, which a shared-physical-database "cross-shard"
-//     setup can never reproduce (every row lives in the one database
-//     regardless of which logical connection reads it).
+//     Unlike the other `worker_cross_shard_*` tests here, this test uses TWO
+//     physically separate databases: two independent
+//     `setup_test_database_url()` calls. The bug shows only when the wrong
+//     connection cannot see the target's rows at all. One Postgres shared by
+//     two logical shard ids cannot reproduce that, because every row lives in
+//     the one database.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn cross_shard_cancel_reports_unfinished_handlers_on_the_target_shard() {
@@ -2390,12 +2365,12 @@ async fn cross_shard_cancel_reports_unfinished_handlers_on_the_target_shard() {
         &mut target_conn,
         target_exec_id,
         &[
-            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::workflow_started(serde_json::json!({}), jiff::Timestamp::now()),
             WorkflowEvent::UpdateAdmitted {
                 update_id,
                 name: "approve".to_string(),
                 input: serde_json::Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
             },
         ],
         1,
@@ -2423,7 +2398,7 @@ async fn cross_shard_cancel_reports_unfinished_handlers_on_the_target_shard() {
         &mut caller_conn,
         caller_exec_id,
         &[
-            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::workflow_started(serde_json::json!({}), jiff::Timestamp::now()),
             WorkflowEvent::ExternalCancelRequested {
                 cancel_id,
                 target: autumn_harvest::types::ExternalTarget::WorkflowId {
@@ -2466,10 +2441,9 @@ async fn cross_shard_cancel_reports_unfinished_handlers_on_the_target_shard() {
         .expect("load target after cancel");
     assert_eq!(target_after.state, "CANCELLED");
 
-    // The regression: the deferred unfinished-handler check must have run
-    // against the TARGET's shard and reported the genuinely unfinished
-    // `approve` update -- not silently seen zero events because it ran on
-    // the caller's (wrong, physically separate) connection.
+    // The regression: the deferred unfinished-handler check must run against
+    // the TARGET's shard and report the unfinished `approve` update. On the
+    // caller's physically separate connection it would see zero events.
     let calls = recorder.calls.lock().unwrap().clone();
     assert_eq!(
         calls,
@@ -2495,13 +2469,13 @@ async fn cross_shard_cancel_reports_unfinished_handlers_on_the_target_shard() {
     );
 }
 
-/// A minimal [`MetricsRecorder`] that captures every terminal-observability
-/// call the cross-pool cancel-by-id follow-up path can make: the deferred
-/// unfinished-update-handler check, the cancel-terminal metric, and the
-/// (later, caller-side) "external cancel sent" metric. Used by the round-3
-/// review test below to prove the terminal-shard follow-ups are recorded
-/// immediately -- before the caller-side outer transaction has any chance
-/// to fail and discard them.
+/// A minimal [`MetricsRecorder`] for the cross-pool cancel-by-id follow-ups.
+///
+/// It captures the deferred unfinished-update-handler check, the
+/// cancel-terminal metric, and the later, caller-side "external cancel sent"
+/// metric. Test 7c uses it to prove that the terminal-shard follow-ups are
+/// recorded immediately. That is before the caller-side outer transaction
+/// has any chance to fail and discard them.
 #[derive(Default)]
 struct CrossPoolFollowupRecorder {
     unfinished_handler: std::sync::Mutex<Vec<(String, u64)>>,
@@ -2537,23 +2511,22 @@ impl autumn_harvest::telemetry::MetricsRecorder for CrossPoolFollowupRecorder {
     }
 }
 
-// 7c. Issue #751 code review (round 3, P2): a cross-shard cancel's target-side
+// 7c. Issue #751: a cross-shard cancel's target-side
 //     commit is real and irrevocable the instant `attempt_cancel_delivery`
-//     returns for the cross-pool branch -- it runs on a *fresh* connection
+//     returns for the cross-pool branch. It runs on a *fresh* connection
 //     with its own top-level `conn.transaction(...)` wrap, not a savepoint on
-//     the caller's outer transaction. If the accumulated follow-ups
+//     the caller's outer transaction. Suppose the accumulated follow-ups
 //     (unfinished-handler check, terminal metric, deferred trigger starts)
-//     are deferred past the *caller-side* outer transaction's own commit,
-//     an unrelated failure of that caller-side transaction (e.g. the
-//     `store::append_events`/`queue::wake_workflow_task` call erroring, here
-//     forced by seeding the caller's history with an undecodable third row)
-//     discards them permanently: a retry sees the target as already
-//     `AlreadyTerminal`, which produces no new checks/metrics of its own.
+//     wait for the *caller-side* outer commit. An unrelated failure of that
+//     transaction then discards them permanently. One example is an error
+//     from `store::append_events` or `queue::wake_workflow_task`. This test
+//     forces it with an undecodable third row in the caller's history. A
+//     retry sees the target as `AlreadyTerminal`, which produces no new
+//     checks or metrics.
 //
-//     This test proves the fix: the target-shard follow-ups must be recorded
-//     immediately after the target-side commit -- using the still-open
-//     target connection -- rather than deferred past the (here, deliberately
-//     failing) caller-side transaction.
+//     This test proves the fix. The target-shard follow-ups must be recorded
+//     right after the target-side commit, on the still-open target
+//     connection. They must not wait for the failing caller-side transaction.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn cross_shard_cancel_target_followups_survive_a_failed_caller_side_commit() {
@@ -2583,9 +2556,9 @@ async fn cross_shard_cancel_target_followups_survive_a_failed_caller_side_commit
         "test setup must guarantee a genuine cross-shard pairing"
     );
 
-    // Seed the target on its own (physically separate) shard's database:
-    // RUNNING, with an admitted update handler that never resolved -- so the
-    // deferred unfinished-handler check has something genuine to report.
+    // Seed the target on its own, physically separate shard database. It is
+    // RUNNING, with an admitted update handler that never resolved. So the
+    // deferred unfinished-handler check has something to report.
     let mut target_conn = sharded_pool
         .pool_for(target_exec_id.shard())
         .get()
@@ -2603,12 +2576,12 @@ async fn cross_shard_cancel_target_followups_survive_a_failed_caller_side_commit
         &mut target_conn,
         target_exec_id,
         &[
-            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::workflow_started(serde_json::json!({}), jiff::Timestamp::now()),
             WorkflowEvent::UpdateAdmitted {
                 update_id,
                 name: "approve".to_string(),
                 input: serde_json::Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
             },
         ],
         1,
@@ -2616,16 +2589,15 @@ async fn cross_shard_cancel_target_followups_survive_a_failed_caller_side_commit
     .await
     .expect("seed target history");
 
-    // Seed the caller with a pending `ExternalCancelRequested` targeting the
-    // business key above, PLUS a deliberately undecodable third event row --
-    // wrong `event_type` so the outbox's own scanning query (which filters on
-    // `event_type = 'ExternalCancelRequested'`) still finds row #2 normally,
-    // but malformed `event_data` so the LATER, full-history
-    // `lock_workflow_execution_and_load_history` call -- which only runs
-    // *after* the cross-pool target commit has already happened -- fails
-    // deterministically while decoding it. This reproduces "caller-side
-    // outer transaction fails after the target-side commit already
-    // succeeded" with no timing/race dependency at all.
+    // Seed the caller with a pending `ExternalCancelRequested` for the
+    // business key above, PLUS a deliberately undecodable third event row.
+    // Its `event_type` is wrong, so the outbox scan (which filters on
+    // `event_type = 'ExternalCancelRequested'`) still finds row #2. Its
+    // `event_data` is malformed. So the LATER full-history
+    // `lock_workflow_execution_and_load_history` call fails while it decodes
+    // the row. That call runs only *after* the cross-pool target commit. This
+    // reproduces a caller-side failure after a successful target-side commit,
+    // with no timing or race dependency.
     let mut caller_conn = sharded_pool
         .pool_for(caller_exec_id.shard())
         .get()
@@ -2643,7 +2615,7 @@ async fn cross_shard_cancel_target_followups_survive_a_failed_caller_side_commit
         &mut caller_conn,
         caller_exec_id,
         &[
-            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::workflow_started(serde_json::json!({}), jiff::Timestamp::now()),
             WorkflowEvent::ExternalCancelRequested {
                 cancel_id,
                 target: autumn_harvest::types::ExternalTarget::WorkflowId {
@@ -2703,9 +2675,9 @@ async fn cross_shard_cancel_target_followups_survive_a_failed_caller_side_commit
          the deliberately undecodable third event row; got: {outcome:?}"
     );
 
-    // The target must still be durably CANCELLED on its own database: the
-    // cross-pool commit already happened independently and must not be
-    // rolled back by the unrelated, later-failing caller-side transaction.
+    // The target must still be durably CANCELLED on its own database. The
+    // cross-pool commit happened independently. The later caller-side
+    // failure must not roll it back.
     let target_after = harvest_workflow_executions::table
         .find(target_exec_id.as_uuid())
         .select(WorkflowExecution::as_select())
@@ -2719,9 +2691,9 @@ async fn cross_shard_cancel_target_followups_survive_a_failed_caller_side_commit
     );
 
     // The regression: the deferred unfinished-handler check and the
-    // cancel-terminal metric must have been recorded immediately after the
-    // target-side commit -- NOT deferred past the caller-side transaction,
-    // which fails here and would otherwise have discarded them permanently.
+    // cancel-terminal metric must be recorded right after the target-side
+    // commit. Deferred past the failing caller-side transaction, they would
+    // be lost permanently.
     let unfinished_calls = recorder.unfinished_handler.lock().unwrap().clone();
     assert_eq!(
         unfinished_calls,
@@ -2743,9 +2715,9 @@ async fn cross_shard_cancel_target_followups_survive_a_failed_caller_side_commit
          got: {terminal_calls:?}"
     );
 
-    // `record_external_cancel_sent` is only ever called on the caller side,
-    // after the (here, failing) history load/append -- it must NOT have
-    // fired, confirming execution genuinely never reached that later step.
+    // Only the caller side calls `record_external_cancel_sent`, after the
+    // failing history load and append. It must NOT have fired. That confirms
+    // execution never reached that later step.
     let external_cancel_sent_calls = recorder.external_cancel_sent.lock().unwrap().clone();
     assert!(
         external_cancel_sent_calls.is_empty(),
@@ -2754,23 +2726,22 @@ async fn cross_shard_cancel_target_followups_survive_a_failed_caller_side_commit
     );
 }
 
-// 7d. Issue #751 code review (round 5, P2): the deferred unfinished-handler
-//     check's same-pool decision must compare *resolved connection pools*,
-//     not raw `ShardId`s. A legacy/pre-sharding caller execution carries the
-//     `ShardId::UNENCODED` sentinel, which `exact_pool_for_execution`
-//     correctly resolves to the default shard's pool via its own fallback --
-//     but a raw `exec_id.shard() == caller_shard` comparison sees an
-//     unencoded caller and an *encoded* default-shard target as different
-//     shards even though both are physically served by the identical pool.
-//     That misclassification takes the "cross-shard" branch and tries to
-//     acquire a SECOND connection from that same pool while the first
-//     (`conn`) is still checked out -- a self-deadlock under the documented
-//     pool-size-1 configuration this whole routing exists to protect
-//     (issue #688's precedent).
+// 7d. Issue #751: the same-pool decision of the deferred unfinished-handler
+//     check must compare *resolved connection pools*, not raw `ShardId`s. A
+//     legacy, pre-sharding caller execution carries the `ShardId::UNENCODED`
+//     sentinel. `exact_pool_for_execution` resolves it to the default shard's
+//     pool via its own fallback. A raw `exec_id.shard() == caller_shard`
+//     comparison instead sees an unencoded caller and an *encoded*
+//     default-shard target as different shards. The same pool serves both.
+//     The misclassification takes the "cross-shard" branch. It then asks that
+//     pool for a SECOND connection while the first (`conn`) is still checked
+//     out. That self-deadlocks under the documented pool-size-1
+//     configuration, which this routing exists to protect (issue #688's
+//     precedent).
 //
-//     This test uses a genuinely size-1 connection pool and bounds the call
-//     with a timeout, so the pre-fix deadlock is reproduced deterministically
-//     as a timeout rather than an actual indefinite hang.
+//     This test uses a size-1 connection pool and bounds the call with a
+//     timeout. So the pre-fix deadlock shows deterministically as a timeout,
+//     not an indefinite hang.
 #[tokio::test]
 async fn cross_shard_cancel_deferred_check_does_not_deadlock_on_unencoded_caller_id() {
     let _guard = TEST_MUTEX.lock().await;
@@ -2810,12 +2781,12 @@ async fn cross_shard_cancel_deferred_check_does_not_deadlock_on_unencoded_caller
         &mut conn,
         target_exec_id,
         &[
-            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::workflow_started(serde_json::json!({}), jiff::Timestamp::now()),
             WorkflowEvent::UpdateAdmitted {
                 update_id,
                 name: "approve".to_string(),
                 input: serde_json::Value::Null,
-                timestamp: chrono::Utc::now(),
+                timestamp: jiff::Timestamp::now(),
             },
         ],
         1,
@@ -2835,7 +2806,7 @@ async fn cross_shard_cancel_deferred_check_does_not_deadlock_on_unencoded_caller
         &mut conn,
         caller_exec_id,
         &[
-            WorkflowEvent::workflow_started(serde_json::json!({}), chrono::Utc::now()),
+            WorkflowEvent::workflow_started(serde_json::json!({}), jiff::Timestamp::now()),
             WorkflowEvent::ExternalCancelRequested {
                 cancel_id,
                 target: autumn_harvest::types::ExternalTarget::ExecutionId(target_exec_id),
@@ -2846,10 +2817,9 @@ async fn cross_shard_cancel_deferred_check_does_not_deadlock_on_unencoded_caller
     .await
     .expect("seed caller history");
 
-    // `conn` is the size-1 pool's only connection and stays checked out for
-    // the entire outbox sweep call below -- exactly the condition that
-    // exposes a self-deadlock if the routing decision wrongly reaches for a
-    // second connection from the same pool.
+    // `conn` is the only connection of the size-1 pool. It stays checked out
+    // for the whole outbox sweep below. A routing decision that wrongly asks
+    // the same pool for a second connection then self-deadlocks.
     let recorder = Arc::new(UnfinishedHandlerRecorder::default());
     let result = tokio::time::timeout(
         Duration::from_secs(8),
@@ -2891,9 +2861,8 @@ async fn cross_shard_cancel_deferred_check_does_not_deadlock_on_unencoded_caller
 }
 
 // 8. AC6 end-to-end: signalling own `(workflow_name, workflow_id)` is
-//    rejected immediately, with no DB round trip needed for the rejection
-//    itself — the workflow completes cleanly, surfacing the typed
-//    `self_signal` reason.
+//    rejected immediately, with no DB round trip for the rejection. The
+//    workflow completes cleanly and surfaces the typed `self_signal` reason.
 #[tokio::test]
 async fn worker_self_signal_by_id_rejected_end_to_end() {
     let _guard = TEST_MUTEX.lock().await;

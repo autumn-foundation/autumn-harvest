@@ -69,7 +69,6 @@ pub use crate::webhook_trigger::{
     WebhookCtx, WebhookHandlerError, WebhookTarget, WebhookTriggerInfo, validate_webhook_triggers,
 };
 
-// Re-export macros from autumn-harvest-macros.
 pub use autumn_harvest_macros::{
     activities, activity, dag, dags, queries, query, signal, signals, update, updates, webhook,
     webhooks, workflow, workflows,

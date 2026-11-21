@@ -41,7 +41,7 @@ pub struct HarvestOutboxConfig {
 /// Tunables for the batch-operations executor (issue #102).
 ///
 /// `concurrency` caps the number of in-flight per-target operations so a
-/// 10k-target batch can't monopolise the connection pool. `tick_interval_ms`
+/// 10k-target batch cannot monopolise the connection pool. `tick_interval_ms`
 /// is how often the background loop wakes up to scan for new open jobs;
 /// the same loop drains in-progress jobs synchronously within a tick.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,8 +67,9 @@ pub struct HarvestReadinessConfig {
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum RetentionRunOn {
-    /// Run retention where the resolved scheduler runs. This is the default.
-    /// A `web` role runs no scheduler, so it runs no retention.
+    /// The default. An explicit `scheduler_enabled` moves retention with
+    /// it. With none, the `harvest.maintenance` capability of the role
+    /// decides. A `web` role runs no retention.
     #[default]
     Scheduler,
     /// Run retention on each process. This is the behaviour before issue
@@ -217,8 +218,8 @@ pub struct HarvestRedisConfig {
 /// startup (issue #700 AC4).
 ///
 /// An *orphaned* type has ≥1 non-terminal execution whose `#[workflow]` handler
-/// is no longer registered in this build — those runs would wedge in permanent
-/// replay failure. This action defaults to `Warn` (non-breaking): mixed fleets
+/// this build no longer registers. Those runs would wedge in permanent replay
+/// failure. This action defaults to `Warn` (non-breaking): mixed fleets
 /// mid-rollout must not crash-loop just because an old handler was removed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -339,14 +340,30 @@ impl HarvestRuntimeConfig {
     ///
     /// `role` is the Autumn process role, or `None` with no `AppState`.
     #[must_use]
-    pub const fn process_switches(
+    pub fn process_switches(
         &self,
-        role: Option<autumn_web::config::ProcessRole>,
+        role: Option<&autumn_web::config::Role>,
     ) -> crate::process_role::ProcessSwitches {
         crate::process_role::ProcessSwitches::resolve(
             self.worker_enabled,
             self.scheduler_enabled,
             role,
+        )
+    }
+
+    /// The explicit switch of each Harvest runtime.
+    ///
+    /// `retention_enabled` is `RetentionConfig::enabled` of the build.
+    #[must_use]
+    pub const fn loop_switches(
+        &self,
+        retention_enabled: bool,
+    ) -> crate::process_role::LoopSwitches {
+        crate::process_role::LoopSwitches::new(
+            self.worker_enabled,
+            self.scheduler_enabled,
+            retention_enabled,
+            self.retention.run_on,
         )
     }
 

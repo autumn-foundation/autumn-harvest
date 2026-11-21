@@ -14,7 +14,7 @@ use std::sync::{Mutex, PoisonError};
 use autumn_harvest::agent_policy_log::{
     ACTION_RESET, ACTION_SET, PolicyAuditRow, PolicyChangeRow, PolicyRow, next_policy_revision,
 };
-use autumn_harvest::chrono::{DateTime, Utc};
+use autumn_harvest::time::Timestamp;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -95,7 +95,7 @@ pub struct PolicyAudit {
     /// The stored policy after the change.
     pub new: Option<serde_json::Value>,
     /// The time of the change.
-    pub at: DateTime<Utc>,
+    pub at: Timestamp,
 }
 
 impl PolicyAudit {
@@ -213,7 +213,6 @@ pub trait SamplingPolicyStore: Send + Sync + std::fmt::Debug {
     ) -> BoxFuture<'a, Result<Vec<PolicyAudit>, PolicyStoreError>>;
 }
 
-/// Refuse a kind that is not a valid agent kind.
 fn check_kind(kind: &str) -> Result<(), PolicyStoreError> {
     if valid_name(kind) {
         Ok(())
@@ -337,7 +336,7 @@ impl InMemorySamplingPolicyStore {
         let current = entry.row.as_ref().map_or(0, |row| row.revision);
         let revision = next_policy_revision(current).ok_or(PolicyStoreError::Full)?;
         let old = entry.row.take().and_then(|row| row.body);
-        let at = Utc::now();
+        let at = Timestamp::now();
         let action = if body.is_some() {
             ACTION_SET
         } else {

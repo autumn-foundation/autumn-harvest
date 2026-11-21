@@ -23,18 +23,24 @@ postgres = ["autumn-harvest/db"]
 eval = ["autumn-harvest/testing"]
 # A tool that runs agent code in a sandbox. See `docs/sandbox-activities.md`.
 sandbox = ["autumn-harvest/sandbox-activities", "dep:tokio-util"]
+# A Claude model over the Anthropic Messages API. It adds an HTTP client, so
+# it is off by default. See `docs/agent-adapter.md`.
+anthropic = ["dep:reqwest", "dep:rustls"]
+# A model over any OpenAI-compatible Chat Completions API: OpenAI,
+# OpenRouter, Ollama, vLLM, a LiteLLM proxy. The same HTTP client.
+openai = ["dep:reqwest", "dep:rustls"]
 
 [dependencies]
 # The backend-neutral core only: no Diesel, no Postgres, no autumn-web.
-autumn-harvest = { version = "0.10.0", path = "../autumn-harvest", default-features = false }
-autumn-harvest-sqlite = { version = "0.10.0", path = "../autumn-harvest-sqlite", optional = true }
+autumn-harvest = { version = "0.11.0", path = "../autumn-harvest", default-features = false }
+autumn-harvest-sqlite = { version = "0.11.0", path = "../autumn-harvest-sqlite", optional = true }
 # Workspace snapshots carry file bytes as base64 (issue #2274). The core
 # crate already depends on this version.
 base64 = "0.23"
 # `join_all` runs the child runs of a fan-out at the same time (issue #2270).
 futures = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 sha2 = "0.11"
 thiserror = { workspace = true }
 tokio = { workspace = true }
@@ -42,14 +48,20 @@ tracing = { workspace = true }
 # The cancellation token of a sandbox run. The core crate already depends on
 # this version.
 tokio-util = { version = "0.7", optional = true }
+# The HTTP client of the `anthropic` and `openai` features. The examples already lock
+# these versions. The TLS provider is `ring`.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"], optional = true }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 
 [dev-dependencies]
 # `testing` adds `ActivityContext::new_test_with_state` for the engine path.
-autumn-harvest = { version = "0.10.0", path = "../autumn-harvest", default-features = false, features = ["testing"] }
-chrono = { workspace = true }
-autumn-harvest-sqlite = { version = "0.10.0", path = "../autumn-harvest-sqlite" }
+autumn-harvest = { version = "0.11.0", path = "../autumn-harvest", default-features = false, features = ["testing"] }
+jiff = { workspace = true }
+autumn-harvest-sqlite = { version = "0.11.0", path = "../autumn-harvest-sqlite" }
 proptest = { workspace = true }
 tempfile = "3"
+# The store tests read the rows of the SQLite file. Already in the lockfile.
+rusqlite = { workspace = true }
 # The sandbox tool tests pass a cancellation token.
 tokio-util = "0.7"
 # Measures gzip against delta encoding (issue #2009). Already in the lockfile.
@@ -59,6 +71,7 @@ tokio = { workspace = true }
 # checks the guard with raw SQL.
 deadpool = { workspace = true }
 diesel = { workspace = true }
+jiff-diesel = { workspace = true }
 diesel-async = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
@@ -142,6 +155,23 @@ required-features = ["eval", "sqlite"]
 name = "refine_run"
 required-features = ["eval", "sqlite"]
 
+# Issue #2752: each agent workflow fits a small fixed stack in a debug build.
+[[test]]
+name = "stack_budget"
+required-features = ["eval", "sqlite"]
+
+[[test]]
+name = "refine_live"
+required-features = ["eval", "sqlite"]
+
+[[test]]
+name = "refine_gate"
+required-features = ["eval", "sqlite"]
+
+[[test]]
+name = "refine_lessons"
+required-features = ["eval", "sqlite"]
+
 [[test]]
 name = "transcript_delta"
 required-features = ["sqlite", "eval"]
@@ -180,6 +210,10 @@ required-features = ["sqlite"]
 
 [[test]]
 name = "overlay_read"
+required-features = ["sqlite"]
+
+[[test]]
+name = "profile_reload"
 required-features = ["sqlite"]
 
 [[test]]
@@ -227,8 +261,44 @@ name = "sample_crash"
 required-features = ["sqlite"]
 
 [[test]]
+name = "sample_cascade"
+required-features = ["sqlite"]
+
+[[test]]
+name = "sample_cascade_crash"
+required-features = ["sqlite"]
+
+[[test]]
+name = "sample_beam"
+required-features = ["sqlite"]
+
+[[test]]
+name = "sample_beam_crash"
+required-features = ["sqlite"]
+
+[[test]]
 name = "sample_postgres"
 required-features = ["postgres"]
+
+[[test]]
+name = "sweep"
+required-features = ["sqlite"]
+
+[[test]]
+name = "sweep_tool"
+required-features = ["sqlite"]
+
+[[test]]
+name = "sweep_crash"
+required-features = ["sqlite"]
+
+[[test]]
+name = "vote"
+required-features = ["sqlite"]
+
+[[test]]
+name = "vote_crash"
+required-features = ["sqlite"]
 
 # The `postgres` module on a real worker: the Postgres form of the SQLite
 # helpers.
@@ -255,6 +325,13 @@ workspace = true
 name = "sqlite_agent"
 required-features = ["sqlite"]
 
+# The smallest agent mesh: a delegation, a refusal and a restart. `test =
+# true` runs its tests in the crate test step. CI also runs `main`.
+[[example]]
+name = "sqlite_mesh"
+required-features = ["sqlite"]
+test = true
+
 # The same story on Postgres, with a worker in the process.
 [[example]]
 name = "postgres_agent"
@@ -265,6 +342,21 @@ required-features = ["postgres"]
 [[example]]
 name = "agent_session_entity"
 required-features = ["sqlite"]
+test = true
+
+# Two strategies over one fixed set of inputs, with a table of each sweep.
+# `test = true` runs its embedded test in the crate's own `cargo test` step.
+[[example]]
+name = "sweep_compare"
+required-features = ["sqlite"]
+test = true
+
+# The refine loop of a kind, end to end: a failed op, a refine run, an
+# approval and a passed op. The refine workflow needs `eval`. `test = true`
+# runs its tests in the crate test step, and CI also runs `main`.
+[[example]]
+name = "agent_refine"
+required-features = ["sqlite", "eval"]
 test = true
 
 # Deterministic instruction-count harness for `AgentHarness::model_turn`, the
@@ -287,3 +379,23 @@ harness = false
 [[bench]]
 name = "durable_agent_replay_profile"
 harness = false
+
+[[test]]
+name = "approval_notices"
+required-features = ["sqlite"]
+
+# The durable stores on SQLite: the suite, a crash and an erase.
+[[test]]
+name = "agent_stores"
+required-features = ["sqlite"]
+
+# The same suite on Postgres, with a worker in the process.
+[[test]]
+name = "agent_stores_postgres"
+required-features = ["postgres"]
+
+# A live check against a real OpenAI-compatible server. Its tests are
+# ignored by default.
+[[test]]
+name = "openai_live"
+required-features = ["openai"]

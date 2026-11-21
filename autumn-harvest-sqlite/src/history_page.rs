@@ -10,7 +10,7 @@
 //! on Postgres, so `after=0` reads from the first event.
 
 use autumn_harvest::{ExecutionId, WorkflowEvent};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use rusqlite::{Connection, params};
 
 use crate::error::{SqliteError, SqliteResult};
@@ -82,7 +82,7 @@ pub struct PagedEvent {
     pub event_id: i64,
     /// When the event was appended. `None` for an event written before
     /// issue #2489, or by a file that has no such column.
-    pub recorded_at: Option<DateTime<Utc>>,
+    pub recorded_at: Option<Timestamp>,
     /// The event.
     pub event: WorkflowEvent,
 }
@@ -144,7 +144,7 @@ pub fn history_page(
         events.push(PagedEvent {
             id: seq + 1,
             event_id: seq,
-            recorded_at: recorded_at.and_then(DateTime::from_timestamp_micros),
+            recorded_at: recorded_at.map(autumn_harvest::time::from_microsecond_clamped),
             event: serde_json::from_str(&json)?,
         });
     }

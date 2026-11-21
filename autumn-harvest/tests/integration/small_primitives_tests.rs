@@ -14,7 +14,7 @@ use autumn_harvest::durable_promise::{PromiseId, PromiseSettlement};
 use autumn_harvest::event::{SideEffectKind, WorkflowEvent};
 use autumn_harvest::testing::{HistorySnapshot, ReplayStatus, WorkflowReplayer, WorkflowTestEnv};
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 type HandlerFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>>;
@@ -22,7 +22,7 @@ type HandlerFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, String>> + Se
 fn started() -> WorkflowEvent {
     WorkflowEvent::WorkflowStarted {
         input: Value::Null,
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,

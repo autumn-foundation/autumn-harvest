@@ -3,11 +3,16 @@
 //! Tasks that exhaust all retry attempts are moved to the `harvest_dead_letters`
 //! table for post-mortem inspection and potential manual reprocessing. This is
 //! the final resting place for permanently failed tasks.
+//!
+//! Triggers keep the DLQ depth in `harvest_dead_letter_counts`. Each insert
+//! and delete statement inserts one delta row, in the transaction of that
+//! statement. A writer locks no counter row, so it never waits and never
+//! raises a serialization failure.
 
 use crate::schema::harvest_workflow_executions_ext;
+use jiff_diesel::ToDiesel;
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
 use diesel::ExpressionMethods;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
@@ -15,6 +20,7 @@ use diesel::SelectableHelper;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use jiff::Timestamp;
 use uuid::Uuid;
 
 use crate::error::{HarvestError, HarvestResult};
@@ -58,9 +64,9 @@ pub struct BulkDlqFilter {
     #[serde(default)]
     pub min_attempts: Option<i32>,
     /// Inclusive lower bound on `failed_at`.
-    pub failed_after: Option<chrono::DateTime<chrono::Utc>>,
+    pub failed_after: Option<jiff::Timestamp>,
     /// Exclusive upper bound on `failed_at`.
-    pub failed_before: Option<chrono::DateTime<chrono::Utc>>,
+    pub failed_before: Option<jiff::Timestamp>,
     /// Exact match on the derived [`error_class`] of the entry's error text
     /// (issue #613). Applied as a compute-on-read post-filter.
     #[serde(default)]
@@ -184,9 +190,9 @@ pub struct RedriveFilter {
     /// Exact match on the workflow name of the owning execution.
     pub workflow_name: Option<String>,
     /// Inclusive lower bound on `failed_at`.
-    pub dead_lettered_after: Option<DateTime<Utc>>,
+    pub dead_lettered_after: Option<Timestamp>,
     /// Exclusive upper bound on `failed_at`.
-    pub dead_lettered_before: Option<DateTime<Utc>>,
+    pub dead_lettered_before: Option<Timestamp>,
     /// Case-insensitive substring match on the `error` column.
     pub error_contains: Option<String>,
     /// Explicit set of dead-letter row IDs to target.
@@ -314,10 +320,10 @@ fn spread_offset_nanos(index: u128, count: u128, window: u128, mix: u64) -> u128
 /// each task keeps the default, immediate `scheduled_at`.
 #[must_use]
 pub fn redrive_schedule(
-    now: DateTime<Utc>,
+    now: Timestamp,
     window: std::time::Duration,
     ids: &[Uuid],
-) -> Vec<Option<DateTime<Utc>>> {
+) -> Vec<Option<Timestamp>> {
     if window.is_zero() {
         return vec![None; ids.len()];
     }
@@ -326,9 +332,9 @@ pub fn redrive_schedule(
         .map(|(index, id)| {
             let (high, low) = id.as_u64_pair();
             let offset = redrive_spread_offset(index, ids.len(), window, high ^ low);
-            chrono::Duration::from_std(offset)
+            jiff::SignedDuration::try_from(offset)
                 .ok()
-                .and_then(|offset| now.checked_add_signed(offset))
+                .and_then(|offset| now.checked_add(offset).ok())
         })
         .collect()
 }
@@ -406,12 +412,12 @@ pub enum DeadLetterReason {
         timeout_secs: u64,
     },
     /// A completion-callback delivery (issue #605) exhausted its configured
-    /// retry budget without ever receiving a 2xx response. Distinct from
-    /// clean task-retry exhaustion: there is no `harvest_task_queue` row or
-    /// workflow execution to reactivate on redrive — an operator-triggered
-    /// redrive resets the *same* `harvest_completion_deliveries` row
-    /// (`completion_callback::redrive_delivery`) to `PENDING` so the
-    /// scanner re-attempts it with the same `delivery_id`.
+    /// retry budget without ever receiving a 2xx response. This differs from
+    /// clean task-retry exhaustion. A redrive has no `harvest_task_queue` row or
+    /// workflow execution to reactivate. An operator-triggered redrive resets
+    /// the *same* `harvest_completion_deliveries` row
+    /// (`completion_callback::redrive_delivery`) to `PENDING`. The scanner then
+    /// re-attempts it with the same `delivery_id`.
     CallbackDeliveryExhausted {
         delivery_id: Uuid,
         attempts: i32,
@@ -459,24 +465,24 @@ impl DeadLetterReason {
 }
 
 /// Delegate a `task_type = "CALLBACK"` dead-letter's replay to the
-/// completion-delivery redrive primitive (issue #605), so the generic DLQ
-/// replay surface (single-row API, bulk replay, UI) actually redrives the
-/// delivery instead of failing on `dead_letter_task_type`'s "invalid
-/// `task_type`" error (issue #921 review, Codex P2). Called from inside the
-/// caller's already-open transaction; `completion_callback::redrive_delivery`
-/// opens its own nested transaction (a savepoint) on the same connection,
-/// which is safe.
+/// completion-delivery redrive primitive (issue #605).
+///
+/// This makes the generic DLQ replay surface (single-row API, bulk replay, UI)
+/// redrive the delivery. It does not fail on the "invalid `task_type`" error of
+/// `dead_letter_task_type` (issue #921). The caller's transaction is already
+/// open. `completion_callback::redrive_delivery` opens its own nested
+/// transaction (a savepoint) on the same connection, which is safe.
 ///
 /// Returns the delivery's own id (`original_task_id`, stable across
-/// redrives) in place of a newly-created task-queue row id — there is no
-/// task-queue row for a completion delivery, so this is the closest
-/// equivalent "id of the unit of work that now represents this retry."
+/// redrives), not a new task-queue row id. A completion delivery has no
+/// task-queue row. So this id is the closest equivalent: "id of the unit of
+/// work that now represents this retry."
 async fn redrive_callback_dead_letter(
     conn: &mut AsyncPgConnection,
     dead_letter_id: Uuid,
     workflow_exec_id: Option<Uuid>,
     original_task_id: Uuid,
-    not_before: Option<DateTime<Utc>>,
+    not_before: Option<Timestamp>,
 ) -> HarvestResult<Uuid> {
     let exec_id = workflow_exec_id
         .map(crate::types::ExecutionId::from_uuid)
@@ -516,13 +522,13 @@ async fn redrive_callback_dead_letter(
 /// compares `next_attempt_at` with the host clock.
 async fn slot_on_host_clock(
     conn: &mut AsyncPgConnection,
-    not_before: Option<DateTime<Utc>>,
-) -> HarvestResult<Option<DateTime<Utc>>> {
+    not_before: Option<Timestamp>,
+) -> HarvestResult<Option<Timestamp>> {
     let Some(at) = not_before else {
         return Ok(None);
     };
     let db_now = crate::queue::db_now(conn).await?;
-    Ok(Some(to_host_clock(at, db_now, Utc::now())))
+    Ok(Some(to_host_clock(at, db_now, Timestamp::now())))
 }
 
 /// Where a redriven run's timeout window starts (issue #1832).
@@ -533,36 +539,52 @@ async fn slot_on_host_clock(
 /// both clocks, so a window that starts there never expires before the task
 /// becomes due. Clock skew can only add time to the window.
 #[must_use]
-fn deadline_window_start(
-    slot: DateTime<Utc>,
-    db_now: DateTime<Utc>,
-    host_now: DateTime<Utc>,
-) -> DateTime<Utc> {
+fn deadline_window_start(slot: Timestamp, db_now: Timestamp, host_now: Timestamp) -> Timestamp {
     slot.max(to_host_clock(slot, db_now, host_now))
 }
 
 /// [`deadline_window_start`] for an optional slot, with the clocks read now.
 async fn deadline_slot(
     conn: &mut AsyncPgConnection,
-    not_before: Option<DateTime<Utc>>,
-) -> HarvestResult<Option<DateTime<Utc>>> {
+    not_before: Option<Timestamp>,
+) -> HarvestResult<Option<Timestamp>> {
     let Some(slot) = not_before else {
         return Ok(None);
     };
     let db_now = crate::queue::db_now(conn).await?;
-    Ok(Some(deadline_window_start(slot, db_now, Utc::now())))
+    Ok(Some(deadline_window_start(slot, db_now, Timestamp::now())))
 }
 
 /// Move a database-clock instant onto the host clock (issue #1832).
 ///
 /// The result is as far after `host_now` as `at` is after `db_now`.
 #[must_use]
-fn to_host_clock(
-    at: DateTime<Utc>,
-    db_now: DateTime<Utc>,
-    host_now: DateTime<Utc>,
-) -> DateTime<Utc> {
+fn to_host_clock(at: Timestamp, db_now: Timestamp, host_now: Timestamp) -> Timestamp {
     host_now + (at - db_now)
+}
+
+/// Give a requeued activity task the key and the current cap of its
+/// activity.
+///
+/// The dead letter stores no key and no cap. Without them the task would
+/// claim past the cap of its key. The cap is the effective cap, so an
+/// operator override applies. A process with no registry, or one that does
+/// not register the activity, leaves the task with no key and no cap.
+fn restore_activity_concurrency(
+    params: &mut EnqueueParams,
+    task_type: TaskType,
+    registry: Option<&HandlerRegistry>,
+) {
+    if task_type != TaskType::Activity {
+        return;
+    }
+    let (Some(registry), Some(name)) = (registry, params.activity_name.as_deref()) else {
+        return;
+    };
+    if let (Some(key), cap) = registry.activity_concurrency(name) {
+        params.concurrency_key = Some(key);
+        params.max_concurrent = cap;
+    }
 }
 
 /// The enqueue parameters that put `entry` back on its queue.
@@ -578,7 +600,7 @@ fn to_host_clock(
 fn requeue_params(
     entry: DeadLetter,
     task_type: TaskType,
-    not_before: Option<DateTime<Utc>>,
+    not_before: Option<Timestamp>,
     codecs: &PayloadCodecs,
 ) -> (EnqueueParams, bool) {
     let (input, decoded) = match codecs.decode_column(&entry.input) {
@@ -701,13 +723,12 @@ pub struct NewDeadLetterEntry {
 /// Denormalizes `workflow_name` and the resolved per-tenant `quota_key` (issue
 /// #946) onto the DLQ row itself, via a single indexed point lookup keyed on
 /// `entry.workflow_exec_id`. This mirrors the `owner`/`severity` denormalization
-/// precedent (issue #372): `max_dead_letters` quota accounting must never
-/// depend on the originating execution row still existing once retention
-/// (issue #737) collects it, and resolving it centrally here (rather than
-/// requiring every one of `dead_letter()`'s many call sites to pass it in)
-/// guarantees every DLQ insertion path gets correct quota bookkeeping for
-/// free. When `workflow_exec_id` is `None` (a non-workflow-scoped task), both
-/// columns are left `NULL`.
+/// precedent (issue #372). `max_dead_letters` quota accounting must never
+/// depend on the originating execution row, which retention (issue #737) can
+/// collect. The central lookup here means no call site of `dead_letter()` has
+/// to pass the values in. So every DLQ insertion path gets correct quota
+/// bookkeeping for free. When `workflow_exec_id` is `None` (a
+/// non-workflow-scoped task), both columns are left `NULL`.
 ///
 /// This form does not encode the input. It stores the input as it arrives,
 /// so a stored envelope stays an envelope. Use [`dead_letter_with_codecs`] to
@@ -784,21 +805,81 @@ pub async fn dead_letter_with_codecs(
         .ok_or_else(|| HarvestError::Database("insert returned no ID".into()))
 }
 
+/// The DLQ depth statement of [`dead_letter_count`].
+///
+/// Triggers on `harvest_dead_letters` keep `harvest_dead_letter_counts`
+/// exact. `harvest_dead_letter_depth()` sums its rows.
+/// [`fold_dead_letter_counts`] keeps those rows few. So the statement does not
+/// read the dead letters. The function is `SECURITY DEFINER`, so a role needs
+/// no grant on the counter table.
+pub const DLQ_DEPTH_SQL: &str = "SELECT harvest_dead_letter_depth() AS entries";
+
+#[derive(diesel::QueryableByName)]
+struct DepthRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    entries: i64,
+}
+
 /// Count the total number of entries in the dead-letter queue.
+///
+/// The count is exact, unless a write bypassed the triggers. Then
+/// [`recount_dead_letters`] repairs it. It reads the counter of
+/// [`DLQ_DEPTH_SQL`], so its cost does not grow with the DLQ.
 ///
 /// # Errors
 ///
 /// Returns [`HarvestError::Database`] on query failure.
 pub async fn dead_letter_count(conn: &mut AsyncPgConnection) -> HarvestResult<i64> {
-    use crate::schema::harvest_dead_letters::dsl;
-
-    let count: i64 = dsl::harvest_dead_letters
-        .count()
+    let row: DepthRow = diesel::sql_query(DLQ_DEPTH_SQL)
         .get_result(conn)
         .await
         .map_err(crate::error::database_error)?;
+    Ok(row.entries)
+}
 
-    Ok(count)
+/// Run `sql`, a `SELECT` of one counter function, in a `READ COMMITTED`
+/// transaction. The level is pinned, not inherited from the session.
+async fn counter_call(conn: &mut AsyncPgConnection, sql: &'static str) -> HarvestResult<i64> {
+    let mut tx = conn.build_transaction().read_committed();
+    let row: DepthRow = Box::pin(tx.run(async |c| {
+        diesel::sql_query(sql)
+            .get_result::<DepthRow>(c)
+            .await
+            .map_err(HarvestError::from)
+    }))
+    .await?;
+    Ok(row.entries)
+}
+
+/// Fold the free delta rows of the DLQ depth counter into one row.
+///
+/// Each dead-letter statement adds one delta row. The timeout pass calls this
+/// function once per tick, so the gauge reads a few rows. A fold scans the
+/// whole counter, so no writer calls it. A row that another open transaction
+/// holds stays as it is.
+///
+/// Returns the count of rows that the fold removed.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] on query failure.
+pub async fn fold_dead_letter_counts(conn: &mut AsyncPgConnection) -> HarvestResult<i64> {
+    counter_call(conn, "SELECT harvest_dead_letter_fold() AS entries").await
+}
+
+/// Set the DLQ depth counter to the exact count of `harvest_dead_letters`.
+///
+/// It repairs a drift: for example after a write with the triggers off, a
+/// data-only restore, or a promotion of a logical standby. It locks the DLQ
+/// against writes until it commits, and it reads the whole DLQ once.
+///
+/// Returns the exact count.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] on query failure or a lock timeout.
+pub async fn recount_dead_letters(conn: &mut AsyncPgConnection) -> HarvestResult<i64> {
+    counter_call(conn, "SELECT harvest_dead_letter_recount() AS entries").await
 }
 
 /// The age in whole seconds of the newest dead letter, or `NULL` with none.
@@ -870,7 +951,7 @@ pub async fn replay_dead_letter_at(
     conn: &mut AsyncPgConnection,
     dead_letter_id: Uuid,
     registry: Option<&HandlerRegistry>,
-    not_before: Option<DateTime<Utc>>,
+    not_before: Option<Timestamp>,
 ) -> HarvestResult<Uuid> {
     use crate::schema::harvest_dead_letters::dsl;
 
@@ -892,12 +973,12 @@ pub async fn replay_dead_letter_at(
                 .ok_or_else(|| HarvestError::NotFound(format!("dead-letter {dead_letter_id}")))?;
 
             // A completion-callback dead letter (issue #605) is not a
-            // WORKFLOW/ACTIVITY task-queue row -- it represents an exhausted
+            // WORKFLOW/ACTIVITY task-queue row. It is an exhausted
             // completion-delivery attempt, and "replay by re-enqueue" below
             // has no meaning for it. Delegate to the delivery's own redrive
-            // primitive instead of erroring with "invalid task_type" (issue
-            // #921 review, Codex P2): the generic DLQ "replay" surface (API,
-            // bulk replay, UI) must actually redrive the delivery, not fail.
+            // primitive, not an "invalid task_type" error (issue #921). The
+            // generic DLQ "replay" surface (API, bulk replay, UI) must redrive
+            // the delivery, not fail.
             if entry.task_type.eq_ignore_ascii_case("callback") {
                 return redrive_callback_dead_letter(
                     conn,
@@ -949,10 +1030,10 @@ pub async fn replay_dead_letter_at(
                     }
                     params.required_build_id = build_id;
                     // Concurrency policy lives on WorkflowInfo and governs
-                    // workflow-task slots only.  Activity tasks are not subject
-                    // to the workflow-level cap (the claim query enforces caps
-                    // per task_type, so mixing them would throttle activities
-                    // against the wrong budget).
+                    // workflow-task slots only. The workflow-level cap does not
+                    // apply to activity tasks. The claim query enforces caps
+                    // per task_type, so a mix would throttle activities
+                    // against the wrong budget.
                     if task_type == TaskType::Workflow
                         && decoded
                         && let Some(reg) = registry
@@ -966,6 +1047,7 @@ pub async fn replay_dead_letter_at(
                     }
                 }
             }
+            restore_activity_concurrency(&mut params, task_type, registry);
 
             seal_requeued_input(&mut params, decoded, codecs)?;
             let task_id = crate::queue::enqueue(conn, &params).await?;
@@ -991,13 +1073,13 @@ pub async fn replay_dead_letter_at(
 
 /// Count dead-letter rows matching `filter` without applying a row limit.
 ///
-/// Used both internally (to populate `BulkDlqResult::matched`) and by the
-/// API fan-out layer to count matches on shards where the global limit is
-/// already exhausted, so that `matched` in the aggregated response always
-/// reflects the true pre-limit total across all shards.
+/// It populates `BulkDlqResult::matched`. The API fan-out layer also uses it
+/// to count matches on shards where the global limit is already exhausted. So
+/// `matched` in the aggregated response is the true pre-limit total across all
+/// shards.
 ///
-/// This is part of the external-embedder surface (issue #613): the live HTTP
-/// path uses the `_api_bulk` variants in the plugin's `api.rs`, which apply the
+/// This is part of the external-embedder surface (issue #613). The live HTTP
+/// path uses the `_api_bulk` variants in the plugin's `api.rs`. They apply the
 /// same predicate set. Keep the two in sync when adding a filter dimension.
 ///
 /// A cause filter is compute-on-read — it loads all SQL-prefiltered rows and
@@ -1052,10 +1134,10 @@ pub async fn count_bulk_filter_matches(
         query = query.filter(dsl::attempts.ge(min));
     }
     if let Some(after) = filter.failed_after {
-        query = query.filter(dsl::failed_at.ge(after));
+        query = query.filter(dsl::failed_at.ge(after.to_diesel()));
     }
     if let Some(before) = filter.failed_before {
-        query = query.filter(dsl::failed_at.lt(before));
+        query = query.filter(dsl::failed_at.lt(before.to_diesel()));
     }
 
     // Cause dimensions (issue #613) are compute-on-read: load the SQL-filtered
@@ -1121,10 +1203,10 @@ async fn query_dead_letters_for_bulk(
         query = query.filter(dsl::attempts.ge(min));
     }
     if let Some(after) = filter.failed_after {
-        query = query.filter(dsl::failed_at.ge(after));
+        query = query.filter(dsl::failed_at.ge(after.to_diesel()));
     }
     if let Some(before) = filter.failed_before {
-        query = query.filter(dsl::failed_at.lt(before));
+        query = query.filter(dsl::failed_at.lt(before.to_diesel()));
     }
 
     let rows = query
@@ -1234,7 +1316,7 @@ async fn spread_schedule(
     conn: &mut AsyncPgConnection,
     spread_secs: Option<u64>,
     ids: &[Uuid],
-) -> HarvestResult<Vec<Option<DateTime<Utc>>>> {
+) -> HarvestResult<Vec<Option<Timestamp>>> {
     let window = redrive_spread_window(spread_secs, ids.len());
     if window.is_zero() {
         return Ok(vec![None; ids.len()]);
@@ -1395,10 +1477,10 @@ fn apply_redrive_filter<'a>(
         );
     }
     if let Some(after) = filter.dead_lettered_after {
-        query = query.filter(dsl::failed_at.ge(after));
+        query = query.filter(dsl::failed_at.ge(after.to_diesel()));
     }
     if let Some(before) = filter.dead_lettered_before {
-        query = query.filter(dsl::failed_at.lt(before));
+        query = query.filter(dsl::failed_at.lt(before.to_diesel()));
     }
     if let Some(ref needle) = filter.error_contains {
         query = query.filter(dsl::error.ilike(format!("%{}%", escape_like(needle))));
@@ -1451,9 +1533,9 @@ async fn query_dead_letters_for_redrive(
 ///
 /// Re-enqueues the dead-lettered task onto its original queue with a fresh
 /// retry budget. Unlike [`replay_dead_letter`], a redrive **reactivates** an
-/// owning execution that was sealed `FAILED` at quarantine time (`FAILED →
-/// RUNNING`, appending a [`WorkflowEvent::WorkflowRedriven`] event so replay
-/// resumes from existing history append-only). The whole operation is one
+/// owning execution sealed `FAILED` at quarantine time (`FAILED → RUNNING`).
+/// It appends a [`WorkflowEvent::WorkflowRedriven`] event, so replay resumes
+/// from existing history append-only. The whole operation is one
 /// transaction.
 ///
 /// Outcomes:
@@ -1494,7 +1576,7 @@ pub async fn redrive_dead_letter_at(
     dead_letter_id: Uuid,
     registry: Option<&HandlerRegistry>,
     reason: Option<&str>,
-    not_before: Option<DateTime<Utc>>,
+    not_before: Option<Timestamp>,
 ) -> HarvestResult<RedriveOutcome> {
     use crate::schema::harvest_dead_letters::dsl;
 
@@ -1516,9 +1598,8 @@ pub async fn redrive_dead_letter_at(
             };
 
             // Delegate a completion-callback dead letter (issue #605) to its
-            // own redrive primitive instead of erroring with "invalid
-            // task_type" (issue #921 review, Codex P2) -- see
-            // `redrive_callback_dead_letter`'s doc comment.
+            // own redrive primitive, not an "invalid task_type" error (issue
+            // #921). See the doc comment of `redrive_callback_dead_letter`.
             if entry.task_type.eq_ignore_ascii_case("callback") {
                 return match redrive_callback_dead_letter(
                     conn,
@@ -1606,6 +1687,7 @@ pub async fn redrive_dead_letter_at(
                     params.max_concurrent = Some(policy.limit);
                 }
             }
+            restore_activity_concurrency(&mut params, task_type, registry);
 
             seal_requeued_input(&mut params, decoded, codecs)?;
             let task_id = crate::queue::enqueue(conn, &params).await?;
@@ -1697,21 +1779,20 @@ pub async fn redrive_dead_letters(
 // Root-cause aggregation (issue #385)
 // ---------------------------------------------------------------------------
 //
-// The DLQ aggregation endpoint answers the operator's first incident question —
-// "what is the shape of this fire?" — by grouping dead-letter rows along a small,
-// named set of dimensions and returning per-group counts plus a handful of
+// The DLQ aggregation endpoint answers the first incident question of an
+// operator: what is the shape of this fire? It groups dead-letter rows along
+// a small, named set of dimensions. It returns per-group counts plus a few
 // representative `dead_letter_id`s. It is a read-path-only feature: no new
 // `WorkflowEvent` variants and no schema change.
 //
 // **Signature derivation choice.** `harvest_dead_letters.error` is freeform
 // `TEXT`, so grouping on the raw column yields a long tail of singletons. This
-// slice implements the *compute-on-read normalized substring* option (the
-// zero-migration choice called out in the issue): [`failure_signature`] takes
-// the first line of the error, normalizes dynamic runs (UUIDs, long hex strings,
-// and decimal integers) to fixed placeholders, and truncates to
-// [`SIGNATURE_MAX_LEN`] characters. Because it is a pure function of the error
-// text, the same root cause aggregates identically across queries and across
-// shards.
+// slice implements the *compute-on-read normalized substring* option, the
+// zero-migration choice in the issue. [`failure_signature`] takes the first
+// line of the error. It normalizes dynamic runs (UUIDs, long hex strings, and
+// decimal integers) to fixed placeholders. It truncates to
+// [`SIGNATURE_MAX_LEN`] characters. It is a pure function of the error text.
+// So the same root cause aggregates identically across queries and shards.
 
 /// Maximum length of a derived failure signature, in characters.
 pub const SIGNATURE_MAX_LEN: usize = 200;
@@ -1731,9 +1812,9 @@ const PLACEHOLDER_NUM: &str = "<NUM>";
 
 /// Derive a stable, deterministic failure signature from a freeform DLQ error.
 ///
-/// The signature is the first line of `error`, with dynamic runs (UUIDs, long
-/// hex strings, and decimal integers) normalized to fixed placeholders and the
-/// result truncated to [`SIGNATURE_MAX_LEN`] characters. It is a pure function
+/// The signature is the first line of `error`. Dynamic runs (UUIDs, long hex
+/// strings, and decimal integers) become fixed placeholders. The result is
+/// truncated to [`SIGNATURE_MAX_LEN`] characters. It is a pure function
 /// of its input, so it is identical across queries and across shards for the
 /// same root-cause error text (issue #385).
 #[must_use]
@@ -1751,11 +1832,11 @@ pub const ERROR_CLASS_MAX_LEN: usize = 80;
 ///
 /// Engine-authored quarantine entries serialize a tagged [`DeadLetterReason`]
 /// as their `error` (see `dead_letter`'s callers); those map to the reason's
-/// stable `snake_case` [`DeadLetterReason::reason_class`]. Every other error —
-/// a plain `Err(String)` or a typed activity-failure envelope — is retry
-/// exhaustion (there is no production path that dead-letters a plain
-/// retry-exhausted activity, but tests and embedders can), so it maps to
-/// `"retry_exhaustion"`. Pure and deterministic: identical across queries and
+/// stable `snake_case` [`DeadLetterReason::reason_class`]. Every other error is
+/// retry exhaustion and maps to `"retry_exhaustion"`. Such an error is a plain
+/// `Err(String)` or a typed activity-failure envelope. No production path
+/// dead-letters a plain retry-exhausted activity, but tests and embedders can.
+/// Pure and deterministic: identical across queries and
 /// shards for the same input.
 #[must_use]
 pub fn dlq_reason(error: &str) -> String {
@@ -1779,14 +1860,14 @@ pub fn dlq_reason(error: &str) -> String {
 /// deterministic: identical across queries and shards for the same input.
 ///
 /// An empty `error` yields an empty-string class, which the bulk-filter
-/// validator rejects with `400` (a degenerate input: production `error` is NOT
-/// NULL and carries a tagged reason or a non-empty message).
+/// validator rejects with `400`. That input is degenerate: production `error`
+/// is NOT NULL and carries a tagged reason or a non-empty message.
 #[must_use]
 pub fn error_class(error: &str) -> String {
-    // Every branch returns a trimmed value so a padded `error_type` facet key
-    // round-trips through the (trimming) bulk-filter validator (issue #613): a
-    // facet key read from this classifier and fed back as a `BulkDlqFilter`
-    // cause dimension must re-select the same rows.
+    // Every branch returns a trimmed value. So a padded `error_type` facet key
+    // round-trips through the trimming bulk-filter validator (issue #613). A
+    // facet key from this classifier, fed back as a `BulkDlqFilter` cause
+    // dimension, must re-select the same rows.
     if let Some(failure) = crate::failure::parse_typed_payload(error) {
         return truncate_chars(failure.error_type.trim(), ERROR_CLASS_MAX_LEN);
     }
@@ -1861,9 +1942,9 @@ fn is_hex_run(token: &str) -> bool {
     {
         return !body.is_empty() && body.bytes().all(|b| b.is_ascii_hexdigit());
     }
-    // Plain hex: require length >= 8 to avoid normalizing short words, and
-    // require at least one hex letter (a-f/A-F) so pure decimal strings ≥8
-    // digits fall through to replace_digit_runs instead of becoming <HEX>.
+    // Plain hex: require length >= 8, so short words stay as they are. Also
+    // require at least one hex letter (a-f/A-F). Then a pure decimal string of
+    // 8 or more digits falls through to replace_digit_runs, not <HEX>.
     token.len() >= 8
         && token.bytes().all(|b| b.is_ascii_hexdigit())
         && token
@@ -1956,10 +2037,10 @@ pub enum TimeBucketGranularity {
 impl TimeBucketGranularity {
     /// Format a timestamp into its bucket key.
     #[must_use]
-    pub fn format(self, ts: DateTime<Utc>) -> String {
+    pub fn format(self, ts: Timestamp) -> String {
         match self {
-            Self::Hour => ts.format("%Y-%m-%dT%H:00:00Z").to_string(),
-            Self::Day => ts.format("%Y-%m-%d").to_string(),
+            Self::Hour => ts.strftime("%Y-%m-%dT%H:00:00Z").to_string(),
+            Self::Day => ts.strftime("%Y-%m-%d").to_string(),
         }
     }
 }
@@ -1980,9 +2061,9 @@ pub struct DlqAggregateParams {
     /// Filter: exact task type (`"activity"` or `"workflow"`, case-insensitive).
     pub task_type: Option<String>,
     /// Filter: inclusive lower bound on `failed_at`.
-    pub since: Option<DateTime<Utc>>,
+    pub since: Option<Timestamp>,
     /// Filter: exclusive upper bound on `failed_at`.
-    pub until: Option<DateTime<Utc>>,
+    pub until: Option<Timestamp>,
     /// Filter: minimum number of attempts.
     pub min_attempts: Option<i32>,
     /// Cap on returned groups; long tail rolls into `_other`.
@@ -2013,19 +2094,17 @@ impl DlqAggregateParams {
     /// Parse and validate query-string pairs into aggregation parameters.
     ///
     /// `now` anchors relative durations (e.g. `since=24h`). Unknown query keys
-    /// are ignored (forward-compatible), but invalid values for known keys —
-    /// an unknown `group_by` dimension, a malformed duration, or an out-of-range
-    /// `limit_groups`/`samples_per_group` — return `Err(message)` so the caller
-    /// can answer `400 Bad Request` rather than silently matching nothing.
+    /// are ignored (forward-compatible). An invalid value for a known key
+    /// returns `Err(message)`, so the caller can answer `400 Bad Request` and
+    /// not silently match nothing. Examples are an unknown `group_by`
+    /// dimension, a malformed duration, or an out-of-range
+    /// `limit_groups`/`samples_per_group`.
     ///
     /// # Errors
     ///
     /// Returns a human-readable error message string on any invalid parameter
     /// value, or when no `group_by` dimension is supplied.
-    pub fn from_query_pairs(
-        pairs: &[(String, String)],
-        now: DateTime<Utc>,
-    ) -> Result<Self, String> {
+    pub fn from_query_pairs(pairs: &[(String, String)], now: Timestamp) -> Result<Self, String> {
         let mut params = Self::default();
 
         for (key, value) in pairs {
@@ -2123,19 +2202,16 @@ fn set_filter(slot: &mut Option<String>, value: &str) {
     }
 }
 
-pub fn parse_instant(
-    field: &str,
-    value: &str,
-    now: DateTime<Utc>,
-) -> Result<DateTime<Utc>, String> {
+pub fn parse_instant(field: &str, value: &str, now: Timestamp) -> Result<Timestamp, String> {
     let trimmed = value.trim();
-    if let Ok(parsed) = DateTime::parse_from_rfc3339(trimmed) {
-        return Ok(parsed.with_timezone(&Utc));
+    if let Ok(parsed) = crate::time::parse::rfc3339(trimmed) {
+        return Ok(parsed);
     }
     if let Some(dur) = crate::task_duration(trimmed)
-        && let Ok(chrono_dur) = chrono::Duration::from_std(dur)
+        && let Ok(dur) = jiff::SignedDuration::try_from(dur)
+        && let Ok(at) = now.checked_sub(dur)
     {
-        return Ok(now - chrono_dur);
+        return Ok(at);
     }
     Err(format!(
         "invalid {field} '{value}'; expected an RFC 3339 timestamp or a relative \
@@ -2154,9 +2230,9 @@ pub struct DlqRawGroup {
     /// Number of DLQ rows in this group.
     pub count: i64,
     /// Earliest `failed_at` in the group.
-    pub first_seen: Option<DateTime<Utc>>,
+    pub first_seen: Option<Timestamp>,
     /// Latest `failed_at` in the group.
-    pub last_seen: Option<DateTime<Utc>>,
+    pub last_seen: Option<Timestamp>,
     /// Representative `dead_letter_id`s (capped at `samples_per_group`).
     pub sample_ids: Vec<String>,
 }
@@ -2182,10 +2258,10 @@ pub struct DlqGroup {
     pub count: i64,
     /// Earliest `failed_at` across shards (omitted for the `_other` row).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub first_seen: Option<DateTime<Utc>>,
+    pub first_seen: Option<Timestamp>,
     /// Latest `failed_at` across shards (omitted for the `_other` row).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_seen: Option<DateTime<Utc>>,
+    pub last_seen: Option<Timestamp>,
     /// Representative `dead_letter_id`s, taken from any shard.
     pub sample_dead_letter_ids: Vec<String>,
 }
@@ -2203,7 +2279,7 @@ pub struct DlqAggregateResponse {
     pub truncated: bool,
 }
 
-fn min_instant(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+fn min_instant(a: Option<Timestamp>, b: Option<Timestamp>) -> Option<Timestamp> {
     match (a, b) {
         (Some(x), Some(y)) => Some(x.min(y)),
         (Some(x), None) | (None, Some(x)) => Some(x),
@@ -2211,7 +2287,7 @@ fn min_instant(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Option<Dat
     }
 }
 
-fn max_instant(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+fn max_instant(a: Option<Timestamp>, b: Option<Timestamp>) -> Option<Timestamp> {
     match (a, b) {
         (Some(x), Some(y)) => Some(x.max(y)),
         (Some(x), None) | (None, Some(x)) => Some(x),
@@ -2235,13 +2311,13 @@ fn render_group_key(params: &DlqAggregateParams, key: &[Option<String>]) -> serd
 /// workflow-count fleet snapshot in `autumn-harvest-plugin`).
 ///
 /// `groups` is sorted descending by `count_of` (ties broken by `key`,
-/// ascending) and truncated to `limit`. When the dropped tail's summed count
-/// is positive, it is folded into one rollup entry appended via `make_other`
-/// and the returned `bool` is `true`; a truncation that only drops zero-count
-/// entries reports `false` and appends no rollup row (this never happens for
-/// real `COUNT(*)` rows, which are always `>= 1`, but keeps the helper exact
-/// for any future caller with synthetic zero-count groups). Per-group counts
-/// always reconcile to the pre-rollup total either way.
+/// ascending) and truncated to `limit`. A dropped tail with a positive summed
+/// count folds into one rollup entry from `make_other`, and the returned
+/// `bool` is `true`. A truncation that only drops zero-count entries reports
+/// `false` and appends no rollup row. Real `COUNT(*)` rows are always `>= 1`,
+/// so that never happens for them. The rule keeps the helper exact for a
+/// future caller with synthetic zero-count groups. Per-group counts always reconcile to the
+/// pre-rollup total either way.
 #[must_use]
 pub fn rollup_top_n<K: Ord, A, T>(
     mut groups: Vec<(K, A)>,
@@ -2276,10 +2352,10 @@ pub fn rollup_top_n<K: Ord, A, T>(
 ///
 /// Counts sum across shards; `first_seen`/`last_seen` take the global min/max;
 /// sample IDs are taken from any shard up to `samples_per_group`. Groups are
-/// ordered by descending count (ties broken by key for determinism). When more
-/// than `limit_groups` distinct groups exist, the long tail is rolled into a
-/// single `{"_other": true}` group so the per-group counts reconcile to
-/// `filtered_total`, and `truncated` is set to `true`.
+/// ordered by descending count (ties broken by key for determinism). Past
+/// `limit_groups` distinct groups, the long tail rolls into a single
+/// `{"_other": true}` group, and `truncated` is set to `true`. So the per-group
+/// counts reconcile to `filtered_total`.
 #[must_use]
 pub fn merge_dlq_aggregates(
     params: &DlqAggregateParams,
@@ -2353,17 +2429,16 @@ pub fn merge_dlq_aggregates(
 /// [`aggregate_dead_letters`] selects it: `(id, workflow_exec_id,
 /// activity_name, queue_name, task_type, failed_at, error)`.
 ///
-/// `pub` (rather than the module-private alias this used to be) so
-/// [`group_dead_letter_rows`] -- and the `dlq_aggregate_profile` benchmark
-/// harness that drives it directly, without a database -- can be called from
-/// outside this module.
+/// It is `pub` so code outside this module can call
+/// [`group_dead_letter_rows`]. The `dlq_aggregate_profile` benchmark harness
+/// drives it directly, without a database.
 pub type AggregateRow = (
     Uuid,
     Option<Uuid>,
     Option<String>,
     String,
     String,
-    DateTime<Utc>,
+    Timestamp,
     String,
 );
 
@@ -2372,25 +2447,21 @@ pub type AggregateRow = (
 /// Pure and DB-free: the derived [`failure_signature`]/[`dlq_reason`]/
 /// [`error_class`] classification, the per-row grouping key, and the count/
 /// first-seen/last-seen/sample-id bookkeeping are all in-memory work with no
-/// I/O. Shared verbatim by [`aggregate_dead_letters`] (fed real DB rows) and
-/// the `dlq_aggregate_profile` benchmark harness (fed a synthetic but
-/// realistic incident-shaped batch), so both exercise byte-identical code —
-/// see `benches/dlq_aggregate_profile.rs` and
-/// `docs/performance-dlq-aggregate.md`.
+/// I/O. [`aggregate_dead_letters`] (real DB rows) and the
+/// `dlq_aggregate_profile` benchmark harness (a synthetic incident-shaped
+/// batch) share it verbatim. So both exercise byte-identical code. See
+/// `benches/dlq_aggregate_profile.rs` and `docs/performance-dlq-aggregate.md`.
 ///
-/// Deliberately uses `entry(key.clone())` rather than a `get_mut`-first
-/// lookup: a `get_mut`-first rewrite was measured to save ~6% instructions
-/// on a hit-heavy (few groups, many rows -- the intended "DLQ flood"
-/// triage) workload, but `group_by` is fully caller-controlled, and the
-/// same rewrite was independently measured to *cost* ~4.5% instructions on
-/// an adversarial miss-heavy workload (a caller-chosen `group_by` that
-/// yields mostly-distinct keys, e.g. `[ActivityName]` on a fleet with many
-/// distinct activity names): `get_mut` plus a fallback `insert` pays two
-/// hash+probe passes on every miss, versus `entry()`'s one. `entry()`'s
-/// per-row cost is invariant to hit/miss ratio, which matters more for a
-/// caller-facing endpoint than optimizing one particular input shape at
-/// another's expense. See `docs/performance-dlq-aggregate.md`'s "Negative
-/// result" section for the full measurement.
+/// It deliberately uses `entry(key.clone())`, not a `get_mut`-first lookup.
+/// A `get_mut`-first rewrite saved ~6% instructions on a hit-heavy workload
+/// (few groups, many rows: the intended "DLQ flood" triage). But `group_by` is
+/// fully caller-controlled. The same rewrite *cost* ~4.5% instructions on an
+/// adversarial miss-heavy workload. An example is `[ActivityName]` on a fleet
+/// with many distinct activity names. `get_mut` plus a fallback `insert` pays
+/// two hash+probe passes on every miss; `entry()` pays one. The per-row cost
+/// of `entry()` does not depend on the hit/miss ratio. For a caller-facing
+/// endpoint, that matters more than a gain on one input shape. See the
+/// "Negative result" section of `docs/performance-dlq-aggregate.md`.
 #[must_use]
 #[allow(
     clippy::implicit_hasher,
@@ -2477,10 +2548,10 @@ pub async fn aggregate_dead_letters(
         );
     }
     if let Some(since) = params.since {
-        query = query.filter(dsl::failed_at.ge(since));
+        query = query.filter(dsl::failed_at.ge(since.to_diesel()));
     }
     if let Some(until) = params.until {
-        query = query.filter(dsl::failed_at.lt(until));
+        query = query.filter(dsl::failed_at.lt(until.to_diesel()));
     }
     if let Some(min) = params.min_attempts {
         query = query.filter(dsl::attempts.ge(min));
@@ -2505,9 +2576,32 @@ pub async fn aggregate_dead_letters(
             dsl::failed_at,
             dsl::error,
         ))
-        .load(conn)
+        .load::<(
+            Uuid,
+            Option<Uuid>,
+            Option<String>,
+            String,
+            String,
+            crate::time::sql::SqlTimestamp,
+            String,
+        )>(conn)
         .await
-        .map_err(crate::error::database_error)?;
+        .map_err(crate::error::database_error)?
+        .into_iter()
+        .map(
+            |(id, exec_id, activity, queue, task_type, failed_at, error)| {
+                (
+                    id,
+                    exec_id,
+                    activity,
+                    queue,
+                    task_type,
+                    failed_at.to_jiff(),
+                    error,
+                )
+            },
+        )
+        .collect();
 
     let filtered_total = i64::try_from(rows.len()).unwrap_or(i64::MAX);
 
@@ -2546,13 +2640,25 @@ async fn load_workflow_names(
     Ok(rows.into_iter().collect())
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `chrono` held a far-future sentinel and read more than 9 fraction
+    /// digits. Both still parse.
+    #[test]
+    fn parse_instant_reads_what_chrono_read() {
+        let now = Timestamp::constant(1_700_000_000, 0);
+        assert_eq!(
+            parse_instant("until", "9999-12-31T23:59:59Z", now),
+            Ok(Timestamp::MAX)
+        );
+        assert_eq!(
+            parse_instant("since", "2026-01-01T00:00:00.1234567891Z", now),
+            Ok(Timestamp::constant(1_767_225_600, 123_456_789))
+        );
+        assert!(parse_instant("since", "soon", now).is_err());
+    }
 
     fn aead_codecs() -> PayloadCodecs {
         let codecs = PayloadCodecs::default();
@@ -2608,7 +2714,7 @@ mod tests {
             input: serde_json::json!({}),
             error: String::new(),
             attempts: 1,
-            failed_at: Utc::now(),
+            failed_at: Timestamp::now(),
             owner: None,
             severity: None,
             workflow_name: None,
@@ -2676,7 +2782,7 @@ mod tests {
         );
         assert!(
             !RedriveFilter {
-                dead_lettered_after: Some(Utc::now()),
+                dead_lettered_after: Some(Timestamp::now()),
                 ..Default::default()
             }
             .is_empty()
@@ -2962,7 +3068,7 @@ mod tests {
     #[test]
     fn bulk_filter_is_not_empty_when_failed_after_set() {
         let filter = BulkDlqFilter {
-            failed_after: Some(chrono::Utc::now()),
+            failed_after: Some(jiff::Timestamp::now()),
             ..BulkDlqFilter::default()
         };
         assert!(!filter.is_empty());
@@ -2989,7 +3095,7 @@ mod tests {
     #[test]
     fn bulk_filter_is_not_empty_when_failed_before_set() {
         let filter = BulkDlqFilter {
-            failed_before: Some(chrono::Utc::now()),
+            failed_before: Some(jiff::Timestamp::now()),
             ..BulkDlqFilter::default()
         };
         assert!(!filter.is_empty());
@@ -3119,32 +3225,28 @@ mod tests {
 
     #[test]
     fn deadline_window_starts_after_the_slot_on_both_clocks() {
-        let db_now = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let slot = db_now + chrono::Duration::seconds(45);
+        let db_now = "2026-01-01T00:00:00Z".parse::<Timestamp>().unwrap();
+        let slot = db_now + jiff::SignedDuration::from_secs(45);
         // Host 30 s behind the database: the database-clock slot is later.
-        let behind = db_now - chrono::Duration::seconds(30);
+        let behind = db_now - jiff::SignedDuration::from_secs(30);
         assert_eq!(deadline_window_start(slot, db_now, behind), slot);
         // Host 30 s ahead: the host-clock slot is later.
-        let ahead = db_now + chrono::Duration::seconds(30);
+        let ahead = db_now + jiff::SignedDuration::from_secs(30);
         assert_eq!(
             deadline_window_start(slot, db_now, ahead),
-            ahead + chrono::Duration::seconds(45)
+            ahead + jiff::SignedDuration::from_secs(45)
         );
     }
 
     #[test]
     fn to_host_clock_keeps_the_offset_across_clock_skew() {
-        let db_now = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let db_now = "2026-01-01T00:00:00Z".parse::<Timestamp>().unwrap();
         // The host runs 30 s ahead of the database.
-        let host_now = db_now + chrono::Duration::seconds(30);
-        let at = db_now + chrono::Duration::seconds(45);
+        let host_now = db_now + jiff::SignedDuration::from_secs(30);
+        let at = db_now + jiff::SignedDuration::from_secs(45);
         assert_eq!(
             to_host_clock(at, db_now, host_now),
-            host_now + chrono::Duration::seconds(45)
+            host_now + jiff::SignedDuration::from_secs(45)
         );
     }
 
@@ -3152,7 +3254,7 @@ mod tests {
     fn schedule_with_no_window_is_immediate() {
         let ids: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
         assert_eq!(
-            redrive_schedule(Utc::now(), StdDuration::ZERO, &ids),
+            redrive_schedule(Timestamp::now(), StdDuration::ZERO, &ids),
             vec![None; 5]
         );
     }
@@ -3160,7 +3262,7 @@ mod tests {
     #[test]
     fn schedule_of_1000_rows_spreads_across_the_window() {
         // Issue #1832 AC: 1000 redriven tasks spread across the window.
-        let now = Utc::now();
+        let now = Timestamp::now();
         let window = StdDuration::from_secs(60);
         let ids: Vec<Uuid> = (0..1000).map(|_| Uuid::new_v4()).collect();
         let schedule = redrive_schedule(now, window, &ids);
@@ -3170,7 +3272,7 @@ mod tests {
         let mut distinct = std::collections::HashSet::new();
         for at in &schedule {
             let at = at.expect("a non-zero window schedules every row");
-            let offset = (at - now).to_std().expect("never before now");
+            let offset = std::time::Duration::try_from(at - now).expect("never before now");
             assert!(offset < window, "{offset:?} is past the window");
             buckets[usize::try_from(offset.as_secs() / 6).unwrap()] += 1;
             distinct.insert(at);
@@ -3390,8 +3492,8 @@ mod tests {
     fn error_class_trims_padded_error_type_for_round_trip() {
         use crate::failure::{ActivityFailure, IntoActivityErrorString};
         // A typed envelope whose error_type carries surrounding whitespace must
-        // classify to the trimmed class so the facet key round-trips through the
-        // (trimming) bulk-filter validator (issue #613, P3-1).
+        // classify to the trimmed class. Then the facet key round-trips through
+        // the trimming bulk-filter validator (issue #613).
         let padded = ActivityFailure::non_retryable("  CircuitOpen  ", "open").into_error_payload();
         assert_eq!(error_class(&padded), "CircuitOpen");
     }
@@ -3498,7 +3600,7 @@ mod tests {
     fn params_parse_cause_group_by_and_still_reject_unknown() {
         let p = DlqAggregateParams::from_query_pairs(
             &pairs(&[("group_by", "dlq_reason"), ("group_by", "error_class")]),
-            Utc::now(),
+            Timestamp::now(),
         )
         .expect("valid");
         assert_eq!(
@@ -3506,9 +3608,11 @@ mod tests {
             vec![DlqGroupDimension::DlqReason, DlqGroupDimension::ErrorClass]
         );
 
-        let err =
-            DlqAggregateParams::from_query_pairs(&pairs(&[("group_by", "bogus_dim")]), Utc::now())
-                .expect_err("unknown dim must still error");
+        let err = DlqAggregateParams::from_query_pairs(
+            &pairs(&[("group_by", "bogus_dim")]),
+            Timestamp::now(),
+        )
+        .expect_err("unknown dim must still error");
         assert!(
             err.contains("dlq_reason"),
             "message should list new dims: {err}"
@@ -3556,7 +3660,7 @@ mod tests {
     fn params_parse_single_group_by() {
         let p = DlqAggregateParams::from_query_pairs(
             &pairs(&[("group_by", "workflow_name")]),
-            Utc::now(),
+            Timestamp::now(),
         )
         .expect("valid");
         assert_eq!(p.group_by, vec![DlqGroupDimension::WorkflowName]);
@@ -3571,7 +3675,7 @@ mod tests {
                 ("group_by", "workflow_name"),
                 ("group_by", "failure_signature"),
             ]),
-            Utc::now(),
+            Timestamp::now(),
         )
         .expect("valid");
         assert_eq!(
@@ -3587,7 +3691,7 @@ mod tests {
     fn params_dedupe_repeated_group_by() {
         let p = DlqAggregateParams::from_query_pairs(
             &pairs(&[("group_by", "queue_name"), ("group_by", "queue_name")]),
-            Utc::now(),
+            Timestamp::now(),
         )
         .expect("valid");
         assert_eq!(p.group_by, vec![DlqGroupDimension::QueueName]);
@@ -3595,17 +3699,21 @@ mod tests {
 
     #[test]
     fn params_require_at_least_one_group_by() {
-        let err =
-            DlqAggregateParams::from_query_pairs(&pairs(&[("limit_groups", "10")]), Utc::now())
-                .unwrap_err();
+        let err = DlqAggregateParams::from_query_pairs(
+            &pairs(&[("limit_groups", "10")]),
+            Timestamp::now(),
+        )
+        .unwrap_err();
         assert!(err.contains("at least one group_by"), "{err}");
     }
 
     #[test]
     fn params_reject_unknown_group_by() {
-        let err =
-            DlqAggregateParams::from_query_pairs(&pairs(&[("group_by", "tenant_id")]), Utc::now())
-                .unwrap_err();
+        let err = DlqAggregateParams::from_query_pairs(
+            &pairs(&[("group_by", "tenant_id")]),
+            Timestamp::now(),
+        )
+        .unwrap_err();
         assert!(err.contains("unknown group_by dimension"), "{err}");
     }
 
@@ -3613,7 +3721,7 @@ mod tests {
     fn params_reject_invalid_time_bucket() {
         let err = DlqAggregateParams::from_query_pairs(
             &pairs(&[("group_by", "time_bucket"), ("time_bucket", "week")]),
-            Utc::now(),
+            Timestamp::now(),
         )
         .unwrap_err();
         assert!(err.contains("invalid time_bucket"), "{err}");
@@ -3623,14 +3731,14 @@ mod tests {
     fn params_reject_limit_groups_out_of_range() {
         let err = DlqAggregateParams::from_query_pairs(
             &pairs(&[("group_by", "queue_name"), ("limit_groups", "9999")]),
-            Utc::now(),
+            Timestamp::now(),
         )
         .unwrap_err();
         assert!(err.contains("limit_groups"), "{err}");
 
         let err_zero = DlqAggregateParams::from_query_pairs(
             &pairs(&[("group_by", "queue_name"), ("limit_groups", "0")]),
-            Utc::now(),
+            Timestamp::now(),
         )
         .unwrap_err();
         assert!(err_zero.contains("limit_groups"), "{err_zero}");
@@ -3640,7 +3748,7 @@ mod tests {
     fn params_reject_samples_per_group_out_of_range() {
         let err = DlqAggregateParams::from_query_pairs(
             &pairs(&[("group_by", "queue_name"), ("samples_per_group", "50")]),
-            Utc::now(),
+            Timestamp::now(),
         )
         .unwrap_err();
         assert!(err.contains("samples_per_group"), "{err}");
@@ -3650,7 +3758,7 @@ mod tests {
     fn params_reject_malformed_duration() {
         let err = DlqAggregateParams::from_query_pairs(
             &pairs(&[("group_by", "queue_name"), ("since", "yesterday")]),
-            Utc::now(),
+            Timestamp::now(),
         )
         .unwrap_err();
         assert!(err.contains("invalid since"), "{err}");
@@ -3658,14 +3766,14 @@ mod tests {
 
     #[test]
     fn params_parse_relative_since_duration() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let p = DlqAggregateParams::from_query_pairs(
             &pairs(&[("group_by", "queue_name"), ("since", "24h")]),
             now,
         )
         .expect("valid");
         let since = p.since.expect("since set");
-        let delta = (now - since).num_seconds();
+        let delta = (now - since).as_secs();
         assert!((86_390..=86_410).contains(&delta), "delta was {delta}");
     }
 
@@ -3676,13 +3784,11 @@ mod tests {
                 ("group_by", "queue_name"),
                 ("since", "2026-05-18T03:00:00Z"),
             ]),
-            Utc::now(),
+            Timestamp::now(),
         )
         .expect("valid");
         assert_eq!(
-            p.since
-                .unwrap()
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            crate::time::rfc3339_opts(p.since.unwrap(), crate::time::SecondsFormat::Secs, true),
             "2026-05-18T03:00:00Z"
         );
     }
@@ -3691,7 +3797,7 @@ mod tests {
     fn params_reject_negative_min_attempts() {
         let err = DlqAggregateParams::from_query_pairs(
             &pairs(&[("group_by", "queue_name"), ("min_attempts", "-1")]),
-            Utc::now(),
+            Timestamp::now(),
         )
         .unwrap_err();
         assert!(err.contains("min_attempts"), "{err}");
@@ -3866,9 +3972,7 @@ mod tests {
 
     #[test]
     fn time_bucket_formats() {
-        let ts = DateTime::parse_from_rfc3339("2026-05-18T03:42:17Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let ts = "2026-05-18T03:42:17Z".parse::<Timestamp>().unwrap();
         assert_eq!(
             TimeBucketGranularity::Hour.format(ts),
             "2026-05-18T03:00:00Z"

@@ -26,7 +26,7 @@ flowchart LR
   W -->|ModelTurnRequest| M["activity agent_model_turn\nAgentModel::chat + ToolPolicy::decide"]
   M -->|ModelTurn: reply + one decision per call| W
   W -->|Allow| X["activity agent_tool_call\nTool::execute"]
-  W -->|RequireApproval| S["signal tool_approval:step:position:call_id\nwith a deadline"]
+  W -->|RequireApproval| S["signal tool_approval:round:position:call_id\nwith a deadline"]
   S -->|Approve or Edit| X
   S -->|Reject or timeout| W
   W -->|Deny| W
@@ -98,14 +98,44 @@ async fn save_a_note(model: Arc<dyn AgentModel>) -> Result<RunState, Box<dyn std
 }
 ```
 
-The SQLite backend has no shared-state registry, so `sqlite::register`
-captures the harness in synchronous closures. Each closure runs its async
-body with `block_in_place`, so use a multi-thread Tokio runtime.
+`sqlite::register` takes a `SqliteRuntime` that the app owns. It captures
+the harness in synchronous closures. Each closure runs its async body with
+`block_in_place`, so use a multi-thread Tokio runtime.
+
+### Under `HarvestPlugin`
+
+An autumn-web app on SQLite needs no runtime of its own. The neutral
+`register` adds the workflows, the activities and the harness to a
+`HarvestBuilder`. It needs no backend feature:
+
+```rust
+use std::sync::Arc;
+use autumn_harvest::builder::HarvestBuilder;
+use autumn_harvest_agent::{AgentHarness, AgentModel, register};
+
+fn agents(model: Arc<dyn AgentModel>) -> HarvestBuilder {
+    register(HarvestBuilder::new(), AgentHarness::new(model))
+}
+```
+
+`HarvestPlugin::agent(harness)` calls it on the builder of the plugin, on
+either backend. On SQLite the driver gives the harness to each
+`#[activity]` body as state.
+The module `autumn_harvest_plugin::sqlite::agent` sends ops and decisions
+through the `HarvestSqlite` handle. It has `send`, `delete`,
+`current_run`, `state` and `decide`. See
+["The durable agent"](sqlite-plugin.md#the-durable-agent).
+
+The next step is a mesh of agents. The example `sqlite_mesh` adds a peer, a
+mandate and a refused delegation to the `sqlite_agent` story. Read
+["Run a small mesh"](agent-mesh.md#run-a-small-mesh).
 
 ## 3. Run it on Postgres
 
 Register the workflows and the activities. Install the harness as worker
-state, because the activities read it with `ActivityContext::state`:
+state, because the activities read it with `ActivityContext::state`.
+`register(builder, harness)` does all three in one call. So does
+`HarvestPlugin::agent(harness)`:
 
 ```rust
 use std::sync::Arc;
@@ -132,8 +162,9 @@ Section 2 shows how `FnTool::shared` makes a tool such as `lookup`.
 `workflows()` returns `agent_loop`, `agent_heartbeat` and the durable
 `agent` (section 15). `activities()` returns `agent_model_turn`,
 `agent_tool_call`, `agent_memory_snapshot`, `agent_deliver`,
-`agent_precheck`, `agent_discover_peers`, `agent_profile`,
-`agent_profile_overlay` (section 15), `agent_memory_reset`,
+`agent_approval_notice` (section 5), `agent_precheck`,
+`agent_discover_peers`, `agent_profile`, `agent_profile_overlay`
+(section 15), `agent_memory_reset`,
 `agent_workspace_retain`, `agent_workspace_reset`, `agent_workspace_floor`,
 `agent_refine_propose` (section 16) and `agent_score` (section 17).
 The test `the_engine_registration_builds` builds this
@@ -228,8 +259,10 @@ To start a run without the module, start the name `agent_loop` with an
 with a serialised `Approval` as the payload. Read the signal name from the wait: the
 deadline timer of the wait is `__signal_timeout:<seq>:<signal name>`. On
 SQLite, `RunState::WaitingSignal` holds the name. For a run with no
-delegation, `approval::approval_signal(step, position, call_id)` also builds
-it from the recorded `ModelTurn`. A worker with
+delegation, `approval::approval_signal(round, position, call_id)` also builds
+it from the recorded `ModelTurn`. In such a run, `round` is the step of the
+run. An inline delegation makes `round` count the tool rounds of the whole
+inline tree. A worker with
 no harness fails the call as `AgentHarnessMissing`, which is not retryable.
 
 A worker with a payload cap other than the default must say so. Set
@@ -247,8 +280,10 @@ a worker. Otherwise the adapter ends a run that the store could carry.
 `AgentHarness` holds the parts that do real work:
 
 - `new(model)` — any `AgentModel`. Implement its one `chat` method for your
-  provider, or bridge a framework you already use. The crate ships no HTTP
-  client.
+  provider, or bridge a framework you already use. The `anthropic` feature
+  ships `ClaudeModel`. See [The Claude model](#the-claude-model). The
+  `openai` feature ships `OpenAiModel` for any OpenAI-compatible server. See
+  [An OpenAI-compatible model](#an-openai-compatible-model).
 - `tool(tool)` / `tools(iter)` — any `Tool`. `FnTool` wraps an async
   function.
 - `policy(policy)` — any `ToolPolicy`. The default is `AllowAll`.
@@ -293,6 +328,104 @@ no memory tool. In a run with a mandate, `delegate` is reserved too. See
 A tool error is cut to fit the result cap too, so a huge error message
 cannot fail the run.
 
+### The Claude model
+
+The `anthropic` feature adds the `anthropic` module. It is off by default,
+so the crate without it has no HTTP client. The module has three layers:
+
+| Layer | Holds |
+|---|---|
+| `anthropic::wire` | The API version, the default model, the settings of each model, the error table, the usage counters and the prices. It does no I/O. |
+| `anthropic::Client` | One POST of a request body. It reads the body under a cap and refuses bytes that are not UTF-8. |
+| `anthropic::ClaudeModel` | The `AgentModel`. `chat` sends one request. `chat_stream` streams it over Server-Sent Events. |
+
+`ClaudeModel::new(key)` refuses a blank key, and a key that an HTTP header
+cannot carry. The client follows no redirect, because a redirect keeps the
+key header. It refuses a stream line that is not UTF-8, as it refuses such a
+body. The default model is `claude-opus-5-5`. Only that model gets
+adaptive thinking, effort `high` and the server-side refusal fallback.
+Another model gets the API defaults. `fallbacks(false)` turns the fallback
+off.
+
+A status maps to an `ErrorKind` as the Anthropic SDKs retry it:
+
+| Status | Kind | Retry |
+|---|---|---|
+| `429` | `RateLimited` | Yes |
+| `408`, `409`, `500` to `599` (`529` is an overload) | `Unavailable` | Yes |
+| `401`, `403` | `Authentication` | No |
+| `413` | `Budget` | No |
+| Any other, such as `400` | `Provider` | No |
+
+A thinking block has no place in a `ChatMessage`, and the API wants it back
+in a tool loop. So the model keeps each raw assistant turn by a hash key.
+`turn_store(store)` adds a durable `TurnStore`, so a restarted process can
+replay the turns. With a store, the memory copy keeps the newest 4096 turns.
+With no store, it is the only copy, so it keeps every turn. A long-lived
+worker should set a store. Each call of `model(name)` starts an empty memory
+copy.
+
+An app with its own transcript format can use `Client` and `wire` alone.
+`examples/claude-agent-daemon` does that.
+
+### An OpenAI-compatible model
+
+The `openai` feature adds the `openai` module. Its `OpenAiModel` speaks the
+Chat Completions API at a base URL that the app sets. So one model reaches
+many servers:
+
+| Server | Base URL |
+|---|---|
+| OpenAI | `openai::OPENAI_BASE_URL` |
+| OpenRouter | `openai::OPENROUTER_BASE_URL` |
+| Ollama | `openai::OLLAMA_BASE_URL` |
+| vLLM, LM Studio, a LiteLLM proxy | The `/v1` URL of the server |
+
+- `OpenAiModel::new(base_url, model)` takes no key, as a local server
+  needs. `api_key(key)` sends `Authorization: Bearer`. A key for a plain
+  `http` URL is refused, unless the host is a loopback name or address.
+- `with_env_key(base_url, model)` reads the key variable of a known host:
+  `OPENAI_API_KEY` for OpenAI, `OPENROUTER_API_KEY` for OpenRouter. Another
+  host gets no key, so a key of one provider never reaches another.
+  `with_key_from(base_url, model, var)` names the variable.
+- `header(name, value)` adds a header, such as the `HTTP-Referer` and
+  `X-Title` of OpenRouter. The headers that the client sets are refused:
+  the key, the body type and the framing.
+- `model_id()` is `{model}@{host}{path}`, so two endpoints do not share cache
+  entries. `id(name)` sets another id.
+- `price(Price)` prices each call. The default is unpriced, because each
+  provider has its own rates. A local server costs nothing.
+- The output cap goes as `max_completion_tokens` to the OpenAI host, as its
+  current models need, and as `max_tokens` to another server.
+  `max_completion_tokens(on)` sets the field. The OpenAI reasoning models
+  also refuse a `temperature` other than 1. `seed(false)` stops the draw number going
+  as `seed`. `stream_usage(false)` stops the usage request on a stream, for
+  a server that refuses `stream_options`.
+
+Each tool call goes back as a JSON string of its arguments. A string that
+is not JSON is a `Decode` error, so no tool runs on a value that the model
+did not send. A stream needs a finish reason, and the end marker or the
+usage. One that breaks off is a `Transport` error, so the retry asks again.
+A `2xx` body with an `error` object is the error of its code. OpenRouter
+sends such a body. A turn cut at the output cap keeps its text and drops a
+call whose arguments it cut. A call with no id gets one made from the
+response, so two turns never share a call id. A context overflow is a
+`Budget` error.
+
+The base URL is the path only. A user, a password, a query or a fragment
+is refused, because each would go into each log line. Use the `/v1`
+endpoint of Azure OpenAI, which needs no query.
+
+Limits. The model sends no reasoning back: a model that needs its
+`reasoning_details` in a tool loop, such as Gemini 3 behind OpenRouter, is
+not supported yet. Each system message goes where it stands, and some
+chat templates refuse a second one. The Mistral API wants call ids of nine
+characters, which a made id is not.
+
+Both models use the shared `provider` module. It holds the transport, the
+error type, the body cap, the status table above, the Server-Sent Events
+framing and `Price`. A fix there reaches both models.
+
 ### The cost ledger
 
 Each model turn writes one row to the
@@ -307,6 +440,14 @@ encrypted turn output, so the usage report can sum it per tenant. Two
   records `None` or any other id as `"unknown"`.
 - `cost_usd_micros(usage)` — the cost of one call, in millionths of a US
   dollar. The default is `None`, which counts the call as unpriced.
+
+`ClaudeModel` fills in both. Its id is the model, with `+effort:high` and
+`+fallbacks:default` on the default model. Its price comes from
+`anthropic::price`, which holds the first-party rates of the Claude 5
+models by exact name. A cache read and a cache write each have their own
+rate. A cache write uses the five-minute rate. An alias or an unknown model
+is unpriced. A turn that a refusal fallback answers is priced at the rates of
+the configured model.
 
 A response cache hit calls no model and spends no tokens, so it writes no
 ledger row.
@@ -347,6 +488,64 @@ run.
 | `Approval::Reject { reason }` | The call does not run. The model reads the reason. |
 | No decision before the deadline | The call does not run. The model reads that no approval arrived. |
 | A payload that is not an `Approval` | The call does not run. The model reads that the decision was not readable. The run goes on. |
+
+### The approval notice
+
+Before the wait, the call sends one notice to the harness delivery:
+`Delivery::notify_approval`. A chat app shows "Approve this?" with it, and
+needs no poll. The send is the activity `agent_approval_notice`.
+
+| Field | Content |
+|---|---|
+| `call.run_id` | The run id that tools see |
+| `call.execution_id` | The run that waits. Pass it to `decide`. |
+| `call.agent_id` | The durable agent, or `None` |
+| `call.session_id` | The session of the run, or `None` |
+| `call.signal` | The signal name. Pass it to `decide`. |
+| `call.tool` | The tool name |
+| `call.reason` | Why the policy asks. Over 256 bytes, a cut text. |
+| `call.arguments` | The arguments. Over the tool result cap, a cut JSON string. |
+| `call.arguments_truncated` | `true` when the arguments were cut |
+| `call.timeout_secs` | The time of the wait |
+| `deadline` | The worker clock plus the timeout. The wait ends at this time or a little later. Clock skew between the worker and the engine can move it. |
+
+```rust
+use autumn_harvest_agent::delivery::{ApprovalNotice, Delivery, Report};
+use autumn_harvest_agent::{AgentError, BoxFuture};
+
+#[derive(Debug)]
+struct Chat;
+
+impl Delivery for Chat {
+    fn deliver<'a>(&'a self, _report: &'a Report) -> BoxFuture<'a, Result<(), AgentError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn notify_approval<'a>(
+        &'a self,
+        notice: &'a ApprovalNotice,
+    ) -> BoxFuture<'a, Result<(), AgentError>> {
+        // Send "Approve `tool`?" to the chat. Keep `key()` to drop a repeat.
+        let _ = (notice.key(), &notice.call.tool, notice.deadline);
+        Box::pin(async { Ok(()) })
+    }
+}
+```
+
+- The result is recorded. A restart during the wait sends no second notice.
+- A retry of the activity can send the notice again. It keeps the key
+  `ApprovalNotice::key`, `<run id>:<execution id>:<signal>`. Dedupe on it.
+  A reset or a fork starts a new execution, so its notice has a new key.
+- A failed notice never fails the run and never releases the call. The
+  call still waits for a decision or its deadline.
+- The default writes the names to the `tracing` log. It never logs the
+  arguments or the reason.
+- A notice is never withdrawn. An interrupt, a deadline or a reset can end
+  the wait first. A decision for an ended wait changes nothing.
+- A probe sends no notice. An evaluation stubs it (section 12). An
+  evaluation sends again an approval for a wait that its notice opened.
+- A run that parked before this release replays with no notice. The patch
+  `agent_approval_notice` gates it.
 
 Each name belongs to one wait. A decision that arrives after its deadline
 stays unread in history. It never releases a later call, even when the model
@@ -567,8 +766,29 @@ result for the next turn.
 - A read checks the digest of the window. A store that hands back a
   changed window is a miss, and the turn goes in the full form.
 - A store holds transcript text outside history and outside the payload
-  codecs. An erasure does not reach it, because `TranscriptStore` has only
-  `get` and `put`. The app must clear its own store when it erases a run.
+  codecs. Each window keeps the run and the session of its turn
+  (`WindowOwner`). A durable agent sets the session of each turn to its
+  agent id. Its memory reset counts the windows with
+  `TranscriptStore::count`, then calls `TranscriptStore::erase`. So
+  `harvest agents erase` deletes each window of the agent. A store that
+  does not implement both reports no count, and the app must clear it
+  itself.
+- `InMemoryTranscriptStore` erases in its own process only. With more
+  than one worker, the other workers keep their windows until eviction or
+  a restart. Use a durable store when an erase must reach every window.
+- `stores::SqliteTranscriptStore` and `stores::PostgresTranscriptStore`
+  are durable stores that every worker shares. Each keeps the newest 4
+  windows of a run (`keep_per_run`). A read misses a window older than 7
+  days (`max_age`). A later put deletes such windows, at most 64 at a
+  time, so a store with no puts keeps them. A read or write error is a
+  miss, and so is a call past the hook timeout. The turn then goes in the
+  full form.
+- A window that a delegated peer keeps is under the session of the peer.
+  An erase of the sender does not reach it, as with the history of the
+  peer.
+- `TranscriptStore` is async. A store that implemented the earlier `get`
+  and `put` returns a boxed future from each, and `put` takes a
+  `WindowOwner`.
 
 A 50-turn run with a 1 KB tool result each turn stores about 86% less
 history (`a_50_turn_run_stores_at_least_80_percent_less_history`).
@@ -602,6 +822,7 @@ it does in a plain run.
 | Heartbeat | Workflow `agent_heartbeat`: one tick per run | `heartbeat::schedule`, `postgres::start_heartbeat`, `sqlite::start_heartbeat` |
 | Follow-up | A durable timer, then a new segment in the same workflow | `AgentTask::followups` |
 | Delivery | Activity `agent_deliver` | `AgentTask::deliver`, `AgentHarness::delivery` |
+| Approval notice | Activity `agent_approval_notice`, before each approval wait (section 5) | `Delivery::notify_approval` |
 | Memory | Activity `agent_memory_snapshot`, once per segment | `AgentTask::memory`, `AgentHarness::memory` |
 | Loop guard | A fingerprint of each recorded call, in the workflow | On by default: `AgentTask::loop_guard` |
 
@@ -633,6 +854,12 @@ first two rules only. The memory rule has its own opt-in:
 `HeartbeatTask::allow_memory_writes` or `AgentTask::unattended_memory_writes`.
 `AgentTask::read_only` applies all three rules to any run.
 `AgentTask::unattended` applies the memory rule.
+
+A run without the `memory` tool still reads its memory snapshot. The head
+of that snapshot says that the run cannot edit it, so the prompt never
+names a tool that the run does not have. A run with the tool reads the
+edit head. The patch `agent_read_only_memory_snapshot` gates both heads,
+so a history from before it replays with the old edit head.
 
 ### Heartbeats
 
@@ -747,7 +974,8 @@ replays as it ran. A task built from JSON can set
 `AgentTask::memory` gives the run a memory scope, and the model a `memory`
 tool to add, replace and remove entries. The store is a `MemoryStore` on
 the harness. `InMemoryMemoryStore` suits tests. Use a durable store in
-production. A run with a scope and no store fails as `MemoryStoreMissing`.
+production: `stores::SqliteMemoryStore` or `stores::PostgresMemoryStore`.
+A run with a scope and no store fails as `MemoryStoreMissing`.
 
 An activity reads the snapshot once per segment. The workflow adds it to
 the system prompt. A write during the segment goes to the store at once,
@@ -767,6 +995,39 @@ failed `remove` therefore cannot remove a newer entry after a crash. A
 durable store must save the key and its result with the edit, in one
 transaction. An `add` of an entry that already exists changes nothing
 either.
+
+The durable stores of the `stores` module follow these rules. Each one
+keeps a scope as one document with its applied keys, so one statement
+writes an edit and its key. A write names the version that it read. A
+write that loses a race reads again, so two workers on one scope lose no
+edit. A clear keeps the document with no text, so its version still
+grows. A writer that read the scope before the clear then loses its
+write. The memory store keeps the newest 4 096 keys of a scope, and cuts
+a stored edit error to 1 KB.
+
+```rust
+use std::path::Path;
+use std::sync::Arc;
+
+use autumn_harvest_agent::stores::{
+    SqliteAgentDb, SqliteEpisodeStore, SqliteMemoryStore, SqliteTranscriptStore,
+};
+use autumn_harvest_agent::{AgentError, AgentHarness};
+
+fn durable(harness: AgentHarness, path: &Path) -> Result<AgentHarness, AgentError> {
+    // The three stores share one connection.
+    let db = SqliteAgentDb::open(path)?;
+    Ok(harness
+        .memory(Arc::new(SqliteMemoryStore::on(db.clone())))
+        .episodes(Arc::new(SqliteEpisodeStore::on(db.clone())))
+        .transcript_store(Arc::new(SqliteTranscriptStore::on(db))))
+}
+```
+
+On Postgres, `PostgresMemoryStore::new(pool)`, `PostgresEpisodeStore::new(pool)`
+and `PostgresTranscriptStore::new(pool)` take the pool of shard 0. The
+migration `20261109005653_harvest_agent_stores` creates their tables. The
+stores keep text in clear, outside the payload codecs.
 
 ### Loop guard
 
@@ -1023,6 +1284,7 @@ change.
 | `agent_tool_call` | The recorded outcome of the same call, or an error stub. No tool runs. |
 | `agent_memory_snapshot` | The recorded snapshot, or an empty one. |
 | `agent_deliver` | A stub. No report leaves the harness. |
+| `agent_approval_notice` | A stub. No notice leaves the harness. |
 | `agent_discover_peers` | The recorded peers for the same names, or none. The candidate needs no roster. |
 | A child run of a fan-out | The recorded report of an unused child run with the same delegation chain and task text. With no match, the candidate run fails. No child runs live. |
 | Any other activity, such as `agent_precheck` | No mock. The candidate run fails. |
@@ -1043,8 +1305,9 @@ id, so the recorded approvals stay valid. Any other call gets a new `eval_`
 id, so no recorded approval can release it. That id holds the turn and the
 position, not the provider id. The harness sends again only an
 approval for a wait that the source opened, when it arrived before the
-deadline. An approval sent before its wait opened leaves no deadline timer,
-so the harness drops it, and the candidate times out at that wait.
+deadline. A wait opens with its approval notice or its deadline timer. An
+approval sent before both is dropped, and the candidate times out at that
+wait.
 
 The report holds one `TurnDiff` per model turn. A turn diverges when the
 calls, the arguments, the policy decisions or the stop reason differ. Two
@@ -1136,6 +1399,7 @@ fork names the source. A worker that holds the same tools runs the fork.
 | The `memory` tool | Refused. A note would show in each later run of the scope. |
 | The policy | Runs as in the source. Nobody answers a probe, so the approval wait is one second. A gated call times out to a deny. |
 | `agent_deliver` | Never runs. The probe input also sets `deliver` to `false`. |
+| `agent_approval_notice` | Never runs. Nobody answers a probe. |
 | A delegated child | Runs inline, as a probe with the same set. A fan-out child would be a separate run that notifies on its end. |
 | A durable peer | The delegation is refused. The peer runs its own effects. |
 | The workspace | A probe reads it and never moves its head. |
@@ -1262,8 +1526,8 @@ also refuses an overlay that `agent::overlay::apply` refuses. A history with pay
 encrypted payloads needs decoding first. The model call blocks in place, so
 run the evaluation on a multi-thread Tokio runtime.
 
-The evaluation is an in-memory fork at the first event. The database fork of
-issue #2000 is a separate feature.
+The evaluation is an in-memory fork at the first event. A database fork is a
+separate feature.
 
 ### Anonymise a pool
 
@@ -1307,7 +1571,7 @@ async fn choose(
 | `AnonId` | `eval::anon::assign` gives the ids, as for an evidence bundle. The key of a candidate is `Candidate::digest`. An id is `c-` and a hex prefix of `SHA-256(seed, source run id, Candidate::digest)`. The prefix has at least 12 digits. It grows until no two ids are equal. `formal/verus/src/agent_anonymise.rs` proves the width rule. |
 | The order | The pool lists the ids in order. The input order changes no id and no text. The candidates also run in pool order. |
 | `text` | `AnonymisedPool::render`: the source end, then per id the counts, the end, each scorer verdict, each turn verdict, and each turn decision as JSON. It holds no model name, overlay digest, label or input index. |
-| `pool` | The same content as JSON. Each `AnonymisedEvaluation` keeps every field of `Evaluation` except `overlay_digest` and `candidate_cost_usd_micros` (issue #2380). A price names a model. The recorded end is in the pool once. |
+| `pool` | The same content as JSON. Each `AnonymisedEvaluation` keeps every field of `Evaluation` except `overlay_digest`, `candidate_cost_usd_micros` (issue #2380) and `candidate_calls` (issue #2577). A price or a model id names a model. The recorded end is in the pool once. |
 | `key` | Each id with its `CandidateRef`: the input index, the candidate digest, the overlay digest and the label. Keep it from the reader. `AnonymisedReport` does not implement `Serialize`, and its `Debug` form hides the key. |
 | A failure text | Each run end error, report error and scorer reject reason replaces each label, digest, route and model id of the pool with `[redacted]`. A judge route of a scorer counts as a route. The source end gets the same treatment. Each route that a run asks for counts, with the model id behind it in each harness. So a route that a candidate keeps from the source, such as the model of a recorded peer, counts too. Only a whole name is replaced, so a short route such as `a` also replaces that word. |
 | `Candidate::label` | An operator name, such as an overlay version id. It enters the digest, never the text. |
@@ -1421,6 +1685,15 @@ as a child run. They split the token remainder with `bounds::sibling_cap`.
 A mandate bounds the delegation tree. Flow rules gate a dangerous sequence
 of tool calls across the tree. Read [`agent-mesh.md`](agent-mesh.md).
 
+A mandate also bounds strategies. `Mandate::max_draws` caps the draws of
+one strategy run in the subtree, and each draw counts as one delegation of
+`max_delegations`. A child mandate takes the smaller cap of its parent and
+its peer, so the cap only narrows. `outbound` and `accept` carry it. A
+mandate with no cap leaves the sampling policy as the only cap. Each draw
+carries the mesh of the profile, so a mesh budget stops the next draw.
+A worker that predates `max_draws` drops it from a peer message. Upgrade
+every worker before you set it.
+
 ## 15. Durable agents
 
 An `Agent` (issue #2263) is a named, long-lived actor. It owns its state,
@@ -1496,9 +1769,10 @@ idempotency key. An app without the module sends the same signal.
 | `user_message` | Runs one segment with the text as the user message. |
 | `control: pause` | Holds each later message in the state. |
 | `control: resume` | Runs the held messages in order, then takes new ones. |
-| `control: reset_memory` | Clears the memory: the scope `agent:<id>`, or the state memory. |
+| `control: reset_memory` | Clears the memory: the scope `agent:<id>`, or the state memory. It also removes each lesson of the kind that names the agent (section 24). |
 | `control: clear_transcript` | Clears the transcript. Only the labels of the memory and of the workspace files stay (issues #2272, #2274). |
 | `control: reset_workspace` | Deletes every workspace snapshot of the agent (issue #2274). |
+| `control: reload_profile` | Reads the profile of the kind again. A good read ends the run at a checkpoint, so the next op runs on the new profile. A failed read keeps the run and sets `last_error` (issue #2658). |
 
 A control op applies at once, also while the agent is paused. The kernel
 `agent::inbox::admit` makes the choice. Verus proves it, see
@@ -1520,6 +1794,67 @@ A control op applies at once, also while the agent is paused. The kernel
   approval names never repeat.
 - The transcript keeps at most `AgentProfile::window` messages. The cut
   lands on a user message.
+- A gated call sends one approval notice before it waits (section 5). The
+  notice holds the agent id, the execution id and the signal. Pass the last
+  two to `decide`. A restart during the wait sends no second notice, so a
+  chat app needs no poll of `agent_status`.
+
+### Reload the profile (issue #2658)
+
+A run reads its profile once, at its start. A long-lived agent keeps one
+run, so a new harness does not reach it. A restart does not help, because
+replay reads the recorded profile. Send `Control::ReloadProfile` to give
+the agent the new profile at its next op.
+
+```rust
+use std::sync::Arc;
+use autumn_harvest_agent::{AgentHarness, AgentId, sqlite};
+use autumn_harvest_sqlite::SqliteRuntime;
+
+async fn reload(
+    rt: &mut SqliteRuntime,
+    harness: AgentHarness,
+) -> Result<Vec<AgentId>, Box<dyn std::error::Error>> {
+    // Register the new harness first. The reload reads it.
+    sqlite::register(rt, Arc::new(harness));
+    let agents = sqlite::reload_profiles(rt, "support")?;
+    for id in &agents {
+        sqlite::drive(rt, id).await?;
+    }
+    Ok(agents)
+}
+```
+
+- The op reads the profile through the recorded activity `agent_profile`,
+  then discovers the peers again. Replay reads both results from history.
+  The op uses only the success of the discovery. The next run discovers
+  the peers again.
+- A good read ends the run at a checkpoint after the op. The next run reads
+  the profile at its start, as each run does, and the ops that wait move to
+  it. `Entity::run_with_wakes_and_checkpoints` takes that checkpoint.
+- The reload op books the heartbeat and sets the search attributes with
+  the profile that it read. A changed interval drops the old booking, so
+  the next tick comes one new interval after the reload.
+- Every other field changes at the next run, `max_ops_per_run` and the
+  mandate included.
+- A waiting op that does not fit the checkpoint input runs first, on the
+  old profile. The checkpoint follows it.
+- An active overlay applies to the new profile at each later op.
+- A failed read keeps the current profile. The op adds one to `failures`
+  and names the error in `last_error`. The kernel
+  `profile_read::reloaded` makes the choice. Verus proves it, see
+  `formal/verus/src/agent_profile_read.rs`.
+- `sqlite::reload_profiles` sends the op to each running agent of a kind,
+  by the workflow id prefix `<kind>/`. `postgres::reload_profiles` does the
+  same by the search attribute `agent_kind`, which each op sets. So it
+  skips an agent that has run no op yet. Both send the op to the live run
+  only, so an ended agent stays ended. `harvest agents reload <id>` sends
+  the op to one agent.
+- In a rolling deploy, send the op only after every worker runs this
+  release. An older worker cannot decode it, and cannot replay a run that
+  holds it.
+- A control op applies at once, also while the agent is paused. A held op
+  runs on the new profile at the resume.
 
 ### Heartbeats and follow-ups (issue #2266)
 
@@ -1578,12 +1913,17 @@ so a list of the agents due to wake reads only those agents.
 | `harvest agents describe <kind>/<name>` | `GET /workflows/by-id/agent/{id}/query/harvest.entity.state` |
 | `harvest agents pause <id> --reason <text>` | `POST /workflows/by-id/agent/{id}/signal/harvest.entity.op` |
 | `harvest agents resume <id>` | the same route, with `resume` |
+| `harvest agents reload <id>` | the same route, with `reload_profile` |
 | `harvest agents erase <id>` | the signal route, then `POST /workflows/{exec}/erase-payloads` for each run and each scheduled pass |
 | `harvest agents profile list <kind>` | `GET /agents/{kind}/profile/versions` |
 | `harvest agents profile show <kind> [--version v]` | `GET /agents/{kind}/profile`, or `GET /agents/{kind}/profile/versions/{v}` |
 | `harvest agents profile diff <kind> <a> <b>` | `GET /agents/{kind}/profile/diff?a=&b=` |
 | `harvest agents profile activate <kind> <v> [--expected v\|none]` | `POST /agents/{kind}/profile/activate`, after the `list` route when `--expected` is absent |
 | `harvest agents profile rollback <kind>` | `POST /agents/{kind}/profile/rollback` |
+| `harvest agents profile pending <kind>` | `GET /workflows?state=RUNNING&filter=workflow_name = 'agent_refine' AND attrs.refine_kind = ... AND attrs.refine_status = 'waiting_approval'`, Postgres only |
+| `harvest agents profile approve <run>` | `POST /workflows/{run}/signal/refine_approval:{run}` |
+| `harvest agents profile reject <run> [--reason text]` | the same route, with `reject` |
+| `harvest agents profile edit <run> --file overlay.json` | the same route, with `edit` |
 
 **Profile overlays (issue #2374).** The `profile` commands use the routes
 of the overlay store. Install the store with
@@ -1614,14 +1954,16 @@ SQLite plugin does not serve these routes yet (epic #2466).
 
 **Erase.** `harvest agents erase` erases an agent and prints one report.
 It removes the history payloads, the entity state, the memory, the
-workspace, the stream chunks and the cost ledger rows. It does not reach
-a `TranscriptStore` (section 8a) or the response cache (section 11). The
-app must clear those stores itself.
+episodes, the transcript windows, the workspace, the stream chunks and the
+cost ledger rows. It does not reach the response cache (section 11), or a
+`TranscriptStore` that does not implement `erase` (section 8a). The app
+must clear those stores itself.
 
 1. The agent gets `pause`, `reset_memory` and `reset_workspace`, then a
    delete. The pause holds new work and stops the ticks, so nothing writes
    the stores after the resets. The resets clear a `MemoryStore` scope, the
-   episode scope and every workspace snapshot, with the scratch files of stopped puts. See
+   episode scope, the transcript windows of the agent and every workspace
+   snapshot, with the scratch files of stopped puts. See
    "Scratch files" and "A save after a reset" below for the two windows
    that stay. An agent that ended gets a new run for them,
    through `POST /workflows/agent/signal-with-start` on the queue of its
@@ -1641,16 +1983,41 @@ app must clear those stores itself.
    A pass that still runs is a failure in the report.
 6. The report sums each count over every run and child:
    `events_scrubbed`, `stream_chunks_deleted`, `ledger_rows_deleted`,
-   `entity_states_scrubbed` and the rest. `episodes_erased` and
-   `facts_erased` come from the final state. It lists each skipped child
+   `entity_states_scrubbed` and the rest. `episodes_erased`,
+   `facts_erased`, `lessons_removed`, `memory_entries_erased` and
+   `transcripts_erased` come from the final state. A `null` count means
+   that the store was not reached or did not count. The agent has no
+   memory scope, the transcript store cannot count, a reset failed, or
+   the reset ran before the counts existed. It lists each skipped child
    and each failure.
+
+The reset records each count in its own step before it deletes. So a
+retried delete after a crash keeps the first count.
+
+With the durable stores of the `stores` module, the erase removes the
+data of the agent from each store:
+
+- Each transcript row of the session of the agent goes.
+- The memory row stays as an empty tombstone, with no entry and no key.
+- The episode row stays as a tombstone. It holds the generation, the key
+  of the clear and its result: the episode count and the fact hash of
+  each derived fact (16 hex digits of SHA-256). It holds no episode text.
+  The generation stops a pass that runs across the erase from writing its
+  facts back.
+
+A tombstone keeps its version, so a writer that read the scope before the
+erase cannot write the old text back. A row that this build cannot decode
+still clears. On SQLite the stores set `secure_delete`, so a delete and a
+rewrite zero the freed pages. The WAL file keeps old frames until a
+checkpoint. On Postgres, a dead row stays until `VACUUM`, and the WAL and
+the backups keep their copies.
 
 The spend of an erased run leaves the LLM budget and mesh budget sums.
 
 ### Mid-turn messages (issue #2265)
 
-A message carries an `Urgency`. `sqlite::send` and `postgres::send` send the
-extra signal first, then the op. Without the module, send the signal of
+A message carries an `Urgency`. `sqlite::send`, `postgres::send` and the
+plugin call `sqlite::agent::send` send the extra signal first, then the op. Without the module, send the signal of
 `Agent::urgency_signal(&op)` to the running run, then the op.
 
 | Urgency | Signal | Effect |
@@ -1667,6 +2034,7 @@ What an interrupt does to the work in flight:
 | A tool call whose tool opts in (`Tool::interruptible`) | The race cancels it. The call answers that it was cancelled. |
 | Any other tool call | It runs to its end. No later call of the round runs. |
 | An approval wait | It ends as a rejection. The tool does not run. |
+| An approval notice | It runs to its end. The wait then ends at once as a rejection. |
 
 The race records its winner, so replay takes the same branch and asks no
 model again. An interrupt that arrives while no op runs is stale, and the
@@ -1758,6 +2126,13 @@ fn support(
   budget of the agent mesh (issue #2272). It then calls the model once, and records one cost ledger call under the pass
   run. Each valid fact becomes one entry of `facts_block`:
   `<subject> <relation> <object> [episodes: <id>, ...]`.
+- **Output cap.** The engine sets no cap on the reply of a pass. An app
+  sets one with `EpisodeSettings::max_pass_output_tokens(n)` (issue #2695).
+  0 sets no cap. With no cap, the provider default applies: Anthropic
+  needs a wire value and gets its adapter default of 16000, and an
+  OpenAI-compatible server may use a small one. A cap that cuts a reply
+  makes it unparsable, so size a cap to `max_pass_episodes`. A reply with
+  no cap can also pass the run token budget by one reply.
 - **Labels.** A fact takes the labels of every episode of its pass. A
   memory store that cannot keep labels refuses a labelled fact, and the
   report counts it under `facts_refused`. The sources of a refused fact
@@ -1771,20 +2146,31 @@ fn support(
   `sqlite::consolidate` or `postgres::consolidate` starts one pass.
 - **Report.** A pass returns a `ConsolidationReport`. Its `stop` is
   `completed`, `nothing_to_do`, `budget_exceeded`, `invalid_reply`,
-  `disabled` or `reset`. A refused budget and a reply that does not parse
-  write no fact and mark no episode. SQLite has no run budget, so a pass
+  `output_capped`, `disabled` or `reset`. A refused budget and a reply that
+  does not parse write no fact and mark no episode. `output_capped` means
+  the reply hit the output cap. A retry fails the same way, so read fewer
+  episodes or raise the cap. SQLite has no run budget, so a pass
   there always passes the budget check.
 - **Erase.** `Control::ResetMemory` clears the episode scope first, then the
-  memory scope. `AgentState::episode_reset` counts the episodes and the
-  derived facts. `harvest agents erase` reports them as `episodes_erased`
-  and `facts_erased`. It also erases each pass that a schedule started, by
-  the search attribute `agent_consolidation_of`. A pass that runs across
+  memory scope, then the transcript windows of the agent.
+  `AgentState::episode_reset` counts the episodes and the derived facts.
+  `AgentState::memory_entries_erased` counts the memory entries, and
+  `AgentState::transcripts_erased` the windows. `harvest agents erase`
+  reports them as `episodes_erased`, `facts_erased`,
+  `memory_entries_erased` and `transcripts_erased`. A reset that history
+  recorded before these counts replays with no count. `harvest agents
+  erase` also erases each pass that a schedule started, by the search
+  attribute `agent_consolidation_of`. A pass that runs across
   the reset writes no fact after it and ends as `reset`. A pass that still
   runs is a failure in the report, so erase again after it ends.
 
-The crate ships `InMemoryEpisodeStore`. A durable store implements
-`EpisodeStore` and calls the methods of `EpisodeLog`, so the rules are the
-same in every store.
+The crate ships `InMemoryEpisodeStore`, and the durable
+`stores::SqliteEpisodeStore` and `stores::PostgresEpisodeStore`. Each
+durable store keeps the `EpisodeLog` of a scope as one document, so an
+append and its key land in one write. A retried append after a crash
+finds its key and adds nothing. Another store implements `EpisodeStore`
+and calls the methods of `EpisodeLog`, so the rules are the same in every
+store.
 
 #### Scheduled passes (issue #2540)
 
@@ -1921,8 +2307,8 @@ fn coder(
   deletes leaves the workspace. So a file that the run moves joins only
   when the run names its new path. The tool-call activity
   saves a changed workspace after a call that succeeds, and returns the new
-  reference with the result. A read-only run reads the files, but its
-  changes are not saved.
+  reference with the result. A read-only run reads the files. A call
+  that changes them returns an error, and the head stays.
 - **Run again on a store failure.** The tool-call activity runs once. A
   workspace store that times out or fails with a retryable error is the one
   exception: the workflow runs the call again from the same head, up to
@@ -2014,6 +2400,90 @@ the answer of each model turn in two layers:
 - The live text is a preview. The `TurnText` and the run result are the
   answer.
 
+### Strategies in an op
+
+A message op can carry an `OpSample`: a `SampleStrategy`, a `ScorerRef` and
+an optional concurrency. The agent then runs the op through the core of
+`agent_sample` (section 20), not as one segment.
+
+```rust
+use autumn_harvest_agent::AgentOp;
+use autumn_harvest_agent::sampling::{OpSample, SampleStrategy, ScorerRef};
+
+let sample = OpSample::new(
+    SampleStrategy::best_of_n(3),
+    ScorerRef::deterministic("exact_match").unwrap(),
+);
+let op = AgentOp::message("Name a prime.").with_sample(sample);
+```
+
+- The op builds its task as a segment does. Each draw gets the
+  transcript as its history, the labels of the agent and the mandate of
+  the op. A peer message uses the accepted mandate.
+- The mandate admits the draws first: `draws_exceeded`, then
+  `fan_out_exhausted`. The sampling policy of the kind then admits the
+  strategy. A refusal comes before any model call.
+- A beam (section 20) checks `max_draws` against its steps only. A step
+  continues the run of its beam, and the beam counts its delegations step
+  by step.
+- Each tier of a cascade (section 20) is a run of its own, so it counts as
+  one delegation, as a draw of best-of-N or of a vote does.
+  `OpSample::vote` runs a vote (section 26), which needs no scorer. A cascade peer op checks
+  the tier models against the accepted mandate, not the model of the
+  profile. It skips each forbidden tier. With no tier left, it ends with
+  `no_accepted_draw`.
+- A refused or failed op is a failed op. The transcript stays as it was,
+  and the next op runs. A peer gets a mandate refusal in
+  `PeerReply::refusal`, and any other error in `PeerReply::error`.
+- The selected draw gives the answer and the new transcript. The tokens and
+  the labels of each draw go into the state, selected or not.
+- A mesh budget that refuses a draw parks the agent until the period
+  ends, as for a segment. When no draw spent a token, a message from a
+  person waits first in line. Else the op answers with the draws that ran.
+- With no accepted draw, the op fails with `no_accepted_draw`.
+- A judge model must be in `Mandate::models`, else the op gets
+  `model_forbidden`. A judge call does not check the mesh budget before
+  the call. Its tokens count after it.
+- A transcript over the workflow input cap fails the op before any draw,
+  because each draw carries the transcript.
+- A steer message with a strategy runs as its own op. An interrupt, a
+  pause or a delete does not stop the draws of a running strategy op.
+- With `AgentProfile::stream`, the op publishes the selected answer once
+  on the durable stream of the agent. A draw streams nothing.
+- A draw has no memory tool, no workspace, no follow-ups and no context
+  reset. It reads the state memory in its system prompt and the progress
+  notes in its window. It changes neither.
+- A worker that predates `OpSample` drops the field and runs a plain
+  segment. Upgrade every worker before a client sends a strategy op.
+
+The design is in [`DESIGN-2449.md`](design/DESIGN-2449.md).
+
+### A strategy through `delegate` (issue #2610)
+
+A delegating model can ask a durable peer for a strategy. The `delegate`
+tool takes an optional `sample` argument, an `OpSample`. The peer runs the
+message as a strategy op. The caller reads the selected answer as the
+tool result. [`agent-mesh.md` section 13](agent-mesh.md#13-durable-peers-issue-2269)
+shows the call.
+
+- The draw cap of a call is the smaller of the caller `max_draws` and
+  the `Peer::max_draws` of the peer role. With neither, the call admits
+  one draw. An operator opts in to more draws with either cap.
+- The tool shows `sample` only when a durable peer has a cap of 2 or
+  more.
+- The usual delegation checks run first. Then the caller checks the draws
+  before it sends anything: `draws_exceeded`, then `fan_out_exhausted`.
+  The delegation takes one unit of `max_delegations`, and each draw takes
+  one more once the message is out. A beam checks `max_draws` only.
+- The receiver checks its accepted mandate and its sampling policy again.
+- An inline peer refuses a strategy with `strategy_needs_durable_peer`.
+  An inline peer is a role, not a kind, so no sampling policy covers it.
+- `DelegationRecord::draws` keeps the draw units that the caller counted.
+- A receiver decodes the envelope mandate strictly. An unknown key fails
+  the op, so the receiver never drops a cap that a newer sender adds.
+
+The design is in [`DESIGN-2610.md`](design/DESIGN-2610.md).
+
 ### Profile overlays (issue #2372)
 
 An activated overlay changes the next op only, because each op reads it
@@ -2038,7 +2508,9 @@ fn with_overlays(db: &Path, base: AgentHarness) -> Result<AgentHarness, Box<dyn 
 - The version must still validate under the current harness profile.
   Then it applies to the run profile under the run ceilings. The op takes
   only the fields that an overlay can set. The mandate, the peers and the heartbeat stay those of the
-  run, so a deploy still changes the next run only.
+  run, so a deploy still changes the next run only. A
+  `Control::ReloadProfile` ends the run, so the next run reads them (see
+  "Reload the profile").
 - With no store, the op schedules no read. With no active version, the
   read records `overlay_version: None`, and the op runs on the run
   profile.
@@ -2056,6 +2528,48 @@ fn with_overlays(db: &Path, base: AgentHarness) -> Result<AgentHarness, Box<dyn 
   this version. An older worker cannot replay a history that holds an op
   read. On a worker with no store, the op read fails and retries. See
   `docs/design/DESIGN-2372.md`.
+
+#### The store in a replicated fleet database
+
+`SqliteOverlayStore::open` keeps one connection with the default
+`wal_autocheckpoint`. A fleet database that ships its WAL to a replica
+needs two rules: only the replicator checkpoints, and the replicator
+connection closes last. So open the store on a connection factory:
+
+```rust
+use std::path::PathBuf;
+use std::sync::Arc;
+use autumn_harvest_agent::{AgentHarness, SqliteConnector, SqliteOverlayStore};
+
+fn with_fleet_overlays(db: PathBuf, base: AgentHarness) -> Result<AgentHarness, Box<dyn std::error::Error>> {
+    let connect: SqliteConnector = Arc::new(move || {
+        let conn = rusqlite::Connection::open(&db)?;
+        conn.execute_batch("PRAGMA busy_timeout = 5000; PRAGMA wal_autocheckpoint = 0;")?;
+        Ok(conn)
+    });
+    let store = Arc::new(SqliteOverlayStore::with_connector(connect, Arc::new(base.clone()))?);
+    Ok(base.overlay_store(store))
+}
+```
+
+- The store applies its schema through the factory.
+- Each call opens one connection and drops it after the call. The store
+  keeps no connection between calls, and runs one call at a time.
+- The store sets `foreign_keys = ON` and no other pragma. Set the pragmas
+  of the fleet in the factory.
+- A store connection does not checkpoint when it closes, also when it
+  closes last.
+- Open a connection only while another connection of the app stays open,
+  such as the replicator connection. Then a store connection never closes
+  last.
+- Set `busy_timeout` in the factory. With none, a call fails at once on a
+  busy file.
+- Use the `rusqlite` version of `autumn-harvest-sqlite`, so the
+  `Connection` types match.
+- Each call must open the same database. A new in-memory database on each
+  call has no tables.
+- The guards of the tables do not change. See
+  `docs/design/DESIGN-2656.md`.
 
 ### Tool guidance and skills (issue #2373)
 
@@ -2194,8 +2708,9 @@ verdict. History records it, so replay never calls the scorer again.
 - A verdict encodes as `{"score": 0.5}` or `{"reject": "reason"}`.
 
 **Built-in scorers.** `ExactMatch` compares the trimmed answer with the
-trimmed expected text. Each built-in scorer checks one fixed target. For
-a target per task, write an app scorer. `JsonSchema` reads the answer as JSON, with or
+trimmed expected text. `ExactMatch::new(text)` checks one fixed target.
+`ExactMatch::per_item()` reads `ScoreInput::expected`, and rejects an
+input with none. `JsonSchema` reads the answer as JSON, with or
 without a Markdown code fence, and checks it with the engine schema check.
 That check covers a subset of JSON Schema: see
 `autumn_harvest::info::validate_against_schema`. Each gives `Score(1.0)` on
@@ -2248,10 +2763,10 @@ an overlay go live without a person. A change takes effect at the next
 read, with no restart: the next op, or the next refine run.
 
 Today the store enforces `ceilings`, `auto_adopt.parts` and
-`auto_adopt.max_per_day`. The refine workflow of #2380 reads `ceilings`,
-`probe_effects` and `proposal_attempts` (section 22). The other settings
-are kernels for open issues: the adoption gate of #2381 and the lesson
-library of #2382. Those issues will read them.
+`auto_adopt.max_per_day`. The refine workflow reads `ceilings`,
+`probe_effects` and `proposal_attempts` (section 22). The adoption gate
+reads `auto_adopt` and `approval_timeout` (section 23). The lesson library
+reads `lessons.max_entries` at each write (section 24).
 
 | Setting | Meaning | Default | Range |
 |---|---|---|---|
@@ -2295,7 +2810,7 @@ harvest agents profile policy support reset
   record. A change during the run never widens that run. A narrowing
   reaches its adoption at once, because the store also checks its current
   policy.
-- **Ceilings.** The store validator and the op read of #2372 apply each
+- **Ceilings.** The store validator and the op read apply each
   overlay under `policy.ceilings.resolve(profile)`. The op read takes the
   policy in the same recorded activity. A raised ceiling lets an overlay
   pass the profile bound. A lowered one fails the next op of a version
@@ -2316,7 +2831,7 @@ harvest agents profile policy support reset
 | `auto_adopted` | The candidate went live without a person. |
 | `awaiting_approval` | The candidate waits, with the reason. |
 | `unchanged` | The candidate changes no part. |
-| `timed_out` | The gate of #2381 waited for `approval_timeout`. It will use `RefinePolicy::gate_state`. |
+| `timed_out` | The adoption gate waited for `approval_timeout`. It will use `RefinePolicy::gate_state`. |
 
 - **Probes.** `eval::live_probe` takes the set of `probe_effects` (issue
   #2378). The tool-call activity of the probe refuses any other effect. A
@@ -2333,7 +2848,7 @@ proves that the auto moves of a day never pass the cap. The design is in [`DESIG
 
 ## 19. Sampling policy (issue #2439)
 
-Each strategy of epic #2438 runs more than one draw. A draw can call
+Each sampling strategy runs more than one draw. A draw can call
 tools. An operator sets the limits of each agent kind in one
 `SamplingPolicy`. A missing policy means every default, and each default
 is the safe value.
@@ -2347,6 +2862,7 @@ is the safe value.
 | `scorers` | The scorer ids that the kind may use: `deterministic`, or `{"only": [ids]}` | `deterministic`: each scorer that calls no model |
 | `judge_models` | The models that a judge scorer may call | none |
 | `max_answer_retries` | The cap of the answer check (section 21). 0 to 16. | 0 |
+| `cascade_models` | The harness models that a cascade tier may name (section 20) | none, so each cascade is refused |
 
 An unknown key fails the decode. So an older worker never drops a setting
 that a newer worker recorded. The run of that older worker fails closed,
@@ -2413,7 +2929,8 @@ wider effects than a single run of its kind.
   id `n`, so N draws are N samples, not one cached answer.
 
 `agent_draws` returns each draw report. An engine failure of a draw fails
-the run. `agent_sample` (section 20) scores the draws and selects one.
+the run. `agent_draws` refuses `cascade` with `sample_only`, because only
+`agent_sample` asks a model per tier. `agent_sample` (section 20) scores the draws and selects one.
 
 ### Upgrade every worker first
 
@@ -2457,12 +2974,18 @@ let input = SampleInput::new(
 
 | Strategy | What it does |
 |---|---|
+| `single` | Runs one draw and scores it. The policy needs no strategy for it, because the default policy makes each run a single draw. The concurrency and the scorer checks still apply. |
 | `best_of_n { n }` | Runs `n` draws, scores each, and selects with `select` (section 17). A tie goes to the lowest draw id. |
 | `rejection { max_attempts, threshold }` | Runs draws until one scores at or above `threshold`, up to `max_attempts` draws. It runs one draw at a time unless the input asks for more. It stops after the wave that holds the pass. |
+| `vote { n, key }` | Keys each answer, and selects the most common key. It needs no scorer. See section 26. |
+| `cascade { tiers }` | Asks each tier in order, one draw per tier, and stops at the first answer at or above the threshold of its tier. See "Model cascade" below. |
 
 The run reads the profile and the sampling policy of the kind once each,
-as `agent_draws` does (section 19). The policy admits the strategy, the
-draw count (`n` or `max_attempts`), the concurrency and the scorer. Each
+as `agent_draws` does (section 19). In a run that starts after this
+release, a profile mandate admits the draws first, as for a strategy op
+(section 15). The policy admits the strategy, the
+draw count (`n` or `max_attempts`), the concurrency and the scorer of
+best-of-N and rejection. Each
 draw gets `draw_effects`, so with the default `[read_only]` a draw that
 calls a `write` tool gets a refusal, and the tool body never runs.
 
@@ -2491,6 +3014,17 @@ but it also returns the tokens and the cost of the judge calls. A draw
 that failed, or that a budget stopped, gets a reject and no score call.
 The run cuts each tool result of a score input to 16 KiB.
 
+`SampleInput::expected` sets the expected answer of the run. Each score
+input carries it in `ScoreInput::expected`. Only `ExactMatch::per_item()`
+reads it. `ExactMatch::new(text)` keeps its own text, so a caller cannot
+change the target of an operator scorer.
+
+`SampleInput::brief` drops the transcript of the selected draw from the
+report. The answer stays. `SampleReport::refused` is `true` when an LLM
+budget refused a model call or a judge call. A spent token cap does not
+set it. `SampleReport::overlay_version` names the overlay of the profile
+that built the draws.
+
 A judge call may name only the judge model of the input `ScorerRef`,
 which the policy admitted. So the scorer must name that model, and `None`
 fails. A call to any other model fails with `ErrorKind::Config`, and the
@@ -2500,21 +3034,193 @@ model is not called.
 
 `SampleReport` holds:
 
-- `outcome`: `selected { draw }`, or `no_accepted_draw` when no draw
-  passed;
+- `outcome`: `selected { draw }`; `escalated { draw }` when no tier of a
+  cascade accepted; or `no_accepted_draw` when no draw passed;
 - `selected`: the `AgentReport` of the selected draw;
-- `stopped`: `completed`, `accepted` (a rejection run found a pass),
-  `budget_exceeded` or `score_failed`;
+- `stopped`: `completed`, `accepted` (a rejection or cascade run found a
+  pass), `budget_exceeded`, `score_failed`, `settled` (a vote leader
+  cannot lose) or `rounds_exhausted` (a beam run ended its last round with
+  a live beam);
 - `attempts`: the draws that ran;
 - `draws`: for each draw, its stop, verdict, usage and cost. The usage and
-  the cost include the judge calls of the draw;
+  the cost include the judge calls of the draw. A cascade draw also holds
+  the `model` of its tier, and a vote draw its key (section 26);
+- `skipped`: each cascade tier whose model the mandate forbids, with its
+  refusal;
+- `tally`: for a vote, the votes of each key, the winner first;
 - `usage` and `cost_usd_micros`: the totals. They equal the cost ledger
   rows of the run tree.
+- `flow_labels`: the labels of each draw, selected or not.
 
 Each `ModelTurn` carries the cost that the ledger recorded for it, and
 `AgentReport::cost_usd_micros` sums it, as `usage` sums the tokens.
 
 The design is in [`DESIGN-2443.md`](design/DESIGN-2443.md).
+
+### Model cascade (issue #2445)
+
+A cascade asks a cheap model first and scores the answer. It asks a
+stronger model only when the score is below the threshold of the tier.
+
+```rust
+use autumn_harvest_agent::sampling::{SampleInput, SampleStrategy, ScorerRef, Tier};
+use autumn_harvest_agent::{ExactMatch, FiniteF64};
+
+// The policy of `researcher` must list `cascade`, with `max_draws >= 2`
+// and `cascade_models` of `["cheap", "strong"]`. The harness adds both
+// models with `AgentHarness::model_named`.
+
+let input = SampleInput::new(
+    "researcher",
+    "Name a prime.",
+    SampleStrategy::cascade([
+        Tier::new("cheap", FiniteF64::new(0.5).unwrap()),
+        Tier::new("strong", FiniteF64::new(0.8).unwrap()),
+    ]),
+    ScorerRef::deterministic(ExactMatch::ID).unwrap(),
+);
+// SQLite: autumn_harvest_agent::sqlite::start_sample(&mut rt, &input)
+```
+
+```sh
+harvest agents sampling policy researcher set --strategies cascade --max-draws 2 --cascade-models cheap,strong
+```
+
+The run asks the tiers in order, one draw per tier. Tier `i` is draw `i`.
+
+1. The policy admits the strategy, the tier count as the draw count, and
+   the scorer. `cascade_models` must list each tier model. A miss fails
+   the run with `sampling refused (tier_model_not_allowed)` before any
+   model call.
+2. A cascade runs one tier at a time. A `concurrency` above 1 fails with
+   `too_many_concurrent_draws`, after the checks of step 1.
+3. When the mandate of the profile does not allow the model of a tier
+   (`Mandate::allows_model`), the run skips the tier, and the next tier
+   runs. `skipped` names each such tier with the refusal `not_permitted`,
+   as `{"tier": 0, "model": "cheap", "refusal": {"refusal":
+   "not_permitted"}}`.
+4. The run stops at the first tier whose score is at or above its
+   threshold. The outcome is `selected`, and `stopped` is `accepted`.
+5. A tier that fails gets a reject, and the next tier runs.
+6. When no tier accepts, `select` picks the best score among the tiers that
+   ran. The outcome is `escalated`. With each tier rejected, it is
+   `no_accepted_draw`.
+7. A budget stop or a failed score can end the run before the last tier.
+   The outcome is then `escalated` when a tier has a score. `stopped`
+   gives the reason, so check it before you deliver the answer.
+
+The tiers share the token budget. Each tier gets the tokens that are
+left. Each tier is a child run, and history records each score. So a
+crash after tier 1 resumes at tier 2, and never asks tier 1 again.
+
+#### The ledger rows
+
+Each tier asks its own harness model, so each ledger row holds the model
+id of its tier. Say that `cheap` has the model id `cheap-v1` at 1
+micro-dollar per token, and `strong` has `strong-v1` at 20. The cheap
+answer scores 0.3, under 0.5. The strong answer scores 0.95, at or above
+0.8. The run writes these rows:
+
+| `model` | `activity_name` | Tokens | `cost_usd_micros` |
+|---|---|---|---|
+| `cheap-v1` | `agent_model_turn` | 5 | 5 |
+| `strong-v1` | `agent_model_turn` | 7 | 140 |
+
+`draws[0].model` is `cheap` and `draws[1].model` is `strong`. Each draw
+cost equals its row, and `cost_usd_micros` of the report is 145. When the
+cheap answer accepts, the ledger holds only the first row. The test
+`the_ledger_has_one_row_per_tier_with_its_model_id` checks these rows.
+
+The design is in [`DESIGN-2445.md`](design/DESIGN-2445.md).
+
+### Beam search
+
+Best-of-N scores whole runs. Beam search scores each model turn, so a
+path that goes wrong at step 2 stops there.
+
+```rust
+use autumn_harvest_agent::sampling::{SampleInput, SampleStrategy, ScorerRef};
+
+// The policy of `researcher` must list `beam`, with
+// `max_draws >= width × expansion × max_rounds`, here 12.
+
+let input = SampleInput::new(
+    "researcher",
+    "Find the path.",
+    SampleStrategy::beam(2, 2, 3),
+    ScorerRef::deterministic("path_score").unwrap(),
+);
+// SQLite: autumn_harvest_agent::sqlite::start_sample(&mut rt, &input)
+```
+
+| Field | What it does |
+|---|---|
+| `width` | The most beams that a round keeps. The run stops when `width` beams are complete. |
+| `expansion` | The model turns that each live beam gets in a round. |
+| `max_rounds` | The most rounds. |
+
+A beam is a transcript. Round 0 has one beam: the user message. Each
+round expands each live beam `expansion` times. Each expansion is a step:
+a child `agent_loop` run with `AgentTask::beam_step` set. A step sends
+its beam as `history`, asks for one model turn, and runs the tool round
+that the turn asks for. A tool round ends the step with `step_ended`. A
+final answer ends it with `completed`. So a kept beam pays for its new
+turn only. Its prefix is data in the request, not a new model call.
+
+Each step has its own draw id, so two steps of one beam never share a
+cached answer. Each step gets `draw_effects`, as a draw does. Each step
+also gets the flow labels of its beam, so a flow rule sees the labels of
+each earlier round.
+
+The scorer of the input is the step scorer. `agent_sample_score` scores
+each step. The score input holds the whole transcript of the beam, and
+its `stop` is `step_ended` until the beam is complete. `ExactMatch` and
+`JsonSchema` give a `step_ended` step the score 0, so a beam keeps it
+below each passed answer. A step that ends with another stop gets a
+reject and no score call.
+
+A step continues its beam, so it also continues the step count. A beam of
+round `r` holds `r` tool rounds, so its step may run `max_steps - r` more.
+With none left, a step that asks for a tool ends `steps_exhausted`. So a
+path never runs more tool rounds than one run of the profile. In the same
+way, the mandate of a step allows only the delegations that its beam has
+not used.
+
+After each round, `beam_rank` keeps the best steps: at most `width` less
+the complete beams. It calls `select` once per kept step, so a tie goes
+to the lowest draw id, and a reject is never kept. A kept step with a
+final answer is complete and leaves the pool. Each other kept step is
+live in the next round, in rank order.
+
+The run stops with `completed` when `width` beams are complete, or when
+no beam is live. It stops with `rounds_exhausted` after `max_rounds` with
+a live beam.
+The outcome is `select` over the complete beams, and `selected` holds the
+report of the best one. Its transcript is the whole path, but its usage
+covers its last step only. The totals are on `SampleReport`. With no
+complete beam, the outcome is `no_accepted_draw`.
+
+Each draw record holds `beam`: its `round`, its `parent` step and its
+`fate` (`live`, `complete` or `pruned`). So the report holds the verdicts
+of each round.
+
+The policy admits `width × expansion × max_rounds` as the draw count,
+before the first model call. The product saturates, so an overflow is
+refused as `too_many_draws`. The budget and the stops of best-of-N apply
+to each round.
+
+Known limits:
+
+- Each step sends its whole beam as input tokens. The loop checks a token
+  cap between model calls, and a step makes one call. So a step can pass
+  its share of the budget by the size of its beam.
+- A step that delegates also runs the model calls of its child. The draw
+  count bounds the turns of the steps only.
+- The loop guard of a step sees only its own turn. `max_rounds` bounds a
+  loop across rounds.
+- A step has no context reset, because a reset rewrites the beam.
+
+The design is in [`DESIGN-2446.md`](design/DESIGN-2446.md).
 
 ## 21. Answer check (issue #2442)
 
@@ -2700,36 +3406,51 @@ On Postgres, install `postgres::Sources::new(pg)` and start the workflow
   `agent_loop` run, so the run names its kind. A run with no kind gets
   `RefineSourceOtherKind`, and so does each run recorded before this
   release. A durable `agent` run has no replay probe yet, so it gets
-  `RefineSourceNotReplayable`.
+  `RefineSourceNotReplayable` before the end and kind checks, of any kind
+  and in any state.
 - **Parallel.** For each source, k INV and k DOM stages start from one
   base. Each candidate gets one probe. k compositions read the shared
   probes. Each candidate composition gets one probe. One selection
   follows.
 - **Sequential.** For each source, k steps. Each step runs INV, DOM, their
   probes, one composition and its probe. A candidate composition is the
-  base of the next step.
+  base of the next step. A composition that failed its live re-probe is
+  not. The next step keeps the base of the step before.
 - **Probe.** `eval::evaluate` against the recorded source, so the base
   rollout costs nothing. A probe that stubs a tool call asks for a live
   re-probe with `probe_effects`. The fork applies the overlay under the
-  policy ceilings, as the stages do. SQLite has no fork, so the probe records
-  `live re-probe skipped: SQLite has no fork` in the stage notes.
+  policy ceilings, as the stages do. The fork id comes from the
+  idempotency key of the probe activity. A retry after a crash waits for
+  the fork of the first attempt, and forks nothing. SQLite has no fork,
+  so the probe records `live re-probe skipped: SQLite has no fork` in the
+  stage notes.
 - **Compose and select.** An `OverlayComposer` reads the probes under
-  opaque ids, with the anonymised pool of issue #2376. The pool redacts
+  opaque ids, with the anonymised pool. The pool redacts
   each route that a probe asked for, with its model id. So a route that a
   probe inherits from its source task, or the route of a recorded peer, is
   redacted too. With a workspace store, the composer also reads an
   evidence bundle, which hides the same names. An `OverlaySelector` picks
   one id. The rule picks in its place when no selector is installed, or when
-  the selector fails, times out or names an id outside the pool. The rule
-  takes a completed end first, then the fewest stubbed tool calls, then
-  the lowest id.
+  the selector fails, times out, or names an id outside the pool or a live
+  failure. The rule never picks a live failure. Then it takes a completed
+  end first, then the fewest stubbed tool calls, then the lowest id.
+- **A live failure.** The pool shows the live re-probe of each candidate
+  as `AnonymisedEvaluation::live`, an `eval::LiveCheck`. It holds no fork
+  id, no cost and no host error, and the pool redacts each run error. A
+  live failure is a fork that did not complete: it failed, ended in
+  another state, or did not end in time. A failed fork call or wait is not
+  one. When each candidate failed live, the select step asks no selector
+  and picks none. A run that started before this release keeps the old
+  rule. The design is in `docs/design/DESIGN-2579.md`.
 - **Budget identity.** For each source, both modes run 3k sessions. Each
   candidate stage adds one probe. A `KeptBase` or `FellBack` stage adds
   none. A run that ran its whole plan checks the counts. A mismatch fails
   it with `RefineBudgetIdentity`.
 - **Spend.** A proposer, composer or selector reports each model call
   with `charge`. `ModelProposer` charges each of its calls. Each step
-  writes its calls to the cost ledger under the refine run. With a budget,
+  writes its calls to the cost ledger under the refine run. A probe writes
+  one row for each candidate turn that called a model, with the model id
+  of that turn. With a budget,
   the run stops before the next step once its own spend reaches a cap. It
   ends as `budget_exhausted` with no `chosen` overlay. A live re-probe
   records its rows under the fork. The run counts the spend of a
@@ -2740,8 +3461,559 @@ On Postgres, install `postgres::Sources::new(pg)` and start the workflow
 - **Crash.** Each step is one recorded activity. A crash re-runs only the
   step in flight.
 
-The run ends with a `RefineReport`: the status (`chosen`, `unchanged` or
-`budget_exhausted`), the chosen overlay, one record per stage, each
-selection and the `RefineLedger`. It holds no id of the refine run and no
-time, so one seed and one script give byte-identical reports. The
-adoption gate of #2381 takes the chosen overlay.
+The run ends with a `RefineReport`: the status, the chosen overlay, one
+record per stage, each selection, the `RefineLedger` and the gate record.
+It holds no id of the refine run and no time, so one seed and one script
+give byte-identical reports. A run that chose an overlay goes on to the
+adoption gate of section 23. `RefineInput::dry_run` ends the run after the
+loop with the status `chosen`. A dry run stores no version and opens no
+gate.
+
+## 23. The adoption gate
+
+A refine run that chose an overlay does not put it live by itself. The
+design is in [`DESIGN-2381.md`](design/DESIGN-2381.md). The gate needs an
+overlay store on the harness. With none, the adoption step fails the run
+as `OverlayStoreMissing`. A dry run needs no store.
+
+1. `agent_refine_adopt` calls `refine::adopt_over` with the version that
+   was active at refine start. A moved pointer ends the run as
+   `superseded`. A candidate whose changed parts the policy lists goes
+   live as `auto:<run>`, under the daily cap.
+   The step puts any other candidate as an inactive version
+   `refine:<run>`. It also reads the head of the activation log.
+2. The run drops each decision that arrived before this point. Then it
+   sets `refine_status = waiting_approval`.
+3. The run waits on the signal `refine_approval:<run>` until
+   `approval_timeout` of its policy passes. The default is 7 days.
+
+| Decision | Payload | Effect | `refine_status` |
+|---|---|---|---|
+| Approve | `{"verdict": "approve"}` | Activates the version over the version that was active at refine start. | `adopted` |
+| Edit | `{"verdict": "edit", "overlay": {...}}` | Checks the overlay under the run ceilings, puts it as `refine:<run>` and activates it. | `adopted` |
+| Reject | `{"verdict": "reject", "reason": "..."}` | Activates nothing. The version stays stored. | `rejected` |
+| No decision | | As reject, at the deadline. | `timed_out` |
+
+- **Superseded.** Any move of the pointer after refine start wins over a
+  decision, by an operator or by another run. So does any move after the
+  wait opens. An approve or an edit then activates nothing, and the run
+  ends as `superseded`. A retry of a decision never moves the pointer
+  again, so it never undoes a rollback.
+- **Refused.** The run ceilings or the store can refuse an edit. A lowered
+  ceiling can refuse an approve. The run notes the reason and waits until
+  the same deadline. A payload that does not decode does the same. A key
+  that the verdict does not read fails the decode, so an approve that
+  carries an overlay activates nothing.
+- **Early decision.** The run drops a decision that arrives before the
+  wait opens, as eval does. List the run first. The report counts each
+  dropped decision.
+- **Attributes.** The run sets `refine_kind` and `refine_status` at each
+  end: `adopted`, `rejected`, `timed_out`, `superseded`, `auto_adopted`,
+  `unchanged`, `budget_exhausted` or `chosen`. A run that fails in the gate
+  gets `failed`.
+- **Actor.** The move records the actor `refine:<run>`. History holds the
+  signal of the person.
+- **Upgrade.** A run that started on an older release opens no gate. It
+  ends with `chosen`, as that release did.
+
+```sh
+harvest agents profile pending support
+harvest agents profile approve <run>
+harvest agents profile reject <run> --reason "too long"
+harvest agents profile edit <run> --file overlay.json
+```
+
+`pending` sends the `filter` of `GET /workflows`, which only a Postgres
+server serves. The other commands take the execution id in any UUID
+spelling and send its canonical form. On SQLite, `sqlite::decide_refine`
+sends a decision, and `ExecutionFilter::search_attribute` lists the runs
+that wait. On Postgres, `postgres::decide_refine` sends it.
+
+## 24. The lesson library
+
+Each adoption adds one lesson to the library of its kind. The next refine
+of the kind reads the library. The design is in
+[`DESIGN-2382.md`](design/DESIGN-2382.md). The library needs a memory store
+on the harness that implements `MemoryStore::ensure_block` and
+`MemoryStore::apply_labelled`. `InMemoryMemoryStore` does.
+
+- **Scope.** The memory scope `kind:<kind>:lessons` holds one block,
+  `lessons`. Each entry is one lesson as one line of JSON. It holds the
+  adopted `version`, the `why` and `lesson` text of the select step, the
+  `sources` exec ids and the `agents` ids. `agents` holds each agent of
+  the kind that a source names: its workflow id, the agent of its memory
+  scope `agent:<id>`, and each agent of its mandate chain. It also holds
+  each agent of the lessons that the run read. `refine::read_lessons`
+  decodes a block.
+- **Write.** A run that ends `adopted` or `auto_adopted` runs
+  `agent_refine_lesson`. A rejected, timed-out or superseded run writes
+  none. The report holds the result in `lesson`: `written`, with the
+  version and the evicted count of the attempt that answered, or
+  `failed`, with the error. A failed write never undoes the adoption. A
+  cancel during the write still cancels the run.
+- **Taint.** The lesson keeps the flow labels of the run: each label of
+  each source and of the lessons that the run read. The report holds them
+  in `flow_labels`. A store that cannot keep labels refuses a labelled
+  write.
+- **Bound.** The write reads the current `lessons.max_entries`. It removes
+  the oldest lessons until the block holds at most that many. A change of
+  the bound applies to the next write.
+- **Read.** The start step records the library, cut to the newest lessons
+  that fit 32 768 rendered characters. A failed read gives no library and
+  a warning. Each proposer stage gets it in `ProposeContext::lessons`,
+  with its labels. `ModelProposer` puts it in its prompt as data.
+- **Why and lesson.** A selector gives the text with
+  `OverlaySelector::choose`. The default calls `select` and gives none. A
+  rule pick and a sequential run give none.
+- **Erase.** `Control::ResetMemory` removes each lesson of the kind whose
+  `agents` holds the agent id, also one that other agents share.
+  `agent_lesson_match` records the matches first, so a retried removal
+  keeps the count. The removal step fails while a match remains.
+  `AgentState::lessons_removed` counts them, and `harvest agents erase`
+  reports `lessons_removed`. History keeps copies of the text in each
+  refine run that read or wrote a lesson. Erase those runs too.
+- **Upgrade.** Upgrade each activity worker first: an older worker
+  refuses a `ProposeRequest` with `lessons`. A run that started on an
+  older release has no source labels, so it writes no lesson. Its report
+  notes why.
+- **Fleet.** `InMemoryMemoryStore` lives in one process. Each worker of a
+  fleet needs the same durable store.
+
+## 25. Refine an agent
+
+The refine loop improves the setup of an agent kind from its recorded
+runs. Sections 16, 18 and 22 to 24 describe the parts. This section shows
+how the parts fit. [ADR 0016](adr/0016-agent-refinement.md) records the
+four decisions, and [ADR 0014](adr/0014-operator-refine-policy.md)
+records the policy rule.
+
+```sh
+cargo run -p autumn-harvest-agent --features sqlite,eval --example agent_refine
+```
+
+`autumn-harvest-agent/examples/agent_refine.rs` runs the loop on SQLite
+with scripted models. It needs no API key and no network. The refine
+workflow needs the `eval` feature.
+
+1. Op 1 is a recorded `agent_loop` run of the kind `support`. Its prompt
+   lacks a refund rule, so the `ExactMatch` scorer rejects its answer.
+2. `agent_refine` with k = 1 reads op 1. The proposer adds the rule, and
+   the probe replays op 1 under the candidate.
+3. The run waits at the adoption gate. The example approves it.
+4. Op 2 goes to the durable agent `support/customer-2`. It reads the
+   adopted version 1, so its answer passes. The example exits non-zero
+   when op 2 fails.
+
+Its tests also send a reject. Op 2 then fails, so the check is not
+vacuous.
+
+### The loop
+
+The loop runs offline. It reads ended runs only, and it never changes an
+op in flight. A durable op reads the active version at its start. It
+never reads a waiting candidate.
+
+1. **Policy.** The run reads the `RefinePolicy` of the kind once, through
+   a recorded activity ([section 18](#18-the-refine-policy-issue-2394)).
+2. **Propose.** A proposer writes INV and DOM candidates from the
+   evidence of the source runs
+   ([section 16](#16-propose-an-overlay-issue-2379)). It tries up to
+   `proposal_attempts` times. With no valid reply, the stage inherits its
+   base.
+3. **Probe and compose.** Each candidate replays against its source. A
+   composer combines the probed candidates
+   ([section 22](#22-refine-a-kind-issue-2380)). In parallel mode, a
+   selector or the fallback rule picks one. In sequential mode, each
+   composition is the base of the next step. Neither mode takes a
+   composition that failed its live re-probe.
+4. **Adopt.** The chosen overlay goes to the adoption gate
+   ([section 23](#23-the-adoption-gate)).
+5. **Learn.** With a memory store, each adoption adds one lesson to the
+   lesson library of the kind ([section 24](#24-the-lesson-library)).
+
+Run the loop from a schedule or by hand. Never run it on the path of an
+op.
+
+### The budget identity
+
+A session is one proposer or composer stage. For each source, both modes
+run 3k sessions. Each candidate stage adds one probe. A `KeptBase` or
+`FellBack` stage adds none. A run that ran its whole plan checks the
+counts, and a mismatch fails it with `RefineBudgetIdentity`. In the
+example, k = 1 gives 3 sessions. The INV stage keeps its base, so the run
+makes 2 probes. With a `MeshBudget`, the run stops before the next step
+once its spend reaches a token or cost cap.
+
+### Ceilings
+
+The operator sets the ceilings. Each stage, each probe, the store and the
+gate apply an overlay under them.
+
+- `ceilings.max_steps`, `ceilings.max_total_tokens` and
+  `ceilings.max_output_tokens` bound the three `max_*` fields.
+  `ceilings.models` lists the models that an overlay may name. The
+  default of each is `null`, the profile value, so an overlay can only
+  narrow.
+- An overlay can set `read_only`, but it cannot clear it. No policy
+  setting allows a clear.
+- An overlay holds a prompt, guardrails, tool guidance, skills, a model,
+  bounds and `read_only` only. It has no field for tools, tool rules,
+  flow rules, a mandate, scripts or plugins. It refuses an unknown key
+  when it decodes, so a model cannot add one.
+
+### Probes and their safety
+
+A probe replays the recorded source, so the base rollout costs nothing.
+No tool runs in a replay. The recorded outcome of the same call answers
+a tool call, and a call with no recorded outcome gets an error stub
+([section 12](#12-evaluate-a-candidate-overlay)). A probe with a stub
+asks for a live re-probe on a fork. The tool-call activity of that fork
+runs only the `ToolEffect`s of `probe_effects`. By default,
+`probe_effects` holds `read_only` only. So a live re-probe runs no tool
+that declares a write. SQLite has no fork, so a SQLite run skips the
+live re-probe and notes it.
+
+### Adoption
+
+By default, a person adopts each overlay. `auto_adopt.parts` is empty,
+so the chosen overlay waits at the gate. A person approves, edits or
+rejects it before `approval_timeout`. No decision at the deadline counts
+as a reject. An operator can list parts in `auto_adopt.parts`. A
+candidate that changes only those parts then goes live without a person,
+under the daily cap `auto_adopt.max_per_day`.
+
+### The policy
+
+Each setting of `RefinePolicy` is a runtime operator setting with a safe
+default. [The settings table](#18-the-refine-policy-issue-2394) lists
+each one with its default and range. This section names the settings
+that shape the loop. Only an operator writes the policy. No model output
+carries it, so the loop cannot widen its own gate.
+
+### The lesson library
+
+With a memory store, each adoption adds one lesson to the library of the
+kind. The next run reads the library and gives it to each proposer as
+data, with its flow labels. `lessons.max_entries` bounds the library,
+and the oldest lesson goes first. The example installs an
+`InMemoryMemoryStore`, so its run writes one lesson.
+
+## 26. The vote strategy
+
+A vote runs a task many times, keys each final answer, and selects the
+most common key. This is self-consistency. It needs no scorer and no
+judge, so its only spend is the draws. It works when an answer has a
+canonical form, such as a number, a label or a tool name.
+
+```rust
+use autumn_harvest_agent::sampling::{AnswerKey, SampleInput};
+
+// The policy of `researcher` must list `vote`, with `max_draws >= 5`.
+
+let input = SampleInput::vote("researcher", "What is 17 * 23?", 5, AnswerKey::LastNumber)
+    .concurrency(1);
+// SQLite: autumn_harvest_agent::sqlite::start_sample(&mut rt, &input)
+```
+
+| Key | The key of an answer |
+|---|---|
+| `trimmed` | The answer with no white space at each end. |
+| `last_number` | The last decimal number, in canonical form: `1,200.50` gives `1200.5`, and `.5` gives `0.5`. Only ASCII digits count. An exponent is a number of its own, so `1e5` gives `5`. |
+| `{"json_field": "/a/b"}` | The field at a JSON pointer (RFC 6901) of the JSON answer. A string gives its trimmed text. A number gives its exact decimal form, so `1`, `1.0` and `1e0` all give `1`, and no digit is lost. `null` gives no key. Each other value gives its JSON text. |
+| `{"custom": "id"}` | The result of the app `AnswerKeyFn` with this id, which must be an agent name. Add it with `AgentHarness::answer_key`. Make it a fast, pure function: it runs inline, with no time budget. |
+
+- **Votes.** Only a draw that completed casts a vote. A draw with no key,
+  or with a key over 1 KiB as JSON text, casts no vote. Its verdict is a
+  reject that names the reason. A draw with a key gets a score of 1.
+- **Winner.** The key with the most votes wins. A tie goes to the key
+  whose first vote has the lowest draw id. The run selects that first
+  draw. With no vote at all, the outcome is `no_accepted_draw`.
+- **Early stop.** After each wave, let `lead` and `second` be the top two
+  counts, and `left` the draws not yet started. When draws are left and
+  `lead > second + left`, the run starts no more draws, and `stopped` is
+  `settled`. Each draw of the wave counts. When the last wave decides the
+  vote, `stopped` is `completed`. Verus proves that the winner and its
+  first draw are then those of the full run, for each way the left draws
+  could vote. It also proves that the order in which draws end does not
+  change the winner.
+- **Concurrency.** A vote takes the cap of the policy by default. A run
+  whose draws fit in one wave never stops early. A lower concurrency lets
+  the run stop after fewer draws.
+- **Failures.** A failed key activity gives the draw a reject, and the
+  run stops with `score_failed`. So does a worker that has no function
+  for an app key, so a fleet that is half upgraded never casts empty
+  votes. A failed key wins over a settled vote and over a budget stop. A
+  settled vote wins over a budget stop.
+- **Report.** `SampleReport::tally` holds the votes of each key, the
+  winner first. `SampleDraw::key` holds the key of each draw.
+- **Durability.** The recorded `agent_vote_key` activity applies each
+  key, built-in or app. So replay reads each key, and a later change to a
+  key rule never changes a recorded run. After a crash, replay rebuilds
+  the tally, and the run starts only the draws that are missing.
+- **Refusals.** Each one comes before any model call: a kind whose policy
+  does not list `vote` (`strategy_not_allowed`), a vote with a scorer
+  (`scorer_not_used`), a key that is not valid (`invalid_answer_key`) and
+  an app key that the harness lacks (`unknown_answer_key`). Best-of-N and
+  rejection with no scorer give `no_scorer`.
+- **The gate of an app key.** The policy does not list app keys. A vote
+  can name only a function that the app added to its harness, and the
+  function gets no model and no context.
+
+The draws share the token budget and the draw effects of section 20. The
+design is in [`DESIGN-2444.md`](design/DESIGN-2444.md).
+
+## 27. Dataset sweep (issue #2448)
+
+`agent_sweep` runs one strategy over a fixed set of inputs, durably. Each
+item runs as a child `agent_sample` run (section 20). The report holds one
+row for each item and the totals. So a sweep compares strategies, such as
+best-of-3 with a cheap model against one draw with a strong model.
+
+```rust
+use autumn_harvest_agent::ExactMatch;
+use autumn_harvest_agent::sampling::{
+    SampleStrategy, ScorerRef, SweepInput, SweepItem, SweepItems,
+};
+
+let items = vec![
+    SweepItem::new("What is 2 + 2?").expected("4"),
+    SweepItem::new("What is 3 + 3?").expected("6"),
+];
+let input = SweepInput::new(
+    "researcher",
+    SweepItems::inline(items),
+    SampleStrategy::single(),
+    ScorerRef::deterministic(ExactMatch::ID).unwrap(),
+)
+.concurrency(1)
+.max_total_tokens(50_000);
+// SQLite: autumn_harvest_agent::sqlite::start_sweep(&mut rt, &input)
+```
+
+Install `ExactMatch::per_item()` as the scorer, so each item compares
+with its own expected answer. `examples/sweep_compare.rs` compares two
+strategies and prints the table.
+
+### Admission
+
+Before the first model call, the sweep checks these, in order:
+
+1. The kind is a valid name (`invalid_kind`).
+2. The list has at least one item (`no_items`), at most `MAX_SWEEP_ITEMS`
+   (`too_many_items`), and no inline item over `MAX_SWEEP_ITEM_BYTES`
+   (`item_too_large`).
+3. The kind has a profile (`unknown_kind`).
+4. The policy cap covers the item concurrency
+   (`too_many_concurrent_draws`).
+5. The policy admits the strategy, the draws and the scorer of one item,
+   as `agent_sample` does. A sweep needs a scorer, so it refuses a vote
+   (section 26) with `scorer_not_used`.
+6. A stored list matches its reference. The first page read checks it.
+
+The items and their draws share the `max_concurrent_draws` cap of the
+policy. `sweep_plan` gives the item concurrency `c`: the ask, or else the
+cap or the item count, whichever is lower. A best-of-N item gets
+`d = cap / c` draws at the same time, at most `n`. A beam item gets
+`d = cap / c`, at most `width × expansion`. Each other strategy gets
+`d = 1`. So `c × d` is never above the cap. The report holds `c` in
+`concurrency` and `d` in `draw_concurrency`.
+
+### Crash and resume
+
+Each item is one child run, so history records the end of each item. A
+crash runs only the items in flight again. A completed item never runs
+again, and its model calls are not sent again.
+
+### The budget
+
+The items share one token budget: `max_total_tokens` of the input. The
+sweep starts each wave of items with the tokens that are left. Item `i` of
+a wave gets the cap `sibling_cap(left, width, i)`. A failed child returns
+no spend, so its whole share counts as spent.
+
+An item that spends its token share, or the token cap of its profile,
+stops as `budget_exceeded`. The sweep goes on with the tokens that are
+left, and stops when none is left.
+
+The LLM budgets apply to each child, as to each run. When an LLM budget
+refuses a call of a child, the sweep stops after that wave. A child whose
+every draw an LLM budget refused before any spend is `not_run`. Each item
+that did not start is `not_run` too. `stopped` is then `budget_exceeded`.
+
+### Configuration changes
+
+Each child reads the profile and the policy of the kind again, as every
+`agent_sample` run does. A run never carries a policy, so a sweep cannot
+pin one. Each row holds the policy `revision` and the `overlay_version`
+that its child read. When a child reads another revision or another
+overlay version than the sweep, the sweep stops after that wave with
+`config_changed`. So an operator change applies at once, and one report
+never mixes two configurations without saying so.
+
+### Items by reference
+
+A workflow input holds at most 2 MiB. Put a larger list in a
+`SweepItemStore`, and pass the reference:
+
+```rust,no_run
+# async fn demo(
+#     payload_store: std::sync::Arc<dyn autumn_harvest::payload_store::PayloadStore>,
+#     codecs: autumn_harvest::payload_codec::PayloadCodecs,
+#     harness: autumn_harvest_agent::AgentHarness,
+#     list: Vec<autumn_harvest_agent::sampling::SweepItem>,
+# ) -> Result<(), autumn_harvest_agent::AgentError> {
+use autumn_harvest_agent::ExactMatch;
+use autumn_harvest_agent::sampling::{SampleStrategy, ScorerRef, SweepInput, SweepItemStore};
+
+let store = SweepItemStore::new(payload_store, codecs);
+let items = store.put(&list).await?; // SweepItems::Stored(..)
+let harness = harness.sweep_items(store);
+let scorer = ScorerRef::deterministic(ExactMatch::ID).expect("a valid id");
+let input = SweepInput::new("researcher", items, SampleStrategy::single(), scorer);
+# let _ = (harness, input);
+# Ok(())
+# }
+```
+
+- The reference holds the key, the SHA-256 digest of the list, the item
+  count and the size. Each read checks all three, so the list cannot
+  change during a sweep.
+- A list holds at most `MAX_SWEEP_LIST_BYTES` (16 MiB).
+- The `agent_sweep_items` activity reads one page at a time. A page holds
+  at most `MAX_SWEEP_PAGE_BYTES` (1 MiB) of items, and at least one.
+  History records each page. Keep the activity result cap of the engine
+  above 2 MiB.
+- The codec registry encodes the list, so an encrypting codec encrypts it
+  at rest. The digest binds the plain list, so a list from before a codec
+  rollout still reads.
+- The store read has the hook timeout of the harness.
+- Give the store its own payload store. The orphan sweep of an engine
+  store deletes a blob that no run references.
+- The store is not scoped to a tenant. A reference names one list by its
+  key and its digest.
+
+### The report
+
+`SweepReport::rows` holds one `SweepRow` for each item, in item order:
+
+- `status`: `completed`, `budget_exceeded`, `failed` or `not_run`;
+- `verdict`: the verdict of the selected draw. With no selection, it is
+  the best score, else the first reject. A reason is cut to 256 bytes;
+- `accepted`: whether the item selected a draw that passed. A cascade
+  that escalates keeps its best answer, but it is not accepted;
+- `answer`: the selected answer, cut to 512 bytes;
+- `draws`, `usage` and `cost_usd_micros`: the spend of the item tree,
+  judge calls included;
+- `revision` and `overlay_version`: the configuration of the child;
+- `error`: the error of a child that failed in the engine. The sweep goes
+  on after a failed child.
+
+`SweepReport::totals` holds `mean_score` (a reject counts as 0),
+`accept_rate` (accepted over run), `usage`, `cost_usd_micros` and
+`cost_per_accepted_usd_micros`. The total cost equals the cost ledger rows
+of the sweep tree, except for a failed child, whose spend only the ledger
+keeps. `stopped` is `completed`, `budget_exceeded` or `config_changed`.
+
+Each child runs with `SampleInput::brief`, so its result in the sweep
+history holds no transcript. The sweep does not use continue-as-new.
+`MAX_SWEEP_ITEMS` (1000) bounds its history. Nothing in the policy caps
+the draws of one sweep: set `max_total_tokens` to bound its spend. The
+design is in [`DESIGN-2448.md`](design/DESIGN-2448.md).
+
+### The sweep tool (issue #2716)
+
+A running agent can start a sweep with the `sweep` workflow tool. An
+operator turns it on for a run or a kind. The ceiling is required:
+
+```rust
+use std::num::NonZeroU32;
+
+use autumn_harvest_agent::sampling::ScorerRef;
+use autumn_harvest_agent::{AgentProfile, Answered, SweepTool};
+
+let scorer = ScorerRef::deterministic(Answered::ID).expect("a valid id");
+let ceiling = NonZeroU32::new(640_000).expect("not zero");
+let sweep = SweepTool::new("research", ceiling, scorer)
+    .max_items(40)
+    .flow_label("outside_text");
+let profile = AgentProfile::new("assistant").sweep(sweep);
+# let _ = profile;
+```
+
+- The model calls `sweep` with an `instruction` and `items`, a list of
+  `{label, source}`. Each item text is the instruction, the label and the
+  source.
+- The workflow runs one `agent_sweep` child with a single draw for each
+  item. No activity runs the call, so the tool timeout does not apply. A
+  crash resumes the child.
+- Each call sets `max_total_tokens` to the ceiling of the setting, or to
+  the tokens that the parent has left under its own cap, whichever is
+  lower. With no token left, the call gets an error result. The call
+  cannot change the kind, the ceiling, the scorer or the concurrency. A
+  call with an unknown key, no item, a blank instruction or more items than
+  `max_items` gets an error result, and no child starts.
+- The result holds `text`, the answers joined as `label: answer`, then one
+  row for each item (`label`, `ok`, `status`, `tokens`, `error`), `stopped`
+  and `spent`. `spent` names the ceiling, the tokens and the cost of the
+  sweep tree.
+- The parent counts the usage and the cost of the sweep tree in its own
+  report. A sweep that fails in the engine gives an error result. Its spend
+  is in the ledger only.
+- Each draw starts with the flow labels of the parent, as a delegated
+  child does (`SweepInput::flow_labels`, then `SampleInput::flow_labels`).
+  So a flow rule in a draw sees what the parent read.
+- Each draw keeps the effects of the parent. A read-only parent gives
+  read-only draws, and each draw keeps only the effects that the parent
+  and the policy both allow (`read_only` and `allowed_effects` on the
+  sweep input and the sample input).
+- The labels that the draws of an item exercised come back in
+  `SweepRow::flow_labels`, and they join the run.
+- The result also adds `flow_labels` of the setting to the run, so a rule
+  sees that the run read outside text.
+- A draw and a delegated child never get the tool, so a sweep never
+  nests. A call in a probe gets an error result.
+- `Answered` accepts each completed run with a non-empty answer. It fits
+  items with no expected answer.
+
+The design is in [`DESIGN-2716.md`](design/DESIGN-2716.md).
+
+## 28. Inference strategies
+
+A strategy runs more than one draw of one task, scores each draw and
+selects one answer. Each draw is a durable child run, so a crash costs one
+draw. A strategy pays off when one draw is often wrong and a check can
+tell a right answer from a wrong one. The example runs one task under
+four strategies, with a scripted model and no API key:
+
+```sh
+cargo run -p agent-strategies
+```
+
+It prints the selected answer, each draw and the cost of each run. The
+cheap model misses on its first draw, so the single draw finds nothing.
+Best-of-3 finds the answer with 3 cheap draws. The vote stops after 4 of
+5. The cascade pays for the strong model once.
+
+| Strategy | Draws | It pays off when | Policy setting |
+|---|---|---|---|
+| `single` | 1 | One draw is usually right, or no check exists. | none |
+| `best_of_n` | `n` | A scorer can rank answers, and draws differ. | `best_of_n` in `strategies`, `max_draws` ≥ `n` |
+| `rejection` | up to `max_attempts` | A check passes or fails, and a pass is common. It stops at the first pass. | `rejection` in `strategies`, `max_draws` ≥ `max_attempts` |
+| `vote` | up to `n` | Answers have a short key, such as a number, and no scorer exists. It stops when the leader cannot lose. | `vote` in `strategies`, `max_draws` ≥ `n` |
+| `cascade` | up to one per tier | A cheap model is often right, and a check can tell when it is not. It stops at the first tier that passes. | `cascade` in `strategies`, each tier model in `cascade_models`, `max_draws` ≥ the tiers |
+| `beam` | `width × expansion × max_rounds` | A task takes many model turns, and a step scorer can rank partial work. | `beam` in `strategies`, `max_draws` ≥ the draws |
+
+- Section 19 holds each [policy setting](#19-sampling-policy-issue-2439).
+  By default a kind has no strategy, so each run is one draw.
+- A score comes from a `Scorer`: a pure check, a test run or a judge
+  model. Section 17 shows [how to score a run](#17-score-a-run-issue-2441).
+- A draw that the run does not select runs `ReadOnly` tools only, by
+  default. An operator widens `draw_effects` per kind.
+- Each draw counts against the LLM budgets and the cost ledger. A durable
+  agent and a mesh also count each draw against the mandate
+  ([section 15](#15-durable-agents)).
+- Section 27 compares strategies over a fixed input set with
+  [a dataset sweep](#27-dataset-sweep-issue-2448).
+
+[ADR 0017](adr/0017-inference-strategies.md) records the design choices.
+The plan is in [`DESIGN-2450.md`](design/DESIGN-2450.md).

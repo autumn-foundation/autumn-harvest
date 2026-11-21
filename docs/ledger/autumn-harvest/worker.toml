@@ -84,7 +84,7 @@ driver = "per_task"
 backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_timers"]
-measured = "unmeasured"
+measured = "docs/performance-timer-pending-exec-lookup.md"
 plan = "docs/ledger/plans/autumn-harvest/worker.md"
 
 ["insert_awaited_child_execution"]
@@ -194,7 +194,7 @@ driver = "per_task"
 backend = ["postgres"]
 kind = ["read", "write"]
 tables = ["harvest_events", "harvest_task_queue", "harvest_timers"]
-measured = "unmeasured"
+measured = "docs/performance-timer-pending-exec-lookup.md"
 plan = "docs/ledger/plans/autumn-harvest/worker.md"
 
 ["persist_workflow_continue_as_new_with_verdict"]
@@ -265,7 +265,7 @@ driver = "per_tick"
 backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_workflow_executions"]
-measured = "unmeasured"
+measured = "docs/performance-population-sampler-cadence.md"
 plan = "docs/ledger/plans/autumn-harvest/worker.md"
 
 ["sample_history_oversized_counts"]
@@ -273,7 +273,7 @@ driver = "per_tick"
 backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_events", "harvest_workflow_executions"]
-measured = "docs/performance-metrics-sampler-guard.md"
+measured = "docs/performance-population-sampler-cadence.md"
 plan = "docs/ledger/plans/autumn-harvest/worker.md"
 
 ["suspended_command_event_count"]

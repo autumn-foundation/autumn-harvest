@@ -12,7 +12,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use autumn_harvest::chrono::{self, DateTime, Utc};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest_agent::agent::MAX_HELD_OPS;
 use autumn_harvest_agent::flow::labels;
@@ -25,6 +24,7 @@ use autumn_harvest_agent::{
 };
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
 use common::{Recorder, ScriptedModel, TryFnModel, recorded_tool, report, runtime};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 
 fn fresh_db() -> (tempfile::TempDir, PathBuf) {
@@ -337,6 +337,7 @@ async fn a_duplicate_is_dropped_and_a_late_message_is_kept() {
         reply_to: None,
         waiting: Vec::new(),
         mesh: None,
+        sample: None,
     };
     // The outbox delivers 2 before 1, then 2 again under another key.
     for (seq, key) in [(2, "k2"), (1, "k1"), (2, "k2-again")] {
@@ -618,10 +619,12 @@ async fn a_reply_after_the_deadline_is_not_waited_for() {
     sqlite::drive(&mut rt, &triage()).await.unwrap();
     // The researcher does not run. The deadline passes.
     let exec = sqlite::current_run(&rt, &triage()).unwrap().unwrap();
-    let later = autumn_harvest::chrono::Utc::now() + chrono::Duration::seconds(120);
+    let later = Timestamp::now() + SignedDuration::from_secs(120);
     rt.run_until_blocked_as_of(exec, later).await.unwrap();
     let answer = state(&rt, &triage()).await.last_answer.unwrap();
     assert!(answer.contains("no reply arrived within 60s"), "{answer}");
+    // Issue #2484: a durable sender reads the verdict too.
+    assert!(answer.contains("reply_timeout"), "{answer}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -991,7 +994,7 @@ async fn a_peer_segment_with_a_failed_fan_out_child_keeps_its_later_sibling() {
 }
 
 /// Drive `agent` at the drive clock `at`, through each checkpoint.
-async fn drive_at(rt: &mut SqliteRuntime, agent: &AgentId, at: DateTime<Utc>) -> RunState {
+async fn drive_at(rt: &mut SqliteRuntime, agent: &AgentId, at: Timestamp) -> RunState {
     let mut exec = sqlite::current_run(rt, agent).unwrap().unwrap();
     loop {
         match rt.run_until_blocked_as_of(exec, at).await.unwrap() {
@@ -1112,13 +1115,13 @@ async fn a_heartbeat_tick_cannot_write_through_a_durable_peer() {
         .mandate(Mandate::new("triage").peers(["researcher"]));
     let mut rt = runtime(&db, writable_researcher(&model, &recorder, sender));
     start(&mut rt, &research()).await;
-    let begin = Utc::now();
+    let begin = Timestamp::now();
     sqlite::send(&mut rt, &triage(), &AgentOp::Control(Control::Resume), None).unwrap();
     drive_at(&mut rt, &triage(), begin).await;
     // The tick is due at 60 seconds. It sends to the researcher and waits.
-    drive_at(&mut rt, &triage(), begin + chrono::Duration::seconds(90)).await;
+    drive_at(&mut rt, &triage(), begin + SignedDuration::from_secs(90)).await;
     sqlite::drive(&mut rt, &research()).await.unwrap();
-    drive_at(&mut rt, &triage(), begin + chrono::Duration::seconds(91)).await;
+    drive_at(&mut rt, &triage(), begin + SignedDuration::from_secs(91)).await;
 
     assert_eq!(state(&rt, &triage()).await.ticks, 1);
     assert_read_only(&rt, &model, &recorder);
@@ -1135,13 +1138,13 @@ async fn a_followup_segment_cannot_write_through_a_durable_peer() {
         .mandate(Mandate::new("triage").peers(["researcher"]));
     let mut rt = runtime(&db, writable_researcher(&model, &recorder, sender));
     start(&mut rt, &research()).await;
-    let begin = Utc::now();
+    let begin = Timestamp::now();
     sqlite::send(&mut rt, &triage(), &AgentOp::message("go"), None).unwrap();
     drive_at(&mut rt, &triage(), begin).await;
-    let woken = begin + chrono::Duration::minutes(3);
+    let woken = begin + SignedDuration::from_mins(3);
     drive_at(&mut rt, &triage(), woken).await;
     sqlite::drive(&mut rt, &research()).await.unwrap();
-    drive_at(&mut rt, &triage(), woken + chrono::Duration::seconds(1)).await;
+    drive_at(&mut rt, &triage(), woken + SignedDuration::from_secs(1)).await;
 
     assert_eq!(state(&rt, &triage()).await.chain, 1, "the follow-up ran");
     assert_read_only(&rt, &model, &recorder);
@@ -1263,13 +1266,13 @@ async fn a_woken_agent_loop_segment_cannot_write_through_a_durable_peer() {
         .followups(Followups::new(Duration::from_secs(3_600)))
         .mandate(Mandate::new("triage").peers(["researcher"]));
     let exec = sqlite::start(&mut rt, &task).unwrap();
-    let begin = Utc::now();
+    let begin = Timestamp::now();
     rt.run_until_blocked_as_of(exec, begin).await.unwrap();
-    let woken = begin + chrono::Duration::minutes(3);
+    let woken = begin + SignedDuration::from_mins(3);
     rt.run_until_blocked_as_of(exec, woken).await.unwrap();
     sqlite::drive(&mut rt, &research()).await.unwrap();
     let ended = rt
-        .run_until_blocked_as_of(exec, woken + chrono::Duration::seconds(1))
+        .run_until_blocked_as_of(exec, woken + SignedDuration::from_secs(1))
         .await
         .unwrap();
 
@@ -1477,4 +1480,403 @@ async fn a_gated_delegation_to_a_durable_peer_names_gated() {
     assert!(report.text.contains("The answer is 42."), "{}", report.text);
     let serials: Vec<_> = report.delegations.iter().map(|r| r.serial).collect();
     assert_eq!(serials, [Some(autumn_harvest_agent::SerialReason::Gated)]);
+}
+
+/// A one-shot run that asks the durable researcher, with a deadline of 60
+/// seconds. Each call to it can run in a batch of 2.
+fn one_shot_ask() -> AgentTask {
+    AgentTask::new("what is it?")
+        .mandate(Mandate::new("triage").peers(["researcher"]))
+        .parallel_children(2)
+}
+
+/// The mesh with a reply deadline of 60 seconds.
+fn deadline_harness(model: Arc<dyn AgentModel>) -> AgentHarness {
+    AgentHarness::new(model)
+        .peer(
+            Peer::agent("researcher", "Finds facts.", &research())
+                .reply_timeout(Duration::from_secs(60)),
+        )
+        .agent(AgentProfile::new("research").mandate(Mandate::new("researcher")))
+}
+
+/// The first tool result of `report`, as JSON.
+fn first_result(report: &autumn_harvest_agent::AgentReport) -> Value {
+    let results = common::tool_results(report);
+    serde_json::from_str(results.first().expect("the model read a result")).unwrap()
+}
+
+// Issue #2484: a timeout is a named verdict, and the record keeps the key
+// of the message. The receiver still applies the message once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_durable_peer_timeout_is_a_named_verdict_with_the_message_key() {
+    use autumn_harvest_agent::{Refusal, SerialReason};
+
+    let (_dir, db) = fresh_db();
+    let mut rt = runtime(&db, deadline_harness(mesh_model()));
+    start(&mut rt, &research()).await;
+    let exec = sqlite::start(&mut rt, &one_shot_ask()).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+    // The researcher does not run. The deadline passes.
+    let later = Timestamp::now() + SignedDuration::from_secs(120);
+    let ended = report(rt.run_until_blocked_as_of(exec, later).await.unwrap());
+
+    let [record] = ended.delegations.as_slice() else {
+        panic!("one record: {:?}", ended.delegations);
+    };
+    assert_eq!(record.refusal, Some(Refusal::ReplyTimeout));
+    assert_eq!(record.stop, None);
+    assert_eq!(record.run_id.as_deref(), Some(research().as_str()));
+    // The message went out, so the call ran alone as a durable peer.
+    assert_eq!(record.serial, Some(SerialReason::DurablePeer));
+    let run_id = ended.run_id.clone().expect("a run id");
+    let key = format!("{run_id}:1");
+    assert_eq!(record.idempotency_key.as_deref(), Some(key.as_str()));
+
+    let result = first_result(&ended);
+    assert_eq!(result["verdict"], "reply_timeout", "{result}");
+    let error = result["error"].as_str().unwrap_or_default();
+    assert!(error.contains("60s") && error.contains("twice"), "{error}");
+    // The model never sees the key.
+    assert!(!common::tool_results(&ended)[0].contains(&key));
+
+    // The receiver applies the late message once, under the same key. A
+    // caller finds it by the key before it asks again.
+    assert!(!state(&rt, &research()).await.inbound.applied_key(&key));
+    sqlite::drive(&mut rt, &research()).await.unwrap();
+    let received = peer_messages(&rt, &research());
+    assert_eq!(received.len(), 1);
+    assert_eq!(format!("{}:{}", received[0].from, received[0].seq), key);
+    assert!(state(&rt, &research()).await.inbound.applied_key(&key));
+}
+
+// Issue #2484: a rejected reply is a named verdict with its reason.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_reply_is_a_named_verdict_with_its_reason() {
+    use autumn_harvest_agent::Refusal;
+
+    let (_dir, db) = fresh_db();
+    let mut rt = runtime(&db, deadline_harness(mesh_model()));
+    start(&mut rt, &research()).await;
+    let exec = sqlite::start(&mut rt, &one_shot_ask()).unwrap();
+    let RunState::WaitingSignal(signal) = rt.run_until_blocked(exec).await.unwrap() else {
+        panic!("the run waits on the reply");
+    };
+    assert!(signal.starts_with("harvest.promise:"), "{signal}");
+    let rejected = json!({"outcome": "rejected", "error": "the operator said no"});
+    rt.send_signal(exec, &signal, rejected).unwrap();
+    let ended = report(rt.run_until_blocked(exec).await.unwrap());
+
+    let [record] = ended.delegations.as_slice() else {
+        panic!("one record: {:?}", ended.delegations);
+    };
+    assert_eq!(record.refusal, Some(Refusal::ReplyRejected));
+    let run_id = ended.run_id.clone().expect("a run id");
+    assert_eq!(record.idempotency_key, Some(format!("{run_id}:1")));
+    assert_eq!(record.run_id.as_deref(), Some(research().as_str()));
+    let result = first_result(&ended);
+    assert_eq!(result["verdict"], "reply_rejected", "{result}");
+    let error = result["error"].as_str().unwrap_or_default();
+    assert!(error.contains("the operator said no"), "{error}");
+}
+
+// Issue #2484: an answer keeps the key of its message. A refusal before the
+// send keeps none, because no message went out.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_a_sent_message_puts_a_key_on_its_record() {
+    let (_dir, db) = fresh_db();
+    let mut rt = runtime(&db, mesh_harness(mesh_model()));
+    start(&mut rt, &research()).await;
+    let exec = sqlite::start(&mut rt, &one_shot_ask()).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+    sqlite::drive(&mut rt, &research()).await.unwrap();
+    let answered = report(rt.run_until_blocked(exec).await.unwrap());
+    let run_id = answered.run_id.clone().expect("a run id");
+    assert_eq!(answered.delegations.len(), 1);
+    assert_eq!(answered.delegations[0].refusal, None);
+    assert_eq!(
+        answered.delegations[0].idempotency_key,
+        Some(format!("{run_id}:1"))
+    );
+
+    // The researcher never started, so the send is refused.
+    let (_dir, db) = fresh_db();
+    let mut rt = runtime(&db, mesh_harness(mesh_model()));
+    let exec = sqlite::start(&mut rt, &one_shot_ask()).unwrap();
+    let refused = report(rt.run_until_blocked(exec).await.unwrap());
+    assert_eq!(refused.delegations.len(), 1);
+    assert_eq!(
+        refused.delegations[0].refusal,
+        Some(autumn_harvest_agent::Refusal::PeerUnavailable)
+    );
+    assert_eq!(refused.delegations[0].idempotency_key, None);
+    // A refused delegation did not run, so it has no serial reason.
+    assert_eq!(refused.delegations[0].serial, None);
+}
+
+// Issue #2484: the patch gate keeps the old text for an old history. Only a
+// sent message asks the gate.
+#[cfg(feature = "eval")]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_reply_verdict_gate_keeps_the_old_text_on_replay() {
+    use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
+    use autumn_harvest_agent::workflow::agent_loop_info;
+
+    const MARKER: &str = "patch:agent_peer_reply_verdict";
+    let is_marker = |event: &WorkflowEvent| matches!(event, WorkflowEvent::MarkerRecorded { name, .. } if name == MARKER);
+    let (_dir, db) = fresh_db();
+    let mut rt = runtime(&db, deadline_harness(mesh_model()));
+    start(&mut rt, &research()).await;
+    let exec = sqlite::start(&mut rt, &one_shot_ask()).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+    let later = Timestamp::now() + SignedDuration::from_secs(120);
+    report(rt.run_until_blocked_as_of(exec, later).await.unwrap());
+    let events = rt.load_history(exec).unwrap();
+    assert_eq!(events.iter().filter(|event| is_marker(event)).count(), 1);
+    let replay = WorkflowReplayer::new()
+        .register(vec![agent_loop_info()])
+        .with_execution_id(exec)
+        .replay_from_events(events.clone())
+        .await;
+    assert!(
+        matches!(replay.status, ReplayStatus::ReplaySucceeded),
+        "{replay}"
+    );
+
+    // With no marker, replay sends the old text. This history holds the
+    // new text, so replay names the mismatch.
+    let old: Vec<WorkflowEvent> = events
+        .into_iter()
+        .filter(|event| !is_marker(event))
+        .collect();
+    let replay = WorkflowReplayer::new()
+        .register(vec![agent_loop_info()])
+        .with_execution_id(exec)
+        .replay_from_events(old)
+        .await;
+    assert!(
+        matches!(replay.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "{replay}"
+    );
+    let ReplayStatus::NonDeterminismDetected { actual, .. } = &replay.status else {
+        panic!("{replay}");
+    };
+    // The replayed model input holds the old text.
+    let input = actual
+        .find("input=")
+        .map(|at| &actual[at + "input=".len()..actual.len() - 1])
+        .expect("the mismatch names the input");
+    let input: Value = serde_json::from_str(input).expect("the input is JSON");
+    let result = input["messages"][1]["content"][0]["tool_result"]["content"]
+        .as_str()
+        .expect("a tool result");
+    assert!(result.contains("gave no answer"), "{result}");
+    assert!(!result.contains("reply_timeout"), "{result}");
+
+    // A refusal before the send records no marker.
+    let (_dir, db) = fresh_db();
+    let mut rt = runtime(&db, mesh_harness(mesh_model()));
+    let exec = sqlite::start(&mut rt, &one_shot_ask()).unwrap();
+    report(rt.run_until_blocked(exec).await.unwrap());
+    let events = rt.load_history(exec).unwrap();
+    assert!(!events.iter().any(is_marker));
+}
+
+// Issue #2484: a receiver that refuses the message got it, so the record
+// keeps the key. The refusal is not unanswered, so it has no serial reason.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refusal_by_the_receiver_keeps_the_key() {
+    use autumn_harvest_agent::Refusal;
+
+    let (_dir, db) = fresh_db();
+    let strong = FnModel::new(|_| text("never"));
+    let harness = AgentHarness::new(mesh_model())
+        .model_named("strong", strong.clone())
+        .peer(Peer::agent("researcher", "Finds facts.", &research()))
+        .agent(
+            AgentProfile::new("research")
+                .model("strong")
+                .mandate(Mandate::new("researcher")),
+        );
+    let mut rt = runtime(&db, harness);
+    start(&mut rt, &research()).await;
+    let task = AgentTask::new("what is it?")
+        .mandate(
+            Mandate::new("triage")
+                .peers(["researcher"])
+                .models([autumn_harvest_agent::DEFAULT_MODEL]),
+        )
+        .parallel_children(2);
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+    sqlite::drive(&mut rt, &research()).await.unwrap();
+    let ended = report(rt.run_until_blocked(exec).await.unwrap());
+
+    let [record] = ended.delegations.as_slice() else {
+        panic!("one record: {:?}", ended.delegations);
+    };
+    assert_eq!(record.refusal, Some(Refusal::ModelForbidden));
+    let run_id = ended.run_id.clone().expect("a run id");
+    assert_eq!(record.idempotency_key, Some(format!("{run_id}:1")));
+    assert_eq!(record.serial, None);
+    assert!(
+        strong.requests().is_empty(),
+        "the forbidden model never runs"
+    );
+}
+
+// Issue #2484: a settlement that holds no reply is a rejected reply, not a
+// failed run. The message went out, so the record keeps its key.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_settlement_that_holds_no_reply_is_a_rejected_reply() {
+    use autumn_harvest_agent::Refusal;
+
+    let (_dir, db) = fresh_db();
+    let mut rt = runtime(&db, deadline_harness(mesh_model()));
+    start(&mut rt, &research()).await;
+    let exec = sqlite::start(&mut rt, &one_shot_ask()).unwrap();
+    let RunState::WaitingSignal(signal) = rt.run_until_blocked(exec).await.unwrap() else {
+        panic!("the run waits on the reply");
+    };
+    let resolved = json!({"outcome": "resolved", "value": {"stop": 7}});
+    rt.send_signal(exec, &signal, resolved).unwrap();
+    let ended = report(rt.run_until_blocked(exec).await.unwrap());
+
+    let [record] = ended.delegations.as_slice() else {
+        panic!("one record: {:?}", ended.delegations);
+    };
+    assert_eq!(record.refusal, Some(Refusal::ReplyRejected));
+    assert!(record.idempotency_key.is_some());
+    let result = first_result(&ended);
+    assert_eq!(result["verdict"], "reply_rejected", "{result}");
+    let error = result["error"].as_str().unwrap_or_default();
+    assert!(error.contains("does not decode"), "{error}");
+}
+
+// Issue #2484: an interrupt of a durable sender that waits for a reply is a
+// named verdict, and the op ends. The history replays.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_interrupted_wait_for_a_reply_is_a_named_verdict() {
+    use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
+    use autumn_harvest_agent::{Urgency, agent_info};
+
+    let (_dir, db) = fresh_db();
+    let model = mesh_model();
+    let mut rt = runtime(&db, mesh_harness(model.clone()));
+    start(&mut rt, &research()).await;
+    sqlite::send(&mut rt, &triage(), &AgentOp::message("what is it?"), None).unwrap();
+    let waiting = sqlite::drive(&mut rt, &triage()).await.unwrap();
+    assert!(
+        matches!(&waiting, Some(RunState::WaitingSignal(name)) if name.starts_with("harvest.promise:")),
+        "{waiting:?}"
+    );
+    let turns = model.requests().len();
+    let stop = AgentOp::urgent("stop", "m-2", Urgency::Interrupt);
+    sqlite::send(&mut rt, &triage(), &stop, Some("m-2")).unwrap();
+    sqlite::drive(&mut rt, &triage()).await.unwrap();
+
+    let sender = state(&rt, &triage()).await;
+    let results: Vec<Value> = sender
+        .transcript
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|part| match part {
+            ContentPart::ToolResult { content, .. } => serde_json::from_str(content).ok(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_eq!(results[0]["verdict"], "reply_interrupted", "{results:?}");
+    let error = results[0]["error"].as_str().unwrap_or_default();
+    assert!(error.contains("twice"), "{error}");
+    // The interrupt ends the op. Each later turn answers the interrupt.
+    let later = &model.requests()[turns..];
+    assert_ne!(later.len(), 0, "the interrupt op ran");
+    assert!(
+        later
+            .iter()
+            .all(|request| last_user(request).contains("stop")),
+        "the op ended at the interrupt"
+    );
+
+    // The run ends, so the replay can reach its end.
+    let exec = sqlite::current_run(&rt, &triage()).unwrap().unwrap();
+    sqlite::delete(&mut rt, &triage(), None).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+    let replay = WorkflowReplayer::new()
+        .register(vec![agent_info()])
+        .with_workflow_id(triage().as_str())
+        .replay_from_events(rt.load_history(exec).unwrap())
+        .await;
+    assert!(
+        matches!(replay.status, ReplayStatus::ReplaySucceeded),
+        "{replay}"
+    );
+}
+
+// Issue #2485: a durable peer runs the first eight checks of the refusal
+// table before its own checks. Its own checks then run `peer_unavailable`
+// before `not_permitted`. Each pair sets up two refusals, so only the stated
+// order passes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_durable_peer_runs_the_mandate_checks_before_its_own() {
+    use autumn_harvest_agent::{DEFAULT_MODEL, Refusal};
+
+    /// The verdict of one delegation to the durable researcher.
+    async fn refusal_of(valid_id: bool, forbid_model: bool, narrow: bool) -> Option<Refusal> {
+        let (_dir, db) = fresh_db();
+        let mut peer = Peer::agent("researcher", "Finds facts.", &research()).model("strong");
+        if !valid_id {
+            // The own check of the durable peer refuses an id that does not parse.
+            peer.agent = Some("not an id".to_owned());
+        }
+        let harness = AgentHarness::new(mesh_model()).peer(peer);
+        let mut mandate = Mandate::new("triage").peers(["researcher"]);
+        if forbid_model {
+            mandate = mandate.models([DEFAULT_MODEL]);
+        }
+        let mut task = AgentTask::new("what is it?").mandate(mandate);
+        if narrow {
+            // Each effect is allowed, so the decision lets `delegate` run.
+            // Only the durable peer refuses a run with an allowlist.
+            let every = [
+                ToolEffect::ReadOnly,
+                ToolEffect::Internal,
+                ToolEffect::Write,
+                ToolEffect::External,
+            ];
+            task.allowed_effects = Some(every.into());
+        }
+        let mut rt = runtime(&db, harness);
+        let exec = sqlite::start(&mut rt, &task).unwrap();
+        let ended = report(rt.run_until_blocked(exec).await.unwrap());
+        let [record] = ended.delegations.as_slice() else {
+            panic!("one record: {:?}", ended.delegations);
+        };
+        record.refusal
+    }
+
+    // Each check fires alone.
+    assert_eq!(
+        refusal_of(false, false, false).await,
+        Some(Refusal::PeerUnavailable)
+    );
+    assert_eq!(
+        refusal_of(true, true, false).await,
+        Some(Refusal::ModelForbidden)
+    );
+    assert_eq!(
+        refusal_of(true, false, true).await,
+        Some(Refusal::NotPermitted)
+    );
+    // The mandate check runs before the own checks.
+    assert_eq!(
+        refusal_of(false, true, false).await,
+        Some(Refusal::ModelForbidden)
+    );
+    // The id check runs before the effect check.
+    assert_eq!(
+        refusal_of(false, false, true).await,
+        Some(Refusal::PeerUnavailable)
+    );
 }

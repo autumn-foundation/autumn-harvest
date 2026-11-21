@@ -25,6 +25,7 @@
 #![allow(clippy::similar_names)]
 #![allow(clippy::too_many_lines)]
 
+use jiff_diesel::ToDiesel;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -46,9 +47,9 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::Utc;
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -204,11 +205,11 @@ fn continue_as_new_info() -> WorkflowInfo {
     }
 }
 
-/// Issue #772 (round 6): a workflow with an `execution_timeout` that performs
-/// the deadline-aware `should_continue_as_new()` checkpoint check (recording /
-/// consuming the reserved `__harvest_deadline_probe` side-effect) BEFORE
-/// processing each item. Its recorded history therefore carries the probe
-/// event — a query replay context that fails to thread the execution's
+/// Issue #772: a workflow with an `execution_timeout`. It performs the
+/// deadline-aware `should_continue_as_new()` checkpoint check BEFORE it
+/// processes each item. The check records or consumes the reserved
+/// `__harvest_deadline_probe` side-effect. So its recorded history carries the
+/// probe event. A query replay context that does not thread the execution's
 /// `execution_timeout`/`deadline_at` leaves that probe unconsumed and diverges.
 fn deadline_probe_workflow<'a>(
     ctx: &'a WorkflowContext,
@@ -416,10 +417,9 @@ async fn seed_execution(
     let mut conn = pool.get().await.expect("pooled conn");
     let exec_id = ExecutionId::new();
 
-    // `erase_workflow_payloads` tombstones BOTH the event payloads AND the
-    // execution row's own `input` column — the terminal-query erasure check is
-    // now the O(1) row check, so a realistic erased fixture must tombstone the
-    // row input too (issue #612 review).
+    // `erase_workflow_payloads` tombstones the event payloads and the row's
+    // `input` column. The terminal-query erasure check is now the O(1) row
+    // check, so a realistic erased fixture tombstones the row input too (issue #612).
     let row_input = if erased {
         erase::erasure_tombstone()
     } else {
@@ -454,11 +454,12 @@ async fn seed_execution(
     exec_id
 }
 
-/// A history the engine sealed while a workflow was parked mid-activity: full
-/// pairs for `completed`, then a bare `ActivityScheduled` for `pending` (no
-/// completion), then the `seal` terminal event. Driving `progress_workflow` with
-/// `items = completed ++ [pending]` reconstructs a partial count of
-/// `completed.len()` before parking on the incomplete activity.
+/// A history the engine sealed while a workflow was parked mid-activity.
+///
+/// It holds full pairs for `completed`, a bare `ActivityScheduled` for
+/// `pending`, then the `seal` terminal event. Driving `progress_workflow` with
+/// `items = completed ++ [pending]` counts `completed.len()`, then parks on the
+/// incomplete activity.
 fn sealed_mid_activity_history(
     completed: &[&str],
     pending: &str,
@@ -469,7 +470,7 @@ fn sealed_mid_activity_history(
     let input = json!({ "items": items, "should_fail": false });
     let mut events = vec![WorkflowEvent::WorkflowStarted {
         input: input.clone(),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -503,7 +504,7 @@ fn progress_history(items: &[&str], should_fail: bool) -> (Value, Vec<WorkflowEv
     let input = json!({ "items": items, "should_fail": should_fail });
     let mut events = vec![WorkflowEvent::WorkflowStarted {
         input: input.clone(),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -550,10 +551,10 @@ struct ExecStateRow {
 
 /// Returns the execution's `state` plus a full-row JSON snapshot.
 ///
-/// `harvest_workflow_executions` has no `updated_at` column, so the zero-writes
-/// belt snapshots the entire row via `to_jsonb(t.*)` and compares the two
-/// snapshots for byte equality — a stronger "row was not rewritten" check than
-/// any single column, and one that does not depend on a column name.
+/// `harvest_workflow_executions` has no `updated_at` column. So the zero-writes
+/// belt snapshots the entire row via `to_jsonb(t.*)` and compares the bytes.
+/// That is a stronger "row was not rewritten" check than any single column,
+/// and it does not depend on a column name.
 async fn exec_state(pool: &DbPool, exec_id: ExecutionId) -> (String, String) {
     let mut conn = pool.get().await.expect("pooled conn");
     let row = diesel::sql_query(
@@ -615,11 +616,10 @@ async fn ac2_failed_cancelled_timed_out_answer_200_with_internal_state() {
     assert_eq!(body, json!(2));
 
     // CANCELLED / TIMED_OUT: the engine seals these while the function is parked
-    // on an in-flight activity, so the history ends with a trailing incomplete
-    // ActivityScheduled + a terminal lifecycle event and the drive replays to a
+    // on an in-flight activity. The history ends with an incomplete
+    // ActivityScheduled and a terminal lifecycle event, so the drive replays to a
     // *suspension*, not Poll::Ready. It must still serve 200 with the partial
-    // internal state reconstructed at the recorded terminal point (count = 1,
-    // one activity completed before the seal).
+    // state at the recorded terminal point (count = 1).
     for (state, seal) in [
         (
             "CANCELLED",
@@ -630,8 +630,8 @@ async fn ac2_failed_cancelled_timed_out_answer_200_with_internal_state() {
         (
             "TIMED_OUT",
             WorkflowEvent::WorkflowExecutionTimedOut {
-                deadline: Utc::now(),
-                timed_out_at: Utc::now(),
+                deadline: Timestamp::now(),
+                timed_out_at: Timestamp::now(),
             },
         ),
     ] {
@@ -654,9 +654,9 @@ async fn ac2_continued_as_new_answers_200_with_internal_state() {
     let app = build_app(&pool);
 
     // CONTINUED_AS_NEW: continue_as_new parks the function forever, so the run
-    // replays to a *suspension*, not Poll::Ready — yet its history ends with the
+    // replays to a *suspension*, not Poll::Ready. Its history ends with the
     // WorkflowContinuedAsNew terminal seal, so the query must serve 200 with the
-    // count reached at the continue_as_new point (2).
+    // count at the continue_as_new point (2).
     let (input, mut events) = progress_history(&["a", "b"], false);
     events.push(WorkflowEvent::WorkflowContinuedAsNew {
         new_exec_id: ExecutionId::new(),
@@ -697,7 +697,7 @@ async fn running_partial_history_serves_query_with_partial_state() {
     let input = json!({ "items": ["a", "b", "c"], "should_fail": false });
     let mut events = vec![WorkflowEvent::WorkflowStarted {
         input: input.clone(),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -784,7 +784,7 @@ async fn ac5_released_and_erased_histories_are_410_unknown_is_404() {
     let released_input = json!({ "items": ["a", "b"], "should_fail": false });
     let released_events = vec![WorkflowEvent::WorkflowStarted {
         input: released_input.clone(),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -832,7 +832,7 @@ async fn ac6_spinning_replay_returns_408() {
     let input = json!({});
     let events = vec![WorkflowEvent::WorkflowStarted {
         input: input.clone(),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -847,20 +847,22 @@ async fn ac6_spinning_replay_returns_408() {
     );
 }
 
-// ── Issue #772 (round 6): deadline probe × query hydration ───────────────────
+// ── Issue #772: deadline probe × query hydration ─────────────────────────────
 //
 // A workflow with an `execution_timeout` records a `__harvest_deadline_probe`
-// side-effect whenever it calls `should_continue_as_new()`. The query hydration
-// paths (`hydrate_ctx_for_query` for the HTTP API here, and the in-process
-// `execute_query_in_process` in `handle.rs`) must thread the execution row's
-// `execution_timeout` + `deadline_at` into their replay context, or the probe is
-// left unconsumed and the query diverges (500 during drive, or a spurious 410 on
-// the terminal drift check). These DB-backed tests exercise the real HTTP path.
+// side-effect whenever it calls `should_continue_as_new()`. Two query hydration
+// paths exist: `hydrate_ctx_for_query` for the HTTP API here, and the in-process
+// `execute_query_in_process` in `handle.rs`. Each must thread the execution
+// row's `execution_timeout` + `deadline_at` into its replay context. Otherwise
+// the probe stays unconsumed and the query diverges. The result is a 500 during
+// drive, or a spurious 410 on the terminal drift check. These DB-backed tests
+// exercise the real HTTP path.
 
-/// Seed an execution row carrying `execution_timeout` (INTERVAL) and
-/// `deadline_at` (TIMESTAMPTZ) plus a history whose events include the deadline
-/// probe — so `load_execution` in `hydrate_ctx_for_query` surfaces the budget the
-/// fix threads into the replay context.
+/// Seed an execution row with `execution_timeout` and `deadline_at`, plus a
+/// history that includes the deadline probe.
+///
+/// So `load_execution` in `hydrate_ctx_for_query` surfaces the budget that the
+/// replay context needs.
 async fn seed_execution_with_deadline(
     pool: &DbPool,
     workflow_name: &str,
@@ -868,7 +870,7 @@ async fn seed_execution_with_deadline(
     input: Value,
     events: Vec<WorkflowEvent>,
     timeout_secs: f64,
-    deadline_at: chrono::DateTime<Utc>,
+    deadline_at: jiff::Timestamp,
 ) -> ExecutionId {
     let mut conn = pool.get().await.expect("pooled conn");
     let exec_id = ExecutionId::new();
@@ -885,7 +887,7 @@ async fn seed_execution_with_deadline(
     .bind::<diesel::sql_types::Jsonb, _>(input)
     .bind::<diesel::sql_types::Text, _>(state)
     .bind::<diesel::sql_types::Double, _>(timeout_secs)
-    .bind::<diesel::sql_types::Timestamptz, _>(deadline_at)
+    .bind::<diesel::sql_types::Timestamptz, _>(deadline_at.to_diesel())
     .execute(&mut conn)
     .await
     .expect("seed execution with deadline");
@@ -902,10 +904,10 @@ async fn seed_execution_with_deadline(
 fn deadline_probe_history(
     items: &[&str],
     completed: bool,
-) -> (Value, Vec<WorkflowEvent>, chrono::DateTime<Utc>) {
-    let t0 = chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
-    let deadline = t0 + chrono::Duration::hours(24);
-    let recorded_now = t0 + chrono::Duration::seconds(1);
+) -> (Value, Vec<WorkflowEvent>, jiff::Timestamp) {
+    let t0 = jiff::Timestamp::from_millisecond(1_700_000_000_000).unwrap();
+    let deadline = t0 + jiff::SignedDuration::from_hours(24);
+    let recorded_now = t0 + jiff::SignedDuration::from_secs(1);
     let input = json!({ "items": items });
     let mut events = vec![
         WorkflowEvent::WorkflowStarted {
@@ -918,7 +920,7 @@ fn deadline_probe_history(
         WorkflowEvent::SideEffectRecorded {
             kind: autumn_harvest::SideEffectKind::Now,
             name: Some(autumn_harvest::DEADLINE_PROBE_SIDE_EFFECT_NAME.to_string()),
-            value: json!(recorded_now.timestamp_millis()),
+            value: json!(recorded_now.as_millisecond()),
         },
     ];
     for item in items {
@@ -942,9 +944,10 @@ fn deadline_probe_history(
     (input, events, deadline)
 }
 
-/// The finding (P2): querying a RUNNING workflow whose history contains the
-/// deadline probe must succeed with the reconstructed count — NOT diverge —
-/// once the hydration path threads the `execution_timeout`/`deadline_at`.
+/// Querying a RUNNING workflow whose history contains the deadline probe
+/// serves the reconstructed count and does not diverge.
+///
+/// The hydration path threads `execution_timeout`/`deadline_at` into the replay.
 #[tokio::test]
 async fn deadline_probe_running_query_serves_reconstructed_state() {
     let (url, _c) = setup_database().await;
@@ -976,9 +979,10 @@ async fn deadline_probe_running_query_serves_reconstructed_state() {
     );
 }
 
-/// The finding (P2, terminal drift): querying a TERMINAL (COMPLETED) workflow
-/// whose history contains the deadline probe must serve 200 — NOT a spurious 410
-/// from the drift check that mistakes the unconsumed probe for leftover history.
+/// Querying a TERMINAL (COMPLETED) workflow with the deadline probe serves 200.
+///
+/// The drift check must not mistake the unconsumed probe for leftover history
+/// and return a spurious 410.
 #[tokio::test]
 async fn deadline_probe_terminal_query_serves_not_gone() {
     let (url, _c) = setup_database().await;

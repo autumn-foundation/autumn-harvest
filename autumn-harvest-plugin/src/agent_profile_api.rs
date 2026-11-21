@@ -16,13 +16,13 @@
 //! with its old and new value. The design is in
 //! `docs/design/DESIGN-2394.md`.
 
+use jiff::Timestamp;
 use std::sync::Arc;
 
 use autumn_harvest::audit::{
     self, OP_AGENT_PROFILE_ACTIVATE, OP_AGENT_PROFILE_POLICY_RESET, OP_AGENT_PROFILE_POLICY_SET,
     OP_AGENT_PROFILE_ROLLBACK, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_AGENT_PROFILE,
 };
-use autumn_harvest::chrono::{DateTime, Utc};
 use autumn_harvest::models::NewAuditRecord;
 use autumn_harvest_agent::agent::MAX_AGENT_NAME_BYTES;
 use autumn_harvest_agent::refine::policy::{PolicyChange, policy_changes};
@@ -61,7 +61,7 @@ pub struct OverlayVersionSummary {
     /// Who or what wrote the version.
     pub provenance: Provenance,
     /// The time of the put.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 /// The body of `GET /agents/{kind}/profile/versions`.
@@ -87,7 +87,7 @@ pub struct OverlayVersionView {
     /// Who or what wrote the version.
     pub provenance: Provenance,
     /// The time of the put.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// The `sha256:<hex>` digest of the overlay.
     pub digest: String,
     /// The overlay.
@@ -170,7 +170,6 @@ fn parse_version(text: &str) -> Result<OverlayVersion, AutumnError> {
         })
 }
 
-/// The HTTP error of a store error.
 fn store_error(error: &OverlayStoreError) -> AutumnError {
     let message = error.to_string();
     match error {
@@ -488,7 +487,6 @@ fn check_kind(kind: &str) -> Result<(), AutumnError> {
     Ok(())
 }
 
-/// The error of a bad request body.
 fn bad_body(rejection: &JsonRejection) -> AutumnError {
     AutumnError::bad_request_msg(format!(
         "invalid request body: {}",
@@ -496,7 +494,6 @@ fn bad_body(rejection: &JsonRejection) -> AutumnError {
     ))
 }
 
-/// The move of an activate request.
 async fn activate_move(
     api_state: &HarvestApiState,
     kind: &str,
@@ -615,7 +612,7 @@ pub struct PolicyChangeView {
     /// The operator id.
     pub actor: String,
     /// The time of the change.
-    pub changed_at: DateTime<Utc>,
+    pub changed_at: Timestamp,
     /// The policy before the change, or `null` for every default.
     pub old: Option<RefinePolicy>,
     /// The policy after the change, or `null` for every default.
@@ -665,7 +662,6 @@ fn policy_view(kind: &str, state: PolicyState) -> PolicyView {
     }
 }
 
-/// The settings that `entry` changed.
 fn entry_changes(entry: &PolicyLogEntry) -> Vec<PolicyChange> {
     let old = entry.before().cloned().unwrap_or_default();
     let new = entry.after().cloned().unwrap_or_default();
@@ -796,7 +792,6 @@ pub async fn list_policy_changes(
     Ok(Json(PolicyChangeList { kind, changes }))
 }
 
-/// The change of a set request.
 async fn set_policy_change(
     api_state: &HarvestApiState,
     kind: &str,

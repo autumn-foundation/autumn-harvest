@@ -6,7 +6,9 @@
 //! works in network-restricted environments.
 #![allow(clippy::literal_string_with_formatting_args)]
 
+use jiff_diesel::ToDiesel;
 use std::fmt::Write as _;
+#[cfg(test)]
 use std::sync::Arc;
 
 use std::collections::{HashMap, HashSet};
@@ -21,12 +23,12 @@ use axum::Router;
 use axum::middleware;
 use axum::response::IntoResponse as _;
 use axum::routing::{get, post};
-use chrono::{DateTime, Utc};
 use diesel::BoolExpressionMethods;
 use diesel::dsl::sql;
 use diesel::sql_types::{Bool, Text};
 use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use maud::{Markup, PreEscaped, html};
 use serde::Deserialize;
 use serde_json::Value;
@@ -389,9 +391,10 @@ struct BlockedOnData {
     external_tasks: Vec<ExternalTask>,
     timers: Vec<HarvestTimer>,
     signals: Vec<HarvestSignal>,
-    /// The replay-derived open-awaitables report (issue #615) — the SAME
-    /// report `GET /workflows/{id}/awaitables` serves (built by
-    /// `crate::api::build_awaitables_report`), so the UI panel and the API can
+    /// The replay-derived open-awaitables report (issue #615).
+    ///
+    /// It is the SAME report `GET /workflows/{id}/awaitables` serves (built by
+    /// `crate::api::build_awaitables_report`). So the UI panel and the API can
     /// never disagree about what the run is parked on. Unlike the side-table
     /// lists above it also names awaited-but-UNSENT signals, pending child
     /// workflows, and `await_condition` parks. `None` for terminal executions
@@ -403,9 +406,9 @@ struct BlockedOnData {
     /// #503). `0` = uncapped. Used when no per-activity override applies.
     heartbeat_details_cap: u64,
     /// Per-activity effective heartbeat checkpoint cap, keyed by activity name
-    /// (per-activity `max_result_bytes` raised against the global ceiling),
-    /// matching the API stack handler so configured large-payload activities
-    /// keep full checkpoint visibility (#503 review). Missing names fall back to
+    /// (per-activity `max_result_bytes` raised against the global ceiling).
+    /// It matches the API stack handler, so configured large-payload activities
+    /// keep full checkpoint visibility (#503). Missing names fall back to
     /// `heartbeat_details_cap`.
     heartbeat_caps: std::collections::HashMap<String, u64>,
 }
@@ -651,8 +654,8 @@ impl DeadLetterTaskKind {
 struct DeadLetterUiFilters {
     workflow_name: Option<String>,
     task_kind: Option<DeadLetterTaskKind>,
-    failed_after: Option<DateTime<Utc>>,
-    failed_before: Option<DateTime<Utc>>,
+    failed_after: Option<Timestamp>,
+    failed_before: Option<Timestamp>,
     shard_id: Option<i32>,
 }
 
@@ -749,8 +752,8 @@ const fn determine_banner_state(stats: &WorkerFleetStats) -> Option<BannerState>
     if stats.total == 0 && !stats.any_shard_errored {
         return None;
     }
-    // Shard errors mean partial visibility — we can't rule out active workers
-    // on the unreachable shard, so cap severity at Degraded.
+    // Shard errors mean partial visibility. Active workers can exist on the
+    // unreachable shard, so cap severity at Degraded.
     if stats.any_shard_errored {
         return Some(BannerState::Degraded);
     }
@@ -784,9 +787,9 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<()> {
         .route("/dags", get(list_dags_ui))
         .route("/dags/{dag_name}", get(dag_detail_ui))
         // issue #957: DAG-run-graph retry flow (dry-run confirm → admin commit).
-        // Both surface a single audited mutation via the extracted
-        // `retry_dag_run_inner`, so the UI introduces no unaudited path; both
-        // are admin-gated to match the API's admin-auth posture.
+        // Both routes reach one audited mutation via `retry_dag_run_inner`, so
+        // the UI adds no unaudited path. Both are admin-gated to match the
+        // API's admin-auth posture.
         .route(
             "/dags/{dag_name}/runs/{run_exec_id}/retry",
             get(dag_retry_confirm_ui)
@@ -846,10 +849,10 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<()> {
         .route("/schedules/{id}/delete", post(schedule_delete_ui))
         .route("/schedules/{id}/trigger-now", post(schedule_trigger_now_ui))
         // issue #951: schedule drill-downs. Each is a presentation slice over an
-        // already-shipped endpoint, and each mirrors that endpoint's admin-auth
-        // posture: `GET /admin/schedules/{id}/runs` is the one admin-gated
-        // schedule read route, so the run history is gated here too; preview and
-        // backfill are not gated, matching their ungated API routes.
+        // already-shipped endpoint, with that endpoint's admin-auth posture.
+        // `GET /admin/schedules/{id}/runs` is the one admin-gated schedule read
+        // route, so the run history is gated here too. Preview and backfill
+        // are not gated, matching their ungated API routes.
         .route("/schedules/{id}/preview", get(schedule_preview_ui))
         .route(
             "/schedules/{id}/runs",
@@ -892,7 +895,7 @@ struct DagUiSummary {
     schedule_expr: Option<String>,
     task_count: usize,
     is_paused: bool,
-    next_run_at: Option<DateTime<Utc>>,
+    next_run_at: Option<Timestamp>,
     max_active_runs: i32,
     catchup: bool,
 }
@@ -972,11 +975,11 @@ async fn dag_detail_ui(
         ..WorkflowFilters::default()
     };
     let runs = load_dag_runs_from_owning_shard(&api_state, &runtime, &dag_name, &filters).await?;
-    // Resolve which run to render. A `?run=` that is present-but-unknown is a
-    // 404 (issue #957 AC7: "unknown run ids render the 404 message"), NOT a
-    // silent fallback to a different run. An omitted `?run=` defaults to the
+    // Resolve which run to render. A present-but-unknown `?run=` is a 404, NOT
+    // a silent fallback to a different run (issue #957 AC7: "unknown run ids
+    // render the 404 message"). An omitted `?run=` defaults to the
     // latest run. The DB existence check only runs for a parseable run id that
-    // isn't already in the displayed page.
+    // is not already in the displayed page.
     // A parseable run id counts as valid only when it names a run of *this* DAG
     // (in the displayed page, or on the owning shard). An unparseable or unknown
     // run id leaves this `None` — the resolution below maps a present-but-unknown
@@ -1006,11 +1009,11 @@ async fn dag_detail_ui(
     };
 
     // Issue #957: render the node topology straight from
-    // `dag_graph::build_run_graph` — the same in-process derivation the #690 API
-    // handler uses — rather than a UI-side status fork. For a unified DAG with a
-    // selected run, this loads the run's timestamped history and annotates the
-    // registered `DagDefinition`; classic (non-unified) DAGs have no unified
-    // topology and render the degraded message (matching #690's 400).
+    // `dag_graph::build_run_graph`, the same in-process derivation the #690 API
+    // handler uses, not a UI-side status fork. For a unified DAG with a
+    // selected run, this loads the run's timestamped history. It annotates the
+    // registered `DagDefinition` with it. Classic (non-unified) DAGs have no
+    // unified topology and render the degraded message (matching #690's 400).
     let graph_data: Option<(Vec<DagRunNode>, String)> = if !dag.is_unified {
         None
     } else if let Some(run_uuid) = selected_run {
@@ -1023,9 +1026,9 @@ async fn dag_detail_ui(
             .await
             .map_err(map_error)?;
         // No further DB reads: release the pool slot before any payload-store
-        // fetch, then decode so the issue #780 compensation filter inside
-        // `build_run_graph` sees real payloads rather than opaque codec /
-        // offload envelopes. Shared with the #690 API handler so the two
+        // fetch. Then decode, so the issue #780 compensation filter inside
+        // `build_run_graph` sees real payloads, not opaque codec / offload
+        // envelopes. Shared with the #690 API handler so the two
         // surfaces can never disagree. See `api::decode_graph_history`.
         drop(conn);
         let runtime = api_state.runtime().map_err(map_error)?;
@@ -1256,10 +1259,10 @@ async fn render_dag_retry_confirm_page(
 }
 
 /// GET the retry confirm page: run a **dry-run** retry through the shared,
-/// audited `retry_dag_run_inner` so the operator sees the authoritative widened
-/// node list (`nodes_to_re_execute`) before committing. On any endpoint error
-/// (400/404/409) the panel renders a human-readable message rather than raw
-/// JSON. Admin-gated at the router.
+/// audited `retry_dag_run_inner`. The operator then sees the authoritative
+/// widened node list (`nodes_to_re_execute`) before committing. On any endpoint
+/// error (400/404/409) the panel renders a human-readable message rather than
+/// raw JSON. Admin-gated at the router.
 async fn dag_retry_confirm_ui(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
@@ -1283,9 +1286,9 @@ async fn dag_retry_confirm_ui(
 /// POST the retry commit: run the fork through `retry_dag_run_inner`
 /// (`dry_run = false`), which writes the `OP_DAG_RETRY` audit row with
 /// `source = ui`. Redirects back to the DAG page with a success flash naming
-/// the new run. If the fork committed but the audit row failed to write
-/// (a partial success), redirects to the *new* run with a warning flash rather
-/// than misreporting it as a failure. A genuine failure (400/404/409) renders
+/// the new run. The fork can commit while the audit row fails to write (a
+/// partial success). That redirects to the *new* run with a warning flash,
+/// not a failure report. A genuine failure (400/404/409) renders
 /// the confirm page in place instead of redirecting. The submitted reason and
 /// the failure itself are both preserved (issue #1723; see `DagRetryEcho`).
 /// Admin-gated at the router.
@@ -1364,9 +1367,11 @@ fn dag_detail_relative_url(dag_name: &str, run: &str, flash: Option<&str>) -> St
     url
 }
 
-/// Render the retry confirm page from a dry-run outcome: on success, the
-/// widened re-execute list + carried-over list + an editable required reason and
-/// a Confirm form (`POSTing` to the same URL); on failure, the human message.
+/// Render the retry confirm page from a dry-run outcome.
+///
+/// On success it shows the widened re-execute list, the carried-over list, an
+/// editable required reason and a Confirm form (`POSTing` to the same URL). On
+/// failure it shows the human message.
 ///
 /// `reason` pre-fills the textarea: either the auto-generated default (the
 /// first-visit `GET`), or the operator's own submission. That submission is
@@ -1424,8 +1429,8 @@ fn render_dag_retry_confirm(
             let dry_run_message = dry_run_failure.human_message();
             html! {
                 div class="banner Warning" { (dry_run_message) }
-                // Codex review (issue #1723): the refreshed dry run this
-                // function's caller re-runs for redisplay can itself fail.
+                // Issue #1723: the refreshed dry run this function's caller
+                // re-runs for redisplay can itself fail.
                 // That is exactly what happens in the race this fix targets,
                 // where a competing retry has already sealed the source run.
                 // Dropping `reason` here on that second failure would
@@ -1441,8 +1446,8 @@ fn render_dag_retry_confirm(
                          no longer be retried from here): "
                         code { (reason) }
                     }
-                    // Codex review (issue #1723): the banner above is the
-                    // *refreshed* dry run's own failure, not necessarily what
+                    // Issue #1723: the banner above is the *refreshed*
+                    // dry run's own failure, not necessarily what
                     // the operator's actual commit attempt failed with. Show
                     // the original commit failure too, when it differs, so a
                     // divergent diagnosis is never silently dropped.
@@ -1516,12 +1521,12 @@ async fn list_workflows_ui(
         .as_ref()
         .map(|key| (key.clone(), search_attr_value.clone()));
 
-    // Issue: a malformed started_after/started_before used to `?`-abort the
-    // whole page (bare 400, no HTML) before the filter form was ever
-    // rendered, discarding every other filter the operator had entered.
-    // `parse_started_bound` instead degrades to "filter not applied" and
-    // hands back the raw text plus an error to redisplay inline, so a typo
-    // costs one field, not the page.
+    // PR #1333: a malformed started_after/started_before used to `?`-abort
+    // the whole page (bare 400, no HTML) before the filter form rendered.
+    // That discarded every other filter the operator had entered.
+    // `parse_started_bound` instead degrades to "filter not applied". It hands
+    // back the raw text plus an error to redisplay inline. So a typo costs one
+    // field, not the page.
     let (started_after, started_after_raw, started_after_error) =
         parse_started_bound(params.started_after.as_deref(), "started_after");
     let (started_before, started_before_raw, started_before_error) =
@@ -1562,9 +1567,9 @@ async fn list_workflows_ui(
     filters.exec_id_prefix = exec_id_search.clone();
 
     // Issue #756: an unreachable shard degrades to a partial page rather than
-    // failing the whole render; the UI shows the reachable-shard rows and a
-    // banner naming the unreachable shard(s) so a partial list is not mistaken
-    // for the authoritative fleet state.
+    // failing the whole render. The UI shows the reachable-shard rows and a
+    // banner naming the unreachable shard(s). So nobody mistakes a partial
+    // list for the authoritative fleet state.
     let fanout_page = load_workflows_from_shards(&api_state, &filters).await?;
     let unavailable_shards = fanout_page.unavailable_shards;
     let workflows = fanout_page.executions;
@@ -1755,20 +1760,22 @@ fn parse_refresh_query_field(raw: Option<&str>) -> (Option<u64>, Option<String>)
 }
 
 /// Parses an optional RFC 3339 `started_after`/`started_before` filter bound
-/// from a raw query-string value. Returns `(parsed, raw_display, error)`:
-/// on success `raw_display` echoes the canonical value and `error` is `None`;
-/// on a parse failure `parsed` is `None` (the bound is not applied to the
-/// query) while `raw_display` echoes exactly what the operator typed and
-/// `error` carries a message to render next to the field — so a typo drops
-/// one filter instead of the whole page (see `list_workflows_ui`).
+/// from a raw query-string value.
+///
+/// Returns `(parsed, raw_display, error)`. On success `raw_display` echoes the
+/// canonical value and `error` is `None`. On a parse failure `parsed` is
+/// `None`, so the bound is not applied to the query. `raw_display` then echoes
+/// exactly what the operator typed, and `error` carries a message to render
+/// next to the field. So a typo drops one filter instead of the whole page
+/// (see `list_workflows_ui`).
 fn parse_started_bound(
     raw: Option<&str>,
     field: &str,
-) -> (Option<DateTime<Utc>>, String, Option<String>) {
+) -> (Option<Timestamp>, String, Option<String>) {
     let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
         return (None, String::new(), None);
     };
-    DateTime::parse_from_rfc3339(trimmed).map_or_else(
+    autumn_harvest::time::parse::rfc3339(trimmed).map_or_else(
         |_| {
             (
                 None,
@@ -1778,7 +1785,7 @@ fn parse_started_bound(
                 )),
             )
         },
-        |dt| (Some(dt.with_timezone(&Utc)), trimmed.to_string(), None),
+        |dt| (Some(dt), trimmed.to_string(), None),
     )
 }
 
@@ -1816,7 +1823,7 @@ fn parse_jump_event_query_field(raw: Option<&str>) -> (Option<i64>, Option<Strin
 /// A valid `jump_event` also suppresses a bad `event_page`'s error.
 /// `jump_event` alone decides the shown page in that case. Naming the
 /// `event_page` fallback would claim a page other than the one on screen
-/// (Codex review, PR #1652). `dag_detail_ui` applies the same suppression
+/// (PR #1652). `dag_detail_ui` applies the same suppression
 /// to `refresh` alongside a bad `node`.
 ///
 /// Returns `(event_page, event_page_error, jump_event_error)`.
@@ -2058,8 +2065,8 @@ async fn render_workflow_detail_page(
     action_echo: WorkflowActionEcho,
     rendered_at_action_url: bool,
     // The caller's own route, for the payload-decode audit trail (issue
-    // #1687 review, Codex finding). Before this parameter existed, every
-    // caller's decoded-payload reads were attributed to the hard-coded
+    // #1687). Before this parameter existed, every caller's
+    // decoded-payload reads were attributed to the hard-coded
     // `"GET /ui/workflows/{id}"`. That was wrong for the three POST
     // handlers rendering this page directly on a rejected submission.
     // A sensitive-read audit trail must name the request that actually
@@ -2125,11 +2132,11 @@ async fn render_workflow_detail_page(
         .map_err(database_error)
         .map_err(map_error)?;
 
-    // Activity-type events for the attempts panel. Heartbeats are excluded from
-    // the type filter. We fetch the most recent ACTIVITY_PANEL_MAX_EVENTS rows
-    // (DESC) and reverse them so collect_activity_attempts sees chronological
-    // order; this ensures activities scheduled near the end of a long history
-    // are never silently dropped by the cap.
+    // Activity-type events for the attempts panel; the type filter excludes
+    // heartbeats. Fetch the most recent ACTIVITY_PANEL_MAX_EVENTS rows (DESC)
+    // and reverse them, so collect_activity_attempts sees chronological order.
+    // The cap then never silently drops activities scheduled near the end of
+    // a long history.
     let mut activity_events: Vec<HarvestEvent> = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
         .filter(harvest_events::event_type.eq_any(ACTIVITY_PANEL_EVENT_TYPES))
@@ -2199,12 +2206,12 @@ async fn render_workflow_detail_page(
         .ok()
         .map(|r| r.registry().history_policy().continue_as_new_threshold());
 
-    // Read-path payload decoding (issue #608): decode the loaded copies only
-    // (stored rows are never touched); one best-effort audit row per page
-    // render that decoded or marked ≥1 envelope. Only the fields the page
-    // actually renders are decoded — the attempts/signals panel event copies
-    // (`activity_events`/`signal_update_events`) are deliberately excluded
-    // since those panels never render payload fields (PR #936 review).
+    // Read-path payload decoding (issue #608): decode the loaded copies only;
+    // stored rows are never touched. Write one best-effort audit row per page
+    // render that decoded or marked ≥1 envelope. Only the rendered fields are
+    // decoded. The attempts/signals panel event copies
+    // (`activity_events`/`signal_update_events`) are deliberately excluded,
+    // since those panels never render payload fields (PR #936).
     let mut execution = execution;
     let mut page_events = page_events;
     let session = extension_session(maybe_session);
@@ -2223,15 +2230,15 @@ async fn render_workflow_detail_page(
 
     // Open-awaitables diagnostic (issue #615): re-source the blocked-on panel
     // from the SAME replay-derived report `GET /workflows/{id}/awaitables`
-    // serves, so the UI and the API can never disagree about why a run is
-    // parked. Gated on harvest-admin access to mirror the API route's
-    // `require_admin` posture (the #608 `read_path_decoder` pattern in this
-    // same handler) — a non-admin principal sees the side-table panels only,
-    // never the replay-derived report the API would deny them. Best-effort: a
+    // serves. So the UI and the API can never disagree about why a run is
+    // parked. It is gated on harvest-admin access, like the API route's
+    // `require_admin` (the #608 `read_path_decoder` pattern in this handler).
+    // A non-admin principal sees the side-table panels only, never the
+    // replay-derived report the API would deny them. Best-effort: a
     // failure degrades to the side-table panels rather than failing the page,
     // with a warn so a persistent failure is diagnosable. The pooled
-    // connection is dropped first so the report's own connection checkout
-    // never overlaps ours (pool-size-1 safety).
+    // connection is dropped first, so the report's own connection checkout
+    // never overlaps this one (pool-size-1 safety).
     // Durable per-execution author log lines (issue #790, AC5). Admin-gated to
     // mirror `GET /workflows/{id}/logs`'s `require_admin` posture — a non-admin
     // principal must not read through the UI what the API would deny them.
@@ -2248,10 +2255,10 @@ async fn render_workflow_detail_page(
             .into_iter()
             .collect();
         // Probe for the cap marker DIRECTLY rather than scanning the page. The
-        // marker sits at `seq = i64::MAX` so it sorts last, and this panel loads
-        // only the first `WORKFLOW_LOG_PANEL_LIMIT` rows -- under the default
+        // marker sits at `seq = i64::MAX`, so it sorts last. This panel loads
+        // only the first `WORKFLOW_LOG_PANEL_LIMIT` rows. Under the default
         // 1,000-line cap a truncated run's marker can never land in a 200-row
-        // page, so a scan would report "not truncated" for exactly the runs that
+        // page. A scan would report "not truncated" for exactly the runs that
         // dropped the most. Mirrors the API route's own filter-independent probe.
         match autumn_harvest::store::load_workflow_logs(
             &mut conn,
@@ -2288,9 +2295,9 @@ async fn render_workflow_detail_page(
             Ok(rows) => rows,
             Err(err) => {
                 // Best-effort: never fail the page over an observational read.
-                // But surface it AS a failure -- the empty state otherwise
-                // affirmatively claims the sink is disabled, which during an
-                // incident is the opposite of what happened.
+                // But surface it AS a failure. Otherwise the empty state claims
+                // the sink is disabled, which during an incident is the
+                // opposite of what happened.
                 tracing::warn!(
                     execution_id = %exec_id,
                     error = ?err,
@@ -2350,14 +2357,15 @@ async fn render_workflow_detail_page(
 }
 
 /// Decode only the workflow-detail fields the renderer actually displays
-/// (PR #936 review, round 5): the execution row's payload fields (the
-/// Input/Output/Memo/Search-attributes cards + the error banner), the
-/// timeline page's event payloads (rendered in full under "view payload"),
-/// and the blocked-on panel's heartbeat checkpoints. Hidden fields are
-/// deliberately NOT decoded — the pending-activity `input`, pending-signal
-/// payloads, and the attempts/signals panel event copies render only
-/// names / error strings / timestamps, never payload fields, so decoding
-/// them would burn codec/KMS work and count envelopes in the
+/// (PR #936). The first is the execution row's payload fields: the
+/// Input/Output/Memo/Search-attributes cards and the error banner. The second
+/// is the timeline page's event payloads, rendered in full under "view
+/// payload". The third is the blocked-on panel's heartbeat checkpoints.
+///
+/// Hidden fields are deliberately NOT decoded. The pending-activity `input`,
+/// pending-signal payloads, and the attempts/signals panel event copies render
+/// only names / error strings / timestamps, never payload fields. Decoding them
+/// would burn codec/KMS work. It would also count envelopes in the
 /// `payload.decode_read` audit outcome for plaintext the operator is never
 /// shown. Returns the merged outcome for the page's single audit row, so the
 /// audit accounting covers exactly the surfaced fields.
@@ -2379,16 +2387,17 @@ fn decode_workflow_detail_rendered_fields(
     outcome
 }
 
-/// Read-path payload decoding for the workflow-detail page (issue #608):
-/// resolves the decode-only-when-admin gate ([`read_path_decoder`]) and, when
-/// active, tolerantly decodes the loaded copies of the rendered fields only
-/// (see [`decode_workflow_detail_rendered_fields`]), then writes the page's
+/// Read-path payload decoding for the workflow-detail page (issue #608).
+///
+/// It resolves the decode-only-when-admin gate ([`read_path_decoder`]). When
+/// active, it tolerantly decodes the loaded copies of the rendered fields only
+/// (see [`decode_workflow_detail_rendered_fields`]). It then writes the page's
 /// single best-effort audit row when ≥1 surfaced envelope was touched.
 /// Operates on in-memory copies only; stored rows are untouched.
 ///
-/// `conn` is the page handler's own (execution-shard) pooled connection —
-/// the audit row is written through it rather than acquiring a second
-/// connection while the caller's is still live (PR #936 review).
+/// `conn` is the page handler's own (execution-shard) pooled connection. The
+/// audit row is written through it, so no second connection is acquired
+/// while the caller's is still live (PR #936).
 #[allow(clippy::too_many_arguments)]
 async fn decode_and_audit_workflow_detail(
     api_state: &HarvestApiState,
@@ -2515,10 +2524,10 @@ async fn load_blocked_on_data(
 }
 
 /// Resolve each pending activity's effective heartbeat checkpoint cap
-/// (per-activity `max_result_bytes` raised against the global ceiling),
-/// mirroring the stack API so a configured large-payload activity keeps full
-/// checkpoint visibility in the UI too (#503 review). No-op when no runtime is
-/// installed (the global default cap then applies at render time).
+/// (per-activity `max_result_bytes` raised against the global ceiling).
+/// This mirrors the stack API, so a configured large-payload activity keeps
+/// full checkpoint visibility in the UI too (#503). No-op when no runtime is
+/// installed; the global default cap then applies at render time.
 fn resolve_blocked_on_heartbeat_caps(api_state: &HarvestApiState, blocked_on: &mut BlockedOnData) {
     if let Ok(rt) = api_state.runtime() {
         let registry = rt.registry();
@@ -2550,11 +2559,7 @@ async fn cancel_workflow_ui(
     let exec_id_str = exec_id.as_uuid().to_string();
     let reason = form.reason.as_deref().unwrap_or("").trim().to_string();
 
-    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder> =
-        api_state.runtime().map_or_else(
-            |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
-            |rt| Arc::clone(&rt.registry().telemetry().metrics),
-        );
+    let metrics_ref = crate::api::metrics_recorder_or_noop(&api_state);
     let cancel_result =
         cancel_workflow_execution(&mut conn, exec_id, &reason, metrics_ref.as_ref()).await;
     let (status, error_summary, flash) = match &cancel_result {
@@ -2597,8 +2602,8 @@ async fn cancel_workflow_ui(
 
 /// Force-terminate a single workflow execution from the detail page (issue #788).
 ///
-/// Mirrors [`cancel_workflow_ui`] exactly — same shard resolution, actor
-/// extraction, metrics fallback, audit plumbing, and detail-page redirect — but
+/// Mirrors [`cancel_workflow_ui`] exactly: same shard resolution, actor
+/// extraction, metrics fallback, audit plumbing, and detail-page redirect. It
 /// delegates to the forceful [`terminate_workflow_execution`] core path (#504)
 /// and records the `OP_WORKFLOW_TERMINATE` audit op.
 async fn terminate_workflow_ui(
@@ -2613,11 +2618,7 @@ async fn terminate_workflow_ui(
     let exec_id_str = exec_id.as_uuid().to_string();
     let reason = form.reason.as_deref().unwrap_or("").trim().to_string();
 
-    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder> =
-        api_state.runtime().map_or_else(
-            |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
-            |rt| Arc::clone(&rt.registry().telemetry().metrics),
-        );
+    let metrics_ref = crate::api::metrics_recorder_or_noop(&api_state);
     let terminate_result =
         terminate_workflow_execution(&mut conn, exec_id, &reason, metrics_ref.as_ref()).await;
     let (status, error_summary, flash) = match &terminate_result {
@@ -2665,9 +2666,9 @@ async fn terminate_workflow_ui(
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
 }
 
-/// Flash text for the pause action: an idempotent repeat (`newly_paused:
-/// false`) is called out so the operator isn't misled into thinking their
-/// click performed the transition (issue #609 post-review hardening).
+/// Flash text for the pause action (issue #609). An idempotent repeat
+/// (`newly_paused: false`) is called out so the operator is not misled into
+/// thinking their click performed the transition.
 const fn pause_flash_message(newly_paused: bool) -> &'static str {
     if newly_paused {
         "Workflow paused"
@@ -2676,9 +2677,9 @@ const fn pause_flash_message(newly_paused: bool) -> &'static str {
     }
 }
 
-/// Flash text for the resume action: since issue #609, resuming a non-paused
-/// run is a success no-op (`newly_resumed: false`) — the flash must say so
-/// rather than claiming a resume happened.
+/// Flash text for the resume action. Since issue #609, resuming a non-paused
+/// run is a success no-op (`newly_resumed: false`). The flash must say so
+/// rather than claim a resume happened.
 const fn resume_flash_message(newly_resumed: bool) -> &'static str {
     if newly_resumed {
         "Workflow resumed"
@@ -2703,11 +2704,7 @@ async fn pause_workflow_ui(
         .map(str::trim)
         .filter(|r| !r.is_empty());
 
-    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder> =
-        api_state.runtime().map_or_else(
-            |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
-            |rt| Arc::clone(&rt.registry().telemetry().metrics),
-        );
+    let metrics_ref = crate::api::metrics_recorder_or_noop(&api_state);
     let result =
         pause_workflow_execution(&mut conn, exec_id, reason, &actor, metrics_ref.as_ref()).await;
     let (status, error_summary, flash) = match &result {
@@ -2757,11 +2754,7 @@ async fn resume_workflow_ui(
     let actor = api_state.extract_actor(&headers);
     let exec_id_str = exec_id.as_uuid().to_string();
 
-    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder> =
-        api_state.runtime().map_or_else(
-            |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
-            |rt| Arc::clone(&rt.registry().telemetry().metrics),
-        );
+    let metrics_ref = crate::api::metrics_recorder_or_noop(&api_state);
     let result = resume_workflow_execution(&mut conn, exec_id, &actor, metrics_ref.as_ref()).await;
     let (status, error_summary, flash) = match &result {
         Ok(resumed) => (
@@ -3303,8 +3296,8 @@ async fn list_dead_letters_ui(
 
     if let Some(codecs) = decoder.as_ref() {
         // Read-path payload decoding (issue #608): decode each rendered row's
-        // JSONB input, TEXT error, and last-events copies; one best-effort
-        // audit row per page render that touched ≥1 envelope.
+        // JSONB input, TEXT error, and last-events copies. Write one
+        // best-effort audit row per page render that touched ≥1 envelope.
         let mut outcome = LossyDecodeOutcome::default();
         for row in &mut page_rows {
             outcome = outcome.merged(codecs.decode_column_lossy(&mut row.dead_letter.input));
@@ -3461,11 +3454,11 @@ fn parse_dead_letter_task_kind_filter(
 fn parse_dead_letter_time_filter(
     field: &str,
     raw: Option<&str>,
-) -> (Option<DateTime<Utc>>, String, Option<String>) {
+) -> (Option<Timestamp>, String, Option<String>) {
     let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
         return (None, String::new(), None);
     };
-    let Ok(parsed) = DateTime::parse_from_rfc3339(trimmed) else {
+    let Ok(parsed) = autumn_harvest::time::parse::rfc3339(trimmed) else {
         return (
             None,
             trimmed.to_string(),
@@ -3474,7 +3467,7 @@ fn parse_dead_letter_time_filter(
             )),
         );
     };
-    (Some(parsed.with_timezone(&Utc)), trimmed.to_string(), None)
+    (Some(parsed), trimmed.to_string(), None)
 }
 
 /// Parses a `shard`/`shard_id` filter shared by the Workers, Dead-Letters,
@@ -3613,10 +3606,10 @@ macro_rules! apply_dead_letter_ui_filters {
             );
         }
         if let Some(failed_after) = $filters.failed_after {
-            $query = $query.filter(harvest_dead_letters::failed_at.ge(failed_after));
+            $query = $query.filter(harvest_dead_letters::failed_at.ge(failed_after.to_diesel()));
         }
         if let Some(failed_before) = $filters.failed_before {
-            $query = $query.filter(harvest_dead_letters::failed_at.lt(failed_before));
+            $query = $query.filter(harvest_dead_letters::failed_at.lt(failed_before.to_diesel()));
         }
     };
 }
@@ -3682,7 +3675,7 @@ async fn load_dead_letter_details_batch(
 
     // One `LATERAL`-per-id "last 10" query instead of N separate
     // `ORDER BY ... LIMIT 10` queries. Each `LATERAL` subquery uses the
-    // same `idx_harvest_events_exec (workflow_exec_id, event_id)` index
+    // same `(workflow_exec_id, event_id)` unique key
     // the old per-row query relied on. The outer `ORDER BY` groups each
     // id's rows in ascending `event_id` order already, so no per-group
     // reverse step is needed here. The old function fetched descending
@@ -3919,39 +3912,40 @@ fn parse_worker_stale_filter(raw: Option<&str>) -> (bool, String, Option<String>
 
 /// A paused queue as rendered on the Workers page, merged across shards.
 ///
-/// Issue #619: an operator queue pause is the single most likely explanation
-/// for "workers are idle but the queue is full", so it is surfaced on the
-/// fleet page an operator lands on during exactly that incident.
+/// Issue #619: an operator queue pause is the most likely explanation for
+/// "workers are idle but the queue is full". So it shows on the fleet page an
+/// operator lands on during exactly that incident.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PausedQueueBannerRow {
     pub queue_name: String,
     pub reason: String,
     pub paused_by: String,
-    pub paused_at: chrono::DateTime<chrono::Utc>,
+    pub paused_at: jiff::Timestamp,
     pub scope_shard_id: Option<i32>,
     pub held_task_count: i64,
     /// False when the shards holding this queue disagree on
-    /// `(reason, paused_by, scope_shard_id)` — the displayed provenance then
-    /// describes only part of the fleet and the banner says so.
+    /// `(reason, paused_by, scope_shard_id)`. The displayed provenance then
+    /// describes only part of the fleet, and the banner says so.
     pub provenance_uniform: bool,
-    /// What the hold **actually** covers, derived from the shards that hold it
-    /// versus the expected shard set — not from the stored `scope_shard_id`,
-    /// which records only the intent of the request that wrote each row.
+    /// What the hold **actually** covers: the shards that hold it versus the
+    /// expected shard set. The stored `scope_shard_id` records only the intent
+    /// of the request that wrote each row.
     pub coverage: autumn_harvest::queue_pause::PauseCoverage,
 }
 
 /// Outcome of the Workers-page paused-queue scan: the merged banner rows plus
 /// the shards whose pause state could not be read at all.
 ///
-/// Issue #619 review: a shard whose connection or pause read fails contributes
-/// **no rows**, which is indistinguishable from "that shard is not holding
+/// Issue #619: a shard whose connection or pause read fails contributes
+/// **no rows**, which looks the same as "that shard is not holding
 /// anything". For *coverage classification* that is the safe reading (a
 /// not-holding shard makes the hold `partial_fleet`, i.e. possibly still
-/// dispatching). For *presence* it is not safe at all: a hold that exists
-/// **only** on an unread shard vanishes from the banner entirely, so an
-/// operator investigating idle workers sees a clean page and looks elsewhere
-/// while dispatch is in fact held. The failed shard ids are therefore carried
-/// alongside the rows and rendered as a warning even when `rows` is empty.
+/// dispatching). For *presence* it is not safe at all. A hold that exists
+/// **only** on an unread shard vanishes from the banner entirely. An
+/// operator investigating idle workers then sees a clean page and looks
+/// elsewhere, while dispatch is in fact held. The failed shard ids are
+/// therefore carried alongside the rows and rendered as a warning even when
+/// `rows` is empty.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PausedQueueScan {
     pub rows: Vec<PausedQueueBannerRow>,
@@ -3962,32 +3956,32 @@ pub(crate) struct PausedQueueScan {
 /// Merge per-shard paused-queue rows into one banner row per queue name.
 ///
 /// Held counts are summed across shards. The top-level provenance is the
-/// **earliest** hold (the one an operator reasons about — "how long has this
-/// been held?"), tie-broken by shard id so the choice never depends on
+/// **earliest** hold, the one an operator reasons about ("how long has this
+/// been held?"). Shard id breaks a tie, so the choice never depends on
 /// fan-out order. Rows are sorted by queue name so the banner is stable
 /// across refreshes.
 ///
-/// The shards' rows are **not** guaranteed to agree: `pause_queue` is
-/// idempotent and preserves the *original* reason and operator on a re-pause,
-/// and the `shard_id` parameter explicitly supports holding the same queue on
-/// two shards separately. Summing every shard's held tasks under a single
-/// shard's reason would then tell the operator a story that is simply not true
-/// for part of the fleet, so `provenance_uniform` records the disagreement and
+/// The shards' rows are **not** guaranteed to agree. `pause_queue` is
+/// idempotent and preserves the *original* reason and operator on a re-pause.
+/// The `shard_id` parameter explicitly supports holding the same queue on
+/// two shards separately. Summing every shard's held tasks under one shard's
+/// reason would then tell the operator an untrue story for part of the fleet.
+/// So `provenance_uniform` records the disagreement and
 /// `render_paused_queues_banner` marks it visibly.
 ///
 /// The uniformity rule is identical to the one `GET /admin/queues/paused` uses
-/// (`api::merge_paused_queue_rows`) — including comparing
+/// (`api::merge_paused_queue_rows`). It compares
 /// `(reason, paused_by, scope_shard_id)` and deliberately **not** `paused_at`,
-/// since each shard stamps its own `NOW()` — so the two surfaces can never
+/// since each shard stamps its own `NOW()`. So the two surfaces can never
 /// disagree about whether a hold is uniform.
 ///
-/// The rendered **scope** is likewise derived from real coverage rather than the
-/// stored `scope_shard_id`, via the shared
-/// [`autumn_harvest::queue_pause::classify_pause_coverage`]: a fleet-wide pause
+/// The rendered **scope** also comes from real coverage, not the stored
+/// `scope_shard_id`, via the shared
+/// [`autumn_harvest::queue_pause::classify_pause_coverage`]. A fleet-wide pause
 /// that only reached some shards persists `scope_shard_id = NULL` on the shards
-/// it reached and no row on the ones it missed, so labelling it "fleet-wide"
+/// it reached and no row on the ones it missed. Labelling it "fleet-wide"
 /// would tell an operator the fleet is held while part of it keeps dispatching
-/// (issue #619 review).
+/// (issue #619).
 pub(crate) fn merge_paused_queue_banner_rows(
     per_shard: Vec<(i32, autumn_harvest::queue_pause::PausedQueue)>,
     expected_shards: &[i32],
@@ -4044,14 +4038,14 @@ pub(crate) fn merge_paused_queue_banner_rows(
 /// **and** every shard's pause state was readable, so a healthy fleet page is
 /// byte-identical to before.
 ///
-/// A row whose shards disagree on provenance is marked "mixed across shards"
-/// rather than silently attributing the fleet-wide held total to one shard's
-/// reason and operator — see [`merge_paused_queue_banner_rows`].
+/// A row whose shards disagree on provenance is marked "mixed across shards".
+/// It never silently attributes the fleet-wide held total to one shard's
+/// reason and operator. See [`merge_paused_queue_banner_rows`].
 ///
-/// `unreadable_shards` renders its own warning **even when `rows` is empty**:
-/// an unread shard's pause state is unknown, so an absent banner would otherwise
-/// read as "nothing is held" on exactly the page an operator lands on when
-/// investigating idle workers — see [`PausedQueueScan`].
+/// `unreadable_shards` renders its own warning **even when `rows` is empty**.
+/// An unread shard's pause state is unknown. An absent banner would read as
+/// "nothing is held" on the page an operator lands on when investigating
+/// idle workers. See [`PausedQueueScan`].
 pub(crate) fn render_paused_queues_banner(
     rows: &[PausedQueueBannerRow],
     unreadable_shards: &[i32],
@@ -4067,16 +4061,16 @@ pub(crate) fn render_paused_queues_banner(
     let held_total: i64 = rows.iter().map(|r| r.held_task_count).sum();
     let mixed = rows.iter().filter(|r| !r.provenance_uniform).count();
     // A fleet-wide hold that did not reach every shard leaves part of the fleet
-    // dispatching into the outage the operator is trying to hold back -- the
-    // single most important thing to say on this banner (issue #619 review).
+    // dispatching into the outage the operator is trying to hold back. That is
+    // the most important thing to say on this banner (issue #619).
     let incomplete = rows
         .iter()
         .filter(|r| r.coverage.is_incomplete_fleet())
         .count();
     html! {
-        // Rendered FIRST and unconditionally on a read failure: if this is the
+        // Rendered FIRST and unconditionally on a read failure. If this is the
         // only thing on the banner, the honest answer is "we do not know whether
-        // dispatch is held", not the silent clean page an absent banner implies.
+        // dispatch is held". An absent banner would imply a clean page instead.
         @if !unreadable_shards.is_empty() {
             div.banner.Degraded {
                 strong { "Queue pause state incomplete" }
@@ -4126,7 +4120,7 @@ pub(crate) fn render_paused_queues_banner(
                                 }
                             }
                             td { (row.held_task_count) }
-                            td { (row.paused_at.to_rfc3339()) }
+                            td { (autumn_harvest::time::rfc3339(row.paused_at)) }
                             td {
                                 (row.paused_by)
                                 @if !row.provenance_uniform { " (mixed across shards)" }
@@ -4145,18 +4139,18 @@ pub(crate) fn render_paused_queues_banner(
 
 /// Load paused queues across every shard for the Workers-page banner.
 ///
-/// Best-effort: an unreachable shard never fails the page — the banner is a
+/// Best-effort: an unreachable shard never fails the page. The banner is a
 /// diagnostic aid, never a gate on rendering the fleet. It is **not** silent
-/// about it either: the failed shard ids come back in
-/// [`PausedQueueScan::unreadable_shards`] and are rendered as their own warning,
-/// because a hold that exists only on an unread shard is otherwise invisible
-/// here (issue #619 review).
+/// about it either. The failed shard ids come back in
+/// [`PausedQueueScan::unreadable_shards`] and render as their own warning.
+/// Otherwise a hold that exists only on an unread shard is invisible here
+/// (issue #619).
 ///
-/// The **expected** shard set (pools plus every shard the router knows about) is
-/// resolved from `api_state`, identical to `GET /admin/queues/paused`, so a
+/// The **expected** shard set (pools plus every shard the router knows about)
+/// comes from `api_state`, identical to `GET /admin/queues/paused`. So a
 /// partially-applied fleet-wide hold is labelled the same way on both surfaces.
-/// An unread shard counts as not-holding for *coverage*, which is the safe
-/// direction (it may still be dispatching) — the warning is what tells the
+/// An unread shard counts as not-holding for *coverage*. That is the safe
+/// direction, because it may still be dispatching. The warning tells the
 /// operator the shown `Scope` could understate the real coverage.
 async fn load_paused_queues_from_shards(api_state: &HarvestApiState) -> PausedQueueScan {
     let pools = crate::shard_fanout::pools_by_shard(api_state);
@@ -4165,18 +4159,19 @@ async fn load_paused_queues_from_shards(api_state: &HarvestApiState) -> PausedQu
     // Fan out over the EXPECTED shard set, not just `pool.iter_shards()`.
     //
     // `expected_shards` deliberately includes a shard the router advertises but
-    // this process has no pool for yet (mid a shard-add rollout). Iterating only
-    // the pools would give such a shard no future at all, so it could never
-    // enter `unreadable_shards` — and if it is the ONLY shard holding a queue,
-    // the Workers page would again render no pause warning whatsoever. That is
+    // this process has no pool for yet (mid a shard-add rollout). Iterating
+    // only the pools would give such a shard no future, so it could never
+    // enter `unreadable_shards`. If it is the ONLY shard holding a queue, the
+    // Workers page would again render no pause warning at all. That is
     // the same presence-vs-coverage gap the unreadable-shard warning exists to
     // close, reached through a missing pool instead of a failing read.
     //
-    // Resolution goes through the API's own `resolve_expected_shard_pools` (one
-    // shared function, not a second copy of the rule) so a poolless shard maps
-    // to `None` and is reported, never silently resolved through
-    // `ShardedDbPool::pool_for`'s default-shard fallback — which would query the
-    // DEFAULT shard's database in its place and let coverage read `fleet`.
+    // Resolution goes through the API's own `resolve_expected_shard_pools`
+    // (one shared function, not a second copy of the rule). So a poolless
+    // shard maps to `None` and is reported. It is never silently resolved
+    // through `ShardedDbPool::pool_for`'s default-shard fallback. That would
+    // query the DEFAULT shard's database in its place and let coverage read
+    // `fleet`.
     let expected: Vec<i32> = expected_set.iter().copied().collect();
     let resolved = crate::api::resolve_expected_shard_pools(&expected_set, &pools);
     scan_paused_queues(resolved, &expected).await
@@ -4186,11 +4181,11 @@ async fn load_paused_queues_from_shards(api_state: &HarvestApiState) -> PausedQu
 /// [`PausedQueueScan`].
 ///
 /// Split out from [`load_paused_queues_from_shards`] so the reporting half is
-/// directly testable: reaching a poolless-but-expected shard through
-/// `api_state` requires an installed runtime with a widened router, but the
-/// rule under test — *a `None` pool is reported, never dropped* — needs
-/// neither. Its counterpart, that a router-known poolless shard resolves to
-/// `None` rather than a default-fallback pool, is guarded on the API side by
+/// directly testable. Reaching a poolless-but-expected shard through
+/// `api_state` requires an installed runtime with a widened router. The rule
+/// under test, *a `None` pool is reported, never dropped*, needs neither. Its
+/// counterpart is that a router-known poolless shard resolves to `None`, not
+/// a default-fallback pool. The API side guards that in
 /// `resolve_expected_shard_pools_flags_poolless_shard_not_default_fallback`.
 ///
 /// `expected` is the same shard set `resolved` was built from, threaded through
@@ -4698,10 +4693,10 @@ fn dlq_summary_key_cell(key: &serde_json::Value, dim: &str) -> String {
 /// Build a click-through link into the list view with whatever filters the list
 /// view can express pre-applied from this group's key.
 ///
-/// Returns `(href, is_partial)`. `is_partial` is `true` when one or more
-/// group dimensions (`activity_name`, `queue_name`, `time_bucket`,
-/// `failure_signature`) have no equivalent list-view filter — the resulting
-/// link will show a superset of the selected group.
+/// Returns `(href, is_partial)`. `is_partial` is `true` when a group dimension
+/// (`activity_name`, `queue_name`, `time_bucket`, `failure_signature`) has no
+/// equivalent list-view filter. The link then shows a superset of the
+/// selected group.
 fn dlq_summary_drilldown_href(
     key: &serde_json::Value,
     group_by: &[autumn_harvest::dlq::DlqGroupDimension],
@@ -4715,8 +4710,8 @@ fn dlq_summary_drilldown_href(
 
     // Start from the filters already applied to the summary so drill-down
     // narrows rather than widens. `drill_raw` starts as a clone of the
-    // summary's own raw state, not a derivation from `drill`. Codex review
-    // on #1420 found the bug in a derived-only `drill_raw`: it silently
+    // summary's own raw state, not a derivation from `drill`. PR #1420
+    // fixed a bug in a derived-only `drill_raw`: it silently
     // dropped an invalid failed_after/failed_before, and its error, on
     // every "View entries" link. This function never touches those two
     // fields. The view toggle, refresh, and group-by form all preserve
@@ -5042,8 +5037,7 @@ fn render_dead_letter_detail(row: &DeadLetterUiRow) -> Markup {
 /// handles an invalid value gracefully like every other GET on this page.
 /// Carries the raw text, not the parsed value. This lets an invalid value's
 /// inline error survive resubmission, instead of being silently dropped.
-/// Same reasoning as the Workers page's `build_worker_query_string` (Codex
-/// review, #1378 P2).
+/// Same reasoning as the Workers page's `build_worker_query_string` (#1378).
 ///
 /// Do NOT use this for the bulk-action POST forms — see
 /// [`render_dead_letter_hidden_filters`], which those forms need instead.
@@ -5080,8 +5074,8 @@ fn render_dead_letter_hidden_filters_raw(
 /// value on the GET group-by form, which is safe there. Doing the same
 /// here would reintroduce the exact bug this PR fixes, one layer down. The
 /// bulk action would abort instead of running, or redisplaying the inline
-/// error (Codex review, #1420). An invalid field is "filter not applied"
-/// on this page, so it is simply omitted here. The operator's raw text and
+/// error (#1420). An invalid field is "filter not applied" on this
+/// page, so it is simply omitted here. The operator's raw text and
 /// the error still redisplay from `return_to`, which is built from the raw
 /// query string.
 fn render_dead_letter_hidden_filters(filters: &DeadLetterUiFilters) -> Markup {
@@ -5092,10 +5086,10 @@ fn render_dead_letter_hidden_filters(filters: &DeadLetterUiFilters) -> Markup {
         @if let Some(task_kind) = filters.task_kind.map(DeadLetterTaskKind::as_label) {
             input type="hidden" name="task_kind" value=(task_kind);
         }
-        @if let Some(failed_after) = filters.failed_after.map(|ts| ts.to_rfc3339()) {
+        @if let Some(failed_after) = filters.failed_after.map(autumn_harvest::time::rfc3339) {
             input type="hidden" name="failed_after" value=(failed_after);
         }
-        @if let Some(failed_before) = filters.failed_before.map(|ts| ts.to_rfc3339()) {
+        @if let Some(failed_before) = filters.failed_before.map(autumn_harvest::time::rfc3339) {
             input type="hidden" name="failed_before" value=(failed_before);
         }
         @if let Some(shard_id) = filters.shard_id {
@@ -5166,8 +5160,7 @@ fn build_dead_letter_query_string(
     // Carry the raw text, not the parsed value. This lets an invalid
     // value's inline error persist across pagination, instead of being
     // silently dropped. Same reasoning as `build_query_string`'s
-    // started_after/started_before handling on the Workflows page (Codex
-    // review, #1378 P2).
+    // started_after/started_before handling on the Workflows page (#1378).
     if !filter_raw.task_kind.is_empty() {
         let _ = write!(out, "&task_kind={}", url_encode(&filter_raw.task_kind));
     }
@@ -5216,10 +5209,9 @@ const fn dead_letter_task_kind_label(task_type: &str) -> &'static str {
         "Workflow"
     } else if task_type.eq_ignore_ascii_case("callback") {
         // Issue #605 completion-callback exhaustion. The generic "Replay"
-        // action still works for this row -- `dlq::replay_dead_letter`
+        // action still works for this row. `dlq::replay_dead_letter`
         // delegates it to the completion-delivery redrive primitive (issue
-        // #921 review) -- so no separate UI treatment is needed beyond a
-        // clear label.
+        // #921). So the only UI treatment needed is a clear label.
         "Callback"
     } else {
         "Unknown"
@@ -5433,7 +5425,7 @@ fn render_worker_table(rows: &[WorkerRow], shard_id: ShardId) -> Markup {
                         td {
                             @let rel = relative_time(row.worker.last_heartbeat_at);
                             @let abs = format_timestamp(Some(row.worker.last_heartbeat_at));
-                            time datetime=(row.worker.last_heartbeat_at.to_rfc3339()) title=(abs) {
+                            time datetime=(autumn_harvest::time::rfc3339(row.worker.last_heartbeat_at)) title=(abs) {
                                 (rel)
                             }
                         }
@@ -5629,11 +5621,9 @@ fn worker_status_badge(status: &str, stale: bool) -> Markup {
     }
 }
 
-/// Format a `DateTime<Utc>` as a human-readable relative time string.
-fn relative_time(ts: DateTime<Utc>) -> String {
-    let elapsed = Utc::now()
-        .signed_duration_since(ts)
-        .to_std()
+/// Format a `Timestamp` as a human-readable relative time string.
+fn relative_time(ts: Timestamp) -> String {
+    let elapsed = std::time::Duration::try_from(Timestamp::now().duration_since(ts))
         .unwrap_or(std::time::Duration::ZERO);
     let secs = elapsed.as_secs();
     if secs < 5 {
@@ -5983,10 +5973,10 @@ fn build_query_string(
         let _ = write!(out, "&search_attr_key={}", url_encode(key));
         let _ = write!(out, "&search_attr_value={}", url_encode(value));
     }
-    // Carries the raw text through, valid or not — a bound the operator is
-    // still correcting (an invalid value with its inline error, see
-    // `parse_started_bound`) must not silently vanish from a Next/Previous
-    // link before they've resolved it.
+    // Carries the raw text through, valid or not. A bound the operator is
+    // still correcting must not silently vanish from a Next/Previous link
+    // before they have resolved it. Such a bound is an invalid value with its
+    // inline error (see `parse_started_bound`).
     if !started_after_raw.is_empty() {
         let _ = write!(out, "&started_after={}", url_encode(started_after_raw));
     }
@@ -6012,9 +6002,9 @@ const SIGNAL_UPDATE_TYPES: &[&str] = &[
 ];
 const SIGNAL_UPDATE_PANEL_LIMIT: usize = 20;
 /// Maximum durable workflow-log lines rendered on the detail page (issue #790).
-/// The API route (`GET /workflows/{id}/logs`) paginates the full set; the panel
-/// shows the FIRST window (oldest-first, matching the store's `seq` order) and
-/// links out for the rest.
+/// The API route (`GET /workflows/{id}/logs`) paginates the full set. The
+/// panel shows the FIRST window (oldest-first, in the store's `seq` order)
+/// and links out for the rest.
 const WORKFLOW_LOG_PANEL_LIMIT: i64 = 200;
 const ACTIVITY_PANEL_EVENT_TYPES: &[&str] = &[
     "ActivityScheduled",
@@ -6037,7 +6027,7 @@ const ACTIVITY_PANEL_EVENT_TYPES: &[&str] = &[
 /// Extract a string field from the inner `data` object of an adjacently-tagged event payload.
 ///
 /// Events are stored as `{"type": "...", "data": {...}}`. This helper reaches through the outer
-/// wrapper so callers don't have to repeat the two-step lookup everywhere.
+/// wrapper so callers do not have to repeat the two-step lookup everywhere.
 fn event_data_field<'a>(event_data: &'a Value, field: &str) -> Option<&'a str> {
     event_data.get("data")?.get(field)?.as_str()
 }
@@ -6049,10 +6039,10 @@ fn event_data_u64(event_data: &Value, field: &str) -> Option<u64> {
 
 /// Map a raw `event_type` string to a human-readable label.
 ///
-/// `execution_state` disambiguates the `WorkflowCancelled` event, which is
-/// reused for force-terminate (issue #504, no new event variant): a terminal
+/// `execution_state` disambiguates the `WorkflowCancelled` event. It is
+/// reused for force-terminate (issue #504, no new event variant). A terminal
 /// `WorkflowCancelled` on a `TERMINATED` execution is labelled "Workflow
-/// terminated" so the timeline matches the (already correct) state badge.
+/// terminated", so the timeline matches the (already correct) state badge.
 fn event_human_label(event_type: &str, event_data: &Value, execution_state: &str) -> String {
     match event_type {
         "WorkflowStarted" => "Workflow started".to_string(),
@@ -6275,7 +6265,7 @@ fn render_workflow_detail_live(
 
     // Duration string.
     let duration = execution.completed_at.map(|end| {
-        let secs = (end - execution.started_at).num_seconds().max(0);
+        let secs = (end - execution.started_at).as_secs().max(0);
         if secs < 60 {
             format!("{secs}s")
         } else if secs < 3600 {
@@ -6350,8 +6340,8 @@ fn render_workflow_detail_live(
                 }
             }
 
-            // Operator actions — use the exec_id in action URLs so they resolve correctly
-            // whether the router is mounted at "/" or at a subpath like "/api/harvest/ui".
+            // Use the exec_id in action URLs so they resolve whether the router
+            // is mounted at "/" or at a subpath like "/api/harvest/ui".
             div."operator-actions" {
                 form method="post" action={ (exec_id_str) "/cancel" }
                       onsubmit="return confirm('Cancel this workflow execution?')" {
@@ -6405,7 +6395,7 @@ fn render_workflow_detail_live(
                         label style="font-size:12px;color:#94a3b8" {
                             "Event # (1-based, as shown in timeline)"
                             // `type="text"` with `inputmode`/`pattern`, not
-                            // `type="number"` (Codex review, issue #1687). A
+                            // `type="number"` (issue #1687). A
                             // browser's number-input value-sanitization
                             // algorithm blanks a non-numeric value from the
                             // visible control. This happens even though the raw
@@ -6490,7 +6480,7 @@ fn render_workflow_detail_live(
                         (kv("Current worker", worker, true))
                     }
                     @if let Some(timeout) = execution.execution_timeout {
-                        (kv("Execution timeout", &format!("{}s", timeout.num_seconds()), false))
+                        (kv("Execution timeout", &format!("{}s", timeout.as_secs()), false))
                     }
                     @if let Some(ref build_id) = execution.assigned_build_id {
                         div.k { "Assigned build" }
@@ -6732,7 +6722,7 @@ fn render_workflow_detail_live(
                             }
                             a href=(workflow_detail_href(&exec_id_str, last_page, selected_log_level)) { "Jump to latest" }
                             // `action=(exec_id_str)`, not the default omitted
-                            // action (issue #1687 review, Codex finding). A GET
+                            // action (issue #1687). A GET
                             // form with no `action` submits to the document's
                             // base url with its query replaced. On this page's
                             // `<base href="..">` fallback (see `layout`'s doc
@@ -6792,11 +6782,12 @@ enum CheckpointCellState {
     OmittedForBudget(u64),
 }
 
-/// Build the per-row checkpoint decisions for the pending-activities table,
-/// mirroring the stack API (#503 review): each checkpoint is judged against its
-/// activity's effective cap (per-activity `max_result_bytes` raised against the
-/// global ceiling), then a cumulative per-page budget — the global cap — bounds
-/// the total rendered bytes so a large fan-out can't generate a huge HTML page.
+/// Build the per-row checkpoint decisions for the pending-activities table.
+/// This mirrors the stack API (#503 review). Each checkpoint is judged against
+/// its activity's effective cap: the per-activity `max_result_bytes`, raised
+/// against the global ceiling. Then a cumulative per-page budget (the global
+/// cap) bounds the total rendered bytes, so a large fan-out cannot generate a
+/// huge HTML page.
 /// The first payload-bearing checkpoint is always shown. The byte size is
 /// measured once here via the shared non-allocating counter; the renderer reads
 /// the resulting state without re-serializing.
@@ -6869,23 +6860,20 @@ fn render_heartbeat_checkpoint_cell(item: &TaskQueueItem, state: CheckpointCellS
     }
 }
 
-/// Render the "Pending activities" table, including each activity's latest
-/// heartbeat checkpoint judged against its effective (per-activity) cap and the
-/// cumulative per-page checkpoint budget (#503).
 /// Build a workflow-detail URL that preserves BOTH view dimensions.
 ///
-/// The detail page now has two independent filters -- the event-history page
-/// and the log-level filter (issue #790) -- and a bare `?log_level=` /
-/// `?event_page=` link silently resets the other one. Every link that changes
-/// one dimension goes through here so it carries the other.
+/// The detail page has two independent filters: the event-history page and
+/// the log-level filter (issue #790). A bare `?log_level=` / `?event_page=`
+/// link silently resets the other one. Every link that changes one dimension
+/// goes through here so it carries the other.
 ///
-/// `jump_event` is deliberately NOT preserved: it is a one-shot "take me to
-/// event N" action that `event_page` already resolves to a concrete page, so
-/// carrying it would re-trigger the jump on every subsequent click.
+/// `jump_event` is deliberately NOT preserved. It is a one-shot "take me to
+/// event N" action that `event_page` already resolves to a concrete page.
+/// Carrying it would re-trigger the jump on every subsequent click.
 ///
-/// Prefixed with `exec_id_str`, not a bare `?query` (issue #1687 review,
-/// Codex finding). A relative reference with an empty path inherits the
-/// browser's *entire* current base path, not just its directory. See
+/// Prefixed with `exec_id_str`, not a bare `?query` (issue #1687). A
+/// relative reference with an empty path inherits the browser's
+/// *entire* current base path, not just its directory. See
 /// `layout`'s doc comment for this page's `<base href="..">` fallback, on
 /// a direct-rendered rejected action. A bare `?event_page=1` there would
 /// resolve to `/workflows/?event_page=1`, dropping the execution id
@@ -6917,36 +6905,36 @@ pub(crate) struct WorkflowLogsPanelData<'a> {
     pub admin: bool,
     /// Whether this execution hit its per-execution log cap.
     ///
-    /// Resolved by the caller with a direct probe for the marker row, NOT by
-    /// scanning `lines`: the marker sits at `seq = i64::MAX` so it sorts last,
-    /// and the panel only loads the FIRST `WORKFLOW_LOG_PANEL_LIMIT` rows. With
+    /// The caller resolves it with a direct probe for the marker row, NOT by
+    /// scanning `lines`. The marker sits at `seq = i64::MAX`, so it sorts last.
+    /// The panel only loads the FIRST `WORKFLOW_LOG_PANEL_LIMIT` rows. With
     /// the default cap (1,000) a truncated run's marker can never appear in a
-    /// 200-row page, so a scan-based check would render `false` for exactly the
-    /// runs that dropped the most -- silently, which is the one failure mode
+    /// 200-row page. A scan-based check would render `false` for exactly the
+    /// runs that dropped the most. That silent loss is the one failure mode
     /// the marker exists to prevent.
     pub truncated: bool,
     /// Whether the log read itself failed (as opposed to returning no rows).
     ///
-    /// Without this the empty state affirmatively tells the operator "the sink
-    /// is disabled" during an incident where the read actually errored -- e.g.
-    /// a node that has not yet run the migration, where every detail page would
-    /// claim every run logged nothing.
+    /// Without this the empty state tells the operator "the sink is disabled"
+    /// during an incident where the read errored. An example is a node that
+    /// has not yet run the migration. Every detail page would then claim every
+    /// run logged nothing.
     pub read_failed: bool,
 }
 
 /// Renders the durable per-execution author-log panel (issue #790, AC5).
 ///
 /// Sourced from the SAME `harvest_workflow_logs` rows `GET /workflows/{id}/logs`
-/// serves, in the same emission order (`seq`), so the UI and the API can never
+/// serves, in the same emission order (`seq`). So the UI and the API can never
 /// disagree about what a run logged. Level filtering is a plain link-based
 /// filter (`?log_level=`) — no JS, matching the Workers/DLQ page precedent.
 ///
 /// The panel is rendered only for a harvest-admin principal (the caller gates
 /// it), mirroring the API route's `require_admin`.
 ///
-/// Logs are observational only (AC7): a run that never logged, or a deployment
-/// with the durable sink disabled, shows the empty state rather than an error —
-/// there is nothing wrong with either.
+/// Logs are observational only (AC7). A run that never logged, or a deployment
+/// with the durable sink disabled, shows the empty state rather than an error.
+/// There is nothing wrong with either.
 fn render_workflow_logs_panel(
     exec_id_str: &str,
     logs: &WorkflowLogsPanelData<'_>,
@@ -7036,6 +7024,9 @@ fn render_workflow_logs_panel(
     }
 }
 
+/// Render the "Pending activities" table, including each activity's latest
+/// heartbeat checkpoint judged against its effective (per-activity) cap and the
+/// cumulative per-page checkpoint budget (#503).
 fn render_pending_activities_table(blocked_on: &BlockedOnData) -> Markup {
     let cell_states = plan_checkpoint_cells(blocked_on);
     html! {
@@ -7243,10 +7234,10 @@ pub(crate) fn pretty_json(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
-pub(crate) fn format_timestamp(ts: Option<DateTime<Utc>>) -> String {
+pub(crate) fn format_timestamp(ts: Option<Timestamp>) -> String {
     ts.map_or_else(
         || "—".to_string(),
-        |ts| ts.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        |ts| ts.strftime("%Y-%m-%d %H:%M:%S UTC").to_string(),
     )
 }
 
@@ -7287,9 +7278,9 @@ pub(crate) fn url_encode(input: &str) -> String {
 
 /// Escape a string for safe embedding inside a single-quoted JavaScript string literal.
 ///
-/// Replaces `\` with `\\` and `'` with `\'` so the value cannot break out of the
-/// surrounding `confirm('...')` or similar inline handler, preventing XSS via
-/// operator-supplied build IDs or queue names.
+/// The value then cannot break out of the surrounding `confirm('...')` or
+/// similar inline handler. This prevents XSS via operator-supplied build IDs
+/// or queue names.
 fn js_escape(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('\'', "\\'")
@@ -7307,7 +7298,7 @@ fn js_escape(s: &str) -> String {
 /// The two are unrelated. `base_href` never resolves in the browser on its
 /// own. Every nav link that uses it is itself parsed relative to the
 /// document's OWN url. `html_base` exists for exactly one caller (issue
-/// #1687 review). `render_workflow_detail_page` renders the workflow
+/// #1687). `render_workflow_detail_page` renders the workflow
 /// detail page directly, as a rejected POST's response body. That happens
 /// from a URL one path segment below the canonical detail page, such as
 /// `/workflows/{id}/signal`. The page's body has many relative links and
@@ -7315,7 +7306,7 @@ fn js_escape(s: &str) -> String {
 /// `../../workflows/{id}/history/export`, pagination hrefs, all of it.
 /// Each one is written assuming the document's own url IS the canonical
 /// detail page. Serving that body unchanged from one level deeper
-/// resolves every one of those wrong (issue #1687 review, Codex finding).
+/// resolves every one of those wrong (issue #1687).
 /// `<base href="..">` there re-establishes the same directory context the
 /// canonical url would give. It fixes all of them at once, rather than
 /// rewriting each link to be mount-depth-aware.
@@ -7463,9 +7454,9 @@ fn schedule_expr_for_ui_summary(schedule: &Schedule) -> String {
 
 // ── Issue #957 — DAG run graph rendering ─────────────────────────────────────
 //
-// Node statuses are NOT re-derived here: they come straight from
-// `dag_graph::build_run_graph` (the same in-process call the #690 API handler
-// makes), so the graph can never disagree with the API or the #366 retry
+// Node statuses are NOT re-derived here. They come straight from
+// `dag_graph::build_run_graph`, the same in-process call the #690 API handler
+// makes. So the graph can never disagree with the API or the #366 retry
 // resolver. The helpers below turn that `Vec<DagRunNode>` into an inline,
 // server-rendered SVG laid out level-by-level, plus a click-through node detail
 // panel and a retry action.
@@ -7542,10 +7533,10 @@ const fn dag_node_status_label(status: DagNodeStatus) -> &'static str {
     }
 }
 
-/// Whether a "Retry from this node" action should be offered: the run must be
-/// terminally retryable (matching #366's accepted source states) and the node
-/// must be an attempted-but-not-succeeded node (so the #366 resolver won't
-/// reject it as never-attempted / already-succeeded).
+/// Whether a "Retry from this node" action should be offered. The run must be
+/// terminally retryable (matching #366's accepted source states). The node
+/// must be an attempted-but-not-succeeded node, so the #366 resolver will not
+/// reject it as never-attempted / already-succeeded.
 fn node_retry_offered(run_state: &str, status: DagNodeStatus) -> bool {
     matches!(run_state, "FAILED" | "CANCELLED" | "TIMED_OUT")
         && matches!(
@@ -7681,10 +7672,11 @@ fn dag_status_legend() -> Markup {
     }
 }
 
-/// The click-through detail panel for a selected node: status, timing,
-/// attempts, dependencies, error (when failed), and — for an
-/// attempted-but-not-succeeded node on a terminally-failed run — the
-/// "Retry from this node" link into the dry-run confirm page.
+/// The click-through detail panel for a selected node.
+///
+/// It shows status, timing, attempts, dependencies, and the error when failed.
+/// For an attempted-but-not-succeeded node on a terminally-failed run, it adds
+/// the "Retry from this node" link into the dry-run confirm page.
 fn render_dag_node_panel(
     node: &DagRunNode,
     idx: usize,
@@ -7734,24 +7726,27 @@ fn dag_retry_success_flash(new_run: &str) -> String {
     format!("Retry started — new run {new_run}")
 }
 
-/// Warning-flash text for the audit-write-after-fork case (issue #957, Codex
-/// review): the fork **committed** (a new run exists) but the `dag.retry` audit
-/// row could not be written. This is a partial success — the operator must be
-/// able to find the run that actually started, so we name it and flag the
-/// missing audit record distinctly from the hard "Retry failed" message used
-/// for real failures (400/404/409).
+/// Warning-flash text for the audit-write-after-fork case (issue #957).
+///
+/// The fork **committed** (a new run exists) but the `dag.retry` audit row
+/// could not be written. This is a partial success. The operator must be able
+/// to find the run that actually started, so the text names it. It flags the
+/// missing audit record apart from the hard "Retry failed" message used for
+/// real failures (400/404/409).
 fn dag_retry_audit_warning_flash(new_run: &str) -> String {
     format!("Retry started — new run {new_run} — but the audit record could not be written")
 }
 
 /// Pure decision for the retry-commit redirect: which run to open next and what
-/// flash text to show, given the shared `retry_dag_run_inner` outcome and the
-/// source run id. A successful fork opens the new run with the success flash; an
-/// [`DagRetryFailure::AuditFailed`] is a **partial success** (the fork committed)
-/// so it opens the *new* run with a warning flash rather than hiding it behind a
-/// failure message; every other failure opens the source run with the hard
-/// "Retry failed" message. Returns unencoded flash text — the caller percent-
-/// encodes it once.
+/// flash text to show. It takes the shared `retry_dag_run_inner` outcome and the
+/// source run id.
+///
+/// A successful fork opens the new run with the success flash. An
+/// [`DagRetryFailure::AuditFailed`] is a **partial success** (the fork
+/// committed). It opens the *new* run with a warning flash rather than hiding
+/// it behind a failure message. Every other failure opens the source run with
+/// the hard "Retry failed" message. Returns unencoded flash text; the caller
+/// percent-encodes it once.
 fn dag_retry_commit_redirect(
     outcome: Result<DagRetryResponse, DagRetryFailure>,
     source_run: &str,
@@ -7785,8 +7780,8 @@ fn dag_retry_default_reason(from_node: &str) -> String {
 // A standalone, read-only page at `GET /workflows/{id}/timeline` that renders
 // the shipped `autumn_harvest::derive_timeline` output as a server-computed
 // inline SVG Gantt. Pause (#383) and ND-block (#603) bands come from the
-// execution-row columns the handler already loads — never from the step data,
-// which carries no such fields. Payload-free (no #608 decode, no audit).
+// execution-row columns the handler already loads. The step data carries no
+// such fields. Payload-free (no #608 decode, no audit).
 
 /// Left gutter width (px) reserved for lane/step labels.
 const TL_GUTTER: f64 = 230.0;
@@ -7854,9 +7849,9 @@ const fn step_kind_lane_label(kind: StepKind) -> &'static str {
     }
 }
 
-/// Map a millisecond offset onto an axis of `axis_width` px, guarding a
-/// zero/negative span (an instantaneous or zero-duration run) so there is no
-/// divide-by-zero / NaN, and clamping the result inside `[0, axis_width]`.
+/// Map a millisecond offset onto an axis of `axis_width` px, clamped inside
+/// `[0, axis_width]`. A zero/negative span (an instantaneous or zero-duration
+/// run) is guarded, so there is no divide-by-zero / NaN.
 fn x_scale(offset_ms: i64, span_ms: i64, axis_width: f64) -> f64 {
     if span_ms <= 0 {
         return 0.0;
@@ -7877,7 +7872,7 @@ enum SegKind {
 
 /// Split a step into its rendered segments. Two segments (`Wait`, `Exec`) only
 /// when the timeline recorded both `wait_ms` and `exec_ms` (a started regular
-/// activity); otherwise a single undivided `Whole` span — the split is never
+/// activity). Otherwise one undivided `Whole` span. The split is never
 /// fabricated (#739 contract).
 fn span_segments(step: &TimelineStep) -> Vec<(SegKind, i64)> {
     match (step.wait_ms, step.exec_ms) {
@@ -7936,12 +7931,12 @@ fn slowest_step_index(timeline: &Timeline) -> Option<usize> {
 }
 
 /// The wall-clock axis geometry for the Gantt: `[start, end]` mapped onto
-/// `[gutter, gutter + width]`, with `height` the full SVG height (used by the
-/// full-height pause band and ND marker).
+/// `[gutter, gutter + width]`. `height` is the full SVG height, which the
+/// full-height pause band and ND marker use.
 #[derive(Debug, Clone, Copy)]
 struct GanttAxis {
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
+    start: Timestamp,
+    end: Timestamp,
     gutter: f64,
     width: f64,
     height: f64,
@@ -7950,11 +7945,11 @@ struct GanttAxis {
 impl GanttAxis {
     /// Build an axis, ensuring `end > start` so a zero-duration run still has a
     /// usable (1 ms) span rather than a degenerate axis.
-    fn new(start: DateTime<Utc>, end: DateTime<Utc>, gutter: f64, width: f64, height: f64) -> Self {
+    fn new(start: Timestamp, end: Timestamp, gutter: f64, width: f64, height: f64) -> Self {
         let end = if end > start {
             end
         } else {
-            start + chrono::Duration::milliseconds(1)
+            start + jiff::SignedDuration::from_millis(1)
         };
         Self {
             start,
@@ -7966,12 +7961,12 @@ impl GanttAxis {
     }
 
     fn span_ms(&self) -> i64 {
-        (self.end - self.start).num_milliseconds().max(1)
+        autumn_harvest::time::num_milliseconds(self.end - self.start).max(1)
     }
 
     /// The x coordinate (px, including the gutter offset) for an instant.
-    fn x_for(&self, t: DateTime<Utc>) -> f64 {
-        let offset = (t - self.start).num_milliseconds();
+    fn x_for(&self, t: Timestamp) -> f64 {
+        let offset = autumn_harvest::time::num_milliseconds(t - self.start);
         self.gutter + x_scale(offset, self.span_ms(), self.width)
     }
 }
@@ -8006,9 +8001,9 @@ fn pause_band_markup(exec: &WorkflowExecution, axis: &GanttAxis) -> Option<Marku
 
 /// The vertical ND-block marker (#603), sourced from the execution row's
 /// `nd_blocked_at`/`nd_block_reason`. `None` when the row is not ND-blocked.
-/// Surfaces the `nondeterminism-block` runbook *path* as inline SVG text — not a
-/// clickable link, since the runbook is a repo path, not a served URL (a relative
-/// `<a href>` here would 404 during ND-block triage). Matches the non-clickable
+/// Shows the `nondeterminism-block` runbook *path* as inline SVG text, not a
+/// link. The runbook is a repo path, not a served URL, so a relative
+/// `<a href>` here would 404 during ND-block triage. Matches the non-clickable
 /// `code { "docs/runbooks/safe-deploy.md" }` convention elsewhere in this file.
 fn nd_marker_markup(exec: &WorkflowExecution, axis: &GanttAxis) -> Option<Markup> {
     let nd_at = exec.nd_blocked_at?;
@@ -8078,11 +8073,13 @@ fn timeline_outcome_legend() -> Markup {
     }
 }
 
-/// Render one step row: the gutter labels (lane group label once per group,
-/// then the step name) plus the span segment rects grouped under an anchor
-/// `<g>` (carrying `id="slowest"` for the slowest step), and the retry badge
-/// for a genuine retry (`attempt > 1`). Segment x offsets are accumulated in
-/// plain Rust (maud cannot mutate inside a `@for`).
+/// Render one step row.
+///
+/// The row holds the gutter labels (lane group label once per group, then the
+/// step name). It holds the span segment rects under an anchor `<g>`, which
+/// carries `id="slowest"` for the slowest step. It holds the retry badge for a
+/// genuine retry (`attempt > 1`). Segment x offsets accumulate in plain Rust,
+/// because maud cannot mutate inside a `@for`.
 fn render_timeline_row(
     step: &TimelineStep,
     kind: StepKind,
@@ -8168,11 +8165,7 @@ fn render_timeline_row(
 /// outline. Pause and ND-block bands overlay the axis, sourced from the
 /// execution row. maud auto-escapes every text/attribute interpolation.
 #[allow(clippy::too_many_lines)]
-fn render_timeline_gantt(
-    timeline: &Timeline,
-    exec: &WorkflowExecution,
-    now: DateTime<Utc>,
-) -> Markup {
+fn render_timeline_gantt(timeline: &Timeline, exec: &WorkflowExecution, now: Timestamp) -> Markup {
     // Lane-group the steps (stable, in TIMELINE_LANES order), marking the first
     // of each present lane so the lane label renders once per group.
     let mut order: Vec<(StepKind, usize, bool)> = Vec::new();
@@ -8236,12 +8229,12 @@ fn render_timeline_gantt(
             div class="card" {
                 strong { "Now: " } (details)
                 " · "
-                // Link to the execution-detail route. The timeline page is served
-                // at `{api_base}/workflows/{id}/timeline`, so its parent route is
-                // `{api_base}/workflows/{id}` — spelled out from the api base
-                // (mirroring the page's own `base_href = "../../"` nav) rather than
-                // a bare `../{id}`, which relies on `..` stripping exactly the
-                // `timeline` segment (Codex review, #960).
+                // Link to the execution-detail route (#960). The page is served
+                // at `{api_base}/workflows/{id}/timeline`, so its parent route
+                // is `{api_base}/workflows/{id}`. It is spelled out from the api
+                // base, like the page's own `base_href = "../../"` nav. A bare
+                // `../{id}` relies on `..` stripping exactly the `timeline`
+                // segment.
                 a href={ "../../workflows/" (timeline.exec_id) } { "what is it blocked on?" }
             }
         }
@@ -8312,8 +8305,8 @@ fn render_timeline_gantt(
 
 /// `GET /workflows/{id}/timeline` — the standalone execution timeline (Gantt).
 ///
-/// Consumes the shipped `autumn_harvest::derive_timeline` in-process (exactly as
-/// the #739 API handler does): loads the execution row + timestamped history,
+/// Calls the shipped `autumn_harvest::derive_timeline` in-process, as the #739
+/// API handler does. It loads the execution row + timestamped history,
 /// derives the timeline, and renders the server-computed inline-SVG Gantt.
 /// Pause/ND-block bands come from the execution row's columns. Read-only, and
 /// payload-free by the API's design — no #608 read-path decode, no audit row.
@@ -8331,7 +8324,7 @@ async fn workflow_timeline_ui(
     let rows = autumn_harvest::store::load_timestamped_history(&mut conn, exec_id)
         .await
         .map_err(map_error)?;
-    let now = Utc::now();
+    let now = Timestamp::now();
     let timeline = derive_timeline(
         &rows,
         execution.started_at,
@@ -8347,19 +8340,20 @@ async fn workflow_timeline_ui(
     Ok(layout(&title, &body, "../../", None))
 }
 
-/// Build the timeline page body (back link + heading + Gantt). Extracted from
-/// `workflow_timeline_ui` so the navigation link is covered by a pure render
-/// test (Codex review, #960): both the "Back to execution" control here and the
-/// current-details card inside `render_timeline_gantt` must resolve to the
-/// execution-detail route `{api_base}/workflows/{id}` — not
+/// Build the timeline page body (back link + heading + Gantt).
+///
+/// A separate function, so a pure render test covers the navigation link
+/// (#960). The "Back to execution" control here and the current-details
+/// card inside `render_timeline_gantt` must both resolve to the
+/// execution-detail route `{api_base}/workflows/{id}`, not
 /// `{api_base}/workflows/{id}/{id}`. The timeline page is served at
-/// `{api_base}/workflows/{id}/timeline`, so the link spells the full path from
-/// the api base (matching the page's `base_href = "../../"` nav) rather than a
-/// bare `../{id}` that depends on `..` stripping exactly the `timeline` segment.
+/// `{api_base}/workflows/{id}/timeline`. So the link spells the full path from
+/// the api base, like the page's `base_href = "../../"` nav. A bare `../{id}`
+/// depends on `..` stripping exactly the `timeline` segment.
 fn render_timeline_body(
     timeline: &Timeline,
     execution: &WorkflowExecution,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Markup {
     html! {
         div.detail-row {
@@ -8497,7 +8491,7 @@ fn render_dag_schedule_fields(dag: &RegisteredDag, schedule: &DagScheduleState) 
             DagScheduleState::Overridden(stored) => {
                 p.override-note {
                     "Operator override by " code { (stored.updated_by) }
-                    " at " (stored.updated_at.to_rfc3339())
+                    " at " (autumn_harvest::time::rfc3339(stored.updated_at))
                     @if let Some(reason) = &stored.reason { ": " (reason) }
                 }
             }
@@ -8550,12 +8544,13 @@ fn render_dag_schedule_fields(dag: &RegisteredDag, schedule: &DagScheduleState) 
 
 /// Render the `<tbody>` of the DAG run list (issue #957).
 ///
-/// Each run's **primary** affordance re-renders THIS page's node graph for that
-/// run via a same-page `?run=` query (the same selector the graph honors, and the
-/// same bare-relative form the SVG node links use). Without this, older runs' graphs
-/// were only reachable by hand-constructing the query URL. The currently-shown run
-/// is marked "(current)" instead of linked, so it is clear which run the graph
-/// reflects. A secondary "detail" link still opens each run's workflow-detail page.
+/// Each run's **primary** affordance re-renders THIS page's node graph for
+/// that run via a same-page `?run=` query. That is the selector the graph
+/// honors, in the bare-relative form the SVG node links use. Without this,
+/// older runs' graphs were only reachable by hand-constructing the query URL.
+/// The currently-shown run is marked "(current)" instead of linked, so it is
+/// clear which run the graph reflects. A secondary "detail" link still opens
+/// each run's workflow-detail page.
 fn render_dag_run_rows(runs: &[WorkflowExecution], selected_run: Option<uuid::Uuid>) -> Markup {
     html! {
         tbody {
@@ -8646,11 +8641,11 @@ fn layout_dag_detail(title: &str, body: &Markup, base_href: &str, refresh: Optio
     }
 }
 
-fn format_run_duration(started_at: DateTime<Utc>, completed_at: Option<DateTime<Utc>>) -> String {
+fn format_run_duration(started_at: Timestamp, completed_at: Option<Timestamp>) -> String {
     let Some(end) = completed_at else {
         return "—".to_string();
     };
-    let secs = (end - started_at).num_seconds().max(0);
+    let secs = (end - started_at).as_secs().max(0);
     if secs < 60 {
         format!("{secs}s")
     } else if secs < 3600 {
@@ -8681,9 +8676,9 @@ async fn list_build_routing_ui(
     let mut policy_map: std::collections::HashMap<String, BuildPolicy> =
         std::collections::HashMap::new();
     let mut diverged_queues: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // Per-shard presence tracking for policy and compat: each entry is the set of
-    // queue names / (build_id, compatible_with) pairs returned by one shard that
-    // successfully responded. Used to detect absent rows on healthy shards.
+    // Per-shard presence tracking for policy and compat. Each entry is the set
+    // of queue names / (build_id, compatible_with) pairs from one shard that
+    // responded. It detects absent rows on healthy shards.
     let mut per_shard_policy_seen: Vec<std::collections::HashSet<String>> = Vec::new();
     let mut compat_map: std::collections::HashMap<(String, String), BuildCompatEntry> =
         std::collections::HashMap::new();
@@ -9521,7 +9516,7 @@ struct ScheduleBulkParams {
     /// The filtered list-page path to redirect back to after the action,
     /// including an unresolved invalid value's raw text. Without it, the
     /// redirect always lands on a bare, unfiltered `schedules?flash=…`
-    /// (Codex review, #1437 P2). See `schedule_bulk_redirect_to`.
+    /// (#1437). See `schedule_bulk_redirect_to`.
     #[serde(default)]
     return_to: Option<String>,
 }
@@ -9558,15 +9553,16 @@ impl ScheduleKindFilter {
 /// Which of the self-inflicted unhealthy states a schedule is currently in
 /// (issue #951 AC3).
 ///
-/// These are the states that make an operator's 3 a.m. question — "did the
-/// nightly billing schedule fire, and if not, why not?" — answerable at a
-/// glance: a schedule that is *not* firing is almost always paused,
-/// auto-paused after repeated failures (#360), exhausted against its `end_at`
-/// or run budget (#478), or silently dropping missed slots under its catchup
-/// policy (#484). Anything else reads as one calm row.
-// The four flags are deliberately independent booleans rather than a state
-// enum: a schedule can be paused *and* exhausted *and* dropping catchup slots
-// at once, and an operator needs to see all of them.
+/// These states answer the operator's 3 a.m. question at a glance: "did the
+/// nightly billing schedule fire, and if not, why not?"
+///
+/// A schedule that is *not* firing is almost always in one of them. It is
+/// paused, auto-paused after repeated failures (#360), or exhausted against
+/// its `end_at` or run budget (#478). Or it is silently dropping missed
+/// slots under its catchup policy (#484). Anything else reads as one calm row.
+// The four flags are independent booleans, not a state enum. A schedule can
+// be paused *and* exhausted *and* dropping catchup slots at once, and an
+// operator needs to see all of them.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct ScheduleHealth {
@@ -9588,9 +9584,9 @@ impl ScheduleHealth {
         !(self.paused || self.auto_paused || self.exhausted || self.catchup_dropped)
     }
 
-    /// Sort rank: `0` for unhealthy, `1` for healthy, so unhealthy schedules
-    /// float to the top of the list (AC3) while healthy rows keep their
-    /// existing `next_run_at`-ascending order among themselves.
+    /// Sort rank: `0` for unhealthy, `1` for healthy. Unhealthy schedules
+    /// float to the top of the list (AC3). Healthy rows keep their existing
+    /// `next_run_at`-ascending order among themselves.
     const fn rank(self) -> u8 {
         if self.is_healthy() { 1 } else { 0 }
     }
@@ -9600,10 +9596,10 @@ impl ScheduleHealth {
 /// **Resume** rather than **Pause**.
 ///
 /// The scheduler's auto-pause (#360) sets `auto_paused_at` and deliberately
-/// does **not** set `is_paused` — so a row can be non-firing with
+/// does **not** set `is_paused`. So a row can be non-firing with
 /// `is_paused = false`. Keying the row actions on `is_paused` alone would show
-/// an "Auto-paused" badge next to a Pause button and leave the operator with no
-/// way to restore firing from this page at all.
+/// an "Auto-paused" badge next to a Pause button. The operator would then have
+/// no way to restore firing from this page.
 /// `POST /admin/schedules/{id}/resume` treats
 /// `is_paused = true OR auto_paused_at IS NOT NULL` as resumable; this mirrors it.
 const fn schedule_is_resumable(row: &HarvestSchedule) -> bool {
@@ -9638,14 +9634,14 @@ fn scheduler_slot_is_raw(row: &HarvestSchedule) -> bool {
 /// `exhausted_at` is written *asynchronously* by the tick that observes the
 /// bound. A tick that dies first leaves a row that is already terminal —
 /// `runs_started >= max_runs`, or `now >= end_at` — with the column still NULL.
-/// The engine never trusts the column alone: `schedule_backfill_inner` and
+/// The engine never trusts the column alone. `schedule_backfill_inner` and
 /// `trigger_schedule_now` both reject on `exhausted_at.is_some() ||
-/// live_end_at_exceeded || live_budget_exhausted`, and the scheduler's own
+/// live_end_at_exceeded || live_budget_exhausted`. The scheduler's own
 /// `schedule_overdue` derives the same thing from the raw fields for exactly
-/// this reason. Reading the column alone here would render such a row as a calm
-/// `Active` schedule, exclude it from `health=Unhealthy`, and sort it *below*
-/// the unhealthy rows — while this page's own preview for it correctly reports
-/// no upcoming fire times.
+/// this reason. Reading the column alone here would render such a row as a
+/// calm `Active` schedule. It would leave it out of `health=Unhealthy` and
+/// sort it *below* the unhealthy rows. Yet this page's own preview for it
+/// correctly reports no upcoming fire times.
 ///
 /// `max_runs = 0` is **unlimited**, not "spent": the `max > 0` guard is the
 /// engine's convention at every bound check (and is pinned by
@@ -9661,7 +9657,7 @@ fn scheduler_slot_is_raw(row: &HarvestSchedule) -> bool {
 /// When [`scheduler_slot_is_raw`] is false, this check judges the raw slot
 /// instead (issue #1568). A raw slot before `end_at` is then never reported
 /// as exhausted, even if the scheduler later stops it.
-fn schedule_is_bounded_out(row: &HarvestSchedule, now: DateTime<Utc>) -> bool {
+fn schedule_is_bounded_out(row: &HarvestSchedule, now: Timestamp) -> bool {
     if row.exhausted_at.is_some() {
         return true;
     }
@@ -9671,15 +9667,15 @@ fn schedule_is_bounded_out(row: &HarvestSchedule, now: DateTime<Utc>) -> bool {
     {
         return true;
     }
-    // The `end_at` bound is about the **pending slot**, not the wall clock —
+    // The `end_at` bound is about the **pending slot**, not the wall clock.
     // `schedule_overdue` tests `next_run_at >= end_at`, and the tick refuses a
     // fire whose `effective_fire_time >= end_at`. Comparing `now` instead is
-    // wrong in both directions: a schedule whose next slot is already past the
-    // cutoff will never fire again while the clock is still short of it (we
-    // would call it healthy), and after downtime an overdue slot from *before*
-    // the cutoff is still legal and will be processed once the clock has passed
-    // it (we would call it exhausted). Fall back to the wall clock only when
-    // there is no pending slot to judge.
+    // wrong in both directions. A schedule whose next slot is past the cutoff
+    // never fires again, even while the clock is short of it. `now` would
+    // call it healthy. After downtime, an overdue slot from *before* the
+    // cutoff is still legal and runs once the clock has passed it. `now`
+    // would call it exhausted. Fall back to the wall clock only when there
+    // is no pending slot to judge.
     //
     // `effective_fire_time` returns `None` for `jitter_secs <= 0`, so an
     // unjittered schedule falls back to the raw slot below. It also falls back
@@ -9697,7 +9693,7 @@ fn schedule_is_bounded_out(row: &HarvestSchedule, now: DateTime<Utc>) -> bool {
 ///
 /// `now` is a parameter rather than read inside so the bounded-out branch is
 /// testable without sleeping.
-fn schedule_health_at(row: &HarvestSchedule, now: DateTime<Utc>) -> ScheduleHealth {
+fn schedule_health_at(row: &HarvestSchedule, now: Timestamp) -> ScheduleHealth {
     ScheduleHealth {
         paused: row.is_paused,
         auto_paused: row.auto_paused_at.is_some(),
@@ -9708,7 +9704,7 @@ fn schedule_health_at(row: &HarvestSchedule, now: DateTime<Utc>) -> ScheduleHeal
 
 /// [`schedule_health_at`] anchored to the current instant.
 fn schedule_health(row: &HarvestSchedule) -> ScheduleHealth {
-    schedule_health_at(row, Utc::now())
+    schedule_health_at(row, Timestamp::now())
 }
 
 /// Filter the list by health (issue #951 AC3): "show me only what is wrong".
@@ -10000,8 +9996,8 @@ async fn load_recent_decisions(
 /// Order the schedules list: unhealthy first (issue #951 AC3), then the
 /// pre-existing `next_run_at`-ascending / name / id order.
 ///
-/// The health rank is a *prefix* on the existing comparator rather than a
-/// replacement for it, so healthy rows keep exactly the relative order they had
+/// The health rank is a *prefix* on the existing comparator, not a
+/// replacement. Healthy rows keep exactly the relative order they had
 /// before this page grew a health column.
 fn sort_schedule_rows(rows: &mut [(ShardId, HarvestSchedule)]) {
     rows.sort_by(|(_, a), (_, b)| {
@@ -10148,7 +10144,6 @@ async fn list_schedules_ui(
     ))
 }
 
-/// Parse a `ScheduleUiFilters` from optional string fields.
 /// Parses a `ScheduleUiFilters` for the bulk-action POST forms
 /// (`../schedules/bulk-pause`, `../schedules/bulk-resume`).
 ///
@@ -10167,9 +10162,9 @@ async fn list_schedules_ui(
 /// `Option<String>` fixes the GET-page 400 (see `parse_shard_id_filter`).
 /// Silently dropping a parse failure to `None` here would mean "no shard
 /// restriction". That would reopen the same gap one layer down. Here,
-/// "not applied" would mean "every shard", not "not this shard" (Codex
-/// review, P1). A malformed `shard_id` in a bulk form is therefore
-/// rejected outright, restoring the pre-PR behavior for this one field.
+/// "not applied" would mean "every shard", not "not this shard". A
+/// malformed `shard_id` in a bulk form is therefore rejected outright,
+/// restoring the pre-PR behavior for this one field.
 fn parse_schedule_bulk_filters(
     params: &ScheduleBulkParams,
 ) -> Result<ScheduleUiFilters, AutumnError> {
@@ -10276,7 +10271,7 @@ async fn schedule_pause_ui(
 
     let flash = if let Some((row, _shard, mut conn)) = found {
         let name = schedule_name(&row);
-        let now = Utc::now();
+        let now = Timestamp::now();
         let _ = diesel::update(
             dsl::harvest_schedules
                 .find(row.id)
@@ -10284,9 +10279,9 @@ async fn schedule_pause_ui(
         )
         .set((
             dsl::is_paused.eq(true),
-            dsl::paused_at.eq(Some(now)),
+            dsl::paused_at.eq(Some(now).to_diesel()),
             dsl::paused_by.eq(Some("ui")),
-            dsl::updated_at.eq(now),
+            dsl::updated_at.eq(now.to_diesel()),
         ))
         .execute(&mut conn)
         .await;
@@ -10324,10 +10319,10 @@ async fn schedule_resume_ui(
 
     let flash = if let Some((row, _shard, mut conn)) = found {
         let name = schedule_name(&row);
-        let now = Utc::now();
-        // Mirrors `set_schedule_paused(.., false, ..)`: the predicate matches an
-        // auto-paused row (`is_paused = false`, `auto_paused_at` set), and the
-        // update clears the auto-pause state and resets the failure counter so
+        let now = Timestamp::now();
+        // Mirrors `set_schedule_paused(.., false, ..)`. The predicate matches an
+        // auto-paused row (`is_paused = false`, `auto_paused_at` set). The
+        // update clears the auto-pause state and resets the failure counter, so
         // the next tick does not immediately re-trigger auto-pause (#360).
         let _ = diesel::update(
             dsl::harvest_schedules.find(row.id).filter(
@@ -10338,12 +10333,12 @@ async fn schedule_resume_ui(
         )
         .set((
             dsl::is_paused.eq(false),
-            dsl::paused_at.eq(None::<chrono::DateTime<Utc>>),
+            dsl::paused_at.eq(None::<jiff_diesel::Timestamp>),
             dsl::paused_by.eq(None::<&str>),
             dsl::pause_reason.eq(None::<&str>),
-            dsl::auto_paused_at.eq(None::<chrono::DateTime<Utc>>),
+            dsl::auto_paused_at.eq(None::<jiff_diesel::Timestamp>),
             dsl::consecutive_failure_count.eq(0),
-            dsl::updated_at.eq(now),
+            dsl::updated_at.eq(now.to_diesel()),
         ))
         .execute(&mut conn)
         .await;
@@ -10430,13 +10425,13 @@ async fn execute_schedule_trigger_ui(
     queue: &str,
 ) -> axum::response::Response {
     // Pre-generate workflow_id and triggered_at so the gate check uses the
-    // actual execution shard (determined by the router) rather than the shard
-    // where the schedule row was found.  The values are reused below.
-    let triggered_at = chrono::Utc::now();
+    // real execution shard (from the router), not the schedule row's shard.
+    // The values are reused below.
+    let triggered_at = jiff::Timestamp::now();
     let workflow_id = format!(
         "manual-{}-{}-{}",
         row.id,
-        triggered_at.timestamp_millis(),
+        triggered_at.as_millisecond(),
         uuid::Uuid::new_v4().simple()
     );
     let exec_shard = runtime
@@ -10480,9 +10475,9 @@ async fn execute_schedule_trigger_ui(
     // matching the scheduler and backfill counters. The async block returns None
     // if any shard is unreachable — used for fail-closed Skip enforcement.
     // The `schedule_id` disjunct (issue #1160) also counts a cross-type
-    // continue-as-new successor of this schedule -- otherwise a manual trigger
-    // could double-dispatch a schedule whose active run has already changed
-    // type mid-chain, matching `scheduler::schedule_running_basis`.
+    // continue-as-new successor of this schedule, matching
+    // `scheduler::schedule_running_basis`. Otherwise a manual trigger could
+    // double-dispatch a schedule whose active run changed type mid-chain.
     let running_count: Option<i64> = async {
         let mut total: i64 = 0;
         for (_, shard_pool) in pool.iter_shards() {
@@ -10561,12 +10556,11 @@ async fn execute_schedule_trigger_ui(
             (None, None) => (None, None, None),
         }
     };
-    // `workflow_name` here is either a registered workflow's own name, or --
-    // for a DAG-backed schedule, per `resolve_trigger_params` above -- the
-    // `dag_name`, which is also the key `DagInfo::as_workflow_info()`
-    // registers a DAG's shadow `WorkflowInfo` under in `registry.workflows`.
-    // So this ONE lookup already resolves both a workflow's AND a DAG's
-    // declared `sla`/`execution_timeout`.
+    // `workflow_name` is a registered workflow's own name. For a DAG-backed
+    // schedule (per `resolve_trigger_params` above) it is the `dag_name`.
+    // `DagInfo::as_workflow_info()` registers a DAG's shadow `WorkflowInfo`
+    // under that key in `registry.workflows`. So this ONE lookup resolves
+    // both a workflow's AND a DAG's declared `sla`/`execution_timeout`.
     let (raw_sla, wf_default_retry_policy, raw_execution_timeout) = runtime
         .registry()
         .workflows
@@ -10610,12 +10604,12 @@ async fn execute_schedule_trigger_ui(
         .registry()
         .chain_execution_timeout(workflow_name)
         .filter(|_| !is_dag)
-        .and_then(|d| chrono::Duration::from_std(d).ok());
+        .and_then(autumn_harvest::time::from_std_bounded);
     let max_workflow_chain_timeout_ceiling = runtime
         .registry()
         .max_workflow_chain_timeout
         .filter(|_| !is_dag)
-        .and_then(|d| chrono::Duration::from_std(d).ok());
+        .and_then(autumn_harvest::time::from_std_bounded);
     let result = start_or_load_workflow_execution_with_metrics_and_codecs(
         conn,
         StartWorkflowParams {
@@ -10629,10 +10623,10 @@ async fn execute_schedule_trigger_ui(
             severity,
             sla,
             // Manual trigger-now fires are attributed to the schedule (schedule_id is
-            // set) so they appear in GET /admin/schedules/{id}/runs, but scheduled_for
-            // stays None so resolve_carryover (issue #488) still short-circuits for
-            // this run — NULL slot comparisons are false, so carryover is never
-            // resolved for a manual fire.
+            // set), so they appear in GET /admin/schedules/{id}/runs. But
+            // scheduled_for stays None, so resolve_carryover (issue #488) still
+            // short-circuits for this run. NULL slot comparisons are false, so
+            // carryover is never resolved for a manual fire.
             schedule_id: Some(row.id),
             workflow_retry_policy: ui_trigger_retry_policy,
             workflow_retry_source: ui_trigger_retry_source,
@@ -10794,7 +10788,7 @@ async fn schedule_bulk_pause_ui(
         Err(e) => return map_error(e).into_response(),
     };
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     let mut acted_on = 0usize;
 
     for (shard_id, shard_pool) in pool.iter_shards() {
@@ -10804,11 +10798,11 @@ async fn schedule_bulk_pause_ui(
         let Ok(mut conn) = acquire_conn(shard_pool).await else {
             continue;
         };
-        // Select whole rows and reuse `ScheduleUiFilters::matches` — the *same*
+        // Select whole rows and reuse `ScheduleUiFilters::matches`, the *same*
         // predicate the list page applies (issue #951). A partial projection
-        // cannot see the health filter, and the button's count and confirmation
-        // text come from the list's filtered total: a bulk action that matched a
-        // wider set than the operator was shown would pause schedules the dialog
+        // cannot see the health filter. The button's count and confirmation
+        // text come from the list's filtered total. A bulk action that matched
+        // a wider set than the operator saw would pause schedules the dialog
         // never mentioned.
         let candidates: Vec<HarvestSchedule> = dsl::harvest_schedules
             .filter(dsl::is_paused.ne(true))
@@ -10831,9 +10825,9 @@ async fn schedule_bulk_pause_ui(
         )
         .set((
             dsl::is_paused.eq(true),
-            dsl::paused_at.eq(Some(now)),
+            dsl::paused_at.eq(Some(now).to_diesel()),
             dsl::paused_by.eq(Some("ui-bulk")),
-            dsl::updated_at.eq(now),
+            dsl::updated_at.eq(now.to_diesel()),
         ))
         .returning(dsl::id)
         .get_results(&mut conn)
@@ -10887,7 +10881,7 @@ async fn schedule_bulk_resume_ui(
         Err(e) => return map_error(e).into_response(),
     };
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     let mut acted_on = 0usize;
 
     for (shard_id, shard_pool) in pool.iter_shards() {
@@ -10931,12 +10925,12 @@ async fn schedule_bulk_resume_ui(
         )
         .set((
             dsl::is_paused.eq(false),
-            dsl::paused_at.eq(None::<chrono::DateTime<Utc>>),
+            dsl::paused_at.eq(None::<jiff_diesel::Timestamp>),
             dsl::paused_by.eq(None::<&str>),
             dsl::pause_reason.eq(None::<&str>),
-            dsl::auto_paused_at.eq(None::<chrono::DateTime<Utc>>),
+            dsl::auto_paused_at.eq(None::<jiff_diesel::Timestamp>),
             dsl::consecutive_failure_count.eq(0),
-            dsl::updated_at.eq(now),
+            dsl::updated_at.eq(now.to_diesel()),
         ))
         .returning(dsl::id)
         .get_results(&mut conn)
@@ -10973,8 +10967,8 @@ async fn schedule_bulk_resume_ui(
 
 /// Redirect back to the schedules list with a flash message.
 ///
-/// `depth` is how many path segments below the UI mount point the *redirecting*
-/// route sits, because the `Location` header is resolved relative to the
+/// `depth` is how many path segments below the UI mount point the
+/// *redirecting* route sits. The `Location` header resolves relative to the
 /// request URL. `/schedules/bulk-pause` is one segment deep, so a bare
 /// `schedules?flash=…` is right there; `/schedules/{id}/pause` is **two**, where
 /// the same string resolves to `<mount>/schedules/{id}/schedules` and 404s.
@@ -10999,7 +10993,7 @@ fn schedule_redirect(flash: &str) -> axum::response::Response {
 /// invalid filter and its inline error lost both the moment they paused
 /// or resumed anything. That is the same "action discards what you were
 /// looking at" gap. #1420 already fixed it for the DLQ page's own bulk
-/// actions (Codex review, #1437 P2).
+/// actions (#1437).
 ///
 /// `return_to` is the bulk form's own hidden field. It is built by
 /// `schedule_return_to_path` from the same filters the list page just
@@ -11013,15 +11007,15 @@ fn schedule_redirect(flash: &str) -> axum::response::Response {
 /// this handler was posted to (`.../schedules/bulk-pause`), not to the
 /// list page. A bare `schedules?...` would merge onto that path's own
 /// directory instead. It would land on `.../schedules/schedules?...` — a
-/// 404 after a mutation that otherwise succeeded (Codex review, #1437
-/// P2, verified against `urllib.parse.urljoin`).
+/// 404 after a mutation that otherwise succeeded (#1437, verified
+/// against `urllib.parse.urljoin`).
 ///
 /// `is_schedule_ui_return_path` also rejects a control character. A raw
 /// `\n` could reach it from a hand-crafted or malformed POST. The
 /// `Redirect`'s own `into_response` builds the `Location` header with
 /// `HeaderValue::try_from`, which rejects those bytes and falls back to
-/// a bare `500` (Codex review, #1437 P2). That is not a panic in this
-/// axum version, verified by reading `axum-0.8.9`'s own `Redirect::
+/// a bare `500` (#1437). That is not a panic in this axum version,
+/// verified by reading `axum-0.8.9`'s own `Redirect::
 /// into_response`. It is still the wrong response after a mutation that
 /// already succeeded.
 fn schedule_bulk_redirect_to(return_to: Option<&str>, flash: &str) -> axum::response::Response {
@@ -11099,7 +11093,7 @@ fn render_schedules_page(
     limit_raw: &str,
     has_next: bool,
     total_filtered: usize,
-    // Unhealthy counts over the whole *filtered* set, not just this page: the
+    // Unhealthy counts over the whole *filtered* set, not just this page. The
     // strip is the first thing an operator reads, so a page-scoped count would
     // understate a fleet-wide problem.
     unhealthy_summary: &str,
@@ -11486,9 +11480,9 @@ fn render_schedule_table(
 
 /// Badges for a row's unhealthy states (issue #951 AC3).
 ///
-/// Renders **nothing** for a healthy schedule — the calm-row requirement — so
-/// the caller decides what a healthy row shows instead (the list shows the
-/// existing "Active" state badge).
+/// Renders **nothing** for a healthy schedule (the calm-row requirement). The
+/// caller decides what a healthy row shows instead; the list shows the
+/// existing "Active" state badge.
 fn render_schedule_health_badges(row: &HarvestSchedule) -> Markup {
     let health = schedule_health(row);
     html! {
@@ -11651,7 +11645,7 @@ fn schedule_target_name(row: &HarvestSchedule) -> &str {
 /// A drill-down is served at `<mount>/schedules/{id}/{leaf}`, whose RFC 3986
 /// base directory is `<mount>/schedules/{id}/` — two segments below the mount
 /// point. Every link *out* of a drill-down (nav chrome included) must carry
-/// this prefix; a link that forgets it silently resolves under the schedule id
+/// this prefix. A link without it silently resolves under the schedule id
 /// and 404s.
 const SCHEDULE_DRILLDOWN_BASE: &str = "../../";
 
@@ -11735,8 +11729,8 @@ fn build_schedule_query_string(
     // Carry the raw text, not the parsed value. This lets an invalid
     // value's inline error persist across pagination, instead of being
     // silently dropped. Same reasoning as `build_dead_letter_query_string`'s
-    // task_kind/failed_after/failed_before handling on the DLQ page (Codex
-    // review, #1378 P2, #1420).
+    // task_kind/failed_after/failed_before handling on the DLQ page
+    // (#1378, #1420).
     if !filter_raw.kind.is_empty() {
         let _ = write!(out, "&kind={}", url_encode(&filter_raw.kind));
     }
@@ -11764,7 +11758,7 @@ fn build_schedule_query_string(
 //   * run history  → `api::load_schedule_runs`        (`GET /admin/schedules/{id}/runs`, #534/#762)
 //   * backfill     → `api::schedule_backfill`         (`POST /admin/schedules/{id}/backfill`, #337)
 //
-// They call those functions directly rather than reimplementing them, so the
+// They call those functions directly rather than reimplementing them. So the
 // page cannot drift from the API on bounded-run truncation, cross-shard
 // partial results, or the audit trail. No new endpoint, no new event variant,
 // no migration.
@@ -11806,9 +11800,9 @@ pub(crate) struct ScheduleRunsUiParams {
     flash: Option<String>,
 }
 
-/// The run-history view's own filter state, kept so the page can re-emit it on
-/// its "Next" link — a keyset cursor is only meaningful under the filters it
-/// was computed with, so dropping them would silently page into different data.
+/// The run-history view's own filter state, which the page re-emits on its
+/// "Next" link. A keyset cursor is only meaningful under the filters it was
+/// computed with, so dropping them would silently page into different data.
 #[derive(Debug, Clone, Default)]
 struct ScheduleRunsView {
     limit: Option<i64>,
@@ -11825,8 +11819,8 @@ impl ScheduleRunsView {
     /// Query-string suffix (leading `&`) carrying the filters, for the next-page link.
     fn query_suffix(&self) -> String {
         let mut out = String::new();
-        // Codex review finding on this PR: prefer `limit_raw` over `limit`
-        // when a parse failure left it set. Otherwise the Next link would
+        // PR #1641: prefer `limit_raw` over `limit` when a parse failure
+        // left it set. Otherwise the Next link would
         // drop the operator's bad text, and its `role="alert"` context,
         // on the very click meant to keep their place. It would silently
         // revert to the default instead of carrying the correction
@@ -11856,10 +11850,10 @@ impl ScheduleRunsView {
 /// * "checked every expected shard, no such row" is a `404`;
 /// * "a shard could not be checked, so existence is indeterminate" is a `503`.
 ///
-/// `find_schedule_row` collapses the last two into "not found", which during a
-/// shard outage would tell an operator that a schedule they can see on the list
-/// page has been deleted — the precise false negative the API's `503` exists to
-/// prevent.
+/// `find_schedule_row` collapses the last two into "not found". During a
+/// shard outage that would tell an operator that a schedule they can see on
+/// the list page has been deleted. The API's `503` exists to prevent that
+/// false negative.
 async fn load_schedule_for_drilldown(
     api_state: &HarvestApiState,
     id_str: &str,
@@ -11881,14 +11875,14 @@ async fn schedule_preview_ui(
 ) -> Result<Markup, AutumnError> {
     let (row, shard_id) = load_schedule_for_drilldown(&api_state, &id_str).await?;
     let (count, count_error) = parse_schedule_preview_count_query_field(params.count.as_deref());
-    // Pass the row through rather than the id: `compute_schedule_preview`'s own
-    // lookup stops at the first unreachable shard, which would fail a preview
-    // for a schedule the resilient resolver above already found on a later one.
+    // Pass the row, not the id. `compute_schedule_preview`'s own lookup stops
+    // at the first unreachable shard. It would fail a preview for a schedule
+    // the resilient resolver above already found on a later shard.
     let preview = crate::api::compute_schedule_preview_for(
         &api_state,
         row.clone(),
         count,
-        chrono::Utc::now(),
+        jiff::Timestamp::now(),
     )
     .await?;
     Ok(render_schedule_preview_page(
@@ -12108,7 +12102,7 @@ async fn schedule_runs_ui(
         pairs.push(("state".to_string(), state.clone()));
     }
     let runs_params =
-        crate::schedule_runs::ScheduleRunsParams::from_query_pairs(&pairs, chrono::Utc::now())
+        crate::schedule_runs::ScheduleRunsParams::from_query_pairs(&pairs, jiff::Timestamp::now())
             .map_err(AutumnError::bad_request_msg)?;
 
     let view = ScheduleRunsView {
@@ -12153,8 +12147,8 @@ async fn schedule_runs_ui(
 /// [`crate::schedule_runs::ScheduleRunsParams::from_query_pairs`] to
 /// reject.
 ///
-/// Codex review finding on this PR: the "Rows" field used to be
-/// `type="number" min="1"`, which a browser refuses to submit below 1.
+/// PR #1641: the "Rows" field used to be `type="number" min="1"`, which a
+/// browser refuses to submit below 1.
 /// The fix below switched it to a text control, to keep bad text visible
 /// (see `per_page_input_is_a_text_control_that_can_hold_invalid_text`).
 /// That drops the browser-side floor. Without clamping here, a `0` typed
@@ -12211,8 +12205,8 @@ fn render_schedule_runs_page(
     let body = html! {
         h2 { "Run history — " code { (schedule_target_name(row)) } }
 
-        // A committed backfill redirects here with its dispatch counts; the
-        // "failed" count is the only place the operator is told about a partial
+        // A committed backfill redirects here with its dispatch counts. The
+        // "failed" count is the only place the operator learns of a partial
         // dispatch, so the message must not be dropped.
         @if let Some(message) = flash {
             div.flash role="status" tabindex="-1" autofocus { (message) }
@@ -12420,8 +12414,8 @@ fn render_unavailable_shard_list(
     }
 }
 
-/// Identity strip shared by the three drill-down pages, so an operator always
-/// knows which schedule they are looking at and can get back to the list.
+/// Identity strip shared by the three drill-down pages. It names the schedule
+/// and links back to the list.
 fn render_schedule_drilldown_header(
     row: &HarvestSchedule,
     shard_id: ShardId,
@@ -12461,8 +12455,8 @@ fn render_schedule_drilldown_header(
 
 /// The backfill window an operator typed, normalised and re-checked.
 ///
-/// Kept as strings so the confirmation step can round-trip the *exact* window
-/// that was previewed into its hidden fields — the committed backfill is then
+/// Kept as strings so the confirmation step can round-trip the *exact*
+/// previewed window into its hidden fields. The committed backfill is then
 /// provably the one whose counts the operator was shown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BackfillFormParams {
@@ -12486,14 +12480,12 @@ impl BackfillFormParams {
         include_paused: bool,
     ) -> Result<Self, String> {
         let parse_one = |label: &str, raw: &str| {
-            chrono::DateTime::parse_from_rfc3339(raw.trim())
-                .map(|d| d.with_timezone(&chrono::Utc))
-                .map_err(|_| {
-                    format!(
-                        "invalid {label} '{raw}': expected an RFC 3339 instant, \
+            autumn_harvest::time::parse::rfc3339(raw.trim()).map_err(|_| {
+                format!(
+                    "invalid {label} '{raw}': expected an RFC 3339 instant, \
                          e.g. 2026-08-01T00:00:00Z"
-                    )
-                })
+                )
+            })
         };
         let from_at = parse_one("start", from)?;
         let to_at = parse_one("end", to)?;
@@ -12506,8 +12498,16 @@ impl BackfillFormParams {
         // `…00Z` shifts every slot in the plan. `AutoSi` keeps a whole-second
         // window spelled `…:00Z` and preserves fractional digits when present.
         Ok(Self {
-            from: from_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
-            to: to_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+            from: autumn_harvest::time::rfc3339_opts(
+                from_at,
+                autumn_harvest::time::SecondsFormat::AutoSi,
+                true,
+            ),
+            to: autumn_harvest::time::rfc3339_opts(
+                to_at,
+                autumn_harvest::time::SecondsFormat::AutoSi,
+                true,
+            ),
             max_count,
             include_paused,
         })
@@ -12520,8 +12520,7 @@ impl BackfillFormParams {
     /// `commit` must map to `dry_run: false` — so callers pass `!commit`.
     fn to_request(&self, dry_run: bool) -> Result<crate::api::ScheduleBackfillRequest, String> {
         let parse_one = |raw: &str| {
-            chrono::DateTime::parse_from_rfc3339(raw)
-                .map(|d| d.with_timezone(&chrono::Utc))
+            raw.parse::<Timestamp>()
                 .map_err(|_| "the backfill window is no longer parseable".to_string())
         };
         Ok(crate::api::ScheduleBackfillRequest {
@@ -12552,9 +12551,9 @@ pub(crate) struct ScheduleBackfillForm {
 
 /// `GET /schedules/{id}/backfill` — the empty launcher form.
 ///
-/// Purely a read: the dry run itself writes a `harvest_backfill_log` row and an
-/// audit record, so it may not sit on a GET (issue #951 AC9, "read path stays
-/// read-only and side-effect-free").
+/// Purely a read. The dry run writes a `harvest_backfill_log` row and an
+/// audit record, so it may not sit on a GET. See issue #951 AC9: "read path
+/// stays read-only and side-effect-free".
 async fn schedule_backfill_form_ui(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id_str): Path<String>,
@@ -12572,7 +12571,7 @@ async fn schedule_backfill_form_ui(
 ///
 /// `stage=commit` dispatches; anything else (including an absent `stage`) runs
 /// the dry run and renders the preview-count confirmation. Both stages go
-/// through `api::schedule_backfill`, so the audit record, the backfill log row
+/// through `api::schedule_backfill`. So the audit record, the backfill log row
 /// and every guard (paused, exhausted, `max_active_runs`, `max_runs`) are the
 /// API's, not a second copy.
 async fn schedule_backfill_ui(
@@ -12597,7 +12596,7 @@ async fn schedule_backfill_ui(
         .filter(|s| !s.is_empty())
     {
         // Clamped: `max_count` *replaces* the endpoint's default planning
-        // guard rather than being capped by it, so an unbounded value from a
+        // guard rather than being capped by it. An unbounded value from a
         // form would let a wide window enumerate millions of timestamps.
         Some(raw) => match raw.parse::<usize>() {
             Ok(n) if n > 0 => Some(n.min(SCHEDULE_BACKFILL_MAX_SLOTS)),
@@ -12646,7 +12645,7 @@ async fn schedule_backfill_ui(
     );
 
     // Shares the endpoint's body (every guard, the backfill log row and the
-    // audit record) but labels the audit with the UI's own route, so a
+    // audit record). The audit carries the UI's own route, so a
     // dashboard-initiated backfill is not recorded as an API call. Mirrors
     // `dag_retry_commit_ui`.
     let result = crate::api::schedule_backfill_inner(
@@ -12677,9 +12676,8 @@ async fn schedule_backfill_ui(
                 render_schedule_backfill_confirm(&row, shard_id, &response, &params).into_response()
             }
         }
-        // A rejected backfill (paused, exhausted, window too large, unknown DAG)
-        // comes back as the API's own message, rendered on the form rather than
-        // as a bare error page.
+        // A rejected backfill (paused, exhausted, window too large, unknown
+        // DAG) shows the API's own message on the form, not a bare error page.
         Err(e) => render_schedule_backfill_form(&row, shard_id, Some(&e.to_string()), &echo)
             .into_response(),
     }
@@ -12781,7 +12779,7 @@ fn render_schedule_backfill_confirm(
 ) -> Markup {
     let id_str = row.id.to_string();
     // `schedule_backfill` rejects a paused *DAG* schedule in non-dry-run mode
-    // outright, so the dry run can report a healthy `dispatched` count for a
+    // outright. The dry run can then report a healthy `dispatched` count for a
     // commit that can only ever 400. Say so instead of offering a button that
     // cannot succeed.
     let paused_dag = row.is_paused && row.dag_name.is_some();
@@ -12886,8 +12884,8 @@ const SCHEDULE_BACKFILL_PREVIEW_ROWS: usize = 20;
 
 /// Ceiling on the launcher's `max_count`.
 ///
-/// The endpoint treats `max_count` as the *planning* limit — supplying one
-/// replaces `DEFAULT_BACKFILL_MAX_COUNT` rather than being capped by it — so an
+/// The endpoint treats `max_count` as the *planning* limit. A supplied value
+/// replaces `DEFAULT_BACKFILL_MAX_COUNT` rather than being capped by it. So an
 /// unbounded value from a browser form could enumerate millions of timestamps
 /// in one request. The UI caps it at the endpoint's own default.
 const SCHEDULE_BACKFILL_MAX_SLOTS: usize = autumn_harvest::scheduler::DEFAULT_BACKFILL_MAX_COUNT;
@@ -12969,7 +12967,7 @@ fn render_gates_page(rows: &[autumn_harvest::models::AdmissionGateRow]) -> Marku
         @for row in rows.iter().filter(|r| r.lifted_at.is_none()) {
             @let id_str = row.id.to_string();
             @let id_short = &id_str[..8];
-            @let now = chrono::Utc::now();
+            @let now = jiff::Timestamp::now();
             @let is_expired = row.expires_at.is_some_and(|exp| exp <= now);
             div.card {
                 div style="display:flex;justify-content:space-between;align-items:center" {
@@ -12991,12 +12989,12 @@ fn render_gates_page(rows: &[autumn_harvest::models::AdmissionGateRow]) -> Marku
                     div style="display:flex;gap:16px;align-items:center" {
                         div style="font-size:12px;color:#94a3b8" {
                             "created by " (row.created_by)
-                            " at " (row.created_at.format("%Y-%m-%d %H:%M:%S UTC"))
+                            " at " (row.created_at.strftime("%Y-%m-%d %H:%M:%S UTC"))
                             @if let Some(exp) = row.expires_at {
                                 @if is_expired {
-                                    " · expired " (exp.format("%Y-%m-%d %H:%M:%S UTC"))
+                                    " · expired " (exp.strftime("%Y-%m-%d %H:%M:%S UTC"))
                                 } @else {
-                                    " · expires " (exp.format("%Y-%m-%d %H:%M:%S UTC"))
+                                    " · expires " (exp.strftime("%Y-%m-%d %H:%M:%S UTC"))
                                 }
                             }
                         }
@@ -13081,8 +13079,8 @@ fn layout_gates(title: &str, body: &Markup) -> Markup {
 /// Chrome for the schedules pages.
 ///
 /// `base_href` is the relative prefix that reaches the UI mount point from the
-/// page being rendered, exactly as [`layout`] takes one: the list at
-/// `/schedules` passes `""`, and the `/schedules/{id}/{leaf}` drill-downs pass
+/// page being rendered, exactly as [`layout`] takes one. The list at
+/// `/schedules` passes `""`. The `/schedules/{id}/{leaf}` drill-downs pass
 /// [`SCHEDULE_DRILLDOWN_BASE`] (`../../`). Without it every nav link on a
 /// drill-down resolves relative to `/schedules/{id}/` and 404s.
 /// `refresh_target` is the current filtered list view's URL, page
@@ -13095,10 +13093,9 @@ fn layout_gates(title: &str, body: &Markup) -> Markup {
 /// `return_to` itself preserves `refresh`. Without an explicit target,
 /// an operator with auto-refresh on would see this page's meta refresh
 /// reload that same flash-bearing URL on every interval. Each reload
-/// would re-announce and re-focus a stale message. Same fix as
-/// `layout_dead_letters` already applies, found in review there as PR
-/// #1396. Codex review on #1437 P2: newly reachable once the bulk
-/// actions started preserving `refresh` through `return_to`.
+/// would re-announce and re-focus a stale message. `layout_dead_letters`
+/// already applies the same fix (PR #1396). The case became reachable once
+/// the bulk actions preserved `refresh` through `return_to` (PR #1437).
 fn layout_schedules(
     title: &str,
     body: &Markup,
@@ -13272,19 +13269,19 @@ mod tests {
         assert_eq!(raw, "2026-01-01T00:00:00Z");
         assert!(error.is_none());
         assert_eq!(
-            parsed.map(|d| d.to_rfc3339()),
+            parsed.map(autumn_harvest::time::rfc3339),
             Some("2026-01-01T00:00:00+00:00".to_string())
         );
     }
 
-    /// GREEN — the fix under test: a malformed bound no longer aborts the
-    /// caller. It degrades to "filter not applied" (`parsed` is `None`) while
-    /// echoing the operator's exact raw input and a recovery message, so the
-    /// caller can redisplay the field inline instead of discarding the page.
+    /// GREEN: a malformed bound no longer aborts the caller. It degrades
+    /// to "filter not applied" (`parsed` is `None`). It echoes the operator's
+    /// exact raw input and a recovery message. The caller can then redisplay
+    /// the field inline instead of discarding the page.
     /// Before this change, `list_workflows_ui` `?`-propagated a bare
-    /// `AutumnError` here, which aborted the whole `/workflows` response
+    /// `AutumnError` here. That aborted the whole `/workflows` response
     /// before the filter form (or any other filter the operator had typed)
-    /// was ever rendered — see the RED baseline in
+    /// was ever rendered. See the RED baseline in
     /// `tests/ui_integration.rs::ui_workflows_invalid_started_after_*`.
     #[test]
     fn parse_started_bound_rejects_invalid_value_without_erroring() {
@@ -13316,8 +13313,8 @@ mod tests {
         );
     }
 
-    /// Codex review finding on this PR: on a successful parse, `raw` must be
-    /// empty, not an echo of the input. `render_filters`/`build_query_string`
+    /// PR #1540: on a successful parse, `raw` must be empty, not an echo
+    /// of the input. `render_filters`/`build_query_string`
     /// treat a non-empty raw as "still invalid, keep displaying the bad
     /// text". Echoing valid text there is harmless when it already matches
     /// the resolved value. See the clamping test below for where it is not.
@@ -13330,8 +13327,8 @@ mod tests {
         );
     }
 
-    /// Codex review finding on this PR: a negative page number parses. It is
-    /// a well-formed whole number, and is clamped, matching the pre-fix
+    /// PR #1540: a negative page number parses. It is a well-formed
+    /// whole number, and is clamped, matching the pre-fix
     /// `.unwrap_or(0).max(0)` behavior. `raw` must stay empty, though, so a
     /// caller displays the clamped `0`, not the pre-clamp `"-5"` alongside
     /// it.
@@ -13372,13 +13369,12 @@ mod tests {
         );
     }
 
-    /// Codex review finding on this PR: a well-formed but out-of-range limit
-    /// (`0`, `100000`) is clamped, matching the pre-fix `.clamp(1,
+    /// PR #1540: a well-formed but out-of-range limit (`0`, `100000`) is clamped, matching the pre-fix `.clamp(1,
     /// MAX_PAGE_SIZE)` behavior. `raw` must stay empty here. Before this
     /// fix, `render_filters` preferred a non-empty `raw` over the resolved
     /// `limit`. The "Per page" field then displayed the pre-clamp text
-    /// (`"100000"`). Pagination actually used the clamped value (`200`) —
-    /// a silent mismatch with no error explaining it.
+    /// (`"100000"`). Pagination used the clamped value (`200`): a
+    /// silent mismatch with no error explaining it.
     #[test]
     fn parse_limit_query_field_clamps_out_of_range_values() {
         assert_eq!(
@@ -13543,7 +13539,7 @@ mod tests {
         assert_eq!(jump_error, None);
     }
 
-    /// Codex review, PR #1652: a valid `jump_event` must suppress a bad
+    /// PR #1652: a valid `jump_event` must suppress a bad
     /// `event_page`'s error. `event_page` plays no part in the shown page
     /// once `jump_event` wins, so naming its fallback ("Showing page 1")
     /// would contradict the page actually on screen.
@@ -13691,11 +13687,11 @@ mod tests {
         );
     }
 
-    /// Codex review finding on this PR: a well-formed but out-of-range
-    /// limit (`0`, `100000`) is clamped here, not left for
+    /// PR #1641: a well-formed but out-of-range limit (`0`, `100000`)
+    /// is clamped here, not left for
     /// `ScheduleRunsParams::from_query_pairs` to reject. The "Rows" field
     /// is a text control with no browser-side floor. An unclamped `0`
-    /// would reach `from_query_pairs` and abort the whole page — the
+    /// would reach `from_query_pairs` and abort the whole page. That is the
     /// exact defect class this PR exists to close.
     #[test]
     fn parse_schedule_runs_limit_query_field_clamps_out_of_range_values() {
@@ -13729,9 +13725,8 @@ mod tests {
         );
     }
 
-    /// Codex review finding on this PR: the Next link used to be built
-    /// from `limit` alone. A parse failure leaves `limit` at `None`. The
-    /// operator's bad text — and the error naming it — then silently
+    /// PR #1641: the Next link used to be built from `limit` alone. A parse failure leaves `limit` at `None`. The
+    /// operator's bad text, and the error naming it, then silently
     /// vanished on the very click meant to preserve their place.
     #[test]
     fn schedule_runs_view_query_suffix_carries_the_invalid_raw_limit() {
@@ -13756,10 +13751,9 @@ mod tests {
         assert_eq!(view.query_suffix(), "&limit=5");
     }
 
-    /// Codex review finding on this PR: a `type="number"` input sanitizes an
-    /// invalid value to blank at render time in a real browser. The
+    /// PR #1540: a `type="number"` input sanitizes an invalid value to blank at render time in a real browser. The
     /// operator could then never see or edit the exact text they typed.
-    /// That holds even though the HTML source already carried it — and
+    /// That holds even though the HTML source already carried it, and
     /// thus this test, if it only checked `contains("not-a-number")`. The
     /// "Per page" field must be a text control, matching the Workers page's
     /// `shard` filter.
@@ -13804,7 +13798,7 @@ mod tests {
     }
 
     /// Issue #619: with nothing paused **and** every shard readable, the banner
-    /// must render nothing at all, so a healthy Workers page is byte-identical to
+    /// renders nothing. A healthy Workers page is then byte-identical to
     /// before the feature.
     #[test]
     fn paused_queues_banner_is_empty_when_nothing_is_paused() {
@@ -13823,17 +13817,17 @@ mod tests {
             .expect("lazy pool builds without connecting")
     }
 
-    /// Issue #619 review (round 11): mid a shard-add rollout the router
+    /// Issue #619: mid a shard-add rollout the router
     /// advertises a shard this process has no pool for. Fanning out over the
-    /// pools alone would give that shard no future at all, so it could never
-    /// reach `unreadable_shards` — and if it is the only shard holding a queue,
-    /// the Workers page renders no pause warning whatsoever, the exact
+    /// pools alone would give that shard no future, so it could never
+    /// reach `unreadable_shards`. If it is the only shard holding a queue,
+    /// the Workers page then renders no pause warning at all. That is the
     /// invisible-hold bug the warning exists to prevent.
     ///
     /// This guards the *reporting* half (a `None` pool is reported, never
-    /// dropped). Its counterpart — that a router-known poolless shard resolves
-    /// to `None` rather than a default-fallback pool — is guarded on the API
-    /// side by `resolve_expected_shard_pools_flags_poolless_shard_not_default_fallback`.
+    /// dropped). Its counterpart is that a router-known poolless shard resolves
+    /// to `None`, not a default-fallback pool. The API side guards that in
+    /// `resolve_expected_shard_pools_flags_poolless_shard_not_default_fallback`.
     #[tokio::test]
     async fn scan_reports_an_expected_shard_that_has_no_local_pool() {
         let live = never_connecting_pool();
@@ -13863,16 +13857,16 @@ mod tests {
         );
     }
 
-    /// The poolless shard is reported even when it is the ONLY expected shard —
-    /// i.e. the fold does not depend on some other shard producing a future.
+    /// The poolless shard is reported even when it is the ONLY expected shard.
+    /// The fold does not depend on some other shard producing a future.
     #[tokio::test]
     async fn scan_reports_a_lone_poolless_shard() {
         let scan = scan_paused_queues(vec![(7, None)], &[7]).await;
         assert_eq!(scan.unreadable_shards, vec![7]);
     }
 
-    /// Issue #619 review: a shard whose pause state could not be read makes the
-    /// banner's silence a lie — a hold that exists ONLY on that shard is absent
+    /// Issue #619: a shard whose pause state could not be read makes the
+    /// banner's silence a lie. A hold that exists ONLY on that shard is absent
     /// from `rows` entirely. The warning must therefore render even with zero
     /// rows, because that is exactly the case an operator misreads as "dispatch
     /// is flowing, look elsewhere".
@@ -13911,7 +13905,7 @@ mod tests {
             queue_name: "email-workers".to_string(),
             reason: "SMTP provider outage".to_string(),
             paused_by: "alice".to_string(),
-            paused_at: chrono::Utc::now(),
+            paused_at: jiff::Timestamp::now(),
             scope_shard_id: None,
             held_task_count: 7,
             provenance_uniform: true,
@@ -13940,15 +13934,15 @@ mod tests {
         );
     }
 
-    /// AC6: the banner surfaces the queue name, held count, actor and reason so
-    /// an operator can see WHO paused WHAT and WHY without leaving the page.
+    /// AC6: the banner shows the queue name, held count, actor and reason.
+    /// An operator sees WHO paused WHAT and WHY without leaving the page.
     #[test]
     fn paused_queues_banner_surfaces_reason_actor_and_held_count() {
         let rows = vec![PausedQueueBannerRow {
             queue_name: "email-workers".to_string(),
             reason: "SMTP provider outage".to_string(),
             paused_by: "alice".to_string(),
-            paused_at: chrono::Utc::now(),
+            paused_at: jiff::Timestamp::now(),
             scope_shard_id: None,
             held_task_count: 42,
             provenance_uniform: true,
@@ -13970,8 +13964,8 @@ mod tests {
     /// shards is ONE banner row whose held count is the fleet-wide sum.
     #[test]
     fn paused_queue_rows_merge_across_shards_summing_held_counts() {
-        let earlier = chrono::Utc::now() - chrono::Duration::seconds(600);
-        let later = chrono::Utc::now();
+        let earlier = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(600);
+        let later = jiff::Timestamp::now();
         let merged = merge_paused_queue_banner_rows(
             vec![
                 (
@@ -14015,16 +14009,16 @@ mod tests {
         assert_eq!(merged[0].paused_by, "alice");
     }
 
-    /// Issue #619 review: two shards holding the same queue with *different*
-    /// reasons/actors is a supported case (`shard_id` scoping, plus the
-    /// idempotent re-pause that preserves the original provenance). The banner
-    /// sums both shards' held tasks, so labelling that fleet-wide total with
-    /// only one shard's story would tell the operator something untrue about
-    /// the rest of the fleet. It must be flagged instead.
+    /// Issue #619: two shards can hold the same queue with *different*
+    /// reasons/actors (`shard_id` scoping, plus the idempotent re-pause that
+    /// preserves the original provenance). The banner sums both shards' held
+    /// tasks. Labelling that total with one shard's story would tell the
+    /// operator something untrue about the rest of the fleet. It must be
+    /// flagged instead.
     #[test]
     fn divergent_shard_provenance_is_flagged_and_visibly_marked() {
-        let earlier = chrono::Utc::now() - chrono::Duration::seconds(600);
-        let later = chrono::Utc::now();
+        let earlier = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(600);
+        let later = jiff::Timestamp::now();
         let merged = merge_paused_queue_banner_rows(
             vec![
                 (
@@ -14071,10 +14065,10 @@ mod tests {
         );
     }
 
-    /// The uniformity rule must match `api::merge_paused_queue_rows` exactly,
-    /// including comparing `(reason, paused_by, scope_shard_id)` and NOT
-    /// `paused_at` — each shard stamps its own `NOW()`, so a fleet-wide hold
-    /// whose shards agree on the story must never be flagged as mixed.
+    /// The uniformity rule must match `api::merge_paused_queue_rows` exactly.
+    /// It compares `(reason, paused_by, scope_shard_id)` and NOT `paused_at`.
+    /// Each shard stamps its own `NOW()`, so a fleet-wide hold whose shards
+    /// agree on the story must never be flagged as mixed.
     #[test]
     fn differing_paused_at_alone_does_not_flag_divergence() {
         let merged = merge_paused_queue_banner_rows(
@@ -14085,7 +14079,7 @@ mod tests {
                         queue_name: "payments".to_string(),
                         reason: "provider outage".to_string(),
                         paused_by: "alice".to_string(),
-                        paused_at: chrono::Utc::now() - chrono::Duration::seconds(3),
+                        paused_at: jiff::Timestamp::now() - jiff::SignedDuration::from_secs(3),
                         scope_shard_id: None,
                         held_task_count: 2,
                     },
@@ -14096,7 +14090,7 @@ mod tests {
                         queue_name: "payments".to_string(),
                         reason: "provider outage".to_string(),
                         paused_by: "alice".to_string(),
-                        paused_at: chrono::Utc::now(),
+                        paused_at: jiff::Timestamp::now(),
                         scope_shard_id: None,
                         held_task_count: 5,
                     },
@@ -14112,13 +14106,13 @@ mod tests {
         assert!(!html.contains("mixed across shards"), "{html}");
     }
 
-    /// Issue #619 review: a fleet-wide pause that only reached SOME shards must
+    /// Issue #619: a fleet-wide pause that only reached SOME shards must
     /// not read as "fleet-wide".
     ///
-    /// The shards it reached persist `scope_shard_id = NULL` and the ones it
-    /// missed persist **no row at all**, so the stored intent is indistinguishable
-    /// from a complete hold — while the missed shards keep dispatching into the
-    /// very outage the operator is trying to hold back. Scope is therefore derived
+    /// The shards it reached persist `scope_shard_id = NULL`. The ones it
+    /// missed persist **no row at all**. So the stored intent looks like a
+    /// complete hold, while the missed shards keep dispatching into the
+    /// outage the operator is trying to hold back. Scope therefore comes
     /// from real coverage against the expected shard set.
     #[test]
     fn a_partially_applied_fleet_pause_is_not_rendered_as_fleet_wide() {
@@ -14129,7 +14123,7 @@ mod tests {
                     queue_name: "payments".to_string(),
                     reason: "stripe outage".to_string(),
                     paused_by: "alice".to_string(),
-                    paused_at: chrono::Utc::now(),
+                    paused_at: jiff::Timestamp::now(),
                     // Fleet-wide INTENT -- what a fleet-wide request writes.
                     scope_shard_id: None,
                     held_task_count: 3,
@@ -14174,7 +14168,7 @@ mod tests {
     /// refreshes (shard iteration order must not shuffle it).
     #[test]
     fn paused_queue_rows_are_sorted_by_queue_name() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let mk = |name: &str| autumn_harvest::queue_pause::PausedQueue {
             queue_name: name.to_string(),
             reason: "r".to_string(),
@@ -14221,9 +14215,9 @@ mod tests {
 
     #[test]
     fn pause_and_resume_flashes_distinguish_noops() {
-        // Issue #609 post-review hardening: a no-op resume (the run was not
-        // paused) must not flash "Workflow resumed", and an idempotent
-        // repeat pause must not claim it performed the transition.
+        // Issue #609: a no-op resume (the run was not paused) must not flash
+        // "Workflow resumed". An idempotent repeat pause must not claim it
+        // performed the transition.
         assert_eq!(resume_flash_message(true), "Workflow resumed");
         assert_eq!(
             resume_flash_message(false),
@@ -14235,8 +14229,8 @@ mod tests {
 
     #[test]
     fn event_label_disambiguates_terminate_from_cancel() {
-        // The WorkflowCancelled event is reused for force-terminate (#504): the
-        // timeline label must follow the authoritative execution state so a
+        // The WorkflowCancelled event is reused for force-terminate (#504). The
+        // timeline label follows the authoritative execution state, so a
         // terminated run reads "Workflow terminated", matching its badge.
         let data = serde_json::json!({});
         assert_eq!(
@@ -14329,11 +14323,11 @@ mod tests {
         );
     }
 
-    /// The Codex review finding on this PR: a Next/Previous link must not
-    /// silently drop an invalid `started_after`/`started_before` an operator
-    /// is still correcting — that would clear the value and its inline error
-    /// (see `parse_started_bound`) via a click that looks unrelated to the
-    /// filter form, one page after the operator typed it.
+    /// PR #1333: a Next/Previous link must not silently drop an invalid
+    /// `started_after`/`started_before` that an operator is still correcting.
+    /// That would clear the value and its inline error (see
+    /// `parse_started_bound`). The click looks unrelated to the filter form,
+    /// and comes one page after the operator typed the value.
     #[test]
     fn build_query_string_preserves_invalid_date_text_for_pagination() {
         assert_eq!(
@@ -14364,7 +14358,7 @@ mod tests {
         );
     }
 
-    /// Same Codex finding, the `limit` field. `limit_raw` is non-empty only
+    /// PR #1540, the `limit` field. `limit_raw` is non-empty only
     /// on a genuine parse failure (`parse_limit_query_field`). It must
     /// override the resolved `limit` in the link, rather than being
     /// dropped alongside it.
@@ -14386,9 +14380,9 @@ mod tests {
     }
 
     /// `started_after_raw`/`started_before_raw` is the operator's exact typed
-    /// text on success too (`parse_started_bound` returns `trimmed`, not a
-    /// reformatted `DateTime`), so a link preserves e.g. the `Z` suffix as
-    /// typed rather than normalizing it to `+00:00`.
+    /// text on success too. `parse_started_bound` returns `trimmed`, not a
+    /// reformatted `DateTime`. So a link keeps e.g. the `Z` suffix as typed
+    /// rather than normalizing it to `+00:00`.
     #[test]
     fn build_query_string_includes_valid_started_after_before() {
         assert_eq!(
@@ -14431,12 +14425,12 @@ mod tests {
         assert!(html.contains("Discard 250 matching dead-letter entries?"));
     }
 
-    /// Codex review on #1420: `parse_bulk_dlq_form` (autumn-harvest-plugin/
+    /// PR #1420: `parse_bulk_dlq_form` (autumn-harvest-plugin/
     /// src/api.rs) re-validates `task_kind`/`failed_after`/`failed_before`
     /// strictly and 400s on a bad value. The bulk-action forms must never
     /// submit an invalid raw value as a hidden field. Otherwise
-    /// replay/discard aborts instead of running — the exact bug this PR
-    /// fixes, one layer down. An invalid field is "filter not applied"
+    /// replay/discard aborts instead of running. That is the exact bug this
+    /// PR fixes, one layer down. An invalid field is "filter not applied"
     /// here, so it must be omitted, not echoed with its raw, unparseable
     /// text.
     #[test]
@@ -14756,9 +14750,8 @@ mod tests {
         );
     }
 
-    /// Codex-review-class regression guard, matching #1378 P2/#1333's own
-    /// follow-up. An invalid filter's raw text — not the parsed value,
-    /// always `None` — must survive into pagination and bulk-action hidden
+    /// PR #1420 regression guard, matching the #1378/#1333 follow-up. An invalid filter's raw text, not the parsed value
+    /// (always `None`), must survive into pagination and bulk-action hidden
     /// fields. Otherwise the inline error vanishes on the very next click.
     #[test]
     fn build_dead_letter_query_string_carries_invalid_raw_values() {
@@ -14867,7 +14860,7 @@ mod tests {
         );
     }
 
-    /// Codex review on #1420: a summary drilldown's "View entries" link
+    /// PR #1420: a summary drilldown's "View entries" link
     /// used to derive its `drill_raw` solely from the successfully parsed
     /// filters. This silently dropped an invalid `failed_after`/
     /// `failed_before` and its error, even though this function never
@@ -15020,25 +15013,25 @@ mod tests {
 
     #[test]
     fn relative_time_just_now_for_recent() {
-        let ts = chrono::Utc::now() - chrono::Duration::seconds(2);
+        let ts = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(2);
         assert_eq!(relative_time(ts), "just now");
     }
 
     #[test]
     fn relative_time_seconds_ago() {
-        let ts = chrono::Utc::now() - chrono::Duration::seconds(20);
+        let ts = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(20);
         assert_eq!(relative_time(ts), "20s ago");
     }
 
     #[test]
     fn relative_time_minutes_ago() {
-        let ts = chrono::Utc::now() - chrono::Duration::seconds(90);
+        let ts = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(90);
         assert_eq!(relative_time(ts), "1m ago");
     }
 
     #[test]
     fn relative_time_hours_ago() {
-        let ts = chrono::Utc::now() - chrono::Duration::seconds(7200);
+        let ts = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(7200);
         assert_eq!(relative_time(ts), "2h ago");
     }
 
@@ -15080,7 +15073,7 @@ mod tests {
         );
     }
 
-    /// Same Codex finding as the Workflows page's
+    /// PR #1560, as for the Workflows page's
     /// `build_query_string_preserves_invalid_limit_text_for_pagination`.
     /// `limit_raw` is non-empty only on a genuine parse failure. It must
     /// override the resolved `limit` in the Next/Previous link rather than
@@ -15134,8 +15127,8 @@ mod tests {
             is_paused,
             last_run_at: None,
             next_run_at: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
+            updated_at: jiff::Timestamp::now(),
             workflow_name: workflow_name.map(str::to_string),
             workflow_input: None,
             queue_name: None,
@@ -15430,13 +15423,13 @@ mod tests {
         assert!(!html_without.contains("http-equiv=\"refresh\""));
     }
 
-    /// Codex review on #1437 (P2): a targetless `meta refresh` would
-    /// reload this page's own URL. If that URL still carries `flash=...`
+    /// PR #1437: a targetless `meta refresh` would reload this page's
+    /// own URL. If that URL still carries `flash=...`
     /// (as it does right after a bulk pause/resume redirect), every
     /// auto-refresh interval re-announces and re-focuses the same stale
     /// message. The tag must instead point `url=` at the flash-free
-    /// target the caller supplies — same fix as `layout_dead_letters`
-    /// already applies (PR #1396).
+    /// target the caller supplies. `layout_dead_letters` already applies
+    /// the same fix (PR #1396).
     #[test]
     fn layout_schedules_refresh_tag_targets_flash_free_url() {
         let body = html! { p { "test" } };
@@ -15630,10 +15623,10 @@ mod tests {
         assert!(html.contains("content=\"30\""));
     }
 
-    // Issue #957 (Codex review): every non-current run in the list must link to
-    // its own graph via `?run=`, and the currently-shown run must be marked
-    // "current" rather than linked — so an operator can inspect an older run's
-    // graph from the page instead of hand-building the query URL.
+    // Issue #957: every non-current run in the list must link to its own graph
+    // via `?run=`. The currently-shown run is marked "current" rather than
+    // linked. An operator can then inspect an older run's graph from the page
+    // instead of hand-building the query URL.
     #[test]
     fn render_dag_run_rows_links_each_run_to_its_graph_and_marks_current() {
         let mut run_a = stub_execution();
@@ -15731,7 +15724,7 @@ mod tests {
     }
 
     fn task_queue_item_for_activity(activity_name: &str, state: &str) -> TaskQueueItem {
-        let now = Utc::now();
+        let now = Timestamp::now();
         TaskQueueItem {
             id: uuid::Uuid::new_v4(),
             queue_name: "default".to_string(),
@@ -15785,8 +15778,8 @@ mod tests {
 
     #[test]
     fn format_run_duration_renders_elapsed_time() {
-        let start = Utc::now();
-        let end = start + chrono::Duration::seconds(125);
+        let start = Timestamp::now();
+        let end = start + jiff::SignedDuration::from_secs(125);
         assert_eq!(format_run_duration(start, Some(end)), "2m 5s");
     }
 
@@ -15835,7 +15828,7 @@ mod tests {
     // -- Issue #279: history event count and continue-as-new threshold --
 
     fn stub_execution() -> autumn_harvest::models::WorkflowExecution {
-        use chrono::Utc;
+        use jiff::Timestamp;
         use uuid::Uuid;
         autumn_harvest::models::WorkflowExecution {
             migrated_to_shard: None,
@@ -15853,7 +15846,7 @@ mod tests {
             parent_id: None,
             sticky_worker_id: None,
             queue_name: "default".to_string(),
-            started_at: Utc::now(),
+            started_at: Timestamp::now(),
             completed_at: None,
             execution_timeout: None,
             deadline_at: None,
@@ -15861,7 +15854,7 @@ mod tests {
             chain_deadline_at: None,
             memo: None,
             search_attrs: None,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             assigned_build_id: None,
             parent_close_policy: None,
             owner: None,
@@ -15915,7 +15908,7 @@ mod tests {
         }
     }
 
-    // ── Issue #608 / PR #936 round 5: decode only rendered detail fields ─────
+    // ── Issue #608 / PR #936: decode only rendered detail fields ─────
 
     /// Reversing test codec so an envelope is distinguishable from plaintext.
     #[derive(Debug)]
@@ -15963,7 +15956,7 @@ mod tests {
             event_id: 0,
             event_type: "ActivityScheduled".to_string(),
             event_data,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
         }
     }
 
@@ -15973,18 +15966,17 @@ mod tests {
             workflow_exec_id: uuid::Uuid::new_v4(),
             signal_name: "approval".to_string(),
             payload,
-            received_at: Utc::now(),
+            received_at: Timestamp::now(),
             consumed: false,
             idempotency_key: None,
         }
     }
 
-    /// PR #936 round 5: the pending-activity `input` and pending-signal
-    /// payloads are never rendered by the detail page, so they must not be
-    /// decoded and must not count toward the `payload.decode_read` audit
-    /// outcome — envelopes there stay untouched and the outcome stays empty
-    /// (no audit row would be written for a page whose only envelopes are
-    /// hidden).
+    /// PR #936: the pending-activity `input` and pending-signal payloads are
+    /// never rendered by the detail page. So they must not be decoded and must
+    /// not count toward the `payload.decode_read` audit outcome. Envelopes there
+    /// stay untouched and the outcome stays empty. No audit row is written for
+    /// a page whose only envelopes are hidden.
     #[test]
     fn hidden_detail_fields_are_not_decoded_and_never_touch_the_audit_outcome() {
         let codecs = ui_test_codecs();
@@ -16024,9 +16016,9 @@ mod tests {
         );
     }
 
-    /// The fields the detail page actually renders — execution payload
-    /// fields, timeline event payloads, and heartbeat checkpoints — are
-    /// decoded, and the audit outcome counts exactly those.
+    /// The fields the detail page renders are decoded: execution payload
+    /// fields, timeline event payloads, and heartbeat checkpoints. The audit
+    /// outcome counts exactly those.
     #[test]
     fn rendered_detail_fields_are_decoded_and_counted_exactly() {
         let codecs = ui_test_codecs();
@@ -16317,8 +16309,8 @@ mod tests {
             queue_name: "test-queue".to_string(),
             build_id: "abc123".to_string(),
             deployment_name: Some("prod-v2".to_string()),
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
+            updated_at: jiff::Timestamp::now(),
             target_build_id: None,
             ramp_percent: None,
         };
@@ -16410,7 +16402,7 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             build_id: "sha-new".to_string(),
             compatible_with: "sha-old".to_string(),
-            declared_at: chrono::Utc::now(),
+            declared_at: jiff::Timestamp::now(),
         };
         let html = render_build_routing_page(
             &[],
@@ -16773,9 +16765,9 @@ mod tests {
         );
     }
 
-    /// GREEN — the fix under test: the Workers page's "Per page" field is
-    /// a text control. This matches the Workflows page's own fix (Codex
-    /// review on #1540). A `type="number"` input sanitizes an invalid
+    /// GREEN, the fix under test: the Workers page's "Per page" field is
+    /// a text control. This matches the Workflows page's own fix
+    /// (#1540). A `type="number"` input sanitizes an invalid
     /// value to blank at render time. The operator could then never see
     /// or correct their own bad input, even though the HTML source
     /// already carried it.
@@ -17119,10 +17111,9 @@ mod tests {
         assert!(svg.contains("&lt;b&gt;evil"), "escaped form present");
     }
 
-    // P8b — accessibility: the per-status glyph is actually embedded in the
-    // rendered node SVG (not just returned by the helper), so dropping the icon
-    // from the render would fail this test. #957 AC: distinguishable without
-    // colour alone.
+    // P8b, accessibility: the per-status glyph is embedded in the rendered node SVG, not just
+    // returned by the helper. Dropping the icon from the render fails this
+    // test. #957 AC: distinguishable without colour alone.
     #[test]
     fn render_dag_run_graph_svg_embeds_status_icon_glyphs() {
         let nodes = vec![
@@ -17221,7 +17212,7 @@ mod tests {
         );
     }
 
-    // Codex review (issue #957): a successful fork opens the NEW run.
+    // Issue #957: a successful fork opens the NEW run.
     #[test]
     fn dag_retry_commit_redirect_opens_new_run_on_success() {
         let plan = DagRetryResponse {
@@ -17246,10 +17237,10 @@ mod tests {
         );
     }
 
-    // Codex review (issue #957): AuditFailed is a PARTIAL SUCCESS — the fork
-    // committed, so redirect to the NEW run with a distinct warning, never the
-    // hard "Retry failed" pointing back at the source (which would hide the run
-    // that actually started).
+    // Issue #957: AuditFailed is a PARTIAL SUCCESS. The fork committed, so
+    // redirect to the NEW run with a distinct warning. Never show the hard
+    // "Retry failed" pointing back at the source, which would hide the run
+    // that actually started.
     #[test]
     fn dag_retry_commit_redirect_surfaces_new_run_on_audit_failure() {
         let failure = DagRetryFailure::AuditFailed {
@@ -17279,7 +17270,7 @@ mod tests {
         );
     }
 
-    // Codex review (issue #957): a genuine failure (400/404/409) redirects back
+    // Issue #957: a genuine failure (400/404/409) redirects back
     // to the SOURCE run with the hard "Retry failed" message.
     #[test]
     fn dag_retry_commit_redirect_opens_source_run_on_real_failure() {
@@ -17370,9 +17361,9 @@ mod tests {
         );
     }
 
-    // Codex review (issue #1723): the confirm page's caller re-runs the dry
+    // Issue #1723: the confirm page's caller re-runs the dry
     // run for a current node list on a commit failure. That refreshed dry
-    // run can itself fail — exactly the race this fix targets, where a
+    // run can itself fail. That is exactly the race this fix targets, where a
     // competing retry has already sealed the source run. The `Err` branch
     // must still preserve the operator's submitted reason in that case,
     // not just on the `Ok` branch covered by the sibling test above.
@@ -17395,7 +17386,7 @@ mod tests {
         );
     }
 
-    // Codex review (issue #1723): the banner shows the *refreshed* dry run's
+    // Issue #1723: the banner shows the *refreshed* dry run's
     // own failure, which is not necessarily what the operator's actual
     // commit attempt failed with. When the two diagnoses differ, both must
     // reach the operator, not just the redisplay's own fresh failure.
@@ -17455,10 +17446,10 @@ mod tests {
             dag_detail_relative_url("graph_linear", "run-2", Some("done")),
             "../../../graph_linear?run=run-2&flash=done"
         );
-        // A `run` value carrying reserved chars (e.g. a raw path segment that
-        // failed to parse as an exec id on the retry-commit Err branch) must be
-        // percent-encoded — mirroring `dag_name` — so it cannot alter the
-        // redirect URL's query/fragment semantics (security P2-1).
+        // A `run` value can carry reserved chars, e.g. a raw path segment that
+        // failed to parse as an exec id on the retry-commit Err branch. It must
+        // be percent-encoded, like `dag_name`, so it cannot alter the redirect
+        // URL's query/fragment semantics.
         assert_eq!(
             dag_detail_relative_url("graph_linear", "run#x&y?z", None),
             "../../../graph_linear?run=run%23x%26y%3Fz"
@@ -17493,10 +17484,8 @@ mod tests {
         StepKind::SideEffect,
     ];
 
-    fn tl_base() -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339("2026-07-15T12:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc)
+    fn tl_base() -> Timestamp {
+        "2026-07-15T12:00:00Z".parse::<Timestamp>().unwrap()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -17511,8 +17500,8 @@ mod tests {
         attempt: Option<i32>,
     ) -> TimelineStep {
         let base = tl_base();
-        let scheduled_at = base + chrono::Duration::milliseconds(sched_off_ms);
-        let ended_at = end_off_ms.map(|o| base + chrono::Duration::milliseconds(o));
+        let scheduled_at = base + jiff::SignedDuration::from_millis(sched_off_ms);
+        let ended_at = end_off_ms.map(|o| base + jiff::SignedDuration::from_millis(o));
         let total_ms = end_off_ms.map_or(0, |e| (e - sched_off_ms).max(0));
         TimelineStep {
             step_kind: kind,
@@ -17728,7 +17717,7 @@ mod tests {
         ];
         let mut exec = stub_execution();
         exec.started_at = tl_base();
-        exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(4000));
+        exec.completed_at = Some(tl_base() + jiff::SignedDuration::from_millis(4000));
         exec.state = "COMPLETED".to_string();
         let timeline = tl_timeline(steps, None);
         let html = render_timeline_gantt(&timeline, &exec, tl_base()).into_string();
@@ -17749,12 +17738,12 @@ mod tests {
         assert!(html.contains(step_outcome_fill(StepOutcome::Fired)));
     }
 
-    // Codex review (#960): the timeline page's "Back to execution" control and
+    // Issue #960: the timeline page's "Back to execution" control and
     // the current-details card must both resolve to the execution-detail route
-    // `{api_base}/workflows/{id}` — NOT `{api_base}/workflows/{id}/{id}`. Both
-    // are built from the api base (`../../workflows/{id}`), matching the page's
-    // own `base_href = "../../"` nav, rather than a bare `../{id}` that relies on
-    // `..` stripping exactly the `timeline` segment.
+    // `{api_base}/workflows/{id}`, NOT `{api_base}/workflows/{id}/{id}`. Both
+    // come from the api base (`../../workflows/{id}`), like the page's own
+    // `base_href = "../../"` nav. A bare `../{id}` relies on `..` stripping
+    // exactly the `timeline` segment.
     #[test]
     fn timeline_nav_links_point_at_execution_detail_route() {
         let steps = vec![tl_step(
@@ -17769,7 +17758,7 @@ mod tests {
         )];
         let mut exec = stub_execution();
         exec.started_at = tl_base();
-        exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(1000));
+        exec.completed_at = Some(tl_base() + jiff::SignedDuration::from_millis(1000));
         // Non-empty current_details makes the "what is it blocked on?" card render.
         exec.current_details = Some("charging card".to_string());
         let timeline = tl_timeline(steps, None); // Timeline::exec_id == "exec-1"
@@ -17793,8 +17782,8 @@ mod tests {
         );
 
         // The old bare-`..` form (which relied on `..` stripping exactly the
-        // `timeline` segment) must be gone, and the href must NEVER produce the
-        // doubled `/{id}/{id}` execution segment Codex flagged.
+        // `timeline` segment) must be gone. The href must NEVER produce the
+        // doubled `/{id}/{id}` execution segment.
         assert!(
             !html.contains(r#"href="../exec-1""#),
             "must not use the fragile bare `../{{id}}` form: {html}"
@@ -17830,7 +17819,7 @@ mod tests {
         );
         let mut exec = stub_execution();
         exec.started_at = tl_base();
-        exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(1500));
+        exec.completed_at = Some(tl_base() + jiff::SignedDuration::from_millis(1500));
         let timeline = tl_timeline(vec![split, whole], None);
         let html = render_timeline_gantt(&timeline, &exec, tl_base()).into_string();
         // Split activity → both wait and exec segment classes.
@@ -17862,7 +17851,7 @@ mod tests {
         exec.completed_at = None;
         exec.state = "RUNNING".to_string();
         let timeline = tl_timeline(vec![pending], None);
-        let now = tl_base() + chrono::Duration::milliseconds(5000);
+        let now = tl_base() + jiff::SignedDuration::from_millis(5000);
         let html = render_timeline_gantt(&timeline, &exec, now).into_string();
         assert!(html.contains("gantt-span-open"), "open span styled: {html}");
         // Regression: an open step (total_ms == 0 in the fixture) must still render
@@ -17889,7 +17878,7 @@ mod tests {
         );
         let mut exec = stub_execution();
         exec.started_at = tl_base();
-        exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(1000));
+        exec.completed_at = Some(tl_base() + jiff::SignedDuration::from_millis(1000));
         let timeline = tl_timeline(vec![retried], None);
         let html = render_timeline_gantt(&timeline, &exec, tl_base()).into_string();
         assert!(html.contains("×3"), "attempt badge visible: {html}");
@@ -17900,12 +17889,12 @@ mod tests {
     fn pause_band_present_when_paused() {
         let mut exec = stub_execution();
         exec.started_at = tl_base();
-        exec.paused_at = Some(tl_base() + chrono::Duration::milliseconds(2000));
+        exec.paused_at = Some(tl_base() + jiff::SignedDuration::from_millis(2000));
         exec.pause_reason = Some("incident-4821".to_string());
         exec.pause_actor = Some("oncall@corp".to_string());
         let axis = GanttAxis::new(
             tl_base(),
-            tl_base() + chrono::Duration::milliseconds(6000),
+            tl_base() + jiff::SignedDuration::from_millis(6000),
             220.0,
             900.0,
             300.0,
@@ -17925,7 +17914,7 @@ mod tests {
         exec.paused_at = None;
         let axis = GanttAxis::new(
             tl_base(),
-            tl_base() + chrono::Duration::milliseconds(6000),
+            tl_base() + jiff::SignedDuration::from_millis(6000),
             220.0,
             900.0,
             300.0,
@@ -17938,12 +17927,12 @@ mod tests {
     fn nd_marker_present_when_blocked() {
         let mut exec = stub_execution();
         exec.started_at = tl_base();
-        exec.nd_blocked_at = Some(tl_base() + chrono::Duration::milliseconds(3000));
+        exec.nd_blocked_at = Some(tl_base() + jiff::SignedDuration::from_millis(3000));
         exec.nd_block_reason = Some("expected ActivityScheduled got TimerStarted".to_string());
         exec.nd_block_count = 4;
         let axis = GanttAxis::new(
             tl_base(),
-            tl_base() + chrono::Duration::milliseconds(6000),
+            tl_base() + jiff::SignedDuration::from_millis(6000),
             220.0,
             900.0,
             300.0,
@@ -17970,7 +17959,7 @@ mod tests {
         exec.nd_blocked_at = None;
         let axis = GanttAxis::new(
             tl_base(),
-            tl_base() + chrono::Duration::milliseconds(6000),
+            tl_base() + jiff::SignedDuration::from_millis(6000),
             220.0,
             900.0,
             300.0,
@@ -17978,22 +17967,22 @@ mod tests {
         assert!(nd_marker_markup(&exec, &axis).is_none());
     }
 
-    // Q12c — operator-controlled `pause_reason`/`pause_actor`/`nd_block_reason`
-    // are assembled into SVG `<text>` bodies via `String::push_str`; prove maud
-    // still HTML-escapes them (a future refactor to `PreEscaped`/an attribute
-    // would regress this). Security review nit-4.
+    // Q12c: operator-controlled `pause_reason`/`pause_actor`/`nd_block_reason`
+    // go into SVG `<text>` bodies via `String::push_str`. Prove maud still
+    // HTML-escapes them. A refactor to `PreEscaped` or an attribute would
+    // regress this.
     #[test]
     fn pause_and_nd_reason_are_html_escaped_in_svg_text() {
         let mut exec = stub_execution();
         exec.started_at = tl_base();
-        exec.paused_at = Some(tl_base() + chrono::Duration::milliseconds(1000));
+        exec.paused_at = Some(tl_base() + jiff::SignedDuration::from_millis(1000));
         exec.pause_reason = Some("<script>alert(1)</script>".to_string());
         exec.pause_actor = Some("<b>bad</b>".to_string());
-        exec.nd_blocked_at = Some(tl_base() + chrono::Duration::milliseconds(2000));
+        exec.nd_blocked_at = Some(tl_base() + jiff::SignedDuration::from_millis(2000));
         exec.nd_block_reason = Some("<img src=x onerror=1>".to_string());
         let axis = GanttAxis::new(
             tl_base(),
-            tl_base() + chrono::Duration::milliseconds(6000),
+            tl_base() + jiff::SignedDuration::from_millis(6000),
             220.0,
             900.0,
             300.0,
@@ -18087,7 +18076,7 @@ mod tests {
         assert_eq!(slowest_step_index(&timeline), Some(1));
         let mut exec = stub_execution();
         exec.started_at = tl_base();
-        exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(9100));
+        exec.completed_at = Some(tl_base() + jiff::SignedDuration::from_millis(9100));
         let html = render_timeline_gantt(&timeline, &exec, tl_base()).into_string();
         assert!(
             html.contains("id=\"slowest\""),
@@ -18114,7 +18103,7 @@ mod tests {
         );
         let mut exec = stub_execution();
         exec.started_at = tl_base();
-        exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(100));
+        exec.completed_at = Some(tl_base() + jiff::SignedDuration::from_millis(100));
         let timeline = tl_timeline(vec![step], None);
         let html = render_timeline_gantt(&timeline, &exec, tl_base()).into_string();
         assert!(
@@ -18146,7 +18135,7 @@ mod tests {
         let mut exec = stub_execution();
         exec.started_at = tl_base();
         exec.completed_at =
-            Some(tl_base() + chrono::Duration::milliseconds(i64::try_from(n).unwrap() * 10));
+            Some(tl_base() + jiff::SignedDuration::from_millis(i64::try_from(n).unwrap() * 10));
         let timeline = tl_timeline(steps, None);
         let html = render_timeline_gantt(&timeline, &exec, tl_base()).into_string();
         // A "showing N of M" note when capped.
@@ -18157,15 +18146,15 @@ mod tests {
         );
     }
 
-    // Q17 (#960): when the step list is capped, the slowest step must stay in the
-    // rendered set even though lane grouping can push it past the prefix — the
-    // rollup and the execution-detail Timeline link both advertise `#slowest`, so
+    // Q17 (#960): when the step list is capped, the slowest step must stay in
+    // the rendered set. Lane grouping can push it past the prefix. The rollup
+    // and the execution-detail Timeline link both advertise `#slowest`, so
     // the `id="slowest"` element must always resolve.
     #[test]
     fn timeline_cap_keeps_slowest_step_rendered() {
-        // MAX_RENDER_STEPS + 1 short Activity steps fill the whole first-lane
-        // prefix, then a single slow SideEffect step (last lane) is lane-grouped
-        // *after* every Activity — beyond the rendered prefix.
+        // MAX_RENDER_STEPS + 1 short Activity steps fill the first-lane prefix.
+        // Then one slow SideEffect step (last lane) is lane-grouped *after*
+        // every Activity, beyond the rendered prefix.
         let mut steps: Vec<TimelineStep> = (0..=MAX_RENDER_STEPS)
             .map(|i| {
                 let off = i64::try_from(i).unwrap() * 10;
@@ -18196,7 +18185,7 @@ mod tests {
         ));
         let mut exec = stub_execution();
         exec.started_at = tl_base();
-        exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(999_999));
+        exec.completed_at = Some(tl_base() + jiff::SignedDuration::from_millis(999_999));
         exec.state = "COMPLETED".to_string();
         let timeline = tl_timeline(steps, None);
         // Sanity: the slowest step is genuinely the SideEffect, and it is past the
@@ -18213,9 +18202,9 @@ mod tests {
             "exactly one id=\"slowest\" element: {}",
             &html[..html.len().min(400)]
         );
-        // The anchored `<g id="slowest">…</g>` belongs to the actual slowest step:
-        // its distinctly-named title is inside the anchored group (and would be
-        // absent entirely without the fix, being past the prefix).
+        // The anchored `<g id="slowest">…</g>` belongs to the slowest step.
+        // Its distinctly-named title is inside the anchored group. Without the
+        // fix it would be absent, being past the prefix.
         let anchor = html.find("id=\"slowest\"").expect("anchor present");
         let group_end = html[anchor..].find("</g>").expect("anchored group closes");
         let anchored_group = &html[anchor..anchor + group_end];
@@ -18259,7 +18248,7 @@ mod tests {
         ];
         let mut exec = stub_execution();
         exec.started_at = tl_base();
-        exec.completed_at = Some(tl_base() + chrono::Duration::milliseconds(5_000));
+        exec.completed_at = Some(tl_base() + jiff::SignedDuration::from_millis(5_000));
         exec.state = "COMPLETED".to_string();
         let timeline = tl_timeline(steps, None);
         let html = render_timeline_gantt(&timeline, &exec, tl_base()).into_string();
@@ -18293,7 +18282,7 @@ mod tests {
             seq,
             level: level.to_string(),
             message: message.to_string(),
-            occurred_at: chrono::Utc::now(),
+            occurred_at: jiff::Timestamp::now(),
         }
     }
 
@@ -18323,7 +18312,7 @@ mod tests {
 
     #[test]
     fn logs_panel_is_not_rendered_for_a_non_admin() {
-        // Mirrors the API route's `require_admin`: a log message is free-form
+        // Mirrors the API route's `require_admin`. A log message is free-form
         // author text, so a non-admin must not read through the UI what the
         // API would deny. `admin: false` is the `Default`, which is also what
         // every non-log detail test passes.
@@ -18663,7 +18652,7 @@ mod tests {
         );
     }
 
-    /// RED before this fix (issue #1687 review, Codex finding). Serving the
+    /// RED before this fix (issue #1687). Serving the
     /// detail page's markup directly as a rejected POST's response body
     /// left every relative link and form action wrong. The body assumed
     /// the document's own url was the canonical `/workflows/{id}` page.
@@ -18714,12 +18703,11 @@ mod tests {
         );
     }
 
-    /// RED before this fix (issue #1687 review, second Codex finding).
-    /// Take a relative reference with an empty path: a bare
-    /// `?event_page=1` link, or a GET `<form>` with no `action`. It
-    /// inherits the browser's *entire* current base path, not just its
-    /// directory. That differs
-    /// from a path-relative reference like `{id}/signal`, which merges
+    /// RED before this fix (issue #1687). Take a relative reference
+    /// with an empty path: a bare `?event_page=1` link, or a GET `<form>`
+    /// with no `action`. It inherits the browser's *entire* current base
+    /// path, not just its directory. That differs from a path-relative
+    /// reference like `{id}/signal`, which merges
     /// against only the base's directory. `<base href="..">` restores the
     /// right directory for path-relative references. But a query-only one
     /// under that base would still resolve to `/workflows/?event_page=1`,
@@ -18765,9 +18753,9 @@ mod tests {
 
     #[test]
     fn logs_panel_shows_the_truncation_banner_from_the_caller_probe() {
-        // The marker sits at `seq = i64::MAX` and sorts LAST, while the panel
-        // loads only the first `WORKFLOW_LOG_PANEL_LIMIT` rows -- so under the
-        // default 1,000-line cap it can never appear in the page. The flag must
+        // The marker sits at `seq = i64::MAX` and sorts LAST. The panel loads
+        // only the first `WORKFLOW_LOG_PANEL_LIMIT` rows, so under the default
+        // 1,000-line cap the marker never appears in the page. The flag must
         // therefore come from the caller's direct probe, not from scanning
         // `lines`; this fixture has a full page with NO marker in it.
         let lines: Vec<_> = (0..3).map(|i| stub_log_line(i, "info", "l")).collect();
@@ -18786,9 +18774,9 @@ mod tests {
 
     #[test]
     fn logs_panel_distinguishes_a_read_failure_from_an_empty_log() {
-        // During an incident -- e.g. a node that has not run the migration --
-        // the empty state would otherwise affirmatively claim the sink is
-        // disabled, which is the opposite of what happened.
+        // During an incident (e.g. a node that has not run the migration),
+        // the empty state would otherwise claim the sink is disabled. That is
+        // the opposite of what happened.
         let failed = render_logs_detail(&WorkflowLogsPanelData {
             lines: &[],
             admin: true,
@@ -18868,7 +18856,7 @@ mod tests {
         );
 
         let exhausted = HarvestSchedule {
-            exhausted_at: Some(chrono::Utc::now()),
+            exhausted_at: Some(jiff::Timestamp::now()),
             exhausted_reason: Some("max_runs_exhausted".to_string()),
             ..make_schedule(Some("wf"), None, false)
         };
@@ -18885,7 +18873,7 @@ mod tests {
 
         let dropped = HarvestSchedule {
             last_catchup_dropped: 7,
-            last_catchup_at: Some(chrono::Utc::now()),
+            last_catchup_at: Some(jiff::Timestamp::now()),
             ..make_schedule(Some("wf"), None, false)
         };
         assert!(schedule_health(&dropped).catchup_dropped);
@@ -18903,7 +18891,7 @@ mod tests {
     fn schedule_health_flags_auto_paused_distinctly() {
         let row = HarvestSchedule {
             is_paused: true,
-            auto_paused_at: Some(chrono::Utc::now()),
+            auto_paused_at: Some(jiff::Timestamp::now()),
             consecutive_failure_count: 3,
             ..make_schedule(Some("wf"), None, true)
         };
@@ -18920,7 +18908,7 @@ mod tests {
     /// existing `next_run_at`-ascending relative order.
     #[test]
     fn schedule_sort_puts_unhealthy_first_without_reordering_healthy_rows() {
-        let t = |mins: i64| Some(chrono::Utc::now() + chrono::Duration::minutes(mins));
+        let t = |mins: i64| Some(jiff::Timestamp::now() + jiff::SignedDuration::from_mins(mins));
         let healthy_soon = HarvestSchedule {
             next_run_at: t(1),
             ..make_schedule(Some("a_soon"), None, false)
@@ -19026,9 +19014,7 @@ mod tests {
         assert!(label.contains("10"), "max_runs missing: {label}");
 
         let ends = HarvestSchedule {
-            end_at: chrono::DateTime::parse_from_rfc3339("2027-01-01T00:00:00Z")
-                .ok()
-                .map(|d| d.with_timezone(&chrono::Utc)),
+            end_at: "2027-01-01T00:00:00Z".parse::<Timestamp>().ok(),
             ..make_schedule(Some("wf"), None, false)
         };
         assert!(schedule_bounded_runs_label(&ends).contains("2027-01-01"));
@@ -19036,7 +19022,7 @@ mod tests {
         let spent = HarvestSchedule {
             max_runs: Some(3),
             runs_started: 3,
-            exhausted_at: Some(chrono::Utc::now()),
+            exhausted_at: Some(jiff::Timestamp::now()),
             exhausted_reason: Some("max_runs_exhausted".to_string()),
             ..make_schedule(Some("wf"), None, false)
         };
@@ -19051,9 +19037,9 @@ mod tests {
     /// jitter is configured, and only `next_run_at` when it is not.
     #[test]
     fn schedule_next_fire_cell_shows_effective_time_only_with_jitter() {
-        let at = chrono::DateTime::parse_from_rfc3339("2026-09-01T12:00:00Z")
-            .expect("valid fixture timestamp")
-            .with_timezone(&chrono::Utc);
+        let at = "2026-09-01T12:00:00Z"
+            .parse::<Timestamp>()
+            .expect("valid fixture timestamp");
 
         let no_jitter = HarvestSchedule {
             next_run_at: Some(at),
@@ -19112,7 +19098,7 @@ mod tests {
             (
                 ShardId::new(0),
                 HarvestSchedule {
-                    exhausted_at: Some(chrono::Utc::now()),
+                    exhausted_at: Some(jiff::Timestamp::now()),
                     ..make_schedule(Some("e"), None, false)
                 },
             ),
@@ -19173,11 +19159,7 @@ mod tests {
         effective_at: Option<&str>,
         reason: &str,
     ) -> crate::api::ScheduleFirePreviewEntry {
-        let parse = |s: &str| {
-            chrono::DateTime::parse_from_rfc3339(s)
-                .expect("valid fixture timestamp")
-                .with_timezone(&chrono::Utc)
-        };
+        let parse = |s: &str| s.parse::<Timestamp>().expect("valid fixture timestamp");
         let effective = effective_at.map(parse);
         crate::api::ScheduleFirePreviewEntry {
             scheduled_at: parse(scheduled_at),
@@ -19207,7 +19189,7 @@ mod tests {
             ],
             is_paused: false,
             pause_reason: None,
-            from: chrono::Utc::now(),
+            from: jiff::Timestamp::now(),
             count_requested: 10,
             end_at: None,
             remaining_runs: None,
@@ -19241,7 +19223,7 @@ mod tests {
         let row = HarvestSchedule {
             max_runs: Some(5),
             runs_started: 5,
-            exhausted_at: Some(chrono::Utc::now()),
+            exhausted_at: Some(jiff::Timestamp::now()),
             exhausted_reason: Some("max_runs_exhausted".to_string()),
             ..make_schedule(Some("payments"), None, false)
         };
@@ -19249,7 +19231,7 @@ mod tests {
             entries: vec![],
             is_paused: false,
             pause_reason: None,
-            from: chrono::Utc::now(),
+            from: jiff::Timestamp::now(),
             count_requested: 10,
             end_at: None,
             remaining_runs: Some(0),
@@ -19275,7 +19257,7 @@ mod tests {
             entries: vec![],
             is_paused: true,
             pause_reason: Some("operator hold".to_string()),
-            from: chrono::Utc::now(),
+            from: jiff::Timestamp::now(),
             count_requested: 10,
             end_at: None,
             remaining_runs: None,
@@ -19297,11 +19279,7 @@ mod tests {
         origin: &str,
         nominal: Option<&str>,
     ) -> crate::schedule_runs::ScheduleRunEntry {
-        let parse = |s: &str| {
-            chrono::DateTime::parse_from_rfc3339(s)
-                .expect("valid fixture timestamp")
-                .with_timezone(&chrono::Utc)
-        };
+        let parse = |s: &str| s.parse::<Timestamp>().expect("valid fixture timestamp");
         crate::schedule_runs::ScheduleRunEntry {
             execution_id: uuid::Uuid::new_v4(),
             nominal_fire_time: nominal.map(parse),
@@ -19365,10 +19343,9 @@ mod tests {
                 "run must link to the execution detail view: {html}"
             );
         }
-        // Origin names and state names also appear in the page chrome (the
-        // summary note, the footer's "Backfill" link) and in the inlined
-        // stylesheet's `.COMPLETED` / `.FAILED` rules, so assert on the actual
-        // table cells.
+        // Origin and state names also appear in the page chrome (the summary
+        // note, the footer's "Backfill" link) and in the stylesheet's
+        // `.COMPLETED` / `.FAILED` rules. So assert on the table cells.
         for origin in ["scheduled", "backfill", "manual_trigger"] {
             assert!(
                 html.contains(&format!("<td><code>{origin}</code></td>")),
@@ -19535,11 +19512,7 @@ mod tests {
     fn backfill_confirm_shows_planned_count_before_dispatch() {
         let row = make_schedule(Some("payments"), None, false);
         let id = row.id.to_string();
-        let parse = |s: &str| {
-            chrono::DateTime::parse_from_rfc3339(s)
-                .expect("valid fixture timestamp")
-                .with_timezone(&chrono::Utc)
-        };
+        let parse = |s: &str| s.parse::<Timestamp>().expect("valid fixture timestamp");
         let dry_run = crate::api::ScheduleBackfillResponse {
             status: "dry_run".to_string(),
             schedule_id: row.id,
@@ -19598,11 +19571,7 @@ mod tests {
     #[test]
     fn backfill_confirm_disables_dispatch_for_an_empty_window() {
         let row = make_schedule(Some("payments"), None, false);
-        let parse = |s: &str| {
-            chrono::DateTime::parse_from_rfc3339(s)
-                .expect("valid fixture timestamp")
-                .with_timezone(&chrono::Utc)
-        };
+        let parse = |s: &str| s.parse::<Timestamp>().expect("valid fixture timestamp");
         let dry_run = crate::api::ScheduleBackfillResponse {
             status: "dry_run".to_string(),
             schedule_id: row.id,
@@ -19665,10 +19634,9 @@ mod tests {
         assert!(ok.include_paused);
     }
 
-    /// Collect the contents of every `onsubmit="…"` attribute in a document, so a
-    /// test can assert on what actually reaches the inline JavaScript context
-    /// rather than on the document as a whole (where an escaped name is harmless
-    /// display text).
+    /// Collect the contents of every `onsubmit="…"` attribute in a document.
+    /// A test can then assert on what reaches the inline JavaScript context.
+    /// In the document as a whole, an escaped name is harmless display text.
     fn onsubmit_attribute_values(html: &str) -> Vec<String> {
         html.match_indices("onsubmit=\"")
             .filter_map(|(start, marker)| {
@@ -19680,7 +19648,7 @@ mod tests {
             .collect()
     }
 
-    /// Names never reach a JavaScript string literal: confirmations interpolate
+    /// Names never reach a JavaScript string literal. Confirmations interpolate
     /// only the schedule UUID, so a hostile workflow name cannot break out of the
     /// inline `confirm('...')` handler.
     #[test]
@@ -19732,11 +19700,11 @@ mod tests {
 
     /// The polarity of `dry_run` versus the UI's `commit` stage.
     ///
-    /// These are opposites, and getting them the same way round makes the
+    /// These are opposites. Getting them the same way round makes the
     /// "Preview backfill" button *dispatch* while the confirmation button only
-    /// projects — with the confirmation page still reading "Nothing has been
-    /// dispatched yet." over the counts of runs it just launched. Pinned here as
-    /// a pure test because the end-to-end version needs a database.
+    /// projects. The confirmation page then reads "Nothing has been dispatched
+    /// yet." over the counts of runs it just launched. This is a pure test
+    /// because the end-to-end version needs a database.
     #[test]
     fn backfill_request_dry_run_is_the_inverse_of_the_commit_stage() {
         let params = BackfillFormParams {
@@ -19777,8 +19745,14 @@ mod tests {
         )
         .expect("a well-formed window parses");
         let request = params.to_request(true).expect("converts");
-        assert_eq!(request.from.to_rfc3339(), "2026-08-01T00:00:00+00:00");
-        assert_eq!(request.to.to_rfc3339(), "2026-08-02T06:30:00+00:00");
+        assert_eq!(
+            autumn_harvest::time::rfc3339(request.from),
+            "2026-08-01T00:00:00+00:00"
+        );
+        assert_eq!(
+            autumn_harvest::time::rfc3339(request.to),
+            "2026-08-02T06:30:00+00:00"
+        );
         assert_eq!(request.max_count, Some(42));
         assert!(request.include_paused);
         // And the normalised strings the confirmation round-trips are the same
@@ -19930,7 +19904,7 @@ mod tests {
         assert!(filters.matches(ShardId::new(0), &unhealthy));
     }
 
-    /// Codex review on #1437 (P1): a malformed `shard_id` in a bulk-action
+    /// PR #1437: a malformed `shard_id` in a bulk-action
     /// POST must reject the request. It must not silently drop to "no
     /// shard restriction" and pause/resume schedules on every shard,
     /// instead of the one the operator scoped the action to.
@@ -19989,7 +19963,7 @@ mod tests {
         assert_eq!(filters.shard_id, None);
     }
 
-    /// Codex review on #1437 (P2): a bulk-action redirect used to always
+    /// PR #1437: a bulk-action redirect used to always
     /// land on a bare, unfiltered `schedules?flash=…`. That dropped
     /// whatever the operator was filtered to, including an unresolved
     /// invalid value and its inline error. `schedule_bulk_redirect_to`
@@ -20030,7 +20004,7 @@ mod tests {
             // A form-decoded control character (a raw newline, here)
             // would make `HeaderValue::try_from` reject the `Location`
             // header. That is an internal error after a mutation that
-            // already succeeded (Codex review, #1437 P2).
+            // already succeeded (#1437).
             "../schedules?x=a\nb",
         ] {
             let response = schedule_bulk_redirect_to(Some(unsafe_value), "Paused 1");
@@ -20112,11 +20086,7 @@ mod tests {
     #[test]
     fn backfill_confirm_refuses_to_offer_a_commit_for_a_paused_dag() {
         let row = make_schedule(None, Some("nightly_etl"), true);
-        let parse = |s: &str| {
-            chrono::DateTime::parse_from_rfc3339(s)
-                .expect("valid fixture timestamp")
-                .with_timezone(&chrono::Utc)
-        };
+        let parse = |s: &str| s.parse::<Timestamp>().expect("valid fixture timestamp");
         let dry_run = crate::api::ScheduleBackfillResponse {
             status: "dry_run".to_string(),
             schedule_id: row.id,
@@ -20198,9 +20168,9 @@ mod tests {
             summary.contains("30 paused"),
             "the summary must count every filtered row: {summary}"
         );
-        // A page slice would report 25 with the default page size; the page
-        // renderer is handed the full-set summary, so the value it displays is
-        // the one computed here.
+        // A page slice would report 25 with the default page size. The page
+        // renderer gets the full-set summary, so it displays the value
+        // computed here.
         let page: Vec<(ShardId, HarvestSchedule)> = all.iter().take(25).cloned().collect();
         assert!(schedule_health_summary(&page).contains("25 paused"));
     }
@@ -20209,7 +20179,7 @@ mod tests {
     #[test]
     fn health_badges_render_bare_exhausted_without_a_reason() {
         let row = HarvestSchedule {
-            exhausted_at: Some(chrono::Utc::now()),
+            exhausted_at: Some(jiff::Timestamp::now()),
             exhausted_reason: None,
             ..make_schedule(Some("wf"), None, false)
         };
@@ -20275,11 +20245,11 @@ mod tests {
         );
     }
 
-    // -- Codex round 1 regressions --
+    // -- Backfill window and auto-pause regressions --
 
-    /// Codex #1: a submitted window with sub-second precision must reach the API
-    /// unchanged. `SecondsFormat::Secs` truncated both bounds, and an `interval:`
-    /// backfill treats `from` as its first slot — so `…00.900Z` normalised to
+    /// Issue #951: a submitted window with sub-second precision must reach the
+    /// API unchanged. `SecondsFormat::Secs` truncated both bounds. An `interval:`
+    /// backfill treats `from` as its first slot. So `…00.900Z` normalised to
     /// `…00Z` shifts every slot in the plan rather than merely respelling it.
     #[test]
     fn backfill_window_preserves_sub_second_precision() {
@@ -20298,11 +20268,11 @@ mod tests {
 
         let request = params.to_request(true).expect("converts");
         assert_eq!(
-            request.from.timestamp_subsec_millis(),
+            request.from.subsec_millisecond(),
             900,
             "the request must carry the submitted precision"
         );
-        assert_eq!(request.to.timestamp_subsec_millis(), 250);
+        assert_eq!(request.to.subsec_millisecond(), 250);
 
         // A whole-second window still normalises to the clean spelling.
         let whole =
@@ -20312,7 +20282,7 @@ mod tests {
         assert_eq!(whole.to, "2026-08-02T00:00:00Z");
     }
 
-    /// Codex #3: the scheduler's auto-pause (#360) sets `auto_paused_at` without
+    /// Issue #951: the scheduler's auto-pause (#360) sets `auto_paused_at` without
     /// setting `is_paused`, so a row can be non-firing with `is_paused = false`.
     /// Keying the row actions on `is_paused` alone showed an "Auto-paused" badge
     /// next to a **Pause** button, leaving no way to restore firing.
@@ -20320,7 +20290,7 @@ mod tests {
     fn an_auto_paused_schedule_is_offered_resume_not_pause() {
         let auto_paused = HarvestSchedule {
             is_paused: false,
-            auto_paused_at: Some(chrono::Utc::now()),
+            auto_paused_at: Some(jiff::Timestamp::now()),
             consecutive_failure_count: 5,
             ..make_schedule(Some("flaky_wf"), None, false)
         };
@@ -20371,9 +20341,9 @@ mod tests {
         assert!(!html.contains(&format!("schedules/{active_id}/resume")));
     }
 
-    // -- Codex round 2 regressions --
+    // -- Unlimited run cap and exhaustion regressions --
 
-    /// Codex #1: `max_runs = 0` is the engine's "unlimited" (every bound check
+    /// Issue #951: `max_runs = 0` is the engine's "unlimited" (every bound check
     /// guards on `max > 0`, pinned by `backfill_max_runs_zero_is_treated_as_unlimited`),
     /// so it must not render as a spent budget.
     #[test]
@@ -20389,7 +20359,7 @@ mod tests {
             "max_runs = 0 must not render a budget at all"
         );
         assert!(
-            !schedule_is_bounded_out(&unlimited_by_zero, chrono::Utc::now()),
+            !schedule_is_bounded_out(&unlimited_by_zero, jiff::Timestamp::now()),
             "max_runs = 0 must never count as bounded out"
         );
         assert!(
@@ -20398,13 +20368,13 @@ mod tests {
         );
     }
 
-    /// Codex #3: `exhausted_at` is stamped asynchronously, so a row can be
+    /// Issue #951: `exhausted_at` is stamped asynchronously, so a row can be
     /// terminal on its live bounds while the column is still NULL. Reading the
-    /// column alone rendered such a row as a calm Active schedule that the
-    /// health filter excluded and the sort put below the unhealthy rows.
+    /// column alone rendered such a row as a calm Active schedule. The health
+    /// filter excluded it, and the sort put it below the unhealthy rows.
     #[test]
     fn a_row_bounded_out_before_its_tick_stamped_it_reads_exhausted() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
 
         let budget_spent = HarvestSchedule {
             max_runs: Some(5),
@@ -20422,7 +20392,7 @@ mod tests {
         );
 
         let past_cutoff = HarvestSchedule {
-            end_at: Some(now - chrono::Duration::hours(1)),
+            end_at: Some(now - jiff::SignedDuration::from_hours(1)),
             exhausted_at: None,
             ..make_schedule(Some("cutoff_wf"), None, false)
         };
@@ -20432,7 +20402,7 @@ mod tests {
 
         // A cutoff still in the future is not bounded out.
         let future_cutoff = HarvestSchedule {
-            end_at: Some(now + chrono::Duration::hours(1)),
+            end_at: Some(now + jiff::SignedDuration::from_hours(1)),
             ..make_schedule(Some("future_wf"), None, false)
         };
         assert!(!schedule_is_bounded_out(&future_cutoff, now));
@@ -20443,16 +20413,16 @@ mod tests {
     /// just the badge — that was the substance of the finding.
     #[test]
     fn a_live_bounded_out_row_is_filtered_and_sorted_as_unhealthy() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let bounded_out = HarvestSchedule {
             max_runs: Some(3),
             runs_started: 3,
             exhausted_at: None,
-            next_run_at: Some(now + chrono::Duration::hours(10)),
+            next_run_at: Some(now + jiff::SignedDuration::from_hours(10)),
             ..make_schedule(Some("z_bounded"), None, false)
         };
         let healthy = HarvestSchedule {
-            next_run_at: Some(now + chrono::Duration::minutes(1)),
+            next_run_at: Some(now + jiff::SignedDuration::from_mins(1)),
             ..make_schedule(Some("a_healthy"), None, false)
         };
 
@@ -20477,21 +20447,21 @@ mod tests {
         );
     }
 
-    // -- Codex round 3 regressions --
+    // -- Pending-slot bound and auto-pause preview regressions --
 
-    /// Codex r3 #1: the `end_at` bound is about the pending slot, not the wall
+    /// Issue #951: the `end_at` bound is about the pending slot, not the wall
     /// clock. `schedule_overdue` tests `next_run_at >= end_at`; comparing `now`
     /// is wrong in both directions.
     #[test]
     fn end_at_exhaustion_is_judged_on_the_pending_slot() {
-        let now = chrono::Utc::now();
-        let cutoff = now + chrono::Duration::hours(2);
+        let now = jiff::Timestamp::now();
+        let cutoff = now + jiff::SignedDuration::from_hours(2);
 
         // Next slot is already past the cutoff, but the clock is not: the
         // scheduler will never fire this again, so it is bounded out.
         let slot_past_cutoff = HarvestSchedule {
             end_at: Some(cutoff),
-            next_run_at: Some(cutoff + chrono::Duration::minutes(1)),
+            next_run_at: Some(cutoff + jiff::SignedDuration::from_mins(1)),
             ..make_schedule(Some("slot_past"), None, false)
         };
         assert!(
@@ -20502,8 +20472,8 @@ mod tests {
         // The clock has passed the cutoff, but an overdue slot from before it is
         // still legal and the tick will process it: NOT bounded out.
         let overdue_legal_slot = HarvestSchedule {
-            end_at: Some(now - chrono::Duration::hours(1)),
-            next_run_at: Some(now - chrono::Duration::hours(2)),
+            end_at: Some(now - jiff::SignedDuration::from_hours(1)),
+            next_run_at: Some(now - jiff::SignedDuration::from_hours(2)),
             ..make_schedule(Some("overdue_legal"), None, false)
         };
         assert!(
@@ -20514,14 +20484,14 @@ mod tests {
         // A slot comfortably before the cutoff is fine.
         let healthy = HarvestSchedule {
             end_at: Some(cutoff),
-            next_run_at: Some(now + chrono::Duration::minutes(5)),
+            next_run_at: Some(now + jiff::SignedDuration::from_mins(5)),
             ..make_schedule(Some("healthy"), None, false)
         };
         assert!(!schedule_is_bounded_out(&healthy, now));
 
         // No pending slot at all: fall back to the wall clock.
         let no_slot_past_cutoff = HarvestSchedule {
-            end_at: Some(now - chrono::Duration::hours(1)),
+            end_at: Some(now - jiff::SignedDuration::from_hours(1)),
             next_run_at: None,
             ..make_schedule(Some("no_slot"), None, false)
         };
@@ -20535,9 +20505,9 @@ mod tests {
         assert!(!schedule_is_bounded_out(&no_slot_before_cutoff, now));
     }
 
-    /// Codex r3 #2: `max_runs = 0` is unlimited, so the *preview* must not report
-    /// a spent budget either. The list cell was corrected in round 2 while the
-    /// shared computation still mapped the raw cap.
+    /// `max_runs = 0` is unlimited, so the *preview* must not report a spent
+    /// budget either. The list cell and the shared computation must both map
+    /// the raw cap to unlimited.
     #[test]
     fn a_zero_run_cap_is_unlimited_in_the_shared_budget_helper() {
         assert_eq!(
@@ -20555,13 +20525,13 @@ mod tests {
         );
     }
 
-    /// Codex r3 #3: an auto-paused schedule previews empty, and the page says
+    /// Issue #951: an auto-paused schedule previews empty, and the page says
     /// why rather than blaming the expression.
     #[test]
     fn preview_page_explains_an_auto_paused_schedule() {
         let row = HarvestSchedule {
             is_paused: false,
-            auto_paused_at: Some(chrono::Utc::now()),
+            auto_paused_at: Some(jiff::Timestamp::now()),
             consecutive_failure_count: 4,
             ..make_schedule(Some("flaky_wf"), None, false)
         };
@@ -20571,7 +20541,7 @@ mod tests {
             pause_reason: Some(
                 "auto-paused after 4 consecutive failures; resume to restore firing".to_string(),
             ),
-            from: chrono::Utc::now(),
+            from: jiff::Timestamp::now(),
             count_requested: 10,
             end_at: None,
             remaining_runs: None,
@@ -20603,12 +20573,12 @@ mod tests {
     /// tick never fires it again.
     #[test]
     fn end_at_exhaustion_accounts_for_jitter() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000001293")
             .expect("valid fixture uuid");
-        let next_run_at = chrono::DateTime::parse_from_rfc3339("2026-09-01T12:00:00Z")
-            .expect("valid fixture timestamp")
-            .with_timezone(&chrono::Utc);
+        let next_run_at = "2026-09-01T12:00:00Z"
+            .parse::<Timestamp>()
+            .expect("valid fixture timestamp");
         let jitter_secs = 300i64;
 
         let offset = autumn_harvest::policy::compute_jitter_offset(
@@ -20617,7 +20587,7 @@ mod tests {
             std::time::Duration::from_secs(jitter_secs.cast_unsigned()),
         );
         let effective_fire_time = next_run_at
-            + chrono::Duration::from_std(offset).expect("offset fits in a chrono duration");
+            + jiff::SignedDuration::try_from(offset).expect("offset fits in a jiff duration");
         assert!(
             effective_fire_time > next_run_at,
             "fixture needs a non-zero offset to exercise the jitter path"
@@ -20642,7 +20612,7 @@ mod tests {
         let unjittered = HarvestSchedule {
             next_run_at: Some(next_run_at),
             jitter_secs: 0,
-            end_at: Some(next_run_at + chrono::Duration::minutes(1)),
+            end_at: Some(next_run_at + jiff::SignedDuration::from_mins(1)),
             ..make_schedule(Some("plain_wf"), None, false)
         };
         assert!(!schedule_is_bounded_out(&unjittered, now));
@@ -20656,9 +20626,9 @@ mod tests {
     fn jitter_past_cutoff_row() -> HarvestSchedule {
         let id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000001568")
             .expect("valid fixture uuid");
-        let next_run_at = chrono::DateTime::parse_from_rfc3339("2026-09-01T12:00:00Z")
-            .expect("valid fixture timestamp")
-            .with_timezone(&chrono::Utc);
+        let next_run_at = "2026-09-01T12:00:00Z"
+            .parse::<Timestamp>()
+            .expect("valid fixture timestamp");
         let jitter_secs = 300i64;
         let effective = crate::api::effective_fire_time(id, Some(next_run_at), jitter_secs)
             .expect("jittered schedule has an effective fire time");
@@ -20676,7 +20646,7 @@ mod tests {
     /// rebased slot, so the check must judge the raw slot only.
     #[test]
     fn end_at_exhaustion_ignores_jitter_when_calendar_is_set() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let row = HarvestSchedule {
             calendar_name: Some("us_holidays".to_string()),
             ..jitter_past_cutoff_row()
@@ -20699,7 +20669,7 @@ mod tests {
     /// `MostRecent` and `Window` can pick a later slot than `next_run_at`.
     #[test]
     fn end_at_exhaustion_ignores_jitter_for_slot_selecting_catchup() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         for (policy, window_secs) in [("most_recent", None), ("window", Some(3600))] {
             let row = HarvestSchedule {
                 catchup: true,
@@ -20718,7 +20688,7 @@ mod tests {
     /// keep the jitter-adjusted judgement from issue #1293.
     #[test]
     fn end_at_exhaustion_keeps_jitter_for_first_slot_catchup() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         for (policy, catchup) in [
             (Some("skip_all"), false),
             (Some("unbounded"), true),
@@ -20740,7 +20710,7 @@ mod tests {
     /// A calendar alone forces the raw slot, whatever the catchup policy is.
     #[test]
     fn end_at_exhaustion_calendar_overrides_first_slot_catchup() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         for policy in ["skip_all", "unbounded"] {
             let row = HarvestSchedule {
                 calendar_name: Some("us_holidays".to_string()),
@@ -20758,7 +20728,7 @@ mod tests {
     /// scheduler does. `Window` with no seconds still selects a slot.
     #[test]
     fn end_at_exhaustion_catchup_fallbacks_match_the_scheduler() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         for catchup in [false, true] {
             let unknown = HarvestSchedule {
                 catchup,
@@ -20781,11 +20751,11 @@ mod tests {
     /// A calendar with no pending slot still falls back to the wall clock.
     #[test]
     fn end_at_exhaustion_calendar_with_no_slot_uses_wall_clock() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         let row = HarvestSchedule {
             next_run_at: None,
             calendar_name: Some("us_holidays".to_string()),
-            end_at: Some(now - chrono::Duration::hours(1)),
+            end_at: Some(now - jiff::SignedDuration::from_hours(1)),
             ..jitter_past_cutoff_row()
         };
         assert!(schedule_is_bounded_out(&row, now));
@@ -20796,12 +20766,12 @@ mod tests {
     /// `None`, regardless of `jitter_secs`.
     #[test]
     fn end_at_exhaustion_falls_back_to_wall_clock_with_no_pending_slot() {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
 
         let no_slot_past_cutoff = HarvestSchedule {
             next_run_at: None,
             jitter_secs: 300,
-            end_at: Some(now - chrono::Duration::hours(1)),
+            end_at: Some(now - jiff::SignedDuration::from_hours(1)),
             ..make_schedule(Some("no_slot_jittered"), None, false)
         };
         assert!(schedule_is_bounded_out(&no_slot_past_cutoff, now));
@@ -20809,7 +20779,7 @@ mod tests {
         let no_slot_before_cutoff = HarvestSchedule {
             next_run_at: None,
             jitter_secs: 300,
-            end_at: Some(now + chrono::Duration::hours(1)),
+            end_at: Some(now + jiff::SignedDuration::from_hours(1)),
             ..make_schedule(Some("no_slot_jittered_ok"), None, false)
         };
         assert!(!schedule_is_bounded_out(&no_slot_before_cutoff, now));
@@ -20820,11 +20790,7 @@ mod tests {
     #[test]
     fn backfill_confirm_handler_carries_only_escaped_identifiers() {
         let row = make_schedule(Some("evil'); alert(1);//"), None, false);
-        let parse = |s: &str| {
-            chrono::DateTime::parse_from_rfc3339(s)
-                .expect("valid fixture timestamp")
-                .with_timezone(&chrono::Utc)
-        };
+        let parse = |s: &str| s.parse::<Timestamp>().expect("valid fixture timestamp");
         let dry_run = crate::api::ScheduleBackfillResponse {
             status: "dry_run".to_string(),
             schedule_id: row.id,

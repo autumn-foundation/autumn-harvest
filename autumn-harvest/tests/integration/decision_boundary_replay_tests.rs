@@ -149,7 +149,7 @@ fn failing<'a>(
 async fn a_failed_history_with_a_trailing_boundary_reproduces_the_failure() {
     let activity_id = autumn_harvest::types::ActivityExecId::new();
     let events = vec![
-        WorkflowEvent::workflow_started(json!({}), chrono::Utc::now()),
+        WorkflowEvent::workflow_started(json!({}), jiff::Timestamp::now()),
         WorkflowEvent::ActivityScheduled {
             activity_id,
             name: "reserve".into(),

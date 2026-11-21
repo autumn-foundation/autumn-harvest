@@ -1,0 +1,15 @@
+# Ledger profiles for `autumn-harvest-sqlite/src/fleet_epoch.rs`. See `docs/ledger/README.md`.
+
+["raise_on"]
+driver = "setup"
+backend = ["sqlite"]
+kind = ["ddl", "write"]
+tables = ["harvest_fleet_epoch"]
+measured = "unmeasured"
+
+["read_on"]
+driver = "setup"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_fleet_epoch"]
+measured = "unmeasured"

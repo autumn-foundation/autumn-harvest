@@ -1,9 +1,10 @@
 //! Postgres LISTEN/NOTIFY helpers for wake-on-enqueue.
 //!
-//! Instead of polling the task queue on a fixed interval, workers can subscribe
-//! to a Postgres NOTIFY channel and wake immediately when a new task is enqueued.
-//! This module provides the channel naming convention, the notification payload
-//! type, and a [`QueueListener`] that wraps `tokio-postgres` for async LISTEN.
+//! Workers can subscribe to a Postgres NOTIFY channel instead of polling the
+//! task queue on a fixed interval. They then wake immediately when a new task
+//! is enqueued. This module provides the channel naming convention, the
+//! notification payload type, and a [`QueueListener`] that wraps
+//! `tokio-postgres` for async LISTEN.
 //!
 //! # Post-commit delivery
 //!
@@ -44,18 +45,20 @@
 //! Polling stays the correctness floor. A lost wake costs latency, not work.
 //! [`send_failures`] counts lost wakes.
 
+use jiff_diesel::ToDiesel;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
 use deadpool::managed::WeakPool;
 use diesel::sql_types::Text;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection as _, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use uuid::Uuid;
 
+use crate::cached_stmt::CachePreparedDsl as _;
 use crate::error::{HarvestError, HarvestResult};
 
 // ---------------------------------------------------------------------------
@@ -109,8 +112,8 @@ pub const fn workflow_events_channel() -> &'static str {
 /// within Postgres' 63-byte identifier limit.
 ///
 /// Unlike [`workflow_events_channel`] (a single global channel fired on real
-/// event appends), progress is per-execution so a subscriber LISTENs only to
-/// the one run it is streaming and is never woken by unrelated workflows.
+/// event appends), progress is per-execution. A subscriber LISTENs only to the
+/// one run it streams, so unrelated workflows never wake it.
 ///
 /// # Examples
 ///
@@ -157,10 +160,6 @@ pub fn durable_stream_channel(exec_id: Uuid) -> String {
 fn quote_pg_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
-
-// ---------------------------------------------------------------------------
-// NotifyPayload
-// ---------------------------------------------------------------------------
 
 /// Payload sent via Postgres NOTIFY when a task is enqueued.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -793,6 +792,7 @@ async fn resolve_owner_notes(conn: &mut AsyncPgConnection, notes: &mut Vec<Note>
                  WHERE id = ANY($1::uuid[])",
             )
             .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(ids)
+            .cache_prepared()
             .load::<OwnerRow>(conn)
             .await
         })
@@ -848,6 +848,91 @@ pub(crate) fn settle_delay() -> Duration {
     let min = u64::try_from(SETTLE_DELAY_MIN.as_micros()).unwrap_or(u64::MAX);
     let max = u64::try_from(SETTLE_DELAY_MAX.as_micros()).unwrap_or(u64::MAX);
     Duration::from_micros(rand::rng().random_range(min..=max))
+}
+
+/// What the leader claim loop owes after a NOTIFY.
+///
+/// `T` is the end of a settle. The worker uses a `tokio` instant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SettleState<T> {
+    /// The leader owes nothing.
+    Clear,
+    /// The leader owes a fresh settle. One NOTIFY can cut it. Either a NOTIFY
+    /// woke the leader and its poll was empty, or a NOTIFY or an owner wake
+    /// waited at the end of a settle.
+    Due,
+    /// A NOTIFY cut the settle that ends at `T`. The leader owes the rest.
+    /// No NOTIFY cuts the rest, so a fleet cannot poll once per NOTIFY.
+    Rest(T),
+}
+
+/// The settle that the leader runs now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SettlePlan<T> {
+    /// No settle.
+    Skip,
+    /// A fresh settle of [`settle_delay`]. A NOTIFY can cut it.
+    Fresh,
+    /// The rest of a cut settle, up to `T`. Only a local decision end cuts
+    /// it.
+    Rest(T),
+}
+
+/// Give the settle that `state` owes. The caller takes `state` and leaves
+/// `Clear` in its place.
+///
+/// `formal/verus/src/notify_settle.rs` proves the function for every input.
+pub(crate) fn take_settle<T>(state: SettleState<T>) -> SettlePlan<T> {
+    match state {
+        SettleState::Clear => SettlePlan::Skip,
+        SettleState::Due => SettlePlan::Fresh,
+        SettleState::Rest(end) => SettlePlan::Rest(end),
+    }
+}
+
+/// Give the state after a NOTIFY arrives in the settle of `plan`, which
+/// ends at `end`.
+///
+/// Only a fresh settle gives a cut. The cut keeps `end`, so the leader still
+/// polls at the end of the settle. `None` means that the NOTIFY does not
+/// cut. `formal/verus/src/notify_settle.rs` proves the function for every
+/// input, and proves that each settle has one cut at most.
+pub(crate) const fn after_notify_cut<T: Copy>(
+    plan: SettlePlan<T>,
+    end: T,
+) -> Option<SettleState<T>> {
+    match plan {
+        SettlePlan::Fresh => Some(SettleState::Rest(end)),
+        SettlePlan::Skip | SettlePlan::Rest(_) => None,
+    }
+}
+
+/// Give the state after the settle of `plan` ends, at its end or at a local
+/// decision end.
+///
+/// A rest always owes a fresh settle. The NOTIFY that cut the settle can
+/// name a row that a host clock stamped early. The poll at the cut and the
+/// poll at the end can both come before that row is claimable. The fresh
+/// settle gives that NOTIFY its own margin, as a queued NOTIFY got before.
+///
+/// `queued` tells whether a NOTIFY waits at the end of a fresh settle. The
+/// poll after the settle comes after each such NOTIFY, so that poll covers
+/// it. The NOTIFY then needs no poll of its own, only a settle if that poll
+/// is empty. Without this, the next idle wait polls again at once. In a
+/// fleet under a steady NOTIFY stream, that poll is empty on each worker.
+///
+/// `formal/verus/src/notify_settle.rs` proves the function for every input.
+pub(crate) const fn after_settle<T: Copy>(plan: SettlePlan<T>, queued: bool) -> SettleState<T> {
+    match plan {
+        SettlePlan::Rest(_) => SettleState::Due,
+        SettlePlan::Skip | SettlePlan::Fresh => {
+            if queued {
+                SettleState::Due
+            } else {
+                SettleState::Clear
+            }
+        }
+    }
 }
 
 /// Notifications lost to an error since the process started.
@@ -915,7 +1000,7 @@ struct Fingerprint {
     /// `current_database()`.
     database: String,
     /// `pg_postmaster_start_time()`.
-    started_at: DateTime<Utc>,
+    started_at: Timestamp,
 }
 
 /// The database of a sender and when the sender last read it.
@@ -1272,25 +1357,44 @@ pub(crate) struct Stamp {
     database: String,
     /// `pg_postmaster_start_time()`.
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    started_at: DateTime<Utc>,
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+    started_at: Timestamp,
+}
+
+crate::const_sql! {
+    /// The id of the top-level transaction of the statement.
+    pub(crate) StampTxid: diesel::sql_types::Nullable<diesel::sql_types::BigInt> =
+        "txid_current()"
+}
+crate::const_sql! {
+    /// The database of the statement.
+    pub(crate) StampDatabase: Text = "current_database()::text"
+}
+crate::const_sql! {
+    /// The start time of the server of the statement.
+    pub(crate) StampStartedAt: diesel::sql_types::Timestamptz = "pg_postmaster_start_time()"
 }
 
 /// The `RETURNING` expressions of a [`Stamp`].
+///
+/// Each one is a constant fragment (issue #2651). A write that returns its
+/// stamp therefore stays a cached prepared statement. A `sql::<T>()`
+/// fragment made each such write parse and plan again.
 pub(crate) type StampReturning = (
-    diesel::expression::SqlLiteral<diesel::sql_types::Nullable<diesel::sql_types::BigInt>>,
-    diesel::expression::SqlLiteral<Text>,
-    diesel::expression::SqlLiteral<diesel::sql_types::Timestamptz>,
+    crate::cached_stmt::ConstSql<StampTxid>,
+    crate::cached_stmt::ConstSql<StampDatabase>,
+    crate::cached_stmt::ConstSql<StampStartedAt>,
 );
 
 /// The `RETURNING` expressions that make a write return its [`Stamp`].
 ///
 /// `txid_current()` gives the id of the top-level transaction, also inside a
 /// savepoint. Every row of one statement returns the same values.
-pub(crate) fn stamp_returning() -> StampReturning {
+pub(crate) const fn stamp_returning() -> StampReturning {
     (
-        diesel::dsl::sql("txid_current()"),
-        diesel::dsl::sql("current_database()::text"),
-        diesel::dsl::sql("pg_postmaster_start_time()"),
+        crate::cached_stmt::ConstSql::new(),
+        crate::cached_stmt::ConstSql::new(),
+        crate::cached_stmt::ConstSql::new(),
     )
 }
 
@@ -1472,18 +1576,20 @@ async fn stage_now(
 /// that wrote. After an autocommit write it reads NULL, because that write
 /// already committed.
 async fn probe(conn: &mut AsyncPgConnection, in_tx: bool) -> diesel::QueryResult<Stamp> {
-    let txid = if in_tx {
-        "txid_current()"
-    } else {
-        "txid_current_if_assigned()"
-    };
-    diesel::sql_query(format!(
-        "SELECT {txid} AS txid, \
+    // Two constant texts, so the connection caches each one (issue #2651).
+    let sql = if in_tx {
+        "SELECT txid_current() AS txid, \
                 current_database()::text AS database, \
                 pg_postmaster_start_time() AS started_at"
-    ))
-    .get_result::<Stamp>(conn)
-    .await
+    } else {
+        "SELECT txid_current_if_assigned() AS txid, \
+                current_database()::text AS database, \
+                pg_postmaster_start_time() AS started_at"
+    };
+    diesel::sql_query(sql)
+        .cache_prepared()
+        .get_result::<Stamp>(conn)
+        .await
 }
 
 /// The fallback: send `notes` on the write connection.
@@ -1639,7 +1745,7 @@ async fn send_outside_diesel_transaction(
 }
 
 /// The start of the Postgres message for SQLSTATE `25P02`.
-const ABORTED_BLOCK_MESSAGE: &str = "current transaction is aborted";
+pub(crate) const ABORTED_BLOCK_MESSAGE: &str = "current transaction is aborted";
 
 /// True when the failed `probe` aborted a raw `BEGIN` block on `conn`.
 ///
@@ -1714,6 +1820,7 @@ async fn send_wakes(
     diesel::sql_query("SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)")
         .bind::<diesel::sql_types::Array<Text>, _>(channels)
         .bind::<diesel::sql_types::Array<Text>, _>(payloads)
+        .cache_prepared()
         .execute(conn)
         .await
         .map(drop)
@@ -1727,13 +1834,124 @@ struct GateRow {
     database: String,
     /// `pg_postmaster_start_time()`.
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    started_at: DateTime<Utc>,
+    #[diesel(deserialize_as = crate::time::sql::SqlTimestamp)]
+    started_at: Timestamp,
     /// `pg_notification_queue_usage()`.
     #[diesel(sql_type = diesel::sql_types::Double)]
     queue_usage: f64,
     /// `txid_status()` of each staged id, in order.
     #[diesel(sql_type = diesel::sql_types::Array<diesel::sql_types::Nullable<Text>>)]
     statuses: Vec<Option<String>>,
+    /// The number of wakes that the read sent, or `NULL` when it sent none.
+    /// Only [`GATE_AND_SEND_SQL`] fills it.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
+    sent: Option<i64>,
+}
+
+/// The commit-state read of [`tick`].
+///
+/// `txid_status` raises an error for an id that this server has not assigned
+/// yet. The `CASE` guard therefore reads no id at or past the snapshot `xmax`.
+/// No such transaction has completed, so the guard reports it in progress.
+macro_rules! gate_columns_sql {
+    () => {
+        "SELECT current_database()::text AS database, \
+                pg_postmaster_start_time() AS started_at, \
+                pg_notification_queue_usage() AS queue_usage, \
+                ARRAY(SELECT CASE WHEN t.x < txid_snapshot_xmax(txid_current_snapshot()) \
+                                  THEN txid_status(t.x) ELSE 'in progress' END \
+                      FROM unnest($1::bigint[]) WITH ORDINALITY AS t(x, n) \
+                      ORDER BY t.n) AS statuses"
+    };
+}
+
+/// The commit-state read alone. A tick runs it after [`GATE_AND_SEND_SQL`]
+/// fails, so a failed send still leaves a good read.
+const GATE_SQL: &str = concat!(gate_columns_sql!(), ", NULL::bigint AS sent");
+
+/// The commit-state read that also sends the wakes when every note is ready.
+///
+/// `$2` and `$3` are the server of every held note, `$4` and `$5` the
+/// channels and payloads of the wakes. The statement sends them only when
+/// the server is that server and no status is aborted or in progress. That is
+/// the case where [`tick`] sends every wake after the read. A `NULL` in `$2`
+/// turns the send off.
+///
+/// The send is a scalar subquery in a `CASE` branch. Postgres runs such a
+/// subquery only when the branch is taken.
+/// `a_rolled_back_write_sends_no_wake` and
+/// `a_committed_and_an_open_note_send_only_the_committed_wake` prove that an
+/// aborted or open note sends nothing. `array_position` reads a `NULL` status as no match, where
+/// `= ANY` would give `NULL`.
+const GATE_AND_SEND_SQL: &str = concat!(
+    "WITH g AS MATERIALIZED (",
+    gate_columns_sql!(),
+    ") SELECT g.database, g.started_at, g.queue_usage, g.statuses, \
+       CASE WHEN g.database = $2 AND g.started_at = $3 \
+                 AND array_position(g.statuses, 'aborted') IS NULL \
+                 AND array_position(g.statuses, 'in progress') IS NULL \
+            THEN (SELECT count(pg_notify(w.c, w.p)) \
+                  FROM unnest($4::text[], $5::text[]) AS w(c, p)) \
+       END AS sent \
+     FROM g"
+);
+
+/// The wakes that a tick sends with its read, and the server they need.
+///
+/// A tick can send in its read only when every held note names one server.
+/// The wakes are those of every note but the owner notes, which need a
+/// lookup first. `None` when no such wake exists.
+fn wakes_with_the_read(held: &[Staged]) -> Option<(Fingerprint, Vec<(String, String)>)> {
+    let first = held.first()?;
+    if held
+        .iter()
+        .any(|staged| staged.fingerprint != first.fingerprint)
+    {
+        return None;
+    }
+    let notes: Vec<Note> = held
+        .iter()
+        .filter(|staged| !matches!(staged.note, Note::Owner { .. }))
+        .map(|staged| staged.note.clone())
+        .collect();
+    let wakes = coalesce(notes);
+    if wakes.is_empty() {
+        return None;
+    }
+    Some(((*first.fingerprint).clone(), wakes))
+}
+
+/// Read the commit state, and send `wakes` in the same statement when every
+/// note is ready.
+async fn read_gate(
+    conn: &mut AsyncPgConnection,
+    txids: Vec<i64>,
+    wakes: Option<(Fingerprint, Vec<(String, String)>)>,
+) -> Result<GateRow, diesel::result::Error> {
+    use diesel::sql_types::{Array, BigInt, Nullable, Timestamptz};
+    let (server, wakes) = wakes.map_or((None, Vec::new()), |(fp, w)| (Some(fp), w));
+    let (channels, payloads): (Vec<String>, Vec<String>) = wakes.into_iter().unzip();
+    diesel::sql_query(GATE_AND_SEND_SQL)
+        .bind::<Array<BigInt>, _>(txids)
+        .bind::<Nullable<Text>, _>(server.as_ref().map(|fp| fp.database.as_str()))
+        .bind::<Nullable<Timestamptz>, _>(server.as_ref().map(|fp| fp.started_at).to_diesel())
+        .bind::<Array<Text>, _>(channels)
+        .bind::<Array<Text>, _>(payloads)
+        .cache_prepared()
+        .get_result::<GateRow>(conn)
+        .await
+}
+
+/// Read the commit state alone. See [`GATE_SQL`].
+async fn read_gate_only(
+    conn: &mut AsyncPgConnection,
+    txids: Vec<i64>,
+) -> Result<GateRow, diesel::result::Error> {
+    diesel::sql_query(GATE_SQL)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(txids)
+        .cache_prepared()
+        .get_result::<GateRow>(conn)
+        .await
 }
 
 /// The notes a sender task holds.
@@ -1852,26 +2070,28 @@ fn age_out(sink: &SinkShared, held: &mut Vec<Staged>) {
 /// A note staged against another server is dropped and counted, because its
 /// transaction id means nothing here.
 ///
-/// `txid_status` raises an error for an id that this server has not assigned
-/// yet. The `CASE` guard therefore reads no id at or past the snapshot `xmax`.
-/// No such transaction has completed, so the guard reports it in progress.
+/// In the common tick every note is ready, and the read also sends the wakes.
+/// See [`GATE_AND_SEND_SQL`]. Otherwise the read sends nothing, and the tick
+/// sends the ready wakes in a second statement. When the combined statement
+/// fails, the tick reads again with no send. A failure of the second send
+/// counts its wakes as lost.
+///
+/// A wake is a hint, so a rare duplicate is safe. When the connection drops
+/// after the combined statement commits, the read again fails, and the next
+/// tick sends the same wakes once more. A runtime that stops during the
+/// statement counts each held note as lost, even when its wake went out.
 ///
 /// Returns `false` when the commit state cannot be read. The notes then stay
 /// held for the next tick.
 async fn tick(sink: &SinkShared, conn: &mut AsyncPgConnection, held: &mut Vec<Staged>) -> bool {
     let txids: Vec<i64> = held.iter().filter_map(|staged| staged.txid).collect();
-    let gate = diesel::sql_query(
-        "SELECT current_database()::text AS database, \
-                pg_postmaster_start_time() AS started_at, \
-                pg_notification_queue_usage() AS queue_usage, \
-                ARRAY(SELECT CASE WHEN t.x < txid_snapshot_xmax(txid_current_snapshot()) \
-                                  THEN txid_status(t.x) ELSE 'in progress' END \
-                      FROM unnest($1::bigint[]) WITH ORDINALITY AS t(x, n) \
-                      ORDER BY t.n) AS statuses",
-    )
-    .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(txids)
-    .get_result::<GateRow>(conn)
-    .await;
+    let gate = match read_gate(conn, txids.clone(), wakes_with_the_read(held)).await {
+        Ok(gate) => Ok(gate),
+        Err(error) => {
+            tracing::debug!(error = %error, "harvest: notify read with its send failed");
+            read_gate_only(conn, txids).await
+        }
+    };
     let gate = match gate {
         Ok(gate) => gate,
         Err(error) => {
@@ -1879,6 +2099,7 @@ async fn tick(sink: &SinkShared, conn: &mut AsyncPgConnection, held: &mut Vec<St
             return false;
         }
     };
+    let sent_with_the_read = gate.sent;
     let fingerprint = Fingerprint {
         database: gate.database,
         started_at: gate.started_at,
@@ -1934,7 +2155,13 @@ async fn tick(sink: &SinkShared, conn: &mut AsyncPgConnection, held: &mut Vec<St
     sink.record(rejected, &"Postgres rejects the channel name");
     let wakes = coalesce(ready_notes);
     let count = wakes.len();
-    if count > 0 {
+    // The read sent these wakes only when every note was ready on this
+    // server. The classification above then found each note ready.
+    debug_assert!(
+        sent_with_the_read.is_none_or(|sent| usize::try_from(sent).ok() == Some(count)),
+        "the read sent the wakes of the tick"
+    );
+    if count > 0 && sent_with_the_read.is_none() {
         send_counted(sink, count, send_wakes(conn, wakes)).await;
     }
     if !owner_notes.is_empty() {
@@ -1991,11 +2218,11 @@ impl Drop for Unsent<'_> {
 /// Fire a `NOTIFY` carrying one ephemeral progress chunk on the per-execution
 /// progress channel (issue #791).
 ///
-/// Delivered on commit when called inside a transaction — so a rolled-back
-/// workflow-decision cycle's progress is discarded (never delivered) and the
-/// retried cycle re-fires live, and a committed chunk is delivered exactly once
-/// per commit. Best-effort by contract: callers should treat a failure as
-/// non-fatal (the chunk is disposable).
+/// Delivered on commit when called inside a transaction. So a rolled-back
+/// workflow-decision cycle's progress is discarded (never delivered), and the
+/// retried cycle re-fires live. A committed chunk is delivered exactly once per
+/// commit. Best-effort by contract: callers should treat a failure as non-fatal
+/// (the chunk is disposable).
 ///
 /// # Errors
 ///
@@ -2088,6 +2315,7 @@ pub async fn notify_activity_progress_batch(
     )
     .bind::<diesel::sql_types::Array<Text>, _>(&channels)
     .bind::<diesel::sql_types::Array<Text>, _>(&payloads)
+    .cache_prepared()
     .execute(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -2108,6 +2336,7 @@ async fn send_progress(
     diesel::sql_query("SELECT pg_notify($1, $2)")
         .bind::<Text, _>(&channel)
         .bind::<Text, _>(&payload)
+        .cache_prepared()
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -2260,10 +2489,6 @@ where
     ListenConnection { client, rx, driver }
 }
 
-// ---------------------------------------------------------------------------
-// QueueListener (using tokio-postgres)
-// ---------------------------------------------------------------------------
-
 /// Async listener for Postgres NOTIFY events on task queue channels.
 ///
 /// Uses a dedicated `tokio-postgres` connection (separate from the diesel pool)
@@ -2306,7 +2531,6 @@ impl QueueListener {
         let ListenConnection { client, rx, driver } =
             open_listen_connection(database_url, "postgres listener connection error").await?;
 
-        // Subscribe to all queue channels.
         for queue in queues {
             let channel = queue_channel(queue);
             let quoted_channel = quote_pg_identifier(&channel);
@@ -2366,6 +2590,18 @@ impl QueueListener {
             Ok(None) => Ok(QueueWaitOutcome::ChannelClosed),
             Err(_elapsed) => Ok(QueueWaitOutcome::TimedOut),
         }
+    }
+
+    /// Take each notification that is queued now, with no wait.
+    ///
+    /// Returns `true` when at least one was queued. A payload that does not
+    /// parse counts too, because it still marks a write.
+    pub(crate) fn take_queued(&mut self) -> bool {
+        let mut any = false;
+        while self.rx.try_recv().is_ok() {
+            any = true;
+        }
+        any
     }
 
     /// The queue names this listener is subscribed to.
@@ -2991,10 +3227,6 @@ fn parse_owner_wake(notification: &tokio_postgres::Notification) -> Option<Owner
     Some(OwnerWake { partition, payload })
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3301,6 +3533,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn take_settle_gives_the_plan_of_each_state() {
+        assert_eq!(take_settle(SettleState::<u32>::Clear), SettlePlan::Skip);
+        assert_eq!(take_settle(SettleState::<u32>::Due), SettlePlan::Fresh);
+        assert_eq!(take_settle(SettleState::Rest(7_u32)), SettlePlan::Rest(7));
+    }
+
+    #[test]
+    fn a_notify_cuts_a_fresh_settle_and_keeps_its_end() {
+        assert_eq!(
+            after_notify_cut(SettlePlan::Fresh, 9_u32),
+            Some(SettleState::Rest(9))
+        );
+        assert_eq!(
+            take_settle(SettleState::Rest(9_u32)),
+            SettlePlan::Rest(9),
+            "the rest must keep the end of the cut settle"
+        );
+    }
+
+    #[test]
+    fn a_queued_notify_at_the_end_owes_a_settle() {
+        assert_eq!(
+            after_settle(SettlePlan::<u32>::Fresh, true),
+            SettleState::Due
+        );
+        assert_eq!(
+            after_settle(SettlePlan::<u32>::Fresh, false),
+            SettleState::Clear
+        );
+    }
+
+    #[test]
+    fn a_rest_always_owes_a_settle_for_the_notify_that_cut_it() {
+        assert_eq!(
+            after_settle(SettlePlan::Rest(4_u32), false),
+            SettleState::Due
+        );
+        assert_eq!(
+            after_settle(SettlePlan::Rest(4_u32), true),
+            SettleState::Due
+        );
+    }
+
+    #[test]
+    fn a_notify_cuts_no_rest_and_no_skip() {
+        assert_eq!(after_notify_cut(SettlePlan::Rest(3_u32), 9), None);
+        assert_eq!(after_notify_cut(SettlePlan::<u32>::Skip, 9), None);
+    }
+
     // ── TLS for listener connections (issue #1717) ───────────────────────
 
     /// An `SSLRequest` message: length 8, then the code 80877103.
@@ -3596,10 +3878,10 @@ mod tests {
     fn progress_notify_payload_stays_within_pg_notify_limit() {
         // Postgres `pg_notify` payloads are hard-capped at 8000 bytes. The
         // context caps each chunk's serialized JSON at
-        // `PROGRESS_CHUNK_MAX_BYTES` (7000) and this envelope wraps it as
+        // `PROGRESS_CHUNK_MAX_BYTES` (7000), and this envelope wraps it as
         // `{"seq":..,"chunk":..}`. Pin the worst case directly: a max-`u64` seq
-        // (20 decimal digits) plus a chunk serialized right at the cap must
-        // still leave the whole envelope under the 8000-byte NOTIFY limit.
+        // (20 decimal digits) plus a chunk serialized right at the cap. The
+        // whole envelope must still stay under the 8000-byte NOTIFY limit.
         let cap = crate::context::PROGRESS_CHUNK_MAX_BYTES;
         // A JSON string of (cap - 2) chars serializes (with its two quotes) to
         // exactly `cap` bytes — the largest chunk the context will forward.
@@ -3655,7 +3937,7 @@ mod tests {
     fn test_note() -> (Arc<Fingerprint>, Vec<Note>) {
         let fingerprint = Fingerprint {
             database: "unused".into(),
-            started_at: DateTime::<Utc>::UNIX_EPOCH,
+            started_at: Timestamp::UNIX_EPOCH,
         };
         let note = Note::Task {
             channel: queue_channel("q"),
@@ -3736,7 +4018,7 @@ mod tests {
     async fn a_flush_waits_for_a_peer_sender_on_the_same_database() {
         let fingerprint = Fingerprint {
             database: "flush_peer_test".into(),
-            started_at: DateTime::<Utc>::UNIX_EPOCH,
+            started_at: Timestamp::UNIX_EPOCH,
         };
         let (_own_pool, own) = lazy_sink();
         let (_peer_pool, peer) = lazy_sink();
@@ -3810,5 +4092,71 @@ mod tests {
         assert_eq!(AtomicU64::load(&sink.failures, Ordering::Relaxed), 0);
         send_counted(&sink, 2, async { Err::<(), String>("refused".into()) }).await;
         assert_eq!(AtomicU64::load(&sink.failures, Ordering::Relaxed), 2);
+    }
+
+    fn staged(database: &str, note: Note) -> Staged {
+        Staged {
+            txid: Some(7),
+            fingerprint: Arc::new(Fingerprint {
+                database: database.into(),
+                started_at: Timestamp::UNIX_EPOCH,
+            }),
+            queued_at: Instant::now(),
+            note,
+        }
+    }
+
+    fn pending_task_note(channel: &str) -> Note {
+        Note::Task {
+            channel: channel.into(),
+            task_id: Uuid::new_v4(),
+        }
+    }
+
+    #[test]
+    fn the_read_sends_the_merged_wakes_of_one_server() {
+        let held = vec![
+            staged("a", pending_task_note("q1")),
+            staged("a", pending_task_note("q1")),
+            staged("a", pending_task_note("q2")),
+        ];
+        let (server, wakes) = wakes_with_the_read(&held).expect("one server");
+        assert_eq!(server.database, "a");
+        let notes = held.iter().map(|s| s.note.clone()).collect();
+        assert_eq!(wakes, coalesce(notes), "the same coalescing as a tick");
+        assert_eq!(wakes.len(), 2);
+    }
+
+    #[test]
+    fn the_read_sends_nothing_for_two_servers_or_owner_notes_only() {
+        assert!(wakes_with_the_read(&[]).is_none());
+        let mixed = vec![
+            staged("a", pending_task_note("q1")),
+            staged("b", pending_task_note("q1")),
+        ];
+        assert!(wakes_with_the_read(&mixed).is_none());
+        let owner = vec![staged(
+            "a",
+            Note::Owner {
+                exec_id: Uuid::new_v4(),
+                evict: false,
+                writer: None,
+                channel: String::new(),
+            },
+        )];
+        assert!(wakes_with_the_read(&owner).is_none());
+    }
+
+    #[test]
+    fn the_combined_read_sends_only_in_its_case_branch() {
+        assert!(GATE_AND_SEND_SQL.starts_with("WITH g AS MATERIALIZED ("));
+        assert!(GATE_AND_SEND_SQL.contains("array_position(g.statuses, 'aborted') IS NULL"));
+        assert!(GATE_AND_SEND_SQL.contains("array_position(g.statuses, 'in progress') IS NULL"));
+        assert!(GATE_AND_SEND_SQL.contains("g.database = $2 AND g.started_at = $3"));
+        assert_eq!(GATE_AND_SEND_SQL.matches("pg_notify(").count(), 1);
+        assert!(
+            !GATE_SQL.contains("pg_notify("),
+            "the plain read sends nothing"
+        );
     }
 }

@@ -5,25 +5,24 @@
 //! `docs/getting-started/13-broker-connectors.md` drifts from its compiled
 //! copy in `autumn-harvest-plugin/src/connector/binding.rs`.
 //!
-//! Mechanism this guards against: one section of the chapter is "Cutting a
+//! Mechanism this guards against: the chapter has a section "Cutting a
 //! binding over to a new cluster or a recreated topic". Its example called
-//! `.map_json(...)` with the wrong closure signature (PR #1523). A shell approximation of
-//! "does this closure type-check" kept acquiring new gaps. It checked arity,
-//! parameter types, return type and tail position, and each patch left
-//! another gap open. A markdown fence is never compiled anywhere else. No
-//! bound limits how many ways a hand-rolled pattern match can be wrong about
-//! Rust. A real compiler has no such gap.
+//! `.map_json(...)` with the wrong closure signature (PR #1523). A shell
+//! check of "does this closure type-check" kept acquiring new gaps. It
+//! covered arity, parameter types, return type and tail position, and each
+//! patch left another gap open. The markdown fence is never compiled
+//! anywhere else. A hand-rolled pattern match can be wrong about Rust in
+//! unbounded ways. A real compiler has no such gap.
 //!
-//! The fix: the example in the doc must be byte-identical to its compiled
-//! copy, module indentation aside. The copy is the block between the
-//! `cutover-example-start` and `cutover-example-end` markers in
-//! `cutover_example_from_getting_started_ch13_type_checks`. That test is an
-//! ordinary test in `autumn-harvest-plugin/src/connector/binding.rs`. CI's
-//! plugin feature lib-test step compiles and runs it. The `connector` filter
-//! of that step selects it, in
+//! The fix: the doc example must be byte-identical to its compiled copy,
+//! module indentation aside. The copy sits between the `cutover-example-start`
+//! and `cutover-example-end` markers in
+//! `cutover_example_from_getting_started_ch13_type_checks`, an ordinary test
+//! in `autumn-harvest-plugin/src/connector/binding.rs`. CI's plugin feature
+//! lib-test step compiles and runs it through its `connector` filter:
 //! `cargo test -p autumn-harvest-plugin --features connectors,... --lib -- connector ...`.
-//! So a real compile enforces the correctness of the example. The only job
-//! of this guard is to catch the doc and the compiled copy drifting apart.
+//! So a real compile checks the example. This guard only catches the doc and
+//! the compiled copy drifting apart.
 
 use std::path::Path;
 use std::process::ExitCode;

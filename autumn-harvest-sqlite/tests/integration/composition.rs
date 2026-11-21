@@ -21,7 +21,7 @@ use autumn_harvest_sqlite::{
     ActivitySpec, ExecutionOutcome, RunState, SqliteError, SqliteRuntime,
     UNSUPPORTED_FEATURE_ERROR_TYPE,
 };
-use chrono::{TimeZone, Utc};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
@@ -57,19 +57,14 @@ async fn child_typed_failure(ctx: &WorkflowContext, _n: i64) -> Result<i64, Work
         .with_details(json!({ "code": 51 })))
 }
 
-/// Completes, but its last cycle schedules an external activity. This
-/// backend still rejects that, so the child is sealed with a typed failure.
+/// Acquires a worker session. This backend still rejects that, so the runtime
+/// seals the child with a typed failure.
 #[workflow]
 async fn child_unsupported(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
-    // Poll the external activity once, so its command joins the last batch,
-    // then return without awaiting it.
-    let mut external =
-        std::pin::pin!(ctx.execute_activity_external("external", json!({}), "default", 60));
-    let _ = std::future::Future::poll(
-        external.as_mut(),
-        &mut std::task::Context::from_waker(std::task::Waker::noop()),
-    );
-    Ok(n)
+    ctx.create_session(SessionOptions::new("gpu"))
+        .await
+        .map(|_| n)
+        .map_err(|e| e.to_string())
 }
 
 /// Spawns the named child and reports the typed failure it observes.
@@ -993,7 +988,7 @@ async fn an_awaited_child_completes_after_retention_removes_its_parent() {
     rt.terminate(parent, "operator").unwrap();
     let purged = rt
         .purge_terminal_as_of(
-            Utc::now() + chrono::Duration::hours(2),
+            Timestamp::now() + jiff::SignedDuration::from_hours(2),
             std::time::Duration::from_secs(3600),
         )
         .unwrap();
@@ -1054,7 +1049,10 @@ async fn an_unsupported_child_surfaces_as_a_typed_failure() {
     rt.run_until_blocked(parent).await.unwrap();
     let out = completed(&rt, parent);
     assert_eq!(out["error_type"], json!(UNSUPPORTED_FEATURE_ERROR_TYPE));
-    assert_eq!(out["details"]["feature"], json!("ScheduleExternalActivity"));
+    assert_eq!(
+        out["details"]["feature"],
+        json!("ScheduleActivity.schedule_to_start_override")
+    );
     assert_eq!(out["non_retryable"], json!(true));
     assert_replays(&rt, parent, "parent_reports_child_failure").await;
 }
@@ -1139,14 +1137,14 @@ async fn a_child_timeout_race_cancels_the_losing_child() {
     let (_dir, path) = temp_db();
     let mut rt = SqliteRuntime::open(&path).unwrap();
     register_all(&mut rt);
-    let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let t0 = autumn_harvest::time::utc_ymd_hms(2026, 1, 1, 0, 0, 0).unwrap();
     let parent = rt.start_workflow("parent_child_timeout", json!(0)).unwrap();
 
     let state = rt.run_until_blocked_as_of(parent, t0).await.unwrap();
     assert!(matches!(state, RunState::WaitingWorkflow(_)), "{state:?}");
     let child = children_of(&rt, parent)[0];
 
-    let later = t0 + chrono::Duration::seconds(61);
+    let later = t0 + jiff::SignedDuration::from_secs(61);
     let state = rt.run_until_blocked_as_of(parent, later).await.unwrap();
     assert!(
         matches!(state, RunState::Completed(ref v) if v == &json!({ "child": null })),
@@ -2034,9 +2032,7 @@ async fn a_late_child_loses_to_a_due_deadline() {
     let mut rt = runtime();
     let clock = Arc::new(AtomicI64::new(1_767_225_600_000));
     let read = Arc::clone(&clock);
-    rt.set_clock(move || {
-        chrono::DateTime::from_timestamp_millis(read.load(Ordering::SeqCst)).unwrap()
-    });
+    rt.set_clock(move || jiff::Timestamp::from_millisecond(read.load(Ordering::SeqCst)).unwrap());
     let bump = Arc::clone(&clock);
     rt.register_activity_raw(
         "slow",
@@ -2244,9 +2240,7 @@ async fn a_query_on_a_child_sees_its_parent() {
 #[tokio::test]
 async fn a_long_terminal_cycle_loses_to_a_due_deadline() {
     let mut rt = runtime();
-    rt.set_clock(|| {
-        chrono::DateTime::from_timestamp_millis(BUSY_CLOCK.load(Ordering::SeqCst)).unwrap()
-    });
+    rt.set_clock(|| jiff::Timestamp::from_millisecond(BUSY_CLOCK.load(Ordering::SeqCst)).unwrap());
     let parent = rt
         .start_workflow("parent_child_timeout_busy", json!(0))
         .unwrap();
@@ -2275,7 +2269,7 @@ async fn a_long_terminal_cycle_loses_to_a_due_deadline() {
 async fn a_long_cancel_cleanup_loses_to_a_due_deadline() {
     let mut rt = runtime();
     rt.set_clock(|| {
-        chrono::DateTime::from_timestamp_millis(CANCEL_CLOCK.load(Ordering::SeqCst)).unwrap()
+        jiff::Timestamp::from_millisecond(CANCEL_CLOCK.load(Ordering::SeqCst)).unwrap()
     });
     let parent = rt
         .start_workflow("parent_child_timeout_cancel", json!(0))
@@ -2308,7 +2302,7 @@ async fn a_long_cancel_cleanup_loses_to_a_due_deadline() {
 async fn a_signal_sent_after_a_deadline_loses_to_it() {
     let mut rt = runtime();
     rt.set_clock(|| {
-        chrono::DateTime::from_timestamp_millis(SIGNAL_CLOCK.load(Ordering::SeqCst)).unwrap()
+        jiff::Timestamp::from_millisecond(SIGNAL_CLOCK.load(Ordering::SeqCst)).unwrap()
     });
     let target = rt.start_workflow("waits_for_go_briefly", json!(0)).unwrap();
     rt.run_until_blocked(target).await.unwrap();
@@ -2328,9 +2322,7 @@ async fn a_signal_sent_after_a_deadline_loses_to_it() {
 #[tokio::test]
 async fn a_long_final_panic_loses_to_a_due_deadline() {
     let mut rt = runtime();
-    rt.set_clock(|| {
-        chrono::DateTime::from_timestamp_millis(PANIC_CLOCK.load(Ordering::SeqCst)).unwrap()
-    });
+    rt.set_clock(|| jiff::Timestamp::from_millisecond(PANIC_CLOCK.load(Ordering::SeqCst)).unwrap());
     let parent = rt
         .start_workflow("parent_child_timeout_panic", json!(0))
         .unwrap();
@@ -2452,9 +2444,7 @@ async fn a_timed_out_parent_applies_its_close_policy() {
     let mut rt = runtime();
     let clock = Arc::new(AtomicI64::new(1_767_225_600_000));
     let read = Arc::clone(&clock);
-    rt.set_clock(move || {
-        chrono::DateTime::from_timestamp_millis(read.load(Ordering::SeqCst)).unwrap()
-    });
+    rt.set_clock(move || jiff::Timestamp::from_millisecond(read.load(Ordering::SeqCst)).unwrap());
     let parent = rt
         .start_workflow("spawns_then_times_out", json!(0))
         .unwrap();
@@ -2489,9 +2479,7 @@ async fn an_awaited_child_times_out_by_its_declared_timeout() {
     let mut rt = runtime();
     let clock = Arc::new(AtomicI64::new(1_767_225_600_000));
     let read = Arc::clone(&clock);
-    rt.set_clock(move || {
-        chrono::DateTime::from_timestamp_millis(read.load(Ordering::SeqCst)).unwrap()
-    });
+    rt.set_clock(move || jiff::Timestamp::from_millisecond(read.load(Ordering::SeqCst)).unwrap());
     let parent = rt
         .start_workflow("parent_reports_child_failure", json!("timed_child"))
         .unwrap();

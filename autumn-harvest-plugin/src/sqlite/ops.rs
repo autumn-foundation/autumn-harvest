@@ -36,7 +36,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -64,6 +64,7 @@ pub fn routes(flags: &HarvestApiState) -> Router<ApiState> {
         // Static paths win over `{id}`. These have no SQLite port.
         .route("/admin/schedules/decisions", any(not_ported))
         .route("/admin/schedules/preview", any(not_ported))
+        .route("/admin/schedules/herd", any(not_ported))
         .route(
             "/admin/schedules/{id}",
             get(get_one).patch(patch).delete(delete),
@@ -97,8 +98,8 @@ struct Entry {
     timezone: String,
     is_paused: bool,
     pause_reason: Option<String>,
-    next_run_at: Option<DateTime<Utc>>,
-    last_run_at: Option<DateTime<Utc>>,
+    next_run_at: Option<Timestamp>,
+    last_run_at: Option<Timestamp>,
     max_active_runs: u32,
     catchup: bool,
     workflow_input: Value,
@@ -173,8 +174,11 @@ struct CreateBody {
     skip_policy: Option<String>,
     #[serde(default)]
     consecutive_failure_limit: Option<u32>,
-    #[serde(default)]
-    end_at: Option<DateTime<Utc>>,
+    #[serde(
+        default,
+        deserialize_with = "autumn_harvest::time::parse::de::optional"
+    )]
+    end_at: Option<Timestamp>,
     #[serde(default)]
     max_runs: Option<u32>,
     #[serde(default)]
@@ -255,14 +259,15 @@ impl PatchBody {
 
     /// The Postgres `check_override_fields`, before any write.
     ///
-    /// A code schedule takes its input from code. A clear stands alone,
+    /// This backend has no payload codecs, so a code schedule takes its input
+    /// from code. Postgres takes an input override. A clear stands alone,
     /// because the other fields resolve against the stored override. An API
     /// schedule has no override, so a clear or a reason is a mistake.
     fn check_override_fields(&self, code: bool, id: uuid::Uuid) -> Result<(), AutumnError> {
         let refusal = if code && self.input.is_some() {
             Some(format!(
-                "schedule {id} is declared in code; its input is set in code and an override \
-                 cannot change it"
+                "schedule {id} is declared in code; the SQLite backend has no payload codecs, \
+                 so an override cannot change its input"
             ))
         } else if code && self.clear_override && self.has_edit_fields() {
             Some(format!(
@@ -833,7 +838,7 @@ async fn trigger_inner(
     let handle = state.handle()?;
     let stored = load_one(&handle, id).await?;
     let name = stored.workflow_name.clone();
-    let triggered_at = Utc::now();
+    let triggered_at = Timestamp::now();
     let outcome = handle
         .run(move |runtime| runtime.trigger_schedule(&name, force, overlap))
         .await

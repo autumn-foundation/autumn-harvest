@@ -5,7 +5,7 @@
 
 use autumn_harvest::admission_gate::{AdmissionGate, AdmissionGateId, GateScope, check_admission};
 use autumn_harvest::error::HarvestError;
-use chrono::Utc;
+use jiff::Timestamp;
 use uuid::Uuid;
 
 fn make_gate(scope: GateScope, reason: &str) -> AdmissionGate {
@@ -15,23 +15,19 @@ fn make_gate(scope: GateScope, reason: &str) -> AdmissionGate {
         reason: reason.to_string(),
         message: None,
         created_by: "test-operator".to_string(),
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         expires_at: None,
     }
 }
 
-fn make_expiring_gate(
-    scope: GateScope,
-    reason: &str,
-    expires: chrono::DateTime<Utc>,
-) -> AdmissionGate {
+fn make_expiring_gate(scope: GateScope, reason: &str, expires: jiff::Timestamp) -> AdmissionGate {
     AdmissionGate {
         id: AdmissionGateId(Uuid::new_v4()),
         scope,
         reason: reason.to_string(),
         message: None,
         created_by: "test-operator".to_string(),
-        created_at: Utc::now(),
+        created_at: Timestamp::now(),
         expires_at: Some(expires),
     }
 }
@@ -167,7 +163,7 @@ fn owner_scope_does_not_match_no_owner() {
 
 #[test]
 fn expired_gate_does_not_block() {
-    let past = Utc::now() - chrono::Duration::hours(1);
+    let past = Timestamp::now() - jiff::SignedDuration::from_hours(1);
     let gates = [make_expiring_gate(
         GateScope::Fleet,
         "expired incident",
@@ -179,7 +175,7 @@ fn expired_gate_does_not_block() {
 
 #[test]
 fn future_expiry_gate_blocks() {
-    let future = Utc::now() + chrono::Duration::hours(1);
+    let future = Timestamp::now() + jiff::SignedDuration::from_hours(1);
     let gates = [make_expiring_gate(
         GateScope::Fleet,
         "live incident",
@@ -226,7 +222,7 @@ fn first_matching_gate_is_returned() {
 
 #[test]
 fn or_semantics_any_matching_gate_blocks() {
-    // gate1 is scoped to queue-A (won't match queue-B), gate2 is fleet
+    // gate1 is scoped to queue-A (will not match queue-B), gate2 is fleet
     let gates = [
         make_gate(GateScope::Queue("queue-A".to_string()), "queue A down"),
         make_gate(GateScope::Fleet, "full incident"),
@@ -328,7 +324,7 @@ fn gate_id_display_matches_inner_uuid() {
 #[test]
 fn max_active_gates_constant_is_documented() {
     // Confirm the constant exists and has a reasonable bound. Read through a
-    // runtime variable so clippy::assertions_on_constants doesn't fire.
+    // runtime variable so clippy::assertions_on_constants does not fire.
     let cap = autumn_harvest::admission_gate::MAX_ACTIVE_GATES;
     assert!(
         cap >= 10,

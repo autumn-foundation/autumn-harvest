@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use autumn_web::AppState;
 use autumn_web::error::AutumnError;
-use chrono::NaiveDateTime;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use serde::{Deserialize, Serialize};
@@ -68,11 +67,15 @@ struct HarvestWorkflowOutboxRow {
     delivery_attempts: i64,
     last_error: Option<String>,
     delivered_execution_id: Option<String>,
-    delivered_at: Option<NaiveDateTime>,
-    next_attempt_at: NaiveDateTime,
-    claimed_at: Option<NaiveDateTime>,
+    #[diesel(deserialize_as = jiff_diesel::NullableDateTime)]
+    delivered_at: Option<jiff::civil::DateTime>,
+    #[diesel(deserialize_as = jiff_diesel::DateTime)]
+    next_attempt_at: jiff::civil::DateTime,
+    #[diesel(deserialize_as = jiff_diesel::NullableDateTime)]
+    claimed_at: Option<jiff::civil::DateTime>,
     claimed_by: Option<String>,
-    created_at: NaiveDateTime,
+    #[diesel(deserialize_as = jiff_diesel::DateTime)]
+    created_at: jiff::civil::DateTime,
 }
 
 #[derive(diesel::Insertable)]
@@ -114,12 +117,10 @@ impl HarvestWorkflowOutboxRow {
 /// # Errors
 ///
 /// Returns a Diesel error if the outbox insert cannot be executed, or if
-/// `request.workflow_id` is an explicit empty string (issue #1353, Codex
-/// review). `diesel::result::Error` has no dedicated variant for a rejected
-/// precondition, so `QueryBuilderError` carries it -- the query is never
-/// even built. Rejecting here, not only at dispatch time, means a
-/// successful `Ok(())` never promises delivery of a row that can never
-/// start.
+/// `request.workflow_id` is an explicit empty string (issue #1353).
+/// `diesel::result::Error` has no variant for a rejected precondition, so
+/// `QueryBuilderError` carries it. The query is never built. Rejecting here,
+/// not only at dispatch, means `Ok(())` never promises a row that cannot start.
 pub async fn enqueue_workflow_start_outbox(
     conn: &mut AsyncPgConnection,
     request: &WorkflowStartRequest,
@@ -177,16 +178,14 @@ pub async fn drain_workflow_start_outbox_once(
 /// A row stays claimed -- unreachable by any relay's reclaim, and for a
 /// failed row, unreachable for its own retry -- until its mark flushes.
 /// Flushing every `OUTBOX_MARK_FLUSH_EVERY` outcomes bounds that wait to
-/// a handful of dispatches. The alternative, flushing only once after
-/// the whole batch has dispatched, bounds it to the rest of the batch
-/// instead (issue #1620 review, Codex).
+/// a handful of dispatches. One flush after the whole batch would bound it
+/// to the rest of the batch instead (issue #1620).
 ///
 /// This bound alone is on outcome COUNT, not elapsed time. Dispatch does
 /// not touch `app_conn`. A flush CAN run while one dispatch is still in
 /// flight -- see the `tokio::select!` in the drain loop below. Without
 /// that race, a single long-running dispatch would hold every row already
-/// queued in its chunk. It would hold them for that whole call's duration
-/// (issue #1620 review, Codex, second and third rounds).
+/// queued in its chunk. It would hold them for that whole call's duration.
 /// `OUTBOX_MARK_FLUSH_MAX_DELAY` below bounds that case too.
 const OUTBOX_MARK_FLUSH_EVERY: usize = 8;
 
@@ -197,16 +196,16 @@ const OUTBOX_MARK_FLUSH_EVERY: usize = 8;
 const OUTBOX_MARK_FLUSH_MAX_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Margin subtracted from `claim_ttl_ms` before computing the claim
-/// deadline (issue #1620 review, Codex, seventh round). Waking the flush
-/// timer exactly at claim expiry leaves no time for the mark query's own
-/// round trip. A concurrent relay can win a reclaim race in that gap.
-/// Ten percent of the TTL, capped at one second, trades a small part of
-/// the claim window for headroom. `.max(1)` keeps that trade real for
+/// deadline (issue #1620). Waking the flush timer exactly at claim
+/// expiry leaves no time for the mark query's own round trip. A
+/// concurrent relay can win a reclaim race in that gap. Ten percent of
+/// the TTL, capped at one second, trades a small part of the claim
+/// window for headroom. `.max(1)` keeps that trade real for
 /// every validated TTL (`claim_ttl_ms >= 1`). Plain integer division
-/// truncates a tenth of anything under 10ms to zero (issue #1620 review,
-/// Codex, ninth round), silently dropping the margin back to none. The
-/// final `.min(claim_ttl_ms)` caps it at the TTL itself, so a 1ms TTL
-/// reserves its own whole window rather than a margin bigger than it.
+/// truncates a tenth of anything under 10ms to zero, which drops the
+/// margin back to none. The final `.min(claim_ttl_ms)` caps it at the
+/// TTL itself, so a 1ms TTL reserves its own whole window rather than a
+/// margin bigger than it.
 fn claim_flush_margin_ms(claim_ttl_ms: u64) -> u64 {
     (claim_ttl_ms / 10).max(1).min(claim_ttl_ms).min(1_000)
 }
@@ -217,9 +216,8 @@ fn claim_flush_margin_ms(claim_ttl_ms: u64) -> u64 {
 /// from the inner `select!` that races a flush deadline against a still
 /// in-flight dispatch. `tokio::select!` picks arbitrarily among branches
 /// ready at the same time. So the post-dispatch check cannot rely on the
-/// timer branch alone ever winning (issue #1620 review, Codex, eighth
-/// round). `deadline` is the soonest of three candidates
-/// (issue #1620 review, Codex, fifth round). The fixed `last_flush +
+/// timer branch alone ever winning (issue #1620). `deadline` is the
+/// soonest of three candidates. The fixed `last_flush +
 /// OUTBOX_MARK_FLUSH_MAX_DELAY` bound. Any failed row's own configured
 /// retry deadline -- a short `base_retry_delay_ms` must not wait behind
 /// the fixed bound. `claim_deadline`, while anything is pending, so a
@@ -245,10 +243,9 @@ fn outbox_mark_flush_remaining(
 }
 
 /// Whether pending marks are due to flush right now -- the post-dispatch
-/// check's own yes/no form of `outbox_mark_flush_remaining` (issue #1620
-/// review, Codex, eighth round). See that function's doc comment for why
-/// this check cannot rely on the inner loop's `select!` timer branch
-/// alone.
+/// check's own yes/no form of `outbox_mark_flush_remaining` (issue #1620).
+/// See that function's doc comment for why this check cannot rely on the
+/// inner loop's `select!` timer branch alone.
 fn outbox_mark_flush_due_now(
     now: std::time::Instant,
     pending: usize,
@@ -298,16 +295,16 @@ async fn drain_workflow_start_outbox_batch(
         .get()
         .await
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
-    // Captured BEFORE the claim query, not after (issue #1620 review,
-    // Codex, sixth round). Postgres sets `claimed_at = NOW()` inside
-    // that query. A pre-call Instant is always <= the real claim time.
+    // Captured BEFORE the claim query, not after (issue #1620). Postgres
+    // sets `claimed_at = NOW()` inside that query. A pre-call Instant is
+    // always <= the real claim time.
     let claim_started_at = std::time::Instant::now();
     let rows = claim_due_outbox_rows(&mut app_conn, limit.max(1), &claimant, &config)
         .await
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
     // One claim query sets `claimed_at` for every row in this batch.
-    // One deadline stands in for all of them (issue #1620 review, Codex,
-    // fifth and seventh rounds). See `claim_flush_margin_ms`.
+    // One deadline stands in for all of them (issue #1620). See
+    // `claim_flush_margin_ms`.
     let claim_deadline = claim_started_at
         + Duration::from_millis(
             config
@@ -315,7 +312,7 @@ async fn drain_workflow_start_outbox_batch(
                 .saturating_sub(claim_flush_margin_ms(config.claim_ttl_ms)),
         );
 
-    // issue #618, F-round8: the metrics recorder for the exempt-with-bypass-counter
+    // issue #618: the metrics recorder for the exempt-with-bypass-counter
     // "outbox" producer. Fetched once; the bypass is counted per row only AFTER the
     // app outbox row is durably marked delivered (see below).
     let outbox_metrics = state
@@ -328,13 +325,13 @@ async fn drain_workflow_start_outbox_batch(
     // $2`. It differs only in its bound values. This collects the marks
     // here and flushes them in chunks of `OUTBOX_MARK_FLUSH_EVERY`, below.
     // That replaces one mark per row (issue #1620, Ledger) and also
-    // replaces one mark for the whole batch (issue #1620 review, Codex).
+    // replaces one mark for the whole batch (issue #1620).
     let claimed = rows.len();
     let mut delivered = 0_usize;
     let mut delivered_marks: Vec<(i64, ExecutionId)> = Vec::new();
     // The retry deadline is captured as a monotonic `Instant`, not a
-    // duration, right when each row's own dispatch fails (issue #1620
-    // review). A later row's dispatch can still be running at that
+    // duration, right when each row's own dispatch fails (issue #1620).
+    // A later row's dispatch can still be running at that
     // point. The flush computes the deadline once it runs. Capturing it
     // here instead keeps this row's actual backoff close to
     // `retry_delay_ms`, whatever the rest of the chunk took.
@@ -342,9 +339,9 @@ async fn drain_workflow_start_outbox_batch(
     let mut last_flush = std::time::Instant::now();
     for row in rows {
         // `dispatch_workflow_start_request` uses its own `HarvestDbPool`
-        // connection (issue #1620 review, Codex, third round). So
-        // `app_conn` is idle for the whole call. Race the dispatch
-        // future against a periodic flush deadline below.
+        // connection (issue #1620). So `app_conn` is idle for the whole
+        // call. Race the dispatch future against a periodic flush deadline
+        // below.
         let request = row.request();
         let dispatch_fut = dispatch_workflow_start_request(state, &request);
         tokio::pin!(dispatch_fut);
@@ -361,9 +358,8 @@ async fn drain_workflow_start_outbox_batch(
                 result = &mut dispatch_fut => break result,
                 // Guard on `pending > 0`, not "already due". `select!`
                 // evaluates a guard once per call, not on every poll
-                // (issue #1620 review, Codex, fourth round). A
-                // not-yet-due guard would disable this branch for the
-                // rest of the call. `remaining` decides WHEN it fires.
+                // (issue #1620). A not-yet-due guard would disable this
+                // branch for the rest of the call. `remaining` decides WHEN it fires.
                 () = tokio::time::sleep(remaining), if pending > 0 => {
                     delivered += flush_outbox_marks_or_err(
                         &mut app_conn,
@@ -387,8 +383,8 @@ async fn drain_workflow_start_outbox_batch(
             }
         }
 
-        // See `outbox_mark_flush_due_now` (issue #1620 review, Codex,
-        // eighth round) for why this cannot be a simpler check.
+        // See `outbox_mark_flush_due_now` (issue #1620) for why this
+        // cannot be a simpler check.
         let pending = delivered_marks.len() + failed_marks.len();
         let flush_due = outbox_mark_flush_due_now(
             std::time::Instant::now(),
@@ -455,7 +451,7 @@ async fn flush_outbox_marks(
     // reclaims.
     //
     // Recorded HERE, right after the delivered mark commits, and before
-    // the failed-row mark below (issue #1620 review). The two marks are
+    // the failed-row mark below (issue #1620). The two marks are
     // separate statements, not one transaction. Recording the metric
     // only after BOTH marks ran would risk this: a failure in the
     // failed-row mark returns early via `?`. That would permanently
@@ -481,10 +477,7 @@ async fn flush_outbox_marks(
     Ok(delivered)
 }
 
-/// `flush_outbox_marks`, converting its error and propagating with `?`.
-/// Three call sites in the drain loop below need exactly this; factored
-/// out so each is one line instead of repeating the same `.await
-/// .map_err(...)` boilerplate.
+/// `flush_outbox_marks`, with its error converted to an [`AutumnError`].
 async fn flush_outbox_marks_or_err(
     conn: &mut AsyncPgConnection,
     claimant: &str,
@@ -513,7 +506,6 @@ async fn flush_outbox_marks_or_err(
 /// Returns an [`AutumnError`] when claiming or marking any outbox row fails. On SQLite, it
 /// also fails when the driver has stopped, or when an activity or a workflow calls it.
 pub async fn flush_workflow_start_outbox(state: &AppState) -> Result<usize, AutumnError> {
-    // A SQLite app in embedded mode drains its own outbox (issue #2470).
     #[cfg(feature = "sqlite")]
     if let Some(outbox) = state.extension::<crate::sqlite::SqliteOutbox>() {
         return outbox.flush().await;
@@ -578,7 +570,7 @@ pub(crate) async fn dispatch_workflow_start_request(
     state: &AppState,
     request: &WorkflowStartRequest,
 ) -> HarvestResult<ExecutionId> {
-    // issue #1353 (Codex review): `enqueue_workflow_start_outbox` below
+    // issue #1353: `enqueue_workflow_start_outbox` below
     // already rejects a NEW empty workflow_id before persisting it. This is
     // the backstop for a row enqueued before that admission guard shipped.
     // Such a legacy row would otherwise retry with backoff forever. This
@@ -627,28 +619,30 @@ pub(crate) async fn dispatch_workflow_start_request(
     let max_workflow_attempts_ceiling = registry_ext
         .as_ref()
         .and_then(|registry| registry.max_workflow_attempts_ceiling);
-    let sla = info_sla.and_then(|d| chrono::Duration::from_std(d).ok());
+    let sla = info_sla.and_then(autumn_harvest::time::from_std_bounded);
     // The start clamps the timeout to the fleet ceiling, and the SLA to the
     // timeout, as on the API start path.
-    let to_chrono =
-        |d: std::time::Duration| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX);
-    let execution_timeout = info_execution_timeout.map(to_chrono);
+    let to_signed = |d: std::time::Duration| {
+        autumn_harvest::time::from_std_bounded(d)
+            .unwrap_or(autumn_harvest::time::CHRONO_MAX_DURATION)
+    };
+    let execution_timeout = info_execution_timeout.map(to_signed);
     let max_execution_timeout_ceiling = registry_ext
         .as_ref()
         .and_then(|registry| registry.max_workflow_execution_timeout)
-        .map(to_chrono);
+        .map(to_signed);
     // Issue #2406: an outbox start begins a new chain. It takes the chain cap
     // of the type, the operator override and the fleet chain ceiling, as the
     // API start does.
-    let to_chrono_opt = |d: std::time::Duration| chrono::Duration::from_std(d).ok();
+    let to_signed_opt = autumn_harvest::time::from_std_bounded;
     let chain_execution_timeout = registry_ext
         .as_ref()
         .and_then(|registry| registry.chain_execution_timeout(&request.workflow_name))
-        .and_then(to_chrono_opt);
+        .and_then(to_signed_opt);
     let max_workflow_chain_timeout_ceiling = registry_ext
         .as_ref()
         .and_then(|registry| registry.max_workflow_chain_timeout)
-        .and_then(to_chrono_opt);
+        .and_then(to_signed_opt);
 
     // Issue #1243: `WorkflowStarted.input` is payload-bearing. Fall back to
     // the identity registry only when no `HandlerRegistry` extension is
@@ -695,20 +689,20 @@ pub(crate) async fn dispatch_workflow_start_request(
     .await?;
 
     // issue #618: the outbox relay is EXEMPT-BY-DESIGN from the admission gate.
-    // It replays workflow-start requests that were durably committed to the
-    // outbox before any gate was raised; gating them would drop already-accepted
-    // in-flight work, which is the opposite of the gate contract ("halt NEW
-    // starts while in-flight work drains").
+    // It replays workflow-start requests durably committed to the outbox
+    // before any gate was raised. Gating them would drop already-accepted
+    // in-flight work. That breaks the gate
+    // contract ("halt NEW starts while in-flight work drains").
     //
-    // The `harvest.admission.bypassed{producer="outbox"}` count is recorded by the
-    // CALLER (`drain_workflow_start_outbox_batch`), gated on the app outbox row
-    // being DURABLY marked delivered (issue #618, F-round8) — NOT here. The start
-    // succeeding is not the exactly-once boundary: if `mark_outbox_row_delivered`
-    // then fails, the row stays eligible past its claim TTL and the retry re-enters
-    // this path (`start_or_load` returns the SAME existing execution), so counting
-    // here would report one committed start as multiple bypasses. Counting only
-    // once the mark succeeds mirrors round 6's "gate the count on the row delete
-    // actually removing the row". See `admission_gate::producer_contract`.
+    // The CALLER (`drain_workflow_start_outbox_batch`) records the
+    // `harvest.admission.bypassed{producer="outbox"}` count, NOT this function.
+    // It counts only once the app outbox row is DURABLY marked delivered.
+    // A successful start is not the exactly-once boundary. If
+    // `mark_outbox_row_delivered` then fails, the row stays eligible past its
+    // claim TTL. The retry re-enters this path, and `start_or_load` returns the
+    // SAME execution. So a count here would report one start as many bypasses.
+    // This mirrors the delete-path rule: count only when the delete removes the
+    // row. See `admission_gate::producer_contract`.
     Ok(start.exec_id)
 }
 
@@ -814,13 +808,13 @@ async fn mark_outbox_rows_delivered_batch(
 }
 
 /// A `Duration` rounded up to whole milliseconds, never truncated down
-/// (issue #1620 review, Codex, tenth round). `Duration::as_millis`
-/// truncates. A genuinely positive sub-millisecond remainder is possible
-/// whenever `base_retry_delay_ms` is configured near its 1ms validated
-/// minimum. Truncating it would silently become a 0ms retry delay --
-/// retrying an unexpired deadline immediately. `div_ceil` on nanoseconds
-/// still returns exactly 0 for `Duration::ZERO` (a deadline already at
-/// or past `now`), only rounding a positive remainder up.
+/// (issue #1620). `Duration::as_millis` truncates. A genuinely positive
+/// sub-millisecond remainder is possible whenever `base_retry_delay_ms`
+/// is configured near its 1ms validated minimum. Truncating it would
+/// silently become a 0ms retry delay -- retrying an unexpired deadline
+/// immediately. `div_ceil` on nanoseconds still returns exactly 0 for
+/// `Duration::ZERO` (a deadline already at or past `now`), only rounding
+/// a positive remainder up.
 fn remaining_ms_rounded_up(remaining: std::time::Duration) -> i64 {
     i64::try_from(remaining.as_nanos().div_ceil(1_000_000)).unwrap_or(i64::MAX)
 }
@@ -845,11 +839,6 @@ async fn mark_outbox_rows_failed_batch(
     }
     let ids: Vec<i64> = rows.iter().map(|(id, _, _)| *id).collect();
     let errors: Vec<&str> = rows.iter().map(|(_, error, _)| error.as_str()).collect();
-    // Each `deadline` was computed from THIS row's own dispatch failure,
-    // not from when the batch's remaining dispatches finish (issue
-    // #1620 review). Re-deriving the remaining delay here, right before
-    // the query, keeps that row's own backoff close to
-    // `retry_delay_ms`, whatever the rest of the batch took.
     let now = std::time::Instant::now();
     let delays: Vec<i64> = rows
         .iter()
@@ -901,12 +890,11 @@ pub(crate) fn retry_delay_for_attempts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
 
     /// `outbox_mark_flush_remaining` picks the soonest of its three
-    /// candidate deadlines (issue #1620 review, Codex, fifth round). The
-    /// fixed bound, the earliest failed-row deadline, and the claim
-    /// deadline -- the last one only while something is pending.
+    /// candidate deadlines (issue #1620). The fixed bound, the earliest
+    /// failed-row deadline, and the claim deadline -- the last one only
+    /// while something is pending.
     #[test]
     fn outbox_mark_flush_remaining_picks_the_soonest_candidate() {
         use std::time::Duration;
@@ -945,7 +933,7 @@ mod tests {
     }
 
     /// The post-dispatch check's yes/no form of the same decision (issue
-    /// #1620 review, Codex, eighth round).
+    /// #1620).
     #[test]
     fn outbox_mark_flush_due_now_matches_zero_remaining() {
         use std::time::Duration;
@@ -971,12 +959,11 @@ mod tests {
         );
     }
 
-    /// Ten percent of the TTL, capped at one second (issue #1620 review,
-    /// Codex, seventh round). At least 1ms whenever `claim_ttl_ms >= 1`
-    /// (ninth round): plain integer division truncates a tenth of
-    /// anything under 10ms to zero. Never more than the TTL itself, so
-    /// `claim_ttl_ms.saturating_sub(margin)` never underflows to a
-    /// deadline before `claim_started_at`.
+    /// Ten percent of the TTL, capped at one second (issue #1620). At
+    /// least 1ms whenever `claim_ttl_ms >= 1`: plain integer division
+    /// truncates a tenth of anything under 10ms to zero. Never more than
+    /// the TTL itself, so `claim_ttl_ms.saturating_sub(margin)` never
+    /// underflows to a deadline before `claim_started_at`.
     #[test]
     fn claim_flush_margin_ms_is_a_tenth_of_ttl_capped_at_one_second() {
         assert_eq!(claim_flush_margin_ms(30_000), 1_000, "default TTL: capped");
@@ -993,7 +980,7 @@ mod tests {
         );
     }
 
-    /// Rounds up, never down (issue #1620 review, Codex, tenth round).
+    /// Rounds up, never down (issue #1620).
     /// `Duration::as_millis` alone would truncate a positive
     /// sub-millisecond remainder to 0. That retries an unexpired
     /// deadline immediately when `base_retry_delay_ms` is close to its
@@ -1048,16 +1035,16 @@ mod tests {
             last_error: None,
             delivered_execution_id: None,
             delivered_at: None,
-            next_attempt_at: Utc::now().naive_utc(),
+            next_attempt_at: autumn_harvest::time::utc_datetime(jiff::Timestamp::now()),
             claimed_at: None,
             claimed_by: None,
-            created_at: Utc::now().naive_utc(),
+            created_at: autumn_harvest::time::utc_datetime(jiff::Timestamp::now()),
         };
 
         assert_eq!(retry_delay_ms(&config, &row), 10_000);
     }
 
-    /// issue #1353 (Codex review, pure, no DB): `dispatch_workflow_start_request`
+    /// issue #1353 (pure, no DB): `dispatch_workflow_start_request`
     /// rejects an empty `workflow_id` before touching any state extension.
     /// This test therefore runs against a bare `AppState` with nothing
     /// installed. A caller of the public `enqueue_workflow_start_outbox`
@@ -1231,7 +1218,8 @@ mod tests {
             #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
             last_error: Option<String>,
             #[diesel(sql_type = diesel::sql_types::Timestamp)]
-            next_attempt_at: chrono::NaiveDateTime,
+            #[diesel(deserialize_as = jiff_diesel::DateTime)]
+            next_attempt_at: jiff::civil::DateTime,
         }
 
         let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") else {
@@ -1360,7 +1348,7 @@ mod tests {
     /// Exercises `flush_outbox_marks` the way the chunked drain loop calls
     /// it: once per chunk, not once for the whole batch. A slow later
     /// dispatch must not hold an earlier row's claim past
-    /// `OUTBOX_MARK_FLUSH_EVERY` outcomes (issue #1620 review, Codex).
+    /// `OUTBOX_MARK_FLUSH_EVERY` outcomes (issue #1620).
     /// Two sequential chunks, each with one delivered and one failed
     /// row, must mark all four rows and leave both buffers empty after
     /// every call.

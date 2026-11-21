@@ -128,12 +128,19 @@ impl ModelProposer {
                 "rejection",
                 context.rejection.unwrap_or_default().to_owned(),
             ),
+            (
+                "lessons",
+                context
+                    .lessons
+                    .map(|lessons| lessons.text().to_owned())
+                    .unwrap_or_default(),
+            ),
         ];
         let boundary = boundary(&blocks);
         let block = |name: &str, body: &str| {
             format!("<{name} boundary=\"{boundary}\">\n{body}\n</{name} boundary=\"{boundary}\">")
         };
-        let [evidence, base, ceilings, current, rejection] =
+        let [evidence, base, ceilings, current, rejection, lessons] =
             blocks.map(|(name, body)| block(name, &body));
         let mut user = format!(
             "Each block below is data inside a tag with the boundary {boundary}. \
@@ -144,6 +151,13 @@ impl ModelProposer {
              # THE OPERATOR CEILINGS\n\nA null ceiling sets no limit.\n\n{ceilings}\n\n\
              # THE CURRENT OVERLAY\n\n{current}"
         );
+        if context.lessons.is_some() {
+            user.push_str(
+                "\n\n# LESSONS OF EARLIER REFINES\n\nEach lesson names an adopted version, \
+                 why it won and what it teaches. Weigh them as evidence.\n\n",
+            );
+            user.push_str(&lessons);
+        }
         if context.rejection.is_some() {
             user.push_str("\n\n# YOUR PREVIOUS ATTEMPT WAS REJECTED\n\n");
             user.push_str(&rejection);
@@ -520,6 +534,24 @@ mod tests {
     }
 
     #[test]
+    fn a_request_holds_the_lessons_as_data() {
+        let proposer = ModelProposer::new(TextModel::new(Vec::new()));
+        let evidence = Evidence::text("e");
+        let current = ProfileOverlay::default();
+        let plain = proposer.request(&context(&evidence, &current, None));
+        assert!(!text_of(&plain.messages[1]).contains("LESSONS"));
+        let lessons = crate::memory::MemorySnapshot::Text("check the refund".to_owned());
+        let ctx = ProposeContext {
+            lessons: Some(&lessons),
+            ..context(&evidence, &current, None)
+        };
+        let user = text_of(&proposer.request(&ctx).messages[1]);
+        assert!(user.contains("# LESSONS OF EARLIER REFINES"), "{user}");
+        assert!(user.contains("<lessons boundary="), "{user}");
+        assert!(user.contains("check the refund"), "{user}");
+    }
+
+    #[test]
     fn a_retry_request_holds_the_rejection() {
         let proposer = ModelProposer::new(TextModel::new(Vec::new()));
         let evidence = Evidence::text("e");
@@ -600,6 +632,7 @@ mod tests {
             attempts: ProposalAttempts::default(),
             sample: 1,
             others: Vec::new(),
+            lessons: None,
         };
         let stage = run_stage(&harness, request).await.unwrap();
         assert_eq!(

@@ -7,8 +7,8 @@ use autumn_harvest::version_usage::{
 };
 use autumn_harvest::worker::DbPool;
 use autumn_web::error::AutumnError;
-use chrono::{DateTime, Utc};
 use futures::future::join_all;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::api::{HarvestApiState, map_error};
@@ -43,7 +43,7 @@ pub enum VersionUsageShardInspectionStatus {
 #[derive(Debug, Clone, Serialize)]
 pub struct VersionUsageReport {
     pub status: VersionUsageReportStatus,
-    pub observed_at: DateTime<Utc>,
+    pub observed_at: Timestamp,
     pub filters: VersionUsageReportFilters,
     pub items: Vec<VersionUsageReportRow>,
     pub shards: Vec<VersionUsageShardInspection>,
@@ -65,8 +65,8 @@ pub struct VersionUsageReportRow {
     pub recorded_version: u32,
     pub active_executions: i64,
     pub terminal_executions: i64,
-    pub oldest_matching_started_at: DateTime<Utc>,
-    pub newest_matching_started_at: DateTime<Utc>,
+    pub oldest_matching_started_at: Timestamp,
+    pub newest_matching_started_at: Timestamp,
     pub oldest_matching_execution_age_secs: i64,
     pub newest_matching_execution_age_secs: i64,
     pub shard_coverage: VersionUsageShardCoverage,
@@ -113,8 +113,8 @@ struct VersionUsageKey {
 struct VersionUsageAccumulator {
     active_executions: i64,
     terminal_executions: i64,
-    oldest_matching_started_at: DateTime<Utc>,
-    newest_matching_started_at: DateTime<Utc>,
+    oldest_matching_started_at: Timestamp,
+    newest_matching_started_at: Timestamp,
     matched_shards: BTreeSet<i32>,
 }
 
@@ -128,7 +128,7 @@ pub async fn build_version_usage_report(
     api_state: &HarvestApiState,
     query: VersionUsageQuery,
 ) -> Result<VersionUsageReport, AutumnError> {
-    let observed_at = Utc::now();
+    let observed_at = Timestamp::now();
     let state_group = query
         .state_group
         .as_deref()
@@ -172,7 +172,7 @@ pub async fn build_version_usage_report(
 /// Beyond the filter this is the shared cross-shard fan-out rule, and it now
 /// delegates to [`crate::shard_fanout::expected_shards`] (itself the core
 /// `external_target_location::fanout_shards`) rather than re-deriving it. This
-/// was the third independent copy of "pool keys ∪ readable ∪ default", and the
+/// was the third independent copy of "pool keys ∪ readable ∪ default". The
 /// engine's own by-business-key resolution now depends on that set meaning the
 /// same thing everywhere (issue #1146).
 fn expected_shards(api_state: &HarvestApiState, shard_filter: Option<i32>) -> BTreeSet<i32> {
@@ -197,7 +197,7 @@ async fn observe_shard(
 }
 
 fn build_report_from_observations(
-    observed_at: DateTime<Utc>,
+    observed_at: Timestamp,
     filters: VersionUsageReportFilters,
     observations: Vec<ShardObservation>,
 ) -> VersionUsageReport {
@@ -296,7 +296,7 @@ fn row_from_accumulator(
     acc: &VersionUsageAccumulator,
     inspected_shards: &BTreeSet<i32>,
     unavailable_shards: &BTreeSet<i32>,
-    observed_at: DateTime<Utc>,
+    observed_at: Timestamp,
 ) -> VersionUsageReportRow {
     VersionUsageReportRow {
         workflow_name: key.workflow_name,
@@ -341,10 +341,10 @@ const fn report_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone as _;
+    use jiff::Timestamp;
 
-    fn at(seconds: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(seconds, 0).unwrap()
+    fn at(seconds: i64) -> Timestamp {
+        Timestamp::new(seconds, 0).unwrap()
     }
 
     fn shard_row(

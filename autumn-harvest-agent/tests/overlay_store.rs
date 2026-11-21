@@ -71,3 +71,198 @@ async fn the_sqlite_store_keeps_versions_across_a_reopen() {
     assert_eq!(v1, OverlayVersion::new(1).expect("v1"));
     assert_eq!(active.overlay(), &overlay);
 }
+
+/// A fleet database: a WAL file whose replicator connection stays open
+/// and never checkpoints by itself.
+#[cfg(feature = "sqlite")]
+struct Fleet {
+    _dir: tempfile::TempDir,
+    path: std::path::PathBuf,
+    replicator: rusqlite::Connection,
+}
+
+#[cfg(feature = "sqlite")]
+impl Fleet {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tenant.db");
+        let replicator = rusqlite::Connection::open(&path).expect("replicator");
+        replicator
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;\n\
+                 PRAGMA wal_autocheckpoint = 0;\n\
+                 CREATE TABLE IF NOT EXISTS app_rows (id INTEGER PRIMARY KEY);",
+            )
+            .expect("replicator pragmas");
+        Self {
+            _dir: dir,
+            path,
+            replicator,
+        }
+    }
+
+    /// The factory of the app. It sets the pragmas of the fleet.
+    fn connector(&self) -> autumn_harvest_agent::SqliteConnector {
+        let path = self.path.clone();
+        std::sync::Arc::new(move || {
+            let conn = rusqlite::Connection::open(&path)?;
+            conn.execute_batch(
+                "PRAGMA busy_timeout = 5000;\n\
+                 PRAGMA wal_autocheckpoint = 0;",
+            )?;
+            Ok(conn)
+        })
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn the_sqlite_factory_store_passes_the_suite() {
+    use autumn_harvest_agent::SqliteOverlayStore;
+
+    let fleet = Fleet::new();
+    // The replicator connection is not `Sync`. The suite closures share the
+    // factory only.
+    let connect = fleet.connector();
+    overlay_store_suite::run_all(
+        &|validator| {
+            Box::new(SqliteOverlayStore::with_connector(connect.clone(), validator).expect("open"))
+        },
+        &|validator, clock| {
+            Box::new(
+                SqliteOverlayStore::with_connector(connect.clone(), validator)
+                    .expect("open")
+                    .with_clock(clock),
+            )
+        },
+    )
+    .await;
+}
+
+/// A factory store on a fleet WAL file never checkpoints it. The frames of
+/// a put, an activation and a rollback stay in the WAL for the replicator.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn a_factory_store_leaves_every_frame_in_the_wal() {
+    use std::sync::Arc;
+
+    use autumn_harvest_agent::{
+        ProfileOverlay, ProfileOverlayStore, Provenance, SqliteOverlayStore,
+    };
+
+    let fleet = Fleet::new();
+    let main_before = std::fs::read(&fleet.path).expect("main file");
+    let store = SqliteOverlayStore::with_connector(
+        fleet.connector(),
+        Arc::new(overlay_store_suite::Gate::default()),
+    )
+    .expect("open");
+    let ops = || Provenance::operator("ops");
+    let narrow = |steps| ProfileOverlay {
+        max_steps: Some(steps),
+        ..ProfileOverlay::default()
+    };
+    let v1 = store
+        .put("support", &narrow(4), ops())
+        .await
+        .expect("put v1");
+    store
+        .activate("support", v1, None, ops())
+        .await
+        .expect("activate v1");
+    let v2 = store
+        .put("support", &narrow(3), ops())
+        .await
+        .expect("put v2");
+    store
+        .activate("support", v2, Some(v1), ops())
+        .await
+        .expect("activate v2");
+    let rollback = store.rollback("support", ops()).await.expect("rollback");
+    assert_eq!(rollback.to, v1);
+    let active = store.active("support").await.expect("active").expect("set");
+    assert_eq!(active.version(), v1);
+
+    assert_eq!(
+        std::fs::read(&fleet.path).expect("main file"),
+        main_before,
+        "the store folded no frame into the main file"
+    );
+    let (busy, log, done): (i64, i64, i64) = fleet
+        .replicator
+        .query_row("PRAGMA wal_checkpoint", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .expect("checkpoint");
+    assert_eq!(busy, 0);
+    assert!(log > 0, "the WAL still holds the frames of the store");
+    assert_eq!(done, log, "the replicator checkpoints them all");
+
+    // The store is still open. A held store connection stays open after
+    // the replicator closes, and the WAL file then stays.
+    let Fleet {
+        _dir: dir,
+        path,
+        replicator,
+    } = fleet;
+    replicator.close().expect("close");
+    assert!(
+        !wal_of(&path).exists(),
+        "the replicator connection closed last, and SQLite removed the WAL"
+    );
+    drop(store);
+    drop(dir);
+}
+
+/// The WAL file of the database at `path`.
+#[cfg(feature = "sqlite")]
+fn wal_of(path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push("-wal");
+    std::path::PathBuf::from(name)
+}
+
+/// A failed connect is a backend error, at the open and at a later call.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn a_failed_connect_is_a_backend_error() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use autumn_harvest_agent::{
+        OverlayStoreError, ProfileOverlay, ProfileOverlayStore, Provenance, SqliteConnector,
+        SqliteOverlayStore,
+    };
+
+    let gate = Arc::new(overlay_store_suite::Gate::default());
+    let refuse: SqliteConnector =
+        Arc::new(|| Err(rusqlite::Error::InvalidPath("no fleet lease".into())));
+    let err = SqliteOverlayStore::with_connector(refuse, gate.clone()).expect_err("no connection");
+    assert!(matches!(err, OverlayStoreError::Backend { .. }), "{err}");
+
+    let fleet = Fleet::new();
+    let inner = fleet.connector();
+    let lost = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&lost);
+    let connect: SqliteConnector = Arc::new(move || {
+        if flag.load(Ordering::SeqCst) {
+            return Err(rusqlite::Error::InvalidPath(
+                "the fleet lease is gone".into(),
+            ));
+        }
+        inner()
+    });
+    let store = SqliteOverlayStore::with_connector(connect, gate).expect("open");
+    lost.store(true, Ordering::SeqCst);
+    let overlay = ProfileOverlay {
+        max_steps: Some(4),
+        ..ProfileOverlay::default()
+    };
+    let err = store
+        .put("support", &overlay, Provenance::operator("ops"))
+        .await
+        .expect_err("no connection");
+    assert!(matches!(err, OverlayStoreError::Backend { .. }), "{err}");
+    let err = store.active("support").await.expect_err("no connection");
+    assert!(matches!(err, OverlayStoreError::Backend { .. }), "{err}");
+}

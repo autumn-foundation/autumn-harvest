@@ -8,9 +8,10 @@
 //! `autumn-harvest-plugin/src/api.rs` parses each `search_attr` query value
 //! with `value.split_once(':')`. With no colon it answers 400 with
 //! `invalid search_attr '...'; expected 'key:value'`.
-//! `strict_query::decode_or_autumn_error` percent-decodes that value before `parse_workflow_filters` sees it. So a
-//! literal `:` and its encoded forms `%3A` and `%3a` are equally valid on the
-//! wire, and this guard accepts all three (PR #1432).
+//! `strict_query::decode_or_autumn_error` percent-decodes that value before
+//! `parse_workflow_filters` sees it. So a literal `:` and its encoded forms
+//! `%3A` and `%3a` are equally valid on the wire, and this guard accepts all
+//! three (PR #1432).
 //!
 //! `README.md` documents the correct `?search_attr=tenant:acme` shape. But
 //! `examples/billing-autumn-web/README.md` gave `search_attr=tenant_id=acme`.

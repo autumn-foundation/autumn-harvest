@@ -18,6 +18,7 @@ use super::ci_run_coverage::{
 const FUZZ_CARGO_TOML: &str = include_str!("../../../fuzz/Cargo.toml");
 const FUZZ_SMOKE_RS: &str = include_str!("../../../xtask/src/dev/fuzz_smoke.rs");
 const NIGHTLY: &str = ".github/workflows/fuzz-nightly.yml";
+const CI: &str = ".github/workflows/ci.yml";
 
 /// The path that the upload step must name.
 const CORPUS_PATH: &str = "fuzz/corpus/${{ matrix.target }}";
@@ -197,6 +198,44 @@ fn fuzz_toolchain_pins_agree() {
             && str_at(s, &["with", "toolchain"]) == "${{ env.FUZZ_TOOLCHAIN }}"
     });
     assert!(installs, "the `fuzz` job must install `env.FUZZ_TOOLCHAIN`");
+}
+
+/// The manual smoke job of `ci.yml` fuzzes with the same dated nightly.
+///
+/// It once installed `toolchain: nightly`. The newest nightly could not
+/// build the crate, so each manual run of the CI workflow failed in this
+/// job before any fuzzing.
+#[test]
+fn the_manual_smoke_job_uses_the_pinned_nightly() {
+    let pinned_doc = parse_workflow(NIGHTLY);
+    let pinned = str_at(&pinned_doc, &["env", "FUZZ_TOOLCHAIN"]);
+
+    let ci = parse_workflow(CI);
+    let job = &ci["jobs"]["fuzz-smoke"];
+    assert_eq!(
+        str_at(job, &["env", "FUZZ_TOOLCHAIN"]),
+        pinned,
+        "the `fuzz-smoke` job of {CI} must pin the nightly that {NIGHTLY} pins"
+    );
+    let installs = steps(job).iter().any(|s| {
+        str_at(s, &["uses"]).starts_with("dtolnay/rust-toolchain@")
+            && str_at(s, &["with", "toolchain"]) == "${{ env.FUZZ_TOOLCHAIN }}"
+    });
+    assert!(
+        installs,
+        "the `fuzz-smoke` job must install `env.FUZZ_TOOLCHAIN`"
+    );
+    let unpinned = steps(job)
+        .iter()
+        .any(|s| str_at(s, &["run"]).contains("cargo +nightly "));
+    assert!(
+        !unpinned,
+        "the `fuzz-smoke` job must fuzz with `+${{FUZZ_TOOLCHAIN}}`, not `+nightly`"
+    );
+    let fuzzes = steps(job)
+        .iter()
+        .any(|s| str_at(s, &["run"]).contains("cargo \"+${FUZZ_TOOLCHAIN}\" fuzz run"));
+    assert!(fuzzes, "the `fuzz-smoke` job must run `cargo fuzz`");
 }
 
 #[test]

@@ -4,9 +4,9 @@
 //! `POST /workflows/{id}/terminate` end-to-end.
 //!
 //! Scenarios covered:
-//!   (a) Terminating a RUNNING execution seals it `TERMINATED`, returns 202 with
-//!       `newly_terminated: true`, records the reason, and surfaces as a terminal
-//!       failure via `GET /workflows/{id}/result` (AC #1, #4).
+//!   (a) Terminating a RUNNING execution seals it `TERMINATED` and returns 202
+//!       with `newly_terminated: true`. It records the reason and surfaces as a
+//!       terminal failure via `GET /workflows/{id}/result` (AC #1, #4).
 //!   (b) Terminate affects ONLY the addressed id — a concurrent execution of the
 //!       same workflow type/queue is untouched (AC #3).
 //!   (c) Idempotent no-op against an already-terminal execution: `newly_terminated:
@@ -17,6 +17,7 @@
 #![allow(clippy::similar_names)]
 #![allow(clippy::too_many_lines)]
 
+use jiff_diesel::ToDiesel;
 use std::sync::Arc;
 
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
@@ -34,10 +35,10 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -215,7 +216,7 @@ async fn seed_terminal(
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq(state),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             harvest_workflow_executions::error.eq(error),
         ))
         .execute(conn)
@@ -323,7 +324,7 @@ async fn terminate_idempotent_on_terminal() {
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -561,9 +562,9 @@ async fn post_empty_json(app: &HarvestApiApp, uri: &str) -> StatusCode {
     response.status()
 }
 
-/// (P1, #787 review) Terminating an **awaited** child wakes the parent: a
-/// `ChildWorkflowFailed` event carrying the termination reason is appended to
-/// the parent's history, so a parent parked on the child's await is not stuck.
+/// Issue #787: terminating an **awaited** child wakes the parent. A
+/// `ChildWorkflowFailed` event with the termination reason goes into the
+/// parent's history. So a parent parked on the child's await is not stuck.
 #[tokio::test]
 async fn terminate_awaited_child_notifies_parent() {
     let (url, _container) = setup_database().await;
@@ -599,9 +600,9 @@ async fn terminate_awaited_child_notifies_parent() {
     );
 }
 
-/// (P1, #787 review) A **detached** child (`parent_close_policy` set) is the
-/// parent-close cascade's responsibility, not this path — terminating it must
-/// NOT append a `ChildWorkflowFailed` to the parent.
+/// Issue #787: the parent-close cascade owns a **detached** child
+/// (`parent_close_policy` set), not this path. Terminating it must NOT append a
+/// `ChildWorkflowFailed` to the parent.
 #[tokio::test]
 async fn terminate_detached_child_does_not_notify_parent() {
     let (url, _container) = setup_database().await;
@@ -664,7 +665,7 @@ async fn terminate_awaited_child_skips_wake_when_parent_terminal() {
     diesel::update(harvest_workflow_executions::table.find(parent.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("TIMED_OUT"),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
         ))
         .execute(&mut conn)
         .await

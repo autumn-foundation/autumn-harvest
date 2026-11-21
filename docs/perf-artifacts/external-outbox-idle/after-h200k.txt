@@ -1,0 +1,107 @@
+ pg_stat_statements_reset 
+--------------------------
+ 
+(1 row)
+
+                                                                                                              QUERY PLAN                                                                                                               
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=33.44..33.45 rows=1 width=566) (actual time=0.031..0.032 rows=0 loops=1)
+   Output: e.id, e.workflow_exec_id, e.event_id, e.event_type, e.event_data, e."timestamp", p.requested_at, p.event_row_id, p.ctid, running.*, e.*
+   Buffers: shared hit=6
+   ->  LockRows  (cost=33.44..33.45 rows=1 width=566) (actual time=0.030..0.031 rows=0 loops=1)
+         Output: e.id, e.workflow_exec_id, e.event_id, e.event_type, e.event_data, e."timestamp", p.requested_at, p.event_row_id, p.ctid, running.*, e.*
+         Buffers: shared hit=6
+         ->  Sort  (cost=33.44..33.44 rows=1 width=566) (actual time=0.030..0.031 rows=0 loops=1)
+               Output: e.id, e.workflow_exec_id, e.event_id, e.event_type, e.event_data, e."timestamp", p.requested_at, p.event_row_id, p.ctid, running.*, e.*
+               Sort Key: p.requested_at, p.event_row_id
+               Sort Method: quicksort  Memory: 25kB
+               Buffers: shared hit=6
+               ->  Nested Loop  (cost=1.27..33.43 rows=1 width=566) (actual time=0.004..0.005 rows=0 loops=1)
+                     Output: e.id, e.workflow_exec_id, e.event_id, e.event_type, e.event_data, e."timestamp", p.requested_at, p.event_row_id, p.ctid, running.*, e.*
+                     ->  Nested Loop  (cost=0.42..8.47 rows=1 width=46) (actual time=0.004..0.004 rows=0 loops=1)
+                           Output: p.requested_at, p.event_row_id, p.ctid, running.*
+                           ->  Seq Scan on public.harvest_external_outbox_pending p  (cost=0.00..0.00 rows=1 width=38) (actual time=0.004..0.004 rows=0 loops=1)
+                                 Output: p.requested_at, p.event_row_id, p.ctid, p.workflow_exec_id
+                                 Filter: ((p.request_type = 'ExternalSignalRequested'::text) AND (p.event_row_id <> ALL ($2)))
+                           ->  Subquery Scan on running  (cost=0.42..8.46 rows=1 width=24) (never executed)
+                                 Output: running.*
+                                 ->  Limit  (cost=0.42..8.45 rows=1 width=4) (never executed)
+                                       Output: 1
+                                       ->  Index Scan using harvest_workflow_executions_pkey on public.harvest_workflow_executions x  (cost=0.42..8.45 rows=1 width=4) (never executed)
+                                             Output: 1
+                                             Index Cond: (x.id = p.workflow_exec_id)
+                                             Filter: ((x.state = 'RUNNING'::text) AND (x.shard_id = ANY ($1)))
+                     ->  Subquery Scan on e  (cost=0.85..24.95 rows=1 width=520) (never executed)
+                           Output: e.id, e.workflow_exec_id, e.event_id, e.event_type, e.event_data, e."timestamp", e.*
+                           ->  Limit  (cost=0.85..24.94 rows=1 width=260) (never executed)
+                                 Output: ev.id, ev.workflow_exec_id, ev.event_id, ev.event_type, ev.event_data, ev."timestamp", ev.ctid, res.ctid
+                                 ->  LockRows  (cost=0.85..24.94 rows=1 width=260) (never executed)
+                                       Output: ev.id, ev.workflow_exec_id, ev.event_id, ev.event_type, ev.event_data, ev."timestamp", ev.ctid, res.ctid
+                                       ->  Nested Loop Anti Join  (cost=0.85..24.93 rows=1 width=260) (never executed)
+                                             Output: ev.id, ev.workflow_exec_id, ev.event_id, ev.event_type, ev.event_data, ev."timestamp", ev.ctid, res.ctid
+                                             ->  Index Scan using harvest_events_pkey on public.harvest_events ev  (cost=0.43..8.46 rows=1 width=254) (never executed)
+                                                   Output: ev.id, ev.workflow_exec_id, ev.event_id, ev.event_type, ev.event_data, ev."timestamp", ev.ctid
+                                                   Index Cond: (ev.id = p.event_row_id)
+                                                   Filter: ((ev.event_type = 'ExternalSignalRequested'::text) AND (((ev.event_data -> 'data'::text) ->> 'signal_id'::text) IS NOT NULL))
+                                             ->  Index Scan using idx_harvest_events_external_signal_resolved on public.harvest_events res  (cost=0.42..8.45 rows=1 width=215) (never executed)
+                                                   Output: res.ctid, res.workflow_exec_id, res.event_data
+                                                   Index Cond: ((res.workflow_exec_id = ev.workflow_exec_id) AND (((res.event_data -> 'data'::text) ->> 'signal_id'::text) = ((ev.event_data -> 'data'::text) ->> 'signal_id'::text)))
+                                                   Filter: (res.event_type = ANY ('{ExternalSignalDelivered,ExternalSignalFailed}'::text[]))
+ Settings: plan_cache_mode = 'force_generic_plan'
+ Query Identifier: 6043207553270405524
+ Planning:
+   Buffers: shared hit=1361
+ Planning Time: 3.282 ms
+ Execution Time: 0.145 ms
+(48 rows)
+
+ pg_stat_statements_reset 
+--------------------------
+ 
+(1 row)
+
+ id | workflow_exec_id | event_id | event_type | event_data | timestamp 
+----+------------------+----------+------------+------------+-----------
+(0 rows)
+
+ id | workflow_exec_id | event_id | event_type | event_data | timestamp 
+----+------------------+----------+------------+------------+-----------
+(0 rows)
+
+ id | workflow_exec_id | event_id | event_type | event_data | timestamp 
+----+------------------+----------+------------+------------+-----------
+(0 rows)
+
+ id | workflow_exec_id | event_id | event_type | event_data | timestamp 
+----+------------------+----------+------------+------------+-----------
+(0 rows)
+
+ id | workflow_exec_id | event_id | event_type | event_data | timestamp 
+----+------------------+----------+------------+------------+-----------
+(0 rows)
+
+ id | workflow_exec_id | event_id | event_type | event_data | timestamp 
+----+------------------+----------+------------+------------+-----------
+(0 rows)
+
+ id | workflow_exec_id | event_id | event_type | event_data | timestamp 
+----+------------------+----------+------------+------------+-----------
+(0 rows)
+
+ id | workflow_exec_id | event_id | event_type | event_data | timestamp 
+----+------------------+----------+------------+------------+-----------
+(0 rows)
+
+ id | workflow_exec_id | event_id | event_type | event_data | timestamp 
+----+------------------+----------+------------+------------+-----------
+(0 rows)
+
+ id | workflow_exec_id | event_id | event_type | event_data | timestamp 
+----+------------------+----------+------------+------------+-----------
+(0 rows)
+
+ calls | buffers | per_call | rows | temp_blks_written 
+-------+---------+----------+------+-------------------
+    10 |       0 |        0 |    0 |                 0
+(1 row)
+

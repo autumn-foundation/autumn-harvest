@@ -1,9 +1,10 @@
 //! Integration tests for `ReplayVerifier` — the batch CI replay gate (issue #251).
 //!
-//! These tests exercise the three scenarios described in the acceptance criteria:
-//! (a) always-pass fixture
-//! (b) fixture that fails because the handler has reordered activities
-//! (c) fixture for an unregistered workflow name (harness error)
+//! These tests exercise the three acceptance-criteria scenarios:
+//!
+//! - (a) an always-pass fixture;
+//! - (b) a fixture that fails because the handler has reordered activities;
+//! - (c) a fixture for an unregistered workflow name (harness error).
 //!
 //! Run with:
 //! ```bash
@@ -22,7 +23,7 @@ use autumn_harvest::testing::{
     ReplayVerifier, ReportFormat,
 };
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
-use chrono::Utc;
+use jiff::Timestamp;
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
@@ -73,7 +74,7 @@ fn canonical_snapshot_json(workflow_name: &str) -> String {
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -121,7 +122,7 @@ fn unregistered_snapshot_json() -> String {
         execution_id: ExecutionId::new(),
         events: vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,

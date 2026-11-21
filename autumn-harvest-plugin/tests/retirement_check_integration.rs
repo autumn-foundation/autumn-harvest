@@ -1,3 +1,4 @@
+use jiff_diesel::ToDiesel;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -16,10 +17,10 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::Utc;
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -211,14 +212,15 @@ async fn insert_versioned_execution(
     let completed_at = if state == "RUNNING" {
         None
     } else {
-        Some(Utc::now())
+        Some(Timestamp::now())
     };
     diesel::update(
         autumn_harvest::schema::harvest_workflow_executions::table.find(exec_id.as_uuid()),
     )
     .set((
         autumn_harvest::schema::harvest_workflow_executions::state.eq(state),
-        autumn_harvest::schema::harvest_workflow_executions::completed_at.eq(completed_at),
+        autumn_harvest::schema::harvest_workflow_executions::completed_at
+            .eq(completed_at.to_diesel()),
     ))
     .execute(&mut conn)
     .await
@@ -227,7 +229,7 @@ async fn insert_versioned_execution(
     let events = vec![
         WorkflowEvent::WorkflowStarted {
             input: json!({}),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
@@ -305,14 +307,15 @@ async fn insert_execution_without_marker(
     let completed_at = if state == "RUNNING" {
         None
     } else {
-        Some(Utc::now())
+        Some(Timestamp::now())
     };
     diesel::update(
         autumn_harvest::schema::harvest_workflow_executions::table.find(exec_id.as_uuid()),
     )
     .set((
         autumn_harvest::schema::harvest_workflow_executions::state.eq(state),
-        autumn_harvest::schema::harvest_workflow_executions::completed_at.eq(completed_at),
+        autumn_harvest::schema::harvest_workflow_executions::completed_at
+            .eq(completed_at.to_diesel()),
     ))
     .execute(&mut conn)
     .await
@@ -321,7 +324,7 @@ async fn insert_execution_without_marker(
     // Only append WorkflowStarted — no MarkerRecorded event for any change id.
     let events = vec![WorkflowEvent::WorkflowStarted {
         input: json!({}),
-        timestamp: Utc::now(),
+        timestamp: Timestamp::now(),
         last_completion_result: None,
         last_error: None,
         scheduled_time: None,
@@ -436,7 +439,6 @@ async fn retirement_check_blocked_while_v1_running_safe_after_terminal() {
         "sample IDs should include the running v1 execution; got {sample_ids:?}"
     );
 
-    // Now mark the v1 execution as COMPLETED
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
         .await
         .unwrap();
@@ -445,7 +447,8 @@ async fn retirement_check_blocked_while_v1_running_safe_after_terminal() {
     )
     .set((
         autumn_harvest::schema::harvest_workflow_executions::state.eq("COMPLETED"),
-        autumn_harvest::schema::harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+        autumn_harvest::schema::harvest_workflow_executions::completed_at
+            .eq(Some(Timestamp::now()).to_diesel()),
     ))
     .execute(&mut conn)
     .await
@@ -607,10 +610,9 @@ async fn retirement_check_degraded_when_one_shard_unavailable() {
 }
 
 /// Executions that started before a version gate was inserted carry no
-/// `MarkerRecorded` event for that change id.  When the gate is later added to
-/// the code and `workflow_name` is supplied to the retirement check, these
-/// pre-gate executions must appear as blockers (`recorded_version` = 0) so that
-/// operators are not misled into retiring the old branch prematurely.
+/// `MarkerRecorded` event for that change id. The retirement check with a
+/// `workflow_name` must list them as blockers (`recorded_version` = 0). Otherwise
+/// operators can retire the old branch too early.
 #[tokio::test]
 async fn retirement_check_includes_pre_gate_executions_as_blockers() {
     let (database_url, _container) = setup_database_url_with_migrations().await;

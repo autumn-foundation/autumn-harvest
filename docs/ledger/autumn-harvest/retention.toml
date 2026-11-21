@@ -93,5 +93,5 @@ driver = "per_tick"
 backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_signals", "harvest_task_queue", "harvest_timers", "harvest_workflow_executions"]
-measured = "unmeasured"
+measured = "docs/performance-retention-pass-statement-cache.md"
 plan = "docs/ledger/plans/autumn-harvest/retention.md"

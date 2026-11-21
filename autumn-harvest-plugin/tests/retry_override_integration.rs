@@ -13,6 +13,7 @@
 //! run each test in a fresh database on that cluster. Otherwise each test
 //! starts a testcontainers Postgres 16.
 
+use jiff_diesel::ToDiesel;
 use std::sync::Arc;
 
 use autumn_harvest::RetentionConfig;
@@ -522,7 +523,8 @@ async fn insert_schedule(url: &str, retry_policy: Option<&RetryPolicy>) -> Uuid 
             dsl::catchup.eq(false),
             dsl::max_active_runs.eq(10),
             dsl::is_paused.eq(false),
-            dsl::next_run_at.eq(chrono::Utc::now() + chrono::Duration::hours(1)),
+            dsl::next_run_at
+                .eq((jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1)).to_diesel()),
             dsl::jitter_secs.eq(0_i64),
             dsl::overlap_policy.eq("skip"),
             dsl::buffered_runs.eq(json!([])),
@@ -559,10 +561,10 @@ async fn trigger_now_and_backfill_mark_only_a_schedule_policy() {
     let app = build_app(&build_pool(&url));
     let own = RetryPolicy::fixed(2, std::time::Duration::from_secs(1));
     // One hour-aligned slot of the `interval:3600` schedule, two hours ago.
-    let hours = chrono::Utc::now().timestamp() / 3_600 - 2;
-    let slot = chrono::DateTime::from_timestamp(hours * 3_600, 0).expect("a slot");
-    let window_start = slot - chrono::Duration::seconds(1);
-    let window_end = slot + chrono::Duration::seconds(1);
+    let hours = jiff::Timestamp::now().as_second() / 3_600 - 2;
+    let slot = jiff::Timestamp::from_second(hours * 3_600).expect("a slot");
+    let window_start = slot - jiff::SignedDuration::from_secs(1);
+    let window_end = slot + jiff::SignedDuration::from_secs(1);
     // A type holds one schedule, so the two cases run one after the other.
     for (policy, mark, attempts) in [(Some(&own), Some(SCHEDULE_SOURCE), 2), (None, None, 5)] {
         let schedule = insert_schedule(&url, policy).await;

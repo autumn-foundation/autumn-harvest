@@ -13,9 +13,10 @@
 //! - `set_legal_hold` / `release_legal_hold` are idempotent (round-trip).
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
-//! against it directly (single-threaded; each test scrubs first); otherwise a
-//! fresh testcontainers Postgres is booted with the full migration bundle.
+//! against it directly (single-threaded; each test scrubs first). Otherwise a
+//! fresh testcontainers Postgres boots with the full migration bundle.
 
+use jiff_diesel::ToDiesel;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,10 +25,10 @@ use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::DbPool;
-use chrono::{DateTime, Utc};
 use diesel::sql_types::{BigInt, Nullable, Text, Timestamptz};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use jiff::Timestamp;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -118,9 +119,9 @@ async fn insert_completed(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
     workflow_id: &str,
-    completed_at: DateTime<Utc>,
-    hold_set_at: Option<DateTime<Utc>>,
-    hold_until: Option<DateTime<Utc>>,
+    completed_at: Timestamp,
+    hold_set_at: Option<Timestamp>,
+    hold_until: Option<Timestamp>,
 ) -> uuid::Uuid {
     let id: uuid::Uuid = diesel::sql_query(
         "INSERT INTO harvest_workflow_executions
@@ -133,9 +134,9 @@ async fn insert_completed(
     )
     .bind::<Text, _>(workflow_name)
     .bind::<Text, _>(workflow_id)
-    .bind::<Timestamptz, _>(completed_at)
-    .bind::<Nullable<Timestamptz>, _>(hold_set_at)
-    .bind::<Nullable<Timestamptz>, _>(hold_until)
+    .bind::<Timestamptz, _>(completed_at.to_diesel())
+    .bind::<Nullable<Timestamptz>, _>(hold_set_at.to_diesel())
+    .bind::<Nullable<Timestamptz>, _>(hold_until.to_diesel())
     .get_result::<IdRow>(conn)
     .await
     .expect("insert execution")
@@ -226,11 +227,12 @@ async fn run_one_tick_with_archiver(
     result.expect("retention tick did not report a result in time")
 }
 
-/// A `HistoryArchiver` that records every archived `exec_id` and, when
-/// `place_hold_on` is set, places a legal hold on that execution FROM INSIDE
-/// `archive()` — deterministically injecting the "hold committed after
-/// candidate selection but before delete" race that the delete-tx `FOR UPDATE`
-/// re-check must honor (issue #747 BLOCKER 1).
+/// A `HistoryArchiver` that records every archived `exec_id`.
+///
+/// When `place_hold_on` is set, it places a legal hold on that execution FROM
+/// INSIDE `archive()`. That deterministically injects the race "hold
+/// committed after candidate selection but before delete". The delete-tx
+/// `FOR UPDATE` re-check must honor it (issue #747).
 struct RaceArchiver {
     url: String,
     archived: Mutex<Vec<uuid::Uuid>>,
@@ -264,7 +266,7 @@ impl autumn_harvest::HistoryArchiver for RaceArchiver {
                     "mid-tick hold",
                     None,
                     "racer",
-                    Utc::now(),
+                    Timestamp::now(),
                 )
                 .await
                 .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?;
@@ -277,14 +279,16 @@ impl autumn_harvest::HistoryArchiver for RaceArchiver {
 async fn hold_columns(
     conn: &mut AsyncPgConnection,
     id: uuid::Uuid,
-) -> (Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>) {
+) -> (Option<Timestamp>, Option<Timestamp>, Option<String>) {
     #[derive(diesel::QueryableByName)]
     #[allow(clippy::struct_field_names)]
     struct HoldRow {
         #[diesel(sql_type = Nullable<Timestamptz>)]
-        legal_hold_set_at: Option<DateTime<Utc>>,
+        #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+        legal_hold_set_at: Option<Timestamp>,
         #[diesel(sql_type = Nullable<Timestamptz>)]
-        legal_hold_until: Option<DateTime<Utc>>,
+        #[diesel(deserialize_as = autumn_harvest::time::sql::NullableTimestamp)]
+        legal_hold_until: Option<Timestamp>,
         #[diesel(sql_type = Nullable<Text>)]
         legal_hold_reason: Option<String>,
     }
@@ -321,8 +325,8 @@ async fn held_execution_survives_and_metric_is_zero_for_it() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let now = Utc::now();
-    let two_days_ago = now - chrono::Duration::days(2);
+    let now = Timestamp::now();
+    let two_days_ago = now - autumn_harvest::time::days(2);
 
     // Held (indefinite): completed 2 days ago, older than the 1-day global.
     insert_completed(&mut conn, "held_wf", "h1", two_days_ago, Some(now), None).await;
@@ -357,9 +361,9 @@ async fn expired_hold_becomes_eligible_and_is_deleted() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let now = Utc::now();
-    let two_days_ago = now - chrono::Duration::days(2);
-    let one_hour_ago = now - chrono::Duration::hours(1);
+    let now = Timestamp::now();
+    let two_days_ago = now - autumn_harvest::time::days(2);
+    let one_hour_ago = now - jiff::SignedDuration::from_hours(1);
 
     // Hold placed but auto-expired an hour ago -> inactive -> eligible.
     insert_completed(
@@ -392,8 +396,8 @@ async fn hold_trumps_global_and_override() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let now = Utc::now();
-    let two_days_ago = now - chrono::Duration::days(2);
+    let now = Timestamp::now();
+    let two_days_ago = now - autumn_harvest::time::days(2);
 
     // Held row for a type carrying a SHORT (1-hour) override — the override
     // alone would delete it at 2 days old, but the hold wins.
@@ -424,12 +428,12 @@ async fn erase_rejected_while_held() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     let id = insert_completed(
         &mut conn,
         "erase_wf",
         "x1",
-        now - chrono::Duration::days(1),
+        now - autumn_harvest::time::days(1),
         Some(now),
         None,
     )
@@ -451,7 +455,7 @@ async fn erase_rejected_while_held() {
     );
 
     // After releasing, erase succeeds and DOES tombstone.
-    autumn_harvest::release_legal_hold(&mut conn, exec_id, Utc::now())
+    autumn_harvest::release_legal_hold(&mut conn, exec_id, Timestamp::now())
         .await
         .expect("release");
     autumn_harvest::erase::erase_workflow_payloads(&mut conn, exec_id, "gdpr")
@@ -472,12 +476,12 @@ async fn set_release_idempotency_round_trip() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     let id = insert_completed(
         &mut conn,
         "idem_wf",
         "i1",
-        now - chrono::Duration::days(1),
+        now - autumn_harvest::time::days(1),
         None,
         None,
     )
@@ -528,9 +532,9 @@ async fn set_release_idempotency_round_trip() {
 
 // ── MINOR 2b: held child is SKIPPED (not failed) during cascade ───────────────
 
-// During cascade erasure, a child under an active legal hold is reported as a
-// SKIPPED child (with a legal-hold reason), NOT a failure; its events are left
-// intact while the parent's are tombstoned.
+// During cascade erasure, a child under an active legal hold is a SKIPPED
+// child with a legal-hold reason, NOT a failure. Its events stay intact while
+// the parent's are tombstoned.
 #[tokio::test]
 async fn held_child_is_skipped_not_failed_during_cascade() {
     let (url, _container) = setup_db().await;
@@ -538,8 +542,8 @@ async fn held_child_is_skipped_not_failed_during_cascade() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let now = Utc::now();
-    let ago = now - chrono::Duration::days(1);
+    let now = Timestamp::now();
+    let ago = now - autumn_harvest::time::days(1);
 
     // Parent (terminal, unheld) with a PII event.
     let parent_id = insert_completed(&mut conn, "parent_wf", "pw-child", ago, None, None).await;
@@ -554,9 +558,9 @@ async fn held_child_is_skipped_not_failed_during_cascade() {
                  $2, $3, NULL, 'child subpoena', 'legal')
          RETURNING id",
     )
-    .bind::<Timestamptz, _>(ago)
+    .bind::<Timestamptz, _>(ago.to_diesel())
     .bind::<diesel::sql_types::Uuid, _>(parent_id)
-    .bind::<Timestamptz, _>(now)
+    .bind::<Timestamptz, _>(now.to_diesel())
     .get_result::<IdRow>(&mut conn)
     .await
     .expect("insert child")
@@ -612,9 +616,9 @@ async fn held_child_is_skipped_not_failed_during_cascade() {
 
 // ── BLOCKER 1: delete-time hold TOCTOU ────────────────────────────────────────
 
-// A hold placed AFTER candidate selection but before the delete transaction
-// (injected here from inside archive()) must be honored by the delete-tx
-// FOR UPDATE re-check: the row SURVIVES and the deletion metric reads zero.
+// The delete-tx FOR UPDATE re-check must honor a hold placed AFTER candidate
+// selection but before the delete transaction. This test injects that hold
+// from inside archive(). The row SURVIVES and the deletion metric reads zero.
 #[tokio::test]
 async fn hold_placed_mid_tick_is_not_deleted() {
     let (url, _container) = setup_db().await;
@@ -622,8 +626,8 @@ async fn hold_placed_mid_tick_is_not_deleted() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let now = Utc::now();
-    let two_days_ago = now - chrono::Duration::days(2);
+    let now = Timestamp::now();
+    let two_days_ago = now - autumn_harvest::time::days(2);
 
     // An UNHELD candidate at selection time — the hold is placed mid-tick.
     let mid_id = insert_completed(&mut conn, "mid_wf", "m1", two_days_ago, None, None).await;
@@ -678,8 +682,8 @@ async fn held_row_is_not_archived() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let now = Utc::now();
-    let two_days_ago = now - chrono::Duration::days(2);
+    let now = Timestamp::now();
+    let two_days_ago = now - autumn_harvest::time::days(2);
 
     // Held (indefinite) old row + unheld old sibling.
     let held_id =
@@ -734,19 +738,19 @@ async fn set_legal_hold_with_past_until_reports_inactive() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     let id = insert_completed(
         &mut conn,
         "past_wf",
         "pw1",
-        now - chrono::Duration::days(1),
+        now - autumn_harvest::time::days(1),
         None,
         None,
     )
     .await;
     let exec_id = ExecutionId::from_uuid(id);
 
-    let past = now - chrono::Duration::hours(1);
+    let past = now - jiff::SignedDuration::from_hours(1);
     let out = autumn_harvest::set_legal_hold(&mut conn, exec_id, "case-x", Some(past), "op", now)
         .await
         .expect("set");
@@ -766,12 +770,12 @@ async fn expired_hold_is_overwritten_by_a_fresh_set() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     let id = insert_completed(
         &mut conn,
         "ovr_wf",
         "ow1",
-        now - chrono::Duration::days(1),
+        now - autumn_harvest::time::days(1),
         None,
         None,
     )
@@ -779,7 +783,7 @@ async fn expired_hold_is_overwritten_by_a_fresh_set() {
     let exec_id = ExecutionId::from_uuid(id);
 
     // First: an already-expired hold.
-    let past = now - chrono::Duration::hours(1);
+    let past = now - jiff::SignedDuration::from_hours(1);
     let first =
         autumn_harvest::set_legal_hold(&mut conn, exec_id, "old-reason", Some(past), "alice", now)
             .await
@@ -788,7 +792,7 @@ async fn expired_hold_is_overwritten_by_a_fresh_set() {
 
     // Re-set with a FUTURE until: provenance replaced (expired hold does not
     // block the overwrite), newly_held == true.
-    let future = now + chrono::Duration::days(3);
+    let future = now + autumn_harvest::time::days(3);
     let second =
         autumn_harvest::set_legal_hold(&mut conn, exec_id, "new-reason", Some(future), "bob", now)
             .await
@@ -811,7 +815,7 @@ async fn hold_on_running_execution_persists_and_is_untouched_by_tick() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     // Insert a RUNNING execution (no completed_at).
     let id: uuid::Uuid = diesel::sql_query(
         "INSERT INTO harvest_workflow_executions
@@ -819,7 +823,7 @@ async fn hold_on_running_execution_persists_and_is_untouched_by_tick() {
          VALUES ('run_wf', 'rw1', 0, 'RUNNING', '{}'::jsonb, $1)
          RETURNING id",
     )
-    .bind::<Timestamptz, _>(now - chrono::Duration::days(2))
+    .bind::<Timestamptz, _>((now - autumn_harvest::time::days(2)).to_diesel())
     .get_result::<IdRow>(&mut conn)
     .await
     .expect("insert running")
@@ -856,15 +860,15 @@ async fn release_of_expired_hold_clears_columns() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let now = Utc::now();
-    let one_hour_ago = now - chrono::Duration::hours(1);
+    let now = Timestamp::now();
+    let one_hour_ago = now - jiff::SignedDuration::from_hours(1);
     // Seed an execution whose hold has already expired (set_at + past until).
     let id = insert_completed(
         &mut conn,
         "relexp_wf",
         "re1",
-        now - chrono::Duration::days(1),
-        Some(now - chrono::Duration::hours(2)),
+        now - autumn_harvest::time::days(1),
+        Some(now - jiff::SignedDuration::from_hours(2)),
         Some(one_hour_ago),
     )
     .await;
@@ -886,9 +890,9 @@ async fn release_of_expired_hold_clears_columns() {
     );
 }
 
-// Second-tick metric-zero: an indefinitely-held old row survives TWO ticks and
-// the deletion metric reads zero across both (the success metric's ">= 1 full
-// cycle beyond max_age" spirit).
+// An indefinitely-held old row survives TWO ticks, and the deletion metric
+// reads zero across both. This follows the success metric ">= 1 full cycle
+// beyond max_age".
 #[tokio::test]
 async fn indefinitely_held_row_survives_two_ticks_metric_zero() {
     let (url, _container) = setup_db().await;
@@ -896,8 +900,8 @@ async fn indefinitely_held_row_survives_two_ticks_metric_zero() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     scrub(&mut conn).await;
 
-    let now = Utc::now();
-    let two_days_ago = now - chrono::Duration::days(2);
+    let now = Timestamp::now();
+    let two_days_ago = now - autumn_harvest::time::days(2);
     insert_completed(
         &mut conn,
         "twotick_wf",

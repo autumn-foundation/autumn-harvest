@@ -7,17 +7,19 @@
 //! load-bearing: "which shard" *is* "which pool", so a single database
 //! pretending to be several would make every cross-shard assertion vacuous.
 //!
-//! The pure placement logic and the relay's decision table are covered without a
-//! database in `cross_shard_child_placement_unit.rs` and
-//! `cross_shard_child_context_tests.rs`; this suite proves the parts that only a
-//! second real database can: that the child's rows actually land over there,
-//! that its terminal actually wakes the parent back here, that a cancel and a
-//! parent-close cascade actually cross the boundary, and that the parent's own
-//! transaction never does.
+//! `cross_shard_child_placement_unit.rs` and `cross_shard_child_context_tests.rs`
+//! cover the pure placement logic and the relay's decision table without a
+//! database. This suite proves what only a second real database can:
+//!
+//! - the child's rows land over there;
+//! - its terminal wakes the parent back here;
+//! - a cancel and a parent-close cascade cross the boundary;
+//! - the parent's own transaction never does.
 //!
 //! Each test names the acceptance criterion it discharges.
 
 use autumn_harvest::schema::harvest_workflow_executions_ext;
+use jiff_diesel::ToDiesel;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -34,16 +36,17 @@ use autumn_harvest::schema::{
 };
 use autumn_harvest::shard::{ChildPlacement, ShardRouter, ShardedDbPool};
 use autumn_harvest::telemetry::TelemetryConfig;
+use autumn_harvest::time::sql::{NullableTimestamp, SqlTimestamp};
 use autumn_harvest::types::{ExecutionId, ParentClosePolicy, ShardId};
 use autumn_harvest::worker::{DbPool, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
     HarvestBuilder, StartWorkflowParams, WorkerConfig, start_or_load_workflow_execution,
 };
 
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -56,13 +59,11 @@ const SHARDS: [i32; 4] = [0, 1, 2, 3];
 
 /// How many children each fan-out test spawns.
 ///
-/// 32 is chosen so the suite can assert the strong form of AC8 — *every*
-/// writable shard receives at least one child — without being flaky: the
-/// probability that rendezvous hashing leaves any one of four shards empty is
-/// `4 * (3/4)^32`, about 4 in 10,000. (The ±10% distribution bound itself is
-/// asserted over a real 10,000-child fan-out in
-/// `cross_shard_child_placement_unit.rs`, where no database is involved and the
-/// full success-metric scale is cheap.)
+/// 32 lets the suite assert the strong form of AC8 without flakes: *every*
+/// writable shard receives at least one child. The probability that rendezvous
+/// hashing leaves one of four shards empty is `4 * (3/4)^32`, about 4 in 10,000.
+/// `cross_shard_child_placement_unit.rs` asserts the ±10% distribution bound
+/// over a real 10,000-child fan-out. With no database, that full scale is cheap.
 const FAN_OUT_N: usize = 32;
 
 const PARENT_SHARD: i32 = 0;
@@ -157,9 +158,9 @@ fn router_for(shards: &[i32]) -> ShardRouter {
 /// Install the process-global router + sharded pool the runtime resolves
 /// placement and cross-shard routing through.
 ///
-/// These are process globals shared with the rest of this test binary, so every
-/// test in this module is `#[serial]`-by-convention: they all install the same
-/// 4-shard topology and are the only `db` tests that need a multi-shard one.
+/// The rest of this test binary shares these process globals. So every test in
+/// this module is `#[serial]`-by-convention. They all install the same 4-shard
+/// topology, and they are the only `db` tests that need a multi-shard one.
 fn install_globals(router: &ShardRouter, _pool: &ShardedDbPool) {
     autumn_harvest::shard::install_global_router(router.clone());
     // `ShardedDbPool::from_map` (called by `build_sharded_pool`) already
@@ -240,9 +241,9 @@ fn child_typed_failure<'a>(
     })
 }
 
-/// Awaits one typed-failing child pinned to a shard that is definitely not the
-/// parent's, and swallows the failure so the assertion can be made on the
-/// parent's recorded history rather than on its terminal state.
+/// Awaits one typed-failing child pinned to a shard that is not the parent's.
+/// It swallows the failure, so the test asserts on the parent's recorded
+/// history, not on its terminal state.
 fn typed_failure_parent<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -477,7 +478,7 @@ async fn start_parent(pool: &ShardedDbPool, workflow_name: &str, workflow_id: &s
 // ── AC1 / AC2 / AC8: children actually land on other shards ──────────────────
 
 /// **AC2 + AC8 + success metric.** A fan-out with placement enabled spreads its
-/// children across writable shards, each child's row lives on the shard its
+/// children across writable shards. Each child's row lives on the shard its
 /// `ExecutionId` encodes, and the parent's shard holds none of them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_distributed_fan_out_places_children_on_other_shards() {
@@ -642,24 +643,24 @@ async fn a_cross_shard_childs_chain_deadline_is_anchored_at_its_own_creation() {
     }
 
     let mut child_conn = shard_conn(&sharded, child_shard.as_i32()).await;
-    let (created_at, chain_deadline_at): (chrono::DateTime<Utc>, Option<chrono::DateTime<Utc>>) =
+    let (SqlTimestamp(created_at), NullableTimestamp(chain_deadline_at)) =
         harvest_workflow_executions::table
             .find(child_id.as_uuid())
             .select((
                 harvest_workflow_executions::created_at,
                 harvest_workflow_executions_ext::chain_deadline_at,
             ))
-            .first(&mut *child_conn)
+            .first::<(SqlTimestamp, NullableTimestamp)>(&mut *child_conn)
             .await
             .expect("child row must exist on its target shard");
 
     let chain_deadline_at = chain_deadline_at.expect("chain deadline must be set");
     assert!(
-        chain_deadline_at > Utc::now(),
+        chain_deadline_at > Timestamp::now(),
         "the chain deadline must be in the future — carried-over stale value was {chain_deadline_at}"
     );
-    let expected = created_at + chrono::Duration::seconds(chain_execution_timeout_secs);
-    let drift = (chain_deadline_at - expected).num_seconds().abs();
+    let expected = created_at + jiff::SignedDuration::from_secs(chain_execution_timeout_secs);
+    let drift = (chain_deadline_at - expected).as_secs().abs();
     assert!(
         drift <= 5,
         "the chain deadline must be anchored at the child's own creation \
@@ -1210,7 +1211,7 @@ async fn erasing_a_parent_reaches_a_terminal_cross_shard_childs_payloads() {
         diesel::update(harvest_workflow_executions::table.find(parent.as_uuid()))
             .set((
                 harvest_workflow_executions::state.eq("COMPLETED"),
-                harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             ))
             .execute(&mut *parent_conn)
             .await
@@ -1261,7 +1262,7 @@ async fn erasing_a_parent_reaches_a_terminal_cross_shard_childs_payloads() {
             .set((
                 harvest_workflow_executions::state.eq("COMPLETED"),
                 harvest_workflow_executions::output.eq(Some(&secret_output)),
-                harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             ))
             .execute(&mut *child_conn)
             .await
@@ -1340,7 +1341,7 @@ async fn erasing_a_parent_scrubs_the_outbox_child_specs_input() {
         diesel::update(harvest_workflow_executions::table.find(parent.as_uuid()))
             .set((
                 harvest_workflow_executions::state.eq("COMPLETED"),
-                harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             ))
             .execute(&mut *parent_conn)
             .await
@@ -1390,7 +1391,7 @@ async fn erasing_a_parent_scrubs_the_outbox_child_specs_input() {
         diesel::update(harvest_workflow_executions::table.find(child_id.as_uuid()))
             .set((
                 harvest_workflow_executions::state.eq("COMPLETED"),
-                harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             ))
             .execute(&mut *child_conn)
             .await
@@ -1472,7 +1473,7 @@ async fn erasing_a_parent_preserves_a_still_running_started_childs_outbox_spec()
         diesel::update(harvest_workflow_executions::table.find(parent.as_uuid()))
             .set((
                 harvest_workflow_executions::state.eq("COMPLETED"),
-                harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             ))
             .execute(&mut *parent_conn)
             .await
@@ -1590,7 +1591,7 @@ async fn erasing_a_parent_with_a_pending_start_child_reports_it_as_skipped() {
     diesel::update(harvest_workflow_executions::table.find(parent.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
         ))
         .execute(&mut *parent_conn)
         .await
@@ -1681,9 +1682,8 @@ async fn erasing_a_parent_with_a_pending_start_child_reports_it_as_skipped() {
 /// nothing on the target shard afterward means retention collected the
 /// execution and its summary. Most often that is because terminal
 /// delivery to the parent ran later than that horizon. Retrying can never
-/// surface the row again, so treating this like `PENDING_START` would
-/// leave the outbox's
-/// own surviving PII copy unscrubbed forever.
+/// surface the row again. Treating this like `PENDING_START` would leave
+/// the outbox's own surviving PII copy unscrubbed forever.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn erasing_a_parent_scrubs_a_started_childs_spec_after_target_side_retention() {
     let (urls, _container) = setup_shard_databases(&SHARDS).await;
@@ -1699,7 +1699,7 @@ async fn erasing_a_parent_scrubs_a_started_childs_spec_after_target_side_retenti
     diesel::update(harvest_workflow_executions::table.find(parent.as_uuid()))
         .set((
             harvest_workflow_executions::state.eq("COMPLETED"),
-            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
         ))
         .execute(&mut *parent_conn)
         .await
@@ -1869,9 +1869,9 @@ async fn a_cross_shard_parent_is_recognised_so_the_inline_wake_is_skipped() {
     );
 }
 
-/// **AC1.** With placement left at its default, the identical fan-out keeps
-/// every child on the parent's shard and writes no outbox rows at all — the
-/// pre-#956 behaviour, byte for byte.
+/// **AC1.** With the default placement, the identical fan-out keeps every child
+/// on the parent's shard and writes no outbox rows. That is the pre-#956
+/// behaviour, byte for byte.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_default_placement_writes_no_cross_shard_rows() {
     fn default_parent<'a>(
@@ -1952,20 +1952,20 @@ async fn the_default_placement_writes_no_cross_shard_rows() {
 
 // ── AC5: the parent's decision transaction stays shard-local ─────────────────
 
-/// **AC5.** At the instant the parent suspends, its own shard holds the outbox
-/// row and the `ChildWorkflowStarted` events, and the target shards hold
-/// *nothing* — proving the parent's decision transaction never spanned two
-/// databases. The children only appear once the relay has run.
+/// **AC5.** When the parent suspends, its own shard holds the outbox row and the
+/// `ChildWorkflowStarted` events. The target shards hold *nothing*. This proves
+/// that the parent's decision transaction never spanned two databases. The
+/// children appear only after the relay runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_parents_decision_transaction_never_touches_the_target_shard() {
     let (urls, _container) = setup_shard_databases(&SHARDS).await;
     let sharded = build_sharded_pool(&urls);
     install_globals(&router_for(&SHARDS), &sharded);
 
-    // A worker assigned ONLY the parent's shard: it runs the parent's decision
-    // cycle but never sweeps the other shards' relay work... except that the
-    // relay runs on the PARENT's shard (the outbox lives here), so to observe
-    // the pre-relay state we snapshot immediately after the parent parks.
+    // A worker assigned ONLY the parent's shard runs the parent's decision
+    // cycle and never sweeps the other shards' relay work. But the relay runs
+    // on the PARENT's shard, where the outbox lives. So the test snapshots
+    // right after the parent parks to see the pre-relay state.
     let worker = build_worker(&sharded, "w-acid");
     let default_pool = sharded
         .exact_pool_for(ShardId::new(PARENT_SHARD))
@@ -1990,9 +1990,9 @@ async fn the_parents_decision_transaction_never_touches_the_target_shard() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
 
-    // Whatever the relay has already done, no child may EVER appear on the
-    // parent's shard: that is the placement contract, and it is the one
-    // invariant a race with the relay cannot blur.
+    // Whatever the relay has done, no child may EVER appear on the parent's
+    // shard. That is the placement contract. A race with the relay cannot blur
+    // it.
     for child in &child_ids {
         if child.shard().as_i32() == PARENT_SHARD {
             continue;
@@ -2021,14 +2021,13 @@ async fn the_parents_decision_transaction_never_touches_the_target_shard() {
 
 // ── AC3: no lost wake across a crash ─────────────────────────────────────────
 
-/// **AC3.** The child's terminal commit and the parent's notify are separated by
-/// a worker crash: the child is completed directly on its shard while nothing is
-/// relaying, then the relay is run once. The parent must still be woken.
+/// **AC3.** A worker crash separates the child's terminal commit from the
+/// parent's notify. The test completes the child on its shard while nothing
+/// relays, then runs the relay once. The parent must still wake.
 ///
 /// This is the crash-safety property in its sharpest form. The delivery is a
-/// *pull* off a durable row on the parent's shard, so there is no in-flight
-/// notify for a crash to lose — the test proves that structurally rather than by
-/// timing.
+/// *pull* off a durable row on the parent's shard. So no in-flight notify exists
+/// for a crash to lose. The test proves that structurally, not by timing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_crash_between_the_childs_terminal_and_the_parents_notify_loses_no_wake() {
     let (urls, _container) = setup_shard_databases(&SHARDS).await;
@@ -2056,9 +2055,9 @@ async fn a_crash_between_the_childs_terminal_and_the_parents_notify_loses_no_wak
         "baseline: the parent completes when nothing is interrupted"
     );
 
-    // Now the sharp version: kill the worker, then hand-complete a fresh
-    // parent's children on their shards with no relay running at all, and prove
-    // one manual relay sweep still delivers every wake.
+    // The sharp version: kill the worker and hand-complete a fresh parent's
+    // children on their shards with no relay running. One manual relay sweep
+    // must still deliver every wake.
     worker.shutdown();
     let _ = handle.await;
 
@@ -2124,11 +2123,10 @@ async fn a_crash_between_the_childs_terminal_and_the_parents_notify_loses_no_wak
         "every cross-shard child must settle"
     );
 
-    // The actual property under test: the wake was not merely *delivered*, it
-    // was *consumed* — the parent ran to completion off terminals that were
-    // relayed with no worker alive at the moment the children finished. A
-    // settled outbox with a still-parked parent would be a lost wake dressed up
-    // as a clean sweep.
+    // The property under test: the wake was *consumed*, not merely *delivered*.
+    // The parent ran to completion off relayed terminals, with no worker alive
+    // when the children finished. A settled outbox with a still-parked parent
+    // would be a lost wake that looks like a clean sweep.
     let worker3 = build_worker(&sharded, "w-crash-drain");
     let pool3 = sharded
         .exact_pool_for(ShardId::new(PARENT_SHARD))
@@ -2156,12 +2154,12 @@ async fn a_crash_between_the_childs_terminal_and_the_parents_notify_loses_no_wak
 /// **AC4.** A race loser that lives on another shard is durably cancelled.
 ///
 /// `ctx.race()` and the #779 child-deadline race both tear their losers down
-/// through one `CancelRaceLosers` command. For a cross-shard loser that command
-/// cannot cancel inline — the child is in another database — so the parent flags
-/// the outbox row inside its own decision transaction and the relay delivers the
-/// (idempotent) cancel. Without that hop, `cancel_workflow_execution_collect`
-/// would report `NotFound` for a child that is perfectly alive on its own shard,
-/// and that arm is treated as a benign no-op: the loser would run forever.
+/// through one `CancelRaceLosers` command. That command cannot cancel a
+/// cross-shard loser inline, because the child is in another database. So the
+/// parent flags the outbox row inside its own decision transaction. The relay
+/// delivers the (idempotent) cancel. Without that hop,
+/// `cancel_workflow_execution_collect` reports `NotFound` for a live child on
+/// its own shard. That arm is a benign no-op, so the loser would run forever.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cross_shard_race_loser_is_cancelled_on_its_own_shard() {
     fn racing_parent<'a>(
@@ -2355,18 +2353,18 @@ async fn a_scope_cancel_gives_a_cross_shard_child_the_scope_reason() {
 
 // ── Regression: a re-park must not double-record a cross-shard child ─────────
 
-/// **Regression (review finding).** A parent that wakes on a *sibling* while a
-/// cross-shard child is still running must not append a second
-/// `ChildWorkflowStarted` for that child.
+/// **Regression.** A parent that wakes on a *sibling* while a cross-shard child
+/// is still running must not append a second `ChildWorkflowStarted` for that
+/// child.
 ///
 /// The "is this child genuinely new?" test is a lookup in
-/// `harvest_workflow_executions` **on the parent's shard**, where a cross-shard
-/// child's row never appears — so without a shard-aware test every re-park
-/// re-classified the remote child as new. The parent's history would accumulate
-/// one duplicate `ChildWorkflowStarted` per wake, and its next replay would hit
-/// the duplicate positionally and fail the run with a non-determinism
-/// divergence. This is the first realistic shape of the feature: a `Distributed`
-/// fan-out where any sibling settles before a remote child does.
+/// `harvest_workflow_executions` **on the parent's shard**. A cross-shard
+/// child's row never appears there. Without a shard-aware test, every re-park
+/// re-classified the remote child as new. The parent's history gained one
+/// duplicate `ChildWorkflowStarted` per wake. Its next replay hit the duplicate
+/// positionally and failed the run with a non-determinism divergence. This is
+/// the first realistic shape of the feature: a `Distributed` fan-out where any
+/// sibling settles before a remote child does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_repark_never_double_records_a_cross_shard_child() {
     let (urls, _container) = setup_shard_databases(&SHARDS).await;
@@ -2413,10 +2411,9 @@ async fn a_repark_never_double_records_a_cross_shard_child() {
 
 // ── AC4: cancellation and the parent-close cascade cross the boundary ────────
 
-/// **AC4.** A detached cross-shard child is reached by its parent's
-/// `ParentClosePolicy::RequestCancel` cascade even though the child lives on a
-/// different database — with the at-least-once + idempotent-delivery semantics
-/// of the #492 outboxes.
+/// **AC4.** The parent's `ParentClosePolicy::RequestCancel` cascade reaches a
+/// detached child on a different database. It has the at-least-once and
+/// idempotent-delivery semantics of the #492 outboxes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_parent_close_cascade_reaches_a_cross_shard_detached_child() {
     let (urls, _container) = setup_shard_databases(&SHARDS).await;
@@ -2514,8 +2511,8 @@ async fn the_parent_close_cascade_reaches_a_cross_shard_detached_child() {
 // ── AC6: zero event-schema impact ────────────────────────────────────────────
 
 /// **AC6.** The parent's recorded history contains only the pre-existing child
-/// event variants, and every `ChildWorkflowStarted` carries exactly its three
-/// historical fields — whatever shard the child physically lives on.
+/// event variants. Every `ChildWorkflowStarted` carries exactly its three
+/// historical fields, whatever shard the child lives on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cross_shard_parents_history_uses_only_the_existing_event_contract() {
     let (urls, _container) = setup_shard_databases(&SHARDS).await;
@@ -2575,13 +2572,13 @@ async fn a_cross_shard_parents_history_uses_only_the_existing_event_contract() {
     let _ = handle.await;
 }
 
-/// **AC8.** A placement that resolves to a shard this node has no pool for must
-/// fail the child start — never quietly land the child on the parent's shard.
+/// **AC8.** A placement to a shard with no pool on this node must fail the child
+/// start. It must never quietly land the child on the parent's shard.
 ///
 /// The router declares four shards; the pool only has three. Rendezvous over 16
-/// children makes hitting the missing shard essentially certain, and the parent
-/// must be left parked with no child on its own shard rather than completing
-/// with a broken placement contract.
+/// children almost certainly hits the missing shard. The parent must stay
+/// parked with no child on its own shard. It must not complete with a broken
+/// placement contract.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unreachable_target_shard_never_falls_back_to_the_parents_shard() {
     let (urls, _container) = setup_shard_databases(&[0, 1, 2]).await;
@@ -2639,18 +2636,16 @@ async fn an_unreachable_target_shard_never_falls_back_to_the_parents_shard() {
 /// **AC3, issue #767 parity.** A cross-shard child that fails with a typed
 /// `WorkflowFailure` reaches its parent as a *typed* `ChildWorkflowFailed`.
 ///
-/// This is the regression test for a defect that survived a whole review round
-/// because only the field was added and never populated: the relay sees the
-/// child solely through what the child durably wrote, and the execution row's
-/// `error` column holds `decoded.message` alone. Reading it back therefore
-/// yields an untyped failure, silently dropping `error_type` / `details` /
-/// `non_retryable` — the same-shard path forwards the raw envelope through a
-/// function argument and never round-trips it through storage, so nothing on
-/// that path exercises this.
+/// This is the regression test for a defect that went unnoticed: the field was
+/// added but never populated. The relay sees the child solely through what the
+/// child durably wrote. The execution row's `error` column holds
+/// `decoded.message` alone. Reading it back gives an untyped failure, which
+/// drops `error_type` / `details` / `non_retryable`. The same-shard path
+/// passes the raw envelope as a function argument and never stores it. So
+/// nothing on that path exercises this.
 ///
-/// Asserting on the parent's recorded history rather than on a handler-visible
-/// error is deliberate: the event is what replay, the API and the completion
-/// triggers all read.
+/// The test asserts on the parent's recorded history, not on a handler-visible
+/// error. Replay, the API and the completion triggers all read the event.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cross_shard_typed_failure_reaches_the_parent_with_its_type_intact() {
     let (urls, _container) = setup_shard_databases(&SHARDS).await;
@@ -3135,7 +3130,7 @@ async fn a_retry_for_an_existing_child_needs_no_key() {
         .set((
             harvest_cross_shard_children::status.eq("PENDING_START"),
             harvest_cross_shard_children::attempts.eq(0),
-            harvest_cross_shard_children::last_attempt_at.eq(None::<chrono::DateTime<Utc>>),
+            harvest_cross_shard_children::last_attempt_at.eq(None::<jiff_diesel::Timestamp>),
         ))
         .execute(&mut *conn)
         .await
@@ -3175,7 +3170,7 @@ async fn erasing_a_parent_replaces_an_encoded_spec_with_a_tombstone() {
         diesel::update(harvest_workflow_executions::table.find(parent.as_uuid()))
             .set((
                 harvest_workflow_executions::state.eq("COMPLETED"),
-                harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             ))
             .execute(&mut *parent_conn)
             .await
@@ -3209,7 +3204,7 @@ async fn erasing_a_parent_replaces_an_encoded_spec_with_a_tombstone() {
         diesel::update(harvest_workflow_executions::table.find(child_id.as_uuid()))
             .set((
                 harvest_workflow_executions::state.eq("COMPLETED"),
-                harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                harvest_workflow_executions::completed_at.eq(Some(Timestamp::now()).to_diesel()),
             ))
             .execute(&mut *child_conn)
             .await

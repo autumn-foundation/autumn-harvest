@@ -1,11 +1,12 @@
 //! HTTP integration tests for `PATCH /admin/schedules/{id}` — issue #771.
 //!
-//! In-place partial schedule update: identity (`schedule_id`) preservation,
-//! #488 carryover survival across an edit, validate-before-commit (400 leaves
-//! the row byte-for-byte unchanged), workflow-type immutability, DAG-row
-//! rejection, the #350 fire-claim 409, audit rows, and immediate list
-//! visibility.
+//! Covers in-place partial schedule update. The tests check that the
+//! `schedule_id` stays the same and that #488 carryover survives an edit. A 400
+//! leaves the row byte-for-byte unchanged. They also cover workflow-type
+//! immutability, DAG-row rejection, the #350 fire-claim 409, audit rows, and
+//! immediate list visibility.
 
+use jiff_diesel::ToDiesel;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,11 +27,11 @@ use autumn_harvest_plugin::api::{
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -256,7 +257,10 @@ async fn arm_slot(url: &str, id: Uuid, secs_ago: i64) {
     use harvest_schedules::dsl;
     let mut conn = connect(url).await;
     diesel::update(harvest_schedules::table.find(id))
-        .set(dsl::next_run_at.eq(Utc::now() - chrono::Duration::seconds(secs_ago)))
+        .set(
+            dsl::next_run_at
+                .eq((Timestamp::now() - jiff::SignedDuration::from_secs(secs_ago)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("arm slot");
@@ -304,9 +308,9 @@ async fn tick(pool: &DbPool, registry: &Arc<HandlerRegistry>) {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-/// The AC11 money test: create → run once → PATCH cron+input → the id is
-/// unchanged, #488 carryover from the pre-edit run resolves on the next fire,
-/// and the next fire uses the new cadence + new input.
+/// The AC11 money test: create → run once → PATCH cron+input. The id stays
+/// the same, and #488 carryover from the pre-edit run resolves on the next
+/// fire. The next fire uses the new cadence and the new input.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn patch_preserves_identity_and_carryover_across_the_edit() {
@@ -391,7 +395,7 @@ async fn patch_preserves_identity_and_carryover_across_the_edit() {
     );
 
     // ── Run 2 under the post-edit spec ───────────────────────────────────────
-    let t_before_tick2 = Utc::now();
+    let t_before_tick2 = Timestamp::now();
     arm_slot(&url, id, 200).await;
     tick(&pool, &registry).await;
     let completed_ids = wait_for_completed(&url, wf_name, 2).await;
@@ -424,22 +428,22 @@ async fn patch_preserves_identity_and_carryover_across_the_edit() {
          namespace (AC6), got {run2_workflow_id}"
     );
 
-    // AC11c strengthening: the advanced next_run_at must reflect the NEW
-    // 120 s interval. Non-catchup dispatch advances to
-    // next_run_after(schedule, tick_now) = tick_now + 120 with
-    // tick_now >= t_before_tick2; under the OLD 60 s interval it would be
-    // tick_now + 60 < t_before_tick2 + 120 (the tick starts immediately).
+    // AC11c: the advanced `next_run_at` must reflect the NEW 120 s interval.
+    // Non-catchup dispatch advances to `next_run_after(schedule, tick_now)`,
+    // which is tick_now + 120, with tick_now >= t_before_tick2. The OLD 60 s
+    // interval gives tick_now + 60, which is below t_before_tick2 + 120
+    // because the tick starts immediately.
     let row_after_run2 = load_schedule_row(&url, id).await;
     let advanced = row_after_run2
         .next_run_at
         .expect("next_run_at must be advanced after the fire");
     assert!(
-        advanced >= t_before_tick2 + chrono::Duration::seconds(120),
+        advanced >= t_before_tick2 + jiff::SignedDuration::from_secs(120),
         "the advanced next_run_at must be driven by the NEW 120s interval \
          (got {advanced}, tick started {t_before_tick2})"
     );
     assert!(
-        advanced <= Utc::now() + chrono::Duration::seconds(121),
+        advanced <= Timestamp::now() + jiff::SignedDuration::from_secs(121),
         "the advanced next_run_at must be ~tick_now + 120s, got {advanced}"
     );
 
@@ -633,7 +637,8 @@ async fn live_fire_claim_returns_409_until_expired() {
     diesel::update(harvest_schedules::table.find(id))
         .set((
             dsl::fire_claim_token.eq(Some(Uuid::new_v4())),
-            dsl::fire_claimed_until.eq(Some(Utc::now() + chrono::Duration::seconds(25))),
+            dsl::fire_claimed_until
+                .eq(Some(Timestamp::now() + jiff::SignedDuration::from_secs(25)).to_diesel()),
         ))
         .execute(&mut conn)
         .await
@@ -653,7 +658,10 @@ async fn live_fire_claim_returns_409_until_expired() {
 
     // Expire the claim — the edit proceeds.
     diesel::update(harvest_schedules::table.find(id))
-        .set(dsl::fire_claimed_until.eq(Some(Utc::now() - chrono::Duration::seconds(5))))
+        .set(
+            dsl::fire_claimed_until
+                .eq(Some(Timestamp::now() - jiff::SignedDuration::from_secs(5)).to_diesel()),
+        )
         .execute(&mut conn)
         .await
         .expect("expire claim");
@@ -774,9 +782,9 @@ async fn explicit_null_clears_and_absence_preserves_nullable_fields() {
     let _ = load_schedule_row(&url, id).await;
 }
 
-/// Write-path coverage for every remaining AC2 field: each PATCH round-trips
-/// through the row so a field silently dropped by the merge/changeset can't
-/// hide behind response-echo only.
+/// Write-path coverage for each remaining AC2 field. Each PATCH round-trips
+/// through the row. So a field that the merge or changeset drops cannot hide
+/// behind the response echo.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn patch_covers_every_editable_field_write_path() {
@@ -826,7 +834,6 @@ async fn patch_covers_every_editable_field_write_path() {
         "the stored buffered_runs must be trimmed to the new cap"
     );
 
-    // queue_name.
     let (status, patched) = patch_json(
         &app,
         format!("/admin/schedules/{id}"),
@@ -837,7 +844,6 @@ async fn patch_covers_every_editable_field_write_path() {
     let row = load_schedule_row(&url, id).await;
     assert_eq!(row.queue_name.as_deref(), Some("edited-queue"));
 
-    // skip_policy.
     let (status, patched) = patch_json(
         &app,
         format!("/admin/schedules/{id}"),
@@ -865,7 +871,6 @@ async fn patch_covers_every_editable_field_write_path() {
         "a legacy-bool edit must not mint an explicit catchup policy"
     );
 
-    // consecutive_failure_limit.
     let (status, patched) = patch_json(
         &app,
         format!("/admin/schedules/{id}"),
@@ -1086,11 +1091,10 @@ async fn unknown_body_field_is_rejected_with_400_not_silently_ignored() {
     );
 }
 
-/// A timezone-only PATCH on a row whose stored schedule expression is
-/// unparseable returns 400 (repair by sending `schedule_expr` explicitly)
-/// instead of leniently coercing the row to `manual` and `NULL`ing
-/// `next_run_at` as a side effect. A stored `"manual"` expression remains a
-/// legitimate timezone no-op.
+/// A timezone-only PATCH on a row with an unparseable stored expression returns
+/// 400. The caller repairs it by sending `schedule_expr` explicitly. The PATCH
+/// does not coerce the row to `manual` and set `next_run_at` to `NULL`. A
+/// stored `"manual"` expression remains a legitimate timezone no-op.
 #[tokio::test]
 async fn timezone_only_patch_on_unparseable_stored_expr_returns_400() {
     use harvest_schedules::dsl;
@@ -1244,7 +1248,6 @@ async fn code_declared_schedule_patch_writes_an_override_that_the_tick_keeps() {
     );
 
     for bad in [
-        json!({ "input": { "env": "B" } }),
         json!({ "schedule_expr": "interval:0" }),
         // A clear stands alone: `timezone` would resolve against the override.
         json!({ "clear_override": true, "timezone": "Europe/Berlin" }),
@@ -1262,6 +1265,129 @@ async fn code_declared_schedule_patch_writes_an_override_that_the_tick_keeps() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["schedule_expr"], "interval:3600");
     assert_eq!(override_count(&url).await, 0);
+}
+
+/// The `schedule.update` audit rows of schedule `id`, as `(status, error)`,
+/// oldest first.
+async fn schedule_audit_rows(url: &str, id: Uuid) -> Vec<(String, Option<String>)> {
+    let mut conn = connect(url).await;
+    harvest_audit_log::table
+        .filter(harvest_audit_log::dsl::operation.eq("schedule.update"))
+        .filter(harvest_audit_log::dsl::target_id.eq(id.to_string()))
+        .order(harvest_audit_log::dsl::occurred_at.asc())
+        .select((
+            harvest_audit_log::dsl::status,
+            harvest_audit_log::dsl::error_summary,
+        ))
+        .load(&mut conn)
+        .await
+        .expect("load audit rows")
+}
+
+/// The stored input of the override of workflow schedule `wf_name`.
+async fn stored_override_input(url: &str, wf_name: &str) -> Option<Value> {
+    use autumn_harvest::schema::harvest_schedule_overrides::dsl;
+    let mut conn = connect(url).await;
+    dsl::harvest_schedule_overrides
+        .filter(dsl::kind.eq("workflow"))
+        .filter(dsl::name.eq(wf_name))
+        .select(dsl::workflow_input)
+        .first::<Option<Value>>(&mut conn)
+        .await
+        .optional()
+        .expect("load the override input")
+        .flatten()
+}
+
+/// The input override of a code-declared schedule, over HTTP. The patch
+/// takes the input, the tick keeps it, and a clear restores the code input.
+/// Each change writes one audit row.
+#[tokio::test]
+async fn code_declared_schedule_takes_an_input_override() {
+    let (url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&url);
+    let wf_name = "sched_override_input_wf";
+    let registry = etl_registry(wf_name);
+    let mut code_schedule = autumn_harvest::policy::WorkflowSchedule::new(
+        wf_name,
+        autumn_harvest::policy::Schedule::Interval(Duration::from_secs(3600)),
+    );
+    code_schedule.input = json!({ "env": "A" });
+    let code = vec![code_schedule];
+    let app = build_app_with_code_schedules(&pool, registry.clone(), code.clone());
+    tick_with_code(&pool, &registry, &code).await;
+    let id = schedule_id_for(&url, wf_name).await;
+    let route = format!("/admin/schedules/{id}");
+
+    let (status, body) = patch_json(
+        &app,
+        route.clone(),
+        json!({ "input": { "env": "B" }, "reason": "INC-4821" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["workflow_input"], json!({ "env": "B" }));
+    assert_eq!(
+        stored_override_input(&url, wf_name).await,
+        Some(json!({ "env": "B" })),
+        "the identity codec stores the input as it is"
+    );
+
+    for _ in 0..2 {
+        tick_with_code(&pool, &registry, &code).await;
+    }
+    assert_eq!(
+        load_schedule_row(&url, id).await.workflow_input,
+        Some(json!({ "env": "B" })),
+        "the tick keeps the override input"
+    );
+
+    // A JSON null is an absent field. It keeps the stored input.
+    let (status, body) = patch_json(
+        &app,
+        route.clone(),
+        json!({ "input": null, "max_active_runs": 2 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["workflow_input"], json!({ "env": "B" }));
+    assert_eq!(body["max_active_runs"], 2);
+
+    // A refused patch writes nothing, and its audit row holds no input.
+    let (status, body) = patch_json(
+        &app,
+        route.clone(),
+        json!({ "input": { "secret": "AUDIT-LEAK-PROBE" }, "schedule_expr": "interval:0" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        stored_override_input(&url, wf_name).await,
+        Some(json!({ "env": "B" })),
+        "a refused patch keeps the stored input"
+    );
+
+    let (status, body) = patch_json(&app, route.clone(), json!({ "clear_override": true })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["workflow_input"], json!({ "env": "A" }));
+    assert_eq!(override_count(&url).await, 0);
+    assert_eq!(stored_override_input(&url, wf_name).await, None);
+
+    let audit = schedule_audit_rows(&url, id).await;
+    assert_eq!(
+        audit
+            .iter()
+            .map(|(status, _)| status.as_str())
+            .collect::<Vec<_>>(),
+        vec!["succeeded", "succeeded", "failed", "succeeded"],
+        "each change writes one audit row: {audit:?}"
+    );
+    assert!(
+        audit
+            .iter()
+            .all(|(_, error)| !error.as_deref().unwrap_or("").contains("AUDIT-LEAK-PROBE")),
+        "an audit row never holds the input: {audit:?}"
+    );
 }
 
 /// Issue #2386 AC4: a schedule made through the API keeps the row edit.

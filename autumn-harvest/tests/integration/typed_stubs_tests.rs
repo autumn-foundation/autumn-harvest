@@ -49,8 +49,6 @@ fn build_pool(database_url: &str) -> DbPool {
         .expect("test pool should build")
 }
 
-// ── Test Workflow Declaration ───────────────────────────────────────────────
-
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 struct OnboardingInput {
     user_id: i64,
@@ -58,7 +56,6 @@ struct OnboardingInput {
 
 #[workflow]
 async fn onboarding(ctx: &WorkflowContext, input: OnboardingInput) -> Result<String, String> {
-    // Wait for the signal
     let val = ctx
         .wait_for_signal("subscription_active")
         .await
@@ -92,8 +89,6 @@ fn payment_received(_ctx: &WorkflowContext, idempotency_key: String) {
     let _ = idempotency_key;
 }
 
-// ── Tests ───────────────────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn test_typed_workflow_client_stubs() {
     let (db_url, _container) = setup_database_url().await;
@@ -105,31 +100,27 @@ async fn test_typed_workflow_client_stubs() {
     let workflow_id = "onboarding-user-1";
     let input = OnboardingInput { user_id: 1337 };
 
-    // 1. Start the workflow using the generated stub
     let handle = OnboardingStub::start(&mut conn, &client, workflow_id, input.clone())
         .await
         .unwrap();
 
     assert_eq!(handle.exec_id(), handle.inner().exec_id());
 
-    // Verify snapshot shows Running state
     let snap = handle.result_snapshot().await.unwrap();
     assert_eq!(snap.state, WorkflowResultState::Running);
     assert!(snap.output.is_none());
 
-    // 2. Query in process via generated typed method
     let query_res = OnboardingStub::query_current_progress(handle.inner())
         .await
         .unwrap();
     assert_eq!(query_res, 100);
 
-    // 3. Send type-safe signal using generated stub method
     OnboardingStub::signal_subscription_active(&mut conn, handle.inner(), 42)
         .await
         .unwrap();
 
-    // No worker is running, so write the workflow-completed event directly.
-    // This simulates the worker finishing and lets result() resolve.
+    // No worker runs, so write the workflow-completed event directly. This lets
+    // `result()` resolve.
     use autumn_harvest::WorkflowEvent;
     use autumn_harvest::schema::harvest_workflow_executions::dsl;
 
@@ -157,11 +148,9 @@ async fn test_typed_workflow_client_stubs() {
     .await
     .unwrap();
 
-    // 4. Await result and check typed return value
     let result = handle.result().await.unwrap();
     assert_eq!(result, "user 1337: subscription active with value 42");
 
-    // Check completed snapshot
     let final_snap = handle.result_snapshot().await.unwrap();
     assert_eq!(final_snap.state, WorkflowResultState::Completed);
     assert_eq!(
@@ -229,7 +218,6 @@ async fn test_typed_workflow_client_stubs_invalid_timeout() {
 
     let workflow_id = "onboarding-user-4";
     let input = OnboardingInput { user_id: 1340 };
-    // Pass overflowed execution_timeout
     let opts = TypedStartOptions {
         execution_timeout: Some(Duration::from_secs(u64::MAX)),
         ..Default::default()
@@ -285,8 +273,6 @@ async fn test_typed_workflow_client_stubs_signal_with_start_payload_cap() {
     );
 }
 
-// ── Dummy Workflow for Mismatch Testing ──────────────────────────────────────
-
 #[workflow]
 async fn dummy_other_workflow(_ctx: &WorkflowContext, input: String) -> Result<String, String> {
     Ok(input)
@@ -314,7 +300,6 @@ async fn test_typed_workflow_client_stubs_mismatch_validation() {
 
     let client = WorkflowHandleClient::single(pool, db_url.clone());
 
-    // 1. Start onboarding workflow
     let onboarding_handle = OnboardingStub::start(
         &mut conn,
         &client,
@@ -324,7 +309,6 @@ async fn test_typed_workflow_client_stubs_mismatch_validation() {
     .await
     .unwrap();
 
-    // 2. Query mismatch: call DummyOtherWorkflowStub::query_dummy_query with onboarding_handle
     let query_err = DummyOtherWorkflowStub::query_dummy_query(onboarding_handle.inner())
         .await
         .unwrap_err();
@@ -340,7 +324,6 @@ async fn test_typed_workflow_client_stubs_mismatch_validation() {
         query_err
     );
 
-    // 3. Update mismatch: call DummyOtherWorkflowStub::update_dummy_update with onboarding_handle
     let update_err =
         DummyOtherWorkflowStub::update_dummy_update(&mut conn, onboarding_handle.inner())
             .await
@@ -357,7 +340,6 @@ async fn test_typed_workflow_client_stubs_mismatch_validation() {
         update_err
     );
 
-    // 4. Signal mismatch: call DummyOtherWorkflowStub::signal_dummy_signal with onboarding_handle
     let signal_err =
         DummyOtherWorkflowStub::signal_dummy_signal(&mut conn, onboarding_handle.inner())
             .await

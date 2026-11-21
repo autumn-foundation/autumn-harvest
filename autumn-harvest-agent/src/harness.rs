@@ -15,7 +15,7 @@ use crate::agent::AgentProfile;
 use crate::agent::overlay_store::ProfileOverlayStore;
 use crate::bounds::{exceeds_bytes, json_len};
 use crate::consolidate_all::AgentDirectory;
-use crate::delivery::{Delivery, LogDelivery, Report};
+use crate::delivery::{Delivery, LogDelivery, ParkedCall, Report};
 use crate::episode::EpisodeStore;
 use crate::error::{AgentError, ErrorKind};
 use crate::flow::{FlowRules, Released, call_labels};
@@ -25,21 +25,27 @@ use crate::live::{Coalescer, LiveEvent, LiveSink};
 use crate::memory::{MEMORY_TOOL, MemoryScope, MemorySnapshot, MemoryStore, MemoryTool};
 use crate::mesh::{DELEGATE_TOOL, Peer, delegate_definition, valid_name};
 use crate::mesh_control::{MESH_BUDGET_EXCEEDED, MeshBudget, MeshBudgetExceeded, MeshSpend};
-use crate::message::{ChatMessage, ContentPart, RunId, TokenUsage, ToolDefinition};
+use crate::message::{ChatMessage, ContentPart, RunId, SessionId, TokenUsage, ToolDefinition};
 use crate::model::{AgentModel, BoxFuture, ChatRequest, ChatResponse, UNKNOWN_MODEL_ID};
 use crate::policy::{
     AllowAll, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules, effect_refusal,
 };
 use crate::refine::{DEFAULT_PROPOSER_TIMEOUT, OverlayProposer};
 use crate::response_cache::{CacheKey, KeyTenant, ResponseCache};
-use crate::sampling::{PolicyRead, PolicyStoreError, SamplingPolicy, SamplingPolicyStore};
+use crate::sampling::{
+    AnswerKeyFn, PolicyRead, PolicyStoreError, SamplingPolicy, SamplingPolicyStore, SweepItem,
+    SweepItemStore, SweepPage,
+};
 use crate::score::Scorer;
 use crate::skill::{LOAD_SKILL_TOOL, SkillTool};
 use crate::tool::{Tool, ToolContext, ToolEffect};
 use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
+use autumn_harvest::time::Timestamp;
 
-use crate::transcript::{InMemoryTranscriptStore, PREFIX_MISSING, TranscriptStore, chain};
+use crate::transcript::{
+    InMemoryTranscriptStore, PREFIX_MISSING, TranscriptStore, WindowOwner, chain,
+};
 use crate::types::{ModelTurn, ModelTurnRequest, SkillLookup, ToolCallRequest, ToolOutcome};
 use crate::workspace::{WorkspaceHandle, WorkspaceMount, WorkspaceRef, WorkspaceStore};
 
@@ -83,8 +89,8 @@ pub const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_mins(9);
 /// the model turn, and SQLite cannot end the turn from outside.
 pub const DEFAULT_POLICY_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The default time budget of one memory read, delivery or precheck: 30
-/// seconds.
+/// The default time budget of one memory read, delivery, approval notice or
+/// precheck: 30 seconds.
 ///
 /// It is below the one-minute `start_to_close` of the shortest of those
 /// activities. SQLite cannot end a stalled call from outside.
@@ -112,8 +118,10 @@ pub(crate) const TRUNCATED: &str = "…[truncated]";
 
 /// The model, the tools, and the policy behind the two agent activities.
 ///
-/// Install it once per worker. On the Postgres engine, pass it to
-/// `HarvestBuilder::state`. On SQLite, pass it to `sqlite::register`.
+/// Install it once per worker. On a `HarvestBuilder`, pass it to
+/// [`register`](crate::register). Under `HarvestPlugin`, pass it to
+/// `HarvestPlugin::agent`. On a `SqliteRuntime`, pass it to
+/// `sqlite::register`.
 #[derive(Debug, Clone)]
 pub struct AgentHarness {
     client: Arc<dyn AgentModel>,
@@ -151,7 +159,9 @@ pub struct AgentHarness {
     #[cfg(feature = "eval")]
     selector: Option<Arc<dyn crate::refine::OverlaySelector>>,
     sampling: Option<Arc<dyn SamplingPolicyStore>>,
+    sweep_items: Option<SweepItemStore>,
     scorers: BTreeMap<String, Arc<dyn Scorer>>,
+    answer_keys: BTreeMap<String, Arc<dyn AnswerKeyFn>>,
     score_timeout: Duration,
     overlays: Option<Arc<dyn ProfileOverlayStore>>,
 }
@@ -176,7 +186,9 @@ impl AgentHarness {
             #[cfg(feature = "eval")]
             selector: None,
             sampling: None,
+            sweep_items: None,
             scorers: BTreeMap::new(),
+            answer_keys: BTreeMap::new(),
             score_timeout: DEFAULT_SCORE_TIMEOUT,
             overlays: None,
             tools: Vec::new(),
@@ -298,7 +310,6 @@ impl AgentHarness {
         self
     }
 
-    /// The overlay composer, if one is installed.
     #[cfg(feature = "eval")]
     pub(crate) fn overlay_composer(&self) -> Option<&Arc<dyn crate::refine::OverlayComposer>> {
         self.composer.as_ref()
@@ -313,7 +324,6 @@ impl AgentHarness {
         self
     }
 
-    /// The selector, if one is installed.
     #[cfg(feature = "eval")]
     pub(crate) fn overlay_selector(&self) -> Option<&Arc<dyn crate::refine::OverlaySelector>> {
         self.selector.as_ref()
@@ -342,6 +352,42 @@ impl AgentHarness {
     pub fn sampling_policies(mut self, store: Arc<dyn SamplingPolicyStore>) -> Self {
         self.sampling = Some(store);
         self
+    }
+
+    /// Set the store of sweep item lists.
+    ///
+    /// A sweep whose input holds a stored reference reads its items here.
+    /// Without a store, such a sweep fails before its first model call.
+    #[must_use]
+    pub fn sweep_items(mut self, store: SweepItemStore) -> Self {
+        self.sweep_items = Some(store);
+        self
+    }
+
+    /// One page of a stored sweep list, for the `agent_sweep_items`
+    /// activity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a non-retryable error when the harness has no item store, or
+    /// the list does not match its reference. Returns a retryable error
+    /// when the store fails or takes longer than the hook timeout.
+    pub async fn sweep_page(&self, page: &SweepPage) -> Result<Vec<SweepItem>, String> {
+        let Some(store) = &self.sweep_items else {
+            return Err(ActivityFailure::non_retryable(
+                "Config",
+                "the harness has no sweep item store; add it with AgentHarness::sweep_items",
+            )
+            .into_error_payload());
+        };
+        match tokio::time::timeout(self.hook_timeout, store.page(&page.items, page.start)).await {
+            Ok(Ok(items)) => Ok(items),
+            Ok(Err(err)) => Err(model_failure(&err)),
+            Err(_) => Err(model_failure(&AgentError::new(
+                ErrorKind::Unavailable,
+                "the sweep item store did not answer within the hook timeout",
+            ))),
+        }
     }
 
     /// The sampling policy of `kind`, for the `agent_sampling_policy`
@@ -384,12 +430,10 @@ impl AgentHarness {
         self
     }
 
-    /// The overlay store, if one is installed.
     pub(crate) fn overlays(&self) -> Option<&Arc<dyn ProfileOverlayStore>> {
         self.overlays.as_ref()
     }
 
-    /// The overlay proposer, if one is installed.
     pub(crate) fn overlay_proposer(&self) -> Option<&Arc<dyn OverlayProposer>> {
         self.proposer.as_ref()
     }
@@ -415,9 +459,36 @@ impl AgentHarness {
         self.scorers.contains_key(id)
     }
 
-    /// The scorer with this id.
     pub(crate) fn scorer_of(&self, id: &str) -> Option<&Arc<dyn Scorer>> {
         self.scorers.get(id)
+    }
+
+    /// Add an app key function of the vote strategy under its id. The
+    /// `agent_vote_key` activity calls it.
+    ///
+    /// A later function with the same id replaces the earlier one. A vote
+    /// can name only an id that is an agent name, so the harness logs a
+    /// warning for any other id.
+    #[must_use]
+    pub fn answer_key(mut self, key: Arc<dyn AnswerKeyFn>) -> Self {
+        if !crate::mesh::valid_name(key.id()) {
+            tracing::warn!(
+                id = %truncate(key.id(), crate::mesh::MAX_NAME_LEN),
+                "an answer key id that is not an agent name: no vote can name it"
+            );
+        }
+        self.answer_keys.insert(key.id().to_owned(), key);
+        self
+    }
+
+    /// Whether the harness has an app key function with this id.
+    #[must_use]
+    pub fn has_answer_key(&self, id: &str) -> bool {
+        self.answer_keys.contains_key(id)
+    }
+
+    pub(crate) fn answer_key_of(&self, id: &str) -> Option<&Arc<dyn AnswerKeyFn>> {
+        self.answer_keys.get(id)
     }
 
     /// Set the time budget of one score, judge calls included.
@@ -467,7 +538,8 @@ impl AgentHarness {
         self
     }
 
-    /// Set the time budget of one memory read, delivery or precheck.
+    /// Set the time budget of one memory read, delivery, approval notice or
+    /// precheck.
     #[must_use]
     pub const fn hook_timeout(mut self, timeout: Duration) -> Self {
         self.hook_timeout = timeout;
@@ -504,6 +576,11 @@ impl AgentHarness {
         self.directory
             .as_ref()
             .ok_or_else(crate::consolidate_all::directory_missing)
+    }
+
+    /// The time budget of one store or hook call.
+    pub(crate) const fn hook_limit(&self) -> Duration {
+        self.hook_timeout
     }
 
     /// The memory store, or a non-retryable error that names the fix.
@@ -611,6 +688,12 @@ impl AgentHarness {
         !is_builtin_name(name) && self.tools.iter().any(|tool| tool.name() == name)
     }
 
+    /// The name of each named model route of the registry.
+    #[cfg_attr(not(feature = "eval"), allow(dead_code))]
+    pub(crate) fn model_names(&self) -> impl Iterator<Item = &str> {
+        self.models.keys().map(String::as_str)
+    }
+
     /// The model `name`. `None` is the [`DEFAULT_MODEL`].
     ///
     /// # Errors
@@ -676,7 +759,7 @@ impl AgentHarness {
     pub(crate) async fn check_mesh_budget(
         &self,
         mesh: Option<&str>,
-        now: autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>,
+        now: Timestamp,
     ) -> Result<(), String> {
         let Some(mesh) = mesh else {
             return Ok(());
@@ -704,7 +787,7 @@ impl AgentHarness {
             if budget.is_spent(&spend) {
                 let details = MeshBudgetExceeded {
                     mesh: mesh.to_owned(),
-                    until_ms: until.timestamp_millis(),
+                    until_ms: until.as_millisecond(),
                 };
                 return Err(ActivityFailure::non_retryable(
                     MESH_BUDGET_EXCEEDED,
@@ -735,25 +818,28 @@ impl AgentHarness {
     ///
     /// Returns a non-retryable [`PREFIX_MISSING`] payload when the store does
     /// not hold the prefix. The workflow then sends the full form.
-    fn window(&self, request: &mut ModelTurnRequest) -> Result<Vec<ChatMessage>, String> {
+    async fn window(&self, request: &mut ModelTurnRequest) -> Result<Vec<ChatMessage>, String> {
         let added = std::mem::take(&mut request.messages);
         let (digest, window) = match &request.prefix {
             None => (None, added.clone()),
             Some(prefix) => {
                 // The digest check makes a changed window a miss, so a
                 // shared store cannot put words into a turn.
-                let held = self
-                    .transcripts
-                    .get(&prefix.digest)
-                    .filter(|held| u32::try_from(held.len()).is_ok_and(|len| len == prefix.len))
-                    .filter(|held| chain(None, held) == prefix.digest)
-                    .ok_or_else(|| {
-                        ActivityFailure::non_retryable(
-                            PREFIX_MISSING,
-                            "the transcript store does not hold the prefix of this turn",
-                        )
-                        .into_error_payload()
-                    })?;
+                // A store that hangs is a miss, as a store error is.
+                let held =
+                    tokio::time::timeout(self.hook_timeout, self.transcripts.get(&prefix.digest))
+                        .await
+                        .ok()
+                        .flatten()
+                        .filter(|held| u32::try_from(held.len()).is_ok_and(|len| len == prefix.len))
+                        .filter(|held| chain(None, held) == prefix.digest)
+                        .ok_or_else(|| {
+                            ActivityFailure::non_retryable(
+                                PREFIX_MISSING,
+                                "the transcript store does not hold the prefix of this turn",
+                            )
+                            .into_error_payload()
+                        })?;
                 let mut window = held;
                 window.extend(added.iter().cloned());
                 (Some(prefix.digest.as_str()), window)
@@ -766,9 +852,40 @@ impl AgentHarness {
                 || chain(None, &window),
                 |prefix| chain(Some(prefix), &added),
             );
-            self.transcripts.put(&digest, &window);
+            let owner = WindowOwner::new(&request.run_id, request.session_id.as_ref());
+            if tokio::time::timeout(
+                self.hook_timeout,
+                self.transcripts.put(owner, &digest, &window),
+            )
+            .await
+            .is_err()
+            {
+                tracing::warn!("the transcript store did not keep a window in time");
+            }
         }
         Ok(window)
+    }
+
+    /// The windows that `session` keeps in the transcript store. `None`
+    /// means that the store cannot count.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error, or a timeout.
+    pub async fn transcript_count(&self, session: SessionId) -> Result<Option<u64>, String> {
+        self.hooked("the transcript store", self.transcripts.count(&session))
+            .await
+    }
+
+    /// Delete every window that `session` keeps in the transcript store,
+    /// and count them. `None` means that the store cannot erase by session.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error, or a timeout.
+    pub async fn transcript_erase(&self, session: SessionId) -> Result<Option<u64>, String> {
+        self.hooked("the transcript store", self.transcripts.erase(&session))
+            .await
     }
 
     /// Add one peer to the roster. A run whose mandate names the peer can
@@ -938,15 +1055,9 @@ impl AgentHarness {
         tenant: CacheTenant,
         prepare: impl FnMut(&mut Vec<ContentPart>),
     ) -> Result<ModelTurn, String> {
-        self.model_turn_timed_in(
-            request,
-            tenant,
-            prepare,
-            None,
-            autumn_harvest::chrono::Utc::now(),
-        )
-        .await
-        .map(|(turn, _latency)| turn)
+        self.model_turn_timed_in(request, tenant, prepare, None, Timestamp::now())
+            .await
+            .map(|(turn, _latency)| turn)
     }
 
     /// [`model_turn_in`](Self::model_turn_in), with the latency of the model
@@ -967,7 +1078,7 @@ impl AgentHarness {
         tenant: CacheTenant,
         prepare: impl FnMut(&mut Vec<ContentPart>),
         publish: Option<&(dyn Fn(&LiveEvent) + Send + Sync)>,
-        now: autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>,
+        now: Timestamp,
     ) -> Result<(ModelTurn, Option<Duration>), String> {
         let span = tracing::info_span!(
             "agent_model_turn",
@@ -998,7 +1109,7 @@ impl AgentHarness {
         // workflow tool, so the workflow refuses it with a named verdict.
         let hidden_delegate = mandate && !builtins.iter().any(|tool| tool.name() == DELEGATE_TOOL);
         if hidden_delegate {
-            builtins.push(Arc::new(WorkflowTool(delegate_definition(&[]))));
+            builtins.push(Arc::new(WorkflowTool(delegate_definition(&[], None))));
         }
         let tools = self
             .permitted(&builtins, request.allowed_tools.as_ref())
@@ -1015,7 +1126,7 @@ impl AgentHarness {
         tenant: CacheTenant,
         mut prepare: impl FnMut(&mut Vec<ContentPart>),
         publish: Option<&(dyn Fn(&LiveEvent) + Send + Sync)>,
-        now: autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>,
+        now: Timestamp,
     ) -> Result<(ModelTurn, Option<Duration>), String> {
         let live = Live {
             run_id: request.run_id.clone(),
@@ -1026,7 +1137,7 @@ impl AgentHarness {
         let client = self.model(request.model.as_deref())?;
         self.check_mesh_budget(request.mesh.as_deref(), now).await?;
         let mut request = request;
-        let messages = self.window(&mut request)?;
+        let messages = self.window(&mut request).await?;
         let (builtins, tools) = self.turn_tools(&request);
         let allowed = request.allowed_tools.as_ref();
         let chat = ChatRequest {
@@ -1488,8 +1599,8 @@ impl AgentHarness {
         if let Some(lookup) = request.skill.filter(|_| tool.name() == LOAD_SKILL_TOOL) {
             return Ok(self.skill_outcome(lookup, &call.arguments));
         }
-        // A read-only run can read the files but never moves the head. A
-        // probe never moves it either, because the head belongs to the
+        // A read-only run can read the files but never moves the head. A call
+        // that changes them there is an error (issue #2692). A probe never moves it either, because the head belongs to the
         // source scope (issue #2378).
         let keep_files = !request.read_only && request.probe_effects.is_none();
         // Only a tool that opts in loads the workspace (issue #2274).
@@ -1508,6 +1619,11 @@ impl AgentHarness {
         let execution = tool.execute(call.arguments, &ctx);
         Ok(
             match tokio::time::timeout(self.tool_timeout, execution).await {
+                Ok(Ok(_)) if request.read_only && changed_workspace(handle.as_ref()) => {
+                    // A read-only run never moves the head. A success result
+                    // would hide the dropped change from the model (issue #2692).
+                    self.error_outcome(READ_ONLY_WORKSPACE_REFUSAL)
+                }
                 Ok(Ok(output)) => {
                     let mut outcome = ToolOutcome::ok(fit_result(
                         truncate(&output.to_string(), self.tool_output_limit),
@@ -1533,7 +1649,6 @@ impl AgentHarness {
         )
     }
 
-    /// The workspace store, if one is installed.
     #[cfg(feature = "eval")]
     pub(crate) const fn workspace_store_opt(&self) -> Option<&WorkspaceStore> {
         self.workspace.as_ref()
@@ -1704,17 +1819,42 @@ impl AgentHarness {
     /// Returns a non-retryable error when no store is installed, and the
     /// store error otherwise.
     pub async fn memory_reset(&self, scope: MemoryScope) -> Result<(), String> {
-        let Some(store) = &self.memory else {
-            return Err(ActivityFailure::non_retryable(
-                "MemoryStoreMissing",
-                "the agent has a memory scope, but no memory store is installed: call AgentHarness::memory",
-            )
-            .into_error_payload());
-        };
+        let store = self.memory_for_reset()?;
         tokio::time::timeout(self.hook_timeout, store.clear(&scope))
             .await
             .map_err(|_| self.hook_timed_out("MemoryTimeout", "the memory store"))?
             .map_err(|err| model_failure(&err))
+    }
+
+    /// The entries that the memory of `scope` holds. The reset of a durable
+    /// agent records the count before the clear, so a retried clear keeps
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`memory_reset`](Self::memory_reset), and a failed
+    /// read.
+    pub async fn memory_count(&self, scope: MemoryScope) -> Result<u64, String> {
+        let store = self.memory_for_reset()?;
+        Ok(tokio::time::timeout(self.hook_timeout, store.load(&scope))
+            .await
+            .map_err(|_| self.hook_timed_out("MemoryTimeout", "the memory store"))?
+            .map_err(|err| model_failure(&err))?
+            .iter()
+            .map(|block| block.entries.len() as u64)
+            .sum())
+    }
+
+    /// The memory store of a reset. A missing store is a non-retryable
+    /// error, because a reset must not report a clear that did not happen.
+    fn memory_for_reset(&self) -> Result<&Arc<dyn MemoryStore>, String> {
+        self.memory.as_ref().ok_or_else(|| {
+            ActivityFailure::non_retryable(
+                "MemoryStoreMissing",
+                "the agent has a memory scope, but no memory store is installed: call AgentHarness::memory",
+            )
+            .into_error_payload()
+        })
     }
 
     /// Send one report to the delivery.
@@ -1727,6 +1867,22 @@ impl AgentHarness {
         tokio::time::timeout(self.hook_timeout, self.delivery.deliver(&report))
             .await
             .map_err(|_| self.hook_timed_out("DeliveryTimeout", "the delivery"))?
+            .map_err(|err| model_failure(&err))
+    }
+
+    /// Send the notice of one parked call to the delivery.
+    ///
+    /// The deadline is the clock of this worker plus the timeout of the call.
+    ///
+    /// # Errors
+    ///
+    /// Returns the delivery error. A retryable kind retries, and so does a
+    /// send over its time budget.
+    pub async fn notify_approval(&self, call: ParkedCall) -> Result<(), String> {
+        let notice = call.notice(Timestamp::now());
+        tokio::time::timeout(self.hook_timeout, self.delivery.notify_approval(&notice))
+            .await
+            .map_err(|_| self.hook_timed_out("ApprovalNoticeTimeout", "the approval notice"))?
             .map_err(|err| model_failure(&err))
     }
 
@@ -1858,7 +2014,9 @@ fn guided(
 
 /// Whether `name` is the name of a built-in tool of the crate.
 fn is_builtin_name(name: &str) -> bool {
-    matches!(name, LOAD_SKILL_TOOL | MEMORY_TOOL | DELEGATE_TOOL) || name == FOLLOWUP_TOOL
+    matches!(name, LOAD_SKILL_TOOL | MEMORY_TOOL | DELEGATE_TOOL)
+        || name == FOLLOWUP_TOOL
+        || name == crate::sweep_tool::SWEEP_TOOL
 }
 
 /// Warn when an app tool takes the reserved name [`LOAD_SKILL_TOOL`]. The
@@ -2014,6 +2172,15 @@ fn workspace_failure(err: &AgentError) -> String {
     }
 }
 
+/// The text of a refused workspace change on a read-only run (issue #2692).
+const READ_ONLY_WORKSPACE_REFUSAL: &str =
+    "this run cannot change the workspace; the change was not saved";
+
+/// Whether the tool call changed the workspace that it loaded.
+fn changed_workspace(handle: Option<&WorkspaceHandle>) -> bool {
+    handle.is_some_and(|handle| handle.snapshot().is_dirty())
+}
+
 fn workspace_timeout() -> String {
     ActivityFailure::retryable(
         WORKSPACE_TIMEOUT,
@@ -2080,7 +2247,7 @@ pub(crate) fn cut_bytes(text: String, max: usize) -> String {
 ///
 /// A policy writes a reason as free text. 256 bytes still tell the reviewer or
 /// the model why. A turn with many calls then stays small.
-const REASON_CUT_BYTES: usize = 256;
+pub(crate) const REASON_CUT_BYTES: usize = 256;
 
 /// The cost of one call of `client`, as the cost ledger records it.
 ///
@@ -2179,7 +2346,6 @@ mod tests {
         let cap = DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
         let max = max_tool_result_bytes(cap);
         for unit in ["x", "\u{0}", "é", "\""] {
-            // At the limit, one byte under it, and far over it.
             for len in [max - 1, max, max + 1, 2 * max] {
                 let text: String = unit.repeat(len).chars().take(len).collect();
                 let outcome = ToolOutcome::ok(fit_result(text, cap));

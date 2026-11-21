@@ -3,8 +3,8 @@
 //!
 //! Demonstrates `ctx.request_cancel_external_workflow(target)`: a supervisor
 //! workflow aborts an in-flight fulfillment workflow after a fraud review
-//! verdict arrives — one deterministic call, exactly-once cancel dispatch,
-//! clean replay on every worker.
+//! verdict arrives. It is one deterministic call with exactly-once cancel
+//! dispatch and a clean replay on every worker.
 //!
 //! # Key semantics
 //!
@@ -44,7 +44,6 @@ pub struct OrderId {
 /// is replayed as `Ok(())`.
 #[workflow]
 async fn fraud_review_supervisor(ctx: &WorkflowContext, input: OrderId) -> Result<String, String> {
-    // Parse the fulfillment execution ID that was started earlier.
     let fulfillment_id = uuid::Uuid::parse_str(&input.fulfillment_exec_id)
         .map_err(|e| format!("invalid exec id: {e}"))?;
     let target = ExecutionId::from_uuid(fulfillment_id);

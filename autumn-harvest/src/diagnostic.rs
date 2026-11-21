@@ -81,14 +81,14 @@ impl SimulatorResultExt for SimulatorResult {
 mod tests {
     use super::*;
     use crate::event::WorkflowEvent;
-    use chrono::Utc;
+    use jiff::Timestamp;
 
     #[test]
     fn test_diagnostic_report_generation() {
         let history = vec![
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!({}),
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
                 last_completion_result: None,
                 last_error: None,
                 scheduled_time: None,

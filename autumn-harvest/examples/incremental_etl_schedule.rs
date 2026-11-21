@@ -1,9 +1,9 @@
 #![allow(clippy::all, clippy::pedantic, clippy::nursery)]
 //! Cursor-based incremental ETL schedule (issue #488).
 //!
-//! Demonstrates the `ctx.last_completion_result()` / `ctx.last_error()` accessors
-//! for scheduled workflows that need to process only rows added since the previous
-//! successful run — without an external high-water-mark table.
+//! Demonstrates the `ctx.last_completion_result()` / `ctx.last_error()` accessors.
+//! A scheduled workflow uses them to process only rows added since the previous
+//! successful run, with no external high-water-mark table.
 //!
 //! ## How it works
 //!
@@ -27,8 +27,8 @@
 //!
 //! **Manual starts** (not triggered by a schedule) always see `None` for both.
 //!
-//! **Skipped fires** (`OverlapPolicy::Skip`) do not advance the cursor — the
-//! skipped slot never calls `start_or_load_workflow_execution`, so the next run's
+//! **Skipped fires** (`OverlapPolicy::Skip`) do not advance the cursor. The
+//! skipped slot never calls `start_or_load_workflow_execution`. So the next run's
 //! `last_completion_result` still refers to the last non-skipped COMPLETED run.
 //!
 //! ## Example

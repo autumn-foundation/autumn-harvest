@@ -5,9 +5,9 @@
 //! becomes `max_in_flight` for `execute_activity_fan_out_raw_windowed`, so the
 //! dispatch shape recorded in history depends on ambient configuration.
 //!
-//! **Launder.** `.read()` is not `.lock()`, so HVG007 — the single ambient-state
-//! rule — misses this *even when written inline in a workflow body*; the crate
-//! boundary is belt-and-braces. DET has no lock or `RwLock` pattern at all.
+//! **Launder.** `.read()` is not `.lock()`. So HVG007, the single ambient-state
+//! rule, misses this *even inline in a workflow body*. The crate boundary is
+//! belt-and-braces. DET has no lock or `RwLock` pattern at all.
 //!
 //! **Expected trace hops.** `wf_rwlock_config_read` ⇒
 //! `harvest_verify_corpus_helpers::window_size` ⇒ `RwLock::<usize>::read` on

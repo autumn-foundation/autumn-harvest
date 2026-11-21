@@ -23,7 +23,6 @@ use autumn_harvest::types::{
     ExternalAwaitId, ExternalCancelId, ExternalSignalId, ExternalTarget, ParentClosePolicy,
 };
 use autumn_harvest::{ExecutionId, WorkflowCommand, WorkflowEvent, WorkflowHandlerFn};
-use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::error::{SqliteError, SqliteResult};
@@ -213,8 +212,8 @@ pub fn start_child(
     )?;
     // List and describe read the start time from the row (issue #2027). The
     // deadline counts from it.
-    let started_at = DateTime::from_timestamp_millis(now).unwrap_or_else(Utc::now);
-    store::set_start_fields(conn, child_id, started_at.timestamp_micros(), None, None)?;
+    let started_at = autumn_harvest::time::from_millisecond_clamped(now);
+    store::set_start_fields(conn, child_id, started_at.as_microsecond(), None, None)?;
     store::append_event(
         conn,
         child_id,
@@ -513,9 +512,7 @@ struct SignalRequest<'a> {
     signal_id: ExternalSignalId,
     /// The run to signal.
     target: &'a ExternalTarget,
-    /// The signal name.
     signal_name: &'a str,
-    /// The signal payload.
     payload: &'a Value,
     /// The dedup key, if any.
     idempotency_key: Option<&'a str>,

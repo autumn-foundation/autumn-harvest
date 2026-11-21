@@ -2,10 +2,9 @@
 //! The `dev-runtime-managed` acquisition path (issue #525, AC2).
 //!
 //! This is the half of AC2 that says "on a clean machine with only the Rust
-//! toolchain": when no `PostgreSQL` server is installed, the runtime downloads
-//! and extracts one. Everything else in the suite runs against a Postgres that
-//! is already there, so without this the download path would be compiled and
-//! never executed.
+//! toolchain". With no `PostgreSQL` server installed, the runtime downloads
+//! and extracts one. The rest of the suite uses an installed Postgres, so
+//! without this test the download path never runs.
 //!
 //! **Opt-in**, because it fetches roughly 30 MB over the network:
 //!
@@ -14,8 +13,8 @@
 //!     --features dev-runtime-managed --test dev_runtime_managed
 //! ```
 //!
-//! CI compiles this target on every leg (a `compileonly` manifest row) so it
-//! cannot rot, and the opt-in run is how the path is actually exercised.
+//! CI compiles this target on every leg (a `compileonly` manifest row), so it
+//! cannot rot. The opt-in run is what exercises the path.
 
 use autumn_harvest_plugin::dev::{DevRuntimeConfig, EphemeralPostgres, running_as_root};
 

@@ -1,0 +1,15 @@
+# Six alternating pairs of the `throughput` cell, 1 shard.
+# base = trunk-dev at a0045b6. new = this change, all six items. One box, 2026-11-12.
+# pg_stat_statements.track_planning = off, no commit probe.
+base_1 workflows_per_sec=69.71
+new_1 workflows_per_sec=71.57
+new_2 workflows_per_sec=78.43
+base_2 workflows_per_sec=69.32
+base_3 workflows_per_sec=72.40
+new_3 workflows_per_sec=78.50
+new_4 workflows_per_sec=78.59
+base_4 workflows_per_sec=74.36
+base_5 workflows_per_sec=77.52
+new_5 workflows_per_sec=78.27
+new_6 workflows_per_sec=79.52
+base_6 workflows_per_sec=71.12

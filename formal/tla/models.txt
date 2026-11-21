@@ -47,3 +47,16 @@ AgentWorkspaceRetention AgentWorkspaceRetentionContentKeys.cfg violation:HeadPre
 AgentWorkspaceRetention AgentWorkspaceRetentionClockFloor.cfg  violation:HeadPresent
 AgentWorkspaceRetention AgentWorkspaceRetentionNoMarker.cfg    violation:HeadPresent
 AgentWorkspaceRetention AgentWorkspaceRetentionReach.cfg       violation:NoStaleRun
+OverrideCarry      OverrideCarry.cfg                   pass
+OverrideCarry      OverrideCarryThreeShards.cfg        pass
+OverrideCarry      OverrideCarryFlipAfterFailedDelete.cfg pass
+OverrideCarry      OverrideCarryFlipMidCarry.cfg       pass
+OverrideCarry      OverrideCarrySkew.cfg               pass
+OverrideCarry      OverrideCarrySkewLimit.cfg          violation:LastWriteWins
+OverrideCarry      OverrideCarryNoFloor.cfg            violation:ClearIsKept
+OverrideCarry      OverrideCarryNoFloorCarry.cfg       violation:ClearIsKept
+OverrideCarry      OverrideCarryWallClock.cfg          violation:NothingLostWithoutAClear
+OverrideCarry      OverrideCarryOwnerRowWins.cfg       violation:LastWriteWins
+OverrideCarry      OverrideCarryUnserialized.cfg       violation:NothingLostWithoutAClear
+OverrideCarry      OverrideCarryUnfenced.cfg           violation:NoWriteAfterPromotion
+OverrideCarry      OverrideCarryReach.cfg              violation:NoClearOfACopiedRow

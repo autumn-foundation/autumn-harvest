@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use autumn_harvest::prelude::*;
 use autumn_harvest_sqlite::{ActivitySpec, RunState, SqliteError, SqliteRuntime};
-use chrono::{DateTime, TimeDelta, Utc};
+use jiff::{SignedDuration, Timestamp};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
 
@@ -111,24 +111,31 @@ async fn timed(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
 }
 
 /// Reaches an unsupported feature, so the drive seals the run `FAILED`.
+///
+/// A cross-type `continue_as_new` mints no value. A worker session records a
+/// marker, and a replay past the seal mints that marker again. The query then
+/// refuses, so a session does not serve this test.
 #[workflow]
-async fn runs_external_activity(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+async fn continues_as_another_type(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
     let stage = Arc::new(Mutex::new(json!("started")));
     let read = Arc::clone(&stage);
     ctx.register_query("stage", move || read.lock().unwrap().clone());
-    set(&stage, json!("before-external"));
-    ctx.execute_activity_external("external", json!({}), "default", 60)
+    set(&stage, json!("before-continue"));
+    ctx.continue_as_new_as_type("timed", json!(0))
         .await
+        .map(|()| Value::Null)
         .map_err(|e| e.to_string())
 }
 
-/// Like `runs_external_activity`, with a side effect in the rolled-back cycle.
+/// Like `continues_as_another_type`, with a side effect in the rolled-back
+/// cycle.
 #[workflow]
-async fn external_activity_after_uuid(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+async fn continues_after_uuid(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
     let id = ctx.new_uuid().to_string();
     ctx.register_query("stage", move || json!(id));
-    ctx.execute_activity_external("external", json!({}), "default", 60)
+    ctx.continue_as_new_as_type("timed", json!(0))
         .await
+        .map(|()| Value::Null)
         .map_err(|e| e.to_string())
 }
 
@@ -604,12 +611,12 @@ async fn query_does_not_fire_a_due_timer() {
     let (_dir, path) = temp_db();
     let mut rt = SqliteRuntime::open(&path).unwrap();
     rt.register_workflow(&timed_info());
-    let t0 = DateTime::<Utc>::from_timestamp(1_000_000, 0).unwrap();
+    let t0 = Timestamp::from_second(1_000_000).unwrap();
     let exec = rt.start_workflow("timed", json!(0)).unwrap();
     let state = rt.run_until_blocked_as_of(exec, t0).await.unwrap();
     assert!(matches!(state, RunState::WaitingTimer), "got {state:?}");
     // The timer is now due. Only a drive may fire it.
-    rt.set_clock(move || t0 + TimeDelta::hours(2));
+    rt.set_clock(move || t0 + SignedDuration::from_hours(2));
 
     let reader = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
     let rows_before = snapshot(&reader);
@@ -625,9 +632,9 @@ async fn query_does_not_fire_a_due_timer() {
 async fn unsupported_sealed_run_serves_state_before_the_feature() {
     let (_dir, path) = temp_db();
     let mut rt = SqliteRuntime::open(&path).unwrap();
-    rt.register_workflow(&runs_external_activity_info());
+    rt.register_workflow(&continues_as_another_type_info());
     let exec = rt
-        .start_workflow("runs_external_activity", json!(0))
+        .start_workflow("continues_as_another_type", json!(0))
         .unwrap();
     let err = rt.run_until_blocked(exec).await.unwrap_err();
     assert!(matches!(err, SqliteError::Unsupported(_)), "got {err:?}");
@@ -636,7 +643,7 @@ async fn unsupported_sealed_run_serves_state_before_the_feature() {
     let rows_before = snapshot(&reader);
     let version_before = data_version(&reader);
     let answer = rt.query(exec, "stage", Value::Null).await.unwrap();
-    assert_eq!(answer, json!("before-external"));
+    assert_eq!(answer, json!("before-continue"));
     assert_eq!(
         snapshot(&reader),
         rows_before,
@@ -650,10 +657,8 @@ async fn unsupported_sealed_run_serves_state_before_the_feature() {
 #[tokio::test]
 async fn unrecorded_side_effect_on_a_terminal_run_is_query_unavailable() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    rt.register_workflow(&external_activity_after_uuid_info());
-    let exec = rt
-        .start_workflow("external_activity_after_uuid", json!(0))
-        .unwrap();
+    rt.register_workflow(&continues_after_uuid_info());
+    let exec = rt.start_workflow("continues_after_uuid", json!(0)).unwrap();
     rt.run_until_blocked(exec).await.unwrap_err();
 
     let err = rt.query(exec, "stage", Value::Null).await.unwrap_err();

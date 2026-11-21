@@ -208,6 +208,13 @@ impl Backend for Pg {
         self.worker = Some((worker, handle));
     }
 
+    async fn reload_kind(&mut self, kind: &str) -> Vec<AgentId> {
+        let pg = autumn_harvest_agent::postgres::PostgresAgents::single(self.pool.clone());
+        autumn_harvest_agent::postgres::reload_profiles(&pg, kind)
+            .await
+            .unwrap()
+    }
+
     async fn send(&mut self, id: &AgentId, op: &AgentOp) {
         use autumn_harvest::WorkflowIdReusePolicy;
         use autumn_harvest::execution::{
@@ -418,4 +425,14 @@ async fn a_policy_ceiling_reaches_the_op_read() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_rollback_after_an_auto_adoption_restores_v1() {
     overlay_read_suite::a_rollback_after_an_auto_adoption_restores_v1(&mut Pg::new().await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reload_reads_the_new_profile() {
+    overlay_read_suite::a_reload_reads_the_new_profile(&mut Pg::new().await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reload_keeps_the_active_overlay() {
+    overlay_read_suite::a_reload_keeps_the_active_overlay(&mut Pg::new().await).await;
 }

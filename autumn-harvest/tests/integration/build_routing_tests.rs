@@ -1,14 +1,9 @@
 //! Tests for worker build-id routing (issue #171).
 //!
-//! Covers: `BuildId`, `DeploymentName`, `BuildCompatibilitySet` pure logic,
-//! and (when `db` feature is enabled) the full DB-backed lifecycle:
-//! worker registration with build identity, build policy CRUD, build
-//! compatibility declaration, build-aware task claiming, and build
-//! reachability reporting.
-//!
-//! TDD structure:
-//!   RED  – these tests drove the initial API design
-//!   GREEN – implementations in `build_routing.rs`, `types.rs`, et al.
+//! Covers the pure logic of `BuildId`, `DeploymentName` and
+//! `BuildCompatibilitySet`. With the `db` feature it also covers the full
+//! DB-backed lifecycle: worker registration with build identity, build policy
+//! CRUD, compatibility declaration, build-aware claiming and reachability.
 
 // ── Pure-logic tests (no DB required) ─────────────────────────────────────
 
@@ -116,7 +111,7 @@ fn empty_build_id_worker_cannot_claim_a_pinned_task() {
 #[test]
 fn empty_build_worker_is_flagged_only_on_queues_with_a_policy() {
     use autumn_harvest::build_routing::{BuildPolicy, empty_build_policy_queues};
-    use chrono::Utc;
+    use jiff::Timestamp;
     use uuid::Uuid;
 
     let policy = |queue: &str| BuildPolicy {
@@ -126,8 +121,8 @@ fn empty_build_worker_is_flagged_only_on_queues_with_a_policy() {
         deployment_name: None,
         target_build_id: None,
         ramp_percent: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: Timestamp::now(),
+        updated_at: Timestamp::now(),
     };
     let queues = vec!["default".to_string(), "bulk".to_string()];
     let policies = vec![policy("default"), policy("other")];
@@ -268,7 +263,7 @@ fn merge_reachability_empty_input_returns_empty() {
 fn ramp_percent_zero_always_resolves_to_base_build() {
     use autumn_harvest::build_routing::BuildPolicy;
     use autumn_harvest::types::ExecutionId;
-    use chrono::Utc;
+    use jiff::Timestamp;
     use uuid::Uuid;
 
     let policy = BuildPolicy {
@@ -278,8 +273,8 @@ fn ramp_percent_zero_always_resolves_to_base_build() {
         deployment_name: None,
         target_build_id: Some("canary-v2".to_string()),
         ramp_percent: Some(0),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: Timestamp::now(),
+        updated_at: Timestamp::now(),
     };
 
     for _ in 0..500 {
@@ -292,7 +287,7 @@ fn ramp_percent_zero_always_resolves_to_base_build() {
 fn ramp_percent_hundred_always_resolves_to_target_build() {
     use autumn_harvest::build_routing::BuildPolicy;
     use autumn_harvest::types::ExecutionId;
-    use chrono::Utc;
+    use jiff::Timestamp;
     use uuid::Uuid;
 
     let policy = BuildPolicy {
@@ -302,8 +297,8 @@ fn ramp_percent_hundred_always_resolves_to_target_build() {
         deployment_name: None,
         target_build_id: Some("canary-v2".to_string()),
         ramp_percent: Some(100),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: Timestamp::now(),
+        updated_at: Timestamp::now(),
     };
 
     for _ in 0..500 {
@@ -316,7 +311,7 @@ fn ramp_percent_hundred_always_resolves_to_target_build() {
 fn no_ramp_configured_resolves_to_base_build() {
     use autumn_harvest::build_routing::BuildPolicy;
     use autumn_harvest::types::ExecutionId;
-    use chrono::Utc;
+    use jiff::Timestamp;
     use uuid::Uuid;
 
     let policy = BuildPolicy {
@@ -326,8 +321,8 @@ fn no_ramp_configured_resolves_to_base_build() {
         deployment_name: None,
         target_build_id: None,
         ramp_percent: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: Timestamp::now(),
+        updated_at: Timestamp::now(),
     };
 
     for _ in 0..50 {
@@ -338,12 +333,11 @@ fn no_ramp_configured_resolves_to_base_build() {
 
 #[test]
 fn cleared_ramp_percent_with_stale_target_resolves_to_base() {
-    // `ramp_percent = None` (cleared) must win even if a stale `target_build_id`
-    // value is still present on the row — clearing the percent alone must be
-    // enough to immediately stop new starts going to the target (AC6).
+    // `ramp_percent = None` (cleared) wins over a stale `target_build_id` on the
+    // row. Clearing the percent alone stops new starts going to the target (AC6).
     use autumn_harvest::build_routing::BuildPolicy;
     use autumn_harvest::types::ExecutionId;
-    use chrono::Utc;
+    use jiff::Timestamp;
     use uuid::Uuid;
 
     let policy = BuildPolicy {
@@ -353,8 +347,8 @@ fn cleared_ramp_percent_with_stale_target_resolves_to_base() {
         deployment_name: None,
         target_build_id: Some("canary-v2".to_string()),
         ramp_percent: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: Timestamp::now(),
+        updated_at: Timestamp::now(),
     };
 
     for _ in 0..50 {
@@ -369,7 +363,7 @@ fn ramp_decision_is_deterministic_for_a_given_execution_id() {
     // (AC3). The decision must be a pure function of exec_id.
     use autumn_harvest::build_routing::BuildPolicy;
     use autumn_harvest::types::ExecutionId;
-    use chrono::Utc;
+    use jiff::Timestamp;
     use uuid::Uuid;
 
     let policy = BuildPolicy {
@@ -379,8 +373,8 @@ fn ramp_decision_is_deterministic_for_a_given_execution_id() {
         deployment_name: None,
         target_build_id: Some("canary-v2".to_string()),
         ramp_percent: Some(37),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: Timestamp::now(),
+        updated_at: Timestamp::now(),
     };
 
     for _ in 0..200 {
@@ -398,12 +392,11 @@ fn ramp_decision_is_deterministic_for_a_given_execution_id() {
 
 #[test]
 fn ramp_decision_differs_across_two_independent_policies_with_disjoint_targets() {
-    // Sanity check that the ramp decision is actually keyed off the exec_id
-    // (not e.g. always true/false regardless of input) by asserting that at
-    // 50% ramp, both outcomes are actually observed across many exec_ids.
+    // The ramp decision must depend on the exec_id. At 50% ramp, both outcomes
+    // must occur across many exec_ids.
     use autumn_harvest::build_routing::BuildPolicy;
     use autumn_harvest::types::ExecutionId;
-    use chrono::Utc;
+    use jiff::Timestamp;
     use uuid::Uuid;
 
     let policy = BuildPolicy {
@@ -413,8 +406,8 @@ fn ramp_decision_differs_across_two_independent_policies_with_disjoint_targets()
         deployment_name: None,
         target_build_id: Some("canary-v2".to_string()),
         ramp_percent: Some(50),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: Timestamp::now(),
+        updated_at: Timestamp::now(),
     };
 
     let mut saw_base = false;
@@ -443,7 +436,7 @@ fn ramp_distribution_is_within_two_percentage_points_at_various_percents() {
     // configured percentage across a large sample of distinct new starts.
     use autumn_harvest::build_routing::BuildPolicy;
     use autumn_harvest::types::ExecutionId;
-    use chrono::Utc;
+    use jiff::Timestamp;
     use uuid::Uuid;
 
     for percent in [5_i32, 25, 50, 75, 95] {
@@ -454,8 +447,8 @@ fn ramp_distribution_is_within_two_percentage_points_at_various_percents() {
             deployment_name: None,
             target_build_id: Some("canary-v2".to_string()),
             ramp_percent: Some(percent),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
         };
 
         let total = 10_000;
@@ -1192,9 +1185,8 @@ mod db_tests {
 
     #[tokio::test]
     async fn ramp_back_to_zero_stops_new_starts_from_reaching_target() {
-        // AC6: setting ramp back to 0 (or clearing it) must immediately stop
-        // new starts going to the target; verified by a follow-up start
-        // landing on the base build.
+        // AC6: a ramp set back to 0 (or cleared) immediately stops new starts
+        // going to the target. A follow-up start must land on the base build.
         let (mut conn, _c) = setup().await;
 
         set_build_policy(&mut conn, "default", "base-v1", None)
@@ -1251,9 +1243,9 @@ mod db_tests {
 
     #[tokio::test]
     async fn pre_ramp_policy_row_without_ramp_columns_still_routes_to_base_build() {
-        // Back-compat (AC additive migration): a policy row created before
-        // this feature shipped (ramp columns NULL by default) must keep
-        // routing 100% of new starts to the base build, unchanged.
+        // Back-compat (AC additive migration). A policy row from before this
+        // feature has NULL ramp columns. It must keep routing 100% of new
+        // starts to the base build.
         let (mut conn, _c) = setup().await;
 
         set_build_policy(&mut conn, "default", "base-v1", None)

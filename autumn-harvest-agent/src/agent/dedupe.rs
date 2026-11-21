@@ -127,6 +127,27 @@ impl Inbound {
         applied.seen = taken;
         applied.apply(seq)
     }
+
+    /// `true` when the receiver took the message with the idempotency key
+    /// `key` (issue #2484).
+    ///
+    /// The key is `<from>:<seq>`, as `DelegationRecord::idempotency_key`
+    /// holds it. A sender numbers its messages per receiver, so check the
+    /// key on the receiver that the record names. Then a `true` is sound. A
+    /// `false` can also mean that the bound dropped the sender or the
+    /// number. A malformed key is `false`.
+    #[must_use]
+    pub fn applied_key(&self, key: &str) -> bool {
+        let Some((sender, seq)) = key.rsplit_once(':') else {
+            return false;
+        };
+        let Ok(seq) = seq.parse::<u64>() else {
+            return false;
+        };
+        self.senders
+            .get(sender)
+            .is_some_and(|applied| applied.contains(seq))
+    }
 }
 
 #[cfg(test)]
@@ -177,6 +198,19 @@ mod tests {
         assert!(applied.apply(u64::MAX));
         assert_eq!(applied.floor, u64::MAX);
         assert!(!applied.apply(u64::MAX), "a repeat is a duplicate");
+    }
+
+    // Issue #2484: a caller finds a sent message by its key.
+    #[test]
+    fn a_key_names_an_applied_message() {
+        let mut inbound = Inbound::default();
+        assert!(inbound.apply("agent:triage:t1@3", 2));
+        assert!(inbound.applied_key("agent:triage:t1@3:2"));
+        assert!(!inbound.applied_key("agent:triage:t1@3:1"), "a gap");
+        assert!(!inbound.applied_key("agent:triage:t1@4:2"), "another life");
+        for malformed in ["", "2", ":2", "agent:triage:t1@3:", "agent:triage:t1@3:x"] {
+            assert!(!inbound.applied_key(malformed), "{malformed:?}");
+        }
     }
 
     #[test]

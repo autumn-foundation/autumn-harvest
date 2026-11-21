@@ -2,21 +2,22 @@
 //! **is** the `{exec_id}` segment of the management API's workflow routes.
 //!
 //! The core-crate suite (`autumn-harvest/tests/integration/activity_info_tests.rs`)
-//! can only prove the reported id round-trips through `FromStr` and selects the
-//! right `harvest_workflow_executions` row — the HTTP route lives in this crate,
-//! so the literal "`GET /api/harvest/workflows/{id}` → 200" clause has to be
-//! asserted here.
+//! can only prove two things. The reported id round-trips through `FromStr`,
+//! and it selects the right `harvest_workflow_executions` row. The HTTP route
+//! lives in this crate. So the literal "`GET /api/harvest/workflows/{id}` →
+//! 200" clause is asserted here.
 //!
-//! The proof is deliberately end-to-end and self-reporting: the activity itself
-//! returns `ctx.info().execution_id.to_string()` as its output, a real worker
-//! drives the run to `COMPLETED`, and the *activity-observed* string — never a
-//! value the test knew up front — is spliced straight into the request URI. A
-//! 404 control on a fresh id proves the 200 is attributable to that id rather
-//! than to the route answering 200 for anything.
+//! The proof is deliberately end-to-end and self-reporting. The activity
+//! returns `ctx.info().execution_id.to_string()` as its output, and a real
+//! worker drives the run to `COMPLETED`. The *activity-observed* string goes
+//! straight into the request URI. The test never knows that value up front.
+//! A 404 control on a fresh id proves that the 200 belongs to that id, and
+//! not to a route that answers 200 for anything.
 //!
-//! Dual-mode DB: prefers `HARVEST_TEST_DATABASE_URL` (creates a fresh uniquely
-//! named database on that server, migrates it) so the suite is runnable without
-//! Docker; falls back to testcontainers Postgres 16 (the mode CI runs).
+//! Dual-mode DB: prefers `HARVEST_TEST_DATABASE_URL`, so the suite runs
+//! without Docker. It creates a fresh uniquely named database on that server
+//! and migrates it. It falls back to testcontainers Postgres 16 (the mode CI
+//! runs).
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -113,9 +114,10 @@ fn wf_correlate(ctx: &autumn_harvest::context::WorkflowContext, input: Value) ->
     })
 }
 
-/// The AC3 subject: an activity reporting the owning run's id the way an
-/// operator-facing log line would (`ctx.info().execution_id`), rendered with
-/// `Display` — the exact form that has to be pasteable into a route.
+/// The AC3 subject: an activity that reports the id of its owning run.
+///
+/// It reads `ctx.info().execution_id` as an operator-facing log line would,
+/// and renders it with `Display`. That is the exact form a route must accept.
 fn correlate_activity(ctx: &autumn_harvest::ActivityContext, _input: Value) -> BoxFut<'_> {
     Box::pin(async move { Ok(json!(ctx.info().execution_id.to_string())) })
 }

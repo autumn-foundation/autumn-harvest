@@ -41,12 +41,12 @@
 //!                    "body":{"approved_by":"alice"}}}}
 //! ```
 //!
-//! Safety posture: exposure is opt-in twice (the `mcp` attribute selects
-//! workflows; `HarvestPlugin::mcp_tools()` mounts the routes), the mutating
-//! tools are never part of autumn-web's read-only `expose_all_as_mcp` hatch,
-//! and the whole `/mcp` endpoint should be gated with
-//! `AppBuilder::secure_mcp(...)` in production — tool calls replay the
-//! caller's credentials through the real handler pipeline.
+//! Safety posture: exposure is opt-in twice. The `mcp` attribute selects
+//! workflows, and `HarvestPlugin::mcp_tools()` mounts the routes. The mutating
+//! tools are never part of autumn-web's read-only `expose_all_as_mcp` hatch.
+//! In production, gate the whole `/mcp` endpoint with
+//! `AppBuilder::secure_mcp(...)`. Tool calls replay the caller's credentials
+//! through the real handler pipeline.
 
 use autumn_harvest::prelude::*;
 use autumn_harvest_plugin::HarvestPlugin;

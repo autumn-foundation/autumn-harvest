@@ -2,17 +2,18 @@
 
 use crate::schema::{harvest_schedules_ext, harvest_workflow_executions_ext};
 use crate::table_split::SetExt;
-use std::collections::{BTreeSet, HashMap};
+use jiff_diesel::ToDiesel;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use chrono::{DateTime, NaiveDate, Utc};
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
 use diesel::SelectableHelper;
 use diesel::{BoolExpressionMethods, ExpressionMethods};
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use jiff::Timestamp;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::task::JoinHandle;
@@ -23,6 +24,7 @@ use crate::execution::{StartWorkflowParams, StartedWorkflowExecution};
 use crate::info::DagInfo;
 use crate::models::{HarvestSchedule, NewHarvestSchedule};
 use crate::policy::{OverlapPolicy, Schedule, WorkflowSchedule, compute_jitter_offset};
+use crate::prepared_loop::PreparedLoop;
 use crate::schema::{harvest_schedules, harvest_workflow_executions};
 use crate::shard::{ShardRouter, ShardedDbPool};
 use crate::types::{ExecutionId, ShardId, WorkflowIdReusePolicy};
@@ -73,17 +75,17 @@ fn registration_backoff_delay(failures: u32) -> Duration {
 #[derive(Debug, Clone, Copy)]
 struct RegistrationBackoffEntry {
     failures: u32,
-    retry_at: DateTime<Utc>,
+    retry_at: Timestamp,
 }
 
 /// Per-schedule registration backoff (issue #1157, defect 2).
 ///
 /// The reconciler used to re-issue an identical failing write once per second
 /// forever, with no memory of the previous failure. This holds, per schedule
-/// key, how many consecutive registration failures it has seen and when it may
-/// next be attempted, so an unconvergeable schedule quiesces to one attempt per
-/// [`REGISTRATION_BACKOFF_CAP`] instead of 3600/hour — while every other
-/// schedule keeps reconciling at full rate.
+/// key, the count of consecutive registration failures and the next attempt
+/// time. An unconvergeable schedule quiesces to one attempt per
+/// [`REGISTRATION_BACKOFF_CAP`] instead of 3600/hour. Every other schedule
+/// keeps reconciling at full rate.
 ///
 /// Owned by [`SchedulerRuntime`] so the state spans ticks. One-shot callers of
 /// [`tick_once_sharded`] get a fresh instance, which is behaviourally identical
@@ -127,14 +129,14 @@ impl ScheduleRegistrationBackoff {
 
     /// Whether `key` may be attempted at `now`.
     #[must_use]
-    pub fn should_attempt(&self, key: &str, now: DateTime<Utc>) -> bool {
+    pub fn should_attempt(&self, key: &str, now: Timestamp) -> bool {
         self.lock()
             .get(key)
             .is_none_or(|entry| now >= entry.retry_at)
     }
 
     /// Record a failed registration for `key`, escalating its delay.
-    pub fn record_failure(&self, key: &str, now: DateTime<Utc>) {
+    pub fn record_failure(&self, key: &str, now: Timestamp) {
         let mut entries = self.lock();
         let entry = entries
             .entry(key.to_string())
@@ -143,11 +145,9 @@ impl ScheduleRegistrationBackoff {
                 retry_at: now,
             });
         entry.failures = entry.failures.saturating_add(1);
-        let delay = chrono::Duration::from_std(registration_backoff_delay(entry.failures))
-            .unwrap_or_else(|_| chrono::Duration::seconds(300));
-        entry.retry_at = now
-            .checked_add_signed(delay)
-            .unwrap_or(chrono::DateTime::<Utc>::MAX_UTC);
+        let delay = jiff::SignedDuration::try_from(registration_backoff_delay(entry.failures))
+            .unwrap_or_else(|_| jiff::SignedDuration::from_secs(300));
+        entry.retry_at = now.checked_add(delay).unwrap_or(jiff::Timestamp::MAX);
         drop(entries);
     }
 
@@ -196,7 +196,7 @@ impl std::fmt::Display for BackfillPlanError {
 /// - For `Cron` schedules the first occurrence at or after `from` is included; subsequent
 ///   occurrences are stepped through until they exceed `to`.
 /// - For `Interval` schedules `from` is treated as the first backfill timestamp and slots are
-///   spaced by the interval duration. The plan stops at the last date that `chrono` holds.
+///   spaced by the interval duration. The plan stops at the last date that jiff holds.
 /// - `Manual` schedules and `None` return an empty list (no automatic firing times).
 ///
 /// # Errors
@@ -206,10 +206,10 @@ impl std::fmt::Display for BackfillPlanError {
 /// [`DEFAULT_BACKFILL_MAX_COUNT`] unless a tighter bound is required.
 pub fn plan_backfill_timestamps(
     schedule: Option<&Schedule>,
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
+    from: Timestamp,
+    to: Timestamp,
     max_count: usize,
-) -> Result<Vec<DateTime<Utc>>, BackfillPlanError> {
+) -> Result<Vec<Timestamp>, BackfillPlanError> {
     if to < from {
         return Ok(vec![]);
     }
@@ -217,9 +217,9 @@ pub fn plan_backfill_timestamps(
     match schedule {
         None | Some(Schedule::Manual) => Ok(vec![]),
         Some(Schedule::Cron(_) | Schedule::CronInTimezone { .. }) => {
-            // Find the first cron occurrence at or after `from` by searching from 1 ms before
-            // it (cron fires on whole-second boundaries; 1 ms is a safe undercut).
-            let reference = from - chrono::Duration::milliseconds(1);
+            // Search from 1 ms before `from` to include an occurrence at `from`.
+            // Cron fires on whole-second boundaries, so 1 ms is a safe undercut.
+            let reference = from - jiff::SignedDuration::from_millis(1);
             let walker = slot_walker(schedule);
             let next_slot = |at| walker.as_ref().and_then(|w| w.next_after(at));
             let Some(mut cursor) = next_slot(reference) else {
@@ -242,7 +242,8 @@ pub fn plan_backfill_timestamps(
             Ok(timestamps)
         }
         Some(Schedule::Interval(interval)) => {
-            let dur = chrono::Duration::from_std(*interval).unwrap_or(chrono::Duration::MAX);
+            let dur =
+                jiff::SignedDuration::try_from(*interval).unwrap_or(jiff::SignedDuration::MAX);
             let mut timestamps = Vec::new();
             let mut cursor = from;
             loop {
@@ -253,8 +254,8 @@ pub fn plan_backfill_timestamps(
                     return Err(BackfillPlanError::LimitExceeded { limit: max_count });
                 }
                 timestamps.push(cursor);
-                // Stop when the next slot passes the last date that chrono holds (issue #2048).
-                let Some(next) = cursor.checked_add_signed(dur) else {
+                // Stop when the next slot passes the last date that jiff holds (issue #2048).
+                let Some(next) = cursor.checked_add(dur).ok() else {
                     break;
                 };
                 cursor = next;
@@ -318,7 +319,7 @@ pub struct SchedulerSnapshot {
     /// Interval in milliseconds between scheduler ticks.
     pub tick_interval_ms: u64,
     /// UTC timestamp of the last executed tick.
-    pub last_tick_at: Option<DateTime<Utc>>,
+    pub last_tick_at: Option<Timestamp>,
 }
 
 /// Provides diagnostic visibility into a running scheduler.
@@ -344,7 +345,7 @@ impl SchedulerMonitor {
         }
     }
 
-    /// Creates a dummy offline monitor for contexts where the scheduler isn't running.
+    /// Creates a dummy offline monitor for contexts where the scheduler is not running.
     #[must_use]
     pub fn offline() -> Self {
         Self {
@@ -373,7 +374,7 @@ impl SchedulerMonitor {
         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         guard.running = true;
         guard.dag_count = dag_count;
-        guard.last_tick_at = Some(Utc::now());
+        guard.last_tick_at = Some(Timestamp::now());
     }
 
     fn mark_stopped(&self, dag_count: usize) {
@@ -386,6 +387,43 @@ impl SchedulerMonitor {
 /// How long a stopping scheduler waits for each notify sender to drain
 /// (issue #1796).
 const NOTIFY_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A scheduler loop that is built but not yet running.
+///
+/// [`SchedulerRuntime::prepare_sharded`] builds it.
+#[derive(Debug)]
+#[must_use = "a prepared scheduler does nothing until it runs"]
+pub struct PreparedScheduler {
+    task: PreparedLoop,
+    monitor: SchedulerMonitor,
+}
+
+impl PreparedScheduler {
+    /// The monitor of this scheduler. It reads `running` once the loop ticks.
+    #[must_use]
+    pub fn monitor(&self) -> SchedulerMonitor {
+        self.monitor.clone()
+    }
+
+    /// Run the loop in the current task until `host` is cancelled.
+    ///
+    /// The loop then finishes its tick, flushes its notifications and
+    /// returns. See [`PreparedLoop::run`].
+    pub async fn run(self, host: CancellationToken) {
+        self.task.run(host).await;
+    }
+
+    /// Spawn the loop on a new Tokio task.
+    #[must_use]
+    pub fn spawn(self) -> SchedulerRuntime {
+        let (shutdown, handle) = self.task.spawn();
+        SchedulerRuntime {
+            shutdown,
+            handle,
+            monitor: self.monitor,
+        }
+    }
+}
 
 /// The background runtime that drives DAG and workflow scheduling.
 pub struct SchedulerRuntime {
@@ -423,8 +461,8 @@ impl SchedulerRuntime {
     /// # Panics
     ///
     /// Panics when the scheduler is built without `unified-dag-execution` and
-    /// the DAG catalog contains classic DAGs, because there is no supported
-    /// tick path for executing those schedule rows.
+    /// the DAG catalog contains classic DAGs. No supported tick path executes
+    /// those schedule rows.
     #[must_use]
     pub fn spawn_sharded(
         pool: ShardedDbPool,
@@ -433,6 +471,25 @@ impl SchedulerRuntime {
         dags: Arc<DagCatalog>,
         workflow_schedules: Arc<Vec<WorkflowSchedule>>,
     ) -> Self {
+        Self::prepare_sharded(pool, router, registry, dags, workflow_schedules).spawn()
+    }
+
+    /// Build the scheduler loop of [`Self::spawn_sharded`], but do not spawn
+    /// it.
+    ///
+    /// The caller runs it with [`PreparedScheduler::run`], or spawns it with
+    /// [`PreparedScheduler::spawn`].
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::spawn_sharded`].
+    pub fn prepare_sharded(
+        pool: ShardedDbPool,
+        router: ShardRouter,
+        registry: Arc<HandlerRegistry>,
+        dags: Arc<DagCatalog>,
+        workflow_schedules: Arc<Vec<WorkflowSchedule>>,
+    ) -> PreparedScheduler {
         #[cfg(not(feature = "unified-dag-execution"))]
         {
             if let Err(error) = reject_classic_dags_without_unified_execution(dags.as_ref()) {
@@ -454,17 +511,19 @@ impl SchedulerRuntime {
         // Issue #1157, defect 2: per-schedule registration backoff state must
         // span ticks, so the loop owns it rather than the (stateless) tick fn.
         let backoff = ScheduleRegistrationBackoff::new();
-        // Issue #797: declare the loop before its first iteration so the
-        // `scanner_liveness` check expects it and grants it boot grace. Unlike
-        // the other loops, the schedule ticker sleeps AFTER its first pass, so
-        // it normally ticks almost immediately.
         let scanner_metrics = Arc::clone(&registry.telemetry().metrics);
-        let owner = crate::scanner_health::register_scanner(
-            scanner_metrics.as_ref(),
-            crate::scanner_health::Scanner::Schedule,
-            DEFAULT_SCHEDULER_TICK_INTERVAL,
-        );
-        let handle = tokio::spawn(async move {
+        let task = async move {
+            // Issue #797: declare the loop before its first iteration so the
+            // `scanner_liveness` check expects it and grants it boot grace.
+            // Unlike the other loops, the schedule ticker sleeps AFTER its
+            // first pass, so it normally ticks almost immediately. The loop
+            // declares itself when it starts. A prepared loop that never runs
+            // then leaves no entry behind.
+            let owner = crate::scanner_health::register_scanner(
+                scanner_metrics.as_ref(),
+                crate::scanner_health::Scanner::Schedule,
+                DEFAULT_SCHEDULER_TICK_INTERVAL,
+            );
             while !shutdown_for_task.is_cancelled() {
                 if let Err(error) = tick_once_sharded_with_backoff(
                     pool.clone(),
@@ -480,10 +539,10 @@ impl SchedulerRuntime {
                     tracing::warn!(error = %error, "harvest scheduler tick failed");
                 }
 
-                // Issue #797: unconditional end-of-pass liveness tick — a tick
-                // that fired nothing (the overwhelmingly common case) still
-                // proves the ticker is alive, which the work-only
-                // `harvest.schedule.fire_attempts` counter cannot.
+                // Issue #797: unconditional end-of-pass liveness tick. A tick
+                // that fired nothing (the common case) still proves the ticker
+                // is alive. The work-only `harvest.schedule.fire_attempts`
+                // counter cannot prove that.
                 crate::scanner_health::record_scanner_tick(scanner_metrics.as_ref(), owner);
 
                 tokio::select! {
@@ -507,11 +566,10 @@ impl SchedulerRuntime {
                     .flush(NOTIFY_FLUSH_TIMEOUT)
                     .await;
             }
-        });
+        };
 
-        Self {
-            shutdown,
-            handle,
+        PreparedScheduler {
+            task: PreparedLoop::new(shutdown, task),
             monitor,
         }
     }
@@ -625,11 +683,11 @@ pub async fn register_schedules(
 /// Try to take the fleet-wide schedule-registration advisory lock on `conn`
 /// (issue #1157, defect 4).
 ///
-/// Every process running with `scheduler_enabled` reconciles, so N processes
-/// against one database issued N× the registration writes and could race each
-/// other on the same rows. This transaction-scoped `try_` lock lets exactly one
-/// process reconcile a shard at a time; a process that does not get it simply
-/// skips (its peer is doing the work) and retries on the next tick.
+/// Every process running with `scheduler_enabled` reconciles. N processes
+/// against one database issued N× the registration writes and could race on
+/// the same rows. This transaction-scoped `try_` lock lets exactly one process
+/// reconcile a shard at a time. A process that does not get it skips, because
+/// its peer does the work, and retries on the next tick.
 ///
 /// Must be called inside a transaction — a `pg_*_advisory_xact_lock` taken in
 /// autocommit mode is released the instant the statement ends.
@@ -680,10 +738,10 @@ pub(crate) async fn wait_for_registration_lock(conn: &mut AsyncPgConnection) -> 
 /// Log a per-schedule registration failure once, naming the schedule.
 ///
 /// Issue #1157, defect 2: the pre-fix reconciler propagated the first error
-/// with `?`, so a tick raised exactly one error however many schedules were
+/// with `?`. A tick raised exactly one error however many schedules were
 /// broken, and re-issued the identical failing write every second. Each failing
 /// schedule now gets its own WARN, emitted only on an attempt the backoff
-/// actually permitted.
+/// permitted.
 fn warn_registration_failure(kind: &str, name: &str, shard: ShardId, error: &HarvestError) {
     tracing::warn!(
         error = %error,
@@ -705,7 +763,7 @@ async fn register_schedules_for_shard(
 ) -> HarvestResult<()> {
     #[cfg(not(feature = "unified-dag-execution"))]
     reject_classic_dags_without_unified_execution(dags)?;
-    let now = Utc::now();
+    let now = Timestamp::now();
     for dag in dags.values() {
         if router.pick_for_dag(&dag.name) != shard {
             continue;
@@ -724,9 +782,9 @@ async fn register_schedules_for_shard(
 
 /// The backoff key for one schedule on one shard.
 ///
-/// Not part of the stable public API — the format is an internal detail,
-/// exposed only so a cross-crate test can look a schedule up in a registry it
-/// owns. `kind` is `"dag"` or `"workflow"`.
+/// Not part of the stable public API. The format is an internal detail,
+/// exposed only so a cross-crate test can look up a schedule in its own
+/// registry. `kind` is `"dag"` or `"workflow"`.
 #[doc(hidden)]
 #[must_use]
 pub fn registration_backoff_key(kind: &str, name: &str, shard: ShardId) -> String {
@@ -736,14 +794,13 @@ pub fn registration_backoff_key(kind: &str, name: &str, shard: ShardId) -> Strin
 /// What one schedule's registration attempt actually did.
 ///
 /// The `Skipped` case is why this is not a bare `Result`. A process that loses
-/// the fleet-wide registration lock did **not** reconcile anything, so treating
-/// it as a success would call [`ScheduleRegistrationBackoff::record_success`]
-/// and *clear* the schedule's accumulated penalty. On a multi-process fleet —
-/// exactly the deployment shape the lock exists for — a permanently-broken
-/// schedule would then alternate lose-lock (penalty reset) / win-lock (fail,
-/// penalty = 1) and never escalate past the first backoff step, so the storm
-/// this fix suppresses would persist at roughly full rate, merely spread across
-/// processes.
+/// the fleet-wide registration lock did **not** reconcile anything. Treating
+/// it as a success calls [`ScheduleRegistrationBackoff::record_success`] and
+/// *clears* the schedule's accumulated penalty. The lock exists for a
+/// multi-process fleet. There, a permanently-broken schedule then alternates
+/// lose-lock (penalty reset) and win-lock (fail, penalty = 1). It never
+/// escalates past the first backoff step. The write storm then persists at
+/// roughly full rate, spread across processes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegistrationOutcome {
     /// The row was reconciled, or was already converged. Clears any penalty.
@@ -760,7 +817,7 @@ fn record_registration_outcome(
     name: &str,
     shard: ShardId,
     outcome: HarvestResult<RegistrationOutcome>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) {
     match outcome {
         Ok(RegistrationOutcome::Settled) => backoff.record_success(key),
@@ -776,9 +833,9 @@ fn record_registration_outcome(
 /// Validate + upsert a single classic DAG schedule row on the tick path.
 ///
 /// Issue #1157 (defects 3 + 4): a converged row short-circuits before any
-/// transaction or lock is taken, and a row that *does* need a write is written
-/// under the fleet-wide registration lock so N scheduler processes perform 1×
-/// the write volume rather than N×.
+/// transaction or lock. A row that *does* need a write is written under the
+/// fleet-wide registration lock. N scheduler processes then perform 1× the
+/// write volume rather than N×.
 async fn register_one_dag_schedule(
     conn: &mut AsyncPgConnection,
     dag: &RegisteredDag,
@@ -790,12 +847,11 @@ async fn register_one_dag_schedule(
     if dag_registration_is_converged(conn, dag).await? {
         return Ok(RegistrationOutcome::Settled);
     }
-    // READ COMMITTED is pinned rather than inherited, matching the convention
-    // documented at `queue.rs`'s claim transaction: leaving it to
-    // `default_transaction_isolation` would let an operator set REPEATABLE READ
-    // on the database or role and turn every concurrent row touch (the
-    // fire-claim UPDATE, the PATCH route) into a 40001 serialization abort,
-    // which this path would then misread as a registration failure and back the
+    // READ COMMITTED is pinned rather than inherited, as in `queue.rs`'s claim
+    // transaction. An operator can set REPEATABLE READ on the database or role
+    // through `default_transaction_isolation`. Every concurrent row touch (the
+    // fire-claim UPDATE, the PATCH route) then becomes a 40001 serialization
+    // abort. This path misreads that as a registration failure and backs the
     // healthy schedule off for up to five minutes.
     let mut tx = conn.build_transaction().read_committed();
     Box::pin(tx.run(async |c| {
@@ -844,10 +900,10 @@ async fn register_one_workflow_schedule_locked(
 /// Read-only probe: is this DAG's schedule row already exactly what
 /// registration would write? (issue #1157, defect 3.)
 ///
-/// Deliberately conservative — any shape that is not the plain, fully-converged
-/// one (missing row, a foreign holder of the name, any drifted column) returns
-/// `false` and falls through to the full reconciling path, so skipping a write
-/// can never cost self-healing.
+/// Deliberately conservative. Any shape that is not plain and fully converged
+/// returns `false`: a missing row, a foreign holder of the name, any drifted
+/// column. That shape falls through to the full reconciling path, so skipping
+/// a write never costs self-healing.
 async fn dag_registration_is_converged(
     conn: &mut AsyncPgConnection,
     dag: &RegisteredDag,
@@ -878,7 +934,11 @@ async fn dag_registration_is_converged(
         return Ok(false);
     }
 
-    Ok(dag_schedule_row_is_converged(&existing, dag, Utc::now()))
+    Ok(dag_schedule_row_is_converged(
+        &existing,
+        dag,
+        Timestamp::now(),
+    ))
 }
 
 /// Read-only probe: is this workflow schedule's row already exactly what
@@ -940,9 +1000,10 @@ async fn find_converged_workflow_schedule(
         return Ok(None);
     }
 
-    let converged = workflow_schedule_row_is_converged_with(&existing, ws, Utc::now(), |stored| {
-        stored_schedule_input_matches(stored, existing.id, &ws.input, codecs)
-    });
+    let converged =
+        workflow_schedule_row_is_converged_with(&existing, ws, Timestamp::now(), |stored| {
+            stored_schedule_input_matches(stored, existing.id, &ws.input, codecs)
+        });
     Ok(converged.then_some(existing))
 }
 
@@ -982,14 +1043,13 @@ pub async fn register_workflow_schedules_with_codecs(
 
 /// Whether a shard may fire schedules after its registration pass.
 ///
-/// Issue #1157: both firing passes — `tick_workflow_schedules` and
-/// `drain_buffered_schedule_runs` — select due rows with *no* target-shard
-/// predicate, so each fires whatever happens to be in its own shard's database.
-/// That is only sound while the registration pass upholds its end of the
-/// bargain: every row a routing change stranded on a non-owning shard has been
-/// collected. If a stale row survives the pass, this shard and the row's new
-/// owner both hold a due copy and both fire it — the duplicate-run storm this
-/// issue reports.
+/// Issue #1157: both firing passes, `tick_workflow_schedules` and
+/// `drain_buffered_schedule_runs`, select due rows with *no* target-shard
+/// predicate. Each fires whatever is in its own shard's database. That is
+/// sound only when the registration pass has collected every row that a
+/// routing change stranded on a non-owning shard. If a stale row survives the
+/// pass, this shard and the row's new owner both hold a due copy and both fire
+/// it. That is the duplicate-run storm this issue reports.
 ///
 /// Not part of the stable public API — exposed only so the integration suite can
 /// assert the decision a registration pass reaches.
@@ -1070,7 +1130,7 @@ async fn register_workflow_schedules_fenced(
     codecs: &crate::payload_codec::PayloadCodecs,
     fence: Option<&str>,
 ) -> HarvestResult<ShardFiringDecision> {
-    let now = Utc::now();
+    let now = Timestamp::now();
     let mut decision = ShardFiringDecision::Allowed;
     for ws in schedules {
         if schedule_targets_shard(ws, router, shard) {
@@ -1078,13 +1138,13 @@ async fn register_workflow_schedules_fenced(
             if !backoff.should_attempt(&key, now) {
                 continue;
             }
-            // Collect rather than `?`: pre-#1157 the first failing schedule
-            // aborted the whole pass, so a tick raised exactly one error however
-            // many schedules were broken and every schedule after it in
-            // iteration order was never registered at all. A failed *upsert*
-            // costs a missed fire on the owning shard, never a duplicate — the
-            // row's previous owner still collects its stale copy — so it is
-            // backed off and the pass keeps going.
+            // Collect rather than `?`. Pre-#1157 the first failing schedule
+            // aborted the whole pass. A tick raised exactly one error however
+            // many schedules were broken. No schedule after it in iteration
+            // order was registered at all. A failed *upsert* costs a missed fire
+            // on the owning shard, never a duplicate. The row's previous owner
+            // still collects its stale copy. So the upsert is backed off and
+            // the pass keeps going.
             let outcome = register_one_workflow_schedule_locked(conn, ws, codecs, fence).await;
             record_registration_outcome(
                 backoff,
@@ -1097,16 +1157,16 @@ async fn register_workflow_schedules_fenced(
             );
         } else if ws.dag_name.is_some() && !pool_peer_owns(ws, router, pool_peers) {
             // Deliberately *not* backoff-gated, unlike the upsert above, and
-            // deliberately not collected into one either. A failed collection
-            // leaves a due row on a shard that no longer owns it, so unlike a
-            // failed upsert it costs a duplicate run rather than a missed one —
-            // firing has to stand down until it succeeds.
+            // not collected into one either. A failed collection leaves a due
+            // row on a shard that no longer owns it. Unlike a failed upsert, it
+            // costs a duplicate run rather than a missed one. Firing must stand
+            // down until it succeeds.
             //
-            // Backing it off would defeat that: a skipped attempt never fails,
-            // so the shard would read as clean and resume firing the stale row
-            // for the whole backoff window. The probe inside makes the converged
-            // case a single cheap indexed read, so re-attempting every tick
-            // costs nothing until something is genuinely wrong.
+            // Backing it off defeats that. A skipped attempt never fails, so
+            // the shard reads as clean and resumes firing the stale row for the
+            // whole backoff window. The probe inside makes the converged case a
+            // single cheap indexed read. Re-attempting every tick costs nothing
+            // until something is wrong.
             if let Err(error) = collect_stale_dag_workflow_schedule(conn, ws).await {
                 warn_registration_failure("workflow-cleanup", &ws.workflow_name, shard, &error);
                 decision = ShardFiringDecision::SuppressedUncollectedStaleRows;
@@ -1178,13 +1238,13 @@ fn pool_peers(pool: &ShardedDbPool, shard: ShardId) -> Vec<ShardId> {
 
 /// The rows a non-owning shard considers stale for `ws`.
 ///
-/// Single-sourced so the convergence probe and the `DELETE` cannot drift: a
-/// probe narrower than the delete would leave stale rows uncollected, and one
-/// wider would take the registration lock for a delete that removes nothing.
+/// Single-sourced so the convergence probe and the `DELETE` cannot drift. A
+/// probe narrower than the delete leaves stale rows uncollected. A wider one
+/// takes the registration lock for a delete that removes nothing.
 ///
-/// `SqlType` is `Nullable<Bool>` because both columns are nullable; Postgres
-/// treats a `NULL` predicate as false in a `WHERE` clause, which is exactly the
-/// pre-existing inline semantics this alias preserves.
+/// `SqlType` is `Nullable<Bool>` because both columns are nullable. Postgres
+/// treats a `NULL` predicate as false in a `WHERE` clause. This alias keeps
+/// those pre-existing inline semantics.
 type StaleDagRowFilter<'a> = Box<
     dyn diesel::BoxableExpression<
             crate::schema::harvest_schedules::table,
@@ -1208,9 +1268,9 @@ fn stale_dag_row_filter<'a>(workflow_name: &'a str, dag_name: &'a str) -> StaleD
 ///
 /// The convergence probe for the non-owning-shard cleanup path (issue #1157,
 /// defect 3). Without it the tick issued an unconditional `DELETE` once per
-/// second per DAG on **every** non-owning shard, forever — replica-scaled write
-/// statements and table locks on a fleet that is already converged, which is
-/// the storm this change exists to remove.
+/// second per DAG on **every** non-owning shard, forever. That is the storm of
+/// replica-scaled write statements and table locks on a converged fleet that
+/// this change removes.
 ///
 /// # Errors
 ///
@@ -1236,27 +1296,27 @@ async fn stale_dag_rows_exist(
 
 /// Drop this shard's stale rows for `ws`. Returns whether a `DELETE` was issued.
 ///
-/// The probe is the write-volume fix (issue #1157, defect 3): a converged shard
-/// performs one cheap `SELECT` instead of a `DELETE` statement — and its table
-/// lock — once per second per DAG, forever.
+/// The probe is the write-volume fix (issue #1157, defect 3). A converged
+/// shard performs one cheap `SELECT` instead of a `DELETE` statement and its
+/// table lock, once per second per DAG, forever.
 ///
 /// **Deliberately *not* behind the fleet-wide registration lock**, unlike its
-/// upsert sibling, and the asymmetry is load-bearing rather than an oversight.
-/// The lock exists to stop N replicas issuing N copies of the *same converging
-/// write*; skipping is safe there because the peer holding the lock is writing
-/// that very row. Here it is not: a peer holds the lock while reconciling its
-/// *own* schedules, so a skip means the row is collected by **nobody** this
-/// tick. `tick_once_sharded` then runs `tick_workflow_schedules` against the
-/// same shard in the same pass, and that due query has no target-shard filter —
-/// so a surviving stale row claims and fires on the shard that no longer owns
-/// the schedule, duplicating the execution the owning shard creates. Deferring
-/// a delete is therefore a correctness bug in a way deferring an upsert is not.
+/// upsert sibling. The asymmetry is load-bearing.
+/// The lock stops N replicas issuing N copies of the *same converging write*.
+/// Skipping is safe there because the peer holding the lock writes that very
+/// row. Here it is not. A peer holds the lock while it reconciles its *own*
+/// schedules, so a skip means **nobody** collects the row this tick.
+/// `tick_once_sharded` then runs `tick_workflow_schedules` against the same
+/// shard in the same pass, and that due query has no target-shard filter. A
+/// surviving stale row then claims and fires on the shard that no longer owns
+/// the schedule. It duplicates the execution the owning shard creates. So a
+/// deferred delete is a correctness bug, and a deferred upsert is not.
 ///
-/// Nothing is lost by dropping the lock: a duplicate `DELETE` is idempotent and
-/// the probe means a converged shard issues none at all, so the steady-state
-/// write volume is zero either way. The only cost is that the first tick after
-/// a routing change may issue the delete once per replica assigned to the
-/// shard — once, not once per second.
+/// Dropping the lock loses nothing. A duplicate `DELETE` is idempotent. With
+/// the probe, a converged shard issues none at all, so the steady-state write
+/// volume is zero either way. The only cost: the first tick after a routing
+/// change can issue the delete once per replica assigned to the shard. That
+/// happens once, not once per second.
 ///
 /// # Errors
 ///
@@ -1303,15 +1363,16 @@ fn workflow_schedule_shard(schedule: &WorkflowSchedule, router: &ShardRouter) ->
 /// (issue #796).
 ///
 /// Default (`all_writable_shards == false`): the schedule owns exactly one
-/// shard — [`router.default_shard()`](ShardRouter::default_shard) for a non-DAG
-/// schedule, its rendezvous shard for a DAG — so this returns `true` only for
-/// that shard, **byte-identical** to the pre-#796
+/// shard. That is [`router.default_shard()`](ShardRouter::default_shard) for a
+/// non-DAG schedule, and its rendezvous shard for a DAG. This returns `true`
+/// only for that shard, **byte-identical** to the pre-#796
 /// `workflow_schedule_shard(..) == shard` gate.
 ///
 /// Opt-in (`all_writable_shards == true`): the schedule is registered on
-/// **every writable shard**, so a single dead/write-blocked shard surfaces as a
-/// failing/stale probe for that shard — the synthetic liveness canary's
-/// per-writable-shard coverage (AC4). Distinct from the #512 replay canary.
+/// **every writable shard**. A single dead/write-blocked shard then surfaces
+/// as a failing/stale probe for that shard. That is the synthetic liveness
+/// canary's per-writable-shard coverage (AC4). Distinct from the #512 replay
+/// canary.
 fn schedule_targets_shard(
     schedule: &WorkflowSchedule,
     router: &ShardRouter,
@@ -1324,27 +1385,27 @@ fn schedule_targets_shard(
     }
 }
 
-/// Decide whether a scheduled fire on `current_shard` should mint a
-/// **shard-encoded** [`ExecutionId::new_for_shard`] rather than the default
-/// [`ExecutionId::new`] (which resolves to the router's default shard)
-/// (issue #796).
+/// Decide whether a scheduled fire mints a **shard-encoded** id (issue #796).
 ///
-/// The fire path only sees the persisted `harvest_schedules` row, which carries
-/// no `all_writable_shards` flag (that flag is a registration-time signal, and
-/// issue #796 ships **no migration**). So a per-writable-shard schedule's fire
+/// The alternative is the default [`ExecutionId::new`], which resolves to the
+/// router's default shard. The encoded one is [`ExecutionId::new_for_shard`].
+///
+/// The fire path sees only the persisted `harvest_schedules` row. That row
+/// carries no `all_writable_shards` flag, which is a registration-time signal.
+/// Issue #796 ships **no migration**. So a per-writable-shard schedule's fire
 /// is recognised the same two ways the row can be:
 ///
 /// - `is_dag` — a DAG schedule already encodes its shard (unchanged, pre-#796).
 /// - [`canary::is_canary_workflow`](crate::canary::is_canary_workflow) — the
-///   built-in synthetic liveness canary is registered on every writable shard
-///   and each shard's fire must land an execution ON that shard so a
+///   built-in synthetic liveness canary is registered on every writable shard.
+///   Each shard's fire must land an execution ON that shard, so a
 ///   dead/write-blocked shard surfaces as a failing/stale probe for it (AC4).
 ///
 /// Every other schedule keeps minting `ExecutionId::new()` (UNENCODED → default
 /// shard), byte-identical to pre-#796 behaviour. A general (non-canary)
-/// `all_writable_shards` schedule would need a persisted marker (a future
-/// migration) for its fire to encode the shard; the canary works today because
-/// its reserved name is recognised. Distinct from the #512 replay canary.
+/// `all_writable_shards` schedule needs a persisted marker (a future migration)
+/// for its fire to encode the shard. The canary works today because its
+/// reserved name is recognised. Distinct from the #512 replay canary.
 fn scheduled_fire_encodes_shard(wf_name: &str, is_dag: bool) -> bool {
     is_dag || crate::canary::is_canary_workflow(wf_name)
 }
@@ -1370,9 +1431,9 @@ fn scheduled_fire_exec_id(wf_name: &str, is_dag: bool, current_shard: ShardId) -
 
 /// Run one scheduler tick: dispatch due workflow-schedule runs.
 ///
-/// The `_dags` parameter is retained for API compatibility; since
-/// `unified-dag-execution` is the default, all DAGs are registered as workflow
-/// schedules and `_dags` is always an empty catalog.
+/// The `_dags` parameter is retained for API compatibility.
+/// `unified-dag-execution` is the default, so all DAGs are registered as
+/// workflow schedules and `_dags` is always an empty catalog.
 ///
 /// # Errors
 ///
@@ -1407,10 +1468,10 @@ pub async fn tick_once(
 /// firing a due schedule fails.
 ///
 /// **A per-schedule registration failure is NOT returned** (changed in #1157).
-/// One unconvergeable schedule used to abort the whole pass with `?`, which
-/// both hid every other schedule's registration and re-issued the identical
+/// One unconvergeable schedule used to abort the whole pass with `?`. That
+/// hid every other schedule's registration and re-issued the identical
 /// failing write every tick. Such a failure is now logged at `WARN` naming the
-/// schedule and backed off per-schedule; the tick still reports `Ok`. Drive
+/// schedule and backed off per-schedule. The tick still reports `Ok`. Drive
 /// alerting off those logs rather than off this return value.
 pub async fn tick_once_sharded(
     pool: ShardedDbPool,
@@ -1641,12 +1702,15 @@ pub async fn tick_once_sharded_with_backoff(
             Some(result) => result?,
             None => Vec::new(),
         };
-        // The move checks out a connection to another shard. The barrier
-        // drops first, so a wait on that pool cannot hold off a bump.
+        // The move checks out a connection to another shard, then fences
+        // both shards itself. The barrier drops first. So a wait on that pool
+        // cannot hold off a bump, and the move never opens a guard while it
+        // holds one.
         #[cfg(feature = "db")]
         drop(fence);
         if !single_pool {
-            carry_misplaced_overrides(&mut conn, shard, &misplaced, &pool, &router).await;
+            let source = (shard, shard_pool);
+            carry_misplaced_overrides(&mut conn, source, &misplaced, &pool, &router).await;
         }
     }
 
@@ -1675,7 +1739,8 @@ impl ShardPass<'_> {
 }
 
 /// Move each DAG override that this shard holds for another shard to its new
-/// owner (issue #2389).
+/// owner (issue #2389). A floor of such a DAG moves too, also with no row
+/// (issue #2602).
 ///
 /// A routing change moves a DAG's schedule row to a new shard. Its override
 /// must move too, or the new owner reconciles the row to the code value. The
@@ -1683,17 +1748,44 @@ impl ShardPass<'_> {
 /// applies the override in the same tick. An owner earlier in shard order
 /// applies it on the next tick.
 ///
+/// `source` is this shard and its pool, and `conn` is a connection of that
+/// pool. The DAGs move in one group per owner. Each group runs under the DR
+/// fence of both shards. See [`carry_to_owner`]. A group whose pass stops
+/// ends the backend of `conn`, so the remaining groups wait for the next
+/// tick. A lock wait that times out stops its group too.
+///
 /// A failure is logged, and the next tick retries the move. Two shards of one
 /// pool share one table, so nothing moves between them.
 async fn carry_misplaced_overrides(
     conn: &mut AsyncPgConnection,
-    shard: ShardId,
+    source: (ShardId, &DbPool),
     misplaced: &[String],
     pool: &ShardedDbPool,
     router: &ShardRouter,
 ) {
-    for dag_name in misplaced {
-        let owner = router.pick_for_dag(dag_name);
+    let (shard, _) = source;
+    // Issue #2602: a floor moves to the owner too, also with no row.
+    let mut names: BTreeSet<String> = misplaced.iter().cloned().collect();
+    match crate::schedule_override::dag_floor_names(conn).await {
+        Ok(floors) => names.extend(
+            floors
+                .into_iter()
+                .filter(|dag_name| router.pick_for_dag(dag_name) != shard),
+        ),
+        Err(error) => tracing::warn!(
+            error = %error,
+            shard_id = shard.as_i32(),
+            "harvest: could not read the override floors; the next tick retries"
+        ),
+    }
+    let mut by_owner: BTreeMap<ShardId, Vec<&str>> = BTreeMap::new();
+    for dag_name in &names {
+        by_owner
+            .entry(router.pick_for_dag(dag_name))
+            .or_default()
+            .push(dag_name);
+    }
+    for (owner, dag_names) in by_owner {
         if pool.same_physical_pool(shard, owner)
             || crate::replication::shard_writes_held(Some(owner))
         {
@@ -1702,30 +1794,111 @@ async fn carry_misplaced_overrides(
         let Some(owner_pool) = pool.exact_pool_for(owner) else {
             continue;
         };
-        let moved = match crate::replication::fenced_checkout(owner_pool).await {
-            Ok(mut to) => {
-                crate::schedule_override::carry_dag_override(conn, &mut to, dag_name).await
-            }
-            Err(error) => Err(error),
-        };
-        match moved {
-            Ok(true) => tracing::info!(
-                dag_name = dag_name.as_str(),
-                from_shard = shard.as_i32(),
-                to_shard = owner.as_i32(),
-                "harvest: moved a DAG schedule override to the shard that now owns the DAG"
-            ),
-            Ok(false) => {}
-            Err(error) => tracing::warn!(
-                error = %error,
-                dag_name = dag_name.as_str(),
-                from_shard = shard.as_i32(),
-                to_shard = owner.as_i32(),
-                "harvest: could not move a DAG schedule override to its new shard; \
-                 the next tick retries"
-            ),
+        if !carry_to_owner(conn, source, (owner, owner_pool), &dag_names).await {
+            break;
         }
     }
+}
+
+/// Move the overrides of `dag_names` from `source` to `owner`, under the DR
+/// fence of both shards.
+///
+/// Both connections come first: `conn` is already held, and the function
+/// then checks out the owner connection. Then one operation opens the guards of
+/// both shards. So a wait on a pool never holds off a bump. A fenced or held
+/// shard skips the group, and the next tick tries again.
+///
+/// Both connections join the pass. A lost guard then ends their backends, so
+/// a statement in flight cannot commit after a bump. Each carry transaction
+/// also asserts the fence of its own shard.
+///
+/// Returns `false` when the pass stopped. `conn` then has no live backend,
+/// so the caller must not use it again.
+async fn carry_to_owner(
+    conn: &mut AsyncPgConnection,
+    source: (ShardId, &DbPool),
+    owner: (ShardId, &DbPool),
+    dag_names: &[&str],
+) -> bool {
+    let ((from_shard, from_pool), (to_shard, to_pool)) = (source, owner);
+    let mut to = match crate::replication::fenced_checkout(to_pool).await {
+        Ok(to) => to,
+        Err(error) => {
+            warn_carry_skipped(from_shard, to_shard, &error);
+            return true;
+        }
+    };
+    let fence = match crate::replication::begin_fenced_groups(&[
+        (from_pool, from_shard),
+        (to_pool, to_shard),
+    ])
+    .await
+    {
+        Ok(guards) => guards,
+        Err(error) => {
+            warn_carry_skipped(from_shard, to_shard, &error);
+            return true;
+        }
+    };
+    let pass = async {
+        let _from = crate::replication::join_fenced_pass(from_pool, conn).await;
+        let _to = crate::replication::join_fenced_pass(to_pool, &mut to).await;
+        for dag_name in dag_names {
+            let moved = crate::schedule_override::carry_dag_override(
+                conn, &mut to, from_shard, to_shard, dag_name,
+            )
+            .await;
+            // A lock wait that timed out stops the group. So the guards hold
+            // off a bump for one carry at most.
+            let timed_out = matches!(
+                &moved,
+                Err(error) if crate::partition::is_lock_timeout(&error.to_string())
+            );
+            log_carry(dag_name, from_shard, to_shard, moved);
+            if timed_out {
+                break;
+            }
+        }
+    };
+    match crate::replication::run_fenced_pass(&fence, Box::pin(pass)).await {
+        Ok(()) => true,
+        Err(error) => {
+            warn_carry_skipped(from_shard, to_shard, &error);
+            false
+        }
+    }
+}
+
+/// Log the result of the move of one DAG override.
+fn log_carry(dag_name: &str, from_shard: ShardId, to_shard: ShardId, moved: HarvestResult<bool>) {
+    match moved {
+        Ok(true) => tracing::info!(
+            dag_name,
+            from_shard = from_shard.as_i32(),
+            to_shard = to_shard.as_i32(),
+            "harvest: moved a DAG schedule override to the shard that now owns the DAG"
+        ),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            error = %error,
+            dag_name,
+            from_shard = from_shard.as_i32(),
+            to_shard = to_shard.as_i32(),
+            "harvest: could not move a DAG schedule override to its new shard; \
+             the next tick retries"
+        ),
+    }
+}
+
+/// Log a group of override moves that did not run or did not finish.
+fn warn_carry_skipped(from_shard: ShardId, to_shard: ShardId, error: &HarvestError) {
+    tracing::warn!(
+        error = %error,
+        from_shard = from_shard.as_i32(),
+        to_shard = to_shard.as_i32(),
+        "harvest: DAG schedule overrides did not move to their new shard; \
+         the next tick retries"
+    );
 }
 
 /// Register the schedules of one shard for one pass.
@@ -1745,15 +1918,17 @@ async fn register_shard_pass<'a>(
     backoff: &ScheduleRegistrationBackoff,
     registry: &HandlerRegistry,
 ) -> HarvestResult<ShardPass<'a>> {
-    // Issue #1157: on a converged shard this pass is read-only — no
-    // transaction, no advisory lock, no UPDATE. Only a schedule that
-    // genuinely needs a write opens a transaction and contends for the
-    // fleet-wide registration lock, and a per-schedule failure is collected
-    // and backed off rather than aborting the rest of the pass.
+    // Issue #1157: on a converged shard this pass is read-only. It takes no
+    // transaction, no advisory lock and no UPDATE. Only a schedule that needs
+    // a write opens a transaction and contends for the registration lock.
+    // A per-schedule failure is collected and backed off. It does not abort
+    // the rest of the pass.
     // Issue #2385: operator overrides win over code. Both registration
     // passes and the firing pass read the same effective values, or the
     // two registration passes would rewrite the same DAG row each tick.
-    let Some((overrides, override_fence)) = load_shard_overrides(conn, shard).await else {
+    let Some((overrides, override_fence)) =
+        load_shard_overrides(conn, shard, registry.payload_codecs()).await
+    else {
         return Ok(ShardPass::skipped());
     };
     let misplaced = overrides
@@ -1779,11 +1954,11 @@ async fn register_shard_pass<'a>(
     )
     .await?;
 
-    // Issue #1157: neither firing pass below filters by target shard, so a
-    // stale row this pass could not collect would be fired here *and* by the
-    // shard that now owns it. Stand this shard down for the tick rather than
-    // duplicate the run; the owning shard is unaffected and still fires it
-    // exactly once, and the next tick re-attempts the collection.
+    // Issue #1157: neither firing pass below filters by target shard. A stale
+    // row this pass could not collect fires here *and* on its new owner.
+    // Stand this shard down for the tick rather than duplicate the run. The
+    // owning shard still fires it exactly once. The next tick re-attempts the
+    // collection.
     if firing == ShardFiringDecision::SuppressedUncollectedStaleRows {
         tracing::warn!(
             shard_id = shard.as_i32(),
@@ -1819,17 +1994,29 @@ async fn register_shard_pass<'a>(
 async fn load_shard_overrides(
     conn: &mut AsyncPgConnection,
     shard: ShardId,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> Option<(crate::schedule_override::ScheduleOverrides, String)> {
     // The fingerprint is read first. A write between the two reads then only
     // makes the snapshot newer than its fence, and the pass skips its writes.
     let loaded = match crate::schedule_override::override_fingerprint(conn).await {
-        Ok(fence) => crate::schedule_override::load_overrides(conn)
+        Ok(fence) => crate::schedule_override::load_overrides(conn, codecs)
             .await
             .map(|overrides| (overrides, fence)),
         Err(error) => Err(error),
     };
     match loaded {
-        Ok(loaded) => Some(loaded),
+        Ok(loaded) => {
+            // No payload text: the name and the shard only.
+            for workflow_name in loaded.0.unreadable_inputs() {
+                tracing::warn!(
+                    shard_id = shard.as_i32(),
+                    workflow_name,
+                    "harvest: a schedule override input does not decode; this pass leaves \
+                     that schedule as it is. Restore the codec key or clear the override"
+                );
+            }
+            Some(loaded)
+        }
         Err(error) => {
             tracing::warn!(
                 error = %error,
@@ -1854,9 +2041,9 @@ async fn fire_shard_schedules(
     metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
     active_gates: &[crate::admission_gate::AdmissionGate],
 ) {
-    // Drain buffered slots BEFORE evaluating newly-due firings so that
-    // capacity freed by a just-completed run is consumed by the oldest
-    // pending slot first, not by the freshest next_run_at firing.
+    // Drain buffered slots BEFORE newly-due firings. Capacity freed by a
+    // just-completed run then goes to the oldest pending slot, not to the
+    // freshest next_run_at firing.
     #[cfg(feature = "db")]
     if let Err(error) = drain_buffered_schedule_runs(
         conn,
@@ -1916,12 +2103,12 @@ pub async fn trigger_unified_dag(
     owner: Option<&str>,
     runbook_url: Option<&str>,
     severity: Option<&str>,
-    // Issue #743 review (PR #1141, Finding #1): a manual/MCP trigger must
-    // thread the DAG's declared `execution_timeout`/`sla`, and the fleet-wide
-    // `max_workflow_execution_timeout` ceiling (Finding #3), the SAME way the
-    // scheduler tick's main dispatch path already does -- resolved from the
-    // DAG's own shadow `WorkflowInfo`, registered under `dag_name` in
-    // `registry.workflows` by `DagInfo::as_workflow_info()`.
+    // Issue #743 (PR #1141): a manual/MCP trigger threads the DAG's declared
+    // `execution_timeout`/`sla` and the fleet-wide
+    // `max_workflow_execution_timeout` ceiling. It does so the SAME way as the
+    // scheduler tick's main dispatch path. Both resolve from the DAG's own
+    // shadow `WorkflowInfo`. `DagInfo::as_workflow_info()` registers it under
+    // `dag_name` in `registry.workflows`.
     registry: &crate::worker::HandlerRegistry,
     // Workflow-start provenance for this DAG run (issue #740). The caller
     // decides: a manual HTTP/UI trigger passes `Schedule`, a scheduler tick
@@ -1979,10 +2166,9 @@ pub async fn trigger_unified_dag(
             });
         }
 
-        // Tick-exact basis (issue #1160): counts a cross-type continue-as-new
-        // successor of this schedule too, not just same-named runs -- a manual
-        // trigger must not double-dispatch a schedule whose active run has
-        // already changed type mid-chain.
+        // Tick-exact basis (issue #1160): this also counts a cross-type
+        // continue-as-new successor of this schedule. A manual trigger must not
+        // double-dispatch a schedule whose active run changed type mid-chain.
         // `AllowAll` ignores `max_active_runs` here too (issue #1985). It skips
         // the count, so a failed count query cannot block its trigger.
         let allow_all =
@@ -2114,7 +2300,7 @@ async fn merge_pause_metadata_into_schedule(
     diesel::update(dsl::harvest_schedules.find(target.id))
         .set((
             dsl::is_paused.eq(target.is_paused || source.is_paused),
-            dsl::paused_at.eq(paused_at_value),
+            dsl::paused_at.eq(paused_at_value.to_diesel()),
             dsl::paused_by.eq(paused_by_value.as_deref()),
             dsl::pause_reason.eq(pause_reason_value.as_deref()),
         ))
@@ -2177,12 +2363,12 @@ async fn upsert_schedule(
     use crate::schema::harvest_schedules::dsl;
 
     let existing = find_reusable_dag_schedule(conn, &dag.name).await?;
-    let now = Utc::now();
+    let now = Timestamp::now();
     let expr = schedule_expr(dag.schedule.as_ref());
 
     if let Some(existing) = existing {
         // Issue #1157, defect 3: skip the write when the row already matches.
-        if dag_schedule_row_is_converged(&existing, dag, Utc::now()) {
+        if dag_schedule_row_is_converged(&existing, dag, Timestamp::now()) {
             return Ok(existing);
         }
         let schedule_changed = existing.schedule_expr != expr;
@@ -2193,10 +2379,10 @@ async fn upsert_schedule(
                 .next_run_at
                 .or_else(|| next_run_after(dag.schedule.as_ref(), now))
         };
-        // Clear buffered slots when the schedule cadence changes or when the
-        // operator switches away from a buffering policy, so stale firings are
-        // not dispatched under a configuration that never produced them.  Also
-        // trim to the new cap when tightening the policy or buffer_all_max.
+        // Clear buffered slots when the cadence changes or the operator leaves
+        // a buffering policy. Stale firings must not dispatch under a
+        // configuration that never produced them. Also trim to the new cap
+        // when tightening the policy or buffer_all_max.
         let is_buffering_policy = matches!(
             dag.overlap_policy,
             OverlapPolicy::BufferOne | OverlapPolicy::BufferAll
@@ -2220,18 +2406,18 @@ async fn upsert_schedule(
                 dsl::timezone.eq(tz),
                 dsl::catchup.eq(dag.catchup),
                 // DAGs use the legacy `catchup` bool, not the bounded-catchup
-                // policy columns. When this registration reuses a row that was
-                // previously a workflow schedule with a `most_recent` / `window`
-                // policy, clear the stale policy columns: otherwise the
-                // policy-takes-precedence resolver (`CatchupPolicy::from_db`) would
-                // keep driving ticks off the old bounded policy and ignore the
-                // DAG's `catchup` setting (issue #484 / Codex #1552).
+                // policy columns. This registration can reuse a former workflow
+                // schedule row with a `most_recent` / `window` policy. Clear the
+                // stale policy columns. Otherwise `CatchupPolicy::from_db`, where
+                // the policy takes precedence, keeps driving ticks off the old
+                // bounded policy and ignores the DAG's `catchup` setting
+                // (issue #484 / #1552).
                 SetExt(harvest_schedules_ext::catchup_policy.eq(Option::<String>::None)),
                 SetExt(harvest_schedules_ext::catchup_window_secs.eq(Option::<i64>::None)),
                 dsl::max_active_runs.eq(i32::try_from(dag.max_active_runs).unwrap_or(i32::MAX)),
                 dsl::dag_name.eq(Some(dag.name.as_str())),
-                dsl::updated_at.eq(now),
-                dsl::next_run_at.eq(next_run_at),
+                dsl::updated_at.eq(now.to_diesel()),
+                dsl::next_run_at.eq(next_run_at.to_diesel()),
                 dsl::jitter_secs.eq(i64::try_from(dag.jitter.as_secs()).unwrap_or(i64::MAX)),
                 dsl::overlap_policy.eq(dag.overlap_policy.as_str()),
                 dsl::buffer_all_max.eq(i32::try_from(dag.buffer_all_max).unwrap_or(i32::MAX)),
@@ -2292,7 +2478,7 @@ async fn upsert_schedule(
         }
         let initial_next_run = next_run_after(dag.schedule.as_ref(), now);
         diesel::update(dsl::harvest_schedules.find(inserted.id))
-            .set(dsl::next_run_at.eq(initial_next_run))
+            .set(dsl::next_run_at.eq(initial_next_run.to_diesel()))
             .execute(conn)
             .await
             .map_err(crate::error::database_error)?;
@@ -2311,38 +2497,38 @@ async fn upsert_schedule(
 ///
 /// The reconciler used to look for a holder only among rows with
 /// `dag_name IS NULL`. A holder with a non-NULL, non-matching `dag_name`
-/// matched nothing, so the resolver handed back the `dag_name = D` row and the
-/// subsequent `UPDATE ... SET workflow_name = D` ran while another row still
-/// held `D` — a `harvest_schedules_workflow_name_unique` violation re-issued
+/// matched nothing. The resolver then handed back the `dag_name = D` row. The
+/// next `UPDATE ... SET workflow_name = D` ran while another row still held
+/// `D`. That `harvest_schedules_workflow_name_unique` violation re-issued
 /// once per second, forever.
 ///
 /// The classification turns on *who owns the contested name by right*, not on
 /// whether a row's two names happen to differ.
 /// [`DagInfo::as_workflow_schedule`](crate::info::DagInfo::as_workflow_schedule)
-/// always sets `workflow_name == dag_name`, so a DAG registering under its own
-/// name has a first claim to it; a row squatting that name while answering to a
-/// different `dag_name` is the shape issue #1157 reported, and it yields.
-/// A row whose two names merely differ is **not** presumed corrupt — see
-/// [`Self::Conflict`] — because `WorkflowSchedule` has always exposed the two
-/// as independent public fields and earlier versions persisted them that way.
+/// always sets `workflow_name == dag_name`. So a DAG registering under its own
+/// name has a first claim to it. A row that squats that name while it answers
+/// to a different `dag_name` is the shape issue #1157 reported, and it yields.
+/// A row whose two names merely differ is **not** presumed corrupt (see
+/// [`Self::Conflict`]). `WorkflowSchedule` has always exposed the two as
+/// independent public fields, and earlier versions persisted them that way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkflowNameHolder {
     /// Nothing holds the name — the write is unobstructed.
     Vacant,
     /// A legacy workflow-only row (`dag_name IS NULL`). This is the documented
-    /// upgrade shape: merge its pause metadata into the DAG row and drop it, or
-    /// adopt it outright when no DAG row exists yet. Behaviour predates #1157.
+    /// upgrade shape. Merge its pause metadata into the DAG row and drop it.
+    /// Or adopt it outright when no DAG row exists yet. Behaviour predates #1157.
     WorkflowOnly,
     /// An internally inconsistent row: non-NULL `dag_name` that differs from
-    /// the `workflow_name` it holds. Unreachable through registration, so it is
-    /// corrupt — release the name it squats (the row keeps its own identity,
-    /// pause state and counters, and its rightful owner re-stamps it).
+    /// the `workflow_name` it holds. Registration cannot produce it, so it is
+    /// corrupt. Release the name it squats. The row keeps its own identity,
+    /// pause state and counters, and its rightful owner re-stamps it.
     Squatter,
-    /// Another row holds the name and the registrant has no claim to it: either
-    /// a well-formed row genuinely answering to it, or *any* foreign holder when
-    /// the registrant does not own the name by right of its own `dag_name`.
-    /// Refuse to write rather than flap the name between them at 1 Hz — and
-    /// report both sides so an operator can rename one.
+    /// Another row holds the name and the registrant has no claim to it.
+    /// Either a well-formed row answers to it, or the registrant does not own
+    /// the name by right of its own `dag_name` (then *any* foreign holder).
+    /// Refuse to write rather than flap the name between them at 1 Hz. Report
+    /// both sides so an operator can rename one.
     Conflict,
 }
 
@@ -2364,16 +2550,16 @@ enum NameHolder<'a> {
 /// Classify the row holding `registering_workflow`, if any.
 ///
 /// The gate on [`WorkflowNameHolder::Squatter`] is the load-bearing part.
-/// `dag_name != workflow_name` is **not** by itself proof of corruption:
-/// `WorkflowSchedule` exposes the two as independent public fields,
-/// `validate_workflow_schedules` has never required them to agree, and earlier
-/// versions persisted such rows — so a deployment upgrading into this fix can
-/// legitimately hold them. The distinguisher is narrower: **does the registrant
-/// own this `workflow_name` by right of its own `dag_name`?** Only then is a
-/// foreign holder demonstrably squatting a name that is not its own, which is
-/// precisely issue #1157's reported repro. A registrant that does not own the
-/// name by right reconciles a free one and reports a foreign holder as a named
-/// [`WorkflowNameHolder::Conflict`], so the repair path can never manufacture a
+/// `dag_name != workflow_name` is **not** by itself proof of corruption.
+/// `WorkflowSchedule` exposes the two as independent public fields.
+/// `validate_workflow_schedules` has never required them to agree. Earlier
+/// versions persisted such rows, so an upgrading deployment can legitimately
+/// hold them. The distinguisher is narrower: **does the registrant
+/// own this `workflow_name` by right of its own `dag_name`?** Only then does a
+/// foreign holder demonstrably squat a name that is not its own. That is
+/// issue #1157's reported repro. A registrant that does not own the name by
+/// right reconciles a free one. It reports a foreign holder as a named
+/// [`WorkflowNameHolder::Conflict`]. So the repair path never manufactures a
 /// victim by stripping a row it has no claim against.
 const fn classify_workflow_name_holder(
     registering_dag: &str,
@@ -2416,28 +2602,28 @@ const fn const_str_eq(a: &str, b: &str) -> bool {
 
 /// Release a corrupt row's squat on `workflow_name` (issue #1157).
 ///
-/// Sets `workflow_name = NULL` rather than deleting the row: the row's identity
-/// is its `dag_name`, and nulling preserves its pause state, buffered runs,
-/// `runs_started` and `next_run_at` so its rightful owner's own registration
+/// Sets `workflow_name = NULL` rather than deleting the row. The row's
+/// identity is its `dag_name`. Nulling keeps its pause state, buffered runs,
+/// `runs_started` and `next_run_at`, and its rightful owner's registration
 /// re-stamps it in the same pass. `harvest_schedules_kind_check` still holds
 /// because the row's `dag_name` is non-NULL by construction here.
 ///
 /// **This is a compare-and-swap, not an id-keyed write, and that is
-/// load-bearing.** The `WHERE` clause re-asserts the exact condition that
-/// classified the row as a squatter — it still holds `contested_name`, and its
-/// own `dag_name` still is not that name. `dag_name <> $1` also excludes a NULL
+/// load-bearing.** The `WHERE` clause re-asserts the exact squatter condition.
+/// The row still holds `contested_name`, and its own `dag_name` still is not
+/// that name. `dag_name <> $1` also excludes a NULL
 /// `dag_name`, which is the [`WorkflowNameHolder::WorkflowOnly`] shape and a
 /// different arm entirely.
 ///
 /// The public registration path deliberately takes no advisory lock (see
-/// [`REGISTRATION_LOCK_KEY`]), so a peer can correct the holder between the
-/// resolver's read and this write — at which point an id-only `UPDATE` would
-/// null a `workflow_name` the holder had just legitimately claimed. Since the
-/// due list requires `workflow_name IS NOT NULL`, that schedule would then stop
-/// firing *silently and permanently*: a quiet outage traded for a loud storm,
-/// which is the failure this whole change set exists to avoid. Returns whether
-/// the release actually applied; `false` means the row changed underneath and
-/// the caller must not proceed as though the name were freed.
+/// [`REGISTRATION_LOCK_KEY`]). A peer can correct the holder between the
+/// resolver's read and this write. An id-only `UPDATE` then nulls a
+/// `workflow_name` the holder has just legitimately claimed. The due list
+/// requires `workflow_name IS NOT NULL`, so that schedule stops firing
+/// *silently and permanently*. That trades a loud storm for a quiet outage,
+/// the failure this change set exists to avoid. Returns whether the release
+/// applied. `false` means the row changed underneath, and the caller must not
+/// proceed as though the name were freed.
 #[doc(hidden)]
 pub async fn release_squatted_workflow_name(
     conn: &mut AsyncPgConnection,
@@ -2454,7 +2640,7 @@ pub async fn release_squatted_workflow_name(
         )
         .set((
             dsl::workflow_name.eq(Option::<String>::None),
-            dsl::updated_at.eq(Utc::now()),
+            dsl::updated_at.eq(Timestamp::now().to_diesel()),
         ))
         .execute(conn)
         .await
@@ -2482,9 +2668,9 @@ pub async fn release_squatted_workflow_name(
 /// fields, preserving `is_paused` (managed independently via pause/resume).
 ///
 /// The `workflow_name` holder is looked up **without** a `dag_name` predicate
-/// (issue #1157): restricting it to `dag_name IS NULL` left a third row shape —
-/// a non-NULL, non-matching `dag_name` — invisible, and the resulting write was
-/// a permanent unique violation. See [`WorkflowNameHolder`].
+/// (issue #1157). The `dag_name IS NULL` restriction hid a third row shape, a
+/// non-NULL, non-matching `dag_name`. The resulting write was a permanent
+/// unique violation. See [`WorkflowNameHolder`].
 async fn find_reusable_dag_workflow_schedule(
     conn: &mut AsyncPgConnection,
     dag_name: &str,
@@ -2549,14 +2735,13 @@ async fn find_reusable_dag_workflow_schedule(
             )]
             let squatter = foreign_holder.expect("classified from a present holder");
             if !release_squatted_workflow_name(conn, squatter, workflow_name).await? {
-                // The holder stopped matching the squat we classified between
-                // the read above and the write. The public registration path
-                // takes no advisory lock, so a peer can legitimately re-stamp
-                // that row's `workflow_name` in that window; nulling it anyway
-                // would drop a valid schedule off the due list, silently and
-                // permanently. Refuse instead and let the next pass — tick
-                // backoff, or the caller on the public path — re-resolve from
-                // scratch against whatever the row now is.
+                // The holder stopped matching the classified squat between the
+                // read above and the write. The public registration path takes
+                // no advisory lock, so a peer can legitimately re-stamp that
+                // row's `workflow_name` in that window. Nulling it anyway drops a
+                // valid schedule off the due list, silently and permanently.
+                // Refuse instead. The next pass (tick backoff, or the caller on
+                // the public path) re-resolves from scratch against the row.
                 return Err(HarvestError::Config(format!(
                     "schedule registration raced a concurrent pass: the holder of \
                      workflow_name '{workflow_name}' (schedule {}) changed while \
@@ -2714,11 +2899,11 @@ async fn find_or_insert_workflow_schedule(
 /// Would the registration UPDATE for `ws` be a no-op against `existing`?
 /// (Issue #1157, defect 3.)
 ///
-/// Compares **every column** [`apply_workflow_schedule_update`] writes — the
-/// changeset, the post-update exhaustion reconciliation (#478), *and* the
-/// post-update auto-pause clear (#360) — against the values that update would
-/// compute. `updated_at` is excluded: it is bumped by the write itself, so
-/// comparing it would make convergence unreachable and reinstate the 1 Hz
+/// Compares **every column** [`apply_workflow_schedule_update`] writes against
+/// the values that update would compute. That covers the changeset, the
+/// post-update exhaustion reconciliation (#478), *and* the post-update
+/// auto-pause clear (#360). `updated_at` is excluded: the write itself bumps
+/// it, so comparing it makes convergence unreachable and reinstates the 1 Hz
 /// storm. `is_paused` and its metadata are excluded because the changeset
 /// deliberately never writes them (pause/resume owns them).
 ///
@@ -2727,16 +2912,15 @@ async fn find_or_insert_workflow_schedule(
 /// too. `auto_paused_at` is the one that lives outside the changeset entirely.
 ///
 /// The dangerous direction here is the false positive: a drifted row reported
-/// converged would never be reconciled again. Every branch therefore fails
-/// closed — anything not provably equal returns `false`. The unit test
+/// converged is never reconciled again. Every branch therefore fails closed.
+/// Anything not provably equal returns `false`. The unit test
 /// `every_written_column_is_compared` mutates each column in turn and asserts
-/// convergence flips, so a column added to the changeset without being added
-/// here is caught.
+/// convergence flips. It catches a column added to the changeset but not here.
 #[cfg(test)]
 fn workflow_schedule_row_is_converged(
     existing: &HarvestSchedule,
     ws: &WorkflowSchedule,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> bool {
     workflow_schedule_row_is_converged_with(existing, ws, now, |stored| stored == Some(&ws.input))
 }
@@ -2750,7 +2934,7 @@ fn workflow_schedule_row_is_converged(
 fn workflow_schedule_row_is_converged_with(
     existing: &HarvestSchedule,
     ws: &WorkflowSchedule,
-    now: DateTime<Utc>,
+    now: Timestamp,
     input_matches: impl FnOnce(Option<&serde_json::Value>) -> bool,
 ) -> bool {
     let expr = schedule_expr(Some(&ws.schedule));
@@ -2762,19 +2946,18 @@ fn workflow_schedule_row_is_converged_with(
     }
     // The update writes `existing.next_run_at.or_else(|| next_run_after(..))`,
     // so a NULL column is only a write when the fallback would actually fill
-    // it. `Schedule::Manual` (and an unscheduled DAG) yield `None`, leaving the
-    // column permanently NULL — comparing `is_none()` alone would mean those
-    // schedules could NEVER converge and would rewrite on every 1 Hz tick,
-    // which is exactly the storm this check exists to stop.
+    // it. `Schedule::Manual` (and an unscheduled DAG) yield `None`, so the
+    // column stays NULL. With an `is_none()` check alone, those schedules NEVER
+    // converge and rewrite on every 1 Hz tick. That is the storm this check
+    // stops.
     if existing.next_run_at.is_none() && next_run_after(Some(&ws.schedule), now).is_some() {
         return false;
     }
 
     // buffered_runs: the update preserves-and-trims under a buffering policy
     // and clears otherwise. `!schedule_changed` mirrors the changeset's own
-    // guard verbatim; it is a tautology after the early return above, and is
-    // kept so the two blocks stay textually identical if that return is ever
-    // relaxed.
+    // guard verbatim. It is a tautology after the early return above. It keeps
+    // the two blocks textually identical if that return is ever relaxed.
     let is_buffering_policy = !schedule_changed
         && matches!(
             ws.overlap_policy,
@@ -2815,14 +2998,14 @@ fn workflow_schedule_row_is_converged_with(
         .and_then(|p| serde_json::to_value(p).ok());
 
     // #360's post-update clear: when the failure limit is disabled, the update
-    // NULLs `auto_paused_at`. That statement lives OUTSIDE the changeset, so it
-    // is invisible to a changeset-shaped comparison — and it is the one write
-    // whose omission is a genuine false positive: a row left
-    // `(consecutive_failure_limit = NULL, auto_paused_at = Some(_))` (reachable
-    // when the two autocommit statements are torn by a crash on the
-    // non-transactional `register_workflow_schedules` path) would be reported
-    // converged forever, so the auto-pause would never lift and the schedule
-    // would stay silently disabled with no log and no metric.
+    // NULLs `auto_paused_at`. That statement lives OUTSIDE the changeset, so a
+    // changeset-shaped comparison cannot see it. It is the one write whose
+    // omission is a genuine false positive. A crash can tear the two
+    // autocommit statements on the non-transactional
+    // `register_workflow_schedules` path. That leaves a row
+    // `(consecutive_failure_limit = NULL, auto_paused_at = Some(_))`, which
+    // then reads as converged forever. The auto-pause never lifts, and the
+    // schedule stays silently disabled with no log and no metric.
     let limit_disabled = ws.consecutive_failure_limit.is_none_or(|n| n == 0);
     if limit_disabled && existing.auto_paused_at.is_some() {
         return false;
@@ -2863,7 +3046,7 @@ fn workflow_schedule_row_is_converged_with(
 fn exhaustion_reconciliation_is_noop(
     existing: &HarvestSchedule,
     ws: &WorkflowSchedule,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> bool {
     if existing.exhausted_at.is_some() {
         let end_at_ok = ws.end_at.is_none_or(|new_end| {
@@ -2900,23 +3083,23 @@ fn exhaustion_reconciliation_is_noop(
 /// (Issue #1157, defect 3.)
 ///
 /// Mirrors the changeset in [`upsert_schedule`]. With `unified-dag-execution`
-/// on, every DAG is reconciled by *both* this pass and the workflow-schedule
-/// pass, so skipping converged writes here removes half the no-op UPDATE volume.
+/// on, *both* this pass and the workflow-schedule pass reconcile every DAG.
+/// Skipping converged writes here removes half the no-op UPDATE volume.
 fn dag_schedule_row_is_converged(
     existing: &HarvestSchedule,
     dag: &RegisteredDag,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> bool {
     let expr = schedule_expr(dag.schedule.as_ref());
     let schedule_changed = existing.schedule_expr != expr;
     if schedule_changed {
         return false;
     }
-    // See the sibling note in `workflow_schedule_row_is_converged`: an
-    // *unscheduled* DAG (`schedule: None`) has `next_run_at` permanently NULL,
-    // and `register_schedules_for_shard` iterates every DAG in the catalog —
-    // so an `is_none()` guard alone would leave trigger-only DAGs (often most
-    // of a catalog) rewriting on every tick, gutting the fix.
+    // See the sibling note in `workflow_schedule_row_is_converged`. An
+    // *unscheduled* DAG (`schedule: None`) has `next_run_at` permanently NULL.
+    // `register_schedules_for_shard` iterates every DAG in the catalog. With
+    // an `is_none()` guard alone, trigger-only DAGs (often most of a catalog)
+    // rewrite on every tick, which guts the fix.
     if existing.next_run_at.is_none() && next_run_after(dag.schedule.as_ref(), now).is_some() {
         return false;
     }
@@ -3040,7 +3223,7 @@ async fn upsert_workflow_schedule(
     // Issue #1157, defect 3: a row that already says exactly what registration
     // would write needs no write. This also covers the public/API entry points
     // (`register_workflow_schedules`), not just the tick.
-    if workflow_schedule_row_is_converged_with(&existing, ws, Utc::now(), |stored| {
+    if workflow_schedule_row_is_converged_with(&existing, ws, Timestamp::now(), |stored| {
         stored_schedule_input_matches(stored, existing.id, &ws.input, codecs)
     }) {
         return Ok(existing);
@@ -3067,20 +3250,22 @@ enum AppliedScheduleUpdate {
 
 /// Shared in-place UPDATE body for an existing `harvest_schedules` row.
 ///
-/// Single source of truth for the update semantics used by both the
-/// startup/registration upsert ([`upsert_workflow_schedule`]) and the
-/// operator PATCH path ([`update_workflow_schedule`], issue #771):
-/// `next_run_at` recompute on cadence change only, buffered-runs
-/// preservation/trim rules (#241), legacy `catchup` bool mirroring (#484),
-/// exhaustion reconciliation in both directions (#478), and the
-/// `auto_paused_at` clear rule (#360).
+/// Single source of truth for the update semantics of two callers. They are
+/// the startup/registration upsert ([`upsert_workflow_schedule`]) and the
+/// operator PATCH path ([`update_workflow_schedule`], issue #771). The rules:
 ///
-/// With `guard_live_fire_claim` the main UPDATE additionally requires
-/// `fire_claim_token IS NULL OR fire_claimed_until < NOW()` (issue #350):
-/// when a scheduler replica currently holds a live claim on the row (a fire
-/// is in flight), nothing is written and `SkippedLiveClaim` is returned so
-/// an edit can never race an in-flight fire. The upsert path passes `false`,
-/// preserving its pre-existing unconditional-update behavior.
+/// - `next_run_at` recompute on cadence change only.
+/// - Buffered-runs preservation/trim rules (#241).
+/// - Legacy `catchup` bool mirroring (#484).
+/// - Exhaustion reconciliation in both directions (#478).
+/// - The `auto_paused_at` clear rule (#360).
+///
+/// With `guard_live_fire_claim` the main UPDATE also requires
+/// `fire_claim_token IS NULL OR fire_claimed_until < NOW()` (issue #350).
+/// A scheduler replica can hold a live claim on the row while a fire is in
+/// flight. Then nothing is written and `SkippedLiveClaim` is returned, so an
+/// edit never races an in-flight fire. The upsert path passes `false`, which
+/// keeps its pre-existing unconditional-update behavior.
 #[allow(clippy::too_many_lines)]
 async fn apply_workflow_schedule_update(
     conn: &mut AsyncPgConnection,
@@ -3090,7 +3275,7 @@ async fn apply_workflow_schedule_update(
 ) -> HarvestResult<AppliedScheduleUpdate> {
     use crate::schema::harvest_schedules::dsl;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     let expr = schedule_expr(Some(&ws.schedule));
     let dag_name = ws.dag_name.as_deref().or(existing.dag_name.as_deref());
 
@@ -3105,8 +3290,8 @@ async fn apply_workflow_schedule_update(
     };
     // is_paused is deliberately excluded — it is managed via pause/resume, not here.
     // buffered_runs: preserved only when the policy is still buffering AND the cadence
-    // has not changed.  Also trim to the new effective cap so that tightening the
-    // policy (BufferAll→BufferOne, or lowering buffer_all_max) never lets the drain
+    // has not changed. Also trim to the new effective cap. Then a tightened policy
+    // (BufferAll→BufferOne, or a lower buffer_all_max) never lets the drain
     // dispatch more slots than the updated configuration permits.
     let is_buffering_policy = matches!(
         ws.overlap_policy,
@@ -3127,11 +3312,11 @@ async fn apply_workflow_schedule_update(
     let changeset = (
         dsl::schedule_expr.eq(expr),
         dsl::timezone.eq(ws.schedule.timezone_str()),
-        // Mirror the effective catchup policy into the legacy `catchup`
-        // bool so API responses and any rollback/older reader that only
-        // honors the legacy column see the same enabled/disabled decision
-        // the policy columns encode (issue #484 / Codex #1220). When no
-        // policy is set the caller's explicit `catchup` bool is preserved.
+        // Mirror the effective catchup policy into the legacy `catchup` bool.
+        // API responses and any rollback/older reader of only that column then
+        // see the decision the policy columns encode (issue #484 / #1220).
+        // When no policy is set the caller's explicit `catchup` bool is
+        // preserved.
         dsl::catchup.eq(ws
             .catchup_policy
             .map_or(ws.catchup, crate::policy::CatchupPolicy::is_catchup_enabled)),
@@ -3140,8 +3325,8 @@ async fn apply_workflow_schedule_update(
         dsl::workflow_name.eq(Some(ws.workflow_name.as_str())),
         SetExt(harvest_schedules_ext::workflow_input.eq(Some(ws.input.clone()))),
         dsl::queue_name.eq(Some(ws.queue_name.as_str())),
-        dsl::updated_at.eq(now),
-        dsl::next_run_at.eq(next_run_at),
+        dsl::updated_at.eq(now.to_diesel()),
+        dsl::next_run_at.eq(next_run_at.to_diesel()),
         dsl::jitter_secs.eq(i64::try_from(ws.jitter.as_secs()).unwrap_or(i64::MAX)),
         dsl::overlap_policy.eq(ws.overlap_policy.as_str()),
         dsl::buffer_all_max.eq(i32::try_from(ws.buffer_all_max).unwrap_or(i32::MAX)),
@@ -3151,7 +3336,7 @@ async fn apply_workflow_schedule_update(
         dsl::consecutive_failure_limit.eq(ws
             .consecutive_failure_limit
             .map(|n| i32::try_from(n).unwrap_or(i32::MAX))),
-        dsl::end_at.eq(ws.end_at),
+        dsl::end_at.eq(ws.end_at.to_diesel()),
         dsl::max_runs.eq(ws.max_runs.map(|n| i32::try_from(n).unwrap_or(i32::MAX))),
         // Catchup policy columns (issue #484).
         SetExt(
@@ -3173,17 +3358,17 @@ async fn apply_workflow_schedule_update(
         // Anti-race with the scheduler tick (issue #350 / #771 AC7): refuse to
         // rewrite a row whose fire claim is currently live. The tick's claim
         // UPDATE and its finalize both evaluate claim expiry against the DB
-        // clock (`NOW()`), so this guard uses `diesel::dsl::now` rather than
-        // the app clock — a skewed API host must never judge a claim expired
-        // that the #350 machinery still considers live (or vice versa).
+        // clock (`NOW()`). So this guard uses `diesel::dsl::now`, not the app
+        // clock. A skewed API host must never judge a claim expired that the
+        // #350 machinery still considers live (or vice versa).
         //
-        // When the guard passes because the claim has *expired* (crashed or
-        // straggling replica left a stale token behind), the token is also
-        // nulled out here: a straggler fire's finalize UPDATEs are guarded by
-        // `fire_claim_token = $its_token`, so fencing the token guarantees a
-        // late finalize matches zero rows and can never clobber the edited
-        // `next_run_at`/`buffered_runs` with old-spec values — exactly the
-        // fencing a peer replica's claim-steal performs.
+        // The guard can pass because the claim has *expired*: a crashed or
+        // straggling replica left a stale token behind. The token is then also
+        // nulled here. A straggler fire's finalize UPDATEs are guarded by
+        // `fire_claim_token = $its_token`. Fencing the token makes a late
+        // finalize match zero rows, so it never clobbers the edited
+        // `next_run_at`/`buffered_runs` with old-spec values. A peer replica's
+        // claim-steal performs exactly this fencing.
         let rows_updated = diesel::update(
             dsl::harvest_schedules.find(existing.id).filter(
                 dsl::fire_claim_token
@@ -3194,7 +3379,7 @@ async fn apply_workflow_schedule_update(
         .set((
             changeset,
             dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-            dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
+            dsl::fire_claimed_until.eq(Option::<crate::time::sql::SqlTimestamp>::None),
         ))
         .execute(conn)
         .await
@@ -3214,18 +3399,18 @@ async fn apply_workflow_schedule_update(
     // again possible (issue #478). A schedule exhausted by end_at is no longer
     // exhausted if end_at is extended or removed; similarly for max_runs.
     // The main UPDATE above already resets next_run_at via the or_else fallback
-    // (existing.next_run_at was NULL → fresh next_run_after computation), so we only
-    // need to nullify exhausted_at / exhausted_reason here.
+    // (existing.next_run_at was NULL → fresh next_run_after computation). Only
+    // exhausted_at / exhausted_reason need a reset here.
     if existing.exhausted_at.is_some() {
         // For end_at: "limit removed" or "there is a valid next slot strictly before
-        // the new end_at". Checking `end_at > now` is not sufficient — the schedule
+        // the new end_at". Checking `end_at > now` is not sufficient. A schedule
         // can be legitimately exhausted before the cutoff wall-time when its last
-        // valid slot has already been dispatched (next_run_after >= end_at). Only
-        // clear exhaustion when the schedule expression will actually produce a new
-        // firing inside the new window.
+        // valid slot is already dispatched (next_run_after >= end_at). Clear
+        // exhaustion only when the schedule expression produces a new firing
+        // inside the new window.
         // Special case: Manual schedules have no automatic next slot (next_run_after
-        // returns None), so treat them as ok when the wall clock hasn't yet reached
-        // the cutoff (manual triggers are still allowed until end_at).
+        // returns None). So treat them as ok while the wall clock has not reached
+        // the cutoff. Manual triggers are still allowed until end_at.
         let end_at_ok = ws.end_at.is_none_or(|new_end| {
             if matches!(ws.schedule, crate::policy::Schedule::Manual) {
                 return now < new_end;
@@ -3238,9 +3423,9 @@ async fn apply_workflow_schedule_update(
         if end_at_ok && max_runs_ok {
             diesel::update(dsl::harvest_schedules.find(existing.id))
                 .set((
-                    dsl::exhausted_at.eq(None::<DateTime<Utc>>),
+                    dsl::exhausted_at.eq(None::<crate::time::sql::SqlTimestamp>),
                     dsl::exhausted_reason.eq(None::<String>),
-                    dsl::updated_at.eq(now),
+                    dsl::updated_at.eq(now.to_diesel()),
                 ))
                 .execute(conn)
                 .await
@@ -3249,9 +3434,9 @@ async fn apply_workflow_schedule_update(
     } else {
         // Active schedule: if the new limits are already violated, transition to
         // exhausted immediately rather than waiting for the next due tick (issue #478).
-        // This prevents a schedule whose max_runs was lowered to the current
-        // runs_started (or whose end_at was moved before next_run_at) from lingering
-        // as active-but-never-runnable until the next tick processes it.
+        // Take a max_runs lowered to the current runs_started, or an end_at moved
+        // before next_run_at. Such a schedule must not linger as
+        // active-but-never-runnable until the next tick processes it.
         let max_runs_now_violated = ws.max_runs.is_some_and(|max| {
             let max_i32 = i32::try_from(max).unwrap_or(i32::MAX);
             max_i32 > 0 && existing.runs_started >= max_i32
@@ -3283,10 +3468,10 @@ async fn apply_workflow_schedule_update(
                     .filter(dsl::exhausted_at.is_null()),
             )
             .set((
-                dsl::exhausted_at.eq(Some(now)),
+                dsl::exhausted_at.eq(Some(now).to_diesel()),
                 dsl::exhausted_reason.eq(Some(reason)),
-                dsl::next_run_at.eq(None::<DateTime<Utc>>),
-                dsl::updated_at.eq(now),
+                dsl::next_run_at.eq(None::<crate::time::sql::SqlTimestamp>),
+                dsl::updated_at.eq(now.to_diesel()),
             ))
             .execute(conn)
             .await
@@ -3295,13 +3480,13 @@ async fn apply_workflow_schedule_update(
     }
 
     // Clear auto_paused_at only when disabling the feature (limit = None or Some(0)).
-    // When the limit is positive we deliberately leave the DB value untouched so a
-    // concurrent failure-counter auto-pause (set by the worker completion path) is
-    // never silently overwritten by a redeployment upsert.
+    // A positive limit leaves the DB value untouched. A redeployment upsert then
+    // never overwrites a concurrent failure-counter auto-pause, which the worker
+    // completion path sets.
     let limit_disabled = ws.consecutive_failure_limit.is_none_or(|n| n == 0);
     if limit_disabled {
         diesel::update(dsl::harvest_schedules.find(existing.id))
-            .set(dsl::auto_paused_at.eq(None::<DateTime<Utc>>))
+            .set(dsl::auto_paused_at.eq(None::<crate::time::sql::SqlTimestamp>))
             .execute(conn)
             .await
             .map_err(crate::error::database_error)?;
@@ -3338,18 +3523,17 @@ pub enum ScheduleUpdateOutcome {
 /// Merge a [`WorkflowSchedulePatch`] over an existing `harvest_schedules` row
 /// into the full [`WorkflowSchedule`] the shared update body consumes.
 ///
-/// Only fields present in the patch change; everything else round-trips from
-/// the stored row (`schedule_expr` is re-parsed with the same lenient rules
-/// the tick loop uses, so an unparseable/NULL expression is treated as
-/// `Schedule::Manual`).
+/// Only fields present in the patch change. Everything else round-trips from
+/// the stored row. `schedule_expr` is re-parsed with the tick loop's lenient
+/// rules, so an unparseable/NULL expression becomes `Schedule::Manual`.
 ///
 /// # Errors
 ///
 /// Returns [`HarvestError::Config`] when the row has no `workflow_name` (not
-/// a workflow schedule) or when the patch leaves `retry_policy` untouched but
-/// the stored `retry_policy` JSON does not deserialize as a `RetryPolicy` —
-/// erroring loudly instead of silently dropping the stored policy to NULL on
-/// an unrelated edit (repair by explicitly setting or clearing it).
+/// a workflow schedule). Also returns it when the patch leaves `retry_policy`
+/// untouched but the stored JSON does not deserialize as a `RetryPolicy`. The
+/// loud error beats a silent drop of the stored policy to NULL on an unrelated
+/// edit. Repair the row by explicitly setting or clearing the policy.
 ///
 /// # Jitter
 ///
@@ -3376,9 +3560,9 @@ fn merge_schedule_patch(
         .as_deref()
         .and_then(parse_schedule_from_expr)
         .unwrap_or(Schedule::Manual);
-    // Reconstruct the stored catchup policy without the legacy-bool fallback:
-    // a NULL policy column stays None so an unrelated patch never converts a
-    // legacy-bool row into an explicit-policy row.
+    // Reconstruct the stored catchup policy without the legacy-bool fallback.
+    // A NULL policy column stays None. An unrelated patch then never converts
+    // a legacy-bool row into an explicit-policy row.
     let existing_catchup_policy = existing.catchup_policy.as_deref().map(|_| {
         crate::policy::CatchupPolicy::from_db(
             existing.catchup_policy.as_deref(),
@@ -3386,12 +3570,11 @@ fn merge_schedule_patch(
             existing.catchup,
         )
     });
-    // Resolve the retry policy the merged spec carries. When the patch does
-    // not touch `retry_policy`, the stored JSON must round-trip through the
-    // typed struct (the shared update body re-serializes it); a stored value
-    // that fails to deserialize is surfaced as an error rather than silently
-    // dropped to NULL by an unrelated patch — the operator repairs the row by
-    // explicitly setting or clearing `retry_policy`.
+    // When the patch does not touch `retry_policy`, the stored JSON must
+    // round-trip through the typed struct, because the shared update body
+    // re-serializes it. A stored value that fails to deserialize is an error.
+    // An unrelated patch must not silently drop it to NULL. The operator
+    // repairs the row by explicitly setting or clearing `retry_policy`.
     let merged_retry_policy: Option<crate::policy::RetryPolicy> = match patch.retry_policy.as_ref()
     {
         Some(new) => new.clone(),
@@ -3533,12 +3716,12 @@ pub async fn update_workflow_schedule_with_codecs(
         // FOR UPDATE: serialize this PATCH against a concurrent scheduler
         // tick (whose claim/advance/finalize UPDATEs take the row lock)
         // and against peer PATCHes. Without the lock, a full
-        // claim→advance→clear-claim cycle could commit between this
-        // SELECT and the guarded UPDATE below, and the merge would write
-        // back the *stale* `next_run_at` (re-arming an already-fired slot
-        // → double fire), stale `buffered_runs`, and a stale `runs_started`
-        // basis for the #478 exhaustion reconciliation; two concurrent
-        // PATCHes would likewise silently lose one side's fields.
+        // claim→advance→clear-claim cycle can commit between this SELECT and
+        // the guarded UPDATE below. The merge then writes back stale values:
+        // `next_run_at` (re-arming an already-fired slot → double fire),
+        // `buffered_runs`, and the `runs_started` basis for the #478
+        // exhaustion reconciliation. Two concurrent PATCHes likewise silently
+        // lose one side's fields.
         let existing: Option<HarvestSchedule> = dsl::harvest_schedules
             .find(schedule_id)
             .select(HarvestSchedule::as_select())
@@ -3598,7 +3781,7 @@ pub struct WorkflowOverrideRequest<'a> {
     pub schedule_id: uuid::Uuid,
     /// The code value of the schedule, as the builder declares it.
     pub code: &'a WorkflowSchedule,
-    /// The fields to set. `input` must be `None`.
+    /// The fields to set. The store encodes `input` with the codecs.
     pub patch: &'a WorkflowSchedulePatch,
     /// Delete the stored override before `patch` merges.
     pub clear: bool,
@@ -3629,11 +3812,16 @@ pub struct WorkflowOverrideUpdate {
 /// validation, and nothing when a live fire claim holds the row. The guard
 /// and the `next_run_at` rules are those of [`update_workflow_schedule`].
 ///
+/// `codecs` encodes the input of the row and of the override, and decodes
+/// the stored override input. So the next fire takes the new input, and the
+/// stored input is ciphertext under an active codec.
+///
 /// # Errors
 ///
-/// Returns [`HarvestError::Config`] when the patch carries an input, when
-/// the row belongs to another workflow, or when the merged value is invalid.
-/// Returns [`HarvestError::Database`] on a failed read or write.
+/// Returns [`HarvestError::Config`] when the row belongs to another workflow,
+/// when the merged value is invalid, or when the stored override input does
+/// not decode. A clear never decodes it. Returns [`HarvestError::Database`]
+/// on a failed read or write.
 pub async fn update_code_declared_workflow_schedule(
     conn: &mut AsyncPgConnection,
     request: &WorkflowOverrideRequest<'_>,
@@ -3681,23 +3869,19 @@ pub async fn update_code_declared_workflow_schedule(
         // The row lock above already orders two patches of this schedule.
         // The override lock keeps the read-modify-write sound on its own.
         // A clear never decodes the stored row, so it also removes a row that
-        // no longer decodes.
+        // no longer decodes. A new input never decodes the old one.
         let stored = if request.clear {
             overrides::lock_workflow_override_row(conn, workflow_name).await?;
             None
+        } else if request.patch.input.is_some() {
+            overrides::lock_workflow_override_without_input(conn, workflow_name).await?
         } else {
-            overrides::lock_workflow_override(conn, workflow_name).await?
+            overrides::lock_workflow_override(conn, workflow_name, codecs).await?
         };
         let base = stored
             .as_ref()
             .map(|value| value.fields.clone())
             .unwrap_or_default();
-        if request.patch.input.is_some() {
-            return Err(HarvestError::Config(format!(
-                "schedule '{workflow_name}' is declared in code; an override cannot change \
-                 its input. Change the input in code"
-            )));
-        }
         let merged = overrides::merge_workflow_fields(request.patch, &base);
         let effective = overrides::validate_effective_workflow(request.code, &merged)?;
 
@@ -3712,9 +3896,10 @@ pub async fn update_code_declared_workflow_schedule(
                     &merged,
                     request.actor,
                     request.reason,
+                    codecs,
                 )
                 .await?;
-                let stored = overrides::get_workflow_override(conn, workflow_name).await?;
+                let stored = overrides::get_workflow_override(conn, workflow_name, codecs).await?;
                 Ok(WorkflowOverrideUpdate {
                     outcome: ScheduleUpdateOutcome::Updated(row),
                     stored,
@@ -3731,30 +3916,37 @@ pub async fn update_code_declared_workflow_schedule(
 
 /// Derive a deterministic, idempotent `workflow_id` for a scheduled run.
 ///
-/// The id is stable across retries: if the scheduler ticks twice before
-/// updating `last_run_at`, `RejectDuplicate` reports the already-created
-/// execution and the scheduler treats that slot as dispatched.
+/// The id is stable across retries. The scheduler can tick twice before it
+/// updates `last_run_at`. `RejectDuplicate` then reports the already-created
+/// execution, and the scheduler treats that slot as dispatched.
 fn scheduled_workflow_id(
     schedule_id: uuid::Uuid,
     workflow_name: &str,
-    scheduled_for: DateTime<Utc>,
+    scheduled_for: Timestamp,
 ) -> String {
-    let micros = scheduled_for.timestamp_subsec_micros();
+    // The id keeps the `chrono` split: floored seconds and a fraction that is
+    // never negative. jiff truncates both parts toward zero before 1970.
+    let (seconds, nanos) = crate::time::chrono_split(scheduled_for);
+    let micros = nanos / 1_000;
     if micros == 0 {
-        format!(
-            "sched:{}:{}:{}",
-            schedule_id,
-            workflow_name,
-            scheduled_for.timestamp()
-        )
+        format!("sched:{schedule_id}:{workflow_name}:{seconds}")
     } else {
-        format!(
-            "sched:{}:{}:{}.{:06}",
-            schedule_id,
-            workflow_name,
-            scheduled_for.timestamp(),
-            micros
-        )
+        format!("sched:{schedule_id}:{workflow_name}:{seconds}.{micros:06}")
+    }
+}
+
+/// Returns the legacy scheduled workflow id, which has no schedule id.
+///
+/// A backfill precheck uses it to match a run that older code stored. The
+/// id keeps the `chrono` split, so it matches those stored ids byte for byte.
+#[must_use]
+pub fn legacy_scheduled_workflow_id(name: &str, scheduled_for: Timestamp) -> String {
+    let (seconds, nanos) = crate::time::chrono_split(scheduled_for);
+    let micros = nanos / 1_000;
+    if micros == 0 {
+        format!("sched:{name}:{seconds}")
+    } else {
+        format!("sched:{name}:{seconds}.{micros:06}")
     }
 }
 
@@ -3763,17 +3955,14 @@ fn scheduled_workflow_id(
 pub fn scheduled_workflow_id_pub(
     schedule_id: uuid::Uuid,
     workflow_name: &str,
-    scheduled_for: DateTime<Utc>,
+    scheduled_for: Timestamp,
 ) -> String {
     scheduled_workflow_id(schedule_id, workflow_name, scheduled_for)
 }
 
 /// Public re-export of `next_run_after` for use in [`crate::calendar`] preview helpers.
 #[must_use]
-pub fn next_run_after_pub(
-    schedule: Option<&Schedule>,
-    reference: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
+pub fn next_run_after_pub(schedule: Option<&Schedule>, reference: Timestamp) -> Option<Timestamp> {
     next_run_after(schedule, reference)
 }
 
@@ -3873,7 +4062,7 @@ fn parse_schedule_from_expr(expr: &str) -> Option<Schedule> {
 #[doc(hidden)]
 pub async fn due_workflow_schedules(
     conn: &mut AsyncPgConnection,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> HarvestResult<Vec<HarvestSchedule>> {
     use crate::schema::harvest_schedules::dsl;
 
@@ -3885,7 +4074,7 @@ pub async fn due_workflow_schedules(
         // Exhausted schedules (issue #478) are permanently terminal — never re-fire.
         .filter(dsl::exhausted_at.is_null())
         .filter(dsl::next_run_at.is_not_null())
-        .filter(dsl::next_run_at.le(now))
+        .filter(dsl::next_run_at.le(now.to_diesel()))
         .order(dsl::next_run_at.asc())
         .select(HarvestSchedule::as_select())
         .load(conn)
@@ -3905,7 +4094,7 @@ async fn tick_workflow_schedules(
 ) -> HarvestResult<()> {
     use crate::schema::harvest_schedules::dsl;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     let due = due_workflow_schedules(conn, now).await?;
 
@@ -3944,8 +4133,8 @@ async fn tick_workflow_schedules(
             .await;
             diesel::update(dsl::harvest_schedules.find(schedule.id))
                 .set((
-                    dsl::next_run_at.eq(Option::<DateTime<Utc>>::None),
-                    dsl::updated_at.eq(now),
+                    dsl::next_run_at.eq(Option::<crate::time::sql::SqlTimestamp>::None),
+                    dsl::updated_at.eq(now.to_diesel()),
                 ))
                 .execute(conn)
                 .await
@@ -3972,40 +4161,40 @@ async fn tick_workflow_schedules(
 /// Claim one due workflow-schedule slot (issue #350 HA claim) and fire it from
 /// a **fresh post-claim read** of the row (issue #771 AC7).
 ///
-/// `snapshot` is the row as loaded by the caller's due-list SELECT and may be
-/// stale by the time the claim is attempted: an in-place edit
+/// `snapshot` is the row as loaded by the caller's due-list SELECT. It can be
+/// stale by the time the claim is attempted. An in-place edit
 /// (`PATCH /admin/schedules/{id}`, issue #771) that does not rewrite
-/// `next_run_at` — an input/queue/policy-only edit — can commit between the
+/// `next_run_at` is an input/queue/policy-only edit. It can commit between the
 /// due-list SELECT and the claim UPDATE without invalidating the claim's
-/// `next_run_at` guard. Firing from the pre-claim snapshot would then dispatch
-/// the slot with the pre-edit input/queue/policies. So after winning the claim
-/// this function re-reads the row and re-derives everything the fire consumes
-/// (input, queue, parsed schedule expression, catchup/overlap/retry policies)
-/// from the fresh row. Edits arriving *after* the claim are fenced by the
-/// PATCH's own live-claim guard (`ClaimLive` → 409), so the fresh row is
-/// authoritative for the whole fire. Cadence edits (which rewrite
+/// `next_run_at` guard. A fire from the pre-claim snapshot then dispatches
+/// the slot with the pre-edit input/queue/policies. So after it wins the claim,
+/// this function re-reads the row. It re-derives everything the fire consumes
+/// from the fresh row: input, queue, parsed schedule expression, and the
+/// catchup/overlap/retry policies. The PATCH's own live-claim guard
+/// (`ClaimLive` → 409) fences edits that arrive *after* the claim. So the
+/// fresh row is authoritative for the whole fire. Cadence edits (which rewrite
 /// `next_run_at`) were already fenced by the claim's `next_run_at` guard.
 ///
 /// This mirrors the pre-existing fresh re-read of `consecutive_failure_count`
-/// / `auto_paused_at` inside `tick_one_workflow_schedule`, which exists for
-/// exactly this stale-snapshot bug class (issue #360 / Codex #1928).
+/// / `auto_paused_at` inside `tick_one_workflow_schedule`. That re-read exists
+/// for exactly this stale-snapshot bug class (issue #360 / #1928).
 ///
-/// Exposed `#[doc(hidden)] pub` so the stale-snapshot race can be driven
-/// deterministically from integration tests (a test hands in a deliberately
-/// stale snapshot while the DB row already carries the edited values).
+/// Exposed `#[doc(hidden)] pub` so integration tests can drive the
+/// stale-snapshot race deterministically. A test hands in a stale snapshot
+/// while the DB row already carries the edited values.
 ///
 /// # Errors
 ///
 /// Returns [`HarvestError::Database`] when the claim UPDATE or the post-claim
-/// re-read fails; a `tick_one_workflow_schedule` failure is logged and the
-/// claim released (matching the caller's pre-existing continue-to-next-schedule
-/// semantics) rather than propagated.
+/// re-read fails. A `tick_one_workflow_schedule` failure is logged and the
+/// claim released, not propagated. That matches the caller's pre-existing
+/// continue-to-next-schedule semantics.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn claim_and_fire_workflow_schedule(
     conn: &mut AsyncPgConnection,
     snapshot: &HarvestSchedule,
-    now: DateTime<Utc>,
+    now: Timestamp,
     current_shard: ShardId,
     registered_dags: &DagCatalog,
     registry: &crate::worker::HandlerRegistry,
@@ -4027,17 +4216,17 @@ pub async fn claim_and_fire_workflow_schedule(
     //
     // The UPDATE guards on both the claim expiry (fire_claim_token IS NULL
     // OR fire_claimed_until < NOW()) AND the logical slot (next_run_at =
-    // logical_date). The next_run_at guard prevents a stale-snapshot race:
-    // if a peer has already fired this slot and advanced next_run_at, our
-    // claim UPDATE matches zero rows and we skip cleanly.
+    // logical_date). The next_run_at guard prevents a stale-snapshot race.
+    // If a peer has already fired this slot and advanced next_run_at, this
+    // claim UPDATE matches zero rows and the tick skips cleanly.
     //
-    // We generate the token client-side so we can reference it in the error
-    // cleanup path — preventing a slow late-running tick from clearing a
-    // successor replica's live claim after the 30 s TTL has expired.
+    // The token is generated client-side so the error cleanup path can
+    // reference it. A slow late-running tick then cannot clear a successor
+    // replica's live claim after the 30 s TTL expires.
     //
-    // Crash-recovery window: if this replica crashes after claiming but
-    // before advancing next_run_at, the claim expires after 30 s and any
-    // healthy peer retries the slot on its next tick.
+    // Crash-recovery window: if this replica crashes after the claim but
+    // before it advances next_run_at, the claim expires after 30 s. Any
+    // healthy peer then retries the slot on its next tick.
     let my_claim_token = uuid::Uuid::new_v4();
     let claim_rows_affected: usize = diesel::sql_query(
         "UPDATE harvest_schedules \
@@ -4049,7 +4238,7 @@ pub async fn claim_and_fire_workflow_schedule(
     )
     .bind::<diesel::sql_types::Uuid, _>(my_claim_token)
     .bind::<diesel::sql_types::Uuid, _>(snapshot.id)
-    .bind::<diesel::sql_types::Timestamptz, _>(logical_date)
+    .bind::<diesel::sql_types::Timestamptz, _>(logical_date.to_diesel())
     .execute(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -4072,9 +4261,9 @@ pub async fn claim_and_fire_workflow_schedule(
     crate::chaos_point!(SCHED_AFTER_CLAIM);
 
     // ── Post-claim refresh (issue #771 AC7) ───────────────────────────────
-    // Never fire from the pre-claim snapshot: re-read the row now that the
-    // claim is held so a non-cadence edit that committed between the due-list
-    // SELECT and the claim is picked up by this very fire.
+    // Never fire from the pre-claim snapshot. Re-read the row now that the
+    // claim is held. A non-cadence edit that committed between the due-list
+    // SELECT and the claim then reaches this very fire.
     let fresh: Option<HarvestSchedule> = dsl::harvest_schedules
         .find(snapshot.id)
         .select(HarvestSchedule::as_select())
@@ -4106,15 +4295,14 @@ pub async fn claim_and_fire_workflow_schedule(
         schedule.catchup,
     );
 
-    // issue #377: gate check runs AFTER the HA claim to prevent every
-    // replica from independently recording a skip metric and advancing
-    // next_run_at for the same slot. Only the replica that wins the claim
-    // skips or fires the slot.
+    // issue #377: the gate check runs AFTER the HA claim. Otherwise every
+    // replica records a skip metric and advances next_run_at for the same
+    // slot. Only the replica that wins the claim skips or fires the slot.
     {
         let queue_name = schedule.queue_name.as_deref().unwrap_or("default");
-        // Use dag_name (not wf_name) when looking up DAG metadata so that an
-        // owner-scoped gate is matched even when the workflow name differs from
-        // the DAG name (e.g. unified DAG aliases).
+        // Look up DAG metadata by dag_name, not wf_name. An owner-scoped gate
+        // then matches even when the workflow name differs from the DAG name
+        // (e.g. unified DAG aliases).
         let dag_lookup_key = schedule.dag_name.as_deref().unwrap_or(wf_name.as_str());
         let owner = registry
             .workflows
@@ -4140,12 +4328,12 @@ pub async fn claim_and_fire_workflow_schedule(
                 "harvest: schedule fire skipped due to admission gate"
             );
             metrics.record_schedule_skipped("workflow", wf_name, "admission_blocked");
-            // issue #618, F-round17: the scheduler is a *gated* producer, so a
-            // schedule fire blocked by an active gate must ALSO appear in
-            // harvest.admission.blocked (the "zero-uncounted gated producer" contract),
-            // in addition to the schedule-domain schedule_skipped signal above. Pass
-            // the matched gate's scope kind + reason, mirroring every other gated
-            // producer's block-count call.
+            // issue #618: the scheduler is a *gated* producer. A schedule fire
+            // blocked by an active gate must ALSO appear in
+            // harvest.admission.blocked (the "zero-uncounted gated producer"
+            // contract), besides the schedule_skipped signal above. Pass the
+            // matched gate's scope kind + reason, as every other gated producer's
+            // block-count call does.
             metrics.record_admission_blocked(gate.scope.kind_str(), &gate.reason);
             crate::schedule_decision::record_decision_graceful(
                 conn,
@@ -4177,8 +4365,10 @@ pub async fn claim_and_fire_workflow_schedule(
                      fire_claimed_until = NULL \
                  WHERE id = $3 AND fire_claim_token = $4",
             )
-            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(next_run)
-            .bind::<diesel::sql_types::Timestamptz, _>(now)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
+                next_run.to_diesel(),
+            )
+            .bind::<diesel::sql_types::Timestamptz, _>(now.to_diesel())
             .bind::<diesel::sql_types::Uuid, _>(schedule.id)
             .bind::<diesel::sql_types::Uuid, _>(my_claim_token)
             .execute(conn)
@@ -4246,15 +4436,14 @@ async fn release_fire_claim(
 /// `terminate_in_flight_runs`.
 ///
 /// Filters by `schedule_id` alone -- NOT also by `workflow_name` -- rather than the
-/// `sched:` workflow-id prefix, so that workflow-retry executions (which carry a UUID
-/// `workflow_id` but still link back to the originating schedule via the `schedule_id`
-/// FK) are included, while operator-triggered manual runs (which have `schedule_id =
-/// NULL`) are not inadvertently targeted. `schedule_id` is unique to one schedule, so
-/// it alone is already the correct, sufficient scope: a workflow-name filter on top of
-/// it is redundant for a same-type schedule and actively wrong for one whose
-/// `ctx.continue_as_new_as(...)` (#803) successor carries this `schedule_id` under a
-/// DIFFERENT `workflow_name` -- exactly the case a `workflow_name` filter would silently
-/// exclude from overlap cleanup (issue #1160).
+/// `sched:` workflow-id prefix. Workflow-retry executions carry a UUID `workflow_id`
+/// but link back to the originating schedule via the `schedule_id` FK, so they are
+/// included. Operator-triggered manual runs have `schedule_id = NULL`, so they are
+/// not targeted. `schedule_id` is unique to one schedule, so it alone is the correct,
+/// sufficient scope. A workflow-name filter on top of it is redundant for a
+/// same-type schedule. It is wrong for one whose `ctx.continue_as_new_as(...)` (#803)
+/// successor carries this `schedule_id` under a DIFFERENT `workflow_name`. That
+/// filter silently excludes such a successor from overlap cleanup (issue #1160).
 /// Orders by `started_at ASC` (oldest first) and pushes `limit` into the query
 /// itself rather than loading every match and truncating in Rust.
 #[cfg(feature = "db")]
@@ -4346,16 +4535,18 @@ async fn terminate_in_flight_runs(
     Ok(count)
 }
 
-/// Emit the bounded-catchup drop audit (skip metrics + one aggregated decision
-/// row + the `last_catchup_dropped`/`last_catchup_at` recovery columns) for a
-/// recovery tick that dropped `dropped` missed slots.
+/// Emit the bounded-catchup drop audit for a recovery tick that dropped
+/// `dropped` missed slots.
+///
+/// The audit is skip metrics, one aggregated decision row, and the
+/// `last_catchup_dropped`/`last_catchup_at` recovery columns.
 ///
 /// Call this **only** on a path that commits an advanced `next_run_at` past the
-/// dropped slots (overlap Drop/Buffer early-returns and the dispatch finalize),
-/// never before a fallible dispatch — otherwise a transient failure that leaves
-/// `next_run_at` unchanged would record drops that are then re-recorded when the
-/// same slots are retried (issue #484 / Codex #2174). No-op when `dropped == 0`,
-/// so ordinary (non-recovery) ticks never touch the recovery audit columns.
+/// dropped slots (overlap Drop/Buffer early-returns and the dispatch finalize).
+/// Never call it before a fallible dispatch. A transient failure can leave
+/// `next_run_at` unchanged, and the drops are then re-recorded when the same
+/// slots are retried (issue #484 / #2174). No-op when `dropped == 0`, so
+/// ordinary (non-recovery) ticks never touch the recovery audit columns.
 #[allow(clippy::too_many_arguments)]
 async fn record_catchup_drops(
     conn: &mut AsyncPgConnection,
@@ -4365,7 +4556,7 @@ async fn record_catchup_drops(
     catchup_policy: crate::policy::CatchupPolicy,
     catchup_window_secs: Option<i64>,
     dropped: u64,
-    now: DateTime<Utc>,
+    now: Timestamp,
     current_shard: ShardId,
     claim_token: uuid::Uuid,
 ) {
@@ -4374,9 +4565,9 @@ async fn record_catchup_drops(
     if dropped == 0 {
         return;
     }
-    // Count every dropped slot exactly with a single batched increment — no
-    // O(dropped) loop, so a large recovery never stalls the tick and the counter
-    // does not under-report the outage (issue #484 / Codex #1837).
+    // Count every dropped slot exactly with a single batched increment, not an
+    // O(dropped) loop. A large recovery then never stalls the tick, and the
+    // counter does not under-report the outage (issue #484 / #1837).
     metrics.record_schedule_skipped_n("workflow", wf_name, "catchup_window_exceeded", dropped);
     crate::schedule_decision::record_decision_graceful(
         conn,
@@ -4397,12 +4588,12 @@ async fn record_catchup_drops(
     )
     .await;
 
-    // Persist the catchup-drop summary as a separate, conditional update — NOT
-    // part of the main finalize update — so ordinary (zero-drop) ticks never
-    // reset this recovery audit trail back to 0 / NULL. Guarded by the HA claim
-    // token (like the final update) so a stale tick that lost its claim cannot
-    // stamp obsolete recovery audit fields over a successor replica's row
-    // (issue #484 / Codex #2297).
+    // Persist the catchup-drop summary as a separate, conditional update, NOT
+    // part of the main finalize update. Ordinary (zero-drop) ticks then never
+    // reset this recovery audit trail back to 0 / NULL. The HA claim token
+    // guards it, like the final update. A stale tick that lost its claim then
+    // cannot stamp obsolete recovery audit fields over a successor replica's
+    // row (issue #484 / #2297).
     let _ = diesel::update(
         dsl::harvest_schedules
             .find(schedule_id)
@@ -4410,7 +4601,7 @@ async fn record_catchup_drops(
     )
     .set((
         dsl::last_catchup_dropped.eq(i32::try_from(dropped).unwrap_or(i32::MAX)),
-        SetExt(harvest_schedules_ext::last_catchup_at.eq(Some(now))),
+        SetExt(harvest_schedules_ext::last_catchup_at.eq(Some(now).to_diesel())),
     ))
     .execute(conn)
     .await;
@@ -4423,8 +4614,8 @@ async fn tick_one_workflow_schedule(
     catchup_policy: crate::policy::CatchupPolicy,
     parsed_schedule: Option<&Schedule>,
     schedule: &HarvestSchedule,
-    logical_date: DateTime<Utc>,
-    now: DateTime<Utc>,
+    logical_date: Timestamp,
+    now: Timestamp,
     current_shard: ShardId,
     claim_token: uuid::Uuid,
     registered_dags: &DagCatalog,
@@ -4438,13 +4629,13 @@ async fn tick_one_workflow_schedule(
 
     // Re-read the auto-pause inputs (consecutive_failure_count, auto_paused_at)
     // under the HA claim up front. A concurrent worker completion can reset the
-    // failure counter or set auto_paused_at after this tick loaded the schedule
-    // row, so the pre-plan short-circuit below and the auto-pause guard further
-    // down MUST consult the same *fresh* values — otherwise the short-circuit
-    // could empty the plan off a stale "at limit" snapshot while the guard (using
-    // the reset count) declines to auto-pause, silently stopping the schedule
-    // with next_run_at = NULL (issue #360 / Codex #1928).
-    let (db_failure_count, db_auto_paused_at): (i32, Option<DateTime<Utc>>) =
+    // failure counter or set auto_paused_at after this tick loaded the row.
+    // The pre-plan short-circuit below and the auto-pause guard further down
+    // MUST consult the same *fresh* values. Otherwise the short-circuit can
+    // empty the plan off a stale "at limit" snapshot. The guard, with the reset
+    // count, then declines to auto-pause. The schedule silently stops with
+    // next_run_at = NULL (issue #360 / #1928).
+    let (db_failure_count, db_auto_paused_at): (i32, Option<crate::time::sql::SqlTimestamp>) =
         dsl::harvest_schedules
             .find(schedule.id)
             .select((dsl::consecutive_failure_count, dsl::auto_paused_at))
@@ -4453,27 +4644,26 @@ async fn tick_one_workflow_schedule(
             .map_err(crate::error::database_error)?;
 
     // Compute the bounded catchup plan up front from the *original* oldest
-    // overdue slot, then rebind `logical_date` to the earliest slot the policy
-    // actually intends to fire. This makes the calendar suppression, overlap
-    // buffering, jitter window, and dispatch logic below all operate on a
-    // policy-approved slot rather than the oldest missed one (issue #484:
-    // bounded policies must be applied *before* those branches, not after).
+    // overdue slot. Then rebind `logical_date` to the earliest slot the policy
+    // intends to fire. The calendar suppression, overlap buffering, jitter
+    // window and dispatch logic below then use a policy-approved slot, not the
+    // oldest missed one. Issue #484: bounded policies apply *before* those
+    // branches, not after.
     //
     // For SkipAll / Unbounded / legacy `catchup` schedules, `run_dates.first()`
-    // is exactly the original `logical_date`, so their behavior is completely
-    // unchanged — only the new MostRecent / Window policies shift the anchor.
+    // is exactly the original `logical_date`, so their behavior is unchanged.
+    // Only the new MostRecent / Window policies shift the anchor.
     // Skip materializing the full overdue backlog for an Unbounded / legacy
-    // `catchup = true` schedule that one of the guards below will immediately
-    // exhaust, auto-pause, or otherwise return on without firing: a high-
-    // frequency schedule left down past its cutoff / run budget (end_at /
-    // max_runs, issue #478) or past its consecutive-failure limit (auto-pause,
-    // issue #360) would otherwise allocate one slot per missed interval only for
-    // every slot to be discarded (Codex #1829 / #1938). The authoritative
-    // exhaustion / auto-pause decision is still made (and re-validated against a
-    // fresh DB read) by those guards below — this only avoids the wasted
-    // allocation. The bounded MostRecent / Window policies compute in O(1)
-    // (closed-form for interval schedules), so this short-circuit is scoped to
-    // the unbounded path.
+    // `catchup = true` schedule that a guard below exhausts, auto-pauses, or
+    // otherwise returns on without firing. Take a high-frequency schedule left
+    // down past its cutoff / run budget (end_at / max_runs, issue #478) or its
+    // consecutive-failure limit (auto-pause, issue #360). It otherwise
+    // allocates one slot per missed interval only to discard every slot
+    // (#1829 / #1938). Those guards below still make the authoritative
+    // exhaustion / auto-pause decision against a fresh DB read. This only
+    // avoids the wasted allocation. The bounded MostRecent / Window policies
+    // compute in O(1) (closed-form for interval schedules), so this
+    // short-circuit is scoped to the unbounded path.
     let will_exhaust_before_firing =
         matches!(catchup_policy, crate::policy::CatchupPolicy::Unbounded)
             && (schedule.end_at.is_some_and(|end_at| logical_date >= end_at)
@@ -4486,8 +4676,8 @@ async fn tick_one_workflow_schedule(
                     .is_some_and(|limit| limit > 0 && db_failure_count >= limit));
     let catchup_plan = if will_exhaust_before_firing {
         // Empty plan: `logical_date` rebinding below keeps the original slot
-        // (the `[]` arm), so the calendar / jitter / exhaustion branches see the
-        // exact same `logical_date` they would have with the full plan.
+        // (the `[]` arm). The calendar / jitter / exhaustion branches then see
+        // the same `logical_date` as with the full plan.
         CatchupPlan {
             run_dates: Vec::new(),
             next_run_at: None,
@@ -4509,16 +4699,15 @@ async fn tick_one_workflow_schedule(
         [] => logical_date,
     };
 
-    // Compute jitter window once so it can be reused in the dispatch loop below.
     let jitter_window =
         std::time::Duration::from_secs(u64::try_from(schedule.jitter_secs.max(0)).unwrap_or(0));
 
     // If jitter for this slot has not yet elapsed, skip the overlap check and any
-    // dispatch; the scheduler will revisit on the next tick (next_run_at unchanged).
+    // dispatch. The scheduler revisits on the next tick (next_run_at unchanged).
     {
         let jitter_offset = compute_jitter_offset(schedule.id, logical_date, jitter_window);
         let effective_fire_time =
-            logical_date + chrono::Duration::from_std(jitter_offset).unwrap_or_default();
+            logical_date + jiff::SignedDuration::try_from(jitter_offset).unwrap_or_default();
         if now < effective_fire_time {
             // Release the HA claim so peers are not blocked for the full 30 s
             // TTL while the jitter window elapses. The next tick re-claims
@@ -4531,7 +4720,7 @@ async fn tick_one_workflow_schedule(
             )
             .set((
                 dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-                dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
+                dsl::fire_claimed_until.eq(Option::<crate::time::sql::SqlTimestamp>::None),
             ))
             .execute(conn)
             .await
@@ -4581,11 +4770,11 @@ async fn tick_one_workflow_schedule(
                 // excluded date so overdue non-excluded slots are not dropped; for
                 // non-catchup schedules advance from now.
                 //
-                // A *multi-slot* catchup plan (Window, or Unbounded) is handled by
-                // the `None` fall-through arm below instead: aborting the whole
-                // tick here would strand the later in-window allowed slots, so the
-                // per-slot calendar filter in the dispatch loop skips the excluded
-                // slot(s) and fires the allowed ones (issue #484 / Codex #1867).
+                // The `None` fall-through arm below handles a *multi-slot* catchup
+                // plan (Window, or Unbounded). An abort of the whole tick here
+                // strands the later in-window allowed slots. So the per-slot
+                // calendar filter in the dispatch loop skips the excluded slot(s)
+                // and fires the allowed ones (issue #484 / #1867).
                 tracing::info!(
                     workflow_name = %wf_name,
                     calendar = %cal_name,
@@ -4594,12 +4783,12 @@ async fn tick_one_workflow_schedule(
                 );
                 metrics.record_schedule_skipped("workflow", wf_name, "calendar");
                 // This branch advances next_run_at past the single policy-approved
-                // slot, so any older slots the bounded policy already dropped are
-                // now durably discarded: record their catchup-drop audit here
-                // (committing path) so a MostRecent / single-slot-Window recovery
-                // whose kept slot lands on an excluded calendar date still emits the
-                // `catchup_window_exceeded` decision + `last_catchup_*` summary
-                // (issue #484 / Codex #2012).
+                // slot. Older slots the bounded policy already dropped are now
+                // durably discarded. Record their catchup-drop audit here, on the
+                // committing path. Take a MostRecent / single-slot-Window recovery
+                // whose kept slot lands on an excluded calendar date. It then still
+                // emits the `catchup_window_exceeded` decision + `last_catchup_*`
+                // summary (issue #484 / #2012).
                 record_catchup_drops(
                     conn,
                     metrics,
@@ -4641,10 +4830,10 @@ async fn tick_one_workflow_schedule(
                         .filter(dsl::fire_claim_token.eq(Some(claim_token))),
                 )
                 .set((
-                    dsl::next_run_at.eq(next),
+                    dsl::next_run_at.eq(next.to_diesel()),
                     dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-                    dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
-                    dsl::updated_at.eq(now),
+                    dsl::fire_claimed_until.eq(Option::<crate::time::sql::SqlTimestamp>::None),
+                    dsl::updated_at.eq(now.to_diesel()),
                 ))
                 .execute(conn)
                 .await
@@ -4672,9 +4861,9 @@ async fn tick_one_workflow_schedule(
 
     // ── Auto-pause check (issue #360) ─────────────────────────────────────────
     // Uses `db_auto_paused_at` / `db_failure_count` read under the HA claim at the
-    // top of the tick (the same fresh values the pre-plan short-circuit consulted),
-    // so a concurrent worker completion that set auto_paused_at or reset the
-    // failure counter cannot make the two disagree (issue #360 / Codex #1928).
+    // top of the tick. The pre-plan short-circuit consulted the same fresh values.
+    // A concurrent worker completion that sets auto_paused_at or resets the
+    // failure counter cannot make the two disagree (issue #360 / #1928).
     if db_auto_paused_at.is_some() {
         // Already auto-paused by a concurrent worker; release the claim and stop.
         diesel::update(
@@ -4684,8 +4873,8 @@ async fn tick_one_workflow_schedule(
         )
         .set((
             dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-            dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
-            dsl::updated_at.eq(now),
+            dsl::fire_claimed_until.eq(Option::<crate::time::sql::SqlTimestamp>::None),
+            dsl::updated_at.eq(now.to_diesel()),
         ))
         .execute(conn)
         .await
@@ -4712,10 +4901,10 @@ async fn tick_one_workflow_schedule(
                 .filter(dsl::fire_claim_token.eq(Some(claim_token))),
         )
         .set((
-            dsl::auto_paused_at.eq(Some(now)),
+            dsl::auto_paused_at.eq(Some(now).to_diesel()),
             dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-            dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
-            dsl::updated_at.eq(now),
+            dsl::fire_claimed_until.eq(Option::<crate::time::sql::SqlTimestamp>::None),
+            dsl::updated_at.eq(now.to_diesel()),
         ))
         .execute(conn)
         .await
@@ -4761,12 +4950,12 @@ async fn tick_one_workflow_schedule(
                 .filter(dsl::fire_claim_token.eq(Some(claim_token))),
         )
         .set((
-            dsl::exhausted_at.eq(Some(now)),
+            dsl::exhausted_at.eq(Some(now).to_diesel()),
             dsl::exhausted_reason.eq(Some("end_at_reached")),
-            dsl::next_run_at.eq(Option::<DateTime<Utc>>::None),
+            dsl::next_run_at.eq(Option::<crate::time::sql::SqlTimestamp>::None),
             dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-            dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
-            dsl::updated_at.eq(now),
+            dsl::fire_claimed_until.eq(Option::<crate::time::sql::SqlTimestamp>::None),
+            dsl::updated_at.eq(now.to_diesel()),
         ))
         .execute(conn)
         .await
@@ -4808,12 +4997,12 @@ async fn tick_one_workflow_schedule(
                 .filter(dsl::fire_claim_token.eq(Some(claim_token))),
         )
         .set((
-            dsl::exhausted_at.eq(Some(now)),
+            dsl::exhausted_at.eq(Some(now).to_diesel()),
             dsl::exhausted_reason.eq(Some("max_runs_exhausted")),
-            dsl::next_run_at.eq(Option::<DateTime<Utc>>::None),
+            dsl::next_run_at.eq(Option::<crate::time::sql::SqlTimestamp>::None),
             dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-            dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
-            dsl::updated_at.eq(now),
+            dsl::fire_claimed_until.eq(Option::<crate::time::sql::SqlTimestamp>::None),
+            dsl::updated_at.eq(now.to_diesel()),
         ))
         .execute(conn)
         .await
@@ -4826,29 +5015,28 @@ async fn tick_one_workflow_schedule(
     // dropped count.
     //
     // The catchup-drop audit (skip metrics + decision row + `last_catchup_*`
-    // columns) is NOT emitted here. It is emitted via `record_catchup_drops`
-    // only on the paths that actually *commit* an advanced `next_run_at` past
-    // the dropped slots — the overlap Drop/Buffer early-returns (issue #484 /
-    // Codex #2297) and the dispatch finalize below. A transient
+    // columns) is NOT emitted here. `record_catchup_drops` emits it only on the
+    // paths that *commit* an advanced `next_run_at` past the dropped slots.
+    // Those are the overlap Drop/Buffer early-returns (issue #484 / #2297) and
+    // the dispatch finalize below. A transient
     // `start_or_load_workflow_execution` failure returns `Err` before the
-    // finalize and leaves `next_run_at` unchanged, so those slots are retried on
-    // the next tick; emitting the audit here (before the fallible dispatch) would
-    // produce false/duplicated recovery data for slots that were not durably
-    // dropped (issue #484 / Codex #2174).
+    // finalize and leaves `next_run_at` unchanged. Those slots are retried on
+    // the next tick. An audit here, before the fallible dispatch, produces
+    // false or duplicated recovery data for slots that were not durably
+    // dropped (issue #484 / #2174).
     let CatchupPlan {
         run_dates,
         next_run_at: next_run_after_plan,
         dropped: catchup_slots_dropped,
     } = catchup_plan;
 
-    // A bounded plan with nothing to fire (e.g. a Window where every eligible
-    // slot fell outside the window, so they were all dropped) must still advance
-    // next_run_at past the dropped backlog and record the drops exactly once.
-    // Otherwise the overlap branch below would treat the stale rebound
-    // `logical_date` (still pinned to the oldest overdue slot by the `[]` rebind
-    // arm) as a runnable slot and — under Skip + catchup — retain
-    // `next_run_at = logical_date`, re-auditing the same backlog on every tick
-    // until capacity opens (issue #484 / Codex #1952).
+    // A bounded plan can have nothing to fire, e.g. a Window that dropped every
+    // eligible slot. It must still advance next_run_at past the dropped backlog
+    // and record the drops exactly once. Otherwise the overlap branch below
+    // treats the stale rebound `logical_date` as a runnable slot. The `[]`
+    // rebind arm still pins it to the oldest overdue slot. Under Skip +
+    // catchup it then retains `next_run_at = logical_date`. It re-audits the
+    // same backlog on every tick until capacity opens (issue #484 / #1952).
     if run_dates.is_empty() {
         record_catchup_drops(
             conn,
@@ -4863,11 +5051,11 @@ async fn tick_one_workflow_schedule(
             claim_token,
         )
         .await;
-        // Mirror the dispatch finalize's end_at exhaustion: if the next planned
-        // slot is at/after end_at (or there is none), no future fire can ever be
-        // legal, so mark the schedule terminal here instead of leaving it active
-        // until a future due tick that can never fire — or indefinitely when
-        // next_run_after_plan is None (issue #478 / Codex #2323).
+        // Mirror the dispatch finalize's end_at exhaustion. If the next planned
+        // slot is at/after end_at (or there is none), no future fire is legal.
+        // Mark the schedule terminal here. Do not leave it active until a due
+        // tick that never fires, or indefinitely when next_run_after_plan is
+        // None (issue #478 / #2323).
         let exhausted = schedule
             .end_at
             .is_some_and(|end| next_run_after_plan.is_none_or(|next| next >= end));
@@ -4902,12 +5090,12 @@ async fn tick_one_workflow_schedule(
                 .filter(dsl::fire_claim_token.eq(Some(claim_token))),
         )
         .set((
-            dsl::next_run_at.eq(final_next),
-            dsl::exhausted_at.eq(exhausted_at),
+            dsl::next_run_at.eq(final_next.to_diesel()),
+            dsl::exhausted_at.eq(exhausted_at.to_diesel()),
             dsl::exhausted_reason.eq(exhausted_reason),
             dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-            dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
-            dsl::updated_at.eq(now),
+            dsl::fire_claimed_until.eq(Option::<crate::time::sql::SqlTimestamp>::None),
+            dsl::updated_at.eq(now.to_diesel()),
         ))
         .execute(conn)
         .await
@@ -4936,9 +5124,9 @@ async fn tick_one_workflow_schedule(
 
         match action {
             OverlapAction::Drop { reason } => {
-                // Committing path (next_run_at advances past — or is retained at
-                // the policy-approved slot beyond — the dropped slots), so emit
-                // the catchup-drop audit here (issue #484 / Codex #2297).
+                // Committing path: next_run_at advances past the dropped slots,
+                // or stays at the policy-approved slot beyond them. So emit the
+                // catchup-drop audit here (issue #484 / #2297).
                 record_catchup_drops(
                     conn,
                     metrics,
@@ -4963,9 +5151,9 @@ async fn tick_one_workflow_schedule(
                 metrics.record_schedule_skipped("workflow", wf_name, reason);
                 // For Skip drops (reason = "max_active_runs_reached"), retain
                 // logical_date under catchup so the overdue slot fires once
-                // capacity opens. For buffer-full drops the slot is permanently
-                // discarded; advance past it so newer catchup slots are not
-                // blocked behind the same overdue timestamp on every tick.
+                // capacity opens. A buffer-full drop discards the slot for good.
+                // Advance past it so newer catchup slots are not blocked behind
+                // the same overdue timestamp on every tick.
                 let retain_for_retry = catchup && reason == "max_active_runs_reached";
                 let next = if retain_for_retry {
                     Some(logical_date)
@@ -4996,10 +5184,10 @@ async fn tick_one_workflow_schedule(
                         .filter(dsl::fire_claim_token.eq(Some(claim_token))),
                 )
                 .set((
-                    dsl::next_run_at.eq(next),
+                    dsl::next_run_at.eq(next.to_diesel()),
                     dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-                    dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
-                    dsl::updated_at.eq(now),
+                    dsl::fire_claimed_until.eq(Option::<crate::time::sql::SqlTimestamp>::None),
+                    dsl::updated_at.eq(now.to_diesel()),
                 ))
                 .execute(conn)
                 .await
@@ -5008,7 +5196,7 @@ async fn tick_one_workflow_schedule(
             }
             OverlapAction::Buffer { fire_time } => {
                 // Committing path (next_run_at advances past the dropped slots),
-                // so emit the catchup-drop audit here (issue #484 / Codex #2297).
+                // so emit the catchup-drop audit here (issue #484 / #2297).
                 record_catchup_drops(
                     conn,
                     metrics,
@@ -5061,11 +5249,11 @@ async fn tick_one_workflow_schedule(
                         .filter(dsl::fire_claim_token.eq(Some(claim_token))),
                 )
                 .set((
-                    dsl::next_run_at.eq(next),
+                    dsl::next_run_at.eq(next.to_diesel()),
                     dsl::buffered_runs.eq(buffered_runs_to_json(&buffered)),
                     dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-                    dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
-                    dsl::updated_at.eq(now),
+                    dsl::fire_claimed_until.eq(Option::<crate::time::sql::SqlTimestamp>::None),
+                    dsl::updated_at.eq(now.to_diesel()),
                 ))
                 .execute(conn)
                 .await
@@ -5113,13 +5301,11 @@ async fn tick_one_workflow_schedule(
     }
 
     let dispatch_queue = schedule.queue_name.as_deref().unwrap_or("default");
-    // jitter_window already computed at function entry; reused here.
 
-    // Re-read runs_started from the DB now that we hold the HA claim and have
-    // finished the overlap handling. This captures any concurrent manual trigger
-    // pre-increments that happened between the outer tick query and this point,
-    // giving the dispatch loop a fresh budget baseline so it does not over-dispatch
-    // against a budget that was already partially consumed by a manual trigger.
+    // Re-read runs_started now that the HA claim is held and the overlap handling
+    // is done. This captures concurrent manual trigger pre-increments since the
+    // outer tick query. The dispatch loop then has a fresh budget baseline. It
+    // does not over-dispatch against a budget a manual trigger partly consumed.
     let live_runs_started: i32 = dsl::harvest_schedules
         .find(schedule.id)
         .filter(dsl::fire_claim_token.eq(Some(claim_token)))
@@ -5129,14 +5315,14 @@ async fn tick_one_workflow_schedule(
         .map_err(crate::error::database_error)?;
 
     let mut dispatched: u32 = 0;
-    let mut last_dispatched_at: Option<DateTime<Utc>> = None;
-    // Tracks the pre-rebase original slot of the last dispatched run. Used to
-    // anchor next_run_at when a calendar rebases the fire time forward, so the
-    // natural next cron slot after the original due slot is not skipped.
-    let mut last_original_slot_dispatched: Option<DateTime<Utc>> = None;
-    // Set to the first slot we could not dispatch due to max_active_runs or jitter; if Some,
+    let mut last_dispatched_at: Option<Timestamp> = None;
+    // The pre-rebase original slot of the last dispatched run. It anchors
+    // next_run_at when a calendar rebases the fire time forward. The natural
+    // next cron slot after the original due slot is then not skipped.
+    let mut last_original_slot_dispatched: Option<Timestamp> = None;
+    // The first slot not dispatched due to max_active_runs or jitter. If Some,
     // it becomes next_run_at so catchup slots are not silently dropped.
-    let mut deferred_next_run_at: Option<DateTime<Utc>> = None;
+    let mut deferred_next_run_at: Option<Timestamp> = None;
     for original_slot in &run_dates {
         // Apply calendar filtering for every slot (including the first one, since
         // the pre-loop check no longer rebases `logical_date`).
@@ -5207,10 +5393,10 @@ async fn tick_one_workflow_schedule(
         // Per-slot end_at guard (issue #478): compare against the calendar-rebased
         // effective value (effective_scheduled_for), not original_slot. A slot that
         // was originally before end_at but was rebased to a business day at or past
-        // end_at must also stop. Only defer back to original_slot when it too is
-        // >= end_at (the post-loop end_at_now_exhausted check sees it and exhausts
-        // correctly); when original_slot < end_at, deferring to it creates the same
-        // stuck retry loop as the jitter case — just break.
+        // end_at must also stop. Defer back to original_slot only when it too is
+        // >= end_at. The post-loop end_at_now_exhausted check then sees it and
+        // exhausts correctly. When original_slot < end_at, a defer to it creates
+        // the same stuck retry loop as the jitter case, so just break.
         if let Some(end_at) = schedule.end_at
             && effective_scheduled_for >= end_at
         {
@@ -5220,8 +5406,8 @@ async fn tick_one_workflow_schedule(
             break;
         }
         // Budget cap (issue #478): use the DB-fresh live_runs_started (re-read after
-        // claim, above) rather than the stale schedule.runs_started so that concurrent
-        // manual trigger pre-increments are visible here and prevent over-dispatch.
+        // claim, above), not the stale schedule.runs_started. Concurrent manual
+        // trigger pre-increments are then visible here and prevent over-dispatch.
         if let Some(max_runs) = schedule.max_runs {
             let already =
                 live_runs_started.saturating_add(i32::try_from(dispatched).unwrap_or(i32::MAX));
@@ -5233,15 +5419,15 @@ async fn tick_one_workflow_schedule(
         // Jitter: stall dispatch until the effective fire time has elapsed.
         // effective_fire_time = scheduled_for + hash(schedule_id, scheduled_for) % jitter_window
         let jitter_offset = compute_jitter_offset(schedule.id, *scheduled_for, jitter_window);
-        let chrono_jitter = chrono::Duration::from_std(jitter_offset).unwrap_or_else(|_| {
+        let jitter = jiff::SignedDuration::try_from(jitter_offset).unwrap_or_else(|_| {
             tracing::warn!(
                 schedule_id = %schedule.id,
                 jitter_secs = schedule.jitter_secs,
-                "harvest: jitter_secs overflows chrono::Duration; falling back to zero jitter"
+                "harvest: jitter_secs overflows jiff::SignedDuration; falling back to zero jitter"
             );
-            chrono::Duration::zero()
+            jiff::SignedDuration::ZERO
         });
-        let effective_fire_time = *scheduled_for + chrono_jitter;
+        let effective_fire_time = *scheduled_for + jitter;
         if now < effective_fire_time {
             deferred_next_run_at = Some(*original_slot);
             tracing::debug!(
@@ -5254,12 +5440,11 @@ async fn tick_one_workflow_schedule(
         }
         // Secondary end_at guard: jitter may push the effective dispatch time past
         // the cutoff even when the original slot was before it.
-        // Do NOT set deferred_next_run_at here — original_slot is still < end_at,
-        // so deferring to it would cause every tick to retry the same slot forever
-        // without ever firing or exhausting. Falling through to the post-loop
-        // end_at_now_exhausted check with deferred_next_run_at = None lets it use
-        // next_run_after_plan (which is >= end_at) and correctly mark the schedule
-        // exhausted.
+        // Do NOT set deferred_next_run_at here. original_slot is still < end_at, so
+        // a defer to it makes every tick retry the same slot forever without
+        // firing or exhausting. Fall through to the post-loop end_at_now_exhausted
+        // check with deferred_next_run_at = None. It then uses next_run_after_plan
+        // (which is >= end_at) and correctly marks the schedule exhausted.
         if let Some(end_at) = schedule.end_at
             && effective_fire_time >= end_at
         {
@@ -5330,8 +5515,8 @@ async fn tick_one_workflow_schedule(
         );
 
         // Start-throttle admission (issue #607): pace scheduled fires, defer the
-        // excess. A deferred fire counts as dispatched (the slot is consumed so
-        // it is not re-fired) and is admitted later by the throttle scanner; its
+        // excess. A deferred fire counts as dispatched, so the slot is consumed
+        // and not re-fired. The throttle scanner admits it later. Its
         // schedule_id/scheduled_for/origin are persisted so carryover (#488) and
         // run-history (#534) lineage survive the deferral. On reserve the token
         // is refunded below if the start short-circuits under the reuse policy.
@@ -5347,11 +5532,10 @@ async fn tick_one_workflow_schedule(
                     .map_or(registry.max_workflow_input_bytes, |per| {
                         per.max(registry.max_workflow_input_bytes)
                     });
-                // Fail fast on an oversized input rather than persisting a
-                // pending row that would fail at fire time on every scanner
-                // tick (code-review fix, issue #607). Returning the error here
-                // -- rather than falling through to defer -- mirrors the
-                // non-throttled path's `return Err(error)` a few lines below:
+                // Fail fast on an oversized input. A persisted pending row would
+                // fail at fire time on every scanner tick (issue #607). The error
+                // return here, not a fall-through to defer, mirrors the
+                // non-throttled path's `return Err(error)` a few lines below.
                 // `dispatched`/`last_dispatched_at`/`last_original_slot_dispatched`
                 // are never touched, so `last_run_at` is not advanced and the
                 // next tick retries the same firing. Skipped when
@@ -5383,10 +5567,10 @@ async fn tick_one_workflow_schedule(
                 );
                 let start_options = crate::debounce::DebounceStartOptions {
                     reuse_policy: Some("reject_duplicate".to_string()),
-                    execution_timeout_secs: execution_timeout.map(|d| d.num_seconds()),
+                    execution_timeout_secs: execution_timeout.map(|d| d.as_secs()),
                     memo: None,
                     search_attrs: None,
-                    sla_secs: sla.map(|d| d.num_seconds()),
+                    sla_secs: sla.map(|d| d.as_secs()),
                     context_headers: None,
                     priority: None,
                     concurrency_key: concurrency_key.clone(),
@@ -5400,19 +5584,20 @@ async fn tick_one_workflow_schedule(
                     // ceiling a manual/HTTP start applies. This is parity with the
                     // chain-cap ceiling right below.
                     max_execution_timeout_ceiling_secs: max_execution_timeout_ceiling
-                        .map(|d| d.num_seconds()),
-                    // Chain-scoped lifetime cap (issue #617): workflow-type default
-                    // + fleet-wide ceiling (via registry, since the core scheduler
-                    // has no api_state) captured so a throttled scheduled fire keeps
-                    // the cap — parity with the tick's normal start path.
+                        .map(|d| d.as_secs()),
+                    // Chain-scoped lifetime cap (issue #617): capture the
+                    // workflow-type default + fleet-wide ceiling. The ceiling comes
+                    // via the registry, since the core scheduler has no api_state.
+                    // A throttled scheduled fire then keeps the cap, as the tick's
+                    // normal start path does.
                     chain_execution_timeout_secs: registry
                         .chain_execution_timeout(wf_name)
-                        .and_then(|d| chrono::Duration::from_std(d).ok())
-                        .map(|d| d.num_seconds()),
+                        .and_then(crate::time::from_std_bounded)
+                        .map(|d| d.as_secs()),
                     max_workflow_chain_timeout_ceiling_secs: registry
                         .max_workflow_chain_timeout
-                        .and_then(|d| chrono::Duration::from_std(d).ok())
-                        .map(|d| d.num_seconds()),
+                        .and_then(crate::time::from_std_bounded)
+                        .map(|d| d.as_secs()),
                     max_workflow_input_bytes: Some(effective_cap),
                     trace_context: None,
                     workflow_retry_policy: effective_retry,
@@ -5472,9 +5657,9 @@ async fn tick_one_workflow_schedule(
             schedule.retry_policy.as_ref(),
             wf_info.and_then(|info| info.retry_policy.as_ref()),
         );
-        // Latest-wins supersede counters (issue #811, Codex round 1): the
-        // metrics-less wrapper discards the collected cancellations, so a
-        // scheduled fire that sheds an incumbent emitted neither
+        // Latest-wins supersede counters (issue #811): the metrics-less
+        // wrapper discards the collected cancellations. A scheduled fire that
+        // sheds an incumbent then emitted neither
         // `harvest.concurrency.superseded` nor the cancelled terminal.
         let start_result =
             crate::execution::start_or_load_workflow_execution_with_metrics_and_codecs(
@@ -5487,18 +5672,18 @@ async fn tick_one_workflow_schedule(
                     // below.
                     max_execution_timeout_ceiling,
                     // Chain-scoped lifetime cap (issue #617): carry the workflow-type
-                    // default AND the fleet-wide chain ceiling-as-default, so a whole
-                    // scheduled continue-as-new chain is capped even when the workflow
-                    // under-specifies (AC4). The ceiling reaches the core scheduler via
-                    // the `HandlerRegistry` (it has no `api_state`), diverging from the
-                    // per-run `execution_timeout` ceiling which is a pure cap, not a
-                    // fleet-wide default.
+                    // default AND the fleet-wide chain ceiling-as-default. A whole
+                    // scheduled continue-as-new chain is then capped even when the
+                    // workflow under-specifies (AC4). The ceiling reaches the core
+                    // scheduler via the `HandlerRegistry`, since it has no
+                    // `api_state`. The per-run `execution_timeout` ceiling differs:
+                    // it is a pure cap, not a fleet-wide default.
                     chain_execution_timeout: registry
                         .chain_execution_timeout(wf_name)
-                        .and_then(|d| chrono::Duration::from_std(d).ok()),
+                        .and_then(crate::time::from_std_bounded),
                     max_workflow_chain_timeout_ceiling: registry
                         .max_workflow_chain_timeout
-                        .and_then(|d| chrono::Duration::from_std(d).ok()),
+                        .and_then(crate::time::from_std_bounded),
                     concurrency_key,
                     concurrency_limit,
                     concurrency_on_conflict,
@@ -5594,13 +5779,13 @@ async fn tick_one_workflow_schedule(
     // Chaos: kill/delay after this tick's scheduled starts have committed but
     // before next_run_at/last_run_at advance — the #350 crash-after-fire window.
     // A re-fire on recovery must dedupe (reject_duplicate on the sched: id) to
-    // exactly one run (AC4). Fire only when this tick actually committed or
-    // deferred at least one start (`dispatched` counts both — a throttle defer at
-    // 4585 and a committed/attached start at 4688): a tick that dispatched
+    // exactly one run (AC4). Fire only when this tick committed or deferred at
+    // least one start. `dispatched` counts both a throttle defer and a
+    // committed/attached start in the loop above. A tick that dispatched
     // nothing (empty due list, jitter not-yet-due, calendar exclusion,
     // max_active_runs cap, or an exhausted budget) reaches here with
-    // `dispatched == 0` and has no crash-after-fire window to model, so the point
-    // is skipped — matching its name and the #350 reproducer's intent.
+    // `dispatched == 0`. It has no crash-after-fire window to model, so the
+    // point is skipped, as its name and the #350 reproducer intend.
     if dispatched > 0 {
         crate::chaos_point!(SCHED_AFTER_START_BEFORE_ADVANCE);
     }
@@ -5608,13 +5793,13 @@ async fn tick_one_workflow_schedule(
     // Deferred catchup slots become next_run_at so the next tick retries them.
     // last_run_at only advances to the last slot actually started.
     let effective_last_run_at = last_dispatched_at.or(schedule.last_run_at);
-    // When calendar rebasing is active, next_run_after_plan was anchored to the
-    // original due slot and its `filter(t > now)` guard can spuriously fail when
-    // `now` has advanced past the rebased fire time, causing the natural next
-    // cron slot to be skipped. Re-anchor from the last original (pre-rebase)
-    // slot instead, but preserve the non-catchup skip-overdue semantics by
-    // filtering out past successors and falling back to next_run_after_plan
-    // (which already contains the `or_else(next_run_after(now))` fallback).
+    // With calendar rebasing, next_run_after_plan is anchored to the original
+    // due slot. Its `filter(t > now)` guard can spuriously fail when `now` has
+    // advanced past the rebased fire time. The natural next cron slot is then
+    // skipped. Re-anchor from the last original (pre-rebase) slot instead.
+    // Keep the non-catchup skip-overdue semantics: filter out past successors
+    // and fall back to next_run_after_plan. That value already contains the
+    // `or_else(next_run_after(now))` fallback.
     let effective_next_run_at = deferred_next_run_at.or_else(|| {
         if schedule.calendar_name.is_some() {
             last_original_slot_dispatched
@@ -5629,22 +5814,21 @@ async fn tick_one_workflow_schedule(
     // ── Budget accounting and exhaustion (issue #478) ────────────────────────
     // Increment runs_started using the DB-fresh live_runs_started baseline (re-read
     // after claim). Manual trigger pre-increments are NOT serialized under the HA
-    // claim, so the final UPDATE must use a DB-side expression (runs_started +
-    // dispatched) rather than the in-memory computed value, ensuring the tick and
-    // any concurrent manual trigger each add their own delta without overwriting
-    // the other's contribution.
+    // claim. So the final UPDATE uses a DB-side expression (runs_started +
+    // dispatched), not the in-memory value. The tick and any concurrent manual
+    // trigger then each add their own delta without overwriting the other's.
     let new_runs_started =
         live_runs_started.saturating_add(i32::try_from(dispatched).unwrap_or(i32::MAX));
-    // Treat the schedule as budget-exhausted when the live count reaches max_runs
-    // regardless of whether *this* tick dispatched anything: a concurrent manual
-    // trigger or backfill may have consumed the last slot after the stale
-    // `schedule.runs_started` snapshot but before we read `live_runs_started`.
+    // Treat the schedule as budget-exhausted when the live count reaches max_runs,
+    // even if *this* tick dispatched nothing. A concurrent manual trigger or
+    // backfill can consume the last slot after the stale `schedule.runs_started`
+    // snapshot but before the `live_runs_started` read.
     let now_budget_exhausted = schedule
         .max_runs
         .is_some_and(|max| max > 0 && new_runs_started >= max);
     // Eagerly exhaust on end_at: if the next valid slot is at or past end_at, mark
-    // the schedule exhausted immediately so operators see it as done after the last
-    // valid firing rather than waiting for the next tick to discover it.
+    // the schedule exhausted now. Operators then see it as done after the last
+    // valid firing, not after the next tick discovers it.
     let end_at_now_exhausted = schedule
         .end_at
         .is_some_and(|end| effective_next_run_at.is_none_or(|next| next >= end));
@@ -5700,7 +5884,7 @@ async fn tick_one_workflow_schedule(
         .await;
     }
     let any_exhausted = now_budget_exhausted || end_at_now_exhausted;
-    let budget_exhausted_at: Option<DateTime<Utc>> = any_exhausted.then_some(now);
+    let budget_exhausted_at: Option<Timestamp> = any_exhausted.then_some(now);
     let budget_exhausted_reason: Option<&str> = if now_budget_exhausted {
         Some("max_runs_exhausted")
     } else if end_at_now_exhausted {
@@ -5717,10 +5901,10 @@ async fn tick_one_workflow_schedule(
         effective_next_run_at
     };
 
-    // Dispatch reached the commit point without a `start_or_load` error: the
-    // dropped slots are now durably past `next_run_at`, so emit the catchup-drop
-    // audit here (and only here on the dispatch path) — never before the fallible
-    // dispatch loop above (issue #484 / Codex #2174).
+    // Dispatch reached the commit point without a `start_or_load` error. The
+    // dropped slots are now durably past `next_run_at`. So emit the catchup-drop
+    // audit here, and only here on the dispatch path. Never emit it before the
+    // fallible dispatch loop above (issue #484 / #2174).
     record_catchup_drops(
         conn,
         metrics,
@@ -5735,9 +5919,9 @@ async fn tick_one_workflow_schedule(
     )
     .await;
 
-    // Use a DB-side runs_started + dispatched expression so that concurrent manual
-    // trigger pre-increments (which are not blocked by the HA claim) are preserved
-    // rather than overwritten by this stale in-memory value (issue #478).
+    // Use a DB-side runs_started + dispatched expression. The HA claim does not
+    // block concurrent manual trigger pre-increments. This stale in-memory value
+    // must not overwrite them (issue #478).
     let dispatched_i32 = i32::try_from(dispatched).unwrap_or(i32::MAX);
     diesel::update(
         dsl::harvest_schedules
@@ -5745,21 +5929,21 @@ async fn tick_one_workflow_schedule(
             .filter(dsl::fire_claim_token.eq(Some(claim_token))),
     )
     .set((
-        SetExt(harvest_schedules_ext::last_run_at.eq(effective_last_run_at)),
-        dsl::next_run_at.eq(final_next_run_at),
+        SetExt(harvest_schedules_ext::last_run_at.eq(effective_last_run_at.to_diesel())),
+        dsl::next_run_at.eq(final_next_run_at.to_diesel()),
         dsl::runs_started.eq(dsl::runs_started + dispatched_i32),
-        dsl::exhausted_at.eq(budget_exhausted_at),
+        dsl::exhausted_at.eq(budget_exhausted_at.to_diesel()),
         dsl::exhausted_reason.eq(budget_exhausted_reason),
         // Clear the HA claim so the column stays clean after a successful
         // fire. Guarded by token so a slow late tick cannot overwrite a
         // successor replica's live claim if the 30 s TTL expired.
         dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-        dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
+        dsl::fire_claimed_until.eq(Option::<crate::time::sql::SqlTimestamp>::None),
         // NOTE: last_catchup_dropped / last_catchup_at are intentionally NOT set
-        // here. They are persisted by a separate conditional update in the
-        // `catchup_slots_dropped > 0` block above so that ordinary zero-drop
-        // ticks do not wipe the most-recent recovery audit trail (issue #484).
-        dsl::updated_at.eq(now),
+        // here. A separate conditional update persists them in the
+        // `catchup_slots_dropped > 0` block above. Ordinary zero-drop ticks then
+        // do not wipe the most-recent recovery audit trail (issue #484).
+        dsl::updated_at.eq(now.to_diesel()),
     ))
     .execute(conn)
     .await
@@ -5795,7 +5979,7 @@ fn slot_walker(schedule: Option<&Schedule>) -> Option<crate::schedule_plan::Slot
     schedule.map(crate::schedule_plan::SlotWalker::new)
 }
 
-fn next_run_after(schedule: Option<&Schedule>, reference: DateTime<Utc>) -> Option<DateTime<Utc>> {
+fn next_run_after(schedule: Option<&Schedule>, reference: Timestamp) -> Option<Timestamp> {
     schedule.and_then(|schedule| crate::schedule_plan::next_fire_after(schedule, reference))
 }
 
@@ -5828,10 +6012,10 @@ impl OverdueVerdict {
 ///
 /// - `Interval` → the fixed interval.
 /// - `Cron`/`CronInTimezone` → the gap to the next occurrence strictly after
-///   `anchor` (so a DST-variable cron step reflects the actual upcoming step
-///   following the missed slot, not a fixed assumption).
+///   `anchor`. A DST-variable cron step then reflects the real step after the
+///   missed slot, not a fixed assumption.
 /// - `Manual`/`None`/unparseable → `None` (no cadence; never overdue).
-fn cadence_step(schedule: Option<&Schedule>, anchor: DateTime<Utc>) -> Option<chrono::Duration> {
+fn cadence_step(schedule: Option<&Schedule>, anchor: Timestamp) -> Option<jiff::SignedDuration> {
     if let Some(period) = interval_period(schedule) {
         return Some(period);
     }
@@ -5839,7 +6023,7 @@ fn cadence_step(schedule: Option<&Schedule>, anchor: DateTime<Utc>) -> Option<ch
         Some(Schedule::Cron(_) | Schedule::CronInTimezone { .. }) => {
             let next = next_run_after(schedule, anchor)?;
             let step = next - anchor;
-            (step > chrono::Duration::zero()).then_some(step)
+            (step > jiff::SignedDuration::ZERO).then_some(step)
         }
         // Interval was handled above; Manual/None have no cadence.
         _ => None,
@@ -5857,9 +6041,9 @@ pub struct OverdueInputs<'a> {
     /// Parsed cadence (from `schedule_expr`). `None`/`Manual` ⇒ never overdue.
     pub schedule: Option<&'a Schedule>,
     /// The pending fire slot. `None` ⇒ never overdue.
-    pub next_run_at: Option<DateTime<Utc>>,
-    /// Reference instant (`Utc::now()` at the caller).
-    pub now: DateTime<Utc>,
+    pub next_run_at: Option<Timestamp>,
+    /// Reference instant (`Timestamp::now()` at the caller).
+    pub now: Timestamp,
     /// Jitter window (`jitter_secs`), a grace term.
     pub jitter: Duration,
     /// Scheduler tick interval, a grace term.
@@ -5867,14 +6051,14 @@ pub struct OverdueInputs<'a> {
     /// `is_paused` (#229) — AC3 exclusion.
     pub is_paused: bool,
     /// `auto_paused_at` (#360) — AC3 exclusion.
-    pub auto_paused_at: Option<DateTime<Utc>>,
-    /// `exhausted_at` (#478/#543) — AC3 exclusion. **Note:** set by the tick, so
-    /// the raw `end_at`/`max_runs`/`runs_started` fields below are also consulted
-    /// to catch a schedule that is bounded-out but whose tick died before
-    /// stamping `exhausted_at`.
-    pub exhausted_at: Option<DateTime<Utc>>,
+    pub auto_paused_at: Option<Timestamp>,
+    /// `exhausted_at` (#478/#543) — AC3 exclusion. **Note:** the tick sets it.
+    /// So the raw `end_at`/`max_runs`/`runs_started` fields below are also
+    /// consulted. They catch a bounded-out schedule whose tick died before it
+    /// stamped `exhausted_at`.
+    pub exhausted_at: Option<Timestamp>,
     /// `end_at` (#478) hard cutoff.
-    pub end_at: Option<DateTime<Utc>>,
+    pub end_at: Option<Timestamp>,
     /// `max_runs` (#478) budget.
     pub max_runs: Option<i32>,
     /// `runs_started` (#478) consumed budget.
@@ -5888,39 +6072,41 @@ pub struct OverdueInputs<'a> {
     /// basis: shard-local `RUNNING`/`PAUSED` + #607 pending throttle).
     pub at_capacity: bool,
     /// Calendar-adjusted effective fire time for the pinned `next_run_at` slot
-    /// (issue #696, Codex round 3). `Some(rebased)` when a calendar skip policy
+    /// (issue #696). `Some(rebased)` when a calendar skip policy
     /// (`run_next_business_day`/`run_prev_business_day`) has rebased an excluded
-    /// slot to a different business day; `None` when there is no calendar
+    /// slot to a different business day. `None` when there is no calendar
     /// deferral (no calendar, slot not excluded, `SkipPolicy::Skip`-suppressed,
-    /// or unparseable cadence). The predicate anchors the lag test on
-    /// `max(next_run_at, effective_fire_at)`, so a schedule the tick is
-    /// deliberately holding for a *future* calendar-adjusted fire is not falsely
-    /// flagged overdue, while one wedged **past** its adjusted fire still is. The
-    /// caller resolves this (it needs the calendar's exclusions) so the predicate
-    /// stays DB-free (AC2); see [`resolve_effective_fire_at`].
-    pub effective_fire_at: Option<DateTime<Utc>>,
+    /// or unparseable cadence).
+    ///
+    /// The predicate anchors the lag test on `max(next_run_at,
+    /// effective_fire_at)`. So a schedule that the tick holds for a *future*
+    /// calendar-adjusted fire is not falsely flagged overdue. One wedged
+    /// **past** its adjusted fire still is. The caller resolves this, because it
+    /// needs the calendar's exclusions. So the predicate stays DB-free (AC2);
+    /// see [`resolve_effective_fire_at`].
+    pub effective_fire_at: Option<Timestamp>,
 }
 
 /// Pure overdue predicate (issue #696, AC2). No database.
 ///
 /// A schedule is **overdue** iff it is *active* AND `now − next_run_at > grace`,
 /// where `grace = cadence_step + jitter + tick_interval`. The cadence-step term
-/// gives a full extra cadence of slack (so the first missed fire is detected
-/// within ~one more cadence step), the jitter term absorbs jitter-deferred
-/// dispatch, and the tick term absorbs the scheduler's own poll latency — so a
+/// gives a full extra cadence of slack, so the first missed fire is detected
+/// within ~one more cadence step. The jitter term absorbs jitter-deferred
+/// dispatch. The tick term absorbs the scheduler's own poll latency. So a
 /// healthy schedule caught mid-tick, or deferred by jitter, is never flagged.
 ///
-/// **Bounded-out exclusion, derived from RAW fields (Codex P2-A).** `exhausted_at`
-/// is stamped *by* the tick — the very thing that may be wedged — so the
-/// predicate must also recognise a schedule the tick *would* exhaust but hasn't
-/// yet. Mirroring `tick_one_workflow_schedule` byte-for-byte
+/// **Bounded-out exclusion, derived from RAW fields.** The tick stamps
+/// `exhausted_at`, and the tick is the very thing that may be wedged. So the
+/// predicate must also recognise a schedule that the tick *would* exhaust but
+/// has not yet. It mirrors `tick_one_workflow_schedule` byte-for-byte
 /// (`now_budget_exhausted`/`end_at_now_exhausted`, scheduler.rs): bounded-out =
 /// `exhausted_at.is_some()` **or** `max_runs > 0 && runs_started >= max_runs`
-/// **or** `next_run_at >= end_at`. A slot with `next_run_at < end_at` that hasn't
-/// fired is a GENUINE missed slot (still overdue), only `next_run_at >= end_at`
-/// is bounded-out.
+/// **or** `next_run_at >= end_at`. A slot with `next_run_at < end_at` that has
+/// not fired is a GENUINE missed slot (still overdue). Only
+/// `next_run_at >= end_at` is bounded-out.
 ///
-/// **`at_capacity` suppression, gated to the tick's deferring config (Codex P2-B).**
+/// **`at_capacity` suppression, gated to the tick's deferring config.**
 /// The tick only retains `next_run_at` in the past under
 /// `retain_for_retry = catchup && reason == "max_active_runs_reached"`, and only
 /// `OverlapPolicy::Skip` produces that reason. Every other config *advances*
@@ -5928,22 +6114,22 @@ pub struct OverdueInputs<'a> {
 /// advance, CancelOther/TerminateOther cancel/terminate and proceed.
 /// `AllowAll` proceeds too (issue #1985). So the
 /// `at_capacity` suppression applies **only** when
-/// `overlap_policy == Skip && catchup && at_capacity` — for every other config a
-/// past `next_run_at` while at capacity is a GENUINE stall the gauge must flag.
+/// `overlap_policy == Skip && catchup && at_capacity`. For every other config, a
+/// past `next_run_at` at capacity is a GENUINE stall the gauge must flag.
 ///
 /// AC3: intentionally-not-firing states (`is_paused`, `auto_paused_at` set
 /// (#360), `Schedule::Manual`, and bounded-out schedules) are never overdue.
 #[must_use]
 pub fn schedule_overdue(inputs: &OverdueInputs) -> OverdueVerdict {
-    // Bounded-out via RAW fields (Codex P2-A): mirror the tick's exhaustion
-    // conditions exactly, so a schedule the tick *would* mark exhausted (but
-    // whose tick died first, leaving exhausted_at NULL) is not flagged.
+    // Bounded-out via RAW fields: mirror the tick's exhaustion conditions
+    // exactly. A schedule the tick *would* mark exhausted is then not flagged,
+    // even when its tick died first and left exhausted_at NULL.
     let max_runs_bounded_out = inputs
         .max_runs
         .is_some_and(|max| max > 0 && inputs.runs_started >= max);
-    // The at-capacity suppression applies ONLY under the tick's deferring config
-    // (Codex P2-B): Skip + catchup. For every other policy a stale next_run_at
-    // while at capacity is a genuine stall.
+    // The at-capacity suppression applies ONLY under the tick's deferring config:
+    // Skip + catchup. For every other policy a stale next_run_at while at
+    // capacity is a genuine stall.
     let at_capacity_suppresses =
         inputs.at_capacity && inputs.overlap_policy == OverlapPolicy::Skip && inputs.catchup;
 
@@ -5960,8 +6146,8 @@ pub fn schedule_overdue(inputs: &OverdueInputs) -> OverdueVerdict {
     let Some(next_run_at) = inputs.next_run_at else {
         return OverdueVerdict::NOT_OVERDUE;
     };
-    // end_at bounded-out (Codex P2-A): mirrors `end_at_now_exhausted` — the next
-    // slot is at/past the cutoff, so there is no legal slot left to fire.
+    // end_at bounded-out: mirrors `end_at_now_exhausted`. The next slot is
+    // at/past the cutoff, so no legal slot is left to fire.
     if inputs.end_at.is_some_and(|end| next_run_at >= end) {
         return OverdueVerdict::NOT_OVERDUE;
     }
@@ -5969,29 +6155,29 @@ pub fn schedule_overdue(inputs: &OverdueInputs) -> OverdueVerdict {
     let Some(step) = cadence_step(inputs.schedule, next_run_at) else {
         return OverdueVerdict::NOT_OVERDUE;
     };
-    let jitter =
-        chrono::Duration::from_std(inputs.jitter).unwrap_or_else(|_| chrono::Duration::zero());
-    let tick = chrono::Duration::from_std(inputs.tick_interval)
-        .unwrap_or_else(|_| chrono::Duration::zero());
-    // `chrono::Duration`'s `+` panics on overflow; a pathological (near-i64-ms)
+    // A value past `i64::MAX` milliseconds counts as zero, as `chrono` did.
+    let jitter = crate::time::from_std_bounded(inputs.jitter).unwrap_or(jiff::SignedDuration::ZERO);
+    let tick =
+        crate::time::from_std_bounded(inputs.tick_interval).unwrap_or(jiff::SignedDuration::ZERO);
+    // `jiff::SignedDuration`'s `+` panics on overflow; a pathological (near-i64-seconds)
     // interval + jitter could overflow. Treat an unrepresentable grace as "no
     // cadence" (never overdue), consistent with how the module treats a
     // non-representable interval elsewhere.
     let Some(grace) = step
-        .checked_add(&jitter)
-        .and_then(|partial| partial.checked_add(&tick))
+        .checked_add(jitter)
+        .and_then(|partial| partial.checked_add(tick))
     else {
         return OverdueVerdict::NOT_OVERDUE;
     };
-    // Calendar-deferred anchor (Codex round 3): a calendar skip policy can rebase
-    // an excluded slot to a later business day, and while that adjusted fire is
-    // still in the future the tick deliberately keeps `next_run_at` pinned to the
-    // (now past) original slot. Anchoring the lag on `max(next_run_at,
-    // effective_fire_at)` means a schedule waiting for a *future* calendar fire is
-    // not falsely flagged, while a schedule wedged **past** its adjusted fire is
-    // still caught (its `effective_fire_at` is itself now in the past). With no
-    // calendar, `effective_fire_at` is `None` ⇒ anchor == `next_run_at` (byte-for-
-    // byte unchanged). A backward rebase (`run_prev_business_day`, so
+    // Calendar-deferred anchor (issue #696): a calendar skip policy can rebase
+    // an excluded slot to a later business day. While that adjusted fire is
+    // still in the future, the tick deliberately keeps `next_run_at` pinned to
+    // the (now past) original slot. The lag anchors on `max(next_run_at,
+    // effective_fire_at)`. So a schedule that waits for a *future* calendar fire
+    // is not falsely flagged. A schedule wedged **past** its adjusted fire is
+    // still caught, because its `effective_fire_at` is itself in the past. With
+    // no calendar, `effective_fire_at` is `None` ⇒ anchor == `next_run_at`
+    // (byte-for-byte unchanged). A backward rebase (`run_prev_business_day`, so
     // `effective_fire_at < next_run_at`) also keeps the raw anchor via the `max`,
     // preserving detection.
     let anchor = inputs
@@ -6002,7 +6188,7 @@ pub fn schedule_overdue(inputs: &OverdueInputs) -> OverdueVerdict {
     if lag > grace {
         OverdueVerdict {
             overdue: true,
-            overdue_by_secs: Some(lag.num_seconds()),
+            overdue_by_secs: Some(lag.as_secs()),
         }
     } else {
         OverdueVerdict::NOT_OVERDUE
@@ -6031,18 +6217,18 @@ pub struct OverdueSample {
 /// schedule_id = schedule_id)` **plus** the #607 pending-throttle backlog
 /// (`throttle::pending_throttle_count_for_workflow`) that the tick adds before
 /// comparing against `max_active_runs`. A DAG schedule's executions carry
-/// `workflow_name == dag_name`, and the DAG tick uses the same two-term basis,
-/// so callers pass `dag_name` for a DAG schedule and `workflow_name` for a
-/// workflow schedule. Because the count runs on the schedule's own shard `conn`,
-/// this is shard-local — identical to the tick, which enforces `max_active_runs`
-/// shard-locally. `at_capacity` computed from this basis therefore suppresses
-/// `overdue` *exactly* when the tick would deliberately hold `next_run_at` in
-/// the past.
+/// `workflow_name == dag_name`, and the DAG tick uses the same two-term basis.
+/// So callers pass `dag_name` for a DAG schedule and `workflow_name` for a
+/// workflow schedule. The count runs on the schedule's own shard `conn`, so
+/// it is shard-local, like the tick's `max_active_runs` check. So
+/// `at_capacity` from this basis suppresses `overdue` *exactly* when the tick
+/// would deliberately hold `next_run_at` in the past.
 ///
 /// The `schedule_id` disjunct (issue #1160) additively counts a
-/// `ctx.continue_as_new_as(...)` (#803) successor, which carries this schedule's
-/// `schedule_id` under a DIFFERENT `workflow_name` a name-only count would miss --
-/// one `COUNT(*)`, so a same-type row matching both clauses is still counted once.
+/// `ctx.continue_as_new_as(...)` (#803) successor. That successor carries this
+/// schedule's `schedule_id` under a DIFFERENT `workflow_name`, which a
+/// name-only count misses. It is one `COUNT(*)`, so a same-type row matching
+/// both clauses is still counted once.
 /// See `docs/getting-started/08-dags-and-schedules.md`'s overlap-policy section for
 /// the full rationale and the rejected alternative.
 ///
@@ -6072,20 +6258,18 @@ pub async fn schedule_running_basis(
 /// Batched form of [`schedule_running_basis`] for many schedules at once.
 ///
 /// One grouped `RUNNING`/`PAUSED` count query plus one grouped
-/// pending-throttle query ([`throttle::pending_throttle_counts_for_workflows`])
-/// covering every schedule in `schedules`, all on **one shard** connection,
-/// instead of the two queries *per schedule* `schedule_running_basis` issues
-/// when called in a loop over many schedules (Ledger perf pass on
-/// `GET /admin/schedules`).
+/// pending-throttle query ([`throttle::pending_throttle_counts_for_workflows`]).
+/// Both cover every schedule in `schedules`, on **one shard** connection. A
+/// loop of `schedule_running_basis` issues two queries *per schedule* instead
+/// (Ledger perf pass on `GET /admin/schedules`).
 ///
-/// Returns a map keyed by `schedule_id` rather than by name (issue #1160):
-/// `schedule_running_basis`'s `schedule_id` disjunct means two schedules can
-/// no longer be assumed to have independent, name-only bases, so the caller
-/// must look results up by the schedule it actually asked about. A schedule
-/// with zero total (same-type + cross-type) running/pending executions is
-/// absent from the returned map; callers should treat a missing key as `0`,
-/// matching what a per-schedule call to `schedule_running_basis` would have
-/// returned.
+/// Returns a map keyed by `schedule_id` rather than by name (issue #1160).
+/// With the `schedule_id` disjunct of `schedule_running_basis`, two schedules
+/// no longer have independent, name-only bases. So the caller must look up
+/// results by the schedule it asked about. A schedule with zero total
+/// (same-type + cross-type) running/pending executions is absent from the
+/// map. Treat a missing key as `0`, which matches a per-schedule call to
+/// `schedule_running_basis`.
 ///
 /// # Errors
 ///
@@ -6097,13 +6281,11 @@ pub async fn schedule_running_basis_batch(
     if schedules.is_empty() {
         return Ok(HashMap::new());
     }
-    // Dedupe by schedule id defensively: a duplicate `(id, name)` pair would
-    // otherwise double-add the pending-throttle term for that id below (each
-    // id's basis is looked up once from `by_name`/`cross_type_by_schedule`,
-    // which are already idempotent under a repeat, but the throttle map is
-    // merged with `+=`). No caller passes duplicates today, but the contract
-    // is cheap to hold unconditionally rather than document as a caller
-    // obligation.
+    // Dedupe by schedule id defensively. A duplicate `(id, name)` pair would
+    // otherwise double-add the pending-throttle term for that id below.
+    // `by_name`/`cross_type_by_schedule` are idempotent under a repeat, but
+    // the throttle map is merged with `+=`. No caller passes duplicates today.
+    // The contract is cheap to hold unconditionally, not as a caller duty.
     let owner_name: HashMap<uuid::Uuid, &str> =
         schedules.iter().map(|(id, name)| (*id, *name)).collect();
     let ids: Vec<uuid::Uuid> = owner_name.keys().copied().collect();
@@ -6112,9 +6294,9 @@ pub async fn schedule_running_basis_batch(
 
     // Grouped by (workflow_name, schedule_id): every RUNNING/PAUSED row that
     // matches EITHER this batch's names or its schedule ids, bucketed by its
-    // own exact pair. A row can only ever land in one bucket, so summing
-    // buckets below never double-counts it even when a bucket's name AND
-    // schedule_id both belong to the same schedule in the batch.
+    // own exact pair. A row lands in one bucket only. So the sum below never
+    // double-counts it, even when a bucket's name AND schedule_id both belong
+    // to the same schedule in the batch.
     let grouped: Vec<(String, Option<uuid::Uuid>, i64)> = harvest_workflow_executions::table
         .filter(
             harvest_workflow_executions::workflow_name
@@ -6135,9 +6317,9 @@ pub async fn schedule_running_basis_batch(
         .await
         .map_err(crate::error::database_error)?;
 
-    // Same-type count per name (identical semantics to the pre-#1160 batch:
-    // every RUNNING/PAUSED execution of that workflow type, manual runs
-    // included, regardless of which schedule_id -- if any -- it carries).
+    // Same-type count per name, as in the pre-#1160 batch. It counts every
+    // RUNNING/PAUSED execution of that workflow type, manual runs included,
+    // whatever schedule_id it carries, if any.
     let mut by_name: HashMap<String, i64> = HashMap::new();
     // Cross-type successor count per schedule id (issue #1160): rows carrying
     // that schedule's `schedule_id` under a DIFFERENT `workflow_name`. Kept
@@ -6171,36 +6353,36 @@ pub async fn schedule_running_basis_batch(
 /// Pure (DB-free) core of [`resolve_effective_fire_at`]'s calendar-rebasing logic.
 ///
 /// Parameterized on already-loaded calendar exclusions instead of loading
-/// them itself, so a caller resolving many schedules against a shared pool
-/// of calendars ([`crate::calendar::load_exclusions_for_calendars`]) can load
-/// each distinct calendar's exclusions once and reuse them across every
+/// them itself. So a caller that resolves many schedules against a shared pool
+/// of calendars ([`crate::calendar::load_exclusions_for_calendars`]) loads
+/// each distinct calendar's exclusions once. It reuses them for every
 /// schedule that references it, rather than re-querying per schedule.
 ///
 /// Kept as a separate function rather than a shared refactor of
 /// `resolve_effective_fire_at` so this addition cannot change behavior for
 /// that function's existing (single-schedule) callers.
 ///
-/// `excluded` should be the calendar's exclusion dates -- an empty slice is
-/// only correct when the calendar genuinely has no exclusion rows, **never**
-/// as a stand-in for "the load failed." `exclude_weekends` is a pure name
-/// check (`calendar_name == "weekends-off"`) independent of `excluded`, so
-/// an empty slice does **not** reliably degrade to "no rebasing": a
+/// `excluded` should be the calendar's exclusion dates. An empty slice is
+/// correct only when the calendar has no exclusion rows. It is **never** a
+/// stand-in for "the load failed". `exclude_weekends` is a pure name
+/// check (`calendar_name == "weekends-off"`) independent of `excluded`. So
+/// an empty slice does **not** reliably degrade to "no rebasing". A
 /// `weekends-off` calendar still rebases a weekend slot on an empty slice
 /// (see `resolve_effective_fire_at_pure_rebases_a_weekend_slot_from_the_weekend_flag_alone_even_with_empty_exclusions`
-/// below), which can hide a genuinely overdue wedge. A caller whose
-/// exclusions load failed must skip calling this function entirely (fall
-/// back to the raw anchor) rather than pass `&[]` in its place -- see
+/// below). That can hide a genuinely overdue wedge. A caller whose
+/// exclusions load failed must skip this function and fall back to the raw
+/// anchor. It must not pass `&[]` instead. See
 /// `load_schedule_overdue_aux_by_shard` in `autumn-harvest-plugin/src/api.rs`
 /// for the pattern (`Option<HashMap<..>>`, `None` on failure, short-circuits
 /// before this function is ever called).
 #[must_use]
 pub fn resolve_effective_fire_at_pure(
-    excluded: &[NaiveDate],
+    excluded: &[jiff::civil::Date],
     exclude_weekends: bool,
     skip_policy_db: &str,
     schedule_expr: Option<&str>,
-    next_run_at: Option<DateTime<Utc>>,
-) -> Option<DateTime<Utc>> {
+    next_run_at: Option<Timestamp>,
+) -> Option<Timestamp> {
     let (Some(slot), Some(expr)) = (next_run_at, schedule_expr) else {
         return None;
     };
@@ -6222,7 +6404,7 @@ pub fn resolve_effective_fire_at_pure(
 }
 
 /// Resolve the calendar-adjusted effective fire time for a schedule's pinned
-/// `next_run_at` slot (issue #696, Codex round 3).
+/// `next_run_at` slot (issue #696).
 ///
 /// Mirrors the tick's own calendar rebasing and feeds
 /// [`OverdueInputs::effective_fire_at`].
@@ -6235,9 +6417,9 @@ pub fn resolve_effective_fire_at_pure(
 ///   non-calendar schedule and every `SkipPolicy::Skip` schedule.
 /// - `Ok(Some(rebased))` when a `run_next_business_day`/`run_prev_business_day`
 ///   policy has rebased an excluded slot to a different business day. The predicate
-///   then anchors grace on that adjusted fire (via `max(next_run_at, ..)`), so a
-///   schedule the tick is deliberately holding for a future business-day fire is
-///   not flagged overdue.
+///   then anchors grace on that adjusted fire (via `max(next_run_at, ..)`). A
+///   schedule the tick holds for a future business-day fire is then not flagged
+///   overdue.
 ///
 /// Reuses the **same** `calendar::apply_skip_policy` + [`crate::calendar::rebase_to_date`]
 /// helpers the tick uses (`tick_one_workflow_schedule`'s dispatch loop), so there
@@ -6252,8 +6434,8 @@ pub async fn resolve_effective_fire_at(
     calendar_name: Option<&str>,
     skip_policy_db: &str,
     schedule_expr: Option<&str>,
-    next_run_at: Option<DateTime<Utc>>,
-) -> HarvestResult<Option<DateTime<Utc>>> {
+    next_run_at: Option<Timestamp>,
+) -> HarvestResult<Option<Timestamp>> {
     let (Some(cal_name), Some(slot), Some(expr)) = (calendar_name, next_run_at, schedule_expr)
     else {
         return Ok(None);
@@ -6274,8 +6456,8 @@ pub async fn resolve_effective_fire_at(
 /// One shard's overdue sampling pass (issue #696).
 ///
 /// Carries the per-schedule verdicts plus the minimum active cadence step on the
-/// shard, which the worker sampler uses to adapt its poll interval so a sub-30s
-/// schedule is still detected within its cadence-grace window (Codex round 4).
+/// shard. The worker sampler uses that step to adapt its poll interval. So a
+/// sub-30s schedule is still detected within its cadence-grace window.
 #[derive(Debug, Clone)]
 pub struct OverdueSamplePass {
     /// Per-schedule verdicts (all schedules, including not-overdue ones).
@@ -6351,7 +6533,7 @@ fn calendar_names_needing_exclusions(schedules: &[HarvestSchedule]) -> Vec<&str>
 /// query, or the batched calendar-exclusions query fails.
 pub async fn overdue_schedule_pass(
     conn: &mut AsyncPgConnection,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> HarvestResult<OverdueSamplePass> {
     let schedules: Vec<HarvestSchedule> = harvest_schedules::table
         .select(HarvestSchedule::as_select())
@@ -6391,18 +6573,18 @@ pub async fn overdue_schedule_pass(
             .schedule_expr
             .as_deref()
             .and_then(parse_schedule_from_expr);
-        // Track the fastest *active* cadence for the adaptive sampler interval
-        // (Codex round 4). "Active" = not intentionally dormant (paused /
-        // auto-paused / exhausted); a fast, currently-healthy schedule must still
-        // be sampled near its cadence because it could wedge right after a pass.
+        // Track the fastest *active* cadence for the adaptive sampler interval.
+        // "Active" = not intentionally dormant (paused / auto-paused /
+        // exhausted). A fast, currently-healthy schedule must still be sampled
+        // near its cadence, because it could wedge right after a pass.
         // Over-inclusion (e.g. a bounded-out-but-not-yet-exhausted fast schedule)
-        // only samples slightly faster — correctness-safe, never slower.
+        // only samples slightly faster. That is correctness-safe, never slower.
         if !s.is_paused
             && s.auto_paused_at.is_none()
             && s.exhausted_at.is_none()
             && let Some(anchor) = s.next_run_at
-            && let Some(step) =
-                cadence_step(schedule.as_ref(), anchor).and_then(|d| d.to_std().ok())
+            && let Some(step) = cadence_step(schedule.as_ref(), anchor)
+                .and_then(|d| std::time::Duration::try_from(d).ok())
         {
             min_cadence_step = Some(min_cadence_step.map_or(step, |cur| cur.min(step)));
         }
@@ -6413,7 +6595,7 @@ pub async fn overdue_schedule_pass(
         // (`schedule_running_basis_batch`'s documented contract).
         let at_capacity = basis.get(&s.id).copied().unwrap_or(0) >= i64::from(s.max_active_runs);
         // Resolve overlap/catchup exactly as the tick does, so the gated
-        // at-capacity suppression (Codex P2-B) matches when the tick retains.
+        // at-capacity suppression matches when the tick retains.
         let overlap_policy = OverlapPolicy::from_db(&s.overlap_policy);
         let catchup = crate::policy::CatchupPolicy::from_db(
             s.catchup_policy.as_deref(),
@@ -6426,7 +6608,7 @@ pub async fn overdue_schedule_pass(
         // once above. A calendar-deferred future fire is therefore not
         // flagged.
         let effective_fire_at = s.calendar_name.as_deref().and_then(|cal_name| {
-            let empty: Vec<NaiveDate> = Vec::new();
+            let empty: Vec<jiff::civil::Date> = Vec::new();
             let excluded = exclusions.get(cal_name).unwrap_or(&empty);
             let exclude_weekends = crate::calendar::calendar_excludes_weekends(cal_name);
             resolve_effective_fire_at_pure(
@@ -6470,7 +6652,7 @@ pub async fn overdue_schedule_pass(
 /// Compute the overdue verdict for every schedule on one shard (issue #696).
 ///
 /// Thin wrapper over [`overdue_schedule_pass`] returning only the verdicts, for
-/// callers that don't need the adaptive-interval cadence (the DB tests and
+/// callers that do not need the adaptive-interval cadence (the DB tests and
 /// [`sample_overdue_schedules`]).
 ///
 /// # Errors
@@ -6478,7 +6660,7 @@ pub async fn overdue_schedule_pass(
 /// Returns a database error if any schedule or count query fails.
 pub async fn overdue_schedule_samples(
     conn: &mut AsyncPgConnection,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> HarvestResult<Vec<OverdueSample>> {
     Ok(overdue_schedule_pass(conn, now).await?.samples)
 }
@@ -6486,23 +6668,23 @@ pub async fn overdue_schedule_samples(
 /// Sample the overdue verdict for every schedule on **one shard** and emit the
 /// `harvest.schedule.overdue` gauge (issue #696).
 ///
-/// Verdicts are aggregated per `(kind, name)` within the shard (overdue if any
-/// same-named schedule is overdue) before emitting, so a healthy same-named
-/// schedule cannot mask an overdue one via last-write-wins.
+/// Verdicts are aggregated per `(kind, name)` within the shard before
+/// emitting. The pair is overdue if any same-named schedule is overdue. A
+/// healthy same-named schedule then cannot mask an overdue one.
 ///
 /// This is a single-shard convenience (used by the DB integration tests). The
-/// worker's fleet sampler instead calls [`overdue_schedule_samples`] per shard
-/// and OR-aggregates across **all** shard pools into one `(kind, name)` map
-/// before emitting, so a same-named schedule that transiently exists on two
-/// shards (e.g. a `default_shard`/router reconfiguration) cannot be masked by a
-/// per-pool last-write-wins `.set()`.
+/// worker's fleet sampler instead calls [`overdue_schedule_samples`] per shard.
+/// It OR-aggregates across **all** shard pools into one `(kind, name)` map
+/// before emitting. A same-named schedule can exist on two shards for a while,
+/// e.g. after a `default_shard`/router reconfiguration. A per-pool
+/// last-write-wins `.set()` then cannot mask it.
 ///
 /// # Errors
 ///
 /// Returns a database error if loading schedules or execution counts fails.
 pub async fn sample_overdue_schedules(
     conn: &mut AsyncPgConnection,
-    now: DateTime<Utc>,
+    now: Timestamp,
     metrics: &dyn crate::telemetry::MetricsRecorder,
 ) -> HarvestResult<()> {
     let samples = overdue_schedule_samples(conn, now).await?;
@@ -6521,15 +6703,15 @@ pub async fn sample_overdue_schedules(
 
 fn due_run_plan(
     schedule: Option<&Schedule>,
-    first_due: DateTime<Utc>,
-    now: DateTime<Utc>,
+    first_due: Timestamp,
+    now: Timestamp,
     catchup: bool,
-) -> (Vec<DateTime<Utc>>, Option<DateTime<Utc>>) {
+) -> (Vec<Timestamp>, Option<Timestamp>) {
     if !catchup {
-        // Anchor the next slot to first_due so that jitter-induced latency
-        // does not drift the schedule (interval schedules: next = first_due +
-        // period, not now + period). Fall back to next_run_after(now) when the
-        // slot-anchored next is already in the past to preserve the non-catchup
+        // Anchor the next slot to first_due so jitter-induced latency does
+        // not drift the schedule. For interval schedules, next = first_due +
+        // period, not now + period. If the slot-anchored next is already past,
+        // fall back to next_run_after(now). That keeps the non-catchup
         // skip-overdue-slots semantics for very late dispatchers. The SQLite
         // backend shares this rule (issue #2031).
         let next = schedule.and_then(|schedule| {
@@ -6559,9 +6741,9 @@ fn due_run_plan(
 /// Output of [`catchup_run_plan`].
 pub(crate) struct CatchupPlan {
     /// Slots to actually dispatch, in chronological order.
-    pub run_dates: Vec<DateTime<Utc>>,
+    pub run_dates: Vec<Timestamp>,
     /// First slot strictly after `now` (the next scheduled `next_run_at`).
-    pub next_run_at: Option<DateTime<Utc>>,
+    pub next_run_at: Option<Timestamp>,
     /// Number of missed slots that were dropped by the catchup policy.
     ///
     /// Each dropped slot must be counted towards `harvest.schedule.skipped`
@@ -6577,23 +6759,23 @@ pub(crate) struct CatchupPlan {
 /// its unit tests continue to serve as regression evidence.
 ///
 /// `end_at` is the schedule's hard cut-off (issue #478). For the bounded
-/// policies (`MostRecent`/`Window`) a slot is only eligible if it is strictly
-/// before `end_at`, so the planner never selects a slot at/after `end_at` and
-/// thereby exhausts the schedule before firing the newest *valid* missed slot
-/// (issue #484 / Codex #2861). `SkipAll`/`Unbounded` leave `end_at` enforcement
+/// policies (`MostRecent`/`Window`) a slot is eligible only if it is strictly
+/// before `end_at`. The planner then never selects a slot at/after `end_at`.
+/// Such a slot would exhaust the schedule before the newest *valid* missed
+/// slot fires (issue #484 / #2861). `SkipAll`/`Unbounded` leave `end_at` enforcement
 /// to the dispatch loop, unchanged.
 ///
 /// The bounded policies compute their result **without materializing every
-/// missed slot**: interval schedules use closed-form arithmetic (so a
-/// high-frequency schedule down for a long period costs O(1), not O(n)), and
-/// cron schedules walk but retain only the slots the policy actually keeps
-/// (issue #484 / Codex #2859).
+/// missed slot**. Interval schedules use closed-form arithmetic, so a
+/// high-frequency schedule down for a long period costs O(1), not O(n). Cron
+/// schedules walk but retain only the slots the policy keeps (issue #484 /
+/// #2859).
 pub(crate) fn catchup_run_plan(
     schedule: Option<&Schedule>,
-    first_due: DateTime<Utc>,
-    now: DateTime<Utc>,
+    first_due: Timestamp,
+    now: Timestamp,
     policy: crate::policy::CatchupPolicy,
-    end_at: Option<DateTime<Utc>>,
+    end_at: Option<Timestamp>,
 ) -> CatchupPlan {
     use crate::policy::CatchupPolicy;
 
@@ -6630,15 +6812,14 @@ pub(crate) fn catchup_run_plan(
             }
         }
         CatchupPolicy::Window(window) => {
-            let cutoff = now
-                - chrono::Duration::from_std(window).unwrap_or_else(|_| chrono::Duration::zero());
+            let cutoff = catchup_window_cutoff(now, window);
             let summary = eligible_slot_summary(schedule, first_due, now, end_at);
             let run_dates = window_eligible_slots(schedule, first_due, now, end_at, cutoff);
             let fired = run_dates.len() as u64;
-            // `summary.next_run_at` is the first slot strictly after `now` for both
-            // interval (closed-form) and cron (forward walk to the first slot past
-            // `now`) schedules, so the whole bounded in-window set fires this tick
-            // and `next_run_at` advances past `now`.
+            // `summary.next_run_at` is the first slot strictly after `now`, for
+            // interval (closed-form) and cron (forward walk) schedules alike. So
+            // the whole bounded in-window set fires this tick and `next_run_at`
+            // advances past `now`.
             CatchupPlan {
                 run_dates,
                 next_run_at: summary.next_run_at,
@@ -6646,6 +6827,17 @@ pub(crate) fn catchup_run_plan(
             }
         }
     }
+}
+
+/// Returns the oldest slot time that a catch-up `window` still fires.
+///
+/// A window past the `chrono` range, `i64::MAX` milliseconds, gives `now`, as
+/// `chrono::Duration::from_std` failed for it. A cutoff before the jiff range
+/// gives `Timestamp::MIN`, so every missed slot is in the window, as in chrono.
+fn catchup_window_cutoff(now: Timestamp, window: std::time::Duration) -> Timestamp {
+    crate::time::from_std_bounded(window).map_or(now, |window| {
+        now.checked_sub(window).unwrap_or(Timestamp::MIN)
+    })
 }
 
 /// Summary of the eligible missed slots for a bounded catchup policy.
@@ -6656,18 +6848,18 @@ struct EligibleSummary {
     /// Total number of eligible missed slots.
     eligible_count: u64,
     /// The most recent eligible slot (`None` when there are none).
-    last_eligible: Option<DateTime<Utc>>,
+    last_eligible: Option<Timestamp>,
     /// The first scheduled slot strictly after `now` (the natural next run).
     /// Independent of `end_at`; the dispatch/budget logic handles exhaustion.
-    next_run_at: Option<DateTime<Utc>>,
+    next_run_at: Option<Timestamp>,
 }
 
-/// Extract a strictly-positive interval period as a `chrono::Duration`.
-fn interval_period(schedule: Option<&Schedule>) -> Option<chrono::Duration> {
+/// Extract a strictly-positive interval period as a `jiff::SignedDuration`.
+fn interval_period(schedule: Option<&Schedule>) -> Option<jiff::SignedDuration> {
     match schedule {
         Some(Schedule::Interval(d)) => {
-            let cd = chrono::Duration::from_std(*d).ok()?;
-            (cd > chrono::Duration::zero()).then_some(cd)
+            let cd = jiff::SignedDuration::try_from(*d).ok()?;
+            (cd > jiff::SignedDuration::ZERO).then_some(cd)
         }
         _ => None,
     }
@@ -6693,22 +6885,22 @@ fn last_eligible_step(span_now: i64, period: i64, end_span: Option<i64>) -> Opti
 /// schedules and a bounded walk for cron schedules.
 fn eligible_slot_summary(
     schedule: Option<&Schedule>,
-    first_due: DateTime<Utc>,
-    now: DateTime<Utc>,
-    end_at: Option<DateTime<Utc>>,
+    first_due: Timestamp,
+    now: Timestamp,
+    end_at: Option<Timestamp>,
 ) -> EligibleSummary {
     if let Some(period) = interval_period(schedule)
         && let (Some(p), Some(span_now)) = (
-            period.num_nanoseconds(),
-            (now - first_due).num_nanoseconds(),
+            crate::time::num_nanoseconds(period),
+            crate::time::num_nanoseconds(now - first_due),
         )
     {
-        let end_span = end_at.and_then(|e| (e - first_due).num_nanoseconds());
+        let end_span = end_at.and_then(|e| crate::time::num_nanoseconds(e - first_due));
         // Proceed with arithmetic only when end_at is unset or its offset fits in
         // nanoseconds; otherwise fall through to the walk path (avoids a wrong cap).
         if end_at.is_none() || end_span.is_some() {
             let next_run_at = (span_now >= 0)
-                .then(|| first_due + chrono::Duration::nanoseconds((span_now / p + 1) * p));
+                .then(|| first_due + jiff::SignedDuration::from_nanos((span_now / p + 1) * p));
             return last_eligible_step(span_now, p, end_span).map_or(
                 EligibleSummary {
                     eligible_count: 0,
@@ -6717,7 +6909,7 @@ fn eligible_slot_summary(
                 },
                 |k| EligibleSummary {
                     eligible_count: u64::try_from(k + 1).unwrap_or(0),
-                    last_eligible: Some(first_due + chrono::Duration::nanoseconds(k * p)),
+                    last_eligible: Some(first_due + jiff::SignedDuration::from_nanos(k * p)),
                     next_run_at,
                 },
             );
@@ -6728,13 +6920,13 @@ fn eligible_slot_summary(
     // count and the last eligible slot — never the full slot vector.
     //
     // The walk visits every missed occurrence up to `now`, so its cost is
-    // O(missed occurrences) — the same cost as the `Unbounded` policy. This is
-    // unavoidable for cron `MostRecent`: `croner` exposes only a forward
-    // `find_next_occurrence` (no reverse iterator), so the most-recent slot at or
-    // before `now` and the exact dropped count can only be found by walking
-    // forward from `first_due`. A previous, capped version of this walk fired a
-    // *stale* mid-backlog slot instead of the newest one (issue #484 /
-    // Codex #3210), which violated the policy contract; correctness wins.
+    // O(missed occurrences), the same as the `Unbounded` policy. Cron
+    // `MostRecent` cannot avoid it. `croner` exposes only a forward
+    // `find_next_occurrence` (no reverse iterator). So only a forward walk from
+    // `first_due` finds the most-recent slot at or before `now` and the exact
+    // dropped count. A previous, capped version of this walk fired a *stale*
+    // mid-backlog slot instead of the newest one (issue #484 / #3210). That
+    // violated the policy contract, and correctness wins.
     // High-frequency schedules that need O(1) recovery planning should use an
     // `Interval` schedule (handled by the closed-form arithmetic above) rather
     // than a sub-minute cron expression.
@@ -6771,24 +6963,24 @@ fn eligible_slot_summary(
 /// the caller from [`eligible_slot_summary`].
 fn window_eligible_slots(
     schedule: Option<&Schedule>,
-    first_due: DateTime<Utc>,
-    now: DateTime<Utc>,
-    end_at: Option<DateTime<Utc>>,
-    cutoff: DateTime<Utc>,
-) -> Vec<DateTime<Utc>> {
+    first_due: Timestamp,
+    now: Timestamp,
+    end_at: Option<Timestamp>,
+    cutoff: Timestamp,
+) -> Vec<Timestamp> {
     if let Some(period) = interval_period(schedule)
         && let (Some(p), Some(span_now)) = (
-            period.num_nanoseconds(),
-            (now - first_due).num_nanoseconds(),
+            crate::time::num_nanoseconds(period),
+            crate::time::num_nanoseconds(now - first_due),
         )
     {
-        let end_span = end_at.and_then(|e| (e - first_due).num_nanoseconds());
+        let end_span = end_at.and_then(|e| crate::time::num_nanoseconds(e - first_due));
         if end_at.is_none() || end_span.is_some() {
             let Some(k_hi) = last_eligible_step(span_now, p, end_span) else {
                 return vec![];
             };
             // Smallest k with first_due + k*period >= cutoff.
-            let k_lo = match (cutoff - first_due).num_nanoseconds() {
+            let k_lo = match crate::time::num_nanoseconds(cutoff - first_due) {
                 Some(cs) if cs > 0 => (cs + p - 1) / p, // ceil
                 _ => 0,
             };
@@ -6796,22 +6988,22 @@ fn window_eligible_slots(
                 return vec![];
             }
             return (k_lo..=k_hi)
-                .map(|k| first_due + chrono::Duration::nanoseconds(k * p))
+                .map(|k| first_due + jiff::SignedDuration::from_nanos(k * p))
                 .collect();
         }
     }
 
     // Cron fallback: walk and keep only the in-window, eligible slots. Jump
-    // straight to the first occurrence at/after the window cutoff so a long
-    // pre-window backlog is not walked one slot at a time (issue #484 /
-    // Codex #3069); the in-window set itself is bounded by the operator-chosen
-    // window, so collecting it is intentional. Using `cutoff - 1ns` makes the
+    // straight to the first occurrence at/after the window cutoff. A long
+    // pre-window backlog is then not walked one slot at a time (issue #484 /
+    // #3069). The operator-chosen window bounds the in-window set, so
+    // collecting it is intentional. Using `cutoff - 1ns` makes the
     // jump inclusive of an occurrence landing exactly on the cutoff.
     let walker = slot_walker(schedule);
     let mut cursor = if cutoff > first_due {
         walker
             .as_ref()
-            .and_then(|w| w.next_after(cutoff - chrono::Duration::nanoseconds(1)))
+            .and_then(|w| w.next_after(cutoff - jiff::SignedDuration::from_nanos(1)))
             .unwrap_or(first_due)
     } else {
         first_due
@@ -6833,12 +7025,12 @@ fn window_eligible_slots(
 
 // ── Overlap policy helpers ────────────────────────────────────────────────────
 
-/// The action the scheduler takes when a new firing can't start immediately
+/// The action the scheduler takes when a new firing cannot start immediately
 /// because `max_active_runs` is already reached.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OverlapAction {
     /// Store this fire time in the schedule's buffer for later dispatch.
-    Buffer { fire_time: DateTime<Utc> },
+    Buffer { fire_time: Timestamp },
     /// Drop this firing, recording a skip metric with the given reason string.
     Drop { reason: &'static str },
     /// Cancel all in-flight runs for this workflow, then start the new firing.
@@ -6861,15 +7053,15 @@ pub(crate) enum OverlapAction {
 /// keeps each phase well inside its claim lease.
 pub const ALLOW_ALL_MAX_STARTS_PER_TICK: u32 = 100;
 
-/// Decide what to do with a new firing that can't run immediately.
+/// Decide what to do with a new firing that cannot run immediately.
 ///
 /// `buffered` is the current set of already-buffered fire times.
 /// `buffer_all_max` is the cap for [`OverlapPolicy::BufferAll`].
 #[allow(clippy::missing_const_for_fn)]
 pub(crate) fn apply_overlap_policy(
     policy: OverlapPolicy,
-    fire_time: DateTime<Utc>,
-    buffered: &[DateTime<Utc>],
+    fire_time: Timestamp,
+    buffered: &[Timestamp],
     buffer_all_max: usize,
 ) -> OverlapAction {
     match policy {
@@ -6902,16 +7094,16 @@ pub(crate) fn apply_overlap_policy(
 
 /// Deserialize the `buffered_runs` JSONB column into a sorted list of fire times.
 ///
-/// Malformed entries are silently skipped so a partial JSON corruption can't
+/// Malformed entries are silently skipped, so a partial JSON corruption cannot
 /// permanently wedge a schedule.
-pub(crate) fn parse_buffered_runs(value: &serde_json::Value) -> Vec<DateTime<Utc>> {
+pub(crate) fn parse_buffered_runs(value: &serde_json::Value) -> Vec<Timestamp> {
     let Some(arr) = value.as_array() else {
         return vec![];
     };
-    let mut times: Vec<DateTime<Utc>> = arr
+    let mut times: Vec<Timestamp> = arr
         .iter()
         .filter_map(|v| v.as_str())
-        .filter_map(|s| s.parse::<DateTime<Utc>>().ok())
+        .filter_map(|s| s.parse::<Timestamp>().ok())
         .collect();
     times.sort();
     times
@@ -6919,15 +7111,15 @@ pub(crate) fn parse_buffered_runs(value: &serde_json::Value) -> Vec<DateTime<Utc
 
 /// Public re-export of `parse_buffered_runs` for the plugin API layer.
 #[must_use]
-pub fn parse_buffered_runs_pub(value: &serde_json::Value) -> Vec<DateTime<Utc>> {
+pub fn parse_buffered_runs_pub(value: &serde_json::Value) -> Vec<Timestamp> {
     parse_buffered_runs(value)
 }
 
 /// Serialize a list of fire times back into the `buffered_runs` JSONB column.
-pub(crate) fn buffered_runs_to_json(runs: &[DateTime<Utc>]) -> serde_json::Value {
+pub(crate) fn buffered_runs_to_json(runs: &[Timestamp]) -> serde_json::Value {
     serde_json::Value::Array(
         runs.iter()
-            .map(|t| serde_json::Value::String(t.to_rfc3339()))
+            .map(|t| serde_json::Value::String(crate::time::rfc3339(*t)))
             .collect(),
     )
 }
@@ -6952,7 +7144,7 @@ async fn drain_buffered_schedule_runs(
     use crate::schema::harvest_schedules::dsl;
     use diesel_async::RunQueryDsl;
 
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     // Query schedules that have buffered runs and are not paused or exhausted.
     let pending: Vec<HarvestSchedule> = dsl::harvest_schedules
@@ -7093,10 +7285,9 @@ fn buffered_drain_gated(
         "harvest: buffered drain skipped due to admission gate"
     );
     metrics.record_schedule_skipped("workflow", wf_name, "admission_blocked");
-    // issue #618, F-round17: also count the block in
-    // harvest.admission.blocked (see the tick path above) so the
-    // scheduler's buffered/overlap drain blocks appear like every other
-    // gated producer's.
+    // issue #618: also count the block in harvest.admission.blocked (see the
+    // tick path above). The scheduler's buffered/overlap drain blocks then
+    // appear like every other gated producer's.
     metrics.record_admission_blocked(gate.scope.kind_str(), &gate.reason);
     true
 }
@@ -7133,7 +7324,7 @@ enum DrainClaim {
 async fn claim_and_drain_buffered_schedule(
     conn: &mut AsyncPgConnection,
     schedule_id: uuid::Uuid,
-    now: DateTime<Utc>,
+    now: Timestamp,
     current_shard: ShardId,
     registered_dags: &DagCatalog,
     registry: &crate::worker::HandlerRegistry,
@@ -7190,7 +7381,7 @@ async fn drain_claimed_buffered_schedule(
     conn: &mut AsyncPgConnection,
     schedule_id: uuid::Uuid,
     claim_token: uuid::Uuid,
-    now: DateTime<Utc>,
+    now: Timestamp,
     current_shard: ShardId,
     registered_dags: &DagCatalog,
     registry: &crate::worker::HandlerRegistry,
@@ -7241,7 +7432,7 @@ async fn drain_claimed_buffered_schedule(
             all_buffered_past_end_at = true;
             break;
         }
-        // Budget cap (issue #478): don't let buffered drains exceed max_runs.
+        // Budget cap (issue #478): buffered drains must not exceed max_runs.
         if let Some(max_runs) = schedule.max_runs {
             let already = schedule
                 .runs_started
@@ -7315,10 +7506,10 @@ async fn drain_claimed_buffered_schedule(
             "harvest: dispatching buffered scheduled workflow run"
         );
 
-        // Effective per-workflow input cap (issue #607 code review): this
-        // loop previously enforced no cap at all on either the throttle or
-        // immediate path (`None`/`0` are both "no cap" sentinels to
-        // `StartWorkflowParams`/`DebounceStartOptions`). Mirrors the
+        // Effective per-workflow input cap (issue #607). This loop previously
+        // enforced no cap on either the throttle or the immediate path.
+        // `None`/`0` are both "no cap" sentinels to
+        // `StartWorkflowParams`/`DebounceStartOptions`. Mirrors the
         // scheduler-tick path's `effective_cap` computation.
         let effective_cap = wf_info
             .and_then(|info| info.max_input_bytes)
@@ -7340,9 +7531,9 @@ async fn drain_claimed_buffered_schedule(
                 // Fail fast on an oversized input rather than persisting a
                 // pending row that would fail at fire time on every
                 // scanner tick. `break` (not `return Err`) matches this
-                // loop's own failure-handling convention below: drop this
-                // and any remaining buffered slots this tick rather than
-                // retrying a permanently-failing input forever. Skipped
+                // loop's own failure-handling convention below. Drop this
+                // and any remaining buffered slots this tick. Do not retry a
+                // permanently-failing input forever. Skipped
                 // when `reserve_or_defer` would resolve via `Bypassed` or
                 // an idempotent attach to an already-pending row.
                 let skip_cap_check = crate::throttle::skip_size_check(
@@ -7376,10 +7567,10 @@ async fn drain_claimed_buffered_schedule(
                     // Issue #1412: thread the DAG/workflow's declared
                     // execution_timeout into a throttled buffered-drain fire,
                     // mirroring the normal dispatch path just below.
-                    execution_timeout_secs: execution_timeout.map(|d| d.num_seconds()),
+                    execution_timeout_secs: execution_timeout.map(|d| d.as_secs()),
                     memo: None,
                     search_attrs: None,
-                    sla_secs: sla.map(|d| d.num_seconds()),
+                    sla_secs: sla.map(|d| d.as_secs()),
                     context_headers: None,
                     priority: None,
                     concurrency_key: concurrency_key.clone(),
@@ -7391,18 +7582,18 @@ async fn drain_claimed_buffered_schedule(
                     // Fleet-wide execution_timeout ceiling (issue #1412): parity
                     // with the chain-cap ceiling right below.
                     max_execution_timeout_ceiling_secs: max_execution_timeout_ceiling
-                        .map(|d| d.num_seconds()),
+                        .map(|d| d.as_secs()),
                     // Chain-scoped lifetime cap (issue #617): workflow-type
                     // default + fleet-wide ceiling (via registry) so a throttled
                     // buffered-drain fire keeps the cap.
                     chain_execution_timeout_secs: registry
                         .chain_execution_timeout(wf_name)
-                        .and_then(|d| chrono::Duration::from_std(d).ok())
-                        .map(|d| d.num_seconds()),
+                        .and_then(crate::time::from_std_bounded)
+                        .map(|d| d.as_secs()),
                     max_workflow_chain_timeout_ceiling_secs: registry
                         .max_workflow_chain_timeout
-                        .and_then(|d| chrono::Duration::from_std(d).ok())
-                        .map(|d| d.num_seconds()),
+                        .and_then(crate::time::from_std_bounded)
+                        .map(|d| d.as_secs()),
                     max_workflow_input_bytes: Some(effective_cap),
                     trace_context: None,
                     workflow_retry_policy: effective_retry,
@@ -7460,7 +7651,7 @@ async fn drain_claimed_buffered_schedule(
             schedule.retry_policy.as_ref(),
             wf_info.and_then(|info| info.retry_policy.as_ref()),
         );
-        // Latest-wins supersede counters (issue #811, Codex round 1) --
+        // Latest-wins supersede counters (issue #811) --
         // the buffered drain shares the tick's gap.
         let start_result =
             crate::execution::start_or_load_workflow_execution_with_metrics_and_codecs(
@@ -7477,18 +7668,18 @@ async fn drain_claimed_buffered_schedule(
                     // ceiling right below.
                     max_execution_timeout_ceiling,
                     // Chain-scoped lifetime cap (issue #617): carry the
-                    // workflow-type default AND the fleet-wide chain ceiling (via
-                    // the registry, since the core scheduler has no api_state) so a
-                    // BUFFERED continue-as-new chain is capped even when the
-                    // workflow under-specifies (AC4) — IDENTICAL to the tick-direct
-                    // start path above, and consistent with this site's own
-                    // throttled sibling.
+                    // workflow-type default AND the fleet-wide chain ceiling. The
+                    // ceiling comes via the registry, since the core scheduler has
+                    // no api_state. A BUFFERED continue-as-new chain is then capped
+                    // even when the workflow under-specifies (AC4). This is
+                    // IDENTICAL to the tick-direct start path above and to this
+                    // site's own throttled sibling.
                     chain_execution_timeout: registry
                         .chain_execution_timeout(wf_name)
-                        .and_then(|d| chrono::Duration::from_std(d).ok()),
+                        .and_then(crate::time::from_std_bounded),
                     max_workflow_chain_timeout_ceiling: registry
                         .max_workflow_chain_timeout
-                        .and_then(|d| chrono::Duration::from_std(d).ok()),
+                        .and_then(crate::time::from_std_bounded),
                     concurrency_key,
                     concurrency_limit,
                     concurrency_on_conflict,
@@ -7564,19 +7755,19 @@ async fn drain_claimed_buffered_schedule(
                 ..
             }) => {
                 // issue #946 (Task #7 hardening): a declared per-tenant quota
-                // is exhausted. Unlike the generic `Err(error)` arm below
-                // (which permanently drops the slot -- correct for a request
-                // that can never succeed, e.g. a deleted workflow or a bad
-                // input) this is TEMPORARY: the tenant's usage frees up as an
+                // is exhausted. The generic `Err(error)` arm below drops the
+                // slot permanently. That is correct for a request that can
+                // never succeed, e.g. a deleted workflow or a bad input. This
+                // case is TEMPORARY: the tenant's usage frees up as an
                 // existing execution completes or is deleted. Re-insert the
-                // slot the loop already popped via `buffered.remove(0)` above
-                // so the persisted `buffered_runs` still carries it for the
-                // next tick's drain attempt, rather than silently discarding
-                // a buffered fire forever. Refund the throttle token first
-                // (mirrors the generic arm), then stop draining this
-                // schedule this tick -- every remaining slot for the same
-                // workflow is equally likely to hit the same tenant cap, so
-                // further attempts this tick would just repeat the block.
+                // slot the loop already popped via `buffered.remove(0)` above.
+                // The persisted `buffered_runs` then still carries it for the
+                // next tick's drain attempt. A buffered fire is not silently
+                // discarded forever. Refund the throttle token first, as the
+                // generic arm does. Then stop draining this schedule this
+                // tick. Every remaining slot for the same workflow is equally
+                // likely to hit the same tenant cap, so more attempts this
+                // tick only repeat the block.
                 //
                 // `harvest.quota.rejected` was already recorded by
                 // `start_or_load_workflow_execution_with_metrics` itself
@@ -7651,8 +7842,8 @@ async fn drain_claimed_buffered_schedule(
     } else {
         None
     };
-    // Use two separate UPDATE paths so the non-exhausting path never writes
-    // NULL for exhausted_at/exhausted_reason, which would silently undo a
+    // Use two separate UPDATE paths, so the non-exhausting path never writes
+    // NULL for exhausted_at/exhausted_reason. Such a write silently undoes a
     // concurrent exhaustion set by another HA replica (issue #478).
     // Both paths match only while this drain holds the claim, and both clear it
     // (issue #1820). Thus a drain whose claim expired cannot overwrite a peer.
@@ -7667,12 +7858,12 @@ async fn drain_claimed_buffered_schedule(
             // DB-side increment, so a concurrent manual-trigger increment
             // survives. The claim does not serialize manual triggers.
             dsl::runs_started.eq(dsl::runs_started + dispatched_i32),
-            dsl::exhausted_at.eq(Some(now)),
+            dsl::exhausted_at.eq(Some(now).to_diesel()),
             dsl::exhausted_reason.eq(exhausted_reason),
-            dsl::next_run_at.eq(Option::<DateTime<Utc>>::None),
+            dsl::next_run_at.eq(Option::<crate::time::sql::SqlTimestamp>::None),
             dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-            dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
-            dsl::updated_at.eq(now),
+            dsl::fire_claimed_until.eq(Option::<crate::time::sql::SqlTimestamp>::None),
+            dsl::updated_at.eq(now.to_diesel()),
         ))
         .execute(conn)
         .await
@@ -7693,8 +7884,8 @@ async fn drain_claimed_buffered_schedule(
             dsl::buffered_runs.eq(buffered_runs_to_json(&buffered)),
             dsl::runs_started.eq(dsl::runs_started + dispatched_i32),
             dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
-            dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
-            dsl::updated_at.eq(now),
+            dsl::fire_claimed_until.eq(Option::<crate::time::sql::SqlTimestamp>::None),
+            dsl::updated_at.eq(now.to_diesel()),
         ))
         .execute(conn)
         .await
@@ -7721,9 +7912,9 @@ async fn drain_claimed_buffered_schedule(
 // ── Worker-completion helpers (issue #360) ────────────────────────────────────
 //
 // These functions are called from the worker completion path (`worker.rs`) after
-// a schedule-triggered execution reaches a terminal state.  They are best-effort:
-// errors are logged but never propagated back to the task loop — the workflow task
-// result has already been committed at that point.
+// a schedule-triggered execution reaches a terminal state. They are best-effort.
+// Errors are logged but never propagated back to the task loop. The workflow task
+// result is already committed at that point.
 //
 // Only executions whose `workflow_id` starts with `"sched:"` are considered
 // schedule-triggered.  All other executions are ignored.
@@ -7774,7 +7965,7 @@ pub(crate) async fn maybe_increment_schedule_failure_counter(
             .and_then(|s| uuid::Uuid::parse_str(s).ok())
     });
 
-    let now = Utc::now();
+    let now = Timestamp::now();
 
     // Resolve the schedule IDs to update.  When the workflow_id encodes a schedule
     // UUID (new format) we target that row directly.  For legacy workflow_ids we fall
@@ -7816,7 +8007,7 @@ pub(crate) async fn maybe_increment_schedule_failure_counter(
         )
         .set((
             dsl::consecutive_failure_count.eq(dsl::consecutive_failure_count + 1),
-            dsl::updated_at.eq(now),
+            dsl::updated_at.eq(now.to_diesel()),
         ))
         .returning((
             dsl::consecutive_failure_count,
@@ -7847,7 +8038,7 @@ pub(crate) async fn maybe_increment_schedule_failure_counter(
                     .find(id)
                     .filter(dsl::auto_paused_at.is_null()),
             )
-            .set(dsl::auto_paused_at.eq(Some(now)))
+            .set(dsl::auto_paused_at.eq(Some(now).to_diesel()))
             .execute(conn)
             .await;
 
@@ -7909,7 +8100,7 @@ pub(crate) async fn maybe_reset_schedule_failure_counter(
             .and_then(|s| uuid::Uuid::parse_str(s).ok())
     });
 
-    let now = Utc::now();
+    let now = Timestamp::now();
     let result = if let Some(sid) = schedule_uuid {
         diesel::update(
             dsl::harvest_schedules.find(sid).filter(
@@ -7920,8 +8111,8 @@ pub(crate) async fn maybe_reset_schedule_failure_counter(
         )
         .set((
             dsl::consecutive_failure_count.eq(0),
-            dsl::auto_paused_at.eq(Option::<DateTime<Utc>>::None),
-            dsl::updated_at.eq(now),
+            dsl::auto_paused_at.eq(Option::<crate::time::sql::SqlTimestamp>::None),
+            dsl::updated_at.eq(now.to_diesel()),
         ))
         .execute(conn)
         .await
@@ -7938,8 +8129,8 @@ pub(crate) async fn maybe_reset_schedule_failure_counter(
         )
         .set((
             dsl::consecutive_failure_count.eq(0),
-            dsl::auto_paused_at.eq(Option::<DateTime<Utc>>::None),
-            dsl::updated_at.eq(now),
+            dsl::auto_paused_at.eq(Option::<crate::time::sql::SqlTimestamp>::None),
+            dsl::updated_at.eq(now.to_diesel()),
         ))
         .execute(conn)
         .await
@@ -7957,28 +8148,47 @@ pub(crate) async fn maybe_reset_schedule_failure_counter(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use jiff::Timestamp;
 
-    /// Documents (and pins) the exact hazard `load_schedule_overdue_aux_by_shard`
-    /// (in `autumn-harvest-plugin/src/api.rs`) must avoid when a batched
-    /// `calendar::load_exclusions_for_calendars` call fails: `exclude_weekends`
-    /// is a pure name check (`calendar_name == "weekends-off"`), independent of
-    /// whatever the exclusions query returned, so an EMPTY `excluded` slice is
-    /// **not** a safe stand-in for "the query failed" -- it still lets a
-    /// "weekends-off" calendar rebase a weekend slot away from its raw anchor,
-    /// which is exactly the wedge-hiding the caller's failure handling exists to
-    /// prevent (Codex review, PR #1314). The caller's fix is to treat a failed
-    /// batch as "skip calendar resolution for this shard" (`exclusions: None`),
-    /// never as "no exclusions" (`exclusions: Some(empty map)`) -- this test
-    /// pins why: with an empty `excluded` slice, the weekend flag alone is
-    /// sufficient to trigger a real rebase.
+    #[test]
+    fn catchup_window_cutoff_keeps_the_chrono_result_for_huge_windows() {
+        let now = Timestamp::constant(1_700_000_000, 0);
+        assert_eq!(
+            catchup_window_cutoff(now, Duration::from_secs(60)),
+            Timestamp::constant(1_699_999_940, 0)
+        );
+        // A window before year -9999 keeps every missed slot.
+        assert_eq!(
+            catchup_window_cutoff(now, Duration::from_secs(400_000_000_000)),
+            Timestamp::MIN
+        );
+        // chrono refused a window past `i64::MAX` milliseconds and used zero.
+        assert_eq!(
+            catchup_window_cutoff(now, Duration::from_secs(i64::MAX as u64)),
+            now
+        );
+    }
+
+    /// Pins a hazard for a failed batched `calendar::load_exclusions_for_calendars`.
+    ///
+    /// `load_schedule_overdue_aux_by_shard` (in `autumn-harvest-plugin/src/api.rs`)
+    /// must avoid it. `exclude_weekends` is a pure name check
+    /// (`calendar_name == "weekends-off"`), independent of the exclusions query.
+    /// So an EMPTY `excluded` slice is **not** a safe stand-in for "the query
+    /// failed". It still lets a "weekends-off" calendar rebase a weekend slot
+    /// away from its raw anchor. The caller's failure handling exists to
+    /// prevent exactly that wedge-hiding (PR #1314). The caller treats a failed
+    /// batch as "skip calendar resolution for this shard" (`exclusions: None`).
+    /// It never treats it as "no exclusions" (`exclusions: Some(empty map)`).
+    /// This test pins why: with an empty `excluded` slice, the weekend flag
+    /// alone triggers a real rebase.
     #[test]
     fn resolve_effective_fire_at_pure_rebases_a_weekend_slot_from_the_weekend_flag_alone_even_with_empty_exclusions()
      {
         // 2026-06-13 is a fixed, independently-verified Saturday (not derived
-        // from `Utc::now()`, so this test's outcome never depends on what day
+        // from `Timestamp::now()`, so this test's outcome never depends on what day
         // it happens to run).
-        let saturday = Utc.with_ymd_and_hms(2026, 6, 13, 12, 0, 0).unwrap();
+        let saturday = crate::time::utc_ymd_hms(2026, 6, 13, 12, 0, 0).unwrap();
 
         let rebased = resolve_effective_fire_at_pure(
             &[],  // empty exclusions -- what an "unwrap_or_default() on failure" would produce
@@ -7989,7 +8199,7 @@ mod tests {
         );
 
         assert!(
-            rebased.is_some_and(|r| r.date_naive() != saturday.date_naive()),
+            rebased.is_some_and(|r| crate::time::utc_date(r) != crate::time::utc_date(saturday)),
             "empty exclusions + exclude_weekends=true must still rebase a weekend slot -- \
              proving a caller cannot treat a failed exclusions load as 'no exclusions' \
              without risking exactly this silent rebase, got {rebased:?}"
@@ -8000,7 +8210,7 @@ mod tests {
     #[test]
     fn resolve_effective_fire_at_pure_tests_the_schedule_local_date() {
         // Mon 5 Jan 2026 08:00 JST is Sun 4 Jan 23:00 UTC.
-        let slot = Utc.with_ymd_and_hms(2026, 1, 4, 23, 0, 0).unwrap();
+        let slot = crate::time::utc_ymd_hms(2026, 1, 4, 23, 0, 0).unwrap();
         let rebased = resolve_effective_fire_at_pure(
             &[],
             true,
@@ -8014,7 +8224,7 @@ mod tests {
     /// A representative workflow-schedule row for `merge_schedule_patch` unit
     /// tests (no database required).
     fn merge_base_row() -> HarvestSchedule {
-        let now = Utc::now();
+        let now = Timestamp::now();
         HarvestSchedule {
             id: uuid::Uuid::new_v4(),
             dag_name: None,
@@ -8024,7 +8234,7 @@ mod tests {
             max_active_runs: 2,
             is_paused: false,
             last_run_at: None,
-            next_run_at: Some(now + chrono::Duration::seconds(3600)),
+            next_run_at: Some(now + jiff::SignedDuration::from_secs(3600)),
             created_at: now,
             updated_at: now,
             workflow_name: Some("merge_wf".to_string()),
@@ -8044,7 +8254,7 @@ mod tests {
             consecutive_failure_limit: Some(4),
             consecutive_failure_count: 0,
             auto_paused_at: None,
-            end_at: Some(now + chrono::Duration::days(30)),
+            end_at: Some(now + crate::time::days(30)),
             max_runs: Some(9),
             runs_started: 3,
             exhausted_at: None,
@@ -8292,9 +8502,8 @@ mod tests {
     }
 
     /// A stored `retry_policy` JSON blob that fails to deserialize must fail
-    /// an UNRELATED patch loudly instead of being silently round-tripped to
-    /// NULL (which would destroy the stored policy as a side effect of, say,
-    /// an input-only edit).
+    /// an UNRELATED patch loudly. A silent round-trip to NULL destroys the
+    /// stored policy as a side effect of, say, an input-only edit.
     #[test]
     fn merge_schedule_patch_corrupt_stored_retry_policy_errors_on_unrelated_patch() {
         let mut row = merge_base_row();
@@ -8379,10 +8588,8 @@ mod tests {
         }
     }
 
-    fn parse_utc(value: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(value)
-            .expect("timestamp should parse")
-            .with_timezone(&Utc)
+    fn parse_utc(value: &str) -> Timestamp {
+        value.parse::<Timestamp>().expect("timestamp should parse")
     }
 
     #[test]
@@ -8399,9 +8606,9 @@ mod tests {
 
     #[test]
     fn due_run_plan_without_catchup_anchors_next_slot_to_first_due() {
-        // When now is only slightly past first_due (e.g. jitter delay of 3 min
-        // inside a 60-min interval), next slot must be first_due + period, not
-        // now + period, so the schedule doesn't drift on every fired slot.
+        // Now is only slightly past first_due (e.g. jitter delay of 3 min
+        // inside a 60-min interval). The next slot must be first_due + period,
+        // not now + period. So the schedule does not drift on every fired slot.
         let schedule = Schedule::Interval(Duration::from_secs(3600));
         let first_due = parse_utc("2026-04-06T10:00:00Z");
         let now = parse_utc("2026-04-06T10:03:00Z"); // 3 min jitter delay
@@ -8492,7 +8699,7 @@ mod tests {
         let schedule = Schedule::Interval(Duration::from_mins(15)); // 15-min
         let now = parse_utc("2026-04-06T12:00:00Z");
         // Simulate 24-hour outage: first_due = 24h ago.
-        let first_due = now - chrono::Duration::hours(24);
+        let first_due = now - jiff::SignedDuration::from_hours(24);
 
         let plan = catchup_run_plan(
             Some(&schedule),
@@ -8509,7 +8716,7 @@ mod tests {
         let fired = plan.run_dates[0];
         let next_after_fired = next_run_after(Some(&schedule), fired).unwrap_or(now);
         assert!(
-            next_after_fired > now || (now - fired) < chrono::Duration::minutes(15),
+            next_after_fired > now || (now - fired) < jiff::SignedDuration::from_mins(15),
             "fired slot {fired} should be the most recent: next={next_after_fired} now={now}"
         );
         // 97 slots total, 1 fired, 96 dropped.
@@ -8541,7 +8748,7 @@ mod tests {
         use crate::policy::CatchupPolicy;
         let schedule = Schedule::Interval(Duration::from_mins(15)); // 15-min
         let now = parse_utc("2026-04-06T12:00:00Z");
-        let first_due = now - chrono::Duration::hours(24); // 96 missed slots
+        let first_due = now - jiff::SignedDuration::from_hours(24); // 96 missed slots
 
         // 1-hour window: only the ~4 slots in the last hour fire.
         let window = Duration::from_secs(3600);
@@ -8554,7 +8761,7 @@ mod tests {
         );
 
         // All fired slots must be >= now - window.
-        let cutoff = now - chrono::Duration::seconds(3600);
+        let cutoff = now - jiff::SignedDuration::from_secs(3600);
         for slot in &plan.run_dates {
             assert!(
                 *slot >= cutoff,
@@ -8598,13 +8805,13 @@ mod tests {
     #[test]
     fn catchup_run_plan_window_cron_jump_starts_at_cutoff() {
         use crate::policy::CatchupPolicy;
-        // Hourly cron, down for 7 days. A 2-hour window must fire only the in-
-        // window slots; the long pre-window backlog must NOT block the bounded
-        // result (issue #484 / Codex #3069 — `window_eligible_slots` jump-starts
-        // the cron walk at the window cutoff instead of walking from first_due).
+        // Hourly cron, down for 7 days. A 2-hour window must fire only the
+        // in-window slots. The long pre-window backlog must NOT block the
+        // bounded result (issue #484 / #3069). `window_eligible_slots` starts
+        // the cron walk at the window cutoff, not at first_due.
         let schedule = Schedule::Cron("0 * * * *".to_string()); // top of every hour
         let now = parse_utc("2026-04-08T00:00:00Z");
-        let first_due = now - chrono::Duration::days(7);
+        let first_due = now - crate::time::days(7);
         let window = Duration::from_hours(2); // 2 hours
 
         let plan = catchup_run_plan(
@@ -8642,7 +8849,7 @@ mod tests {
         // fast-path must return in O(1) without materializing the slot vector.
         let schedule = Schedule::Interval(Duration::from_secs(1));
         let now = parse_utc("2026-04-06T00:00:00Z");
-        let first_due = now - chrono::Duration::days(30);
+        let first_due = now - crate::time::days(30);
 
         let plan = catchup_run_plan(
             Some(&schedule),
@@ -8657,7 +8864,10 @@ mod tests {
         assert_eq!(plan.run_dates[0], now, "fires the slot at exactly now");
         // total slots = intervals + 1 (slot at now); dropped = total - 1.
         assert_eq!(plan.dropped, total, "dropped = (intervals + 1) - 1");
-        assert_eq!(plan.next_run_at, Some(now + chrono::Duration::seconds(1)));
+        assert_eq!(
+            plan.next_run_at,
+            Some(now + jiff::SignedDuration::from_secs(1))
+        );
     }
 
     #[test]
@@ -8856,7 +9066,7 @@ mod tests {
         let timestamps = plan_backfill_timestamps(Some(&schedule), from, to, 100)
             .expect("inverted window should return empty without error");
 
-        assert_eq!(timestamps, [] as [chrono::DateTime<chrono::Utc>; 0]);
+        assert_eq!(timestamps, [] as [jiff::Timestamp; 0]);
     }
 
     #[test]
@@ -8867,12 +9077,12 @@ mod tests {
         let timestamps = plan_backfill_timestamps(None, from, to, 100)
             .expect("unset schedule backfill should succeed with empty plan");
 
-        assert_eq!(timestamps, [] as [chrono::DateTime<chrono::Utc>; 0]);
+        assert_eq!(timestamps, [] as [jiff::Timestamp; 0]);
 
         let timestamps = plan_backfill_timestamps(Some(&Schedule::Manual), from, to, 100)
             .expect("manual schedule backfill should succeed with empty plan");
 
-        assert_eq!(timestamps, [] as [chrono::DateTime<chrono::Utc>; 0]);
+        assert_eq!(timestamps, [] as [jiff::Timestamp; 0]);
     }
 
     #[test]
@@ -8932,7 +9142,7 @@ mod tests {
 
     #[test]
     fn plan_backfill_timestamps_huge_interval_returns_only_the_first_slot() {
-        // The second slot is past the last date chrono holds (issue #2048).
+        // The second slot is past the last date that jiff holds (issue #2048).
         let from = parse_utc("2026-04-01T00:00:00Z");
         let to = parse_utc("2026-04-08T00:00:00Z");
         for secs in [9_000_000_000_000_000, u64::MAX] {
@@ -8948,11 +9158,10 @@ mod tests {
     #[test]
     fn plan_backfill_timestamps_interval_stops_at_the_end_of_time() {
         let schedule = Schedule::Interval(Duration::from_secs(60));
-        let from = DateTime::<Utc>::MAX_UTC - chrono::Duration::seconds(30);
+        let from = Timestamp::MAX - jiff::SignedDuration::from_secs(30);
 
-        let timestamps =
-            plan_backfill_timestamps(Some(&schedule), from, DateTime::<Utc>::MAX_UTC, 100)
-                .expect("the end of time must not fail the plan");
+        let timestamps = plan_backfill_timestamps(Some(&schedule), from, Timestamp::MAX, 100)
+            .expect("the end of time must not fail the plan");
 
         assert_eq!(timestamps, vec![from]);
     }
@@ -9077,15 +9286,15 @@ mod tests {
     fn parse_buffered_runs_returns_empty_for_null_or_invalid() {
         assert_eq!(
             parse_buffered_runs(&serde_json::Value::Null),
-            [] as [chrono::DateTime<chrono::Utc>; 0]
+            [] as [jiff::Timestamp; 0]
         );
         assert_eq!(
             parse_buffered_runs(&serde_json::json!([])),
-            [] as [chrono::DateTime<chrono::Utc>; 0]
+            [] as [jiff::Timestamp; 0]
         );
         assert_eq!(
             parse_buffered_runs(&serde_json::json!("not-an-array")),
-            [] as [chrono::DateTime<chrono::Utc>; 0]
+            [] as [jiff::Timestamp; 0]
         );
     }
 
@@ -9105,8 +9314,8 @@ mod tests {
     #[test]
     fn next_run_after_spring_forward_skips_nonexistent_local_time() {
         // America/Los_Angeles spring-forward 2026: 2026-03-08 at 2:00 AM PST → 3:00 AM PDT.
-        // "30 2 * * *" has no valid local instant on 2026-03-08; scheduler must
-        // skip that day and fire at 2026-03-09 02:30 PDT = 09:30 UTC.
+        // "30 2 * * *" has no valid local instant on 2026-03-08. The scheduler
+        // must skip that day and fire at 2026-03-09 02:30 PDT = 09:30 UTC.
         let schedule = Schedule::CronInTimezone {
             expr: "30 2 * * *".to_string(),
             tz: "America/Los_Angeles".to_string(),
@@ -9159,7 +9368,7 @@ mod tests {
 
     #[test]
     fn next_run_after_huge_interval_is_none_not_a_panic() {
-        // chrono panics on `reference + duration` past year 262143 (issue #2048).
+        // jiff panics on `reference + duration` past year 9999 (issue #2048).
         let now = parse_utc("2026-01-01T00:00:00Z");
         for secs in [8_300_000_000_000, 9_000_000_000_000_000, u64::MAX] {
             let schedule = Schedule::Interval(Duration::from_secs(secs));
@@ -9170,27 +9379,24 @@ mod tests {
     #[test]
     fn next_run_after_interval_at_the_end_of_time_is_none() {
         let schedule = Schedule::Interval(Duration::from_secs(1));
-        assert_eq!(
-            next_run_after(Some(&schedule), DateTime::<Utc>::MAX_UTC),
-            None
-        );
+        assert_eq!(next_run_after(Some(&schedule), Timestamp::MAX), None);
     }
 
     #[test]
     fn next_run_after_sum_stops_exactly_at_the_last_date() {
-        // The sum is valid up to the last date that chrono holds, and no further.
+        // The sum is valid up to the last date that jiff holds, and no further.
         let now = parse_utc("2026-01-01T00:00:00Z");
-        let span = u64::try_from((DateTime::<Utc>::MAX_UTC - now).num_seconds()).unwrap();
+        let span = u64::try_from((Timestamp::MAX - now).as_secs()).unwrap();
         let fits = Schedule::Interval(Duration::from_secs(span));
         let over = Schedule::Interval(Duration::from_secs(span + 1));
         assert!(next_run_after(Some(&fits), now).is_some());
         assert_eq!(next_run_after(Some(&over), now), None);
 
         let one_second = Schedule::Interval(Duration::from_secs(1));
-        let last_second = DateTime::<Utc>::MAX_UTC - chrono::Duration::seconds(1);
+        let last_second = Timestamp::MAX - jiff::SignedDuration::from_secs(1);
         assert_eq!(
             next_run_after(Some(&one_second), last_second),
-            Some(DateTime::<Utc>::MAX_UTC)
+            Some(Timestamp::MAX)
         );
     }
 
@@ -9201,7 +9407,7 @@ mod tests {
         let schedule = parse_schedule_from_expr("interval:9000000000000000")
             .expect("a stored interval parses");
         let first_due = parse_utc("2026-01-01T00:00:00Z");
-        let now = first_due + chrono::Duration::hours(1);
+        let now = first_due + jiff::SignedDuration::from_hours(1);
 
         assert_eq!(next_run_after(Some(&schedule), first_due), None);
         assert_eq!(
@@ -9227,7 +9433,7 @@ mod tests {
         ] {
             let schedule = Schedule::Interval(Duration::from_secs(secs));
             assert!(crate::policy::validate_schedule(&schedule).is_ok());
-            let expected = now + chrono::Duration::seconds(i64::try_from(secs).unwrap());
+            let expected = now + jiff::SignedDuration::from_secs(i64::try_from(secs).unwrap());
             assert_eq!(
                 next_run_after(Some(&schedule), now),
                 Some(expected),
@@ -9283,9 +9489,9 @@ mod tests {
     // step + jitter + tick`, so a healthy schedule caught mid-tick, deferred by
     // jitter, or deliberately not firing is never flagged.
 
-    /// Build a fixed UTC instant (avoids `Utc::now()` non-determinism).
-    fn dt(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(y, mo, d, h, mi, s).single().unwrap()
+    /// Build a fixed UTC instant (avoids `Timestamp::now()` non-determinism).
+    fn dt(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> Timestamp {
+        crate::time::utc_ymd_hms(y, mo, d, h, mi, s).unwrap()
     }
 
     const TICK: Duration = Duration::from_secs(1);
@@ -9297,8 +9503,8 @@ mod tests {
     /// `Copy`.
     fn base(
         sched: Option<&Schedule>,
-        next_run_at: Option<DateTime<Utc>>,
-        now: DateTime<Utc>,
+        next_run_at: Option<Timestamp>,
+        now: Timestamp,
     ) -> OverdueInputs<'_> {
         OverdueInputs {
             schedule: sched,
@@ -9324,7 +9530,7 @@ mod tests {
         let sched = Schedule::Interval(Duration::from_secs(300)); // 5-min cadence
         let now = dt(2026, 1, 1, 0, 10, 0);
         // grace = 300 + 0 + 1 = 301. lag = 400 > 301 => overdue.
-        let next_run_at = now - chrono::Duration::seconds(400);
+        let next_run_at = now - jiff::SignedDuration::from_secs(400);
         let v = schedule_overdue(&base(Some(&sched), Some(next_run_at), now));
         assert!(
             v.overdue,
@@ -9344,7 +9550,7 @@ mod tests {
         // lag = 200 <= 301 grace => not overdue (caught mid-cadence).
         let v = schedule_overdue(&base(
             Some(&sched),
-            Some(now - chrono::Duration::seconds(200)),
+            Some(now - jiff::SignedDuration::from_secs(200)),
             now,
         ));
         assert!(!v.overdue);
@@ -9358,33 +9564,33 @@ mod tests {
         // lag == grace (301) => strictly-greater predicate => not overdue.
         let at = schedule_overdue(&base(
             Some(&sched),
-            Some(now - chrono::Duration::seconds(301)),
+            Some(now - jiff::SignedDuration::from_secs(301)),
             now,
         ));
         assert!(!at.overdue, "lag == grace must not flag (strict >)");
         // One second past the boundary flips it.
         let past = schedule_overdue(&base(
             Some(&sched),
-            Some(now - chrono::Duration::seconds(302)),
+            Some(now - jiff::SignedDuration::from_secs(302)),
             now,
         ));
         assert!(past.overdue);
         assert_eq!(past.overdue_by_secs, Some(302));
     }
 
-    // ── Calendar-deferred anchor (issue #696, Codex round 3) ──────────────────
+    // ── Calendar-deferred anchor (issue #696) ─────────────────────────────────
 
     #[test]
     fn calendar_deferred_future_fire_is_not_overdue() {
-        // A daily-cadence schedule whose slot fell on an excluded day: the tick
-        // rebased it to a future business day and pinned next_run_at at the (now
-        // 2-day-past) original slot. next_run_at alone is far past grace, but the
-        // calendar-adjusted fire is still ahead ⇒ not overdue.
+        // A daily-cadence schedule whose slot fell on an excluded day. The tick
+        // rebased it to a future business day and pinned next_run_at at the
+        // original slot, now 2 days past. next_run_at alone is far past grace,
+        // but the calendar-adjusted fire is still ahead ⇒ not overdue.
         let sched = Schedule::Interval(Duration::from_hours(24)); // daily
         let now = dt(2026, 1, 5, 12, 0, 0);
-        let next_run_at = now - chrono::Duration::days(2); // well past grace
+        let next_run_at = now - crate::time::days(2); // well past grace
         let v = schedule_overdue(&OverdueInputs {
-            effective_fire_at: Some(now + chrono::Duration::hours(6)), // future fire
+            effective_fire_at: Some(now + jiff::SignedDuration::from_hours(6)), // future fire
             ..base(Some(&sched), Some(next_run_at), now)
         });
         assert!(
@@ -9396,13 +9602,13 @@ mod tests {
 
     #[test]
     fn calendar_deferred_past_fire_is_still_overdue() {
-        // The calendar-adjusted fire is itself now in the past by > grace: the
-        // scheduler is genuinely wedged past the business-day fire ⇒ still flagged
-        // (detection preserved, not blanket-suppressed for calendar schedules).
+        // The calendar-adjusted fire is itself now in the past by > grace. The
+        // scheduler is wedged past the business-day fire ⇒ still flagged.
+        // Detection holds; calendar schedules are not blanket-suppressed.
         let sched = Schedule::Interval(Duration::from_hours(24)); // daily, grace ≈ 1 day
         let now = dt(2026, 1, 5, 12, 0, 0);
-        let next_run_at = now - chrono::Duration::days(3);
-        let effective = now - chrono::Duration::days(2); // adjusted fire 2 days past
+        let next_run_at = now - crate::time::days(3);
+        let effective = now - crate::time::days(2); // adjusted fire 2 days past
         let v = schedule_overdue(&OverdueInputs {
             effective_fire_at: Some(effective),
             ..base(Some(&sched), Some(next_run_at), now)
@@ -9412,7 +9618,7 @@ mod tests {
             "a schedule wedged PAST its calendar-adjusted fire by > grace must still be overdue"
         );
         // Lag is measured from the adjusted fire (anchor), not the raw slot.
-        assert_eq!(v.overdue_by_secs, Some((now - effective).num_seconds()));
+        assert_eq!(v.overdue_by_secs, Some((now - effective).as_secs()));
     }
 
     #[test]
@@ -9423,16 +9629,16 @@ mod tests {
         // under-detected by a backward rebase).
         let sched = Schedule::Interval(Duration::from_hours(24)); // daily
         let now = dt(2026, 1, 5, 12, 0, 0);
-        let next_run_at = now - chrono::Duration::days(2); // past grace
+        let next_run_at = now - crate::time::days(2); // past grace
         let v = schedule_overdue(&OverdueInputs {
-            effective_fire_at: Some(now - chrono::Duration::days(3)), // earlier
+            effective_fire_at: Some(now - crate::time::days(3)), // earlier
             ..base(Some(&sched), Some(next_run_at), now)
         });
         assert!(
             v.overdue,
             "a backward calendar rebase must not suppress a genuinely stale slot"
         );
-        assert_eq!(v.overdue_by_secs, Some((now - next_run_at).num_seconds()));
+        assert_eq!(v.overdue_by_secs, Some((now - next_run_at).as_secs()));
     }
 
     #[test]
@@ -9447,7 +9653,7 @@ mod tests {
             jitter,
             ..base(
                 Some(&sched),
-                Some(now - chrono::Duration::seconds(400)),
+                Some(now - jiff::SignedDuration::from_secs(400)),
                 now,
             )
         });
@@ -9459,7 +9665,7 @@ mod tests {
         let sched = Schedule::Cron("0 * * * *".to_string()); // top of every hour
         let slot = dt(2026, 1, 1, 0, 0, 0); // a valid occurrence
         // grace = 3600 + 0 + 1 = 3601.
-        let just_over = slot + chrono::Duration::seconds(3700);
+        let just_over = slot + jiff::SignedDuration::from_secs(3700);
         let v = schedule_overdue(&base(Some(&sched), Some(slot), just_over));
         assert!(v.overdue, "hourly cron 3700s past its slot is overdue");
         assert_eq!(v.overdue_by_secs, Some(3700));
@@ -9467,7 +9673,7 @@ mod tests {
         let within = schedule_overdue(&base(
             Some(&sched),
             Some(slot),
-            slot + chrono::Duration::seconds(3500),
+            slot + jiff::SignedDuration::from_secs(3500),
         ));
         assert!(!within.overdue);
     }
@@ -9480,7 +9686,7 @@ mod tests {
         let v = schedule_overdue(&base(
             Some(&sched),
             Some(slot),
-            slot + chrono::Duration::seconds(400),
+            slot + jiff::SignedDuration::from_secs(400),
         ));
         assert!(v.overdue);
         assert_eq!(v.overdue_by_secs, Some(400));
@@ -9494,7 +9700,7 @@ mod tests {
         let within = schedule_overdue(&base(
             Some(&sched),
             Some(slot),
-            slot + chrono::Duration::seconds(86_000),
+            slot + jiff::SignedDuration::from_secs(86_000),
         ));
         assert!(
             !within.overdue,
@@ -9504,7 +9710,7 @@ mod tests {
         let over = schedule_overdue(&base(
             Some(&sched),
             Some(slot),
-            slot + chrono::Duration::seconds(86_500),
+            slot + jiff::SignedDuration::from_secs(86_500),
         ));
         assert!(over.overdue);
     }
@@ -9518,14 +9724,14 @@ mod tests {
         let within = schedule_overdue(&base(
             Some(&sched),
             Some(slot),
-            slot + chrono::Duration::seconds(6 * 86_400),
+            slot + jiff::SignedDuration::from_secs(6 * 86_400),
         ));
         assert!(!within.overdue, "weekly cadence step must be ~604800s");
         // 8 days late exceeds one weekly step => overdue.
         let over = schedule_overdue(&base(
             Some(&sched),
             Some(slot),
-            slot + chrono::Duration::seconds(8 * 86_400),
+            slot + jiff::SignedDuration::from_secs(8 * 86_400),
         ));
         assert!(over.overdue);
     }
@@ -9535,7 +9741,7 @@ mod tests {
         let sched = Schedule::Interval(Duration::from_secs(300));
         let now = dt(2026, 1, 1, 0, 10, 0);
         // A next_run_at well past grace that WOULD be overdue if active.
-        let stale = Some(now - chrono::Duration::seconds(10_000));
+        let stale = Some(now - jiff::SignedDuration::from_secs(10_000));
         let b = || base(Some(&sched), stale, now);
         // Sanity: with none of the exclusions it IS overdue.
         assert!(schedule_overdue(&b()).overdue);
@@ -9579,7 +9785,7 @@ mod tests {
     #[test]
     fn overdue_manual_and_none_never_flagged() {
         let now = dt(2026, 1, 1, 0, 10, 0);
-        let stale = Some(now - chrono::Duration::seconds(10_000));
+        let stale = Some(now - jiff::SignedDuration::from_secs(10_000));
         // Manual schedule: no cadence => never overdue.
         assert!(!schedule_overdue(&base(Some(&Schedule::Manual), stale, now)).overdue);
         // Unparseable/absent schedule (None) => never overdue.
@@ -9613,14 +9819,14 @@ mod tests {
             // fired (lag up to jitter+tick) or scheduled slightly ahead. Never
             // more than one cadence past, so grace always absorbs it.
             let lag = i64::from(i % 30); // 0..29s late — well inside grace
-            let next_run_at = now - chrono::Duration::seconds(lag);
+            let next_run_at = now - jiff::SignedDuration::from_secs(lag);
             // Every 10th schedule is an overlap=Skip + catchup long-running case
             // at capacity, with next_run_at also held stale — the exact tick
             // retain-at-logical_date deferring scenario. It must still report
             // healthy (the P2-B gated suppression applies for Skip+catchup).
             let at_capacity = i % 10 == 0;
             let next_run_at = if at_capacity {
-                now - chrono::Duration::seconds(step_secs * 5) // deep in the past
+                now - jiff::SignedDuration::from_secs(step_secs * 5) // deep in the past
             } else {
                 next_run_at
             };
@@ -9648,14 +9854,14 @@ mod tests {
 
     #[test]
     fn overdue_grace_overflow_is_not_overdue() {
-        // A pathological interval near chrono's i64-ms bound makes `grace =
-        // step + jitter + tick` overflow; the predicate must treat that as
-        // not-overdue (checked add) rather than panic.
+        // A pathological interval near the i64 millisecond bound makes a huge
+        // `grace = step + jitter + tick`. The predicate must treat it as
+        // not-overdue, and a checked add keeps it from a panic.
         let sched = Schedule::Interval(Duration::from_millis(u64::try_from(i64::MAX).unwrap()));
         let now = dt(2026, 1, 1, 0, 0, 0);
         let v = schedule_overdue(&base(
             Some(&sched),
-            Some(now - chrono::Duration::seconds(10_000)),
+            Some(now - jiff::SignedDuration::from_secs(10_000)),
             now,
         ));
         assert!(
@@ -9664,7 +9870,7 @@ mod tests {
         );
     }
 
-    // ── Codex P2-A: bounded-out from RAW fields (exhausted_at may be NULL) ────
+    // ── Bounded-out from RAW fields (exhausted_at may be NULL) ────
 
     #[test]
     fn overdue_bounded_out_by_max_runs_with_null_exhausted_at() {
@@ -9674,7 +9880,7 @@ mod tests {
         // `now_budget_exhausted`.
         let sched = Schedule::Interval(Duration::from_secs(300));
         let now = dt(2026, 1, 1, 0, 10, 0);
-        let stale = Some(now - chrono::Duration::seconds(10_000));
+        let stale = Some(now - jiff::SignedDuration::from_secs(10_000));
         let v = schedule_overdue(&OverdueInputs {
             max_runs: Some(5),
             runs_started: 5, // budget spent
@@ -9704,7 +9910,7 @@ mod tests {
         // `end_at_now_exhausted`), even with exhausted_at NULL.
         let sched = Schedule::Interval(Duration::from_secs(300));
         let now = dt(2026, 1, 1, 0, 10, 0);
-        let next = now - chrono::Duration::seconds(10_000);
+        let next = now - jiff::SignedDuration::from_secs(10_000);
         let v = schedule_overdue(&OverdueInputs {
             end_at: Some(next), // next_run_at == end_at (>= end)
             exhausted_at: None,
@@ -9722,9 +9928,9 @@ mod tests {
         // field must not mask it.
         let sched = Schedule::Interval(Duration::from_secs(300));
         let now = dt(2026, 1, 1, 0, 10, 0);
-        let next = now - chrono::Duration::seconds(10_000);
+        let next = now - jiff::SignedDuration::from_secs(10_000);
         let v = schedule_overdue(&OverdueInputs {
-            end_at: Some(now + chrono::Duration::seconds(100_000)), // far future
+            end_at: Some(now + jiff::SignedDuration::from_secs(100_000)), // far future
             exhausted_at: None,
             ..base(Some(&sched), Some(next), now)
         });
@@ -9734,7 +9940,7 @@ mod tests {
         );
     }
 
-    // ── Codex P2-B: at_capacity suppression gated to the tick's deferring config ─
+    // ── at_capacity suppression gated to the tick's deferring config ─
 
     #[test]
     fn overdue_at_capacity_skip_catchup_is_suppressed() {
@@ -9742,7 +9948,7 @@ mod tests {
         // catchup + at capacity. Must be suppressed (the guard's whole reason).
         let sched = Schedule::Interval(Duration::from_secs(300));
         let now = dt(2026, 1, 1, 0, 10, 0);
-        let stale = Some(now - chrono::Duration::seconds(10_000));
+        let stale = Some(now - jiff::SignedDuration::from_secs(10_000));
         let v = schedule_overdue(&OverdueInputs {
             at_capacity: true,
             overlap_policy: OverlapPolicy::Skip,
@@ -9758,10 +9964,10 @@ mod tests {
     #[test]
     fn overdue_at_capacity_non_deferring_policies_are_flagged() {
         // Every NON-deferring config advances next_run_at, so a stale slot while
-        // at capacity is a GENUINE stall the gauge must flag (Codex P2-B).
+        // at capacity is a GENUINE stall the gauge must flag.
         let sched = Schedule::Interval(Duration::from_secs(300));
         let now = dt(2026, 1, 1, 0, 10, 0);
-        let stale = Some(now - chrono::Duration::seconds(10_000));
+        let stale = Some(now - jiff::SignedDuration::from_secs(10_000));
         // (policy, catchup) combos that do NOT retain next_run_at:
         let non_deferring = [
             (OverlapPolicy::Skip, false),       // non-catchup Skip advances
@@ -9948,9 +10154,9 @@ mod tests {
     /// **AC4 anti-drift guard (issue #961).** Both scheduled-fire paths must
     /// mint their `ExecutionId` through the shared [`scheduled_fire_exec_id`]
     /// decision. A pure-function test on that helper cannot catch a *call site*
-    /// regressing to an inline `ExecutionId::new*` — which is exactly how the
-    /// two drifted before — so this reads the two function bodies and asserts
-    /// the shared call is the only way either mints an id.
+    /// that regresses to an inline `ExecutionId::new*`. That is how the two
+    /// drifted before. So this reads the two function bodies and asserts the
+    /// shared call is the only way either mints an id.
     ///
     /// Source-level guard in the same house style as the dashboard/alert doc
     /// gates, which likewise parse repository files at test time.
@@ -9968,9 +10174,9 @@ mod tests {
         }
 
         fn check(source: &str) {
-            // Normalize line endings first: a Windows checkout
-            // (`core.autocrlf`) hands this file over with `\r\n`, so the bare
-            // `\n}\n` brace probe finds nothing and the guard panics. Same
+            // Normalize line endings first. A Windows checkout
+            // (`core.autocrlf`) hands this file over with `\r\n`. The bare
+            // `\n}\n` brace probe then finds nothing and the guard panics. Same
             // convention as `sqlite_feasibility_docs.rs`.
             let normalized = source.replace('\r', "");
             let source = normalized.as_str();
@@ -9998,10 +10204,10 @@ mod tests {
         let raw = include_str!("scheduler.rs");
         check(raw);
 
-        // Run the identical guard over a CRLF copy of the same source. This is
-        // what a Windows checkout hands `include_str!`, so dropping the
-        // normalization above fails here on *every* platform instead of only on
-        // the Windows CI leg — which is exactly how this guard first broke.
+        // Run the identical guard over a CRLF copy of the same source. A
+        // Windows checkout hands `include_str!` this shape. Without the
+        // normalization above, this fails on *every* platform, not only on the
+        // Windows CI leg. That leg is how this guard first broke.
         check(&raw.replace("\r\n", "\n").replace('\n', "\r\n"));
     }
 
@@ -10011,17 +10217,17 @@ mod tests {
     ///
     /// They had: `drain_buffered_schedule_runs` gated on
     /// `schedule.dag_name.is_some()` while the main path used
-    /// [`scheduled_fire_encodes_shard`], so a **canary** schedule (a non-DAG
-    /// whose fire must land ON its own shard so a write-blocked shard surfaces
-    /// as a failing probe) would drain a buffered slot onto the *default* shard
-    /// instead — silently un-pinning the very signal the shard-coverage check
-    /// relies on.
+    /// [`scheduled_fire_encodes_shard`]. A **canary** schedule is a non-DAG
+    /// whose fire must land ON its own shard, so a write-blocked shard
+    /// surfaces as a failing probe. It drained a buffered slot onto the
+    /// *default* shard instead. That silently un-pinned the very signal the
+    /// shard-coverage check relies on.
     ///
-    /// That drift is not reachable *today*: the built-in canary is registered
+    /// That drift is not reachable *today*. The built-in canary is registered
     /// with `OverlapPolicy::Skip`, and the drain only visits rows with a
     /// non-empty `buffered_runs`, which `Skip` never produces. It becomes live
-    /// the moment an operator `PATCH`es the canary schedule's overlap policy
-    /// (issue #771), so the two sites now share [`scheduled_fire_exec_id`] and
+    /// once an operator `PATCH`es the canary schedule's overlap policy
+    /// (issue #771). So the two sites now share [`scheduled_fire_exec_id`] and
     /// cannot diverge. For DAG and ordinary schedules the change is a strict
     /// no-op.
     #[test]
@@ -10075,9 +10281,8 @@ mod tests {
 
         // THE ISSUE #1157 SHAPE: a row whose dag_name is non-NULL and differs
         // from the workflow_name it holds. `DagInfo::as_workflow_schedule`
-        // always sets workflow_name == dag_name, so this row is unreachable
-        // through any registration path — it is corrupt and must release the
-        // name it squats.
+        // always sets workflow_name == dag_name. No registration path reaches
+        // this row, so it is corrupt and must release the name it squats.
         assert_eq!(
             classify_workflow_name_holder(
                 "my_dag",
@@ -10090,20 +10295,20 @@ mod tests {
         // A CONSISTENT row owned by another DAG is not corrupt: refuse to write
         // rather than flap the name between them.
         //
-        // Note this arm is DEFENSIVE — it is unreachable in practice. Reaching
-        // it needs a foreign holder whose `dag_name` equals the name we are
-        // registering, but `harvest_schedules.dag_name` is UNIQUE and the
-        // caller resolves "the holder is our own dag row" by id first, so the
-        // only row that could carry it is the one already excluded. It is kept
-        // so the classifier stays total if that constraint is ever relaxed.
+        // Note this arm is DEFENSIVE — it is unreachable in practice. It needs
+        // a foreign holder whose `dag_name` equals the registering name. But
+        // `harvest_schedules.dag_name` is UNIQUE, and the caller resolves "the
+        // holder is our own dag row" by id first. So the only row that could
+        // carry it is already excluded. The arm keeps the classifier total if
+        // that constraint is ever relaxed.
         assert_eq!(
             classify_workflow_name_holder("shared", "shared", NameHolder::OwnedBy("shared")),
             H::Conflict
         );
 
         // A registrant that does NOT own the name by right of its own dag_name
-        // still merges the legacy workflow-only shape (that path predates
-        // #1157 and is keyed on the holder, not on the registrant)...
+        // still merges the legacy workflow-only shape. That path predates
+        // #1157 and is keyed on the holder, not on the registrant...
         assert_eq!(
             classify_workflow_name_holder("my_dag", "other_name", NameHolder::Unowned),
             H::WorkflowOnly
@@ -10119,18 +10324,18 @@ mod tests {
     /// A decoupled registration reconciles its own row, and never steals.
     ///
     /// `WorkflowSchedule` exposes `dag_name` and `workflow_name` as independent
-    /// public fields and `validate_workflow_schedules` has never required them
-    /// to agree, so a deployment upgrading into this fix can legitimately hold
-    /// rows where they differ. Refusing every such registration would strand
-    /// them: their cadence could never be reconciled again, and a row parked by
-    /// [`WorkflowNameHolder::Squatter`] could never re-stamp its own name.
+    /// public fields. `validate_workflow_schedules` has never required them to
+    /// agree. So an upgrading deployment can legitimately hold rows where they
+    /// differ. A refusal of every such registration strands them. Their cadence
+    /// is never reconciled again, and a row parked by
+    /// [`WorkflowNameHolder::Squatter`] never re-stamps its own name.
     ///
-    /// The distinguisher is not "do the two names differ" but **"does the
+    /// The distinguisher is not "do the two names differ". It is **"does the
     /// registrant own this `workflow_name` by right of its own DAG name?"**
     /// Only a registrant whose `dag_name == workflow_name` may strip a foreign
-    /// holder — which is exactly issue #1157's repro, and nothing else. A
-    /// decoupled registrant reconciles a free name (in practice its own row,
-    /// excluded by id before classification) and reports a foreign holder as a
+    /// holder. That is exactly issue #1157's repro, and nothing else. A
+    /// decoupled registrant reconciles a free name: in practice its own row,
+    /// excluded by id before classification. It reports a foreign holder as a
     /// named [`WorkflowNameHolder::Conflict`] instead of stealing from it.
     #[test]
     fn a_decoupled_registration_reconciles_its_own_row_and_never_steals() {
@@ -10141,8 +10346,8 @@ mod tests {
             "a legacy decoupled row must still be able to reconcile its own cadence"
         );
 
-        // A foreign holder is a named collision to report, never a row to strip:
-        // the registrant has no claim on this name by right of its own DAG name.
+        // A foreign holder is a named collision to report, never a row to strip.
+        // The registrant has no claim on this name by right of its own DAG name.
         assert_eq!(
             classify_workflow_name_holder("my_dag", "other_name", NameHolder::OwnedBy("third_dag")),
             WorkflowNameHolder::Conflict,
@@ -10186,7 +10391,7 @@ mod tests {
 
     #[test]
     fn backoff_suppresses_retries_until_the_delay_elapses() {
-        let t0 = Utc::now();
+        let t0 = Timestamp::now();
         let backoff = ScheduleRegistrationBackoff::new();
 
         // A never-failed key always attempts.
@@ -10196,15 +10401,15 @@ mod tests {
         // Immediately after a failure the schedule is suppressed — this is
         // what stops the 1 Hz re-issue of an identical failing write.
         assert!(!backoff.should_attempt("my_dag", t0));
-        assert!(!backoff.should_attempt("my_dag", t0 + chrono::Duration::milliseconds(500)));
+        assert!(!backoff.should_attempt("my_dag", t0 + jiff::SignedDuration::from_millis(500)));
         // Once the delay elapses the schedule is retried.
-        let base = chrono::Duration::from_std(REGISTRATION_BACKOFF_BASE).unwrap();
+        let base = jiff::SignedDuration::try_from(REGISTRATION_BACKOFF_BASE).unwrap();
         assert!(backoff.should_attempt("my_dag", t0 + base));
     }
 
     #[test]
     fn backoff_is_per_schedule_and_clears_on_success() {
-        let t0 = Utc::now();
+        let t0 = Timestamp::now();
         let backoff = ScheduleRegistrationBackoff::new();
 
         backoff.record_failure("broken_dag", t0);
@@ -10220,14 +10425,14 @@ mod tests {
 
     #[test]
     fn backoff_escalates_on_repeated_failures() {
-        let t0 = Utc::now();
+        let t0 = Timestamp::now();
         let backoff = ScheduleRegistrationBackoff::new();
-        let base = chrono::Duration::from_std(REGISTRATION_BACKOFF_BASE).unwrap();
+        let base = jiff::SignedDuration::try_from(REGISTRATION_BACKOFF_BASE).unwrap();
 
         backoff.record_failure("k", t0);
         // Second failure recorded after the first delay elapsed: the next wait
-        // is twice as long, so a permanently broken schedule quiesces instead
-        // of re-issuing the identical write every tick forever.
+        // is twice as long. A permanently broken schedule then quiesces. It does
+        // not re-issue the identical write every tick forever.
         let t1 = t0 + base;
         backoff.record_failure("k", t1);
         assert!(!backoff.should_attempt("k", t1 + base));
@@ -10262,7 +10467,7 @@ mod tests {
         row.catchup_policy = None;
         row.catchup_window_secs = None;
         row.retry_policy = None;
-        row.next_run_at = Some(Utc::now() + chrono::Duration::seconds(60));
+        row.next_run_at = Some(Timestamp::now() + jiff::SignedDuration::from_secs(60));
         row.exhausted_at = None;
         (row, ws)
     }
@@ -10270,7 +10475,7 @@ mod tests {
     #[test]
     fn a_converged_row_needs_no_write() {
         let (row, ws) = converged_pair();
-        let now = Utc::now();
+        let now = Timestamp::now();
         // Defect 3: this is the fast path that removes ~2M no-op UPDATEs/day
         // on a healthy deployment.
         assert!(workflow_schedule_row_is_converged(&row, &ws, now));
@@ -10284,9 +10489,9 @@ mod tests {
         // The danger of the defect-3 fast path is the FALSE POSITIVE: a row
         // that has drifted but is reported converged would never be repaired
         // again. Mutate each column the registration UPDATE writes and assert
-        // convergence flips to false, so a column added to the changeset
-        // without being added to the comparison is caught here.
-        let now = Utc::now();
+        // convergence flips to false. This catches a column added to the
+        // changeset but not to the comparison.
+        let now = Timestamp::now();
         let mutators: Vec<(&str, Mutator)> = vec![
             ("schedule_expr", |r| {
                 r.schedule_expr = Some("interval:999".to_string());
@@ -10324,7 +10529,7 @@ mod tests {
             ("consecutive_failure_limit", |r| {
                 r.consecutive_failure_limit = Some(3);
             }),
-            ("end_at", |r| r.end_at = Some(Utc::now())),
+            ("end_at", |r| r.end_at = Some(Timestamp::now())),
             ("max_runs", |r| r.max_runs = Some(5)),
             ("catchup_policy", |r| {
                 r.catchup_policy = Some("window".to_string());
@@ -10336,14 +10541,16 @@ mod tests {
             // Not a changeset column, but the registration pass also performs
             // exhaustion reconciliation (#478) after the UPDATE. A row that
             // still needs that reconciliation is NOT converged.
-            ("exhausted_at", |r| r.exhausted_at = Some(Utc::now())),
+            ("exhausted_at", |r| r.exhausted_at = Some(Timestamp::now())),
             // Likewise #360's auto-pause clear: the registration UPDATE NULLs
             // `auto_paused_at` when the failure limit is disabled (which
             // `converged_pair` leaves it as). This is the one write that lives
-            // outside the changeset AND does not bump `updated_at`, so a
-            // changeset-shaped comparison misses it entirely and a row left
-            // auto-paused would stay silently disabled forever.
-            ("auto_paused_at", |r| r.auto_paused_at = Some(Utc::now())),
+            // outside the changeset AND does not bump `updated_at`. A
+            // changeset-shaped comparison misses it entirely. A row left
+            // auto-paused then stays silently disabled forever.
+            ("auto_paused_at", |r| {
+                r.auto_paused_at = Some(Timestamp::now());
+            }),
         ];
 
         for (column, mutate) in mutators {
@@ -10359,15 +10566,19 @@ mod tests {
 
     #[test]
     fn dag_name_drift_is_absorbed_for_a_workflow_only_schedule() {
-        // The registration changeset writes `ws.dag_name.or(existing.dag_name)`,
-        // so a workflow-only schedule deliberately PRESERVES a dag_name already
-        // on the row (that is how a unified DAG row keeps its identity when the
-        // workflow-schedule pass reconciles it). The update would therefore
-        // write the same value back — genuinely converged, not a missed repair.
+        // The registration changeset writes `ws.dag_name.or(existing.dag_name)`.
+        // So a workflow-only schedule deliberately PRESERVES a dag_name already
+        // on the row. That is how a unified DAG row keeps its identity when the
+        // workflow-schedule pass reconciles it. The update writes the same
+        // value back, so the row is converged, not a missed repair.
         let (mut row, ws) = converged_pair();
         assert!(ws.dag_name.is_none());
         row.dag_name = Some("adopted".to_string());
-        assert!(workflow_schedule_row_is_converged(&row, &ws, Utc::now()));
+        assert!(workflow_schedule_row_is_converged(
+            &row,
+            &ws,
+            Timestamp::now()
+        ));
     }
 
     #[test]
@@ -10377,10 +10588,18 @@ mod tests {
         let (mut row, mut ws) = converged_pair();
         ws.dag_name = Some("nightly_report".to_string());
         row.dag_name = Some("nightly_report".to_string());
-        assert!(workflow_schedule_row_is_converged(&row, &ws, Utc::now()));
+        assert!(workflow_schedule_row_is_converged(
+            &row,
+            &ws,
+            Timestamp::now()
+        ));
 
         row.dag_name = Some("someone_elses_dag".to_string());
-        assert!(!workflow_schedule_row_is_converged(&row, &ws, Utc::now()));
+        assert!(!workflow_schedule_row_is_converged(
+            &row,
+            &ws,
+            Timestamp::now()
+        ));
     }
 
     #[test]
@@ -10388,8 +10607,12 @@ mod tests {
         // `updated_at` is bumped by the write itself; comparing it would make
         // convergence impossible and reinstate the 1 Hz storm.
         let (mut row, ws) = converged_pair();
-        row.updated_at = Utc::now() - chrono::Duration::days(30);
-        assert!(workflow_schedule_row_is_converged(&row, &ws, Utc::now()));
+        row.updated_at = Timestamp::now() - crate::time::days(30);
+        assert!(workflow_schedule_row_is_converged(
+            &row,
+            &ws,
+            Timestamp::now()
+        ));
     }
 
     #[test]
@@ -10399,15 +10622,18 @@ mod tests {
         // registration does not fight pause/resume.
         let (mut row, ws) = converged_pair();
         row.is_paused = true;
-        row.paused_at = Some(Utc::now());
+        row.paused_at = Some(Timestamp::now());
         row.paused_by = Some("operator".to_string());
-        assert!(workflow_schedule_row_is_converged(&row, &ws, Utc::now()));
+        assert!(workflow_schedule_row_is_converged(
+            &row,
+            &ws,
+            Timestamp::now()
+        ));
     }
 
-    /// A `Manual` schedule's `next_run_at` is permanently NULL, so a bare
-    /// `is_none()` guard would mean it can *never* converge — it would rewrite
-    /// on every 1 Hz tick forever, which is precisely the storm defect 3 is
-    /// supposed to end.
+    /// A `Manual` schedule's `next_run_at` is permanently NULL. With a bare
+    /// `is_none()` guard it can *never* converge. It rewrites on every 1 Hz
+    /// tick forever, the storm that defect 3 ends.
     #[test]
     fn a_manual_schedule_converges_despite_a_null_next_run_at() {
         // Start from the known-converged fixture and change only the cadence,
@@ -10419,7 +10645,7 @@ mod tests {
         row.next_run_at = None;
 
         assert!(
-            workflow_schedule_row_is_converged(&row, &ws, Utc::now()),
+            workflow_schedule_row_is_converged(&row, &ws, Timestamp::now()),
             "a manual schedule with a NULL next_run_at is already what the write \
              would produce; reporting it un-converged reinstates the 1 Hz storm"
         );
@@ -10433,7 +10659,7 @@ mod tests {
         let (mut row, ws) = converged_pair();
         row.next_run_at = None;
         assert!(
-            !workflow_schedule_row_is_converged(&row, &ws, Utc::now()),
+            !workflow_schedule_row_is_converged(&row, &ws, Timestamp::now()),
             "an interval schedule CAN compute a next_run_at, so a NULL column is drift"
         );
     }
@@ -10478,20 +10704,20 @@ mod tests {
         row.overlap_policy = OverlapPolicy::Skip.as_str().to_string();
         row.buffer_all_max = 0;
         row.buffered_runs = serde_json::json!([]);
-        row.next_run_at = Some(Utc::now() + chrono::Duration::seconds(60));
+        row.next_run_at = Some(Timestamp::now() + jiff::SignedDuration::from_secs(60));
         (row, dag)
     }
 
     #[test]
     fn a_converged_dag_row_needs_no_write() {
         let (row, dag) = converged_dag_pair();
-        assert!(dag_schedule_row_is_converged(&row, &dag, Utc::now()));
+        assert!(dag_schedule_row_is_converged(&row, &dag, Timestamp::now()));
     }
 
     /// The DAG-side twin of `every_written_column_is_compared`. The classic-DAG
-    /// upsert has its own, smaller changeset and carries the identical
-    /// false-positive hazard, so it needs its own drift injector — otherwise a
-    /// column added to `upsert_schedule` is guarded by nothing at all.
+    /// upsert has its own, smaller changeset with the identical false-positive
+    /// hazard. It needs its own drift injector. Otherwise nothing guards a
+    /// column added to `upsert_schedule`.
     #[test]
     fn every_dag_written_column_is_compared() {
         let mutators: Vec<(&str, Mutator)> = vec![
@@ -10521,7 +10747,7 @@ mod tests {
             let (mut row, dag) = converged_dag_pair();
             mutate(&mut row);
             assert!(
-                !dag_schedule_row_is_converged(&row, &dag, Utc::now()),
+                !dag_schedule_row_is_converged(&row, &dag, Timestamp::now()),
                 "drift in `{column}` must force a write, otherwise the classic-DAG \
                  fast path silently suppresses reconciliation of that column forever"
             );
@@ -10542,18 +10768,18 @@ mod tests {
         row.next_run_at = None;
 
         assert!(
-            dag_schedule_row_is_converged(&row, &dag, Utc::now()),
+            dag_schedule_row_is_converged(&row, &dag, Timestamp::now()),
             "a trigger-only DAG needs no write; rewriting it every tick is the storm"
         );
     }
 
-    /// A lock-skip must be neither a success nor a failure. Recording it as a
-    /// success would clear the penalty, so on a multi-process fleet a broken
-    /// schedule would alternate lose-lock (reset) / win-lock (fail, count = 1)
-    /// and never escalate — the storm would persist at ~full rate.
+    /// A lock-skip must be neither a success nor a failure. A recorded success
+    /// clears the penalty. On a multi-process fleet a broken schedule then
+    /// alternates lose-lock (reset) / win-lock (fail, count = 1). It never
+    /// escalates, and the storm persists at ~full rate.
     #[test]
     fn a_lock_skip_preserves_the_accumulated_backoff() {
-        let t0 = Utc::now();
+        let t0 = Timestamp::now();
         let backoff = ScheduleRegistrationBackoff::new();
         let shard = ShardId::new(0);
         let key = registration_backoff_key("dag", "broken", shard);
@@ -10641,18 +10867,37 @@ mod tests {
     fn scheduled_workflow_id_adds_microseconds_only_when_the_slot_has_them() {
         let id = uuid::Uuid::nil();
         let whole = parse_utc("2026-01-01T00:00:00Z");
-        let fraction = whole + chrono::Duration::microseconds(42);
+        let fraction = whole + jiff::SignedDuration::from_micros(42);
         assert_eq!(
             scheduled_workflow_id(id, "wf", whole),
-            format!("sched:{id}:wf:{}", whole.timestamp())
+            format!("sched:{id}:wf:{}", whole.as_second())
         );
         assert_eq!(
             scheduled_workflow_id(id, "wf", fraction),
-            format!("sched:{id}:wf:{}.000042", whole.timestamp())
+            format!("sched:{id}:wf:{}.000042", whole.as_second())
         );
         assert_eq!(
             scheduled_workflow_id_pub(id, "wf", fraction),
             scheduled_workflow_id(id, "wf", fraction)
+        );
+    }
+
+    #[test]
+    fn both_scheduled_ids_keep_the_chrono_split_before_the_epoch() {
+        let id = uuid::Uuid::nil();
+        let half_before = Timestamp::new(0, -500_000_000).expect("in range");
+        assert_eq!(
+            scheduled_workflow_id(id, "wf", half_before),
+            format!("sched:{id}:wf:-1.500000")
+        );
+        assert_eq!(
+            legacy_scheduled_workflow_id("wf", half_before),
+            "sched:wf:-1.500000"
+        );
+        let earlier = Timestamp::new(-1, -750_000_000).expect("in range");
+        assert_eq!(
+            legacy_scheduled_workflow_id("wf", earlier),
+            "sched:wf:-2.250000"
         );
     }
 
@@ -10703,7 +10948,7 @@ mod tests {
     fn plan_backfill_timestamps_caps_a_cron_window() {
         let hourly = Schedule::Cron("0 * * * *".to_string());
         let from = parse_utc("2026-01-01T00:00:00Z");
-        let to = from + chrono::Duration::hours(10);
+        let to = from + jiff::SignedDuration::from_hours(10);
         assert_eq!(
             plan_backfill_timestamps(Some(&hourly), from, to, 3),
             Err(BackfillPlanError::LimitExceeded { limit: 3 })
@@ -10718,7 +10963,7 @@ mod tests {
             tz: "Mars/Olympus_Mons".to_string(),
         };
         let from = parse_utc("2026-01-01T00:00:00Z");
-        let to = from + chrono::Duration::hours(10);
+        let to = from + jiff::SignedDuration::from_hours(10);
         assert_eq!(
             plan_backfill_timestamps(Some(&never), from, to, 100),
             Ok(vec![])
@@ -10734,13 +10979,13 @@ mod tests {
         row.exhausted_at = Some(now);
 
         // The end has passed, so the exhaustion stays.
-        ws.end_at = Some(now - chrono::Duration::hours(1));
+        ws.end_at = Some(now - jiff::SignedDuration::from_hours(1));
         assert!(exhaustion_reconciliation_is_noop(&row, &ws, now));
 
         // A manual schedule compares the end with now.
         ws.schedule = Schedule::Manual;
         assert!(exhaustion_reconciliation_is_noop(&row, &ws, now));
-        ws.end_at = Some(now + chrono::Duration::hours(1));
+        ws.end_at = Some(now + jiff::SignedDuration::from_hours(1));
         assert!(!exhaustion_reconciliation_is_noop(&row, &ws, now));
 
         // The run budget is spent, so the exhaustion stays.
@@ -10773,18 +11018,18 @@ mod tests {
         let now = parse_utc("2026-06-01T00:00:00Z");
         let (mut row, mut ws) = converged_pair();
         // `ws` fires every 60 s.
-        ws.end_at = Some(now + chrono::Duration::hours(1));
+        ws.end_at = Some(now + jiff::SignedDuration::from_hours(1));
 
         // The pending slot is before the end.
-        row.next_run_at = Some(now + chrono::Duration::seconds(60));
+        row.next_run_at = Some(now + jiff::SignedDuration::from_secs(60));
         assert!(exhaustion_reconciliation_is_noop(&row, &ws, now));
 
         // The pending slot is past the end, but the next slot from now is not.
-        row.next_run_at = Some(now + chrono::Duration::hours(2));
+        row.next_run_at = Some(now + jiff::SignedDuration::from_hours(2));
         assert!(exhaustion_reconciliation_is_noop(&row, &ws, now));
 
         // No slot from now is before the end.
-        ws.end_at = Some(now + chrono::Duration::seconds(30));
+        ws.end_at = Some(now + jiff::SignedDuration::from_secs(30));
         assert!(!exhaustion_reconciliation_is_noop(&row, &ws, now));
 
         // A manual schedule compares the end with now.
@@ -10800,7 +11045,7 @@ mod tests {
     fn buffered(count: usize) -> serde_json::Value {
         let first = parse_utc("2026-01-01T00:00:00Z");
         let runs: Vec<_> = (0..count)
-            .map(|i| first + chrono::Duration::hours(i64::try_from(i).expect("small")))
+            .map(|i| first + jiff::SignedDuration::from_hours(i64::try_from(i).expect("small")))
             .collect();
         buffered_runs_to_json(&runs)
     }
@@ -10811,9 +11056,17 @@ mod tests {
         ws.overlap_policy = OverlapPolicy::BufferOne;
         row.overlap_policy = OverlapPolicy::BufferOne.as_str().to_string();
         row.buffered_runs = buffered(1);
-        assert!(workflow_schedule_row_is_converged(&row, &ws, Utc::now()));
+        assert!(workflow_schedule_row_is_converged(
+            &row,
+            &ws,
+            Timestamp::now()
+        ));
         row.buffered_runs = buffered(2);
-        assert!(!workflow_schedule_row_is_converged(&row, &ws, Utc::now()));
+        assert!(!workflow_schedule_row_is_converged(
+            &row,
+            &ws,
+            Timestamp::now()
+        ));
     }
 
     #[test]
@@ -10824,9 +11077,17 @@ mod tests {
         row.overlap_policy = OverlapPolicy::BufferAll.as_str().to_string();
         row.buffer_all_max = 2;
         row.buffered_runs = buffered(2);
-        assert!(workflow_schedule_row_is_converged(&row, &ws, Utc::now()));
+        assert!(workflow_schedule_row_is_converged(
+            &row,
+            &ws,
+            Timestamp::now()
+        ));
         row.buffered_runs = buffered(3);
-        assert!(!workflow_schedule_row_is_converged(&row, &ws, Utc::now()));
+        assert!(!workflow_schedule_row_is_converged(
+            &row,
+            &ws,
+            Timestamp::now()
+        ));
     }
 
     #[test]
@@ -10834,8 +11095,12 @@ mod tests {
         let (mut row, mut ws) = converged_pair();
         ws.consecutive_failure_limit = Some(3);
         row.consecutive_failure_limit = Some(3);
-        row.auto_paused_at = Some(Utc::now());
-        assert!(workflow_schedule_row_is_converged(&row, &ws, Utc::now()));
+        row.auto_paused_at = Some(Timestamp::now());
+        assert!(workflow_schedule_row_is_converged(
+            &row,
+            &ws,
+            Timestamp::now()
+        ));
     }
 
     #[test]
@@ -10844,17 +11109,17 @@ mod tests {
         dag.overlap_policy = OverlapPolicy::BufferOne;
         row.overlap_policy = OverlapPolicy::BufferOne.as_str().to_string();
         row.buffered_runs = buffered(1);
-        assert!(dag_schedule_row_is_converged(&row, &dag, Utc::now()));
+        assert!(dag_schedule_row_is_converged(&row, &dag, Timestamp::now()));
         row.buffered_runs = buffered(2);
-        assert!(!dag_schedule_row_is_converged(&row, &dag, Utc::now()));
+        assert!(!dag_schedule_row_is_converged(&row, &dag, Timestamp::now()));
 
         dag.overlap_policy = OverlapPolicy::BufferAll;
         dag.buffer_all_max = 2;
         row.overlap_policy = OverlapPolicy::BufferAll.as_str().to_string();
         row.buffer_all_max = 2;
-        assert!(dag_schedule_row_is_converged(&row, &dag, Utc::now()));
+        assert!(dag_schedule_row_is_converged(&row, &dag, Timestamp::now()));
         row.buffered_runs = buffered(3);
-        assert!(!dag_schedule_row_is_converged(&row, &dag, Utc::now()));
+        assert!(!dag_schedule_row_is_converged(&row, &dag, Timestamp::now()));
     }
 
     // ── stored_schedule_input_matches (issue #2333) ──────────────────────────
@@ -10976,8 +11241,8 @@ mod tests {
         // 400 years does not fit in i64 nanoseconds, so the summary walks.
         let hourly = Schedule::Interval(Duration::from_secs(3600));
         let first_due = parse_utc("2026-01-01T00:00:00Z");
-        let now = first_due + chrono::Duration::hours(3);
-        let far_end = first_due + chrono::Duration::days(400 * 365);
+        let now = first_due + jiff::SignedDuration::from_hours(3);
+        let far_end = first_due + crate::time::days(400 * 365);
         let walked = eligible_slot_summary(Some(&hourly), first_due, now, Some(far_end));
         let arithmetic = eligible_slot_summary(Some(&hourly), first_due, now, None);
         assert_eq!(walked.eligible_count, 4);
@@ -10990,17 +11255,17 @@ mod tests {
     fn eligible_slot_summary_of_a_cron_stops_counting_at_the_end() {
         let hourly = Schedule::Cron("0 * * * *".to_string());
         let first_due = parse_utc("2026-01-01T00:00:00Z");
-        let now = first_due + chrono::Duration::hours(3);
-        let end_at = first_due + chrono::Duration::minutes(90);
+        let now = first_due + jiff::SignedDuration::from_hours(3);
+        let end_at = first_due + jiff::SignedDuration::from_mins(90);
         let summary = eligible_slot_summary(Some(&hourly), first_due, now, Some(end_at));
         assert_eq!(summary.eligible_count, 2);
         assert_eq!(
             summary.last_eligible,
-            Some(first_due + chrono::Duration::hours(1))
+            Some(first_due + jiff::SignedDuration::from_hours(1))
         );
         assert_eq!(
             summary.next_run_at,
-            Some(first_due + chrono::Duration::hours(4))
+            Some(first_due + jiff::SignedDuration::from_hours(4))
         );
     }
 
@@ -11008,10 +11273,10 @@ mod tests {
     fn window_eligible_slots_is_empty_before_the_first_slot() {
         let hourly = Schedule::Interval(Duration::from_secs(3600));
         let first_due = parse_utc("2026-01-01T00:00:00Z");
-        let now = first_due - chrono::Duration::minutes(1);
+        let now = first_due - jiff::SignedDuration::from_mins(1);
         assert_eq!(
             window_eligible_slots(Some(&hourly), first_due, now, None, first_due),
-            Vec::<DateTime<Utc>>::new()
+            Vec::<Timestamp>::new()
         );
     }
 
@@ -11019,11 +11284,11 @@ mod tests {
     fn window_eligible_slots_between_two_slots_is_empty() {
         let hourly = Schedule::Interval(Duration::from_secs(3600));
         let first_due = parse_utc("2026-01-01T00:00:00Z");
-        let now = first_due + chrono::Duration::minutes(150);
-        let cutoff = first_due + chrono::Duration::minutes(135);
+        let now = first_due + jiff::SignedDuration::from_mins(150);
+        let cutoff = first_due + jiff::SignedDuration::from_mins(135);
         assert_eq!(
             window_eligible_slots(Some(&hourly), first_due, now, None, cutoff),
-            Vec::<DateTime<Utc>>::new()
+            Vec::<Timestamp>::new()
         );
     }
 
@@ -11031,15 +11296,15 @@ mod tests {
     fn window_eligible_slots_walks_when_the_end_is_out_of_range() {
         let hourly = Schedule::Interval(Duration::from_secs(3600));
         let first_due = parse_utc("2026-01-01T00:00:00Z");
-        let now = first_due + chrono::Duration::hours(2);
-        let far_end = first_due + chrono::Duration::days(400 * 365);
+        let now = first_due + jiff::SignedDuration::from_hours(2);
+        let far_end = first_due + crate::time::days(400 * 365);
         let walked = window_eligible_slots(Some(&hourly), first_due, now, Some(far_end), first_due);
         assert_eq!(
             walked,
             vec![
                 first_due,
-                first_due + chrono::Duration::hours(1),
-                first_due + chrono::Duration::hours(2),
+                first_due + jiff::SignedDuration::from_hours(1),
+                first_due + jiff::SignedDuration::from_hours(2),
             ]
         );
         assert_eq!(
@@ -11052,25 +11317,25 @@ mod tests {
     fn window_eligible_slots_of_a_cron_stops_at_the_end() {
         let hourly = Schedule::Cron("0 * * * *".to_string());
         let first_due = parse_utc("2026-01-01T00:00:00Z");
-        let now = first_due + chrono::Duration::hours(3);
-        let end_at = first_due + chrono::Duration::minutes(90);
+        let now = first_due + jiff::SignedDuration::from_hours(3);
+        let end_at = first_due + jiff::SignedDuration::from_mins(90);
         assert_eq!(
             window_eligible_slots(Some(&hourly), first_due, now, Some(end_at), first_due),
-            vec![first_due, first_due + chrono::Duration::hours(1)]
+            vec![first_due, first_due + jiff::SignedDuration::from_hours(1)]
         );
     }
 
     #[test]
     fn window_eligible_slots_of_an_interval_past_the_end_of_time_is_empty() {
-        // The period has no nanosecond value, and its first step leaves the
-        // range of chrono. The walk stops at once.
+        // The first step of the period leaves the range of jiff. The walk
+        // stops at once.
         let huge = Schedule::Interval(Duration::from_hours(2_500_000_000_000));
         let first_due = parse_utc("2026-01-01T00:00:00Z");
-        let now = first_due + chrono::Duration::hours(2);
-        let cutoff = first_due + chrono::Duration::hours(1);
+        let now = first_due + jiff::SignedDuration::from_hours(2);
+        let cutoff = first_due + jiff::SignedDuration::from_hours(1);
         assert_eq!(
             window_eligible_slots(Some(&huge), first_due, now, None, cutoff),
-            Vec::<DateTime<Utc>>::new()
+            Vec::<Timestamp>::new()
         );
     }
 
@@ -11078,7 +11343,7 @@ mod tests {
     fn overdue_with_budget_left_is_flagged() {
         let sched = Schedule::Interval(Duration::from_secs(300));
         let now = dt(2026, 1, 1, 0, 10, 0);
-        let next_run_at = now - chrono::Duration::seconds(400);
+        let next_run_at = now - jiff::SignedDuration::from_secs(400);
         let verdict = schedule_overdue(&OverdueInputs {
             max_runs: Some(5),
             runs_started: 2,
@@ -11123,7 +11388,7 @@ mod tests {
             reason: "maintenance".to_string(),
             message: None,
             created_by: "operator".to_string(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             expires_at: None,
         }
     }
