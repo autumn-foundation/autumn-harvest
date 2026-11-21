@@ -56,7 +56,7 @@ dependencies = [
 
 [[package]]
 name = "agent-loop-hit-rate"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-agent",
@@ -68,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "agent-mesh"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-agent",
@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "agent-strategies"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-harvest-agent",
  "autumn-harvest-sqlite",
@@ -416,7 +416,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "autoresearch"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-agent",
@@ -436,7 +436,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -501,7 +501,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-agent"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-sqlite",
@@ -532,7 +532,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-cli"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-harvest",
  "clap",
@@ -556,7 +556,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-conformance"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-sqlite",
@@ -573,7 +573,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-macros"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -582,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-plugin"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-trait",
  "autumn-harvest",
@@ -632,7 +632,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-redis"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-trait",
  "autumn-harvest",
@@ -657,7 +657,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-sandbox-guest"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-harvest",
  "libc",
@@ -666,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-sqlite"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-harvest",
  "jiff 1.0.1",
@@ -683,7 +683,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-harvest-verify"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-harvest",
  "clap",
@@ -1410,7 +1410,7 @@ dependencies = [
 
 [[package]]
 name = "billing-autumn-web"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-plugin",
@@ -1862,7 +1862,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "claude-agent-daemon"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-agent",
@@ -3644,7 +3644,7 @@ dependencies = [
 
 [[package]]
 name = "harvest-verify-corpus-boundary"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-harvest",
  "harvest-verify-corpus-helpers",
@@ -3655,7 +3655,7 @@ dependencies = [
 
 [[package]]
 name = "harvest-verify-corpus-clean"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-harvest",
  "harvest-verify-corpus-helpers",
@@ -3667,7 +3667,7 @@ dependencies = [
 
 [[package]]
 name = "harvest-verify-corpus-helpers"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "harvest-verify-corpus-helpers-deep",
  "rand 0.10.4",
@@ -3677,11 +3677,11 @@ dependencies = [
 
 [[package]]
 name = "harvest-verify-corpus-helpers-deep"
-version = "0.10.0"
+version = "0.11.0"
 
 [[package]]
 name = "harvest-verify-corpus-seeded"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-harvest",
  "harvest-verify-corpus-helpers",
@@ -3751,7 +3751,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "history-load-gate"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-sqlite",
@@ -5872,7 +5872,7 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quickstart"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-plugin",
@@ -6189,7 +6189,7 @@ dependencies = [
 
 [[package]]
 name = "recall-eval"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-harvest-agent",
  "autumn-harvest-sqlite",
@@ -6453,7 +6453,7 @@ dependencies = [
 
 [[package]]
 name = "rhai-scripts"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-sqlite",
@@ -6698,7 +6698,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "saga-choreography"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-harvest",
  "jiff 1.0.1",
@@ -7477,7 +7477,7 @@ dependencies = [
 
 [[package]]
 name = "standalone-runner"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-harvest",
  "autumn-harvest-cli",
@@ -9585,7 +9585,7 @@ checksum = "66fee0b777b0f5ac1c69bb06d361268faafa61cd4682ae064a171c16c433e9e4"
 
 [[package]]
 name = "xtask"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "fancy-regex 0.20.2",
  "regex",

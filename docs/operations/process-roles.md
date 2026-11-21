@@ -200,7 +200,7 @@ comma. The variable wins over the file.
 ### The role pin
 
 With no explicit list, Harvest reads the `pin` of a named Autumn role
-(`autumn-web` 0.10):
+(`autumn-web` 0.10 and later):
 
 ```toml
 [roles.priority]
@@ -223,7 +223,7 @@ queues of a worker that the role places. It does not stop the worker.
 
 ### Route groups
 
-`autumn-web` 0.10 serves only the route groups that a preset names in
+`autumn-web` 0.10 and later serve only the route groups that a preset names in
 `mount`. Each Harvest route is in the group `harvest`: the management API,
 the UI, the webhook receivers and the MCP routes. A preset that mounts
 groups must name `harvest`. Otherwise its replicas serve no Harvest route,
@@ -419,8 +419,9 @@ See [`kubernetes-probes.md`](kubernetes-probes.md).
 
 ## Upgrade note
 
-Harvest now needs `autumn-web` 0.11, and Autumn places each Harvest
-runtime. Read [`autumn-web` 0.11](../upgrading/autumn-web-0.11.md) first.
+Harvest 0.11.0 needs `autumn-web` 0.11, and Autumn places each Harvest
+runtime. Read [`autumn-web` 0.11](../upgrading/autumn-web-0.11.md) and the
+[0.11.0 upgrade guide](../upgrading/0.11.0.md) first.
 A named role now places Harvest through its capabilities.
 
 The notes below are for the upgrade to 0.10.0.

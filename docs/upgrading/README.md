@@ -5,6 +5,7 @@ which versions can run side by side, and in which order to upgrade.
 
 Each release also has its own guide:
 
+- [0.10.0 to 0.11.0](0.11.0.md)
 - [0.9.0 to 0.10.0](0.10.0.md)
 - [0.8.0 to 0.9.0](0.9.0.md)
 - [0.7.0 to 0.8.0](0.8.0.md)
@@ -175,6 +176,31 @@ These 0.10 behaviors need care during the roll.
 - **Schedule retry source (issue #2409).** A 0.9 worker that retries a run
   started from a schedule's own retry policy drops the
   `_harvest_retry_source` mark. A retry override then applies to that chain.
+
+### Known limits for 0.10 and 0.11
+
+These 0.11 behaviors need care during the roll.
+
+- **Role capabilities (issue #2480).** `autumn-web` 0.10 refuses the
+  `capabilities` key of a `[roles.<name>]` preset, so a 0.10 process does
+  not boot with it. Add the Harvest capabilities after the roll. See
+  [`autumn-web` 0.11](autumn-web-0.11.md#4-deploy-order).
+- **Schedule override reshard (issues #2413 and #2602).** A 0.10 process
+  writes a schedule override without the floor of
+  `harvest_schedule_override_receipts`. Let each pending shard move end
+  before the roll. Change no override and no shard routing until no 0.10
+  process runs.
+- **Claim slots (issue #2421).** A 0.10 worker takes no claim slot, so a
+  mixed fleet can pass the cap. Set the cap after the roll, on every
+  worker.
+- **Agent features.** A 0.10 worker cannot decode the new strategies, the
+  new refusals and the `ReloadProfile` op. Turn them on after the roll. A
+  0.10 worker also does not register the new agent activities. A 0.11 run
+  uses some of them with no opt-in: a gated tool call runs
+  `agent_approval_notice`, a new `agent_refine` run opens the adoption gate,
+  and an erase counts the stores. So upgrade every worker that hosts agent
+  workflows or agent activities before a new agent run starts. See
+  [0.11.0 §3](0.11.0.md#3-rolling-deploy-turn-on-new-features-after-the-roll).
 
 ## Rolling deploy order
 
