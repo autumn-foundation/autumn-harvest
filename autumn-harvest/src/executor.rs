@@ -1076,9 +1076,10 @@ pub async fn run_workflow_with_context(
 /// the filter value is, by construction, what `ctx.info().workflow_type`
 /// reports to the workflow body.
 ///
-/// Deliberately **not** `#[cfg(any(test, feature = "testing"))]`. Two of its
-/// three callers, `run_workflow_strict` and `run_workflow_canary`, are ungated
-/// `pub` entry points. Gating this helper broke the build under a bare
+/// Deliberately **not** `#[cfg(any(test, feature = "testing"))]`. One of its
+/// three callers, `run_workflow_strict`, is an ungated `pub` entry point. The
+/// other two, `run_workflow_strict_advancing_clock` and `run_workflow_canary`,
+/// are gated on `testing`. Gating this helper broke the build under a bare
 /// `--no-default-features`. It matches the gating of everything it touches: the
 /// ungated [`ReplayDeclarativeHandlers`] and [`ReplayPayloadLimits`] structs,
 /// and the ungated `WorkflowContext::register_declarative_{query,update}_handler`.
@@ -1583,6 +1584,10 @@ async fn run_strict_with_ctx(
 /// The same frontier tolerance applies if execution instead *completes*
 /// (issue #1175). A command emitted after recorded history is fully consumed
 /// is forward progress, not drift. The park and return paths agree on that.
+///
+/// Gated like [`run_workflow_strict_advancing_clock`]. Its one caller is the
+/// `testing` module, so an ungated build reports it as dead code.
+#[cfg(any(test, feature = "testing"))]
 #[allow(
     clippy::implicit_hasher,
     clippy::too_many_lines,
