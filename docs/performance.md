@@ -3179,3 +3179,9 @@ standalone note rather than part of the claim-path attribution table above:
   covering index on `(workflow_exec_id, recorded_at)` makes the window a key
   range. On a 6.26M-row ledger, a read of a large tenant takes 34,833 →
   16,915 buffers with a cold visibility map, and 3,024 after a vacuum.
+* [`docs/performance-mutex-waiter-holder-scan.md`](performance-mutex-waiter-holder-scan.md)
+  — the mutex terminal sweep found the waits of a run with a seq scan of
+  `harvest_mutex_waiters`, because no index leads with `waiter_exec_id`. Each
+  workflow end paid it. An index on `waiter_exec_id` makes it one probe. At
+  100,000 waiter rows, the read takes 1,872 → 6 buffers, and the workload
+  takes 55.7% fewer buffers.

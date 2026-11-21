@@ -1,0 +1,226 @@
+# Mutex waiter key read capture: before
+
+## 1000 fixture waiters, `without` arm
+
+Fixture: 1000 live waiter rows, 200 lock rows, 19 heap pages, 800 hot-key waiters, deepest key 170 rows, indexes: harvest_mutex_waiters_lock_key_waiter_exec_id_key 172032, harvest_mutex_waiters_pkey 65536, idx_harvest_mutex_waiters_key_id 131072
+
+Runs completed 200 of 200, mutex rows left by the runs 0, fixture digest after the sample sweep `04a004e3d3090b7ad334daaa00153b4b`, window 6603 ms
+
+| total buffers | total calls | WAL bytes | temp blocks written | mutex write WAL bytes |
+|--:|--:|--:|--:|--:|
+| 322346 | 56535 | 6485416 | 0 | 145486 |
+
+Waiter key read: 4407 buffers (1.4% of buffers), 200 calls (0.4% of calls), 22.0 buffers per call, 22.0 buffers per run.
+
+### Top 10 by buffers
+
+| buffers | % | calls | rows | statement |
+|--:|--:|--:|--:|---|
+| 118359 | 36.7 | 1512 | 1512 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_qu` |
+| 41730 | 12.9 | 2100 | 2100 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4) RETURNING txid_c` |
+| 18409 | 5.7 | 700 | 700 | `UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, scheduled_at = $2, created_at = clock_timestamp(), acti` |
+| 16852 | 5.2 | 600 | 600 | `INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "p` |
+| 14594 | 4.5 | 700 | 700 | `WITH candidate AS ( SELECT id, wake_requested FROM harvest_task_queue WHERE id = $1 AND (CASE WHEN task_type = $4 AND state = $5 T` |
+| 13035 | 4.0 | 800 | 800 | `UPDATE "harvest_task_queue" SET "state" = $1, "output" = $2, "heartbeat_details" = $3, "error" = $4, "completed_at" = $5 WHERE (("` |
+| 11115 | 3.4 | 1600 | 9500 | `SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_events"."event_type", "ha` |
+| 9605 | 3.0 | 3200 | 3200 | `SELECT $2 FROM ONLY "public"."harvest_workflow_executions" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x` |
+| 7450 | 2.3 | 1500 | 0 | `UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7) WHERE id = $1 AND ` |
+| 4595 | 1.4 | 1400 | 1900 | `SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_events"."event_type", "ha` |
+
+### Top 10 by calls
+
+| calls | % | buffers | statement |
+|--:|--:|--:|---|
+| 5465 | 9.7 | 0 | `SELECT $1` |
+| 4429 | 7.8 | 0 | `COMMIT` |
+| 3200 | 5.7 | 9605 | `SELECT $2 FROM ONLY "public"."harvest_workflow_executions" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x` |
+| 2829 | 5.0 | 0 | `BEGIN` |
+| 2100 | 3.7 | 41730 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4) RETURNING txid_c` |
+| 1761 | 3.1 | 153 | `WITH g AS MATERIALIZED (SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notification_que` |
+| 1600 | 2.8 | 0 | `BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED` |
+| 1600 | 2.8 | 11115 | `SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_events"."event_type", "ha` |
+| 1512 | 2.7 | 0 | `SET LOCAL enable_bitmapscan = off` |
+| 1512 | 2.7 | 0 | `SET LOCAL enable_sort = off` |
+
+### Top 10 by WAL bytes
+
+| WAL bytes | calls | statement |
+|--:|--:|---|
+| 1840716 | 2100 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4) RETURNING txid_c` |
+| 1130284 | 1512 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_qu` |
+| 804078 | 700 | `UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, scheduled_at = $2, created_at = clock_timestamp(), acti` |
+| 612827 | 600 | `INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "p` |
+| 501990 | 800 | `UPDATE "harvest_task_queue" SET "state" = $1, "output" = $2, "heartbeat_details" = $3, "error" = $4, "completed_at" = $5 WHERE (("` |
+| 415256 | 700 | `WITH candidate AS ( SELECT id, wake_requested FROM harvest_task_queue WHERE id = $1 AND (CASE WHEN task_type = $4 AND state = $5 T` |
+| 264808 | 200 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "shard_id", "input", "parent_id", "queue_name", "` |
+| 213510 | 200 | `UPDATE "harvest_workflow_executions" SET "state" = $1, "output" = $2, "error" = $3, "sticky_worker_id" = $4, "completed_at" = $5, ` |
+| 192598 | 200 | `INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "p` |
+| 137499 | 200 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4)` |
+
+### Mutex statements
+
+| buffers | calls | rows | WAL bytes | statement |
+|--:|--:|--:|--:|---|
+| 4407 | 200 | 0 | 57 | `SELECT $2 AS part, lock_key FROM harvest_mutex_locks WHERE holder_exec_id = $1 UNION ALL SELECT DISTINCT $3 AS part, lock_key FROM` |
+| 2210 | 300 | 200 | 57948 | `UPDATE harvest_mutex_locks SET lease_expires_at = now() + make_interval(secs => $2) WHERE holder_exec_id = $1` |
+| 1564 | 100 | 100 | 37656 | `INSERT INTO harvest_mutex_locks (lock_key, holder_exec_id, lock_seq, acquired_at, lease_expires_at) SELECT $1, $2, nextval($4), no` |
+| 1286 | 100 | 100 | 38597 | `INSERT INTO harvest_mutex_waiters (lock_key, waiter_exec_id, requested_at) VALUES ($1, $2, now()) ON CONFLICT (lock_key, waiter_ex` |
+| 503 | 100 | 100 | 5885 | `DELETE FROM harvest_mutex_locks WHERE lock_key = $1 AND holder_exec_id = $2 AND lock_seq = $3 RETURNING acquired_at` |
+| 400 | 100 | 100 | 5400 | `DELETE FROM harvest_mutex_waiters WHERE lock_key = $1 AND waiter_exec_id = $2` |
+| 300 | 100 | 0 | 0 | `SELECT waiter_exec_id FROM harvest_mutex_waiters WHERE lock_key = $1 ORDER BY id ASC LIMIT $2` |
+| 91 | 88 | 0 | 0 | `SELECT l.lock_key FROM harvest_mutex_locks l WHERE l.lease_expires_at < now() AND NOT EXISTS ( SELECT $1 FROM harvest_workflow_exe` |
+
+Statements with temp blocks written: 0
+
+`idx_harvest_mutex_waiters_waiter` idx_scan over the workload: 0
+
+## 10000 fixture waiters, `without` arm
+
+Fixture: 10000 live waiter rows, 2000 lock rows, 187 heap pages, 8000 hot-key waiters, deepest key 1778 rows, indexes: harvest_mutex_waiters_lock_key_waiter_exec_id_key 1548288, harvest_mutex_waiters_pkey 466944, idx_harvest_mutex_waiters_key_id 1335296
+
+Runs completed 200 of 200, mutex rows left by the runs 0, fixture digest after the sample sweep `67bb29bcf6f20563d2f9e86df539081c`, window 6586 ms
+
+| total buffers | total calls | WAL bytes | temp blocks written | mutex write WAL bytes |
+|--:|--:|--:|--:|--:|
+| 358355 | 56516 | 6467413 | 0 | 155666 |
+
+Waiter key read: 37800 buffers (10.5% of buffers), 200 calls (0.4% of calls), 189.0 buffers per call, 189.0 buffers per run.
+
+### Top 10 by buffers
+
+| buffers | % | calls | rows | statement |
+|--:|--:|--:|--:|---|
+| 119829 | 33.4 | 1510 | 1510 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_qu` |
+| 39612 | 11.1 | 2100 | 2100 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4) RETURNING txid_c` |
+| 37800 | 10.5 | 200 | 0 | `SELECT $2 AS part, lock_key FROM harvest_mutex_locks WHERE holder_exec_id = $1 UNION ALL SELECT DISTINCT $3 AS part, lock_key FROM` |
+| 19146 | 5.3 | 700 | 700 | `UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, scheduled_at = $2, created_at = clock_timestamp(), acti` |
+| 16758 | 4.7 | 600 | 600 | `INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "p` |
+| 15151 | 4.2 | 700 | 700 | `WITH candidate AS ( SELECT id, wake_requested FROM harvest_task_queue WHERE id = $1 AND (CASE WHEN task_type = $4 AND state = $5 T` |
+| 12936 | 3.6 | 800 | 800 | `UPDATE "harvest_task_queue" SET "state" = $1, "output" = $2, "heartbeat_details" = $3, "error" = $4, "completed_at" = $5 WHERE (("` |
+| 11211 | 3.1 | 1600 | 9500 | `SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_events"."event_type", "ha` |
+| 9600 | 2.7 | 3200 | 3200 | `SELECT $2 FROM ONLY "public"."harvest_workflow_executions" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x` |
+| 7454 | 2.1 | 1500 | 0 | `UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7) WHERE id = $1 AND ` |
+
+### Top 10 by calls
+
+| calls | % | buffers | statement |
+|--:|--:|--:|---|
+| 5478 | 9.7 | 0 | `SELECT $1` |
+| 4427 | 7.8 | 0 | `COMMIT` |
+| 3200 | 5.7 | 9600 | `SELECT $2 FROM ONLY "public"."harvest_workflow_executions" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x` |
+| 2829 | 5.0 | 0 | `BEGIN` |
+| 2100 | 3.7 | 39612 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4) RETURNING txid_c` |
+| 1777 | 3.1 | 102 | `WITH g AS MATERIALIZED (SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notification_que` |
+| 1600 | 2.8 | 11211 | `SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_events"."event_type", "ha` |
+| 1598 | 2.8 | 0 | `BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED` |
+| 1510 | 2.7 | 0 | `SET LOCAL enable_bitmapscan = off` |
+| 1510 | 2.7 | 0 | `SET LOCAL enable_sort = off` |
+
+### Top 10 by WAL bytes
+
+| WAL bytes | calls | statement |
+|--:|--:|---|
+| 1814949 | 2100 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4) RETURNING txid_c` |
+| 1135415 | 1510 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_qu` |
+| 801616 | 700 | `UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, scheduled_at = $2, created_at = clock_timestamp(), acti` |
+| 619763 | 600 | `INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "p` |
+| 496983 | 800 | `UPDATE "harvest_task_queue" SET "state" = $1, "output" = $2, "heartbeat_details" = $3, "error" = $4, "completed_at" = $5 WHERE (("` |
+| 407309 | 700 | `WITH candidate AS ( SELECT id, wake_requested FROM harvest_task_queue WHERE id = $1 AND (CASE WHEN task_type = $4 AND state = $5 T` |
+| 264856 | 200 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "shard_id", "input", "parent_id", "queue_name", "` |
+| 213557 | 200 | `UPDATE "harvest_workflow_executions" SET "state" = $1, "output" = $2, "error" = $3, "sticky_worker_id" = $4, "completed_at" = $5, ` |
+| 192598 | 200 | `INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "p` |
+| 137499 | 200 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4)` |
+
+### Mutex statements
+
+| buffers | calls | rows | WAL bytes | statement |
+|--:|--:|--:|--:|---|
+| 37800 | 200 | 0 | 2915 | `SELECT $2 AS part, lock_key FROM harvest_mutex_locks WHERE holder_exec_id = $1 UNION ALL SELECT DISTINCT $3 AS part, lock_key FROM` |
+| 3008 | 300 | 200 | 65892 | `UPDATE harvest_mutex_locks SET lease_expires_at = now() + make_interval(secs => $2) WHERE holder_exec_id = $1` |
+| 2002 | 100 | 100 | 38900 | `INSERT INTO harvest_mutex_locks (lock_key, holder_exec_id, lock_seq, acquired_at, lease_expires_at) SELECT $1, $2, nextval($4), no` |
+| 1310 | 100 | 100 | 38597 | `INSERT INTO harvest_mutex_waiters (lock_key, waiter_exec_id, requested_at) VALUES ($1, $2, now()) ON CONFLICT (lock_key, waiter_ex` |
+| 600 | 100 | 100 | 5792 | `DELETE FROM harvest_mutex_locks WHERE lock_key = $1 AND holder_exec_id = $2 AND lock_seq = $3 RETURNING acquired_at` |
+| 400 | 100 | 100 | 6485 | `DELETE FROM harvest_mutex_waiters WHERE lock_key = $1 AND waiter_exec_id = $2` |
+| 300 | 100 | 0 | 0 | `SELECT waiter_exec_id FROM harvest_mutex_waiters WHERE lock_key = $1 ORDER BY id ASC LIMIT $2` |
+| 179 | 88 | 0 | 0 | `SELECT l.lock_key FROM harvest_mutex_locks l WHERE l.lease_expires_at < now() AND NOT EXISTS ( SELECT $1 FROM harvest_workflow_exe` |
+
+Statements with temp blocks written: 0
+
+`idx_harvest_mutex_waiters_waiter` idx_scan over the workload: 0
+
+## 100000 fixture waiters, `without` arm
+
+Fixture: 100000 live waiter rows, 20000 lock rows, 1870 heap pages, 80000 hot-key waiters, deepest key 17650 rows, indexes: harvest_mutex_waiters_lock_key_waiter_exec_id_key 15458304, harvest_mutex_waiters_pkey 4513792, idx_harvest_mutex_waiters_key_id 14196736
+
+Runs completed 200 of 200, mutex rows left by the runs 0, fixture digest after the sample sweep `2d48ebe4207a66335e086ac20aaa0731`, window 6602 ms
+
+| total buffers | total calls | WAL bytes | temp blocks written | mutex write WAL bytes |
+|--:|--:|--:|--:|--:|
+| 702125 | 56324 | 6488540 | 0 | 153116 |
+
+Waiter key read: 374400 buffers (53.3% of buffers), 200 calls (0.4% of calls), 1872.0 buffers per call, 1872.0 buffers per run.
+
+### Top 10 by buffers
+
+| buffers | % | calls | rows | statement |
+|--:|--:|--:|--:|---|
+| 374400 | 53.3 | 200 | 0 | `SELECT $2 AS part, lock_key FROM harvest_mutex_locks WHERE holder_exec_id = $1 UNION ALL SELECT DISTINCT $3 AS part, lock_key FROM` |
+| 121546 | 17.3 | 1512 | 1512 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_qu` |
+| 40328 | 5.7 | 2100 | 2100 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4) RETURNING txid_c` |
+| 19431 | 2.8 | 701 | 701 | `UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, scheduled_at = $2, created_at = clock_timestamp(), acti` |
+| 18132 | 2.6 | 600 | 600 | `INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "p` |
+| 15330 | 2.2 | 701 | 701 | `WITH candidate AS ( SELECT id, wake_requested FROM harvest_task_queue WHERE id = $1 AND (CASE WHEN task_type = $4 AND state = $5 T` |
+| 13071 | 1.9 | 800 | 800 | `UPDATE "harvest_task_queue" SET "state" = $1, "output" = $2, "heartbeat_details" = $3, "error" = $4, "completed_at" = $5 WHERE (("` |
+| 11398 | 1.6 | 1600 | 9500 | `SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_events"."event_type", "ha` |
+| 9600 | 1.4 | 3200 | 3200 | `SELECT $2 FROM ONLY "public"."harvest_workflow_executions" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x` |
+| 7485 | 1.1 | 1501 | 0 | `UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7) WHERE id = $1 AND ` |
+
+### Top 10 by calls
+
+| calls | % | buffers | statement |
+|--:|--:|--:|---|
+| 5421 | 9.6 | 0 | `SELECT $1` |
+| 4409 | 7.8 | 0 | `COMMIT` |
+| 3200 | 5.7 | 9600 | `SELECT $2 FROM ONLY "public"."harvest_workflow_executions" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x` |
+| 2812 | 5.0 | 0 | `BEGIN` |
+| 2100 | 3.7 | 40328 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4) RETURNING txid_c` |
+| 1724 | 3.1 | 153 | `WITH g AS MATERIALIZED (SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notification_que` |
+| 1600 | 2.8 | 11398 | `SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_events"."event_type", "ha` |
+| 1597 | 2.8 | 0 | `BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED` |
+| 1512 | 2.7 | 0 | `SET LOCAL enable_bitmapscan = off` |
+| 1512 | 2.7 | 0 | `SET LOCAL enable_sort = off` |
+
+### Top 10 by WAL bytes
+
+| WAL bytes | calls | statement |
+|--:|--:|---|
+| 1807794 | 2100 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4) RETURNING txid_c` |
+| 1147810 | 1512 | `WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_qu` |
+| 809662 | 701 | `UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, scheduled_at = $2, created_at = clock_timestamp(), acti` |
+| 621343 | 600 | `INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "p` |
+| 496515 | 800 | `UPDATE "harvest_task_queue" SET "state" = $1, "output" = $2, "heartbeat_details" = $3, "error" = $4, "completed_at" = $5 WHERE (("` |
+| 419750 | 701 | `WITH candidate AS ( SELECT id, wake_requested FROM harvest_task_queue WHERE id = $1 AND (CASE WHEN task_type = $4 AND state = $5 T` |
+| 264808 | 200 | `INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "shard_id", "input", "parent_id", "queue_name", "` |
+| 214111 | 200 | `UPDATE "harvest_workflow_executions" SET "state" = $1, "output" = $2, "error" = $3, "sticky_worker_id" = $4, "completed_at" = $5, ` |
+| 192598 | 200 | `INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "p` |
+| 137499 | 200 | `INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4)` |
+
+### Mutex statements
+
+| buffers | calls | rows | WAL bytes | statement |
+|--:|--:|--:|--:|---|
+| 374400 | 200 | 0 | 0 | `SELECT $2 AS part, lock_key FROM harvest_mutex_locks WHERE holder_exec_id = $1 UNION ALL SELECT DISTINCT $3 AS part, lock_key FROM` |
+| 3005 | 300 | 200 | 57626 | `UPDATE harvest_mutex_locks SET lease_expires_at = now() + make_interval(secs => $2) WHERE holder_exec_id = $1` |
+| 2232 | 101 | 100 | 45910 | `INSERT INTO harvest_mutex_locks (lock_key, holder_exec_id, lock_seq, acquired_at, lease_expires_at) SELECT $1, $2, nextval($4), no` |
+| 1870 | 1 | 1 | 0 | `select count(*) from harvest_mutex_waiters` |
+| 1256 | 101 | 100 | 38597 | `INSERT INTO harvest_mutex_waiters (lock_key, waiter_exec_id, requested_at) VALUES ($1, $2, now()) ON CONFLICT (lock_key, waiter_ex` |
+| 602 | 100 | 100 | 5583 | `DELETE FROM harvest_mutex_locks WHERE lock_key = $1 AND holder_exec_id = $2 AND lock_seq = $3 RETURNING acquired_at` |
+| 500 | 100 | 100 | 5400 | `DELETE FROM harvest_mutex_waiters WHERE lock_key = $1 AND waiter_exec_id = $2` |
+| 400 | 100 | 1 | 0 | `SELECT waiter_exec_id FROM harvest_mutex_waiters WHERE lock_key = $1 ORDER BY id ASC LIMIT $2` |
+| 173 | 85 | 0 | 0 | `SELECT l.lock_key FROM harvest_mutex_locks l WHERE l.lease_expires_at < now() AND NOT EXISTS ( SELECT $1 FROM harvest_workflow_exe` |
+| 8 | 1 | 1 | 0 | `SELECT NOT EXISTS ( SELECT $3 FROM harvest_mutex_waiters w WHERE w.lock_key = $1 AND w.id < (SELECT id FROM harvest_mutex_waiters ` |
+
+Statements with temp blocks written: 0
+
+`idx_harvest_mutex_waiters_waiter` idx_scan over the workload: 0
+
