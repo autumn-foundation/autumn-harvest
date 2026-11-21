@@ -1,4 +1,4 @@
-# Claim slots (issue #2421)
+# Claim slots
 
 Each worker caps its own claims with `max_concurrent_claims`. A shard can
 still see `workers × max_concurrent_claims` claim statements at once. Claim
