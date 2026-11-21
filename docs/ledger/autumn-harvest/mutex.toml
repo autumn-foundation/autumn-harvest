@@ -91,7 +91,7 @@ driver = "per_task"
 backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_mutex_locks", "harvest_mutex_waiters"]
-measured = "docs/performance-hot-path-round-trips.md"
+measured = "docs/performance-mutex-waiter-holder-scan.md"
 
 ["db_ops::table_present"]
 driver = "setup"

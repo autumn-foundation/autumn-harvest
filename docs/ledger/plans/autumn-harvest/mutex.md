@@ -33,7 +33,7 @@ Statements: 2. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `DELETE FROM harvest_mutex_waiters WHERE lock_key = $1 AND waiter_exec_id = $2` | `harvest_mutex_waiters`: Index Scan on `harvest_mutex_waiters_lock_key_waiter_exec_id_key`<br>`harvest_mutex_waiters`: ModifyTable |
-| 2 | `SELECT DISTINCT lock_key FROM harvest_mutex_waiters WHERE waiter_exec_id = $1 ORDER BY lock_key` | `harvest_mutex_waiters`: Bitmap Heap Scan on `harvest_mutex_waiters_lock_key_waiter_exec_id_key` |
+| 2 | `SELECT DISTINCT lock_key FROM harvest_mutex_waiters WHERE waiter_exec_id = $1 ORDER BY lock_key` | `harvest_mutex_waiters`: Bitmap Heap Scan on `idx_harvest_mutex_waiters_waiter` |
 
 ## `db_ops::head_of_line`
 

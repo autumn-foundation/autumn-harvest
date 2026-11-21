@@ -697,6 +697,41 @@ fn report(
     out
 }
 
+/// The key read probes the waiter index on a 10,000-waiter fixture.
+///
+/// A seq scan of the waiter heap here means that the index is gone, or that
+/// the key read no longer filters on `waiter_exec_id` alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_key_read_probes_the_waiter_index() {
+    let (admin, _guard) = setup_server().await;
+    let name = format!("mutex_waiter_plan_{}", uuid::Uuid::new_v4().simple());
+    connect(&admin)
+        .await
+        .batch_execute(&format!("CREATE DATABASE \"{name}\""))
+        .await
+        .expect("create the database");
+    let url = db_url(&admin, &name);
+    let mut conn = connect(&url).await;
+    conn.batch_execute(&autumn_harvest::test_init_sql())
+        .await
+        .expect("apply the migration bundle");
+    seed(&mut conn, 10_000).await;
+    let plans = explain(&mut conn).await;
+    drop(conn);
+    drop_db(&admin, &name).await;
+    assert!(
+        !plans.contains("Seq Scan on public.harvest_mutex_waiters"),
+        "the key read must not scan the waiter heap:\n{plans}"
+    );
+    assert_eq!(
+        plans
+            .matches(&format!("Index Scan using {WAITER_INDEX}"))
+            .count(),
+        3,
+        "each explained key read must probe the waiter index:\n{plans}"
+    );
+}
+
 /// The verdict line over both arms of every size.
 ///
 /// Each size needs both arms, and the two digests of a size must match.
