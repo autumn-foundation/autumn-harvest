@@ -672,6 +672,8 @@ pub mod schedule_override;
 pub mod schedule_patch;
 /// Backend-neutral cron and interval slot arithmetic (issue #2031).
 pub mod schedule_plan;
+/// Schedule stagger planner: fixed delays that break up schedule herds.
+pub mod schedule_stagger;
 #[cfg(feature = "db")]
 pub mod scheduler;
 #[cfg(feature = "db")]
