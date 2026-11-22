@@ -27657,15 +27657,24 @@ async fn process_workflow_task(
         let mut history_lent = false;
         let workflow_drive = async {
             if let Some(resident) = warm_resident.take() {
+                // The resident workflow holds no events of its own. It
+                // borrows the history for this drive, takes the delta with
+                // no copy, and gives every event back.
                 match resident
-                    .resume_with(
-                        &history_events[prepared.delta_start..],
+                    .resume_lending_with(
+                        &mut history_events,
+                        prepared.delta_start,
                         resident_key.as_ref(),
                         Some(&span_meta),
                     )
                     .await
                 {
-                    Ok(drive) => return drive,
+                    Ok(drive) => return Ok(drive),
+                    // The history did not come back, so no replay can run
+                    // from it. See the cold drive below.
+                    Err(crate::resident::ResumeDeclined::HistoryNotReturned) => {
+                        return Err(history_not_returned());
+                    }
                     Err(reason) => {
                         resident_outcome = Some(ResidentOutcome::Declined);
                         tracing::debug!(
@@ -27717,14 +27726,14 @@ async fn process_workflow_task(
                 run_first,
             });
             ctx.lend_history();
-            crate::executor::drive_workflow_keep(
+            Ok(crate::executor::drive_workflow_keep(
                 ctx,
                 workflow.handler,
                 handler_input,
                 Some(&span_meta),
                 resident_key.clone(),
             )
-            .await
+            .await)
         };
         // Clone the worker's configured policy — allowlist, queue-override
         // switch, capability grant, decide budget — and stamp the per-execution
@@ -27747,6 +27756,7 @@ async fn process_workflow_task(
         };
         #[cfg(not(feature = "hot-code-swap"))]
         let drive = workflow_drive.await;
+        let drive = drive?;
         let crate::executor::DriveResult {
             outcome: run_outcome,
             pending: pending_cmds,
@@ -27762,11 +27772,7 @@ async fn process_workflow_task(
             // appends. So a missing history is a broken invariant. No path
             // below is safe without the history, so the task fails here and
             // a later attempt loads the history again.
-            history_events = returned_history.ok_or_else(|| {
-                HarvestError::Dispatch(
-                    "the replay did not return the history that the worker lent".to_string(),
-                )
-            })?;
+            history_events = returned_history.ok_or_else(history_not_returned)?;
         }
         // Issue #2257: stop the clock at the end of the drive, before any
         // write below.
@@ -30137,6 +30143,17 @@ const fn cache_update_after_persist(
         Some(_) if deferred_cancel_ended_run => Some(false),
         other => other,
     }
+}
+
+/// The error of a drive that did not give back the history that the worker
+/// lent to it.
+///
+/// The worker and a resident workflow share one history. A drive borrows it
+/// and returns it. A drive that does not is a broken invariant, and no
+/// persist path is safe without the history. So the task fails, and a later
+/// attempt loads the history again.
+fn history_not_returned() -> HarvestError {
+    HarvestError::Dispatch("the replay did not return the history that the worker lent".to_string())
 }
 
 #[allow(clippy::too_many_arguments)]

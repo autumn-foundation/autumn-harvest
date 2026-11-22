@@ -208,7 +208,7 @@ The cache size is configured via `WorkerConfig::workflow_cache_size` (default: 1
 
 **Memory.** The cache is on by default. Each entry holds the full decoded history of one execution, with offloaded payloads loaded back in. The bound is an entry count, not a byte count. A worker that runs many long histories can use a lot of memory. Lower `workflow_cache_size` for such a worker. Decoded payloads stay in memory until the entry is evicted.
 
-A resident entry also holds the parked handler future and its context. The context keeps its own copy of the history, so a resident entry holds two copies. Turn off resident workflows to drop the second copy.
+A resident entry also holds the parked handler future and its context. The context holds no history between two decisions. Each decision lends it the history of the entry and takes that history back, so a resident entry holds one copy ([`performance-cold-decision-lent-history.md`](performance-cold-decision-lent-history.md)).
 
 ## Interaction with other features
 

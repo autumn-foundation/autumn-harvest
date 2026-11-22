@@ -37,6 +37,9 @@ Accepted.
    entry point `run_workflow_lending_history`. The cycle reads the history
    and returns it. The drive no longer gives the executor a deep copy. The
    Postgres worker lends the history of each cold decision the same way.
+6. **A parked run has one history.** The Postgres worker and a resident
+   workflow share the history of the run. The workflow holds no events
+   between two decisions. Each decision lends the history and gets it back.
 
 ## Why each decision is safe
 
@@ -101,17 +104,31 @@ When the matcher gives nothing back, the SQLite drive reads the stored
 history again. Every other caller of the owning entry point keeps it, and
 its matcher still moves each output.
 
-**The lent history of a resident workflow.** The Postgres worker can keep
-a suspended workflow resident (issue #1798). That workflow keeps its
-matcher, so the matcher needs its events after the worker takes the
-history back. The worker gets the whole history, and the matcher keeps a
-copy with no output in each completion that it matched. An owning matcher
-holds those same events, so the resident state is the same as before.
+**The one history of a parked run.** The Postgres worker can keep a
+suspended workflow resident (issue #1798). That workflow keeps its matcher.
 
-A cold drive of the worker always ends with the events that it got. A
-view cut is closed when its poll returns, and only a warm resume appends.
-So the worker treats a history that does not come back as a broken
-invariant. It fails the task, and a later attempt loads the history again.
+- A drive gives every event back, parked or not. The matcher records the
+  count, and it then holds no events.
+- Nothing reads the matcher of a parked workflow. Its future is not
+  polled, and the next decision checks the delta against the parked
+  awaits, which the workflow keeps apart from the matcher.
+- A warm decision lends the history again. The matcher takes it only when
+  the count is the one that it gave back. Another count declines the
+  resume, and the decision replays cold.
+- Each step of a resume takes its events of the delta by a move. The
+  matcher counts them, so it gives the longer history back.
+- The resume puts every event back in the history of the worker, in
+  order, after a success and after a decline.
+
+The check is a count, not a comparison of each event. The worker lends the
+history of the same run, which only grows by appends. So the first events
+of that history are the events that the matcher gave back.
+
+A drive of the worker always ends with the events that it got. A view cut
+is closed when its poll returns, and a warm resume counts each event that
+it appends. So the worker treats a history that does not come back as a
+broken invariant. It fails the task, and a later attempt loads the history
+again.
 
 ## Consequences
 
@@ -128,6 +145,11 @@ invariant. It fails the task, and a later attempt loads the history again.
   connection, or a literal pattern.
 - A new place in the history matcher that changes an event must keep the
   event whole when the matcher is lent, or it must change the event count.
+- A parked run of the Postgres worker holds one history, not two. A warm
+  decision costs 24% to 26% fewer instructions.
+- A resident workflow of the worker resumes only through
+  `resume_lending_with`. New code that reads the matcher of a parked
+  workflow finds no events.
 - A new writer of `harvest_events` on the runtime connection must only
   append. A writer that changes or removes a stored row of a live run must
   clear the cache.
@@ -179,6 +201,11 @@ invariant. It fails the task, and a later attempt loads the history again.
   `a_lent_cycle_matches_an_owned_cycle_and_returns_the_history` compares
   the two entry points. `a_history_that_does_not_come_back_is_read_again`
   covers the drive when the matcher gives nothing back.
-- `a_lent_matcher_keeps_the_copy_of_an_owning_matcher` compares the
-  events that a resident matcher keeps. `assert_warm_matches_cold` drives
-  each resident test workflow with lent cold starts too.
+- `a_released_matcher_takes_its_events_again` and
+  `restore_refuses_events_that_the_matcher_did_not_release` cover the
+  matcher of a parked workflow. `assert_warm_matches_cold` and
+  `assert_arrivals_match_cold` drive each resident test workflow with a
+  lent history too, and compare each returned history with the stored one.
+  `a_workflow_that_shares_its_history_declines_a_resume_with_none` and
+  `a_lent_resume_declines_a_history_that_the_workflow_did_not_give_back`
+  cover the two refusals.

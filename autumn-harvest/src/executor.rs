@@ -2355,8 +2355,9 @@ pub(crate) struct DriveResult {
     /// (issue #2035). The worker wakes the task, so a later cycle runs them.
     #[cfg_attr(not(feature = "db"), allow(dead_code))] // Only the worker reads it.
     pub(crate) updates_deferred: bool,
-    /// The history that the caller lent to the context, unchanged. `None`
-    /// when the context was not lent its history
+    /// The history that the caller lent to the context. A resident cycle
+    /// returns it with the events of its delta on top. `None` when the
+    /// context was not lent its history
     /// ([`WorkflowContext::lend_history`]), or could not give it back whole.
     pub(crate) history: Option<Vec<WorkflowEvent>>,
 }
@@ -2533,14 +2534,12 @@ async fn drive_cycle(
     // as before this fix.
     let router = ctx.resolved_placement_router();
     // A lent history goes back to the caller. A workflow that stays resident
-    // keeps its matcher, so that matcher keeps a copy. Any other handler
-    // future is gone by now, so nothing else reads the matcher. Both calls
-    // return `None` for a context that was not lent its history.
-    let history = if matches!(resident, crate::resident::Residency::Parked(_)) {
-        ctx.reclaim_history_keeping_a_copy()
-    } else {
-        ctx.reclaim_history()
-    };
+    // keeps its matcher with no events, and its driver lends the history
+    // again for the next drive. So a run has one history, not one for the
+    // driver and one for the workflow. Any other handler future is gone by
+    // now, so nothing reads the matcher. A context that was not lent its
+    // history returns `None`.
+    let history = ctx.reclaim_history();
     DriveResult {
         outcome,
         pending,

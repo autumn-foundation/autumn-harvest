@@ -3673,9 +3673,9 @@ mod tests {
         assert_eq!(scope.shared.lock().members.timers, vec![TimerId::new("t")]);
 
         ctx.begin_resident_cycle(
-            &[WorkflowEvent::TimerFired {
+            crate::context::ResidentDelta::Copied(&[WorkflowEvent::TimerFired {
                 timer_id: TimerId::new("t"),
-            }],
+            }]),
             Vec::new(),
         );
 

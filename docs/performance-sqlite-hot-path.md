@@ -246,8 +246,8 @@ on each schedule.
 
 Every other caller of `run_workflow_with_state_history_policy_and_caps`
 keeps that entry point, and its matcher still moves each output. The
-Postgres worker lends its history too. It can keep a workflow resident, so
-it needed one more step.
+Postgres worker lends its history too. It can keep a workflow resident, and
+that workflow shares the one history of its run.
 [`performance-cold-decision-lent-history.md`](performance-cold-decision-lent-history.md)
 measures it.
 

@@ -1195,10 +1195,11 @@ pub struct HistoryMatcher {
     /// (see [`Self::lend_events`]). `None` means that the matcher owns its
     /// events and can move a payload out of them.
     lent_len: Option<usize>,
-    /// The positions of the `ActivityCompleted` events whose output a lent
-    /// matcher copied. An owning matcher would have moved those outputs out.
-    /// See [`Self::reclaim_events_keeping_a_copy`].
-    lent_outputs: Vec<usize>,
+    /// The number of events that [`Self::reclaim_events`] gave back, while
+    /// the matcher holds none of them. A resident workflow keeps such a
+    /// matcher between two decisions (issue #1798), and
+    /// [`Self::restore_events`] fills it again.
+    released_len: Option<usize>,
 }
 
 /// The first `UpdateCompleted` or `UpdateFailed` position of each update.
@@ -1389,7 +1390,7 @@ impl HistoryMatcher {
             activity_scan_index: ActivityScanIndex::default(),
             update_results: std::cell::RefCell::default(),
             lent_len: None,
-            lent_outputs: Vec::new(),
+            released_len: None,
         }
     }
 
@@ -1408,52 +1409,54 @@ impl HistoryMatcher {
     /// Take the lent events back, unchanged.
     ///
     /// Returns `None` when the matcher was not lent its events, or when it
-    /// does not hold exactly the events that it got. A resident append
-    /// ([`Self::append_consumed`]) and an open view cut ([`Self::cut_view`])
-    /// both change the count. The caller then reads the history again from
-    /// its store.
+    /// does not hold exactly the events that it got. A cloning resident
+    /// append ([`Self::append_consumed`]) and an open view cut
+    /// ([`Self::cut_view`]) both change the count. The caller then reads the
+    /// history again from its store.
+    ///
+    /// The matcher holds no event after a successful call. A workflow that
+    /// stays resident keeps such a matcher until [`Self::restore_events`].
+    /// Its positions and its consumed sets stay as they are, so nothing may
+    /// read it in between.
     pub(crate) fn reclaim_events(&mut self) -> Option<Vec<WorkflowEvent>> {
         let lent = self.lent_len.take()?;
-        self.lent_outputs.clear();
-        (self.events.len() == lent).then(|| std::mem::take(&mut self.events))
-    }
-
-    /// Take the lent events back, and keep a copy for a workflow that stays
-    /// resident (issue #1798).
-    ///
-    /// A resident workflow keeps its matcher, so the matcher still needs its
-    /// events. The caller gets the events that it lent. The matcher keeps a
-    /// copy, with no output in each activity completion that it matched.
-    /// Those are the events that an owning matcher holds at the same point:
-    /// it moved each matched output out. So the resident state is the same,
-    /// and the copy is no larger than the one that the caller made before.
-    ///
-    /// The matcher owns its events after this call. Returns `None` in the
-    /// cases of [`Self::reclaim_events`], and then keeps its events as they
-    /// are.
-    pub(crate) fn reclaim_events_keeping_a_copy(&mut self) -> Option<Vec<WorkflowEvent>> {
-        let lent = self.lent_len.take()?;
-        let matched: HashSet<usize> = std::mem::take(&mut self.lent_outputs).into_iter().collect();
         if self.events.len() != lent {
             return None;
         }
-        let copy = self
-            .events
-            .iter()
-            .enumerate()
-            .map(|(index, event)| match event {
-                WorkflowEvent::ActivityCompleted { activity_id, .. }
-                    if matched.contains(&index) =>
-                {
-                    WorkflowEvent::ActivityCompleted {
-                        activity_id: *activity_id,
-                        output: Value::Null,
-                    }
-                }
-                other => other.clone(),
-            })
-            .collect();
-        Some(std::mem::replace(&mut self.events, copy))
+        self.released_len = Some(lent);
+        Some(std::mem::take(&mut self.events))
+    }
+
+    /// True while the matcher holds none of its events, after
+    /// [`Self::reclaim_events`].
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) const fn events_released(&self) -> bool {
+        self.released_len.is_some()
+    }
+
+    /// Lend the events again to a matcher that gave them back.
+    ///
+    /// A resident workflow and its driver share one history this way. The
+    /// driver holds it between two decisions and lends it for each drive.
+    /// `events` must be the events that the matcher gave back, so their count
+    /// must match. A cached history of another length means that the driver
+    /// and the workflow no longer agree.
+    ///
+    /// # Errors
+    ///
+    /// Returns `events` unchanged when the matcher did not give its events
+    /// back, or gave back another number of them.
+    pub(crate) fn restore_events(
+        &mut self,
+        events: Vec<WorkflowEvent>,
+    ) -> Result<(), Vec<WorkflowEvent>> {
+        if self.released_len != Some(events.len()) || !self.events.is_empty() {
+            return Err(events);
+        }
+        self.released_len = None;
+        self.lent_len = Some(events.len());
+        self.events = events;
+        Ok(())
     }
 
     /// Appends events that a resident workflow consumed live (issue #1798).
@@ -1468,6 +1471,20 @@ impl HistoryMatcher {
             self.events.push(event.clone());
         }
         self.cursor = self.events.len();
+    }
+
+    /// [`Self::append_consumed`] for a matcher that was lent its events. It
+    /// takes the new events and makes no copy of them. They join the lent
+    /// events, so [`Self::reclaim_events`] gives them back too.
+    pub(crate) fn append_consumed_owned(&mut self, events: Vec<WorkflowEvent>) {
+        for event in events {
+            self.consumed_out_of_order_events.insert(self.events.len());
+            self.events.push(event);
+        }
+        self.cursor = self.events.len();
+        if self.lent_len.is_some() {
+            self.lent_len = Some(self.events.len());
+        }
     }
 
     /// Whether a non-blocking claim probed `signal_name` with a scan window
@@ -2357,14 +2374,6 @@ impl HistoryMatcher {
             return self.rewind_open_activity(activity_id, first_interleaved_command);
         };
         let lent = self.lent_len.is_some();
-        if lent
-            && matches!(
-                self.events[terminal_cursor],
-                WorkflowEvent::ActivityCompleted { .. }
-            )
-        {
-            self.lent_outputs.push(terminal_cursor);
-        }
         let result = match &mut self.events[terminal_cursor] {
             // Take the recorded output. Do not clone it. `settle_terminal`
             // reads only `activity_id` from this event. No other production
@@ -8102,51 +8111,63 @@ mod tests {
         assert_eq!(stored_form(&returned), lent);
     }
 
-    /// A workflow that stays resident keeps its matcher. The caller gets the
-    /// lent events back whole. The matcher keeps what an owning matcher
-    /// holds. The completion that it matched has no output, and each other
-    /// event is as it was.
+    /// A workflow that stays resident keeps its matcher with no events. The
+    /// driver lends them again for the next drive, with the new events on
+    /// top, and gets them all back.
     #[test]
-    fn a_lent_matcher_keeps_the_copy_of_an_owning_matcher() {
+    fn a_released_matcher_takes_its_events_again() {
         let output = serde_json::json!({"email_id": "msg-001"});
-        let (_first, mut events) = activity_completed_events("send_email", output.clone());
-        let (_second, later) = activity_completed_events("log_email", serde_json::json!("kept"));
-        events.extend(later);
+        let (_first, events) = activity_completed_events("send_email", output.clone());
+        let (second, later) = activity_completed_events("log_email", serde_json::json!("kept"));
         let lent_form = stored_form(&events);
 
-        let mut owned = HistoryMatcher::new(events.clone());
-        let _ = owned.match_activity("send_email");
-
-        let mut lent = HistoryMatcher::new(events);
-        lent.lend_events();
-        let result = lent.match_activity("send_email");
-        assert_eq!(result, HistoryMatch::Matched { output });
-        let returned = lent
-            .reclaim_events_keeping_a_copy()
-            .expect("the events come back");
-
-        assert_eq!(stored_form(&returned), lent_form, "whole for the caller");
+        let mut matcher = HistoryMatcher::new(events);
+        matcher.lend_events();
         assert_eq!(
-            stored_form(&lent.events),
-            stored_form(&owned.events),
-            "the matcher keeps what an owning matcher holds",
+            matcher.match_activity("send_email"),
+            HistoryMatch::Matched { output }
         );
-        assert_eq!(lent.position(), owned.position());
-        assert!(lent.reclaim_events().is_none(), "the matcher owns its copy");
-        // The matcher is an owning one again, so the next match moves.
-        assert_eq!(
-            lent.match_activity("log_email"),
-            HistoryMatch::Matched {
-                output: serde_json::json!("kept")
-            },
-        );
+        let held = matcher.reclaim_events().expect("the events come back");
+        assert!(matcher.events_released());
+        assert!(matcher.events.is_empty());
+        let position = matcher.position();
+
+        matcher.restore_events(held).expect("the same events fit");
+        assert!(!matcher.events_released());
+        assert_eq!(matcher.position(), position, "the cursor did not move");
+        matcher.append_consumed_owned(later);
+        assert_eq!(matcher.position(), 4, "the new events are consumed");
+
+        let returned = matcher.reclaim_events().expect("all events come back");
+        assert_eq!(stored_form(&returned[..2]), lent_form);
         assert!(matches!(
-            &lent.events[3],
-            WorkflowEvent::ActivityCompleted { output, .. } if output.is_null()
+            &returned[3],
+            WorkflowEvent::ActivityCompleted { activity_id, output }
+                if *activity_id == second && output == "kept"
         ));
     }
 
-    /// A resident append adds events that the caller did not lend.
+    /// A released matcher takes only the events that it gave back. A history
+    /// of another length, or a matcher that holds its events, refuses.
+    #[test]
+    fn restore_refuses_events_that_the_matcher_did_not_release() {
+        let (_id, events) = activity_completed_events("send_email", Value::Null);
+
+        let mut owning = HistoryMatcher::new(events.clone());
+        assert!(!owning.events_released());
+        let refused = owning.restore_events(events.clone()).unwrap_err();
+        assert_eq!(refused.len(), events.len(), "the events come back");
+
+        let mut released = HistoryMatcher::new(events);
+        released.lend_events();
+        let held = released.reclaim_events().expect("the events come back");
+        let shorter = held[..1].to_vec();
+        assert_eq!(released.restore_events(shorter).unwrap_err().len(), 1);
+        assert!(released.events_released(), "a refusal changes nothing");
+        released.restore_events(held).expect("the full events fit");
+    }
+
+    /// A cloning resident append adds events that the caller did not lend.
     #[test]
     fn a_lent_matcher_returns_nothing_after_an_append() {
         let (id, events) = activity_completed_events("send_email", Value::Null);
