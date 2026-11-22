@@ -36,6 +36,7 @@ use serde_json::Value;
 
 use crate::error::{SqliteError, SqliteResult};
 use crate::external_task::{ExternalHandoff, ExternalHandoffFilter, ExternalTaskState};
+use crate::history_cache::{DEFAULT_HISTORY_CACHE_BYTES, HistoryCache, LoadedHistory};
 use crate::history_cap::{CapCheck, HistoryCapReason};
 use crate::llm_ledger::LlmLedgerRow;
 use crate::lock::WriterLock;
@@ -490,6 +491,9 @@ pub struct SqliteRuntime {
     /// Whether a claim commit is synced. The open sets it from the journal
     /// mode. See [`ClaimSync`].
     claim_sync: ClaimSync,
+    /// The warm history of each run that a drive read last. See
+    /// [`history_cache`](crate::history_cache).
+    history_cache: HistoryCache,
 }
 
 impl Drop for SqliteRuntime {
@@ -688,6 +692,7 @@ impl SqliteRuntime {
             signal_handlers: HashMap::new(),
             schedules_enabled: true,
             claim_sync,
+            history_cache: HistoryCache::new(DEFAULT_HISTORY_CACHE_BYTES),
         })
     }
 
@@ -821,6 +826,18 @@ impl SqliteRuntime {
     #[must_use]
     pub const fn history_byte_hard_cap(&self) -> Option<u64> {
         self.history_policy.byte_hard_cap()
+    }
+
+    /// Set how many bytes of stored history the runtime keeps warm between
+    /// decision cycles. Zero turns the cache off.
+    ///
+    /// The default is [`DEFAULT_HISTORY_CACHE_BYTES`]. A warm run costs one
+    /// cycle only the events that the last cycle added. A run outside the
+    /// cache reads its whole history on each cycle. The budget counts stored
+    /// JSON, and the parsed events take a few times that in memory. A lower
+    /// budget drops the least recently driven runs at once.
+    pub fn set_history_cache_bytes(&mut self, bytes: u64) {
+        self.history_cache.set_budget(bytes);
     }
 
     /// Set the stored-history byte cap per run (issue #2023). `None` removes
@@ -2893,6 +2910,9 @@ impl SqliteRuntime {
         now: Timestamp,
         policy: &PurgePolicy,
     ) -> SqliteResult<PurgeReport> {
+        // A purge removes stored events. The tail check of the cache sees
+        // that too. This keeps the cache right with no such check.
+        self.history_cache.clear();
         retention::purge_with(&mut self.conn, now.as_microsecond(), policy)
     }
 
@@ -2937,6 +2957,7 @@ impl SqliteRuntime {
     ) -> SqliteResult<u64> {
         let window = i64::try_from(older_than.as_micros()).unwrap_or(i64::MAX);
         let cutoff = now.as_microsecond().saturating_sub(window);
+        self.history_cache.clear();
         retention::purge_terminal(&mut self.conn, cutoff)
     }
 
@@ -3944,18 +3965,52 @@ impl SqliteRuntime {
             return Ok(RunState::WaitingTimer);
         }
 
-        // Plan every staged signal before replay (issue #2020). Replay reads
-        // the planned events in memory. Each persisting transaction below
-        // applies the plan first, so a discarded cycle consumes no signal.
-        // The plan stops at the room the history caps leave.
-        let (mut history, history_bytes) = store::load_history_sized(&self.conn, exec)?;
+        // The history comes from the warm cache when it holds the run. The
+        // cycle gives it back, so the next cycle reads only the new events.
+        // A cached event always came from a committed row, so the cache stays
+        // right after a failed or a discarded cycle too.
+        let mut loaded = self.history_cache.load(&self.conn, exec)?;
+        let result =
+            boxed(|| self.drive_loaded_cycle(exec, now, failure_now, config, &mut loaded)).await;
+        if matches!(
+            result,
+            Ok(RunState::Completed(_)
+                | RunState::Failed(_)
+                | RunState::Cancelled(_)
+                | RunState::Terminated(_)
+                | RunState::TimedOut(_)
+                | RunState::ContinuedAsNew(_))
+        ) {
+            // No drive reads the history of an ended run again.
+            self.history_cache.forget(exec);
+        } else {
+            self.history_cache.keep(exec, loaded);
+        }
+        result
+    }
+
+    /// The rest of one decision cycle, once its history is loaded: plan the
+    /// staged signals, replay the workflow, and persist the outcome.
+    ///
+    /// The cycle adds its planned signal events to `loaded.events`. The
+    /// caller removes them again before it caches the history.
+    #[allow(clippy::too_many_lines)] // one arm per `WorkflowOutcome` variant
+    async fn drive_loaded_cycle(
+        &mut self,
+        exec: ExecutionId,
+        now: i64,
+        failure_now: &(dyn Fn() -> i64 + Send + Sync),
+        config: store::RunConfig,
+        loaded: &mut LoadedHistory,
+    ) -> SqliteResult<RunState> {
+        let history_bytes = loaded.bytes;
         // Issue #2021: a stored cancel request reaches the body through the
         // span meta. The history gets `WorkflowCancelled` only at the seal.
         // A body that ignores the request and keeps working could run forever,
         // so the cleanup may add only a bounded number of events.
         let cancel = store::cancel_request(&self.conn, exec)?;
         if let Some((reason, from)) = &cancel
-            && history.len().saturating_sub(*from) >= CANCEL_CLEANUP_EVENT_BUDGET
+            && loaded.events.len().saturating_sub(*from) >= CANCEL_CLEANUP_EVENT_BUDGET
         {
             return self.seal_cancelled(exec, reason, None, now);
         }
@@ -3965,8 +4020,13 @@ impl SqliteRuntime {
                 Some(from.saturating_add(CANCEL_CLEANUP_EVENT_BUDGET)),
             )
         });
-        let ingest = self.plan_ingest(exec, now, history.len(), history_bytes)?;
-        history.extend(ingest.events().cloned());
+        // Plan every staged signal before replay (issue #2020). Replay reads
+        // the planned events in memory. Each persisting transaction below
+        // applies the plan first, so a discarded cycle consumes no signal.
+        // The plan stops at the room the history caps leave.
+        let ingest = self.plan_ingest(exec, now, loaded.events.len(), history_bytes)?;
+        loaded.events.extend(ingest.events().cloned());
+        let history = &loaded.events;
         let input = store::execution_input(&self.conn, exec)?;
         let workflow_name = store::workflow_name_of(&self.conn, exec)?;
         // Re-read the persisted business `workflow_id` on EVERY cycle (issues #698
