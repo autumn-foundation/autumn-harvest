@@ -477,6 +477,14 @@ name = "replay_profile"
 required-features = ["testing"]
 harness = false
 
+# Deterministic (non-criterion) instruction/allocation-count harness for
+# `ShapeCensus::observe` and `ShapeCensus::judge`. Drive it under
+# `valgrind --tool=callgrind` / `--tool=dhat`.
+[[bench]]
+name = "shape_census_profile"
+required-features = ["testing"]
+harness = false
+
 # Deterministic (non-criterion) instruction/allocation-count profiling harness
 # for `shard_rebalance::history_fingerprint` -- the replay-determinism check
 # `verify_target_copy` runs on both sides of a shard migration.
