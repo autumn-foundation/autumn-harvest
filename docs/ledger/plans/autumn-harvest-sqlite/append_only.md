@@ -20,10 +20,13 @@ The full statement text is in `docs/perf-artifacts/ledger-census/statements.json
 
 ## `with_guard_off`
 
-Statements: 2. Backend: SQLite. Tables with no usable index: `harvest_events`.
+Statements: 5. Backend: SQLite. Tables with no usable index: `harvest_events`.
 
 | # | Statement | Access |
 |---|---|---|
 | 1 | `UPDATE harvest_events SET event_json = '[]'` | `harvest_events`: no usable index |
 | 2 | `UPDATE harvest_events SET event_json = '[]' WHERE exec_id = ?1 AND seq = 0` | `harvest_events`: Search on `sqlite_autoindex_harvest_events_1` |
+| 3 | `UPDATE harvest_events SET event_json = ?1 WHERE exec_id = ?2 AND seq = 0` | `harvest_events`: Search on `sqlite_autoindex_harvest_events_1` |
+| 4 | `UPDATE harvest_events SET event_json = ?1 WHERE seq = 0` | `harvest_events`: no usable index |
+| 5 | `UPDATE harvest_events SET event_json = replace(event_json, '"step":1', '"step":41') WHERE exec_id...` | `harvest_events`: Search on `sqlite_autoindex_harvest_events_1` |
 

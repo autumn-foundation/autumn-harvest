@@ -3425,6 +3425,34 @@
  },
  "docs/ledger/autumn-harvest-sqlite/append_only.toml": {
   "with_guard_off": {
+   "BEGIN DEFERRED": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "COMMIT": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TRIGGER IF NOT EXISTS harvest_events_append_only_ins\nBEFORE INSERT ON harvest_events\nWHEN EXISTS (SELECT 1 FROM harvest_events\nWHERE exec_id = NEW.exec_id AND seq = NEW.seq)\nBEGIN\nSELECT RAISE(ABORT, 'harvest_events is append-only (issue #2031)');\nEND;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TRIGGER IF NOT EXISTS harvest_events_append_only_upd\nBEFORE UPDATE ON harvest_events\nBEGIN\nSELECT RAISE(ABORT, 'harvest_events is append-only (issue #2031)');\nEND;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
    "DROP TRIGGER IF EXISTS harvest_events_append_only_ins;": {
     "backend": "sqlite",
     "literals": [
@@ -3459,6 +3487,339 @@
      {}
     ],
     "types": {}
+   },
+   "UPDATE harvest_events SET event_json = ?1 WHERE exec_id = ?2 AND seq = 0": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "UPDATE harvest_events SET event_json = ?1 WHERE seq = 0": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "UPDATE harvest_events SET event_json = replace(event_json, '\"step\":1', '\"step\":41') WHERE exec_id = ?1 AND event_json LIKE '%ActivityCompleted%' AND event_json LIKE '%\"step\":1%'": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  }
+ },
+ "docs/ledger/autumn-harvest-sqlite/auth.toml": {
+  "SqliteAuthStore::dead_letter_keys": {
+   "SELECT idempotency_key FROM harvest_connector_dead_letters ORDER BY failed_at_us, id": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "SqliteAuthStore::insert_audit": {
+   "INSERT INTO harvest_audit_log (id, occurred_at_us, actor, operation, target_type, target_id, route_or_command, request_id, idempotency_key, status, error_summary, shard_id, source)\nVALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "SqliteAuthStore::insert_dead_letter": {
+   "INSERT INTO harvest_connector_dead_letters (id, binding, stream, coordinates, idempotency_key, workflow_name, reason, detail, attempts, payload, failed_at_us) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT (idempotency_key) DO NOTHING": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "SqliteAuthStore::insert_token": {
+   "INSERT INTO harvest_api_tokens\n(id, name, token_hash, scope, created_at_us, expires_at_us, created_by, tenant)\nVALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "SqliteAuthStore::list_audit": {
+   "SELECT id, occurred_at_us, actor, operation, target_type, target_id, route_or_command, request_id, idempotency_key, status, error_summary, shard_id, source FROM harvest_audit_log\nORDER BY occurred_at_us DESC, id DESC LIMIT ?": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT id, occurred_at_us, actor, operation, target_type, target_id, route_or_command, request_id, idempotency_key, status, error_summary, shard_id, source FROM harvest_audit_log WHERE (occurred_at_us < ? OR (occurred_at_us = ? AND id < ?))\nORDER BY occurred_at_us DESC, id DESC LIMIT ?": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT id, occurred_at_us, actor, operation, target_type, target_id, route_or_command, request_id, idempotency_key, status, error_summary, shard_id, source FROM harvest_audit_log WHERE actor = ? AND operation = ?\nORDER BY occurred_at_us DESC, id DESC LIMIT ?": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT id, occurred_at_us, actor, operation, target_type, target_id, route_or_command, request_id, idempotency_key, status, error_summary, shard_id, source FROM harvest_audit_log WHERE occurred_at_us < ?\nORDER BY occurred_at_us DESC, id DESC LIMIT ?": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT id, occurred_at_us, actor, operation, target_type, target_id, route_or_command, request_id, idempotency_key, status, error_summary, shard_id, source FROM harvest_audit_log WHERE occurred_at_us >= ?\nORDER BY occurred_at_us DESC, id DESC LIMIT ?": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT id, occurred_at_us, actor, operation, target_type, target_id, route_or_command, request_id, idempotency_key, status, error_summary, shard_id, source FROM harvest_audit_log WHERE occurred_at_us >= ? AND occurred_at_us < ?\nORDER BY occurred_at_us DESC, id DESC LIMIT ?": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "SqliteAuthStore::list_tokens": {
+   "SELECT id, name, token_hash, scope, created_at_us, expires_at_us, last_used_at_us, revoked_at_us, created_by, tenant FROM harvest_api_tokens\nORDER BY created_at_us DESC, id DESC": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "SqliteAuthStore::prepare": {
+   "CREATE INDEX IF NOT EXISTS harvest_api_tokens_created_idx\nON harvest_api_tokens (created_at_us DESC);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE INDEX IF NOT EXISTS harvest_audit_actor_idx\nON harvest_audit_log (actor, occurred_at_us DESC);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE INDEX IF NOT EXISTS harvest_audit_occurred_idx\nON harvest_audit_log (occurred_at_us DESC, id DESC);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TABLE IF NOT EXISTS harvest_api_tokens (\nid TEXT PRIMARY KEY,\nname TEXT NOT NULL,\ntoken_hash TEXT NOT NULL UNIQUE,\nscope TEXT NOT NULL CHECK (scope IN ('read', 'mutate', 'admin')),\ncreated_at_us INTEGER NOT NULL,\nexpires_at_us INTEGER,\nlast_used_at_us INTEGER,\nrevoked_at_us INTEGER,\ncreated_by TEXT NOT NULL,\ntenant TEXT\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TABLE IF NOT EXISTS harvest_audit_log (\nid TEXT PRIMARY KEY,\noccurred_at_us INTEGER NOT NULL,\nactor TEXT NOT NULL,\noperation TEXT NOT NULL,\ntarget_type TEXT NOT NULL,\ntarget_id TEXT,\nroute_or_command TEXT NOT NULL,\nrequest_id TEXT,\nidempotency_key TEXT,\nstatus TEXT NOT NULL CHECK (status IN ('succeeded', 'failed')),\nerror_summary TEXT,\nshard_id INTEGER,\nsource TEXT NOT NULL CHECK (source IN ('api', 'cli', 'ui'))\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TABLE IF NOT EXISTS harvest_connector_dead_letters (\nid TEXT PRIMARY KEY,\nbinding TEXT NOT NULL,\nstream TEXT NOT NULL,\ncoordinates TEXT NOT NULL,\nidempotency_key TEXT NOT NULL UNIQUE,\nworkflow_name TEXT NOT NULL,\nreason TEXT NOT NULL,\ndetail TEXT NOT NULL,\nattempts INTEGER NOT NULL,\npayload BLOB NOT NULL,\nfailed_at_us INTEGER NOT NULL\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TRIGGER IF NOT EXISTS harvest_audit_log_immutable_upd\nBEFORE UPDATE ON harvest_audit_log\nBEGIN\nSELECT RAISE(ABORT, 'harvest_audit_log rows do not change (issue #2469)');\nEND;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "PRAGMA busy_timeout = 5000;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "PRAGMA journal_mode = WAL;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "PRAGMA synchronous = FULL;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "SqliteAuthStore::purge_audit_before": {
+   "DELETE FROM harvest_audit_log WHERE occurred_at_us < ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "SqliteAuthStore::revoke_token": {
+   "UPDATE harvest_api_tokens SET revoked_at_us = ?2\nWHERE id = ?1 AND revoked_at_us IS NULL": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "SqliteAuthStore::touch_token": {
+   "UPDATE harvest_api_tokens SET last_used_at_us = ?2 WHERE id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "token_where": {
+   "SELECT id, name, token_hash, scope, created_at_us, expires_at_us, last_used_at_us, revoked_at_us, created_by, tenant FROM harvest_api_tokens WHERE id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT id, name, token_hash, scope, created_at_us, expires_at_us, last_used_at_us, revoked_at_us, created_by, tenant FROM harvest_api_tokens WHERE token_hash = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  }
+ },
+ "docs/ledger/autumn-harvest-sqlite/external_task.toml": {
+  "cancel_pending": {
+   "UPDATE harvest_external_tasks SET state = 'CANCELLED', updated_at = ?2 WHERE exec_id = ?1 AND state = 'PENDING'": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "extend": {
+   "UPDATE harvest_external_tasks SET deadline_at = ?2, updated_at = ?3 WHERE token = ?1 AND state = 'PENDING'": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "UPDATE harvest_timers SET fire_at = ?3 WHERE exec_id = ?1 AND timer_id = ?2 AND fired = 0": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "find": {
+   "SELECT exec_id, activity_id, state, deadline_at FROM harvest_external_tasks WHERE token = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "fire_deadline": {
+   "UPDATE harvest_external_tasks SET state = 'TIMED_OUT', updated_at = deadline_at WHERE token = ?1 AND state = 'PENDING'": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "list": {
+   "SELECT x.token, x.exec_id, e.workflow_id, e.workflow_name, x.activity_id, x.name, x.queue, x.input_json, x.state, x.created_at, x.updated_at, x.deadline_at FROM harvest_external_tasks x JOIN harvest_executions e ON e.exec_id = x.exec_id WHERE (?1 IS NULL OR x.state = ?1) AND (?2 IS NULL OR x.name = ?2) AND (?3 IS NULL OR x.exec_id = ?3) AND (?4 IS NULL OR x.token = ?4) ORDER BY x.deadline_at ASC, x.updated_at DESC, x.token ASC LIMIT ?5": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "record": {
+   "INSERT OR IGNORE INTO harvest_external_tasks (token, exec_id, activity_id, name, queue, input_json, state, created_at, updated_at, deadline_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'PENDING', ?7, ?7, ?8)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "settle": {
+   "UPDATE harvest_external_tasks SET state = ?2, updated_at = ?3 WHERE token = ?1 AND state = 'PENDING'": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  }
+ },
+ "docs/ledger/autumn-harvest-sqlite/fleet_epoch.toml": {
+  "raise_on": {
+   "CREATE TABLE IF NOT EXISTS harvest_fleet_epoch (id INTEGER PRIMARY KEY CHECK (id = 1), epoch INTEGER NOT NULL)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "INSERT INTO harvest_fleet_epoch (id, epoch) VALUES (1, ?1) ON CONFLICT (id) DO UPDATE SET epoch = max(epoch, excluded.epoch)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "read_on": {
+   "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT epoch FROM harvest_fleet_epoch WHERE id = 1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
    }
   }
  },
@@ -3474,6 +3835,40 @@
   },
   "read_from": {
    "SELECT seq, event_json FROM harvest_events WHERE exec_id = ?1 AND seq >= ?2 ORDER BY seq": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  }
+ },
+ "docs/ledger/autumn-harvest-sqlite/history_page.toml": {
+  "has_recorded_at": {
+   "SELECT EXISTS (SELECT 1 FROM pragma_table_info('harvest_events') WHERE name = 'recorded_at')": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "history_page": {
+   "SELECT count(*), max(seq) FROM harvest_events WHERE exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT seq, event_json, NULL FROM harvest_events WHERE exec_id = ?1 AND seq >= ?2 AND (?3 OR json_extract(event_json, '$.type') IN (SELECT value FROM json_each(?4))) ORDER BY seq LIMIT ?5": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT seq, event_json, recorded_at FROM harvest_events WHERE exec_id = ?1 AND seq >= ?2 AND (?3 OR json_extract(event_json, '$.type') IN (SELECT value FROM json_each(?4))) ORDER BY seq LIMIT ?5": {
     "backend": "sqlite",
     "literals": [
      {}
@@ -3626,6 +4021,314 @@
     "types": {}
    },
    "DELETE FROM harvest_mutex_waiters WHERE waiter_exec_id = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  }
+ },
+ "docs/ledger/autumn-harvest-sqlite/operator.toml": {
+  "buffered_signals": {
+   "SELECT name, count(*), min(received_at) FROM harvest_signals WHERE exec_id = ?1 AND delivered = 0 GROUP BY name ORDER BY name": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "children": {
+   "SELECT exec_id, parent_exec_id, workflow_name, workflow_id, state, started_at, closed_at, error, parent_close_policy FROM harvest_executions WHERE parent_exec_id IN (SELECT value FROM json_each(?1)) ORDER BY started_at, rowid LIMIT ?2": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "count": {
+   "SELECT state, workflow_name, count(*) FROM harvest_executions WHERE (?1 IS NULL OR cast(workflow_name as blob) = cast(?1 as blob)) AND (json_array_length(?2) = 0 OR cast(state as blob) IN (SELECT cast(value as blob) FROM json_each(?2))) AND (?3 IS NULL OR (typeof(started_at) = 'integer' AND started_at >= ?3)) AND (?4 IS NULL OR (typeof(started_at) = 'integer' AND started_at <= ?4)) GROUP BY state, workflow_name": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "parents_with_children": {
+   "SELECT DISTINCT parent_exec_id FROM harvest_executions WHERE parent_exec_id IN (SELECT value FROM json_each(?1))": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "pending_tasks": {
+   "SELECT activity_id, name, queue, state, attempt, max_attempts, run_at, scheduled_at, start_to_close_ms, schedule_to_close_at, heartbeat_details, last_error FROM harvest_tasks WHERE exec_id = ?1 AND state IN ('PENDING', 'RUNNING') ORDER BY scheduled_at, seq": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "pending_timers": {
+   "SELECT timer_id, fire_at FROM harvest_timers WHERE exec_id = ?1 AND fired = 0 AND timer_id NOT GLOB '__external_deadline:*' ORDER BY arm_seq": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "timed_history": {
+   "SELECT event_json, recorded_at FROM harvest_events WHERE exec_id = ?1 ORDER BY seq": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  }
+ },
+ "docs/ledger/autumn-harvest-sqlite/overlay_log.toml": {
+  "SqliteOverlayLog::active": {
+   "SELECT o.version, o.body, o.author_kind, o.author, o.created_at_ms\nFROM harvest_agent_overlay_heads h\nJOIN harvest_agent_overlays o ON o.kind = h.kind AND o.version = h.active\nWHERE h.kind = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "SqliteOverlayLog::get": {
+   "SELECT version, body, author_kind, author, created_at_ms FROM harvest_agent_overlays\nWHERE kind = ?1 AND version = ?2": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "SqliteOverlayLog::list": {
+   "SELECT version, body, author_kind, author, created_at_ms FROM harvest_agent_overlays\nWHERE kind = ?1 ORDER BY version": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "SqliteOverlayLog::policy_log": {
+   "SELECT seq, old_body, new_body, actor_kind, actor, changed_at_ms FROM harvest_agent_refine_policies\nWHERE kind = ?1 ORDER BY seq": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "SqliteOverlayLog::prepare": {
+   "PRAGMA foreign_keys = ON;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "activate_in": {
+   "INSERT INTO harvest_agent_overlay_activations\n(kind, seq, from_version, to_version, actor_kind, actor,\nactivated_at_ms)\nSELECT ?1, COALESCE(MAX(seq), 0) + 1, ?2, ?3, ?4, ?5, ?6\nFROM harvest_agent_overlay_activations WHERE kind = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT h.active,\nEXISTS (SELECT 1 FROM harvest_agent_overlays o\nWHERE o.kind = h.kind AND o.version = ?2)\nFROM harvest_agent_overlay_heads h WHERE h.kind = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "UPDATE harvest_agent_overlay_heads SET active = ?2 WHERE kind = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "append_in": {
+   "INSERT INTO harvest_agent_overlay_heads (kind, latest) VALUES (?1, ?2)\nON CONFLICT (kind) DO UPDATE SET latest = excluded.latest": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "INSERT INTO harvest_agent_overlays\n(kind, version, body, author_kind, author, created_at_ms)\nVALUES (?1, ?2, ?3, ?4, ?5, ?6)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT latest FROM harvest_agent_overlay_heads WHERE kind = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "append_policy_in": {
+   "INSERT INTO harvest_agent_refine_policies\n(kind, seq, old_body, new_body, actor_kind, actor, changed_at_ms)\nVALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "apply_schema": {
+   "BEGIN DEFERRED": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TABLE IF NOT EXISTS harvest_agent_overlay_activations (\nkind TEXT NOT NULL CHECK (kind <> ''),\nseq INTEGER NOT NULL CHECK (seq >= 1),\nfrom_version INTEGER CHECK (from_version >= 1),\nto_version INTEGER NOT NULL CHECK (to_version >= 1),\nactor_kind TEXT NOT NULL,\nactor TEXT NOT NULL CHECK (actor <> ''),\nactivated_at_ms INTEGER NOT NULL,\nPRIMARY KEY (kind, seq),\nCHECK (from_version IS NOT to_version)\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TABLE IF NOT EXISTS harvest_agent_overlay_heads (\nkind TEXT PRIMARY KEY,\nlatest INTEGER NOT NULL CHECK (latest >= 1),\nactive INTEGER,\nFOREIGN KEY (kind, active) REFERENCES harvest_agent_overlays (kind, version)\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TABLE IF NOT EXISTS harvest_agent_overlays (\nkind TEXT NOT NULL CHECK (kind <> ''),\nversion INTEGER NOT NULL CHECK (version >= 1),\nbody BLOB NOT NULL,\nauthor_kind TEXT NOT NULL,\nauthor TEXT NOT NULL CHECK (author <> ''),\ncreated_at_ms INTEGER NOT NULL,\nPRIMARY KEY (kind, version)\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TABLE IF NOT EXISTS harvest_agent_refine_policies (\nkind TEXT NOT NULL CHECK (kind <> ''),\nseq INTEGER NOT NULL CHECK (seq >= 1),\nold_body BLOB,\nnew_body BLOB,\nactor_kind TEXT NOT NULL CHECK (actor_kind = 'operator'),\nactor TEXT NOT NULL CHECK (actor <> ''),\nchanged_at_ms INTEGER NOT NULL,\nPRIMARY KEY (kind, seq)\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TRIGGER IF NOT EXISTS harvest_agent_overlay_activations_immutable_ins\nBEFORE INSERT ON harvest_agent_overlay_activations\nWHEN EXISTS (SELECT 1 FROM harvest_agent_overlay_activations\nWHERE kind = NEW.kind AND seq = NEW.seq)\nBEGIN\nSELECT RAISE(ABORT, 'harvest_agent_overlay_activations is append-only (issue #2374)');\nEND;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TRIGGER IF NOT EXISTS harvest_agent_overlay_activations_immutable_upd\nBEFORE UPDATE ON harvest_agent_overlay_activations\nBEGIN\nSELECT RAISE(ABORT, 'harvest_agent_overlay_activations is append-only (issue #2374)');\nEND;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TRIGGER IF NOT EXISTS harvest_agent_overlay_heads_keep_del\nBEFORE DELETE ON harvest_agent_overlay_heads\nBEGIN\nSELECT RAISE(ABORT, 'harvest_agent_overlay_heads keeps its rows (issue #2371)');\nEND;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TRIGGER IF NOT EXISTS harvest_agent_overlays_active_del\nBEFORE DELETE ON harvest_agent_overlays\nWHEN EXISTS (SELECT 1 FROM harvest_agent_overlay_heads\nWHERE kind = OLD.kind AND active = OLD.version)\nBEGIN\nSELECT RAISE(ABORT, 'harvest_agent_overlays keeps its active version (issue #2371)');\nEND;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TRIGGER IF NOT EXISTS harvest_agent_overlays_immutable_ins\nBEFORE INSERT ON harvest_agent_overlays\nWHEN EXISTS (SELECT 1 FROM harvest_agent_overlays\nWHERE kind = NEW.kind AND version = NEW.version)\nBEGIN\nSELECT RAISE(ABORT, 'harvest_agent_overlays is append-only (issue #2371)');\nEND;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TRIGGER IF NOT EXISTS harvest_agent_overlays_immutable_upd\nBEFORE UPDATE ON harvest_agent_overlays\nBEGIN\nSELECT RAISE(ABORT, 'harvest_agent_overlays is append-only (issue #2371)');\nEND;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TRIGGER IF NOT EXISTS harvest_agent_refine_policies_immutable_ins\nBEFORE INSERT ON harvest_agent_refine_policies\nWHEN EXISTS (SELECT 1 FROM harvest_agent_refine_policies\nWHERE kind = NEW.kind AND seq = NEW.seq)\nBEGIN\nSELECT RAISE(ABORT, 'harvest_agent_refine_policies is append-only (issue #2394)');\nEND;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TRIGGER IF NOT EXISTS harvest_agent_refine_policies_immutable_upd\nBEFORE UPDATE ON harvest_agent_refine_policies\nBEGIN\nSELECT RAISE(ABORT, 'harvest_agent_refine_policies is append-only (issue #2394)');\nEND;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "connect_once": {
+   "PRAGMA busy_timeout = 0;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "PRAGMA foreign_keys = ON;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "PRAGMA wal_autocheckpoint = 0;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "PRAGMA wal_autocheckpoint = 1;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "last_move": {
+   "SELECT seq, from_version, to_version, actor_kind, actor, activated_at_ms\nFROM harvest_agent_overlay_activations\nWHERE kind = ?1 ORDER BY seq DESC LIMIT 1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "last_policy_in": {
+   "SELECT seq, old_body, new_body, actor_kind, actor, changed_at_ms FROM harvest_agent_refine_policies\nWHERE kind = ?1 ORDER BY seq DESC LIMIT 1": {
     "backend": "sqlite",
     "literals": [
      {}
@@ -4341,6 +5044,13 @@
      {}
     ],
     "types": {}
+   },
+   "SELECT workflow_name, schedule_json, paused, next_run_at, last_run_at, max_active_runs, input_json, overlap_policy, pause_reason FROM harvest_schedules ORDER BY workflow_name": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
    }
   },
   "load_code": {
@@ -4354,6 +5064,15 @@
   },
   "load_due": {
    "SELECT schedule_json, input_json, overlap_policy, max_active_runs, next_run_at FROM harvest_schedules WHERE workflow_name = ?1 AND paused = 0 AND next_run_at <= ?2": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "load_manual": {
+   "SELECT input_json, overlap_policy, max_active_runs, paused FROM harvest_schedules WHERE workflow_name = ?1": {
     "backend": "sqlite",
     "literals": [
      {}
@@ -4401,7 +5120,21 @@
     ],
     "types": {}
    },
+   "UPDATE harvest_schedules SET paused = 0, next_run_at = ?2, pause_reason = NULL WHERE workflow_name = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
    "UPDATE harvest_schedules SET paused = 1 WHERE workflow_name = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "UPDATE harvest_schedules SET paused = 1, pause_reason = ?2 WHERE workflow_name = ?1": {
     "backend": "sqlite",
     "literals": [
      {}
@@ -4723,6 +5456,13 @@
      {}
     ],
     "types": {}
+   },
+   "INSERT INTO harvest_events (exec_id, seq, event_json, recorded_at) VALUES (?1, ?2, ?3, ?4)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
    }
   },
   "cancel_request": {
@@ -4889,6 +5629,15 @@
   },
   "mark_signal_delivered": {
    "UPDATE harvest_signals SET delivered = 1 WHERE signal_seq = ?1": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "newest_execution_by_key": {
+   "SELECT exec_id FROM harvest_executions WHERE workflow_name = ?1 AND workflow_id = ?2 ORDER BY rowid DESC LIMIT 1": {
     "backend": "sqlite",
     "literals": [
      {}
@@ -5267,6 +6016,83 @@
   },
   "RelaxedSync::restore": {
    "PRAGMA synchronous = FULL": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  }
+ },
+ "docs/ledger/autumn-harvest-sqlite/workflow_log.toml": {
+  "append": {
+   "INSERT OR IGNORE INTO harvest_workflow_logs (exec_id, seq, level, message, occurred_at) VALUES (?1, ?2, ?3, ?4, ?5)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SELECT count(*) FROM harvest_workflow_logs WHERE exec_id = ?1 AND seq <> ?2 AND seq NOT IN (SELECT value FROM json_each(?3))": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "append_commands": {
+   "RELEASE harvest_workflow_logs": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "ROLLBACK TO harvest_workflow_logs;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "SAVEPOINT harvest_workflow_logs": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "count": {
+   "SELECT count(*) FROM harvest_workflow_logs WHERE exec_id = ?1 AND seq <> ?2": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "load": {
+   "SELECT seq, level, message, occurred_at FROM harvest_workflow_logs WHERE exec_id = ?1 AND seq > ?2 AND occurred_at > ?3 AND (json_array_length(?4) = 0 OR level IN (SELECT value FROM json_each(?4))) ORDER BY seq LIMIT ?5": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "table_exists": {
+   "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'harvest_workflow_logs'": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "truncated_on": {
+   "SELECT 1 FROM harvest_workflow_logs WHERE exec_id = ?1 AND seq = ?2": {
     "backend": "sqlite",
     "literals": [
      {}

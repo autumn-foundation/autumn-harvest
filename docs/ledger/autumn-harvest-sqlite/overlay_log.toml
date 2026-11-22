@@ -6,6 +6,7 @@ backend = ["sqlite"]
 kind = ["read", "write"]
 tables = ["harvest_agent_overlay_activations", "harvest_agent_overlay_heads", "harvest_agent_overlays"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/overlay_log.md"
 
 ["SqliteOverlayLog::active"]
 driver = "per_request"
@@ -13,6 +14,7 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_agent_overlay_heads", "harvest_agent_overlays"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/overlay_log.md"
 
 ["append_in"]
 driver = "per_request"
@@ -20,6 +22,7 @@ backend = ["sqlite"]
 kind = ["read", "write"]
 tables = ["harvest_agent_overlay_heads", "harvest_agent_overlays"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/overlay_log.md"
 
 ["SqliteOverlayLog::get"]
 driver = "per_request"
@@ -27,6 +30,7 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_agent_overlays"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/overlay_log.md"
 
 ["SqliteOverlayLog::list"]
 driver = "per_request"
@@ -34,6 +38,7 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_agent_overlays"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/overlay_log.md"
 
 ["apply_schema"]
 driver = "setup"
@@ -62,6 +67,7 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_agent_overlay_activations"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/overlay_log.md"
 
 ["SqliteOverlayLog::policy_log"]
 driver = "per_request"
@@ -69,6 +75,7 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_agent_refine_policies"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/overlay_log.md"
 
 ["append_policy_in"]
 driver = "per_request"
@@ -76,6 +83,7 @@ backend = ["sqlite"]
 kind = ["write"]
 tables = ["harvest_agent_refine_policies"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/overlay_log.md"
 
 ["auto_adopt_in"]
 driver = "per_task"
@@ -90,3 +98,4 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_agent_refine_policies"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/overlay_log.md"

@@ -6,6 +6,7 @@ backend = ["sqlite"]
 kind = ["ddl", "write"]
 tables = ["harvest_fleet_epoch"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/fleet_epoch.md"
 
 ["read_on"]
 driver = "setup"
@@ -13,3 +14,4 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_fleet_epoch"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/fleet_epoch.md"
