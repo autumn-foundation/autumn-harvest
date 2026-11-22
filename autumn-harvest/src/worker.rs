@@ -27757,7 +27757,7 @@ async fn process_workflow_task(
             history: returned_history,
         } = drive;
         if history_lent {
-            // A cold drive always ends with the events that it got: a view
+            // A cold drive always ends with the events that it got. A view
             // cut is closed when its poll returns, and only a warm resume
             // appends. So a missing history is a broken invariant. No path
             // below is safe without the history, so the task fails here and
