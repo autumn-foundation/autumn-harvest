@@ -572,15 +572,18 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_connection_is_a_retryable_transport_error() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/", listener.local_addr().unwrap());
-        drop(listener);
+        // A bound socket that does not listen refuses each connection. It holds
+        // the port, so a parallel test cannot bind it.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let url = format!("http://{}/", socket.local_addr().unwrap());
         let error = transport(&url)
             .json(&json!({}), &HeaderMap::new())
             .await
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Transport);
         assert_eq!(error.status(), None);
+        drop(socket);
     }
 
     #[tokio::test]
