@@ -362,8 +362,8 @@ mod tests {
     }
 
     /// A warm load reads no row below the tail. This test removes such a row
-    /// through the runtime connection, which rule 1 of the module docs
-    /// forbids, to show that the cached prefix is what the load returns.
+    /// through the runtime connection. Rule 1 of the module docs forbids
+    /// that. So the result shows that the load returns the cached prefix.
     #[test]
     fn a_warm_load_does_not_read_the_cached_prefix_again() {
         let (_dir, conn) = open_file();

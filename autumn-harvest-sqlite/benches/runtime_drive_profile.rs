@@ -26,9 +26,10 @@
 //! `replay_profile_support.rs::sequential_workflow` exactly. So this is the
 //! SAME workload that issue #135 budgets for the Postgres replay path. Here it
 //! runs through `SqliteRuntime::run_until_blocked` end-to-end (start -> N
-//! decision cycles -> completion). Each decision cycle re-loads and re-replays
-//! the ENTIRE history so far. This backend has no warm-cache / delta-load path.
-//! So this is the realistic full-run cost, not a single-cycle slice.
+//! decision cycles -> completion). Each decision cycle replays the ENTIRE
+//! history so far. The runtime keeps that history warm, so a cycle parses only
+//! the new events (`docs/performance-sqlite-hot-path.md`). So this is the
+//! realistic full-run cost, not a single-cycle slice.
 //!
 //! `SQLITE_RUNTIME_PROFILE_N` (default `100`) sets the activity count.
 //! `SQLITE_RUNTIME_PROFILE_REPS` (default `1`) repeats the whole

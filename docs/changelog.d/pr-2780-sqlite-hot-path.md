@@ -1,0 +1,14 @@
+## Performance — the `SqliteRuntime` drive path costs 54% to 63% fewer instructions and syncs 27% less
+
+**Performance** (implemented): four changes to the decision cycle of `autumn-harvest-sqlite`. No stored format, schema or public signature changed. `docs/performance-sqlite-hot-path.md` has each measurement, and [ADR 0019](../adr/0019-sqlite-drive-path.md) has each decision.
+
+- **Statements stay compiled.** 58% of the instructions of a short run compiled SQL. The drive sent most statements through the uncached `execute` and `query_row`. The bundled `SQLite` also compiled a cached statement again on each parameter bind, because its planner reads bound values for an index range. The drive path now uses `prepare_cached` with a cache of 128 statements, and the runtime connection turns on `SQLITE_DBCONFIG_ENABLE_QPSG`. A run of 3 activities went from 5,322,065 to 2,214,132 instructions.
+- **The history stays warm.** Each cycle parsed the whole history of its run. The new `history_cache` module keeps the parsed history of each driven run within a byte budget (`DEFAULT_HISTORY_CACHE_BYTES`, 16 MiB). A cycle reads only the rows after the cached tail. The runtime connection only appends, a commit of another connection drops the cache through `PRAGMA data_version`, and each load checks the cached tail row. `SqliteRuntime::set_history_cache_bytes(0)` turns the cache off. A run of 160 activities went from 1,183,734,241 to 603,216,072 instructions.
+- **A claim commit is not synced.** The claim of a frozen task only sets `RUNNING`, and each open undoes that. That commit now runs at `synchronous = NORMAL` in WAL mode. Every other commit stays at `FULL`. The claim that freezes a late-registered task (issue #1068), a file opened with `open_replicated`, and a file outside WAL mode keep the sync. A run of 3 activities on a file went from 11.18 to 8.18 `fsync` calls.
+- **One read of the run row.** A cycle read seven columns of its run row with seven statements. `store::cycle_row` reads them with one.
+
+**Invariant notes.** No new `WorkflowEvent` variant and no migration. `harvest_events` stays append-only: the cache reads it and never writes it. A new writer of `harvest_events` on the runtime connection must only append, or it must clear the cache.
+
+**Not done.** The history is still cloned for the executor in each cycle, as on Postgres. The claim statement still reads each task row of its run. An index on `(exec_id, state, seq)` would fix that, and it needs a census run to refresh the generated plan pages.
+
+**Tests.** New unit tests cover the cache (a warm load, a foreign rewrite, a foreign append, a purge, the budget, and a mixed sequence of 600 operations that compares each load with a full load), the claim sync (each exit restores `FULL`, and the relaxed transaction never commits a freeze), the plan guarantee, and `cycle_row`. The new harness `benches/runtime_throughput_profile.rs` measures many short runs on one open database.

@@ -20,6 +20,9 @@
 //! task and never re-runs the body. The finalize is transactional, so the
 //! replayable log never records a half-completed activity.
 //!
+//! The finalize commit is always synced. The claim commit of a frozen task is
+//! not: it only sets `RUNNING`, and each open undoes that. See [`ClaimSync`].
+//!
 //! # Retry model
 //!
 //! A *retryable* activity failure goes to the `harvest_activity_attempts`

@@ -610,7 +610,9 @@ impl SqliteRuntime {
         // crash-then-reopen tests depend on it, so set it explicitly instead of
         // leaning on driver defaults:
         // - `synchronous = FULL`: fsync on every COMMIT. WAL + FULL is fully
-        //   durable (every commit is flushed), just reader-friendly.
+        //   durable (every commit is flushed), just reader-friendly. The claim
+        //   that only sets a task `RUNNING` is the one exception. See
+        //   [`ClaimSync`].
         // - `journal_mode = WAL`: the idiomatic embedded choice for a single
         //   writer plus an occasional external reader (a monitoring/inspector
         //   connection coexists with the writer without an immediate
@@ -3910,6 +3912,9 @@ impl SqliteRuntime {
         let row = store::cycle_row(&self.conn, exec)?;
         let state = &row.state;
         if autumn_harvest::erase::is_terminal_state(state) {
+            // A cancel, a terminate or a cascade can end a warm run outside
+            // its own cycle. No drive reads its history again.
+            self.history_cache.forget(exec);
             return match state.as_str() {
                 "COMPLETED" => Ok(RunState::Completed(
                     store::execution_output(&self.conn, exec)?.unwrap_or(Value::Null),
@@ -4242,7 +4247,7 @@ impl SqliteRuntime {
                         workflows: &self.workflows,
                         policies: &self.workflow_policies,
                     },
-                    history: &history,
+                    history,
                     cycle: TerminalCycle::Completing,
                     now: decided_at,
                     log_policy: self.log_policy,
@@ -4308,7 +4313,7 @@ impl SqliteRuntime {
                 let retry = retry_plan(&config, &decoded, exec, failure_now())?;
                 let failure = CycleFailure {
                     ingest: &ingest,
-                    history: &history,
+                    history,
                     caps: &caps,
                     terminal: WorkflowEvent::workflow_failed_typed(&decoded),
                     message: decoded.message,
@@ -4333,7 +4338,7 @@ impl SqliteRuntime {
             {
                 let failure = CycleFailure {
                     ingest: &ingest,
-                    history: &history,
+                    history,
                     caps: &caps,
                     terminal: WorkflowEvent::workflow_failed(CHILD_CONTINUE_AS_NEW_ERROR),
                     message: CHILD_CONTINUE_AS_NEW_ERROR.to_string(),
@@ -4384,7 +4389,7 @@ impl SqliteRuntime {
                         exec,
                         &owner,
                         &ingest,
-                        &history,
+                        history,
                         &commands,
                         &caps,
                         CycleClock { now, decided_at },

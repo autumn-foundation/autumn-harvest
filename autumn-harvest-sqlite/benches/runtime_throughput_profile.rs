@@ -154,7 +154,8 @@ fn main() {
     }
 
     latencies.sort_unstable();
-    let rate = workflows as f64 / elapsed.as_secs_f64().max(f64::EPSILON);
+    let runs = f64::from(u32::try_from(workflows).unwrap_or(u32::MAX));
+    let rate = runs / elapsed.as_secs_f64().max(f64::EPSILON);
     println!(
         "sqlite_runtime_throughput_profile: db={} mode={mode} workflows={workflows} \
          activities={activities}",
