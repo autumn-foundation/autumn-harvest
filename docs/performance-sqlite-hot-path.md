@@ -1,19 +1,21 @@
 # `SqliteRuntime` hot path: compiled statements, warm history, fewer syncs
 
-**Outcome: four changes shipped.** A short run costs 63% fewer
-instructions. A long run costs 54% fewer. A run on a file syncs 27% less
-often. No stored format, schema or public signature changed.
+**Outcome: five changes shipped.** A short run costs 64% fewer
+instructions. A long run costs 58% fewer. A run on a file syncs 27% less
+often. No stored format or public signature changed. One index of the task
+table changed.
 
 | Shape | Measure | Before | After | Change |
 |---|---|---:|---:|---:|
-| Short run, 3 activities, memory | instructions per run | 5,322,065 | 1,955,426 | −63.3% |
-| Short run, 1 activity, memory | instructions per run | 2,351,069 | 805,648 | −65.7% |
-| Short run, 10 activities, memory | instructions per run | 18,560,469 | 7,239,139 | −61.0% |
-| Short run, 3 activities, file | instructions per run | 5,385,270 | 2,022,456 | −62.4% |
-| Short run, 3 activities, file | `fsync` calls per run | 11.18 | 8.18 | −26.8% |
-| Long run, 20 activities | instructions, whole process | 52,273,836 | 27,453,038 | −47.5% |
-| Long run, 80 activities | instructions, whole process | 386,055,883 | 175,940,375 | −54.4% |
-| Long run, 160 activities | instructions, whole process | 1,310,122,645 | 599,036,025 | −54.3% |
+| Short run, 3 activities, memory | instructions per run | 5,322,065 | 1,936,072 | −63.6% |
+| Short run, 1 activity, memory | instructions per run | 2,351,069 | 808,942 | −65.6% |
+| Short run, 10 activities, memory | instructions per run | 18,560,469 | 7,093,489 | −61.8% |
+| Short run, 3 activities, file | instructions per run | 5,385,270 | 2,002,938 | −62.8% |
+| Short run, 3 activities, file | `fsync` calls per run | 11.18 | 8.20 | −26.7% |
+| Short run, 3 activities, file | `pwrite` calls per run | 123.80 | 138.94 | +12.2% |
+| Long run, 20 activities | instructions, whole process | 52,273,836 | 26,719,025 | −48.9% |
+| Long run, 80 activities | instructions, whole process | 386,055,883 | 162,327,796 | −58.0% |
+| Long run, 160 activities | instructions, whole process | 1,310,122,645 | 543,932,748 | −58.5% |
 
 Every number is an instruction count from `valgrind --tool=callgrind` or a
 system call count from `strace -c`. Both are deterministic. Wall-clock time
@@ -35,8 +37,8 @@ Two harnesses, both `harness = false` binaries.
   one database and drives `M` runs of `k` activities each. The difference
   between `M = 300` and `M = 100`, divided by 200, is the steady cost of one
   run. The schema setup cancels out. The cost stays flat as the tables grow:
-  it is 2,295,537 per run between 900 and 1,500 runs, against 2,214,132
-  between 100 and 300 at the same commit.
+  it is 2,000,522 per run between 900 and 1,500 runs, against 1,936,072
+  between 100 and 300.
 - **Long run:** `benches/runtime_drive_profile.rs`, unchanged. It drives one
   run of `n` sequential activities on a new database.
 
@@ -147,16 +149,67 @@ statements. `cycle_row` reads them with one. Nothing writes the run row
 between those reads, so the values are the same. A run went from 2,084,538
 to 1,941,874 instructions (−6.8%).
 
+## Finding 5: the claim read every task of its run
+
+`claim_next_ready_task_tx` asks for the oldest ready `PENDING` task of a
+run. The only index that could serve it was on `exec_id`. A run keeps its
+`DONE` rows until retention. So each claim read every task row of the run
+and sorted the ready ones in a temporary B-tree. A run of `n` activities
+made `2n` claims over up to `n` rows each.
+
+The schema now has `idx_harvest_tasks_exec_state_seq` on
+`(exec_id, state, seq)`, and drops `idx_harvest_tasks_exec`. The claim
+seeks to its first row and sorts nothing. The prefix of the new index
+serves each statement that names only the run, so the old index had no use
+left. The wake read (`next_wake_after`) gains too: it now reads only the
+`PENDING` tasks of each running run.
+
+| Long run | Before the index | After | Change |
+|---:|---:|---:|---:|
+| 20 activities | 27,455,768 | 26,719,025 | −2.7% |
+| 80 activities | 175,943,120 | 162,327,796 | −7.7% |
+| 160 activities | 599,062,183 | 543,932,748 | −9.2% |
+| 320 activities | 2,219,378,375 | 1,991,575,100 | −10.3% |
+
+At 160 activities the claim went from 41,209,731 instructions to
+9,874,508. That is 128,780 for each claim before and 30,858 after, and the
+cost no longer grows with the run.
+
+**The cost.** The index holds the state, so each state change of a task
+moves one index entry. A short run pays that and gains little, because its
+run has few task rows:
+
+| Short run | Before the index | After | Change |
+|---|---:|---:|---:|
+| 1 activity, instructions per run | 804,427 | 808,942 | +0.6% |
+| 3 activities, instructions per run | 1,955,426 | 1,936,072 | −1.0% |
+| 10 activities, instructions per run | 7,264,673 | 7,093,489 | −2.4% |
+| 3 activities, file, `pwrite` calls per run | 124.62 | 138.94 | +11.5% |
+| 3 activities, file, `fsync` calls per run | 8.18 | 8.20 | +0.2% |
+
+The claim commit and the result commit each write one more WAL page, the
+index leaf. The number of syncs does not change. The small rise in `fsync`
+is a checkpoint that comes sooner, because the WAL fills faster.
+
+A fleet drive of 20 runs of 40 activities with `run_until_idle` went from
+1,060,883,491 to 982,501,997 instructions (−7.4%).
+
+The first open of an older file builds the index once from its stored
+tasks.
+
+`the_claim_seeks_the_first_pending_task_and_sorts_nothing` guards the
+plan. `the_schema_replaces_the_task_index_of_an_older_file` covers the
+older file.
+
 ## What is left
 
 At 160 activities, after these changes:
 
 | Cost | Share |
 |---|---:|
-| The workflow body runs again from its start in each cycle | 36.7% |
-| The history is cloned for the executor, and the clone is dropped | 37.7% |
-| `SQLite` runs the statements | 12.9% |
-| The claim statement | 6.8% |
+| The workflow body runs again from its start in each cycle | 40.7% |
+| The history is cloned for the executor, and the clone is dropped | 39.0% |
+| `SQLite` runs the statements | 6.9% |
 
 - **The clone.** `run_workflow_with_state_history_policy_and_caps` takes
   the history by value, and the drive needs it again after the call. The
@@ -164,11 +217,6 @@ At 160 activities, after these changes:
   remove it for both, with a change to the core entry points.
 - **The replay.** A replay from the start is the execution model. The
   resident workflow of the Postgres worker (issue #1798) avoids it there.
-- **The claim statement.** It reads each task row of the run and sorts the
-  ready ones, so it grows with the activities of the run. An index on
-  `(exec_id, state, seq)` would make it one probe. That is a schema change,
-  and the generated plan pages in `docs/ledger/plans/` need a census run to
-  follow it. It is not in this change.
 
 ## Reproduce
 

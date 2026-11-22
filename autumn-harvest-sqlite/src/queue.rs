@@ -290,6 +290,17 @@ pub fn freeze_task_defaults(
     Ok(())
 }
 
+/// The oldest ready task of one run.
+///
+/// `idx_harvest_tasks_exec_state_seq` holds the `PENDING` tasks of a run in
+/// `seq` order. So the statement seeks to its first row and sorts nothing. It
+/// reads past a task only when that task waits for a retry backoff.
+const CLAIM_NEXT_READY_TASK_SQL: &str = "SELECT task_id, activity_id, name, input_json, attempt, \
+     max_attempts, retry_policy_json, start_to_close_ms, scheduled_at, schedule_to_close_at, \
+     defaults_frozen, queue, heartbeat_details, last_error \
+     FROM harvest_tasks WHERE state = 'PENDING' AND exec_id = ?1 AND run_at <= ?2 \
+     ORDER BY seq LIMIT 1";
+
 /// Claim the oldest ready (`PENDING`, `run_at <= now`) task for `exec_id` and flip
 /// it to `RUNNING` in a `BEGIN IMMEDIATE` transaction.
 ///
@@ -319,13 +330,7 @@ pub fn claim_next_ready_task_tx(
 ) -> SqliteResult<Option<(Transaction<'_>, ClaimedTask)>> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let row = tx
-        .prepare_cached(
-            "SELECT task_id, activity_id, name, input_json, attempt, max_attempts, \
-             retry_policy_json, start_to_close_ms, scheduled_at, schedule_to_close_at, \
-             defaults_frozen, queue, heartbeat_details, last_error \
-             FROM harvest_tasks WHERE state = 'PENDING' AND exec_id = ?1 AND run_at <= ?2 \
-             ORDER BY seq LIMIT 1",
-        )?
+        .prepare_cached(CLAIM_NEXT_READY_TASK_SQL)?
         .query_row(params![exec_id.to_string(), now], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -574,7 +579,8 @@ pub fn cancel_activity_task(
     Ok(n > 0)
 }
 
-/// The run's own id lets `idx_harvest_tasks_exec` find the task (issue #2429).
+/// The run's own id lets `idx_harvest_tasks_exec_state_seq` find the task (issue
+/// #2429).
 /// The task table keeps finished rows, so an `activity_id` match alone scans it.
 const CANCEL_ACTIVITY_TASK_SQL: &str = "UPDATE harvest_tasks SET state = 'CANCELLED' \
      WHERE exec_id = ?1 AND activity_id = ?2 AND state IN ('PENDING', 'RUNNING')";
@@ -824,8 +830,9 @@ mod tests {
 
     use super::{
         CANCEL_ACTIVITY_TASK_SQL, DELETE_UNDELIVERED_SIGNALS_SQL, NEXT_TIMER_ARM_SEQ_SQL,
-        cancel_activity_task, delete_undelivered_signals_for_execution, due_timers,
-        due_timers_with_deadlines, enqueue_timer,
+        cancel_activity_task, claim_next_ready_task_tx, delete_undelivered_signals_for_execution,
+        due_timers, due_timers_with_deadlines, enqueue_activity, enqueue_timer,
+        requeue_task_to_back,
     };
     use crate::schema;
 
@@ -871,13 +878,102 @@ mod tests {
             )
             .unwrap();
         assert!(
-            plan.contains("USING INDEX idx_harvest_tasks_exec"),
+            plan.contains("USING INDEX idx_harvest_tasks_exec_state_seq"),
             "expected an index search, got plan: {plan}"
         );
         assert!(
             !plan.contains("SCAN"),
             "expected no full-table scan, got plan: {plan}"
         );
+    }
+
+    /// Every step of the query plan of `sql`, with `params` bound.
+    fn plan_of(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let steps: Vec<String> = stmt
+            .query_map(params, |row| row.get(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        steps.join(" | ")
+    }
+
+    // A run keeps its finished task rows. A claim that reads each of them, or
+    // sorts the ready ones, grows with the activities of the run.
+    #[test]
+    fn the_claim_seeks_the_first_pending_task_and_sorts_nothing() {
+        let conn = open();
+        let exec = ExecutionId::new().to_string();
+
+        let plan = plan_of(&conn, super::CLAIM_NEXT_READY_TASK_SQL, params![exec, 0]);
+
+        assert!(
+            plan.contains("USING INDEX idx_harvest_tasks_exec_state_seq (exec_id=? AND state=?)"),
+            "expected a seek on the run and the state, got plan: {plan}"
+        );
+        assert!(!plan.contains("TEMP B-TREE"), "expected no sort: {plan}");
+        assert!(!plan.contains("SCAN"), "expected no scan: {plan}");
+    }
+
+    fn enqueue(conn: &Connection, exec: ExecutionId, name: &str, run_at: i64) {
+        let id = autumn_harvest::ActivityExecId::new();
+        let input = serde_json::json!(null);
+        enqueue_activity(
+            conn, exec, id, name, &input, "default", run_at, None, None, None, None, true,
+        )
+        .unwrap();
+    }
+
+    fn claim_name(conn: &mut Connection, exec: ExecutionId, now: i64) -> Option<String> {
+        let (tx, task) = claim_next_ready_task_tx(conn, exec, now).unwrap()?;
+        tx.commit().unwrap();
+        Some(task.name)
+    }
+
+    /// The claim takes the lowest `seq` among the ready `PENDING` tasks of its
+    /// own run. It passes a finished task, a task in backoff and a task of
+    /// another run.
+    #[test]
+    fn the_claim_takes_the_oldest_ready_task_of_its_run() {
+        let mut conn = open();
+        let exec = ExecutionId::new();
+        let other = ExecutionId::new();
+        enqueue(&conn, exec, "done", 0);
+        enqueue(&conn, other, "foreign", 0);
+        enqueue(&conn, exec, "backoff", 50);
+        enqueue(&conn, exec, "first", 0);
+        enqueue(&conn, exec, "second", 0);
+        conn.execute(
+            "UPDATE harvest_tasks SET state = 'DONE' WHERE name = 'done'",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(claim_name(&mut conn, exec, 10).as_deref(), Some("first"));
+        assert_eq!(claim_name(&mut conn, exec, 10).as_deref(), Some("second"));
+        assert_eq!(claim_name(&mut conn, exec, 10), None, "backoff is not due");
+        assert_eq!(claim_name(&mut conn, exec, 50).as_deref(), Some("backoff"));
+        assert_eq!(claim_name(&mut conn, other, 10).as_deref(), Some("foreign"));
+    }
+
+    /// A zero-delay retry moves its task behind each ready sibling (issue
+    /// #1068). The claim reads the new `seq` through the index.
+    #[test]
+    fn the_claim_follows_a_requeue_to_the_back() {
+        let mut conn = open();
+        let exec = ExecutionId::new();
+        enqueue(&conn, exec, "retried", 0);
+        enqueue(&conn, exec, "sibling", 0);
+        let (tx, task) = claim_next_ready_task_tx(&mut conn, exec, 0)
+            .unwrap()
+            .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(task.name, "retried");
+
+        requeue_task_to_back(&conn, &task.task_id, 1, 0, "boom").unwrap();
+
+        assert_eq!(claim_name(&mut conn, exec, 0).as_deref(), Some("sibling"));
+        assert_eq!(claim_name(&mut conn, exec, 0).as_deref(), Some("retried"));
     }
 
     // Issue #2429: each timer arm reads the largest arm_seq. Fired timers stay

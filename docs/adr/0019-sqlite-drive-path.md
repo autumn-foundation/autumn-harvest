@@ -30,6 +30,9 @@ Accepted.
 3. **A claim commit is not synced.** The commit that only sets a task
    `RUNNING` runs at `synchronous = NORMAL`. Every other commit stays at
    `FULL`.
+4. **The task index follows the claim.** `idx_harvest_tasks_exec_state_seq`
+   on `(exec_id, state, seq)` replaces the index on `exec_id` alone. The
+   claim seeks to the oldest `PENDING` task of its run.
 
 ## Why each decision is safe
 
@@ -73,10 +76,20 @@ Three cases keep the sync on a claim:
   a frame that the file can lose must not reach a replica.
 - A file that is not in WAL mode.
 
+**The task index.** It holds the same rows as the index that it replaces,
+and its first column is the same. So each statement that the old index
+served still has an index. The schema builds it with
+`CREATE INDEX IF NOT EXISTS` on each open, as it builds every other index.
+
 ## Consequences
 
-- A short run costs 63% fewer instructions. A long run costs 54% fewer. A
+- A short run costs 64% fewer instructions. A long run costs 58% fewer. A
   run on a file makes `2k + 2` synced commits.
+- Each state change of a task moves one index entry. A short run on a file
+  makes 12% more `pwrite` calls for that, with no more syncs. A claim no longer
+  grows with the tasks of its run.
+- The first open of an older file builds the task index once from its
+  stored tasks.
 - The runtime holds up to the cache budget of parsed history in memory.
 - A statement that later binds a `LIKE` pattern on the runtime connection
   gets no index range from that pattern. Give such a statement its own
@@ -89,6 +102,11 @@ Three cases keep the sync on a claim:
   body can run again. It needs its own decision.
 
 ## Alternatives
+
+- **A partial index on `(exec_id, seq)` for `PENDING` tasks.** It is
+  smaller, and a finished task leaves it. The statements that name only
+  the run would still need the index on `exec_id`. So the table would
+  carry two indexes, and a task would write as many index pages.
 
 - **Compile each statement by hand and keep the handles.** It gives the
   same result as the cache with more code.
@@ -114,3 +132,5 @@ Three cases keep the sync on a claim:
   restores `FULL`.
 - `a_cached_statement_is_not_compiled_again_on_a_bind` guards the plan
   guarantee.
+- `the_claim_seeks_the_first_pending_task_and_sorts_nothing` guards the
+  plan of the claim.

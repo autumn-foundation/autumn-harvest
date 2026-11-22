@@ -13,3 +13,4 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_events"]
 measured = "docs/performance-sqlite-hot-path.md"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/history_cache.md"

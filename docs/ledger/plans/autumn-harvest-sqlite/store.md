@@ -42,6 +42,14 @@ Statements: 1. Backend: SQLite. Tables with no usable index: none.
 |---|---|---|
 | 1 | `UPDATE harvest_executions SET (memo, search_attrs, schedule_name) = (SELECT memo, search_attrs, s...` | `harvest_executions`: Search on `sqlite_autoindex_harvest_executions_1` |
 
+## `cycle_row`
+
+Statements: 1. Backend: SQLite. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT state, execution_timeout_ms, deadline_at, start_at, workflow_attempt, retry_policy_json, r...` | `harvest_executions`: Search on `sqlite_autoindex_harvest_executions_1` |
+
 ## `execution_error`
 
 Statements: 1. Backend: SQLite. Tables with no usable index: none.

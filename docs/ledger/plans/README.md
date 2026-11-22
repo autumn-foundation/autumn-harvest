@@ -78,6 +78,7 @@ One page for each source file. See [the Ledger profiles](../README.md).
 - [`autumn-harvest-plugin/tenant`](autumn-harvest-plugin/tenant.md)
 - [`autumn-harvest-plugin/ui`](autumn-harvest-plugin/ui.md)
 - [`autumn-harvest-sqlite/append_only`](autumn-harvest-sqlite/append_only.md)
+- [`autumn-harvest-sqlite/history_cache`](autumn-harvest-sqlite/history_cache.md)
 - [`autumn-harvest-sqlite/llm_ledger`](autumn-harvest-sqlite/llm_ledger.md)
 - [`autumn-harvest-sqlite/lock`](autumn-harvest-sqlite/lock.md)
 - [`autumn-harvest-sqlite/mutex`](autumn-harvest-sqlite/mutex.md)
@@ -87,3 +88,4 @@ One page for each source file. See [the Ledger profiles](../README.md).
 - [`autumn-harvest-sqlite/schema`](autumn-harvest-sqlite/schema.md)
 - [`autumn-harvest-sqlite/store`](autumn-harvest-sqlite/store.md)
 - [`autumn-harvest-sqlite/visibility`](autumn-harvest-sqlite/visibility.md)
+- [`autumn-harvest-sqlite/wake`](autumn-harvest-sqlite/wake.md)
