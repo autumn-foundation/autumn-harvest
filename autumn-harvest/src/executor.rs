@@ -2148,20 +2148,16 @@ pub async fn run_workflow_lending_history(
         default_activity_start_to_close,
     );
     ctx.lend_history();
-    let ctx = std::sync::Arc::new(ctx);
-    let future = owned_handler_future(&ctx, handler, input);
-    // On the heap, the cycle adds only a pointer to each caller frame in a
-    // debug build (issue #2752).
-    let cycle = std::sync::Arc::clone(&ctx);
-    let result = crate::frame::boxed(|| drive_cycle(cycle, future, span_meta, None, None)).await;
-    // The cycle dropped the handler future, so nothing reads the matcher now.
-    let history = ctx.reclaim_history();
+    // The keep future holds the context by value. On the heap, it adds only a
+    // pointer to each caller frame in a debug build (issue #2752).
+    let result =
+        crate::frame::boxed(|| drive_workflow_keep(ctx, handler, input, span_meta, None)).await;
     LentCycle {
         outcome: result.outcome,
         pending: result.pending,
         span: result.span,
         router: result.router,
-        history,
+        history: result.history,
     }
 }
 
@@ -2359,6 +2355,10 @@ pub(crate) struct DriveResult {
     /// (issue #2035). The worker wakes the task, so a later cycle runs them.
     #[cfg_attr(not(feature = "db"), allow(dead_code))] // Only the worker reads it.
     pub(crate) updates_deferred: bool,
+    /// The history that the caller lent to the context, unchanged. `None`
+    /// when the context was not lent its history
+    /// ([`WorkflowContext::lend_history`]), or could not give it back whole.
+    pub(crate) history: Option<Vec<WorkflowEvent>>,
 }
 
 impl DriveResult {
@@ -2532,6 +2532,15 @@ async fn drive_cycle(
     // case. The persist layer then keeps asking the global fresh, exactly
     // as before this fix.
     let router = ctx.resolved_placement_router();
+    // A lent history goes back to the caller. A workflow that stays resident
+    // keeps its matcher, so that matcher keeps a copy. Any other handler
+    // future is gone by now, so nothing else reads the matcher. Both calls
+    // return `None` for a context that was not lent its history.
+    let history = if matches!(resident, crate::resident::Residency::Parked(_)) {
+        ctx.reclaim_history_keeping_a_copy()
+    } else {
+        ctx.reclaim_history()
+    };
     DriveResult {
         outcome,
         pending,
@@ -2539,6 +2548,7 @@ async fn drive_cycle(
         router,
         resident,
         updates_deferred,
+        history,
     }
 }
 

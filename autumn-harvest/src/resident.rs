@@ -773,6 +773,29 @@ pub async fn start(
     (outcome, residency.into_workflow())
 }
 
+/// [`start`], with the history lent to the context as the worker lends it.
+///
+/// Returns the history too. A workflow that stays resident keeps a copy, so
+/// the caller gets the history back with a parked workflow or with none. The
+/// history is `None` only when the context could not give it back whole.
+#[cfg(any(test, feature = "testing"))]
+pub async fn start_lending(
+    exec_id: ExecutionId,
+    history: Vec<WorkflowEvent>,
+    handler: WorkflowHandlerFn,
+    input: Value,
+) -> (
+    WorkflowOutcome,
+    Option<ResidentWorkflow>,
+    Option<Vec<WorkflowEvent>>,
+) {
+    let ctx = crate::executor::default_task_context(exec_id, history);
+    ctx.lend_history();
+    let key = ResidentKey::new(handler, None, &HashMap::new());
+    let drive = crate::executor::drive_workflow_keep(ctx, handler, input, None, Some(key)).await;
+    (drive.outcome, drive.resident.into_workflow(), drive.history)
+}
+
 /// [`start`] that also returns why the suspension did not stay resident.
 #[cfg(any(test, feature = "testing"))]
 pub(crate) async fn start_residency(
@@ -991,14 +1014,63 @@ mod tests {
         panic!("the run did not finish in 32 decisions");
     }
 
+    /// The stored form of each event. `WorkflowEvent` has no `PartialEq`.
+    fn stored_form(events: &[WorkflowEvent]) -> Vec<Value> {
+        events
+            .iter()
+            .map(|event| serde_json::to_value(event).expect("an event serializes"))
+            .collect()
+    }
+
+    /// A cold start that lends its history to the context, as the worker
+    /// does. The drive must give the history back unchanged, with a parked
+    /// workflow or with none.
+    async fn start_lent(
+        exec_id: ExecutionId,
+        history: Vec<WorkflowEvent>,
+        handler: WorkflowHandlerFn,
+        input: Value,
+    ) -> (WorkflowOutcome, Option<ResidentWorkflow>) {
+        let lent = stored_form(&history);
+        let (outcome, resident, returned) = start_lending(exec_id, history, handler, input).await;
+        let returned = returned.expect("a cold drive returns its history");
+        assert_eq!(
+            stored_form(&returned),
+            lent,
+            "the history comes back as lent"
+        );
+        (outcome, resident)
+    }
+
+    /// A cold start that gives the context a history of its own, or lends it.
+    async fn cold_start(
+        lend: bool,
+        exec_id: ExecutionId,
+        history: Vec<WorkflowEvent>,
+        handler: WorkflowHandlerFn,
+        input: Value,
+    ) -> (WorkflowOutcome, Option<ResidentWorkflow>) {
+        if lend {
+            start_lent(exec_id, history, handler, input).await
+        } else {
+            start(exec_id, history, handler, input).await
+        }
+    }
+
     /// Drives a run that resumes the resident workflow when it can.
     async fn drive_warm(handler: WorkflowHandlerFn, input: Value) -> Trace {
+        drive_warm_from(false, handler, input).await
+    }
+
+    /// [`drive_warm`], with each cold start lending its history when `lend`
+    /// is set.
+    async fn drive_warm_from(lend: bool, handler: WorkflowHandlerFn, input: Value) -> Trace {
         let exec_id = ExecutionId::new();
         let mut history = vec![started(input.clone())];
         let mut shapes = Vec::new();
         let mut resumes = 0;
         let (mut outcome, mut resident) =
-            start(exec_id, history.clone(), handler, input.clone()).await;
+            cold_start(lend, exec_id, history.clone(), handler, input.clone()).await;
         for _ in 0..32 {
             shapes.push(outcome_shape(&outcome));
             let WorkflowOutcome::Suspended { commands } = &outcome else {
@@ -1023,7 +1095,7 @@ mod tests {
                     resumes += 1;
                     next
                 }
-                None => start(exec_id, history.clone(), handler, input.clone()).await,
+                None => cold_start(lend, exec_id, history.clone(), handler, input.clone()).await,
             };
         }
         panic!("the run did not finish in 32 decisions");
@@ -1031,10 +1103,17 @@ mod tests {
 
     /// Asserts that the warm run decided like the cold run, and that its
     /// history replays cold to the same end.
+    ///
+    /// A warm run whose cold starts lend their history must decide the same,
+    /// and resume as often. Its parked matcher keeps a copy with no matched
+    /// output, as an owning matcher does.
     async fn assert_warm_matches_cold(handler: WorkflowHandlerFn, input: Value) -> Trace {
         let cold = drive_cold(handler, input.clone()).await;
         let warm = drive_warm(handler, input.clone()).await;
         assert_eq!(warm.shapes, cold.shapes, "warm decisions must equal cold");
+        let lent = drive_warm_from(true, handler, input.clone()).await;
+        assert_eq!(lent.shapes, cold.shapes, "lent decisions must equal cold");
+        assert_eq!(lent.resumes, warm.resumes, "a lent run resumes as often");
         let replayed =
             crate::executor::run_workflow(ExecutionId::new(), warm.history.clone(), handler, input)
                 .await;

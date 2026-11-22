@@ -2794,6 +2794,9 @@ standalone note rather than part of the claim-path attribution table above:
 * [`docs/performance-sqlite-hot-path.md`](performance-sqlite-hot-path.md)
   — compiled statements, a warm history and one sync fewer per activity on
   the `SqliteRuntime` drive path.
+* [`docs/performance-cold-decision-lent-history.md`](performance-cold-decision-lent-history.md)
+  — the Postgres worker lends its history to a cold replay and makes no
+  copy of it.
 * [`docs/performance-redis-claim-roundtrip.md`](performance-redis-claim-roundtrip.md)
   — a duplicate `ensure_group` round trip on every `RedisTaskQueue::claim`
   poll, measured in socket-syscall counts (PR #1387).

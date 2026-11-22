@@ -35,7 +35,8 @@ Accepted.
    claim seeks to the oldest `PENDING` task of its run.
 5. **The executor lends the history back.** The drive calls the new core
    entry point `run_workflow_lending_history`. The cycle reads the history
-   and returns it. The drive no longer gives the executor a deep copy.
+   and returns it. The drive no longer gives the executor a deep copy. The
+   Postgres worker lends the history of each cold decision the same way.
 
 ## Why each decision is safe
 
@@ -96,9 +97,21 @@ places, and a lent matcher makes each one safe.
 - A resident workflow appends events (`append_consumed`). A matcher that
   holds more events than it got gives nothing back.
 
-When the matcher gives nothing back, the drive reads the stored history
-again. Every other caller keeps the entry point that takes the history for
-good, and its matcher still moves each output.
+When the matcher gives nothing back, the SQLite drive reads the stored
+history again. Every other caller of the owning entry point keeps it, and
+its matcher still moves each output.
+
+**The lent history of a resident workflow.** The Postgres worker can keep
+a suspended workflow resident (issue #1798). That workflow keeps its
+matcher, so the matcher needs its events after the worker takes the
+history back. The worker gets the whole history, and the matcher keeps a
+copy with no output in each completion that it matched. An owning matcher
+holds those same events, so the resident state is the same as before.
+
+A cold drive of the worker always ends with the events that it got. A
+view cut is closed when its poll returns, and only a warm resume appends.
+So the worker treats a history that does not come back as a broken
+invariant. It fails the task, and a later attempt loads the history again.
 
 ## Consequences
 
@@ -166,3 +179,6 @@ good, and its matcher still moves each output.
   `a_lent_cycle_matches_an_owned_cycle_and_returns_the_history` compares
   the two entry points. `a_history_that_does_not_come_back_is_read_again`
   covers the drive when the matcher gives nothing back.
+- `a_lent_matcher_keeps_the_copy_of_an_owning_matcher` compares the
+  events that a resident matcher keeps. `assert_warm_matches_cold` drives
+  each resident test workflow with lent cold starts too.

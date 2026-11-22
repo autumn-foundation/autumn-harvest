@@ -15983,6 +15983,16 @@ impl WorkflowContext {
             .reclaim_events()
     }
 
+    /// Take the replay history back from a cycle that stays resident. The
+    /// matcher keeps a copy. See
+    /// [`HistoryMatcher::reclaim_events_keeping_a_copy`].
+    pub(crate) fn reclaim_history_keeping_a_copy(&self) -> Option<Vec<WorkflowEvent>> {
+        self.matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .reclaim_events_keeping_a_copy()
+    }
+
     /// Run `f` while the matcher sees only the first `horizon` events.
     ///
     /// A cancelled scope replays its body this way. The body then sees the

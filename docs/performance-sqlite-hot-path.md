@@ -244,10 +244,12 @@ The same change compares activity ids as values in
 `history_has_activity_scheduled`. It made a text form of each recorded id
 on each schedule.
 
-Every other caller keeps `run_workflow_with_state_history_policy_and_caps`,
-and its matcher still moves each output. The Postgres worker is one of
-them. It builds its context itself and can keep a workflow resident, so it
-needs its own change to lend a history.
+Every other caller of `run_workflow_with_state_history_policy_and_caps`
+keeps that entry point, and its matcher still moves each output. The
+Postgres worker lends its history too. It can keep a workflow resident, so
+it needed one more step.
+[`performance-cold-decision-lent-history.md`](performance-cold-decision-lent-history.md)
+measures it.
 
 ## What is left
 
