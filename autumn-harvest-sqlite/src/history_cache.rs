@@ -280,9 +280,20 @@ fn read_from(
 }
 
 /// The `event_json` text of a row of [`ROWS_FROM_SQL`], borrowed.
+///
+/// A value that is not text gives the error that `Row::get` gives for a
+/// `String`. It names the column, and a caller that inspects a damaged file
+/// reads that name.
 fn event_text<'row>(row: &'row rusqlite::Row<'_>) -> rusqlite::Result<&'row str> {
-    row.get_ref(1)?.as_str().map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(error))
+    use rusqlite::types::{FromSqlError, Type};
+
+    const COLUMN: usize = 1;
+    let value = row.get_ref(COLUMN)?;
+    value.as_str().map_err(|error| match error {
+        FromSqlError::InvalidType => {
+            rusqlite::Error::InvalidColumnType(COLUMN, "event_json".into(), value.data_type())
+        }
+        other => rusqlite::Error::FromSqlConversionFailure(COLUMN, Type::Text, Box::new(other)),
     })
 }
 
@@ -468,6 +479,31 @@ mod tests {
 
         append(&conn, exec, 10..12);
         assert_eq!(load_and_keep(&mut cache, &conn, exec), 2);
+    }
+
+    /// A stored event that is not text stops the load, and the error names
+    /// the column. A cold load and a warm load give the same error.
+    #[test]
+    fn an_event_that_is_not_text_names_its_column() {
+        let (_dir, conn) = open_file();
+        let mut cache = HistoryCache::new(DEFAULT_HISTORY_CACHE_BYTES);
+        let exec = ExecutionId::new();
+        append(&conn, exec, 0..2);
+        load_and_keep(&mut cache, &conn, exec);
+        conn.execute(
+            "INSERT INTO harvest_events (exec_id, seq, event_json) VALUES (?1, 2, x'00ff')",
+            [exec.to_string()],
+        )
+        .unwrap();
+
+        let warm = cache.load(&conn, exec).map(|loaded| loaded.events.len());
+        let cold = cache.load(&conn, exec).map(|loaded| loaded.events.len());
+
+        for refused in [warm, cold] {
+            let error = format!("{:?}", refused.expect_err("the row cannot load"));
+            assert!(error.contains("event_json"), "{error}");
+            assert!(error.contains("Blob"), "{error}");
+        }
     }
 
     #[test]
