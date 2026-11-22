@@ -863,10 +863,16 @@ fn last_event(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<Option<Wo
 ///
 /// It keeps command application idempotent. A fresh `ScheduleActivity` mints a new
 /// id, so this matches only on a defensive re-application of the same cycle.
-pub fn history_has_activity_scheduled(events: &[WorkflowEvent], activity_id: &str) -> bool {
+///
+/// The ids are compared as values. A text form of each recorded id would
+/// cost one allocation for each event of the history, on each schedule.
+pub fn history_has_activity_scheduled(
+    events: &[WorkflowEvent],
+    activity_id: autumn_harvest::ActivityExecId,
+) -> bool {
     events.iter().any(|e| {
         matches!(e, WorkflowEvent::ActivityScheduled { activity_id: id, .. }
-            if id.to_string() == activity_id)
+            if *id == activity_id)
     })
 }
 

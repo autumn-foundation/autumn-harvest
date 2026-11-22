@@ -14,8 +14,8 @@ use autumn_harvest::context::{
     empty_shared_state,
 };
 use autumn_harvest::executor::{
-    QueryReplayOutcome, WorkflowExecuteSpanMeta, drive_query_replay_async,
-    run_workflow_with_state_history_policy_and_caps,
+    LentCycle, QueryReplayOutcome, WorkflowExecuteSpanMeta, drive_query_replay_async,
+    run_workflow_lending_history,
 };
 use autumn_harvest::frame::boxed;
 use autumn_harvest::llm_ledger::LlmCall;
@@ -4040,7 +4040,6 @@ impl SqliteRuntime {
         // The plan stops at the room the history caps leave.
         let ingest = self.plan_ingest(exec, now, loaded.events.len(), history_bytes)?;
         loaded.events.extend(ingest.events().cloned());
-        let history = &loaded.events;
         let input: Value = serde_json::from_str(&input_json)?;
         // The cycle row holds the persisted business `workflow_id`, read again
         // on EVERY cycle (issues #698 and #1069). So `ctx.info().workflow_id` is
@@ -4091,10 +4090,14 @@ impl SqliteRuntime {
         let queries: Vec<&QueryHandlerInfo> = queries.iter().collect();
         // The workflow drive and the suspension below go on the heap, so this
         // frame holds no copy of them in a debug build (issue #2752).
-        let (outcome, pending, _span, _resolved_router) = boxed(|| {
-            run_workflow_with_state_history_policy_and_caps(
+        // The executor reads the history and gives it back. So the cycle
+        // makes no copy of it for the checks below. The planned signal events
+        // are in the lent history, as the replay must see them.
+        let lent = std::mem::take(&mut loaded.events);
+        let cycle = boxed(|| {
+            run_workflow_lending_history(
                 exec,
-                history.clone(),
+                lent,
                 handler,
                 input,
                 self.shared_state.clone(),
@@ -4123,6 +4126,15 @@ impl SqliteRuntime {
             )
         })
         .await;
+        let LentCycle {
+            outcome,
+            pending,
+            span: _span,
+            history: returned,
+            ..
+        } = cycle;
+        self.take_back_history(exec, loaded, returned, &ingest)?;
+        let history = &loaded.events;
         // Read the clock again once the body returns (issue #2026). The body
         // can take time. Each write that another run reads by time uses this
         // instant. A close checks the parent's child deadlines at it. A signal
@@ -4400,6 +4412,29 @@ impl SqliteRuntime {
                 .await
             }
         }
+    }
+
+    /// Put the history of a cycle back in `loaded`, once the executor has
+    /// read it.
+    ///
+    /// The executor returns the history that it was lent, with the planned
+    /// events of `ingest` still on top. It returns none when it cannot give
+    /// the history back whole. The stored events are then read again, and the
+    /// same planned events go on top. Nothing wrote to the run in between.
+    fn take_back_history(
+        &mut self,
+        exec: ExecutionId,
+        loaded: &mut LoadedHistory,
+        returned: Option<Vec<WorkflowEvent>>,
+        ingest: &worker::SignalIngest,
+    ) -> SqliteResult<()> {
+        if let Some(events) = returned {
+            loaded.events = events;
+        } else {
+            *loaded = self.history_cache.load(&self.conn, exec)?;
+            loaded.events.extend(ingest.events().cloned());
+        }
+        Ok(())
     }
 
     /// Handle a `WorkflowOutcome::Suspended` decision cycle: persist the batch,
@@ -5108,7 +5143,7 @@ fn apply_schedule_activity(
                 .to_string(),
         ));
     }
-    if store::history_has_activity_scheduled(history, &activity_id.to_string()) {
+    if store::history_has_activity_scheduled(history, *activity_id) {
         return Ok(false);
     }
 
@@ -6722,7 +6757,7 @@ fn duration_to_millis_ceil(d: std::time::Duration) -> i64 {
 /// Build the [`WorkflowExecuteSpanMeta`] the drive path threads into the core
 /// executor each cycle (issue #1069).
 ///
-/// The `run_workflow_with_state_history_policy_and_caps` entry point reads the
+/// The `run_workflow_lending_history` entry point reads the
 /// business `workflow_id` ONLY from `span_meta.workflow_id`. That is the value
 /// of `ctx.info().workflow_id` (issue #698), documented for minting idempotency
 /// keys. There is no dedicated parameter for it, unlike `workflow_name`, which
@@ -8264,6 +8299,55 @@ mod history_cache_tests {
             !rt.history_cache.holds(exec),
             "an ended run leaves the cache"
         );
+    }
+
+    /// The stored form of each event. `WorkflowEvent` has no `PartialEq`.
+    fn stored_form(events: &[autumn_harvest::WorkflowEvent]) -> Vec<Value> {
+        events
+            .iter()
+            .map(|event| serde_json::to_value(event).unwrap())
+            .collect()
+    }
+
+    /// The executor can decline to give the history back. The cycle then
+    /// reads the stored events again and puts its planned events on top, so
+    /// it goes on with the history that it lent.
+    #[tokio::test]
+    async fn a_history_that_does_not_come_back_is_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = runtime(&dir, "declined.db");
+        let exec = rt.start_workflow("works_waits_works", json!(1)).unwrap();
+        let blocked = rt.run_until_blocked(exec).await.unwrap();
+        assert!(matches!(blocked, RunState::WaitingSignal(_)), "{blocked:?}");
+        rt.send_signal(exec, "go", json!("now")).unwrap();
+
+        // What a cycle holds when it lends its history: the stored events and
+        // the planned signal event.
+        let mut loaded = rt.history_cache.load(&rt.conn, exec).unwrap();
+        let stored = loaded.events.len();
+        let ingest = rt.plan_ingest(exec, 0, stored, loaded.bytes).unwrap();
+        loaded.events.extend(ingest.events().cloned());
+        let lent = stored_form(&loaded.events);
+        assert_eq!(lent.len(), stored + 1, "one planned signal event");
+
+        loaded.events.clear();
+        rt.take_back_history(exec, &mut loaded, None, &ingest)
+            .unwrap();
+        assert_eq!(
+            stored_form(&loaded.events),
+            lent,
+            "read again, same history"
+        );
+
+        let returned = std::mem::take(&mut loaded.events);
+        rt.take_back_history(exec, &mut loaded, Some(returned), &ingest)
+            .unwrap();
+        assert_eq!(stored_form(&loaded.events), lent, "given back as lent");
+
+        // The cache keeps only the stored events, and the drive still ends.
+        rt.history_cache.keep(exec, loaded);
+        let done = rt.run_until_blocked(exec).await.unwrap();
+        assert!(matches!(done, RunState::Completed(_)), "{done:?}");
     }
 
     /// A drive with the cache writes the history that a drive with no cache

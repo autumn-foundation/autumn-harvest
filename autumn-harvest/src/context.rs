@@ -15961,6 +15961,28 @@ impl WorkflowContext {
         self.matcher.lock().expect("matcher lock poisoned").len()
     }
 
+    /// Keep the replay history whole, so that
+    /// [`reclaim_history`](Self::reclaim_history) can return it. See
+    /// [`HistoryMatcher::lend_events`].
+    pub(crate) fn lend_history(&self) {
+        self.matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .lend_events();
+    }
+
+    /// Take the replay history back after the cycle. See
+    /// [`HistoryMatcher::reclaim_events`].
+    ///
+    /// The matcher holds no event after this call, so call it only when the
+    /// cycle is over and its handler future is gone.
+    pub(crate) fn reclaim_history(&self) -> Option<Vec<WorkflowEvent>> {
+        self.matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .reclaim_events()
+    }
+
     /// Run `f` while the matcher sees only the first `horizon` events.
     ///
     /// A cancelled scope replays its body this way. The body then sees the

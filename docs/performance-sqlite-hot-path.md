@@ -1,21 +1,21 @@
 # `SqliteRuntime` hot path: compiled statements, warm history, fewer syncs
 
-**Outcome: five changes shipped.** A short run costs 64% fewer
-instructions. A long run costs 58% fewer. A run on a file syncs 27% less
+**Outcome: six changes shipped.** A short run costs 65% fewer
+instructions. A long run costs 76% fewer. A run on a file syncs 27% less
 often. No stored format or public signature changed. One index of the task
-table changed.
+table changed, and the core crate has one new entry point.
 
 | Shape | Measure | Before | After | Change |
 |---|---|---:|---:|---:|
-| Short run, 3 activities, memory | instructions per run | 5,322,065 | 1,936,072 | −63.6% |
-| Short run, 1 activity, memory | instructions per run | 2,351,069 | 808,942 | −65.6% |
-| Short run, 10 activities, memory | instructions per run | 18,560,469 | 7,093,489 | −61.8% |
-| Short run, 3 activities, file | instructions per run | 5,385,270 | 2,002,938 | −62.8% |
+| Short run, 3 activities, memory | instructions per run | 5,322,065 | 1,836,334 | −65.5% |
+| Short run, 1 activity, memory | instructions per run | 2,351,069 | 788,078 | −66.5% |
+| Short run, 10 activities, memory | instructions per run | 18,560,469 | 6,153,532 | −66.8% |
+| Short run, 3 activities, file | instructions per run | 5,385,270 | 1,900,745 | −64.7% |
 | Short run, 3 activities, file | `fsync` calls per run | 11.18 | 8.20 | −26.7% |
-| Short run, 3 activities, file | `pwrite` calls per run | 123.80 | 138.94 | +12.2% |
-| Long run, 20 activities | instructions, whole process | 52,273,836 | 26,719,025 | −48.9% |
-| Long run, 80 activities | instructions, whole process | 386,055,883 | 162,327,796 | −58.0% |
-| Long run, 160 activities | instructions, whole process | 1,310,122,645 | 543,932,748 | −58.5% |
+| Short run, 3 activities, file | `pwrite` calls per run | 123.80 | 137.55 | +11.1% |
+| Long run, 20 activities | instructions, whole process | 52,273,836 | 23,008,791 | −56.0% |
+| Long run, 80 activities | instructions, whole process | 386,055,883 | 105,344,806 | −72.7% |
+| Long run, 160 activities | instructions, whole process | 1,310,122,645 | 317,525,918 | −75.8% |
 
 Every number is an instruction count from `valgrind --tool=callgrind` or a
 system call count from `strace -c`. Both are deterministic. Wall-clock time
@@ -25,7 +25,7 @@ explains. An instruction count moves under 1% between two runs, because
 `HashMap` takes a random seed.
 
 For context only, the in-memory rate on the test machine went from about
-940 to about 2,800 runs per second, and the file rate from about 270 to
+940 to about 3,000 runs per second, and the file rate from about 270 to
 about 400. The disk of that machine syncs in a fraction of a millisecond.
 A disk with a slower sync gains more from the lower sync count.
 
@@ -37,7 +37,7 @@ Two harnesses, both `harness = false` binaries.
   one database and drives `M` runs of `k` activities each. The difference
   between `M = 300` and `M = 100`, divided by 200, is the steady cost of one
   run. The schema setup cancels out. The cost stays flat as the tables grow:
-  it is 2,000,522 per run between 900 and 1,500 runs, against 1,936,072
+  it is 1,919,770 per run between 900 and 1,500 runs, against 1,836,334
   between 100 and 300.
 - **Long run:** `benches/runtime_drive_profile.rs`, unchanged. It drives one
   run of `n` sequential activities on a new database.
@@ -201,22 +201,66 @@ tasks.
 plan. `the_schema_replaces_the_task_index_of_an_older_file` covers the
 older file.
 
+## Finding 6: each cycle copied the whole history for the executor
+
+The core entry point took the history by value, and the drive needs the
+history again after the call. So each cycle gave the executor a deep copy
+and then dropped it. At 160 activities the copy and its drop were 39.0% of
+the instructions.
+
+The copy bought one thing. The history matcher moves the output out of each
+matched `ActivityCompleted`, so the workflow gets it with no copy
+([`performance-replay.md`](performance-replay.md)). A shared history, such
+as one behind an `Arc`, would lose that move and still copy each output.
+
+The core crate now has `run_workflow_lending_history`. The drive lends its
+history, and the cycle returns it in `LentCycle::history`. A lent matcher
+copies the output of each matched activity and leaves the event whole. That
+is the one copy that the workflow needs. The drive makes no other.
+
+The matcher gives the history back only when it holds exactly the events
+that it got. An open view cut of a cancelled scope and a resident append
+both change the count. The drive then reads the stored history again. No
+test of the crate reaches that path through a workflow, so
+`a_history_that_does_not_come_back_is_read_again` calls it directly.
+
+| Long run | Before | After | Change |
+|---:|---:|---:|---:|
+| 20 activities | 26,716,285 | 23,008,791 | −13.9% |
+| 80 activities | 162,332,209 | 105,344,806 | −35.1% |
+| 160 activities | 543,921,219 | 317,525,918 | −41.6% |
+| 320 activities | 1,991,590,340 | 1,091,424,226 | −45.2% |
+
+| Short run | Before | After | Change |
+|---|---:|---:|---:|
+| 1 activity | 808,942 | 788,078 | −2.6% |
+| 3 activities | 1,936,072 | 1,836,334 | −5.2% |
+| 10 activities | 7,093,489 | 6,153,532 | −13.3% |
+
+The fleet drive of 20 runs of 40 activities went from 982,501,997 to
+682,043,015 instructions (−30.6%).
+
+The same change compares activity ids as values in
+`history_has_activity_scheduled`. It made a text form of each recorded id
+on each schedule.
+
+Every other caller keeps `run_workflow_with_state_history_policy_and_caps`,
+and its matcher still moves each output. The Postgres worker is one of
+them. It builds its context itself and can keep a workflow resident, so it
+needs its own change to lend a history.
+
 ## What is left
 
 At 160 activities, after these changes:
 
 | Cost | Share |
 |---|---:|
-| The workflow body runs again from its start in each cycle | 40.7% |
-| The history is cloned for the executor, and the clone is dropped | 39.0% |
-| `SQLite` runs the statements | 6.9% |
+| The workflow body runs again from its start in each cycle | 74.0% |
+| `SQLite` runs the statements | 11.5% |
 
-- **The clone.** `run_workflow_with_state_history_policy_and_caps` takes
-  the history by value, and the drive needs it again after the call. The
-  Postgres worker pays the same clone. A history behind an `Arc` would
-  remove it for both, with a change to the core entry points.
-- **The replay.** A replay from the start is the execution model. The
-  resident workflow of the Postgres worker (issue #1798) avoids it there.
+- **The replay.** A replay from the start is the execution model. Its cost
+  here includes the copy of each recorded output. The resident workflow of
+  the Postgres worker (issue #1798) avoids the replay there.
 
 ## Reproduce
 

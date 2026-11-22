@@ -33,6 +33,9 @@ Accepted.
 4. **The task index follows the claim.** `idx_harvest_tasks_exec_state_seq`
    on `(exec_id, state, seq)` replaces the index on `exec_id` alone. The
    claim seeks to the oldest `PENDING` task of its run.
+5. **The executor lends the history back.** The drive calls the new core
+   entry point `run_workflow_lending_history`. The cycle reads the history
+   and returns it. The drive no longer gives the executor a deep copy.
 
 ## Why each decision is safe
 
@@ -81,9 +84,25 @@ and its first column is the same. So each statement that the old index
 served still has an index. The schema builds it with
 `CREATE INDEX IF NOT EXISTS` on each open, as it builds every other index.
 
+**The lent history.** The history matcher changes its events in three
+places, and a lent matcher makes each one safe.
+
+- It moves the output out of a matched `ActivityCompleted`. A lent matcher
+  copies the output and leaves the event whole. The workflow owns the
+  output that it gets, so that one copy is needed in any design.
+- A cancelled scope hides a tail of the events while its body runs
+  (`cut_view`). A drop guard puts the tail back. A matcher with an open cut
+  gives nothing back.
+- A resident workflow appends events (`append_consumed`). A matcher that
+  holds more events than it got gives nothing back.
+
+When the matcher gives nothing back, the drive reads the stored history
+again. Every other caller keeps the entry point that takes the history for
+good, and its matcher still moves each output.
+
 ## Consequences
 
-- A short run costs 64% fewer instructions. A long run costs 58% fewer. A
+- A short run costs 65% fewer instructions. A long run costs 76% fewer. A
   run on a file makes `2k + 2` synced commits.
 - Each state change of a task moves one index entry. A short run on a file
   makes 12% more `pwrite` calls for that, with no more syncs. A claim no longer
@@ -94,6 +113,8 @@ served still has an index. The schema builds it with
 - A statement that later binds a `LIKE` pattern on the runtime connection
   gets no index range from that pattern. Give such a statement its own
   connection, or a literal pattern.
+- A new place in the history matcher that changes an event must keep the
+  event whole when the matcher is lent, or it must change the event count.
 - A new writer of `harvest_events` on the runtime connection must only
   append. A writer that changes or removes a stored row of a live run must
   clear the cache.
@@ -102,6 +123,12 @@ served still has an index. The schema builds it with
   body can run again. It needs its own decision.
 
 ## Alternatives
+
+- **A history behind an `Arc`.** The matcher needs to change its events,
+  so shared events would need a copy on each change, or a matcher that
+  never changes them. Each read of the event list in the matcher would change
+  too. A shared history would still copy each matched output. So it would
+  cost more work and save no more than a lent one.
 
 - **A partial index on `(exec_id, seq)` for `PENDING` tasks.** It is
   smaller, and a finished task leaves it. The statements that name only
@@ -134,3 +161,8 @@ served still has an index. The schema builds it with
   guarantee.
 - `the_claim_seeks_the_first_pending_task_and_sorts_nothing` guards the
   plan of the claim.
+- `a_lent_matcher_returns_its_events_unchanged` and
+  `a_lent_matcher_returns_nothing_under_an_open_cut` cover the matcher.
+  `a_lent_cycle_matches_an_owned_cycle_and_returns_the_history` compares
+  the two entry points. `a_history_that_does_not_come_back_is_read_again`
+  covers the drive when the matcher gives nothing back.
