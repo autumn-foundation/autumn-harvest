@@ -99,6 +99,7 @@ pub async fn drain_ready(
     failure_now: &(dyn Fn() -> i64 + Send + Sync),
     activities: &HashMap<String, ActivitySpec>,
     settle_after_first_terminal: bool,
+    claim_sync: ClaimSync,
 ) -> SqliteResult<bool> {
     let mut produced = false;
 
@@ -121,24 +122,10 @@ pub async fn drain_ready(
         // `UPDATE`. It commits BEFORE the body runs. So the write lock lasts
         // microseconds, and the body stays at-least-once, outside any
         // transaction.
-        let (task, spec) = {
-            let Some((tx, task)) = queue::claim_next_ready_task_tx(conn, exec_id, now)? else {
-                break;
-            };
-            let mut task = task;
-            // With no registered body, drop the transaction to roll back the
-            // claim. The row stays `PENDING` and a later registration in the
-            // SAME runtime can claim it, with no DB reopen. The error still
-            // surfaces from the drive loop, as the non-determinism gate does.
-            let Some(spec) = activities.get(&task.name) else {
-                drop(tx);
-                return Err(crate::error::SqliteError::unregistered(&task.name));
-            };
-            // Freeze or read the four resolved defaults (issue #1068) in this
-            // same transaction. See [`freeze_defaults_at_claim`].
-            freeze_defaults_at_claim(&tx, &mut task, spec)?;
-            tx.commit()?;
-            (task, spec)
+        //
+        // `claim_sync` says whether that commit is synced. See [`ClaimSync`].
+        let Some((task, spec)) = claim_ready(conn, exec_id, now, activities, claim_sync)? else {
+            break;
         };
 
         // Enforce the total (cross-retry) schedule-to-close deadline BEFORE
@@ -317,6 +304,142 @@ pub async fn drain_ready(
     }
 
     Ok(produced)
+}
+
+/// How the commit of a claim reaches the disk.
+///
+/// The claim of a frozen task writes one value: `state = 'RUNNING'` on its
+/// row. Each open returns a `RUNNING` row to `PENDING`
+/// ([`reclaim_orphaned_running`](crate::queue::reclaim_orphaned_running)). So
+/// the file after a reopen is the same with that commit or without it, and a
+/// sync of that commit buys nothing.
+///
+/// `Deferred` is correct only in WAL mode. There, a commit that is not synced
+/// survives a crash of the process. A power loss can drop it, and then the
+/// file returns to the commit before it, where the row is `PENDING`. The WAL
+/// is one sequence, so the next synced commit also syncs the claim. A
+/// heartbeat or a result is thus never durable without its claim.
+///
+/// A claim that also freezes the defaults of a late-registered task stays
+/// synced (issue #1068). A lost freeze would let a changed registration set
+/// the contract of a task whose body already ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimSync {
+    /// Sync each claim commit, as each other commit.
+    Full,
+    /// Leave a claim that only sets `RUNNING` to the next synced commit.
+    Deferred,
+}
+
+/// The result of one claim transaction.
+enum Claimed<'a> {
+    /// No task is ready.
+    Idle,
+    /// The task is `RUNNING`, and its defaults are frozen.
+    Task(Box<ClaimedTask>, &'a ActivitySpec),
+    /// The next task needs a freeze, so its claim must be synced. The
+    /// transaction rolled back.
+    NeedsSync,
+}
+
+/// Claim the next ready task of `exec_id` and freeze its defaults.
+///
+/// Under [`ClaimSync::Deferred`] the first claim runs with no commit sync and
+/// takes only a frozen task. An unfrozen task rolls that claim back, and a
+/// synced claim takes it.
+fn claim_ready<'a>(
+    conn: &mut Connection,
+    exec_id: ExecutionId,
+    now: i64,
+    activities: &'a HashMap<String, ActivitySpec>,
+    claim_sync: ClaimSync,
+) -> SqliteResult<Option<(ClaimedTask, &'a ActivitySpec)>> {
+    if claim_sync == ClaimSync::Deferred {
+        let mut relaxed = RelaxedSync::begin(conn)?;
+        let claimed = claim_in_tx(relaxed.conn, exec_id, now, activities, true);
+        // Restore the sync level first, so an error below cannot skip it.
+        relaxed.restore()?;
+        match claimed? {
+            Claimed::Idle => return Ok(None),
+            Claimed::Task(task, spec) => return Ok(Some((*task, spec))),
+            Claimed::NeedsSync => {}
+        }
+    }
+    match claim_in_tx(conn, exec_id, now, activities, false)? {
+        Claimed::Task(task, spec) => Ok(Some((*task, spec))),
+        Claimed::Idle | Claimed::NeedsSync => Ok(None),
+    }
+}
+
+/// One claim transaction: the `RUNNING` flip and the freeze commit together.
+///
+/// `frozen_only` rolls back the claim of an unfrozen task and returns
+/// [`Claimed::NeedsSync`].
+fn claim_in_tx<'a>(
+    conn: &mut Connection,
+    exec_id: ExecutionId,
+    now: i64,
+    activities: &'a HashMap<String, ActivitySpec>,
+    frozen_only: bool,
+) -> SqliteResult<Claimed<'a>> {
+    let Some((tx, mut task)) = queue::claim_next_ready_task_tx(conn, exec_id, now)? else {
+        return Ok(Claimed::Idle);
+    };
+    // With no registered body, drop the transaction to roll back the claim.
+    // The row stays `PENDING` and a later registration in the SAME runtime
+    // can claim it, with no DB reopen. The error still surfaces from the
+    // drive loop, as the non-determinism gate does.
+    let Some(spec) = activities.get(&task.name) else {
+        drop(tx);
+        return Err(crate::error::SqliteError::unregistered(&task.name));
+    };
+    if frozen_only && !task.defaults_frozen {
+        drop(tx);
+        return Ok(Claimed::NeedsSync);
+    }
+    // Freeze or read the four resolved defaults (issue #1068) in this same
+    // transaction. See [`freeze_defaults_at_claim`].
+    freeze_defaults_at_claim(&tx, &mut task, spec)?;
+    tx.commit()?;
+    Ok(Claimed::Task(Box::new(task), spec))
+}
+
+/// A connection whose commits are not synced until [`restore`](Self::restore).
+///
+/// `PRAGMA synchronous` takes effect when it compiles, so each change is a
+/// new statement and never a cached one.
+struct RelaxedSync<'c> {
+    conn: &'c mut Connection,
+    restored: bool,
+}
+
+impl<'c> RelaxedSync<'c> {
+    fn begin(conn: &'c mut Connection) -> SqliteResult<Self> {
+        conn.execute_batch("PRAGMA synchronous = NORMAL")?;
+        Ok(Self {
+            conn,
+            restored: false,
+        })
+    }
+
+    /// Sync each later commit again.
+    fn restore(&mut self) -> SqliteResult<()> {
+        self.conn.execute_batch("PRAGMA synchronous = FULL")?;
+        self.restored = true;
+        Ok(())
+    }
+}
+
+impl Drop for RelaxedSync<'_> {
+    /// An unwind or a failed [`restore`](Self::restore) must not leave later
+    /// commits without a sync.
+    fn drop(&mut self) {
+        if !self.restored
+            && let Err(error) = self.conn.execute_batch("PRAGMA synchronous = FULL")
+        {
+            tracing::error!(%error, "the commit sync level was not restored after a claim");
+        }
+    }
 }
 
 /// The run that owns a drain (issue #2024). `ActivityContext::info()` reports it.
@@ -1514,14 +1637,15 @@ mod tests {
 
     use autumn_harvest::ExecutionId;
 
+    use std::collections::HashMap;
     use std::time::Duration;
 
     use super::{
-        IngestBudget, LocalRun, SignalIngest, attempt_deadline, commands_open_activity_race,
-        drain_ready, finalize_within_tx, fire_timer, fire_timer_within_tx,
-        handler_panic_activity_envelope, history_has_unsettled_activity_race, local_attempt_events,
-        payload_too_large_activity_envelope, schedule_to_close_exceeded, signal_timeout_name,
-        start_to_close_exceeded,
+        ClaimSync, IngestBudget, LocalRun, SignalIngest, attempt_deadline,
+        commands_open_activity_race, drain_ready, finalize_within_tx, fire_timer,
+        fire_timer_within_tx, handler_panic_activity_envelope, history_has_unsettled_activity_race,
+        local_attempt_events, payload_too_large_activity_envelope, schedule_to_close_exceeded,
+        signal_timeout_name, start_to_close_exceeded,
     };
     use crate::queue::{self, ClaimedTask};
     use crate::runtime::ActivitySpec;
@@ -2686,6 +2810,7 @@ mod tests {
             &failure_now,
             &activities,
             false,
+            ClaimSync::Full,
         )
         .await
         .unwrap();
@@ -2747,6 +2872,7 @@ mod tests {
             &failure_now,
             &activities,
             false,
+            ClaimSync::Full,
         )
         .await
         .unwrap();
@@ -2806,6 +2932,7 @@ mod tests {
             &failure_now,
             &activities,
             false,
+            ClaimSync::Full,
         )
         .await
         .unwrap();
@@ -2895,6 +3022,7 @@ mod tests {
             &failure_now,
             &activities,
             false,
+            ClaimSync::Full,
         )
         .await
         .unwrap();
@@ -3232,5 +3360,127 @@ mod tests {
             ("RUNNING", 1),
             "clean recovery: the row claims + freezes atomically",
         );
+    }
+
+    /// A WAL file with the runtime pragmas, and one run with one task.
+    fn wal_file_with_task(frozen: bool) -> (tempfile::TempDir, Connection, ExecutionId) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(dir.path().join("claim.sqlite3")).unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL;\nPRAGMA synchronous = FULL;")
+            .unwrap();
+        conn.execute_batch(schema::SCHEMA).unwrap();
+        let exec = ExecutionId::new();
+        seed_exec_with_pending_activity(&conn, exec, "act");
+        if frozen {
+            conn.execute(
+                "UPDATE harvest_tasks SET defaults_frozen = 1, max_attempts = 1",
+                [],
+            )
+            .unwrap();
+        }
+        (dir, conn, exec)
+    }
+
+    /// The `PRAGMA synchronous` level: `2` is `FULL` and `1` is `NORMAL`.
+    fn sync_level(conn: &Connection) -> i64 {
+        conn.query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn one_activity() -> HashMap<String, ActivitySpec> {
+        let spec = ActivitySpec::new(3, |_| Ok(serde_json::json!(null)));
+        HashMap::from([("act".to_string(), spec)])
+    }
+
+    /// A deferred claim takes a frozen task, and each later commit is synced
+    /// again.
+    #[test]
+    fn a_deferred_claim_takes_a_frozen_task_and_restores_the_sync_level() {
+        let (_dir, mut conn, exec) = wal_file_with_task(true);
+        let activities = one_activity();
+
+        let claimed =
+            super::claim_ready(&mut conn, exec, 0, &activities, ClaimSync::Deferred).unwrap();
+
+        assert!(claimed.is_some(), "the frozen task is claimed");
+        assert_eq!(state_and_frozen(&conn, exec), ("RUNNING".to_string(), 1));
+        assert_eq!(sync_level(&conn), 2, "the level is FULL after the claim");
+    }
+
+    /// The transaction with no commit sync never commits a freeze (issue
+    /// #1068). It rolls back, and the synced claim then takes the task.
+    #[test]
+    fn a_deferred_claim_leaves_the_freeze_to_a_synced_claim() {
+        let (_dir, mut conn, exec) = wal_file_with_task(false);
+        let activities = one_activity();
+
+        let relaxed = super::claim_in_tx(&mut conn, exec, 0, &activities, true).unwrap();
+        assert!(matches!(relaxed, super::Claimed::NeedsSync));
+        assert_eq!(
+            state_and_frozen(&conn, exec),
+            ("PENDING".to_string(), 0),
+            "the relaxed transaction rolled back",
+        );
+
+        let claimed =
+            super::claim_ready(&mut conn, exec, 0, &activities, ClaimSync::Deferred).unwrap();
+        assert!(claimed.is_some(), "the synced claim takes the task");
+        assert_eq!(state_and_frozen(&conn, exec), ("RUNNING".to_string(), 1));
+        assert_eq!(sync_level(&conn), 2);
+    }
+
+    /// An error in a deferred claim still restores the sync level, and the
+    /// task stays claimable.
+    #[test]
+    fn a_failed_deferred_claim_restores_the_sync_level() {
+        let (_dir, mut conn, exec) = wal_file_with_task(true);
+        let no_activities = HashMap::new();
+
+        let claimed = super::claim_ready(&mut conn, exec, 0, &no_activities, ClaimSync::Deferred);
+
+        assert!(claimed.is_err(), "an unregistered activity is an error");
+        assert_eq!(state_and_frozen(&conn, exec), ("PENDING".to_string(), 1));
+        assert_eq!(sync_level(&conn), 2, "the level is FULL after the error");
+    }
+
+    /// With no ready task a deferred claim reports none and restores the
+    /// sync level.
+    #[test]
+    fn an_idle_deferred_claim_restores_the_sync_level() {
+        let (_dir, mut conn, exec) = wal_file_with_task(true);
+        let activities = one_activity();
+        conn.execute("UPDATE harvest_tasks SET run_at = 10", [])
+            .unwrap();
+
+        let claimed =
+            super::claim_ready(&mut conn, exec, 0, &activities, ClaimSync::Deferred).unwrap();
+
+        assert!(claimed.is_none(), "the task is not ready yet");
+        assert_eq!(sync_level(&conn), 2);
+    }
+
+    /// A dropped guard restores the sync level, as on an unwind.
+    #[test]
+    fn a_dropped_relaxed_sync_restores_the_sync_level() {
+        let (_dir, mut conn, _exec) = wal_file_with_task(true);
+
+        let relaxed = super::RelaxedSync::begin(&mut conn).unwrap();
+        assert_eq!(sync_level(relaxed.conn), 1, "the level is NORMAL inside");
+        drop(relaxed);
+
+        assert_eq!(sync_level(&conn), 2);
+    }
+
+    /// A full claim never changes the sync level.
+    #[test]
+    fn a_full_claim_keeps_the_sync_level() {
+        let (_dir, mut conn, exec) = wal_file_with_task(false);
+        let activities = one_activity();
+
+        let claimed = super::claim_ready(&mut conn, exec, 0, &activities, ClaimSync::Full).unwrap();
+
+        assert!(claimed.is_some());
+        assert_eq!(state_and_frozen(&conn, exec), ("RUNNING".to_string(), 1));
+        assert_eq!(sync_level(&conn), 2);
     }
 }

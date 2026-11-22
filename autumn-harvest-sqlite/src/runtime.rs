@@ -43,6 +43,7 @@ use crate::query::{DEFAULT_QUERY_TIMEOUT, QueryReplay};
 use crate::retention::{PurgePolicy, PurgeReport};
 use crate::schedule::{ScheduleOverride, ScheduleSummary, ScheduleTrigger};
 use crate::visibility::{ExecutionDescription, ExecutionFilter, ExecutionPage, ListCursor};
+use crate::worker::ClaimSync;
 use crate::{
     composition, external_task, llm_ledger, lock, mutex, queue, retention, schedule, schema, store,
     update, visibility, worker, workflow_log,
@@ -486,6 +487,9 @@ pub struct SqliteRuntime {
     /// `false` fires no schedule (issue #2471). The plugin sets it from
     /// `harvest.scheduler_enabled`.
     schedules_enabled: bool,
+    /// Whether a claim commit is synced. The open sets it from the journal
+    /// mode. See [`ClaimSync`].
+    claim_sync: ClaimSync,
 }
 
 impl Drop for SqliteRuntime {
@@ -578,8 +582,9 @@ impl SqliteRuntime {
         Self::from_connection(conn, writer_lock, Checkpointer::Sqlite)
     }
 
-    /// Apply the pragmas and the schema, and reclaim orphaned tasks.
-    fn prepare(conn: &Connection, checkpointer: Checkpointer) -> SqliteResult<()> {
+    /// Apply the pragmas and the schema, and reclaim orphaned tasks. Returns
+    /// how a claim commit reaches the disk.
+    fn prepare(conn: &Connection, checkpointer: Checkpointer) -> SqliteResult<ClaimSync> {
         if checkpointer == Checkpointer::External {
             // First, so no later statement of this connection checkpoints.
             conn.execute_batch("PRAGMA wal_autocheckpoint = 0;")?;
@@ -627,7 +632,18 @@ impl SqliteRuntime {
         // claimed each task left `RUNNING`. Flip it back to `PENDING` so its body
         // re-runs (at-least-once).
         queue::reclaim_orphaned_running(conn)?;
-        Ok(())
+        // A claim commit can skip its sync only in WAL mode. Another journal
+        // mode needs each sync to keep the file consistent. An in-memory
+        // database reports `memory` and syncs nothing. A replicator ships
+        // WAL frames, and a frame that the file can lose must not reach a
+        // replica, so a replicated file keeps each sync.
+        let journal_mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        let wal = journal_mode.eq_ignore_ascii_case("wal");
+        Ok(if wal && checkpointer == Checkpointer::Sqlite {
+            ClaimSync::Deferred
+        } else {
+            ClaimSync::Full
+        })
     }
 
     fn from_connection(
@@ -643,12 +659,15 @@ impl SqliteRuntime {
         conn.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
         // A failed setup builds no runtime, so `Drop` never runs. Release the
         // lock here, or an in-memory owner row would outlive the failed open.
-        if let Err(err) = Self::prepare(&conn, checkpointer) {
-            if let Some(lock) = &writer_lock {
-                lock.release(&conn);
+        let claim_sync = match Self::prepare(&conn, checkpointer) {
+            Ok(claim_sync) => claim_sync,
+            Err(err) => {
+                if let Some(lock) = &writer_lock {
+                    lock.release(&conn);
+                }
+                return Err(err);
             }
-            return Err(err);
-        }
+        };
         Ok(Self {
             conn,
             workflows: HashMap::new(),
@@ -668,6 +687,7 @@ impl SqliteRuntime {
             workflow_infos: HashMap::new(),
             signal_handlers: HashMap::new(),
             schedules_enabled: true,
+            claim_sync,
         })
     }
 
@@ -4374,6 +4394,7 @@ impl SqliteRuntime {
                 failure_now,
                 &self.activities,
                 settle_after_first_terminal,
+                self.claim_sync,
             )
         });
         // Issue #2029: the workflow deadline bounds the drain. A body past it
@@ -7987,5 +8008,94 @@ mod replicated_open_tests {
         runtime.raise_fleet_epoch(4).unwrap();
         runtime.raise_fleet_epoch(2).unwrap();
         assert_eq!(crate::fleet_epoch::read(&path).unwrap(), 4);
+    }
+}
+
+#[cfg(test)]
+// The `#[workflow]` macro references the input param through its expansion.
+#[allow(clippy::used_underscore_binding)]
+mod claim_sync_tests {
+    use autumn_harvest::prelude::*;
+    use serde_json::{Value, json};
+
+    use super::{ActivitySpec, RunState, SqliteRuntime};
+
+    /// A claim commit skips its sync only on a WAL file that `SQLite`
+    /// checkpoints. See [`ClaimSync`](crate::worker::ClaimSync).
+    #[test]
+    fn only_a_plain_wal_file_defers_the_claim_sync() {
+        use crate::worker::ClaimSync;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = SqliteRuntime::open(dir.path().join("plain.db")).unwrap();
+        assert_eq!(file.claim_sync, ClaimSync::Deferred);
+
+        let replicated = SqliteRuntime::open_replicated(dir.path().join("shipped.db")).unwrap();
+        assert_eq!(replicated.claim_sync, ClaimSync::Full);
+
+        let memory = SqliteRuntime::open_in_memory().unwrap();
+        assert_eq!(memory.claim_sync, ClaimSync::Full);
+    }
+
+    /// A drive on a file leaves the connection at `synchronous = FULL`, so
+    /// each commit after a claim is synced.
+    #[tokio::test]
+    async fn a_drive_on_a_file_leaves_the_commit_sync_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = SqliteRuntime::open(dir.path().join("drive.db")).unwrap();
+        rt.register_workflow(&one_activity_wf_info());
+        rt.register_activity_raw("act", ActivitySpec::new(1, Ok));
+        let exec = rt.start_workflow("one_activity_wf", json!(1)).unwrap();
+
+        let state = rt.run_until_blocked(exec).await.unwrap();
+
+        assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+        let level: i64 = rt
+            .conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(level, 2, "the level is FULL after the drive");
+    }
+
+    #[workflow]
+    async fn one_activity_wf(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+        ctx.execute_activity_raw("act", json!({"k": 1}), "default")
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod statement_cache_tests {
+    use rusqlite::StatementStatus;
+
+    use super::SqliteRuntime;
+
+    /// How often `SQLite` compiled the cached statement `sql` again, after
+    /// one use for each run id in `ids`.
+    fn recompiles(runtime: &SqliteRuntime, sql: &str, ids: &[&str]) -> i32 {
+        for id in ids {
+            let mut stmt = runtime.conn.prepare_cached(sql).unwrap();
+            let mut rows = stmt.query([id]).unwrap();
+            while rows.next().unwrap().is_some() {}
+        }
+        let stmt = runtime.conn.prepare_cached(sql).unwrap();
+        stmt.get_status(StatementStatus::RePrepare)
+    }
+
+    /// A cached drive statement keeps its plan when a run id is bound. Without
+    /// the planner stability guarantee, `SQLite` compiles an index range
+    /// statement again on each bind, and the cache saves nothing.
+    #[test]
+    fn a_cached_statement_is_not_compiled_again_on_a_bind() {
+        let runtime = SqliteRuntime::open_in_memory().unwrap();
+        for sql in [
+            "SELECT MAX(seq) FROM harvest_events WHERE exec_id = ?1",
+            "SELECT event_json FROM harvest_events WHERE exec_id = ?1 ORDER BY seq",
+            "SELECT task_id FROM harvest_tasks WHERE state = 'PENDING' AND exec_id = ?1 \
+             ORDER BY seq LIMIT 1",
+        ] {
+            assert_eq!(recompiles(&runtime, sql, &["a", "a", "b", "c"]), 0, "{sql}");
+        }
     }
 }
