@@ -42,7 +42,7 @@ pub struct SlotPlacement {
 impl SlotPlacement {
     /// Time the task waits for a slot after its earliest start.
     #[must_use]
-    pub fn queued(&self, earliest_start: Duration) -> Duration {
+    pub const fn queued(&self, earliest_start: Duration) -> Duration {
         self.start.saturating_sub(earliest_start)
     }
 }
@@ -66,7 +66,8 @@ impl SlotSchedule {
     /// An empty run has a utilization of zero.
     #[must_use]
     pub fn utilization(&self) -> f64 {
-        let capacity = self.makespan.as_secs_f64() * self.slots as f64;
+        let capacity =
+            self.makespan.as_secs_f64() * f64::from(u32::try_from(self.slots).unwrap_or(u32::MAX));
         if capacity == 0.0 {
             return 0.0;
         }
