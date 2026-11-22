@@ -3905,8 +3905,11 @@ impl SqliteRuntime {
         // these (`store::running_executions` filters to `state = 'RUNNING'`), but a
         // DIRECT `run_until_blocked(sealed_exec)` must short-circuit rather than
         // re-drive a superseded run's handler.
-        let state = store::execution_state(&self.conn, exec)?;
-        if autumn_harvest::erase::is_terminal_state(&state) {
+        //
+        // One read gets each column of the run row that the cycle needs.
+        let row = store::cycle_row(&self.conn, exec)?;
+        let state = &row.state;
+        if autumn_harvest::erase::is_terminal_state(state) {
             return match state.as_str() {
                 "COMPLETED" => Ok(RunState::Completed(
                     store::execution_output(&self.conn, exec)?.unwrap_or(Value::Null),
@@ -3944,12 +3947,12 @@ impl SqliteRuntime {
 
         // Issue #2029: a retry waits for its backoff, and a run past its
         // deadline ends `TIMED_OUT` before it runs again.
-        let config = store::run_config(&self.conn, exec)?;
+        let config = &row.config;
         if config.start_at.is_some_and(|at| now < at) {
             // A retry that has not started yet has no work to clean up, so a
             // pending cancel ends it at once.
-            if let Some((reason, _)) = store::cancel_request(&self.conn, exec)? {
-                return self.seal_cancelled(exec, &reason, None, now);
+            if let Some((reason, _)) = &row.cancel {
+                return self.seal_cancelled(exec, reason, None, now);
             }
             return Ok(RunState::WaitingTimer);
         }
@@ -3959,9 +3962,7 @@ impl SqliteRuntime {
         // A local activity waits for its retry backoff here. A pending cancel
         // skips the wait: the next attempt runs now, so the activity resolves
         // and the body sees the cancel.
-        if config.local_retry_at.is_some_and(|at| now < at)
-            && store::cancel_request(&self.conn, exec)?.is_none()
-        {
+        if config.local_retry_at.is_some_and(|at| now < at) && row.cancel.is_none() {
             return Ok(RunState::WaitingTimer);
         }
 
@@ -3971,7 +3972,7 @@ impl SqliteRuntime {
         // right after a failed or a discarded cycle too.
         let mut loaded = self.history_cache.load(&self.conn, exec)?;
         let result =
-            boxed(|| self.drive_loaded_cycle(exec, now, failure_now, config, &mut loaded)).await;
+            boxed(|| self.drive_loaded_cycle(exec, now, failure_now, row, &mut loaded)).await;
         if matches!(
             result,
             Ok(RunState::Completed(_)
@@ -4000,15 +4001,23 @@ impl SqliteRuntime {
         exec: ExecutionId,
         now: i64,
         failure_now: &(dyn Fn() -> i64 + Send + Sync),
-        config: store::RunConfig,
+        row: store::CycleRow,
         loaded: &mut LoadedHistory,
     ) -> SqliteResult<RunState> {
+        let store::CycleRow {
+            config,
+            cancel,
+            input_json,
+            workflow_name,
+            workflow_id,
+            parent,
+            ..
+        } = row;
         let history_bytes = loaded.bytes;
         // Issue #2021: a stored cancel request reaches the body through the
         // span meta. The history gets `WorkflowCancelled` only at the seal.
         // A body that ignores the request and keeps working could run forever,
         // so the cleanup may add only a bounded number of events.
-        let cancel = store::cancel_request(&self.conn, exec)?;
         if let Some((reason, from)) = &cancel
             && loaded.events.len().saturating_sub(*from) >= CANCEL_CLEANUP_EVENT_BUDGET
         {
@@ -4027,12 +4036,11 @@ impl SqliteRuntime {
         let ingest = self.plan_ingest(exec, now, loaded.events.len(), history_bytes)?;
         loaded.events.extend(ingest.events().cloned());
         let history = &loaded.events;
-        let input = store::execution_input(&self.conn, exec)?;
-        let workflow_name = store::workflow_name_of(&self.conn, exec)?;
-        // Re-read the persisted business `workflow_id` on EVERY cycle (issues #698
-        // and #1069), so `ctx.info().workflow_id` is STABLE across replays. It is
-        // threaded into the context below, never regenerated.
-        let workflow_id = store::workflow_id_of(&self.conn, exec)?;
+        let input: Value = serde_json::from_str(&input_json)?;
+        // The cycle row holds the persisted business `workflow_id`, read again
+        // on EVERY cycle (issues #698 and #1069). So `ctx.info().workflow_id` is
+        // STABLE across replays. It is threaded into the context below, never
+        // regenerated.
         let handler = *self
             .workflows
             .get(&workflow_name)
@@ -4059,7 +4067,6 @@ impl SqliteRuntime {
         // point (issue #1069). The core reads it ONLY from
         // `span_meta.workflow_id`, so build a minimal meta carrying it (see
         // [`drive_span_meta`]).
-        let parent = store::parent_link(&self.conn, exec)?.map(|(parent, _)| parent);
         let mut span_meta = drive_span_meta(
             &workflow_name,
             &workflow_id,
@@ -8157,5 +8164,157 @@ mod statement_cache_tests {
         ] {
             assert_eq!(recompiles(&runtime, sql, &["a", "a", "b", "c"]), 0, "{sql}");
         }
+    }
+}
+
+#[cfg(test)]
+// The `#[workflow]` macro references the input param through its expansion.
+#[allow(clippy::used_underscore_binding)]
+mod history_cache_tests {
+    use autumn_harvest::prelude::*;
+    use serde_json::{Value, json};
+
+    use super::{ActivitySpec, RunState, SqliteRuntime};
+
+    #[workflow]
+    async fn works_waits_works(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+        let first = ctx
+            .execute_activity_raw("act", json!({"step": 1}), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        let signal: Value = ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
+        let last = ctx
+            .execute_activity_raw("act", json!({"step": 2}), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!([first, signal, last]))
+    }
+
+    #[workflow]
+    async fn works_twice_then_waits(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+        let first = ctx
+            .execute_activity_raw("act", json!({"step": 1}), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        let second = ctx
+            .execute_activity_raw("act", json!({"step": 2}), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        let _signal: Value = ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
+        Ok(json!([first, second]))
+    }
+
+    fn runtime(dir: &tempfile::TempDir, name: &str) -> SqliteRuntime {
+        let mut rt = SqliteRuntime::open(dir.path().join(name)).unwrap();
+        rt.register_workflow(&works_waits_works_info());
+        rt.register_workflow(&works_twice_then_waits_info());
+        rt.register_activity_raw("act", ActivitySpec::new(1, Ok));
+        rt
+    }
+
+    /// The event types of a history. Ids and times differ between two runs.
+    fn shape(rt: &SqliteRuntime, exec: ExecutionId) -> Vec<String> {
+        rt.load_history(exec)
+            .unwrap()
+            .iter()
+            .map(|event| {
+                serde_json::to_value(event).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Drive one run to its signal wait, signal it, and drive it to its end.
+    async fn drive(rt: &mut SqliteRuntime) -> (ExecutionId, Value) {
+        let exec = rt.start_workflow("works_waits_works", json!(1)).unwrap();
+        let blocked = rt.run_until_blocked(exec).await.unwrap();
+        assert!(matches!(blocked, RunState::WaitingSignal(_)), "{blocked:?}");
+        rt.send_signal(exec, "go", json!("now")).unwrap();
+        match rt.run_until_blocked(exec).await.unwrap() {
+            RunState::Completed(output) => (exec, output),
+            other => panic!("the run must complete: {other:?}"),
+        }
+    }
+
+    /// A blocked run stays warm, and a run that ends leaves the cache.
+    #[tokio::test]
+    async fn a_blocked_run_is_warm_and_an_ended_run_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = runtime(&dir, "warm.db");
+        let exec = rt.start_workflow("works_waits_works", json!(1)).unwrap();
+
+        let blocked = rt.run_until_blocked(exec).await.unwrap();
+        assert!(matches!(blocked, RunState::WaitingSignal(_)), "{blocked:?}");
+        assert!(rt.history_cache.holds(exec), "a blocked run stays warm");
+        let warm = rt.history_cache.load(&rt.conn, exec).unwrap();
+        assert_eq!(warm.events.len(), rt.load_history(exec).unwrap().len());
+        rt.history_cache.keep(exec, warm);
+
+        rt.send_signal(exec, "go", json!("now")).unwrap();
+        let done = rt.run_until_blocked(exec).await.unwrap();
+        assert!(matches!(done, RunState::Completed(_)), "{done:?}");
+        assert!(
+            !rt.history_cache.holds(exec),
+            "an ended run leaves the cache"
+        );
+    }
+
+    /// A drive with the cache writes the history that a drive with no cache
+    /// writes, and returns the same result.
+    #[tokio::test]
+    async fn a_drive_with_the_cache_matches_a_drive_without_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cached = runtime(&dir, "cached.db");
+        let mut plain = runtime(&dir, "plain.db");
+        plain.set_history_cache_bytes(0);
+
+        let (cached_exec, cached_output) = drive(&mut cached).await;
+        let (plain_exec, plain_output) = drive(&mut plain).await;
+
+        assert_eq!(cached_output, plain_output);
+        assert_eq!(shape(&cached, cached_exec), shape(&plain, plain_exec));
+    }
+
+    /// A fixture that damages a stored event through its own connection is
+    /// seen by the next cycle of a warm run. The event is not the last one,
+    /// so only the data version can show the change.
+    #[tokio::test]
+    async fn a_warm_run_sees_an_event_that_another_connection_rewrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = runtime(&dir, "damaged.db");
+        let exec = rt
+            .start_workflow("works_twice_then_waits", json!(1))
+            .unwrap();
+        let blocked = rt.run_until_blocked(exec).await.unwrap();
+        assert!(matches!(blocked, RunState::WaitingSignal(_)), "{blocked:?}");
+        assert!(rt.history_cache.holds(exec), "the run is warm");
+
+        // Replace the first recorded activity result with another value.
+        let mut raw = rusqlite::Connection::open(dir.path().join("damaged.db")).unwrap();
+        let changed = crate::append_only::with_guard_off(&mut raw, |tx| {
+            tx.execute(
+                "UPDATE harvest_events \
+                 SET event_json = replace(event_json, '\"step\":1', '\"step\":41') \
+                 WHERE exec_id = ?1 AND event_json LIKE '%ActivityCompleted%' \
+                   AND event_json LIKE '%\"step\":1%'",
+                [exec.to_string()],
+            )
+        })
+        .unwrap();
+        assert_eq!(changed, 1, "one stored result changed");
+
+        rt.send_signal(exec, "go", json!("now")).unwrap();
+        let done = rt.run_until_blocked(exec).await.unwrap();
+
+        let RunState::Completed(output) = done else {
+            panic!("the run must complete: {done:?}");
+        };
+        assert_eq!(
+            output[0],
+            json!({"step": 41}),
+            "the replay read the rewritten row"
+        );
     }
 }

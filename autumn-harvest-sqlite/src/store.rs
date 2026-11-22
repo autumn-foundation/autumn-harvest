@@ -139,6 +139,125 @@ impl RunConfig {
     }
 }
 
+/// The columns of one run that each decision cycle reads.
+///
+/// One read replaces a lookup of each column. Nothing writes the run row
+/// between the start of a cycle and its replay, so the values are those that
+/// the separate lookups returned.
+#[derive(Debug)]
+pub struct CycleRow {
+    /// The stored state, such as `RUNNING`.
+    pub state: String,
+    /// The timeout and retry settings (issue #2029).
+    pub config: RunConfig,
+    /// The cooperative cancel request, as [`cancel_request`] returns it.
+    pub cancel: Option<(String, usize)>,
+    /// The stored input, not parsed yet. A terminal run never parses it.
+    pub input_json: String,
+    /// The workflow type.
+    pub workflow_name: String,
+    /// The business `workflow_id` recorded at start (issue #698).
+    pub workflow_id: String,
+    /// The parent run, if this run is a child (issue #2026).
+    pub parent: Option<ExecutionId>,
+}
+
+/// Read the [`CycleRow`] of `exec_id`.
+///
+/// An unknown id is [`SqliteError::ExecutionNotFound`].
+pub fn cycle_row(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<CycleRow> {
+    let row = conn
+        .prepare_cached(
+            "SELECT state, execution_timeout_ms, deadline_at, start_at, workflow_attempt, \
+             retry_policy_json, retry_of_exec_id, local_retry_at, cancel_reason, \
+             cancel_from_seq, input_json, workflow_name, workflow_id, parent_exec_id \
+             FROM harvest_executions WHERE exec_id = ?1",
+        )?
+        .query_row(params![exec_id.to_string()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                (
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, Option<i64>>(7)?,
+                ),
+                r.get::<_, Option<String>>(8)?,
+                r.get::<_, Option<i64>>(9)?,
+                r.get::<_, String>(10)?,
+                r.get::<_, String>(11)?,
+                r.get::<_, String>(12)?,
+                r.get::<_, Option<String>>(13)?,
+            ))
+        })
+        .optional()?
+        .ok_or(SqliteError::ExecutionNotFound(exec_id))?;
+    let (state, config, cancel_reason, cancel_from, input_json, workflow_name, workflow_id, parent) =
+        row;
+    let parent = parent
+        .map(|id| {
+            id.parse()
+                .map_err(|_| SqliteError::corrupt("parent_exec_id"))
+        })
+        .transpose()?;
+    Ok(CycleRow {
+        state,
+        config: run_config_of(config)?,
+        cancel: cancel_reason.map(|reason| (reason, cancel_from_seq(cancel_from))),
+        input_json,
+        workflow_name,
+        workflow_id,
+        parent,
+    })
+}
+
+/// The history length that a stored `cancel_from_seq` names.
+fn cancel_from_seq(from: Option<i64>) -> usize {
+    from.and_then(|seq| usize::try_from(seq).ok()).unwrap_or(0)
+}
+
+/// The stored columns of a [`RunConfig`], in the order of its fields.
+type RunConfigColumns = (
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+);
+
+/// Build a [`RunConfig`] from its stored columns.
+fn run_config_of(columns: RunConfigColumns) -> SqliteResult<RunConfig> {
+    let (
+        execution_timeout_ms,
+        deadline_at,
+        start_at,
+        attempt,
+        retry_policy_json,
+        retry_of,
+        local_retry_at,
+    ) = columns;
+    let retry_of = retry_of
+        .map(|id| {
+            id.parse()
+                .map_err(|_| SqliteError::corrupt("retry_of_exec_id"))
+        })
+        .transpose()?;
+    Ok(RunConfig {
+        execution_timeout_ms,
+        deadline_at,
+        start_at,
+        attempt: u32::try_from(attempt).unwrap_or(1).max(1),
+        retry_policy_json,
+        retry_of,
+        local_retry_at,
+    })
+}
+
 /// The stored [`RunConfig`] of `exec_id` (issue #2029).
 pub fn run_config(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<RunConfig> {
     let row = conn
@@ -160,30 +279,7 @@ pub fn run_config(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<RunCo
         })
         .optional()?
         .ok_or(SqliteError::ExecutionNotFound(exec_id))?;
-    let (
-        execution_timeout_ms,
-        deadline_at,
-        start_at,
-        attempt,
-        retry_policy_json,
-        retry_of,
-        local_retry_at,
-    ) = row;
-    let retry_of = retry_of
-        .map(|id| {
-            id.parse()
-                .map_err(|_| SqliteError::corrupt("retry_of_exec_id"))
-        })
-        .transpose()?;
-    Ok(RunConfig {
-        execution_timeout_ms,
-        deadline_at,
-        start_at,
-        attempt: u32::try_from(attempt).unwrap_or(1).max(1),
-        retry_policy_json,
-        retry_of,
-        local_retry_at,
-    })
+    run_config_of(row)
 }
 
 /// Park `exec_id` until the local-activity backoff ends at `at` (issue
@@ -490,10 +586,7 @@ pub fn cancel_request(
         .query_row(params![exec_id.to_string()], |row| {
             Ok((row.get(0)?, row.get(1)?))
         })?;
-    Ok(reason.map(|reason| {
-        let from = from.and_then(|seq| usize::try_from(seq).ok()).unwrap_or(0);
-        (reason, from)
-    }))
+    Ok(reason.map(|reason| (reason, cancel_from_seq(from))))
 }
 
 /// Put `exec_id` in a terminal `state` with `reason` as its error (issue
@@ -1101,5 +1194,68 @@ mod tests {
             pending_timer_arms(&[started(), cancelled(), started()], "x"),
             1
         );
+    }
+
+    /// The one cycle read returns what the separate lookups return.
+    #[test]
+    fn the_cycle_row_matches_the_separate_lookups() {
+        use autumn_harvest::ExecutionId;
+        use serde_json::json;
+
+        use super::RunConfig;
+        use crate::error::SqliteError;
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::schema::SCHEMA).unwrap();
+        let parent = ExecutionId::new();
+        let child = ExecutionId::new();
+        let config = RunConfig {
+            execution_timeout_ms: Some(5_000),
+            deadline_at: Some(9_000),
+            start_at: Some(4_000),
+            attempt: 2,
+            retry_policy_json: Some("{}".to_string()),
+            retry_of: Some(parent),
+            local_retry_at: None,
+        };
+        super::insert_execution(&conn, parent, "wf", "order-1", &json!({"n": 1})).unwrap();
+        super::insert_child_execution(&conn, child, "kid", &json!([2]), (parent, None), &config)
+            .unwrap();
+        super::append_event(&conn, child, &started()).unwrap();
+        super::request_cancel(&conn, child, "stop").unwrap();
+        super::set_local_retry_at(&conn, child, 7_000).unwrap();
+
+        for exec in [parent, child] {
+            let row = super::cycle_row(&conn, exec).unwrap();
+            assert_eq!(row.state, super::execution_state(&conn, exec).unwrap());
+            assert_eq!(
+                format!("{:?}", row.config),
+                format!("{:?}", super::run_config(&conn, exec).unwrap()),
+            );
+            assert_eq!(row.cancel, super::cancel_request(&conn, exec).unwrap());
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&row.input_json).unwrap(),
+                super::execution_input(&conn, exec).unwrap(),
+            );
+            assert_eq!(
+                row.workflow_name,
+                super::workflow_name_of(&conn, exec).unwrap()
+            );
+            assert_eq!(row.workflow_id, super::workflow_id_of(&conn, exec).unwrap());
+            assert_eq!(
+                row.parent,
+                super::parent_link(&conn, exec).unwrap().map(|(id, _)| id),
+            );
+        }
+        let child_row = super::cycle_row(&conn, child).unwrap();
+        assert_eq!(child_row.cancel, Some(("stop".to_string(), 1)));
+        assert_eq!(child_row.parent, Some(parent));
+        assert_eq!(child_row.config.local_retry_at, Some(7_000));
+
+        let unknown = ExecutionId::new();
+        assert!(matches!(
+            super::cycle_row(&conn, unknown),
+            Err(SqliteError::ExecutionNotFound(id)) if id == unknown
+        ));
     }
 }

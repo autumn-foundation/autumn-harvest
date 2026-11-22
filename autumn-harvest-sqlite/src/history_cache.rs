@@ -126,6 +126,12 @@ impl HistoryCache {
         self.evict_to_budget();
     }
 
+    /// True when the cache holds the history of `exec_id`.
+    #[cfg(test)]
+    pub fn holds(&self, exec_id: ExecutionId) -> bool {
+        self.entries.contains_key(&exec_id)
+    }
+
     /// Drop every entry.
     pub fn clear(&mut self) {
         self.entries.clear();
