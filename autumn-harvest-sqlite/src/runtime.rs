@@ -14,8 +14,8 @@ use autumn_harvest::context::{
     empty_shared_state,
 };
 use autumn_harvest::executor::{
-    QueryReplayOutcome, WorkflowExecuteSpanMeta, drive_query_replay_async,
-    run_workflow_with_state_history_policy_and_caps,
+    LentCycle, QueryReplayOutcome, WorkflowExecuteSpanMeta, drive_query_replay_async,
+    run_workflow_lending_history,
 };
 use autumn_harvest::frame::boxed;
 use autumn_harvest::llm_ledger::LlmCall;
@@ -31,10 +31,12 @@ use autumn_harvest::{
 };
 use jiff::Timestamp;
 use rusqlite::Connection;
+use rusqlite::config::DbConfig;
 use serde_json::Value;
 
 use crate::error::{SqliteError, SqliteResult};
 use crate::external_task::{ExternalHandoff, ExternalHandoffFilter, ExternalTaskState};
+use crate::history_cache::{DEFAULT_HISTORY_CACHE_BYTES, HistoryCache, LoadedHistory};
 use crate::history_cap::{CapCheck, HistoryCapReason};
 use crate::llm_ledger::LlmLedgerRow;
 use crate::lock::WriterLock;
@@ -42,6 +44,7 @@ use crate::query::{DEFAULT_QUERY_TIMEOUT, QueryReplay};
 use crate::retention::{PurgePolicy, PurgeReport};
 use crate::schedule::{ScheduleOverride, ScheduleSummary, ScheduleTrigger};
 use crate::visibility::{ExecutionDescription, ExecutionFilter, ExecutionPage, ListCursor};
+use crate::worker::ClaimSync;
 use crate::{
     composition, external_task, llm_ledger, lock, mutex, queue, retention, schedule, schema, store,
     update, visibility, worker, workflow_log,
@@ -394,6 +397,13 @@ pub const UNSUPPORTED_FEATURE_ERROR_TYPE: &str = "UnsupportedFeature";
 /// `WorkflowTestEnv` mid-run limit.
 const UPDATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The size of the prepared-statement cache of the runtime connection.
+///
+/// It must exceed the distinct statements of the drive path, or the cache
+/// evicts a statement that the next cycle needs. The path has under 100. A
+/// cached statement holds a few kilobytes.
+const STATEMENT_CACHE_CAPACITY: usize = 128;
+
 /// Maximum driver iterations before declaring a runaway. This is a safety bound
 /// only; the supported scenarios converge in a handful of cycles.
 const MAX_ITERATIONS: usize = 10_000;
@@ -478,6 +488,12 @@ pub struct SqliteRuntime {
     /// `false` fires no schedule (issue #2471). The plugin sets it from
     /// `harvest.scheduler_enabled`.
     schedules_enabled: bool,
+    /// Whether a claim commit is synced. The open sets it from the journal
+    /// mode. See [`ClaimSync`].
+    claim_sync: ClaimSync,
+    /// The warm history of each run that a drive read last. See
+    /// [`history_cache`](crate::history_cache).
+    history_cache: HistoryCache,
 }
 
 impl Drop for SqliteRuntime {
@@ -570,18 +586,33 @@ impl SqliteRuntime {
         Self::from_connection(conn, writer_lock, Checkpointer::Sqlite)
     }
 
-    /// Apply the pragmas and the schema, and reclaim orphaned tasks.
-    fn prepare(conn: &Connection, checkpointer: Checkpointer) -> SqliteResult<()> {
+    /// Apply the pragmas and the schema, and reclaim orphaned tasks. Returns
+    /// how a claim commit reaches the disk.
+    fn prepare(conn: &Connection, checkpointer: Checkpointer) -> SqliteResult<ClaimSync> {
         if checkpointer == Checkpointer::External {
             // First, so no later statement of this connection checkpoints.
             conn.execute_batch("PRAGMA wal_autocheckpoint = 0;")?;
         }
+        // The drive sends each statement through `prepare_cached`. The default
+        // cache holds 16 statements, and one decision cycle uses more. An
+        // evicted statement is compiled again, which costs more than its run.
+        conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
+        // Keep one plan for each cached statement. Without this guarantee
+        // `SQLite` reads a bound value while it plans an index range. It then
+        // compiles the statement again each time a parameter is bound, even to
+        // the same value. A drive binds a run id to each statement, so each
+        // cached statement was compiled on each use. The guarantee turns off
+        // only the plans that depend on a bound value. This schema has no
+        // `ANALYZE` data and binds no `LIKE` pattern, so it has no such plan.
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG, true)?;
         // Durability & concurrency posture (issue #1068). This backend claims
         // that a committed transaction survives a crash or power loss. The
         // crash-then-reopen tests depend on it, so set it explicitly instead of
         // leaning on driver defaults:
         // - `synchronous = FULL`: fsync on every COMMIT. WAL + FULL is fully
-        //   durable (every commit is flushed), just reader-friendly.
+        //   durable (every commit is flushed), just reader-friendly. The claim
+        //   that only sets a task `RUNNING` is the one exception. See
+        //   [`ClaimSync`].
         // - `journal_mode = WAL`: the idiomatic embedded choice for a single
         //   writer plus an occasional external reader (a monitoring/inspector
         //   connection coexists with the writer without an immediate
@@ -607,7 +638,18 @@ impl SqliteRuntime {
         // claimed each task left `RUNNING`. Flip it back to `PENDING` so its body
         // re-runs (at-least-once).
         queue::reclaim_orphaned_running(conn)?;
-        Ok(())
+        // A claim commit can skip its sync only in WAL mode. Another journal
+        // mode needs each sync to keep the file consistent. An in-memory
+        // database reports `memory` and syncs nothing. A replicator ships
+        // WAL frames, and a frame that the file can lose must not reach a
+        // replica, so a replicated file keeps each sync.
+        let journal_mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        let wal = journal_mode.eq_ignore_ascii_case("wal");
+        Ok(if wal && checkpointer == Checkpointer::Sqlite {
+            ClaimSync::Deferred
+        } else {
+            ClaimSync::Full
+        })
     }
 
     fn from_connection(
@@ -623,12 +665,15 @@ impl SqliteRuntime {
         conn.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
         // A failed setup builds no runtime, so `Drop` never runs. Release the
         // lock here, or an in-memory owner row would outlive the failed open.
-        if let Err(err) = Self::prepare(&conn, checkpointer) {
-            if let Some(lock) = &writer_lock {
-                lock.release(&conn);
+        let claim_sync = match Self::prepare(&conn, checkpointer) {
+            Ok(claim_sync) => claim_sync,
+            Err(err) => {
+                if let Some(lock) = &writer_lock {
+                    lock.release(&conn);
+                }
+                return Err(err);
             }
-            return Err(err);
-        }
+        };
         Ok(Self {
             conn,
             workflows: HashMap::new(),
@@ -648,6 +693,8 @@ impl SqliteRuntime {
             workflow_infos: HashMap::new(),
             signal_handlers: HashMap::new(),
             schedules_enabled: true,
+            claim_sync,
+            history_cache: HistoryCache::new(DEFAULT_HISTORY_CACHE_BYTES),
         })
     }
 
@@ -781,6 +828,18 @@ impl SqliteRuntime {
     #[must_use]
     pub const fn history_byte_hard_cap(&self) -> Option<u64> {
         self.history_policy.byte_hard_cap()
+    }
+
+    /// Set how many bytes of stored history the runtime keeps warm between
+    /// decision cycles. Zero turns the cache off.
+    ///
+    /// The default is [`DEFAULT_HISTORY_CACHE_BYTES`]. A warm run costs one
+    /// cycle only the events that the last cycle added. A run outside the
+    /// cache reads its whole history on each cycle. The budget counts stored
+    /// JSON, and the parsed events take a few times that in memory. A lower
+    /// budget drops the least recently driven runs at once.
+    pub fn set_history_cache_bytes(&mut self, bytes: u64) {
+        self.history_cache.set_budget(bytes);
     }
 
     /// Set the stored-history byte cap per run (issue #2023). `None` removes
@@ -2853,6 +2912,9 @@ impl SqliteRuntime {
         now: Timestamp,
         policy: &PurgePolicy,
     ) -> SqliteResult<PurgeReport> {
+        // A purge removes stored events. The tail check of the cache sees
+        // that too. This keeps the cache right with no such check.
+        self.history_cache.clear();
         retention::purge_with(&mut self.conn, now.as_microsecond(), policy)
     }
 
@@ -2897,6 +2959,7 @@ impl SqliteRuntime {
     ) -> SqliteResult<u64> {
         let window = i64::try_from(older_than.as_micros()).unwrap_or(i64::MAX);
         let cutoff = now.as_microsecond().saturating_sub(window);
+        self.history_cache.clear();
         retention::purge_terminal(&mut self.conn, cutoff)
     }
 
@@ -3844,8 +3907,14 @@ impl SqliteRuntime {
         // these (`store::running_executions` filters to `state = 'RUNNING'`), but a
         // DIRECT `run_until_blocked(sealed_exec)` must short-circuit rather than
         // re-drive a superseded run's handler.
-        let state = store::execution_state(&self.conn, exec)?;
-        if autumn_harvest::erase::is_terminal_state(&state) {
+        //
+        // One read gets each column of the run row that the cycle needs.
+        let row = store::cycle_row(&self.conn, exec)?;
+        let state = &row.state;
+        if autumn_harvest::erase::is_terminal_state(state) {
+            // A cancel, a terminate or a cascade can end a warm run outside
+            // its own cycle. No drive reads its history again.
+            self.history_cache.forget(exec);
             return match state.as_str() {
                 "COMPLETED" => Ok(RunState::Completed(
                     store::execution_output(&self.conn, exec)?.unwrap_or(Value::Null),
@@ -3883,12 +3952,12 @@ impl SqliteRuntime {
 
         // Issue #2029: a retry waits for its backoff, and a run past its
         // deadline ends `TIMED_OUT` before it runs again.
-        let config = store::run_config(&self.conn, exec)?;
+        let config = &row.config;
         if config.start_at.is_some_and(|at| now < at) {
             // A retry that has not started yet has no work to clean up, so a
             // pending cancel ends it at once.
-            if let Some((reason, _)) = store::cancel_request(&self.conn, exec)? {
-                return self.seal_cancelled(exec, &reason, None, now);
+            if let Some((reason, _)) = &row.cancel {
+                return self.seal_cancelled(exec, reason, None, now);
             }
             return Ok(RunState::WaitingTimer);
         }
@@ -3898,24 +3967,64 @@ impl SqliteRuntime {
         // A local activity waits for its retry backoff here. A pending cancel
         // skips the wait: the next attempt runs now, so the activity resolves
         // and the body sees the cancel.
-        if config.local_retry_at.is_some_and(|at| now < at)
-            && store::cancel_request(&self.conn, exec)?.is_none()
-        {
+        if config.local_retry_at.is_some_and(|at| now < at) && row.cancel.is_none() {
             return Ok(RunState::WaitingTimer);
         }
 
-        // Plan every staged signal before replay (issue #2020). Replay reads
-        // the planned events in memory. Each persisting transaction below
-        // applies the plan first, so a discarded cycle consumes no signal.
-        // The plan stops at the room the history caps leave.
-        let (mut history, history_bytes) = store::load_history_sized(&self.conn, exec)?;
+        // The history comes from the warm cache when it holds the run. The
+        // cycle gives it back, so the next cycle reads only the new events.
+        // A cached event always came from a committed row, so the cache stays
+        // right after a failed or a discarded cycle too.
+        let mut loaded = self.history_cache.load(&self.conn, exec)?;
+        let result =
+            boxed(|| self.drive_loaded_cycle(exec, now, failure_now, row, &mut loaded)).await;
+        if matches!(
+            result,
+            Ok(RunState::Completed(_)
+                | RunState::Failed(_)
+                | RunState::Cancelled(_)
+                | RunState::Terminated(_)
+                | RunState::TimedOut(_)
+                | RunState::ContinuedAsNew(_))
+        ) {
+            // No drive reads the history of an ended run again.
+            self.history_cache.forget(exec);
+        } else {
+            self.history_cache.keep(exec, loaded);
+        }
+        result
+    }
+
+    /// The rest of one decision cycle, once its history is loaded: plan the
+    /// staged signals, replay the workflow, and persist the outcome.
+    ///
+    /// The cycle adds its planned signal events to `loaded.events`. The
+    /// caller removes them again before it caches the history.
+    #[allow(clippy::too_many_lines)] // one arm per `WorkflowOutcome` variant
+    async fn drive_loaded_cycle(
+        &mut self,
+        exec: ExecutionId,
+        now: i64,
+        failure_now: &(dyn Fn() -> i64 + Send + Sync),
+        row: store::CycleRow,
+        loaded: &mut LoadedHistory,
+    ) -> SqliteResult<RunState> {
+        let store::CycleRow {
+            config,
+            cancel,
+            input_json,
+            workflow_name,
+            workflow_id,
+            parent,
+            ..
+        } = row;
+        let history_bytes = loaded.bytes;
         // Issue #2021: a stored cancel request reaches the body through the
         // span meta. The history gets `WorkflowCancelled` only at the seal.
         // A body that ignores the request and keeps working could run forever,
         // so the cleanup may add only a bounded number of events.
-        let cancel = store::cancel_request(&self.conn, exec)?;
         if let Some((reason, from)) = &cancel
-            && history.len().saturating_sub(*from) >= CANCEL_CLEANUP_EVENT_BUDGET
+            && loaded.events.len().saturating_sub(*from) >= CANCEL_CLEANUP_EVENT_BUDGET
         {
             return self.seal_cancelled(exec, reason, None, now);
         }
@@ -3925,14 +4034,17 @@ impl SqliteRuntime {
                 Some(from.saturating_add(CANCEL_CLEANUP_EVENT_BUDGET)),
             )
         });
-        let ingest = self.plan_ingest(exec, now, history.len(), history_bytes)?;
-        history.extend(ingest.events().cloned());
-        let input = store::execution_input(&self.conn, exec)?;
-        let workflow_name = store::workflow_name_of(&self.conn, exec)?;
-        // Re-read the persisted business `workflow_id` on EVERY cycle (issues #698
-        // and #1069), so `ctx.info().workflow_id` is STABLE across replays. It is
-        // threaded into the context below, never regenerated.
-        let workflow_id = store::workflow_id_of(&self.conn, exec)?;
+        // Plan every staged signal before replay (issue #2020). Replay reads
+        // the planned events in memory. Each persisting transaction below
+        // applies the plan first, so a discarded cycle consumes no signal.
+        // The plan stops at the room the history caps leave.
+        let ingest = self.plan_ingest(exec, now, loaded.events.len(), history_bytes)?;
+        loaded.events.extend(ingest.events().cloned());
+        let input: Value = serde_json::from_str(&input_json)?;
+        // The cycle row holds the persisted business `workflow_id`, read again
+        // on EVERY cycle (issues #698 and #1069). So `ctx.info().workflow_id` is
+        // STABLE across replays. It is threaded into the context below, never
+        // regenerated.
         let handler = *self
             .workflows
             .get(&workflow_name)
@@ -3959,7 +4071,6 @@ impl SqliteRuntime {
         // point (issue #1069). The core reads it ONLY from
         // `span_meta.workflow_id`, so build a minimal meta carrying it (see
         // [`drive_span_meta`]).
-        let parent = store::parent_link(&self.conn, exec)?.map(|(parent, _)| parent);
         let mut span_meta = drive_span_meta(
             &workflow_name,
             &workflow_id,
@@ -3979,10 +4090,14 @@ impl SqliteRuntime {
         let queries: Vec<&QueryHandlerInfo> = queries.iter().collect();
         // The workflow drive and the suspension below go on the heap, so this
         // frame holds no copy of them in a debug build (issue #2752).
-        let (outcome, pending, _span, _resolved_router) = boxed(|| {
-            run_workflow_with_state_history_policy_and_caps(
+        // The executor reads the history and gives it back. So the cycle
+        // makes no copy of it for the checks below. The planned signal events
+        // are in the lent history, as the replay must see them.
+        let lent = std::mem::take(&mut loaded.events);
+        let cycle = boxed(|| {
+            run_workflow_lending_history(
                 exec,
-                history.clone(),
+                lent,
                 handler,
                 input,
                 self.shared_state.clone(),
@@ -4011,6 +4126,15 @@ impl SqliteRuntime {
             )
         })
         .await;
+        let LentCycle {
+            outcome,
+            pending,
+            span: _span,
+            history: returned,
+            ..
+        } = cycle;
+        self.take_back_history(exec, loaded, returned, &ingest)?;
+        let history = &loaded.events;
         // Read the clock again once the body returns (issue #2026). The body
         // can take time. Each write that another run reads by time uses this
         // instant. A close checks the parent's child deadlines at it. A signal
@@ -4135,7 +4259,7 @@ impl SqliteRuntime {
                         workflows: &self.workflows,
                         policies: &self.workflow_policies,
                     },
-                    history: &history,
+                    history,
                     cycle: TerminalCycle::Completing,
                     now: decided_at,
                     log_policy: self.log_policy,
@@ -4201,7 +4325,7 @@ impl SqliteRuntime {
                 let retry = retry_plan(&config, &decoded, exec, failure_now())?;
                 let failure = CycleFailure {
                     ingest: &ingest,
-                    history: &history,
+                    history,
                     caps: &caps,
                     terminal: WorkflowEvent::workflow_failed_typed(&decoded),
                     message: decoded.message,
@@ -4226,7 +4350,7 @@ impl SqliteRuntime {
             {
                 let failure = CycleFailure {
                     ingest: &ingest,
-                    history: &history,
+                    history,
                     caps: &caps,
                     terminal: WorkflowEvent::workflow_failed(CHILD_CONTINUE_AS_NEW_ERROR),
                     message: CHILD_CONTINUE_AS_NEW_ERROR.to_string(),
@@ -4277,7 +4401,7 @@ impl SqliteRuntime {
                         exec,
                         &owner,
                         &ingest,
-                        &history,
+                        history,
                         &commands,
                         &caps,
                         CycleClock { now, decided_at },
@@ -4288,6 +4412,29 @@ impl SqliteRuntime {
                 .await
             }
         }
+    }
+
+    /// Put the history of a cycle back in `loaded`, once the executor has
+    /// read it.
+    ///
+    /// The executor returns the history that it was lent, with the planned
+    /// events of `ingest` still on top. It returns none when it cannot give
+    /// the history back whole. The stored events are then read again, and the
+    /// same planned events go on top. Nothing wrote to the run in between.
+    fn take_back_history(
+        &mut self,
+        exec: ExecutionId,
+        loaded: &mut LoadedHistory,
+        returned: Option<Vec<WorkflowEvent>>,
+        ingest: &worker::SignalIngest,
+    ) -> SqliteResult<()> {
+        if let Some(events) = returned {
+            loaded.events = events;
+        } else {
+            *loaded = self.history_cache.load(&self.conn, exec)?;
+            loaded.events.extend(ingest.events().cloned());
+        }
+        Ok(())
     }
 
     /// Handle a `WorkflowOutcome::Suspended` decision cycle: persist the batch,
@@ -4354,6 +4501,7 @@ impl SqliteRuntime {
                 failure_now,
                 &self.activities,
                 settle_after_first_terminal,
+                self.claim_sync,
             )
         });
         // Issue #2029: the workflow deadline bounds the drain. A body past it
@@ -4995,7 +5143,7 @@ fn apply_schedule_activity(
                 .to_string(),
         ));
     }
-    if store::history_has_activity_scheduled(history, &activity_id.to_string()) {
+    if store::history_has_activity_scheduled(history, *activity_id) {
         return Ok(false);
     }
 
@@ -6609,7 +6757,7 @@ fn duration_to_millis_ceil(d: std::time::Duration) -> i64 {
 /// Build the [`WorkflowExecuteSpanMeta`] the drive path threads into the core
 /// executor each cycle (issue #1069).
 ///
-/// The `run_workflow_with_state_history_policy_and_caps` entry point reads the
+/// The `run_workflow_lending_history` entry point reads the
 /// business `workflow_id` ONLY from `span_meta.workflow_id`. That is the value
 /// of `ctx.info().workflow_id` (issue #698), documented for minting idempotency
 /// keys. There is no dedicated parameter for it, unlike `workflow_name`, which
@@ -7967,5 +8115,295 @@ mod replicated_open_tests {
         runtime.raise_fleet_epoch(4).unwrap();
         runtime.raise_fleet_epoch(2).unwrap();
         assert_eq!(crate::fleet_epoch::read(&path).unwrap(), 4);
+    }
+}
+
+#[cfg(test)]
+// The `#[workflow]` macro references the input param through its expansion.
+#[allow(clippy::used_underscore_binding)]
+mod claim_sync_tests {
+    use autumn_harvest::prelude::*;
+    use serde_json::{Value, json};
+
+    use super::{ActivitySpec, RunState, SqliteRuntime};
+
+    /// A claim commit skips its sync only on a WAL file that `SQLite`
+    /// checkpoints. See [`ClaimSync`](crate::worker::ClaimSync).
+    #[test]
+    fn only_a_plain_wal_file_defers_the_claim_sync() {
+        use crate::worker::ClaimSync;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = SqliteRuntime::open(dir.path().join("plain.db")).unwrap();
+        assert_eq!(file.claim_sync, ClaimSync::Deferred);
+
+        let replicated = SqliteRuntime::open_replicated(dir.path().join("shipped.db")).unwrap();
+        assert_eq!(replicated.claim_sync, ClaimSync::Full);
+
+        let memory = SqliteRuntime::open_in_memory().unwrap();
+        assert_eq!(memory.claim_sync, ClaimSync::Full);
+    }
+
+    /// A drive on a file leaves the connection at `synchronous = FULL`, so
+    /// each commit after a claim is synced.
+    #[tokio::test]
+    async fn a_drive_on_a_file_leaves_the_commit_sync_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = SqliteRuntime::open(dir.path().join("drive.db")).unwrap();
+        rt.register_workflow(&one_activity_wf_info());
+        rt.register_activity_raw("act", ActivitySpec::new(1, Ok));
+        let exec = rt.start_workflow("one_activity_wf", json!(1)).unwrap();
+
+        let state = rt.run_until_blocked(exec).await.unwrap();
+
+        assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+        let level: i64 = rt
+            .conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(level, 2, "the level is FULL after the drive");
+    }
+
+    #[workflow]
+    async fn one_activity_wf(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+        ctx.execute_activity_raw("act", json!({"k": 1}), "default")
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod statement_cache_tests {
+    use rusqlite::StatementStatus;
+
+    use super::SqliteRuntime;
+
+    /// How often `SQLite` compiled the cached statement `sql` again, after
+    /// one use for each run id in `ids`.
+    fn recompiles(runtime: &SqliteRuntime, sql: &str, ids: &[&str]) -> i32 {
+        for id in ids {
+            let mut stmt = runtime.conn.prepare_cached(sql).unwrap();
+            let mut rows = stmt.query([id]).unwrap();
+            while rows.next().unwrap().is_some() {}
+        }
+        let stmt = runtime.conn.prepare_cached(sql).unwrap();
+        stmt.get_status(StatementStatus::RePrepare)
+    }
+
+    /// A cached drive statement keeps its plan when a run id is bound. Without
+    /// the planner stability guarantee, `SQLite` compiles an index range
+    /// statement again on each bind, and the cache saves nothing.
+    #[test]
+    fn a_cached_statement_is_not_compiled_again_on_a_bind() {
+        let runtime = SqliteRuntime::open_in_memory().unwrap();
+        for sql in [
+            "SELECT MAX(seq) FROM harvest_events WHERE exec_id = ?1",
+            "SELECT event_json FROM harvest_events WHERE exec_id = ?1 ORDER BY seq",
+            "SELECT task_id FROM harvest_tasks WHERE state = 'PENDING' AND exec_id = ?1 \
+             ORDER BY seq LIMIT 1",
+        ] {
+            assert_eq!(recompiles(&runtime, sql, &["a", "a", "b", "c"]), 0, "{sql}");
+        }
+    }
+}
+
+#[cfg(test)]
+// The `#[workflow]` macro references the input param through its expansion.
+#[allow(clippy::used_underscore_binding)]
+mod history_cache_tests {
+    use autumn_harvest::prelude::*;
+    use serde_json::{Value, json};
+
+    use super::{ActivitySpec, RunState, SqliteRuntime};
+
+    #[workflow]
+    async fn works_waits_works(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+        let first = ctx
+            .execute_activity_raw("act", json!({"step": 1}), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        let signal: Value = ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
+        let last = ctx
+            .execute_activity_raw("act", json!({"step": 2}), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!([first, signal, last]))
+    }
+
+    #[workflow]
+    async fn works_twice_then_waits(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+        let first = ctx
+            .execute_activity_raw("act", json!({"step": 1}), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        let second = ctx
+            .execute_activity_raw("act", json!({"step": 2}), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        let _signal: Value = ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
+        Ok(json!([first, second]))
+    }
+
+    fn runtime(dir: &tempfile::TempDir, name: &str) -> SqliteRuntime {
+        let mut rt = SqliteRuntime::open(dir.path().join(name)).unwrap();
+        rt.register_workflow(&works_waits_works_info());
+        rt.register_workflow(&works_twice_then_waits_info());
+        rt.register_activity_raw("act", ActivitySpec::new(1, Ok));
+        rt
+    }
+
+    /// The event types of a history. Ids and times differ between two runs.
+    fn shape(rt: &SqliteRuntime, exec: ExecutionId) -> Vec<String> {
+        rt.load_history(exec)
+            .unwrap()
+            .iter()
+            .map(|event| {
+                serde_json::to_value(event).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Drive one run to its signal wait, signal it, and drive it to its end.
+    async fn drive(rt: &mut SqliteRuntime) -> (ExecutionId, Value) {
+        let exec = rt.start_workflow("works_waits_works", json!(1)).unwrap();
+        let blocked = rt.run_until_blocked(exec).await.unwrap();
+        assert!(matches!(blocked, RunState::WaitingSignal(_)), "{blocked:?}");
+        rt.send_signal(exec, "go", json!("now")).unwrap();
+        match rt.run_until_blocked(exec).await.unwrap() {
+            RunState::Completed(output) => (exec, output),
+            other => panic!("the run must complete: {other:?}"),
+        }
+    }
+
+    /// A blocked run stays warm, and a run that ends leaves the cache.
+    #[tokio::test]
+    async fn a_blocked_run_is_warm_and_an_ended_run_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = runtime(&dir, "warm.db");
+        let exec = rt.start_workflow("works_waits_works", json!(1)).unwrap();
+
+        let blocked = rt.run_until_blocked(exec).await.unwrap();
+        assert!(matches!(blocked, RunState::WaitingSignal(_)), "{blocked:?}");
+        assert!(rt.history_cache.holds(exec), "a blocked run stays warm");
+        let warm = rt.history_cache.load(&rt.conn, exec).unwrap();
+        assert_eq!(warm.events.len(), rt.load_history(exec).unwrap().len());
+        rt.history_cache.keep(exec, warm);
+
+        rt.send_signal(exec, "go", json!("now")).unwrap();
+        let done = rt.run_until_blocked(exec).await.unwrap();
+        assert!(matches!(done, RunState::Completed(_)), "{done:?}");
+        assert!(
+            !rt.history_cache.holds(exec),
+            "an ended run leaves the cache"
+        );
+    }
+
+    /// The stored form of each event. `WorkflowEvent` has no `PartialEq`.
+    fn stored_form(events: &[autumn_harvest::WorkflowEvent]) -> Vec<Value> {
+        events
+            .iter()
+            .map(|event| serde_json::to_value(event).unwrap())
+            .collect()
+    }
+
+    /// The executor can decline to give the history back. The cycle then
+    /// reads the stored events again and puts its planned events on top, so
+    /// it goes on with the history that it lent.
+    #[tokio::test]
+    async fn a_history_that_does_not_come_back_is_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = runtime(&dir, "declined.db");
+        let exec = rt.start_workflow("works_waits_works", json!(1)).unwrap();
+        let blocked = rt.run_until_blocked(exec).await.unwrap();
+        assert!(matches!(blocked, RunState::WaitingSignal(_)), "{blocked:?}");
+        rt.send_signal(exec, "go", json!("now")).unwrap();
+
+        // What a cycle holds when it lends its history: the stored events and
+        // the planned signal event.
+        let mut loaded = rt.history_cache.load(&rt.conn, exec).unwrap();
+        let stored = loaded.events.len();
+        let ingest = rt.plan_ingest(exec, 0, stored, loaded.bytes).unwrap();
+        loaded.events.extend(ingest.events().cloned());
+        let lent = stored_form(&loaded.events);
+        assert_eq!(lent.len(), stored + 1, "one planned signal event");
+
+        loaded.events.clear();
+        rt.take_back_history(exec, &mut loaded, None, &ingest)
+            .unwrap();
+        assert_eq!(
+            stored_form(&loaded.events),
+            lent,
+            "read again, same history"
+        );
+
+        let returned = std::mem::take(&mut loaded.events);
+        rt.take_back_history(exec, &mut loaded, Some(returned), &ingest)
+            .unwrap();
+        assert_eq!(stored_form(&loaded.events), lent, "given back as lent");
+
+        // The cache keeps only the stored events, and the drive still ends.
+        rt.history_cache.keep(exec, loaded);
+        let done = rt.run_until_blocked(exec).await.unwrap();
+        assert!(matches!(done, RunState::Completed(_)), "{done:?}");
+    }
+
+    /// A drive with the cache writes the history that a drive with no cache
+    /// writes, and returns the same result.
+    #[tokio::test]
+    async fn a_drive_with_the_cache_matches_a_drive_without_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cached = runtime(&dir, "cached.db");
+        let mut plain = runtime(&dir, "plain.db");
+        plain.set_history_cache_bytes(0);
+
+        let (cached_exec, cached_output) = drive(&mut cached).await;
+        let (plain_exec, plain_output) = drive(&mut plain).await;
+
+        assert_eq!(cached_output, plain_output);
+        assert_eq!(shape(&cached, cached_exec), shape(&plain, plain_exec));
+    }
+
+    /// A fixture that damages a stored event through its own connection is
+    /// seen by the next cycle of a warm run. The event is not the last one,
+    /// so only the data version can show the change.
+    #[tokio::test]
+    async fn a_warm_run_sees_an_event_that_another_connection_rewrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = runtime(&dir, "damaged.db");
+        let exec = rt
+            .start_workflow("works_twice_then_waits", json!(1))
+            .unwrap();
+        let blocked = rt.run_until_blocked(exec).await.unwrap();
+        assert!(matches!(blocked, RunState::WaitingSignal(_)), "{blocked:?}");
+        assert!(rt.history_cache.holds(exec), "the run is warm");
+
+        // Replace the first recorded activity result with another value.
+        let mut raw = rusqlite::Connection::open(dir.path().join("damaged.db")).unwrap();
+        let changed = crate::append_only::with_guard_off(&mut raw, |tx| {
+            tx.execute(
+                "UPDATE harvest_events \
+                 SET event_json = replace(event_json, '\"step\":1', '\"step\":41') \
+                 WHERE exec_id = ?1 AND event_json LIKE '%ActivityCompleted%' \
+                   AND event_json LIKE '%\"step\":1%'",
+                [exec.to_string()],
+            )
+        })
+        .unwrap();
+        assert_eq!(changed, 1, "one stored result changed");
+
+        rt.send_signal(exec, "go", json!("now")).unwrap();
+        let done = rt.run_until_blocked(exec).await.unwrap();
+
+        let RunState::Completed(output) = done else {
+            panic!("the run must complete: {done:?}");
+        };
+        assert_eq!(
+            output[0],
+            json!({"step": 41}),
+            "the replay read the rewritten row"
+        );
     }
 }

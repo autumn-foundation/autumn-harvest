@@ -1191,6 +1191,15 @@ pub struct HistoryMatcher {
     /// The recorded result of each update.
     /// [`Self::match_update`] takes `&self`, so the index sits in a cell.
     update_results: std::cell::RefCell<UpdateResultIndex>,
+    /// The number of events that the caller lent, if it wants them back
+    /// (see [`Self::lend_events`]). `None` means that the matcher owns its
+    /// events and can move a payload out of them.
+    lent_len: Option<usize>,
+    /// The number of events that [`Self::reclaim_events`] gave back, while
+    /// the matcher holds none of them. A resident workflow keeps such a
+    /// matcher between two decisions (issue #1798), and
+    /// [`Self::restore_events`] fills it again.
+    released_len: Option<usize>,
 }
 
 /// The first `UpdateCompleted` or `UpdateFailed` position of each update.
@@ -1380,7 +1389,74 @@ impl HistoryMatcher {
             predicate_rejected_signal_events: HashSet::new(),
             activity_scan_index: ActivityScanIndex::default(),
             update_results: std::cell::RefCell::default(),
+            lent_len: None,
+            released_len: None,
         }
+    }
+
+    /// Keep each event whole, so that [`Self::reclaim_events`] can give the
+    /// history back to the caller.
+    ///
+    /// A driver needs the history again after the cycle. Without this, it
+    /// gives the matcher a deep copy and keeps the original. A lent matcher
+    /// copies the output of a matched activity and leaves the event as it
+    /// was. That copy is the only one that the cycle needs: the workflow owns
+    /// the output that it gets.
+    pub(crate) const fn lend_events(&mut self) {
+        self.lent_len = Some(self.events.len());
+    }
+
+    /// Take the lent events back, unchanged.
+    ///
+    /// Returns `None` when the matcher was not lent its events, or when it
+    /// does not hold exactly the events that it got. A cloning resident
+    /// append ([`Self::append_consumed`]) and an open view cut
+    /// ([`Self::cut_view`]) both change the count. The caller then reads the
+    /// history again from its store.
+    ///
+    /// The matcher holds no event after a successful call. A workflow that
+    /// stays resident keeps such a matcher until [`Self::restore_events`].
+    /// Its positions and its consumed sets stay as they are, so nothing may
+    /// read it in between.
+    pub(crate) fn reclaim_events(&mut self) -> Option<Vec<WorkflowEvent>> {
+        let lent = self.lent_len.take()?;
+        if self.events.len() != lent {
+            return None;
+        }
+        self.released_len = Some(lent);
+        Some(std::mem::take(&mut self.events))
+    }
+
+    /// True while the matcher holds none of its events, after
+    /// [`Self::reclaim_events`].
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) const fn events_released(&self) -> bool {
+        self.released_len.is_some()
+    }
+
+    /// Lend the events again to a matcher that gave them back.
+    ///
+    /// A resident workflow and its driver share one history this way. The
+    /// driver holds it between two decisions and lends it for each drive.
+    /// `events` must be the events that the matcher gave back, so their count
+    /// must match. A cached history of another length means that the driver
+    /// and the workflow no longer agree.
+    ///
+    /// # Errors
+    ///
+    /// Returns `events` unchanged when the matcher did not give its events
+    /// back, or gave back another number of them.
+    pub(crate) fn restore_events(
+        &mut self,
+        events: Vec<WorkflowEvent>,
+    ) -> Result<(), Vec<WorkflowEvent>> {
+        if self.released_len != Some(events.len()) || !self.events.is_empty() {
+            return Err(events);
+        }
+        self.released_len = None;
+        self.lent_len = Some(events.len());
+        self.events = events;
+        Ok(())
     }
 
     /// Appends events that a resident workflow consumed live (issue #1798).
@@ -1395,6 +1471,20 @@ impl HistoryMatcher {
             self.events.push(event.clone());
         }
         self.cursor = self.events.len();
+    }
+
+    /// [`Self::append_consumed`] for a matcher that was lent its events. It
+    /// takes the new events and makes no copy of them. They join the lent
+    /// events, so [`Self::reclaim_events`] gives them back too.
+    pub(crate) fn append_consumed_owned(&mut self, events: Vec<WorkflowEvent>) {
+        for event in events {
+            self.consumed_out_of_order_events.insert(self.events.len());
+            self.events.push(event);
+        }
+        self.cursor = self.events.len();
+        if self.lent_len.is_some() {
+            self.lent_len = Some(self.events.len());
+        }
     }
 
     /// Whether a non-blocking claim probed `signal_name` with a scan window
@@ -2283,14 +2373,22 @@ impl HistoryMatcher {
         let Some(terminal_cursor) = terminal else {
             return self.rewind_open_activity(activity_id, first_interleaved_command);
         };
+        let lent = self.lent_len.is_some();
         let result = match &mut self.events[terminal_cursor] {
             // Take the recorded output. Do not clone it. `settle_terminal`
             // reads only `activity_id` from this event. No other production
             // code reads the `output` of a matched `ActivityCompleted`. A
             // clone of a `Value` is a deep copy, so it is waste. See
             // `docs/performance-replay.md`.
+            //
+            // A lent matcher must give each event back whole, so it copies
+            // the output. See [`Self::lend_events`].
             WorkflowEvent::ActivityCompleted { output, .. } => HistoryMatch::Matched {
-                output: std::mem::take(output),
+                output: if lent {
+                    output.clone()
+                } else {
+                    std::mem::take(output)
+                },
             },
             WorkflowEvent::ActivityFailed {
                 error,
@@ -7947,6 +8045,141 @@ mod tests {
         assert_eq!(result, HistoryMatch::Matched { output });
         assert_eq!(matcher.position(), 2);
         assert!(!matcher.is_replaying());
+    }
+
+    /// The stored form of each event. `WorkflowEvent` has no `PartialEq`.
+    fn stored_form(events: &[WorkflowEvent]) -> Vec<Value> {
+        events
+            .iter()
+            .map(|event| serde_json::to_value(event).expect("an event serializes"))
+            .collect()
+    }
+
+    /// A lent matcher gives the workflow the recorded output and keeps the
+    /// event whole. The caller then gets back the history that it lent.
+    #[test]
+    fn a_lent_matcher_returns_its_events_unchanged() {
+        let output = serde_json::json!({"email_id": "msg-001", "tags": ["a", "b"]});
+        let (_id, events) = activity_completed_events("send_email", output.clone());
+        let lent = stored_form(&events);
+
+        let mut matcher = HistoryMatcher::new(events);
+        matcher.lend_events();
+        let result = matcher.match_activity("send_email");
+
+        assert_eq!(result, HistoryMatch::Matched { output });
+        let returned = matcher.reclaim_events().expect("the events come back");
+        assert_eq!(stored_form(&returned), lent);
+        assert!(matcher.reclaim_events().is_none(), "only once");
+    }
+
+    /// A matcher that owns its events moves the output out, and gives no
+    /// event back. This is the path of every other caller.
+    #[test]
+    fn an_owned_matcher_moves_the_output_and_returns_nothing() {
+        let output = serde_json::json!({"email_id": "msg-001"});
+        let (_id, events) = activity_completed_events("send_email", output.clone());
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_activity("send_email");
+
+        assert_eq!(result, HistoryMatch::Matched { output });
+        assert!(matches!(
+            &matcher.events[1],
+            WorkflowEvent::ActivityCompleted { output, .. } if output.is_null()
+        ));
+        assert!(matcher.reclaim_events().is_none());
+    }
+
+    /// A view cut hides a tail of the lent events. The matcher gives them
+    /// back only when the cut is closed again.
+    #[test]
+    fn a_lent_matcher_returns_nothing_under_an_open_cut() {
+        let (_id, events) = activity_completed_events("send_email", Value::Null);
+        let lent = stored_form(&events);
+
+        let mut open = HistoryMatcher::new(events.clone());
+        open.lend_events();
+        let _cut = open.cut_view(1).expect("the cut hides an event");
+        assert!(open.reclaim_events().is_none(), "a tail is hidden");
+
+        let mut closed = HistoryMatcher::new(events);
+        closed.lend_events();
+        let cut = closed.cut_view(1).expect("the cut hides an event");
+        closed.restore_view(cut);
+        let returned = closed.reclaim_events().expect("the cut is closed");
+        assert_eq!(stored_form(&returned), lent);
+    }
+
+    /// A workflow that stays resident keeps its matcher with no events. The
+    /// driver lends them again for the next drive, with the new events on
+    /// top, and gets them all back.
+    #[test]
+    fn a_released_matcher_takes_its_events_again() {
+        let output = serde_json::json!({"email_id": "msg-001"});
+        let (_first, events) = activity_completed_events("send_email", output.clone());
+        let (second, later) = activity_completed_events("log_email", serde_json::json!("kept"));
+        let lent_form = stored_form(&events);
+
+        let mut matcher = HistoryMatcher::new(events);
+        matcher.lend_events();
+        assert_eq!(
+            matcher.match_activity("send_email"),
+            HistoryMatch::Matched { output }
+        );
+        let held = matcher.reclaim_events().expect("the events come back");
+        assert!(matcher.events_released());
+        assert!(matcher.events.is_empty());
+        let position = matcher.position();
+
+        matcher.restore_events(held).expect("the same events fit");
+        assert!(!matcher.events_released());
+        assert_eq!(matcher.position(), position, "the cursor did not move");
+        matcher.append_consumed_owned(later);
+        assert_eq!(matcher.position(), 4, "the new events are consumed");
+
+        let returned = matcher.reclaim_events().expect("all events come back");
+        assert_eq!(stored_form(&returned[..2]), lent_form);
+        assert!(matches!(
+            &returned[3],
+            WorkflowEvent::ActivityCompleted { activity_id, output }
+                if *activity_id == second && output == "kept"
+        ));
+    }
+
+    /// A released matcher takes only the events that it gave back. A history
+    /// of another length, or a matcher that holds its events, refuses.
+    #[test]
+    fn restore_refuses_events_that_the_matcher_did_not_release() {
+        let (_id, events) = activity_completed_events("send_email", Value::Null);
+
+        let mut owning = HistoryMatcher::new(events.clone());
+        assert!(!owning.events_released());
+        let refused = owning.restore_events(events.clone()).unwrap_err();
+        assert_eq!(refused.len(), events.len(), "the events come back");
+
+        let mut released = HistoryMatcher::new(events);
+        released.lend_events();
+        let held = released.reclaim_events().expect("the events come back");
+        let shorter = held[..1].to_vec();
+        assert_eq!(released.restore_events(shorter).unwrap_err().len(), 1);
+        assert!(released.events_released(), "a refusal changes nothing");
+        released.restore_events(held).expect("the full events fit");
+    }
+
+    /// A cloning resident append adds events that the caller did not lend.
+    #[test]
+    fn a_lent_matcher_returns_nothing_after_an_append() {
+        let (id, events) = activity_completed_events("send_email", Value::Null);
+        let mut matcher = HistoryMatcher::new(events);
+        matcher.lend_events();
+
+        matcher.append_consumed(&[WorkflowEvent::ActivityCompleted {
+            activity_id: id,
+            output: Value::Null,
+        }]);
+
+        assert!(matcher.reclaim_events().is_none());
     }
 
     #[test]

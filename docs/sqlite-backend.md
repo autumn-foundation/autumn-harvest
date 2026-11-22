@@ -1274,6 +1274,24 @@ The runtime opens the database with `journal_mode = WAL`, `synchronous = FULL`
 (fsync on every commit — the crash tests depend on it), and a `busy_timeout` so
 an occasional external *reader* (a monitoring/inspector connection) can coexist.
 
+One commit is not synced: the claim that only sets a task `RUNNING`. Each open
+returns a `RUNNING` task to `PENDING`, so the file after a reopen is the same
+with that commit or without it. The next synced commit also syncs the claim.
+A file opened with `open_replicated` syncs each claim too.
+[ADR 0019](adr/0019-sqlite-drive-path.md) gives the argument.
+
+### What the runtime keeps in memory
+
+The runtime keeps the parsed history of each run that it drives, so a decision
+cycle reads only the events that the last cycle added. The cache holds at most
+16 MiB of stored event JSON (`DEFAULT_HISTORY_CACHE_BYTES`), and the parsed
+events take a few times that. `set_history_cache_bytes(n)` changes the budget,
+and `set_history_cache_bytes(0)` turns the cache off. A run that ends leaves
+the cache. A write of another connection drops it, so a second writer on the
+file costs speed, not correctness.
+[`performance-sqlite-hot-path.md`](performance-sqlite-hot-path.md) has the
+measured costs.
+
 ### The contract is enforced (issue #1834)
 
 `SqliteRuntime::open` takes an exclusive OS lock on a sidecar file,

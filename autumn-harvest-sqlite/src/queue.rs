@@ -125,8 +125,9 @@ pub struct ClaimedTask {
 }
 
 fn next_task_seq(conn: &Connection) -> SqliteResult<i64> {
-    let max: Option<i64> =
-        conn.query_row("SELECT MAX(seq) FROM harvest_tasks", [], |row| row.get(0))?;
+    let max: Option<i64> = conn
+        .prepare_cached("SELECT MAX(seq) FROM harvest_tasks")?
+        .query_row([], |row| row.get(0))?;
     Ok(max.map_or(0, |m| m + 1))
 }
 
@@ -140,7 +141,9 @@ fn next_task_seq(conn: &Connection) -> SqliteResult<i64> {
 /// `enqueue_timer` writes its row before the second reads `MAX`. Unlike an
 /// implicit `rowid`, it survives `VACUUM`, which may renumber `rowid`.
 fn next_timer_arm_seq(conn: &Connection) -> SqliteResult<i64> {
-    let max: Option<i64> = conn.query_row(NEXT_TIMER_ARM_SEQ_SQL, [], |row| row.get(0))?;
+    let max: Option<i64> = conn
+        .prepare_cached(NEXT_TIMER_ARM_SEQ_SQL)?
+        .query_row([], |row| row.get(0))?;
     Ok(max.map_or(0, |m| m + 1))
 }
 
@@ -159,10 +162,11 @@ pub fn reclaim_running_for_execution(
     conn: &Connection,
     exec_id: ExecutionId,
 ) -> SqliteResult<usize> {
-    let n = conn.execute(
-        "UPDATE harvest_tasks SET state = 'PENDING' WHERE state = 'RUNNING' AND exec_id = ?1",
-        params![exec_id.to_string()],
-    )?;
+    let n = conn
+        .prepare_cached(
+            "UPDATE harvest_tasks SET state = 'PENDING' WHERE state = 'RUNNING' AND exec_id = ?1",
+        )?
+        .execute(params![exec_id.to_string()])?;
     Ok(n)
 }
 
@@ -172,10 +176,9 @@ pub fn reclaim_running_for_execution(
 /// startup was claimed by a process that has since exited without finalizing.
 /// Returns the number of rows reclaimed.
 pub fn reclaim_orphaned_running(conn: &Connection) -> SqliteResult<usize> {
-    let n = conn.execute(
-        "UPDATE harvest_tasks SET state = 'PENDING' WHERE state = 'RUNNING'",
-        [],
-    )?;
+    let n = conn
+        .prepare_cached("UPDATE harvest_tasks SET state = 'PENDING' WHERE state = 'RUNNING'")?
+        .execute([])?;
     Ok(n)
 }
 
@@ -223,28 +226,28 @@ pub fn enqueue_activity(
     defaults_frozen: bool,
 ) -> SqliteResult<()> {
     let seq = next_task_seq(conn)?;
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO harvest_tasks \
          (task_id, exec_id, activity_id, name, input_json, queue, state, attempt, run_at, seq, \
           max_attempts, retry_policy_json, start_to_close_ms, scheduled_at, \
           schedule_to_close_at, defaults_frozen) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'PENDING', 0, ?7, ?8, ?9, ?10, ?11, ?7, ?12, ?13)",
-        params![
-            uuid::Uuid::new_v4().to_string(),
-            exec_id.to_string(),
-            activity_id.to_string(),
-            name,
-            serde_json::to_string(input)?,
-            queue,
-            run_at,
-            seq,
-            max_attempts.map(i64::from),
-            retry_policy_json,
-            start_to_close_ms,
-            schedule_to_close_at,
-            i64::from(defaults_frozen),
-        ],
-    )?;
+    )?
+    .execute(params![
+        uuid::Uuid::new_v4().to_string(),
+        exec_id.to_string(),
+        activity_id.to_string(),
+        name,
+        serde_json::to_string(input)?,
+        queue,
+        run_at,
+        seq,
+        max_attempts.map(i64::from),
+        retry_policy_json,
+        start_to_close_ms,
+        schedule_to_close_at,
+        i64::from(defaults_frozen),
+    ])?;
     Ok(())
 }
 
@@ -272,20 +275,31 @@ pub fn freeze_task_defaults(
     start_to_close_ms: Option<i64>,
     schedule_to_close_at: Option<i64>,
 ) -> SqliteResult<()> {
-    conn.execute(
+    conn.prepare_cached(
         "UPDATE harvest_tasks SET retry_policy_json = ?2, max_attempts = ?3, \
          start_to_close_ms = ?4, schedule_to_close_at = ?5, defaults_frozen = 1 \
          WHERE task_id = ?1",
-        params![
-            task_id,
-            retry_policy_json,
-            max_attempts.map(i64::from),
-            start_to_close_ms,
-            schedule_to_close_at,
-        ],
-    )?;
+    )?
+    .execute(params![
+        task_id,
+        retry_policy_json,
+        max_attempts.map(i64::from),
+        start_to_close_ms,
+        schedule_to_close_at,
+    ])?;
     Ok(())
 }
+
+/// The oldest ready task of one run.
+///
+/// `idx_harvest_tasks_exec_state_seq` holds the `PENDING` tasks of a run in
+/// `seq` order. So the statement seeks to its first row and sorts nothing. It
+/// reads past a task only when that task waits for a retry backoff.
+const CLAIM_NEXT_READY_TASK_SQL: &str = "SELECT task_id, activity_id, name, input_json, attempt, \
+     max_attempts, retry_policy_json, start_to_close_ms, scheduled_at, schedule_to_close_at, \
+     defaults_frozen, queue, heartbeat_details, last_error \
+     FROM harvest_tasks WHERE state = 'PENDING' AND exec_id = ?1 AND run_at <= ?2 \
+     ORDER BY seq LIMIT 1";
 
 /// Claim the oldest ready (`PENDING`, `run_at <= now`) task for `exec_id` and flip
 /// it to `RUNNING` in a `BEGIN IMMEDIATE` transaction.
@@ -316,34 +330,27 @@ pub fn claim_next_ready_task_tx(
 ) -> SqliteResult<Option<(Transaction<'_>, ClaimedTask)>> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let row = tx
-        .query_row(
-            "SELECT task_id, activity_id, name, input_json, attempt, max_attempts, \
-             retry_policy_json, start_to_close_ms, scheduled_at, schedule_to_close_at, \
-             defaults_frozen, queue, heartbeat_details, last_error \
-             FROM harvest_tasks WHERE state = 'PENDING' AND exec_id = ?1 AND run_at <= ?2 \
-             ORDER BY seq LIMIT 1",
-            params![exec_id.to_string(), now],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, Option<i64>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<i64>>(7)?,
-                    row.get::<_, i64>(8)?,
-                    row.get::<_, Option<i64>>(9)?,
-                    row.get::<_, i64>(10)?,
-                    (
-                        row.get::<_, String>(11)?,
-                        row.get::<_, Option<String>>(12)?,
-                        row.get::<_, Option<String>>(13)?,
-                    ),
-                ))
-            },
-        )
+        .prepare_cached(CLAIM_NEXT_READY_TASK_SQL)?
+        .query_row(params![exec_id.to_string(), now], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+                row.get::<_, i64>(10)?,
+                (
+                    row.get::<_, String>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                ),
+            ))
+        })
         .optional()?;
 
     let Some((
@@ -384,10 +391,8 @@ pub fn claim_next_ready_task_tx(
 
     // Flip to RUNNING but do NOT commit — the caller freezes the resolved defaults
     // (for a late-registered task) in this SAME transaction, then commits both.
-    tx.execute(
-        "UPDATE harvest_tasks SET state = 'RUNNING' WHERE task_id = ?1",
-        params![task_id],
-    )?;
+    tx.prepare_cached("UPDATE harvest_tasks SET state = 'RUNNING' WHERE task_id = ?1")?
+        .execute(params![task_id])?;
 
     let task = ClaimedTask {
         task_id,
@@ -412,10 +417,8 @@ pub fn claim_next_ready_task_tx(
 
 /// Mark a task terminally done (success or exhausted retries).
 pub fn finish_task(conn: &Connection, task_id: &str) -> SqliteResult<()> {
-    conn.execute(
-        "UPDATE harvest_tasks SET state = 'DONE' WHERE task_id = ?1",
-        params![task_id],
-    )?;
+    conn.prepare_cached("UPDATE harvest_tasks SET state = 'DONE' WHERE task_id = ?1")?
+        .execute(params![task_id])?;
     Ok(())
 }
 
@@ -423,11 +426,8 @@ pub fn finish_task(conn: &Connection, task_id: &str) -> SqliteResult<()> {
 #[cfg(test)]
 pub fn task_state(conn: &Connection, task_id: &str) -> SqliteResult<Option<String>> {
     Ok(conn
-        .query_row(
-            "SELECT state FROM harvest_tasks WHERE task_id = ?1",
-            params![task_id],
-            |row| row.get(0),
-        )
+        .prepare_cached("SELECT state FROM harvest_tasks WHERE task_id = ?1")?
+        .query_row(params![task_id], |row| row.get(0))
         .optional()?)
 }
 
@@ -444,11 +444,11 @@ pub fn task_state(conn: &Connection, task_id: &str) -> SqliteResult<Option<Strin
 /// a no-progress state. A poll before the deadline neither re-runs the body nor
 /// spins to `Stuck`. The caller advances the clock and drives again.
 pub fn has_pending_activity(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<bool> {
-    let exists: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM harvest_tasks WHERE exec_id = ?1 AND state = 'PENDING')",
-        params![exec_id.to_string()],
-        |row| row.get(0),
-    )?;
+    let exists: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM harvest_tasks WHERE exec_id = ?1 AND state = 'PENDING')",
+        )?
+        .query_row(params![exec_id.to_string()], |row| row.get(0))?;
     Ok(exists)
 }
 
@@ -458,7 +458,7 @@ pub fn pending_tasks(
     conn: &Connection,
     exec_id: ExecutionId,
 ) -> SqliteResult<Vec<(ActivityExecId, String, u32)>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT activity_id, name, attempt FROM harvest_tasks \
          WHERE exec_id = ?1 AND state = 'PENDING' ORDER BY seq",
     )?;
@@ -499,11 +499,11 @@ pub fn requeue_task(
     run_at: i64,
     last_error: &str,
 ) -> SqliteResult<()> {
-    conn.execute(
+    conn.prepare_cached(
         "UPDATE harvest_tasks SET state = 'PENDING', attempt = ?2, run_at = ?3, last_error = ?4 \
          WHERE task_id = ?1",
-        params![task_id, i64::from(attempt), run_at, last_error],
-    )?;
+    )?
+    .execute(params![task_id, i64::from(attempt), run_at, last_error])?;
     Ok(())
 }
 
@@ -533,11 +533,17 @@ pub fn requeue_task_to_back(
     last_error: &str,
 ) -> SqliteResult<()> {
     let seq = next_task_seq(conn)?;
-    conn.execute(
+    conn.prepare_cached(
         "UPDATE harvest_tasks SET state = 'PENDING', attempt = ?2, run_at = ?3, seq = ?4, \
          last_error = ?5 WHERE task_id = ?1",
-        params![task_id, i64::from(attempt), run_at, seq, last_error],
-    )?;
+    )?
+    .execute(params![
+        task_id,
+        i64::from(attempt),
+        run_at,
+        seq,
+        last_error
+    ])?;
     Ok(())
 }
 
@@ -546,10 +552,8 @@ pub fn requeue_task_to_back(
 /// Last write wins. The write is one autocommit `UPDATE`, because the body
 /// runs outside any transaction.
 pub fn record_heartbeat(conn: &Connection, task_id: &str, details: &Value) -> SqliteResult<()> {
-    conn.execute(
-        "UPDATE harvest_tasks SET heartbeat_details = ?2 WHERE task_id = ?1",
-        params![task_id, serde_json::to_string(details)?],
-    )?;
+    conn.prepare_cached("UPDATE harvest_tasks SET heartbeat_details = ?2 WHERE task_id = ?1")?
+        .execute(params![task_id, serde_json::to_string(details)?])?;
     Ok(())
 }
 
@@ -569,14 +573,14 @@ pub fn cancel_activity_task(
     exec_id: ExecutionId,
     activity_id: ActivityExecId,
 ) -> SqliteResult<bool> {
-    let n = conn.execute(
-        CANCEL_ACTIVITY_TASK_SQL,
-        params![exec_id.to_string(), activity_id.to_string()],
-    )?;
+    let n = conn
+        .prepare_cached(CANCEL_ACTIVITY_TASK_SQL)?
+        .execute(params![exec_id.to_string(), activity_id.to_string()])?;
     Ok(n > 0)
 }
 
-/// The run's own id lets `idx_harvest_tasks_exec` find the task (issue #2429).
+/// The run's own id lets `idx_harvest_tasks_exec_state_seq` find the task (issue
+/// #2429).
 /// The task table keeps finished rows, so an `activity_id` match alone scans it.
 const CANCEL_ACTIVITY_TASK_SQL: &str = "UPDATE harvest_tasks SET state = 'CANCELLED' \
      WHERE exec_id = ?1 AND activity_id = ?2 AND state IN ('PENDING', 'RUNNING')";
@@ -600,11 +604,11 @@ pub fn enqueue_timer(
     // #1069). The replace deletes the spent row and inserts a new one. So a re-arm
     // gets a NEW, higher `arm_seq` and sorts after any sibling armed with it.
     let arm_seq = next_timer_arm_seq(conn)?;
-    conn.execute(
+    conn.prepare_cached(
         "INSERT OR REPLACE INTO harvest_timers (timer_id, exec_id, fire_at, fired, arm_seq) \
          VALUES (?1, ?2, ?3, 0, ?4)",
-        params![timer_id, exec_id.to_string(), fire_at, arm_seq],
-    )?;
+    )?
+    .execute(params![timer_id, exec_id.to_string(), fire_at, arm_seq])?;
     Ok(())
 }
 
@@ -621,11 +625,10 @@ pub fn arm_awaited_timer(
     fire_at: i64,
 ) -> SqliteResult<bool> {
     let unfired: Option<i64> = conn
-        .query_row(
+        .prepare_cached(
             "SELECT 1 FROM harvest_timers WHERE exec_id = ?1 AND timer_id = ?2 AND fired = 0",
-            params![exec_id.to_string(), timer_id],
-            |row| row.get(0),
-        )
+        )?
+        .query_row(params![exec_id.to_string(), timer_id], |row| row.get(0))
         .optional()?;
     if unfired.is_some() {
         return Ok(false);
@@ -685,11 +688,9 @@ pub fn due_timers_with_deadlines(
 /// True if `exec_id` has any armed (unfired) durable timer — the ground-truth
 /// signal a no-progress cycle is genuinely waiting on a not-yet-due timer.
 pub fn has_unfired_timer(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<bool> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM harvest_timers WHERE exec_id = ?1 AND fired = 0",
-        params![exec_id.to_string()],
-        |row| row.get(0),
-    )?;
+    let count: i64 = conn
+        .prepare_cached("SELECT COUNT(*) FROM harvest_timers WHERE exec_id = ?1 AND fired = 0")?
+        .query_row(params![exec_id.to_string()], |row| row.get(0))?;
     Ok(count > 0)
 }
 
@@ -698,10 +699,10 @@ pub fn mark_timer_fired(
     exec_id: ExecutionId,
     timer_id: &str,
 ) -> SqliteResult<()> {
-    conn.execute(
+    conn.prepare_cached(
         "UPDATE harvest_timers SET fired = 1 WHERE exec_id = ?1 AND timer_id = ?2",
-        params![exec_id.to_string(), timer_id],
-    )?;
+    )?
+    .execute(params![exec_id.to_string(), timer_id])?;
     Ok(())
 }
 
@@ -723,10 +724,11 @@ pub fn delete_pending_timer(
     exec_id: ExecutionId,
     timer_id: &str,
 ) -> SqliteResult<bool> {
-    let n = conn.execute(
-        "DELETE FROM harvest_timers WHERE exec_id = ?1 AND timer_id = ?2 AND fired = 0",
-        params![exec_id.to_string(), timer_id],
-    )?;
+    let n = conn
+        .prepare_cached(
+            "DELETE FROM harvest_timers WHERE exec_id = ?1 AND timer_id = ?2 AND fired = 0",
+        )?
+        .execute(params![exec_id.to_string(), timer_id])?;
     Ok(n > 0)
 }
 
@@ -742,10 +744,9 @@ pub fn delete_pending_tasks_for_execution(
     conn: &Connection,
     exec_id: ExecutionId,
 ) -> SqliteResult<usize> {
-    Ok(conn.execute(
-        "DELETE FROM harvest_tasks WHERE exec_id = ?1 AND state = 'PENDING'",
-        params![exec_id.to_string()],
-    )?)
+    Ok(conn
+        .prepare_cached("DELETE FROM harvest_tasks WHERE exec_id = ?1 AND state = 'PENDING'")?
+        .execute(params![exec_id.to_string()])?)
 }
 
 /// Delete every unfired timer row for an execution (issue #1068).
@@ -758,10 +759,9 @@ pub fn delete_unfired_timers_for_execution(
     conn: &Connection,
     exec_id: ExecutionId,
 ) -> SqliteResult<usize> {
-    Ok(conn.execute(
-        "DELETE FROM harvest_timers WHERE exec_id = ?1 AND fired = 0",
-        params![exec_id.to_string()],
-    )?)
+    Ok(conn
+        .prepare_cached("DELETE FROM harvest_timers WHERE exec_id = ?1 AND fired = 0")?
+        .execute(params![exec_id.to_string()])?)
 }
 
 /// Delete every unkeyed, undelivered staged signal row for an execution — companion to
@@ -778,7 +778,9 @@ pub fn delete_undelivered_signals_for_execution(
     conn: &Connection,
     exec_id: ExecutionId,
 ) -> SqliteResult<usize> {
-    Ok(conn.execute(DELETE_UNDELIVERED_SIGNALS_SQL, params![exec_id.to_string()])?)
+    Ok(conn
+        .prepare_cached(DELETE_UNDELIVERED_SIGNALS_SQL)?
+        .execute(params![exec_id.to_string()])?)
 }
 
 /// The statement of [`delete_undelivered_signals_for_execution`].
@@ -795,10 +797,11 @@ pub fn move_undelivered_signals(
     from: ExecutionId,
     to: ExecutionId,
 ) -> SqliteResult<usize> {
-    Ok(conn.execute(
-        "UPDATE harvest_signals SET exec_id = ?2 WHERE exec_id = ?1 AND delivered = 0",
-        params![from.to_string(), to.to_string()],
-    )?)
+    Ok(conn
+        .prepare_cached(
+            "UPDATE harvest_signals SET exec_id = ?2 WHERE exec_id = ?1 AND delivered = 0",
+        )?
+        .execute(params![from.to_string(), to.to_string()])?)
 }
 
 /// Move every signal of `from` to the retry run `to`, as undelivered (issue
@@ -812,10 +815,11 @@ pub fn move_all_signals_to_retry(
     from: ExecutionId,
     to: ExecutionId,
 ) -> SqliteResult<usize> {
-    Ok(conn.execute(
-        "UPDATE harvest_signals SET exec_id = ?2, delivered = 0 WHERE exec_id = ?1",
-        params![from.to_string(), to.to_string()],
-    )?)
+    Ok(conn
+        .prepare_cached(
+            "UPDATE harvest_signals SET exec_id = ?2, delivered = 0 WHERE exec_id = ?1",
+        )?
+        .execute(params![from.to_string(), to.to_string()])?)
 }
 
 #[cfg(test)]
@@ -826,8 +830,9 @@ mod tests {
 
     use super::{
         CANCEL_ACTIVITY_TASK_SQL, DELETE_UNDELIVERED_SIGNALS_SQL, NEXT_TIMER_ARM_SEQ_SQL,
-        cancel_activity_task, delete_undelivered_signals_for_execution, due_timers,
-        due_timers_with_deadlines, enqueue_timer,
+        cancel_activity_task, claim_next_ready_task_tx, delete_undelivered_signals_for_execution,
+        due_timers, due_timers_with_deadlines, enqueue_activity, enqueue_timer,
+        requeue_task_to_back,
     };
     use crate::schema;
 
@@ -873,13 +878,102 @@ mod tests {
             )
             .unwrap();
         assert!(
-            plan.contains("USING INDEX idx_harvest_tasks_exec"),
+            plan.contains("USING INDEX idx_harvest_tasks_exec_state_seq"),
             "expected an index search, got plan: {plan}"
         );
         assert!(
             !plan.contains("SCAN"),
             "expected no full-table scan, got plan: {plan}"
         );
+    }
+
+    /// Every step of the query plan of `sql`, with `params` bound.
+    fn plan_of(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let steps: Vec<String> = stmt
+            .query_map(params, |row| row.get(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        steps.join(" | ")
+    }
+
+    // A run keeps its finished task rows. A claim that reads each of them, or
+    // sorts the ready ones, grows with the activities of the run.
+    #[test]
+    fn the_claim_seeks_the_first_pending_task_and_sorts_nothing() {
+        let conn = open();
+        let exec = ExecutionId::new().to_string();
+
+        let plan = plan_of(&conn, super::CLAIM_NEXT_READY_TASK_SQL, params![exec, 0]);
+
+        assert!(
+            plan.contains("USING INDEX idx_harvest_tasks_exec_state_seq (exec_id=? AND state=?)"),
+            "expected a seek on the run and the state, got plan: {plan}"
+        );
+        assert!(!plan.contains("TEMP B-TREE"), "expected no sort: {plan}");
+        assert!(!plan.contains("SCAN"), "expected no scan: {plan}");
+    }
+
+    fn enqueue(conn: &Connection, exec: ExecutionId, name: &str, run_at: i64) {
+        let id = autumn_harvest::ActivityExecId::new();
+        let input = serde_json::json!(null);
+        enqueue_activity(
+            conn, exec, id, name, &input, "default", run_at, None, None, None, None, true,
+        )
+        .unwrap();
+    }
+
+    fn claim_name(conn: &mut Connection, exec: ExecutionId, now: i64) -> Option<String> {
+        let (tx, task) = claim_next_ready_task_tx(conn, exec, now).unwrap()?;
+        tx.commit().unwrap();
+        Some(task.name)
+    }
+
+    /// The claim takes the lowest `seq` among the ready `PENDING` tasks of its
+    /// own run. It passes a finished task, a task in backoff and a task of
+    /// another run.
+    #[test]
+    fn the_claim_takes_the_oldest_ready_task_of_its_run() {
+        let mut conn = open();
+        let exec = ExecutionId::new();
+        let other = ExecutionId::new();
+        enqueue(&conn, exec, "done", 0);
+        enqueue(&conn, other, "foreign", 0);
+        enqueue(&conn, exec, "backoff", 50);
+        enqueue(&conn, exec, "first", 0);
+        enqueue(&conn, exec, "second", 0);
+        conn.execute(
+            "UPDATE harvest_tasks SET state = 'DONE' WHERE name = 'done'",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(claim_name(&mut conn, exec, 10).as_deref(), Some("first"));
+        assert_eq!(claim_name(&mut conn, exec, 10).as_deref(), Some("second"));
+        assert_eq!(claim_name(&mut conn, exec, 10), None, "backoff is not due");
+        assert_eq!(claim_name(&mut conn, exec, 50).as_deref(), Some("backoff"));
+        assert_eq!(claim_name(&mut conn, other, 10).as_deref(), Some("foreign"));
+    }
+
+    /// A zero-delay retry moves its task behind each ready sibling (issue
+    /// #1068). The claim reads the new `seq` through the index.
+    #[test]
+    fn the_claim_follows_a_requeue_to_the_back() {
+        let mut conn = open();
+        let exec = ExecutionId::new();
+        enqueue(&conn, exec, "retried", 0);
+        enqueue(&conn, exec, "sibling", 0);
+        let (tx, task) = claim_next_ready_task_tx(&mut conn, exec, 0)
+            .unwrap()
+            .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(task.name, "retried");
+
+        requeue_task_to_back(&conn, &task.task_id, 1, 0, "boom").unwrap();
+
+        assert_eq!(claim_name(&mut conn, exec, 0).as_deref(), Some("sibling"));
+        assert_eq!(claim_name(&mut conn, exec, 0).as_deref(), Some("retried"));
     }
 
     // Issue #2429: each timer arm reads the largest arm_seq. Fired timers stay

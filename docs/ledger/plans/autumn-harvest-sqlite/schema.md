@@ -18,6 +18,14 @@ A full scan of a partial index reads only the rows that match its predicate.
 
 The full statement text is in `docs/perf-artifacts/ledger-census/statements.json`.
 
+## `add_recorded_at`
+
+Statements: 1. Backend: SQLite. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'harvest_events')` | no table |
+
 ## `add_schedule_code`
 
 Statements: 1. Backend: SQLite. Tables with no usable index: none.

@@ -135,17 +135,20 @@ fn append(
     // A line of this batch that is already stored does not count. A
     // re-driven cycle offers it again, and the insert ignores it.
     let seqs: Vec<i64> = lines.iter().map(|(seq, _, _)| *seq).collect();
-    let existing: i64 = conn.query_row(
-        "SELECT count(*) FROM harvest_workflow_logs \
+    let existing: i64 = conn
+        .prepare_cached(
+            "SELECT count(*) FROM harvest_workflow_logs \
          WHERE exec_id = ?1 AND seq <> ?2 \
            AND seq NOT IN (SELECT value FROM json_each(?3))",
-        params![
-            id,
-            WORKFLOW_LOG_TRUNCATION_SEQ,
-            serde_json::to_string(&seqs)?
-        ],
-        |row| row.get(0),
-    )?;
+        )?
+        .query_row(
+            params![
+                id,
+                WORKFLOW_LOG_TRUNCATION_SEQ,
+                serde_json::to_string(&seqs)?
+            ],
+            |row| row.get(0),
+        )?;
     let remaining = i64::from(max_lines).saturating_sub(existing).max(0);
     let admit = usize::try_from(remaining)
         .unwrap_or(usize::MAX)
@@ -179,11 +182,10 @@ fn append(
 /// read-only reader cannot, so its runs read as having no lines.
 fn table_exists(conn: &Connection) -> SqliteResult<bool> {
     Ok(conn
-        .query_row(
+        .prepare_cached(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'harvest_workflow_logs'",
-            [],
-            |_| Ok(()),
-        )
+        )?
+        .query_row([], |_| Ok(()))
         .optional()?
         .is_some())
 }
@@ -191,11 +193,8 @@ fn table_exists(conn: &Connection) -> SqliteResult<bool> {
 /// Whether the run of `id` holds the truncation marker.
 fn truncated_on(conn: &Connection, id: &str) -> SqliteResult<bool> {
     Ok(conn
-        .query_row(
-            "SELECT 1 FROM harvest_workflow_logs WHERE exec_id = ?1 AND seq = ?2",
-            params![id, WORKFLOW_LOG_TRUNCATION_SEQ],
-            |_| Ok(()),
-        )
+        .prepare_cached("SELECT 1 FROM harvest_workflow_logs WHERE exec_id = ?1 AND seq = ?2")?
+        .query_row(params![id, WORKFLOW_LOG_TRUNCATION_SEQ], |_| Ok(()))
         .optional()?
         .is_some())
 }
@@ -262,11 +261,14 @@ pub fn count(conn: &Connection, exec: ExecutionId) -> SqliteResult<i64> {
     if !table_exists(conn)? {
         return Ok(0);
     }
-    Ok(conn.query_row(
-        "SELECT count(*) FROM harvest_workflow_logs WHERE exec_id = ?1 AND seq <> ?2",
-        params![exec.to_string(), WORKFLOW_LOG_TRUNCATION_SEQ],
-        |row| row.get(0),
-    )?)
+    Ok(conn
+        .prepare_cached(
+            "SELECT count(*) FROM harvest_workflow_logs WHERE exec_id = ?1 AND seq <> ?2",
+        )?
+        .query_row(
+            params![exec.to_string(), WORKFLOW_LOG_TRUNCATION_SEQ],
+            |row| row.get(0),
+        )?)
 }
 
 /// Whether `exec` reached its line cap.

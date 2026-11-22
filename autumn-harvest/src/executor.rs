@@ -2084,6 +2084,88 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
     drive_workflow(ctx, handler, input, span_meta).await
 }
 
+/// One decision cycle that gives its history back. See
+/// [`run_workflow_lending_history`].
+pub struct LentCycle {
+    /// How the cycle ended.
+    pub outcome: WorkflowOutcome,
+    /// Commands drained with a terminal outcome. Empty for a suspension.
+    pub pending: Vec<WorkflowCommand>,
+    /// The open `harvest.workflow.execute` span. See [`run_workflow_with_state`].
+    pub span: tracing::Span,
+    /// The explicit context-local router, if any. See [`run_workflow_with_state`].
+    pub router: Option<crate::shard::ShardRouter>,
+    /// The history that the caller lent, unchanged. `None` when the cycle
+    /// could not give it back whole. The caller then reads it again from its
+    /// store.
+    pub history: Option<Vec<WorkflowEvent>>,
+}
+
+/// [`run_workflow_with_state_history_policy_and_caps`], for a driver that
+/// needs the history again after the cycle.
+///
+/// The other entry point takes the history for good, so such a driver must
+/// give it a deep copy on each cycle. This one lends the history: the cycle
+/// reads it and returns it in [`LentCycle::history`]. The replay is the same.
+/// Its one difference is internal: it copies the output of each matched
+/// activity out of the history, where the other entry point moves it out.
+#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
+pub async fn run_workflow_lending_history(
+    exec_id: ExecutionId,
+    history: Vec<WorkflowEvent>,
+    handler: WorkflowHandlerFn,
+    input: Value,
+    state: SharedState,
+    history_policy: WorkflowHistoryPolicy,
+    span_meta: Option<&WorkflowExecuteSpanMeta>,
+    declarative_query_handlers: &[&QueryHandlerInfo],
+    declarative_update_handlers: &[&UpdateHandlerInfo],
+    workflow_name: &str,
+    max_activity_input_bytes: u64,
+    max_signal_payload_bytes: u64,
+    max_workflow_input_bytes: u64,
+    max_current_details_bytes: usize,
+    workflow_log_policy: Option<crate::context::WorkflowLogPolicy>,
+    context_headers: std::collections::HashMap<String, String>,
+    payload_offload_threshold: Option<u64>,
+    metrics: std::sync::Arc<dyn MetricsRecorder>,
+    default_activity_retry_policy: Option<crate::policy::RetryPolicy>,
+    default_activity_start_to_close: Option<std::time::Duration>,
+) -> LentCycle {
+    let ctx = build_task_context(
+        exec_id,
+        history,
+        state,
+        history_policy,
+        span_meta,
+        declarative_query_handlers,
+        declarative_update_handlers,
+        workflow_name,
+        max_activity_input_bytes,
+        max_signal_payload_bytes,
+        max_workflow_input_bytes,
+        max_current_details_bytes,
+        workflow_log_policy,
+        context_headers,
+        payload_offload_threshold,
+        metrics,
+        default_activity_retry_policy,
+        default_activity_start_to_close,
+    );
+    ctx.lend_history();
+    // The keep future holds the context by value. On the heap, it adds only a
+    // pointer to each caller frame in a debug build (issue #2752).
+    let result =
+        crate::frame::boxed(|| drive_workflow_keep(ctx, handler, input, span_meta, None)).await;
+    LentCycle {
+        outcome: result.outcome,
+        pending: result.pending,
+        span: result.span,
+        router: result.router,
+        history: result.history,
+    }
+}
+
 /// The context of [`run_workflow`]: default caps, state and policy.
 ///
 /// [`crate::resident::start`] builds the same context, so the resident tests
@@ -2278,6 +2360,11 @@ pub(crate) struct DriveResult {
     /// (issue #2035). The worker wakes the task, so a later cycle runs them.
     #[cfg_attr(not(feature = "db"), allow(dead_code))] // Only the worker reads it.
     pub(crate) updates_deferred: bool,
+    /// The history that the caller lent to the context. A resident cycle
+    /// returns it with the events of its delta on top. `None` when the
+    /// context was not lent its history
+    /// ([`WorkflowContext::lend_history`]), or could not give it back whole.
+    pub(crate) history: Option<Vec<WorkflowEvent>>,
 }
 
 impl DriveResult {
@@ -2451,6 +2538,13 @@ async fn drive_cycle(
     // case. The persist layer then keeps asking the global fresh, exactly
     // as before this fix.
     let router = ctx.resolved_placement_router();
+    // A lent history goes back to the caller. A workflow that stays resident
+    // keeps its matcher with no events, and its driver lends the history
+    // again for the next drive. So a run has one history, not one for the
+    // driver and one for the workflow. Any other handler future is gone by
+    // now, so nothing reads the matcher. A context that was not lent its
+    // history returns `None`.
+    let history = ctx.reclaim_history();
     DriveResult {
         outcome,
         pending,
@@ -2458,6 +2552,7 @@ async fn drive_cycle(
         router,
         resident,
         updates_deferred,
+        history,
     }
 }
 
@@ -2731,6 +2826,139 @@ mod tests {
             }
             other => panic!("expected Completed, got {other:?}"),
         }
+    }
+
+    /// A workflow that calls two activities in sequence.
+    fn two_activity_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let first = ctx
+                .execute_activity_raw("send_email", input, "default")
+                .await
+                .map_err(|e| e.to_string())?;
+            let second = ctx
+                .execute_activity_raw("log_email", first.clone(), "default")
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!([first, second]))
+        })
+    }
+
+    /// Run one cycle of `handler` over `history` with the lending entry point.
+    async fn lent_cycle(
+        history: Vec<WorkflowEvent>,
+        handler: WorkflowHandlerFn,
+        input: Value,
+    ) -> LentCycle {
+        run_workflow_lending_history(
+            ExecutionId::new(),
+            history,
+            handler,
+            input,
+            empty_shared_state(),
+            WorkflowHistoryPolicy::default(),
+            None,
+            &[],
+            &[],
+            "",
+            crate::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
+            crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
+            crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
+            crate::context::DEFAULT_CURRENT_DETAILS_CAP_BYTES,
+            None,
+            std::collections::HashMap::new(),
+            None,
+            std::sync::Arc::new(NoOpMetrics),
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// The stored form of each event. `WorkflowEvent` has no `PartialEq`.
+    fn stored_form(events: &[WorkflowEvent]) -> Vec<Value> {
+        events
+            .iter()
+            .map(|event| serde_json::to_value(event).expect("an event serializes"))
+            .collect()
+    }
+
+    /// A history with one completed activity, so a second one is new.
+    fn one_activity_done(input: &Value, output: &Value) -> Vec<WorkflowEvent> {
+        let activity_id = crate::types::ActivityExecId::new();
+        vec![
+            WorkflowEvent::WorkflowStarted {
+                input: input.clone(),
+                timestamp: Timestamp::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: input.clone(),
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: output.clone(),
+            },
+        ]
+    }
+
+    /// The lending entry point replays as the owning one does, and gives the
+    /// history back as it got it.
+    #[tokio::test]
+    async fn a_lent_cycle_matches_an_owned_cycle_and_returns_the_history() {
+        let input = serde_json::json!({"to": "a@example.com"});
+        let output = serde_json::json!({"email_id": "msg-001", "parts": [1, 2]});
+        let history = one_activity_done(&input, &output);
+        let lent_form = stored_form(&history);
+
+        let owned = run_workflow(
+            ExecutionId::new(),
+            history.clone(),
+            two_activity_workflow,
+            input.clone(),
+        )
+        .await;
+        let lent = lent_cycle(history, two_activity_workflow, input).await;
+
+        let (
+            WorkflowOutcome::Suspended { commands: owned },
+            WorkflowOutcome::Suspended { commands },
+        ) = (owned, lent.outcome)
+        else {
+            panic!("both cycles suspend on the second activity");
+        };
+        assert_eq!(commands.len(), owned.len());
+        assert!(matches!(
+            &commands[0],
+            WorkflowCommand::ScheduleActivity { name, input, .. }
+                if name == "log_email" && *input == output
+        ));
+        let returned = lent.history.expect("the history comes back");
+        assert_eq!(stored_form(&returned), lent_form);
+    }
+
+    /// A cycle that ends the workflow gives the history back too.
+    #[tokio::test]
+    async fn a_lent_cycle_that_completes_returns_the_history() {
+        let input = serde_json::json!({"greeting": "hello"});
+        let output = serde_json::json!("sent");
+        let history = one_activity_done(&input, &output);
+        let lent_form = stored_form(&history);
+
+        let lent = lent_cycle(history, activity_workflow, input).await;
+
+        assert!(matches!(
+            lent.outcome,
+            WorkflowOutcome::Completed { output: got, .. } if got == output
+        ));
+        assert_eq!(stored_form(&lent.history.expect("the history")), lent_form);
     }
 
     #[tokio::test]

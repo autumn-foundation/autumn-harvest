@@ -26,7 +26,8 @@ use crate::error::SqliteResult;
 /// `CROSS JOIN` keeps the running runs as the outer loop. SQLite then reads
 /// the timers and the tasks of each running run by key. A fired timer and a
 /// finished task stay until retention, so a scan from that side grows with
-/// history.
+/// history. The task index holds the state too, so the read takes only the
+/// `PENDING` tasks of a run.
 const NEXT_WAKE_AT_SQL: &str = "\
 WITH running AS MATERIALIZED (
     SELECT exec_id, deadline_at, start_at, local_retry_at FROM harvest_executions
@@ -99,12 +100,13 @@ mod tests {
             !plan.iter().any(|step| step == "SCAN harvest_executions"),
             "{plan:#?}"
         );
-        // `t` is the timer alias and `k` the task alias.
-        for alias in ["t", "k"] {
+        // `t` is the timer alias and `k` the task alias. The task index also
+        // holds the state, so the read skips each finished task of a run.
+        for (alias, key) in [("t", "(exec_id=?)"), ("k", "(exec_id=? AND state=?)")] {
             assert!(
-                plan.iter()
-                    .any(|step| step.starts_with(&format!("SEARCH {alias} "))
-                        && step.ends_with("(exec_id=?)")),
+                plan.iter().any(
+                    |step| step.starts_with(&format!("SEARCH {alias} ")) && step.ends_with(key)
+                ),
                 "{alias}: {plan:#?}"
             );
             assert!(

@@ -3462,6 +3462,26 @@
    }
   }
  },
+ "docs/ledger/autumn-harvest-sqlite/history_cache.toml": {
+  "HistoryCache::same_data_version": {
+   "PRAGMA data_version": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "read_from": {
+   "SELECT seq, event_json FROM harvest_events WHERE exec_id = ?1 AND seq >= ?2 ORDER BY seq": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  }
+ },
  "docs/ledger/autumn-harvest-sqlite/llm_ledger.toml": {
   "insert_rows": {
    "INSERT INTO harvest_llm_ledger (exec_id, event_seq, call_index, activity_name, model, input_tokens, output_tokens, cost_usd_micros, latency_ms, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)": {
@@ -3865,6 +3885,80 @@
   }
  },
  "docs/ledger/autumn-harvest-sqlite/retention.toml": {
+  "delete_runs": {
+   "DELETE FROM harvest_activity_attempts WHERE exec_id IN (SELECT value FROM json_each(?1))": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "DELETE FROM harvest_events WHERE exec_id IN (SELECT value FROM json_each(?1))": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "DELETE FROM harvest_executions WHERE exec_id IN (SELECT value FROM json_each(?1))": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "DELETE FROM harvest_external_tasks WHERE exec_id IN (SELECT value FROM json_each(?1))": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "DELETE FROM harvest_llm_ledger WHERE exec_id IN (SELECT value FROM json_each(?1))": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "DELETE FROM harvest_signals WHERE exec_id IN (SELECT value FROM json_each(?1))": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "DELETE FROM harvest_tasks WHERE exec_id IN (SELECT value FROM json_each(?1))": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "DELETE FROM harvest_timers WHERE exec_id IN (SELECT value FROM json_each(?1))": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "DELETE FROM harvest_workflow_logs WHERE exec_id IN (SELECT value FROM json_each(?1))": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "purge_scope": {
+   "SELECT closed_at, exec_id, workflow_name FROM harvest_executions INDEXED BY idx_harvest_executions_closed WHERE closed_at IS NOT NULL AND closed_at < ?1 AND (closed_at, exec_id) > (?2, ?3) AND state IN ('COMPLETED', 'FAILED', 'CANCELLED', 'TERMINATED', 'TIMED_OUT', 'CONTINUED_AS_NEW') AND (?5 IS NULL OR workflow_name = ?5) AND workflow_name NOT IN (SELECT value FROM json_each(?6)) ORDER BY closed_at, exec_id LIMIT ?4": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
   "purge_terminal": {
    "DELETE FROM harvest_activity_attempts WHERE exec_id IN (SELECT value FROM json_each(?1))": {
     "backend": "sqlite",
@@ -3933,7 +4027,7 @@
     ],
     "types": {}
    },
-   "-- A purge deletes the tasks of a batch of runs by `exec_id` (issue #2031).\n-- Without this index, each batch scans the whole table, so a large purge is\n-- quadratic. The column exists in every file, so the base schema builds it.\nCREATE INDEX IF NOT EXISTS idx_harvest_tasks_exec\nON harvest_tasks (exec_id);": {
+   "-- A terminal write and a purge find the rows of one run.\nCREATE INDEX IF NOT EXISTS idx_harvest_external_tasks_exec\nON harvest_external_tasks (exec_id);": {
     "backend": "sqlite",
     "literals": [
      {}
@@ -3954,7 +4048,21 @@
     ],
     "types": {}
    },
+   "-- Cron and interval schedules (issue #2031). The workflow name is the key,\n-- as on Postgres. Each `poll_once` pass fires the rows whose slot is due.\nCREATE TABLE IF NOT EXISTS harvest_schedules (\nworkflow_name TEXT PRIMARY KEY,\nschedule_json TEXT NOT NULL, -- the `Schedule` spec as JSON\ninput_json TEXT NOT NULL, -- the input of each run\noverlap_policy TEXT NOT NULL, -- skip | allow_all\nmax_active_runs INTEGER NOT NULL, -- the run limit of `skip`\npaused INTEGER NOT NULL DEFAULT 0,\nnext_run_at INTEGER, -- the next slot in epoch milliseconds.\n-- NULL = never fires.\nlast_run_at INTEGER, -- the slot of the last started run in\n-- epoch milliseconds\ncode_json TEXT, -- the code `WorkflowSchedule` as JSON\n-- (issue #2390). The row holds the\n-- effective value; an override\n-- merges over this one.\npause_reason TEXT -- the reason of the pause, while\n-- paused (issue #2471)\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
    "-- Each timer arm reads `MAX(arm_seq)` over every timer row (issue #2429). Fired\n-- rows stay until retention purges their run, so without this index each arm\n-- reads the whole table. The column exists in every file, so the base schema\n-- builds the index.\nCREATE INDEX IF NOT EXISTS idx_harvest_timers_arm_seq\nON harvest_timers (arm_seq);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "-- External (task-token) activity handoffs. One row per token. A dispatcher\n-- reads the `PENDING` rows and settles each token. The deadline also lives in\n-- `harvest_timers`, so it fires through the timer path. The table is new, so\n-- `CREATE TABLE IF NOT EXISTS` adds it to an older file.\nCREATE TABLE IF NOT EXISTS harvest_external_tasks (\ntoken TEXT PRIMARY KEY,\nexec_id TEXT NOT NULL,\nactivity_id TEXT NOT NULL,\nname TEXT NOT NULL, -- the activity name\nqueue TEXT NOT NULL,\ninput_json TEXT NOT NULL,\nstate TEXT NOT NULL, -- PENDING | COMPLETED | FAILED |\n-- TIMED_OUT | CANCELLED\ncreated_at INTEGER NOT NULL, -- epoch milliseconds\nupdated_at INTEGER NOT NULL, -- epoch milliseconds\ndeadline_at INTEGER NOT NULL -- the schedule-to-close deadline in\n-- epoch milliseconds\n);": {
     "backend": "sqlite",
     "literals": [
      {}
@@ -3996,7 +4104,28 @@
     ],
     "types": {}
    },
+   "-- The dispatcher read: pending rows of one activity, by deadline.\nCREATE INDEX IF NOT EXISTS idx_harvest_external_tasks_pending\nON harvest_external_tasks (state, name, deadline_at);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "-- The durable workflow log lines (issue #2468), as on Postgres (issue #790).\n-- `seq` is the call ordinal of a line, so a re-driven cycle stores it once.\n-- `seq = i64::MAX` is the truncation marker. The table is new, so\n-- `CREATE TABLE IF NOT EXISTS` adds it to an older file.\nCREATE TABLE IF NOT EXISTS harvest_workflow_logs (\nexec_id TEXT NOT NULL,\nseq INTEGER NOT NULL,\nlevel TEXT NOT NULL,\nmessage TEXT NOT NULL,\noccurred_at INTEGER NOT NULL, -- epoch microseconds\nPRIMARY KEY (exec_id, seq)\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
    "-- The state filter of a listing (issue #2027). It indexes the same expression\n-- the filter tests, so the planner can use it. The filter compares bytes, so a\n-- value in the wrong storage class still matches. Without the index, a filter\n-- on `state` reads past `input_json` on every row, which is slow when the\n-- inputs are large. The index is non-unique and idempotent, so it builds on\n-- every open of an older file.\nCREATE INDEX IF NOT EXISTS idx_harvest_executions_state\nON harvest_executions (cast(state as blob));": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "-- The tasks of one run, by state and then in claim order. The claim reads\n-- the oldest `PENDING` task of a run. A run keeps its `DONE` rows, so an\n-- index on `exec_id` alone made each claim read every task of the run and\n-- sort the ready ones. With this index a claim seeks to its first row.\n--\n-- The `exec_id` prefix also serves each statement that names only the run.\n-- A purge deletes the tasks of a batch of runs by `exec_id` (issue #2031).\n-- Without an index, each batch scans the whole table, so a large purge is\n-- quadratic. So the older index on `exec_id` alone has no use left, and the\n-- schema drops it. The columns exist in every file, so the base schema\n-- builds the index on each open. The first open of an older file builds it\n-- once from the stored tasks.\nCREATE INDEX IF NOT EXISTS idx_harvest_tasks_exec_state_seq\nON harvest_tasks (exec_id, state, seq);": {
     "backend": "sqlite",
     "literals": [
      {}
@@ -4039,6 +4168,13 @@
     "types": {}
    },
    "CREATE TABLE IF NOT EXISTS harvest_events (\nexec_id TEXT NOT NULL,\nseq INTEGER NOT NULL,\nevent_json TEXT NOT NULL,\nPRIMARY KEY (exec_id, seq)\n);": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "CREATE TABLE IF NOT EXISTS harvest_events (\nexec_id TEXT NOT NULL,\nseq INTEGER NOT NULL,\nevent_json TEXT NOT NULL,\nrecorded_at INTEGER, -- the append time in epoch microseconds\n-- (issue #2489). NULL on a row written\n-- before that issue. Replay never reads it.\nPRIMARY KEY (exec_id, seq)\n);": {
     "backend": "sqlite",
     "literals": [
      {}
@@ -4101,7 +4237,21 @@
     ],
     "types": {}
    },
+   "DROP INDEX IF EXISTS idx_harvest_tasks_exec;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
    "PRAGMA busy_timeout = 5000;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "PRAGMA journal_mode": {
     "backend": "sqlite",
     "literals": [
      {}
@@ -4116,6 +4266,13 @@
     "types": {}
    },
    "PRAGMA synchronous = FULL;": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "PRAGMA wal_autocheckpoint = 0;": {
     "backend": "sqlite",
     "literals": [
      {}
@@ -4271,6 +4428,13 @@
  },
  "docs/ledger/autumn-harvest-sqlite/schema.toml": {
   "add_column_if_absent": {
+   "ALTER TABLE harvest_events ADD COLUMN recorded_at INTEGER": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
    "ALTER TABLE harvest_executions ADD COLUMN cancel_from_seq INTEGER": {
     "backend": "sqlite",
     "literals": [
@@ -4390,6 +4554,13 @@
     ],
     "types": {}
    },
+   "ALTER TABLE harvest_schedules ADD COLUMN pause_reason TEXT": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
    "ALTER TABLE harvest_signals ADD COLUMN idempotency_key TEXT": {
     "backend": "sqlite",
     "literals": [
@@ -4426,6 +4597,15 @@
     "types": {}
    }
   },
+  "add_recorded_at": {
+   "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'harvest_events')": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
   "add_schedule_code": {
    "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'harvest_schedules')": {
     "backend": "sqlite",
@@ -4437,6 +4617,13 @@
   },
   "add_signal_key": {
    "BEGIN DEFERRED": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
+   "BEGIN IMMEDIATE": {
     "backend": "sqlite",
     "literals": [
      {}
@@ -4475,6 +4662,13 @@
    }
   },
   "column_exists": {
+   "PRAGMA table_info(harvest_events)": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   },
    "PRAGMA table_info(harvest_executions)": {
     "backend": "sqlite",
     "literals": [
@@ -4542,6 +4736,15 @@
   },
   "copy_inherited_fields": {
    "UPDATE harvest_executions SET (memo, search_attrs, schedule_name) = (SELECT memo, search_attrs, schedule_name FROM harvest_executions WHERE exec_id = ?1) WHERE exec_id = ?2": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "cycle_row": {
+   "SELECT state, execution_timeout_ms, deadline_at, start_at, workflow_attempt, retry_policy_json, retry_of_exec_id, local_retry_at, cancel_reason, cancel_from_seq, input_json, workflow_name, workflow_id, parent_exec_id FROM harvest_executions WHERE exec_id = ?1": {
     "backend": "sqlite",
     "literals": [
      {}
@@ -5033,6 +5236,37 @@
     "types": {}
    },
    "SELECT rowid, exec_id, workflow_name, workflow_id, state, started_at, closed_at, search_attrs, memo, input_json, output_json, error FROM harvest_executions WHERE rowid < ?1 ORDER BY rowid DESC LIMIT ?2": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  }
+ },
+ "docs/ledger/autumn-harvest-sqlite/wake.toml": {
+  "next_wake_after": {
+   "WITH running AS MATERIALIZED (\nSELECT exec_id, deadline_at, start_at, local_retry_at FROM harvest_executions\nWHERE cast(state as blob) = cast('RUNNING' as blob)\n)\nSELECT MIN(at) FROM (\nSELECT t.fire_at AS at\nFROM running r CROSS JOIN harvest_timers t ON t.exec_id = r.exec_id\nWHERE t.fired = 0\nUNION ALL\nSELECT k.run_at\nFROM running r CROSS JOIN harvest_tasks k ON k.exec_id = r.exec_id\nWHERE k.state = 'PENDING'\nUNION ALL\nSELECT deadline_at FROM running\nUNION ALL\nSELECT start_at FROM running WHERE start_at > ?1\nUNION ALL\nSELECT local_retry_at FROM running WHERE local_retry_at > ?1\nUNION ALL\nSELECT next_run_at FROM harvest_schedules WHERE ?2 AND paused = 0\n) WHERE at > ?3": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  }
+ },
+ "docs/ledger/autumn-harvest-sqlite/worker.toml": {
+  "RelaxedSync::begin": {
+   "PRAGMA synchronous = NORMAL": {
+    "backend": "sqlite",
+    "literals": [
+     {}
+    ],
+    "types": {}
+   }
+  },
+  "RelaxedSync::restore": {
+   "PRAGMA synchronous = FULL": {
     "backend": "sqlite",
     "literals": [
      {}

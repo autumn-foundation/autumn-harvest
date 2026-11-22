@@ -79,24 +79,24 @@ pub fn insert_execution_with_config(
     input: &Value,
     config: &RunConfig,
 ) -> SqliteResult<()> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO harvest_executions (exec_id, workflow_name, workflow_id, input_json, state, \
            execution_timeout_ms, deadline_at, start_at, workflow_attempt, retry_policy_json, \
            retry_of_exec_id) \
          VALUES (?1, ?2, ?3, ?4, 'RUNNING', ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![
-            exec_id.to_string(),
-            workflow_name,
-            workflow_id,
-            serde_json::to_string(input)?,
-            config.execution_timeout_ms,
-            config.deadline_at,
-            config.start_at,
-            config.attempt.max(1),
-            config.retry_policy_json,
-            config.retry_of.map(|e| e.to_string()),
-        ],
-    )?;
+    )?
+    .execute(params![
+        exec_id.to_string(),
+        workflow_name,
+        workflow_id,
+        serde_json::to_string(input)?,
+        config.execution_timeout_ms,
+        config.deadline_at,
+        config.start_at,
+        config.attempt.max(1),
+        config.retry_policy_json,
+        config.retry_of.map(|e| e.to_string()),
+    ])?;
     Ok(())
 }
 
@@ -117,11 +117,11 @@ pub fn insert_child_execution(
     // A child's business id is its own execution id, as on Postgres.
     let workflow_id = exec_id.to_string();
     insert_execution_with_config(conn, exec_id, workflow_name, &workflow_id, input, config)?;
-    conn.execute(
+    conn.prepare_cached(
         "UPDATE harvest_executions SET parent_exec_id = ?2, parent_close_policy = ?3 \
          WHERE exec_id = ?1",
-        params![exec_id.to_string(), parent.0.to_string(), parent.1],
-    )?;
+    )?
+    .execute(params![exec_id.to_string(), parent.0.to_string(), parent.1])?;
     Ok(())
 }
 
@@ -139,28 +139,99 @@ impl RunConfig {
     }
 }
 
-/// The stored [`RunConfig`] of `exec_id` (issue #2029).
-pub fn run_config(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<RunConfig> {
+/// The columns of one run that each decision cycle reads.
+///
+/// One read replaces a lookup of each column. Nothing writes the run row
+/// between the start of a cycle and its replay, so the values are those that
+/// the separate lookups returned.
+#[derive(Debug)]
+pub struct CycleRow {
+    /// The stored state, such as `RUNNING`.
+    pub state: String,
+    /// The timeout and retry settings (issue #2029).
+    pub config: RunConfig,
+    /// The cooperative cancel request, as [`cancel_request`] returns it.
+    pub cancel: Option<(String, usize)>,
+    /// The stored input, not parsed yet. A terminal run never parses it.
+    pub input_json: String,
+    /// The workflow type.
+    pub workflow_name: String,
+    /// The business `workflow_id` recorded at start (issue #698).
+    pub workflow_id: String,
+    /// The parent run, if this run is a child (issue #2026).
+    pub parent: Option<ExecutionId>,
+}
+
+/// Read the [`CycleRow`] of `exec_id`.
+///
+/// An unknown id is [`SqliteError::ExecutionNotFound`].
+pub fn cycle_row(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<CycleRow> {
     let row = conn
-        .query_row(
-            "SELECT execution_timeout_ms, deadline_at, start_at, workflow_attempt, \
-             retry_policy_json, retry_of_exec_id, local_retry_at \
+        .prepare_cached(
+            "SELECT state, execution_timeout_ms, deadline_at, start_at, workflow_attempt, \
+             retry_policy_json, retry_of_exec_id, local_retry_at, cancel_reason, \
+             cancel_from_seq, input_json, workflow_name, workflow_id, parent_exec_id \
              FROM harvest_executions WHERE exec_id = ?1",
-            params![exec_id.to_string()],
-            |r| {
-                Ok((
-                    r.get::<_, Option<i64>>(0)?,
+        )?
+        .query_row(params![exec_id.to_string()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                (
                     r.get::<_, Option<i64>>(1)?,
                     r.get::<_, Option<i64>>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<i64>>(3)?,
+                    r.get::<_, i64>(4)?,
                     r.get::<_, Option<String>>(5)?,
-                    r.get::<_, Option<i64>>(6)?,
-                ))
-            },
-        )
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, Option<i64>>(7)?,
+                ),
+                r.get::<_, Option<String>>(8)?,
+                r.get::<_, Option<i64>>(9)?,
+                r.get::<_, String>(10)?,
+                r.get::<_, String>(11)?,
+                r.get::<_, String>(12)?,
+                r.get::<_, Option<String>>(13)?,
+            ))
+        })
         .optional()?
         .ok_or(SqliteError::ExecutionNotFound(exec_id))?;
+    let (state, config, cancel_reason, cancel_from, input_json, workflow_name, workflow_id, parent) =
+        row;
+    let parent = parent
+        .map(|id| {
+            id.parse()
+                .map_err(|_| SqliteError::corrupt("parent_exec_id"))
+        })
+        .transpose()?;
+    Ok(CycleRow {
+        state,
+        config: run_config_of(config)?,
+        cancel: cancel_reason.map(|reason| (reason, cancel_from_seq(cancel_from))),
+        input_json,
+        workflow_name,
+        workflow_id,
+        parent,
+    })
+}
+
+/// The history length that a stored `cancel_from_seq` names.
+fn cancel_from_seq(from: Option<i64>) -> usize {
+    from.and_then(|seq| usize::try_from(seq).ok()).unwrap_or(0)
+}
+
+/// The stored columns of a [`RunConfig`], in the order of its fields.
+type RunConfigColumns = (
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+);
+
+/// Build a [`RunConfig`] from its stored columns.
+fn run_config_of(columns: RunConfigColumns) -> SqliteResult<RunConfig> {
     let (
         execution_timeout_ms,
         deadline_at,
@@ -169,7 +240,7 @@ pub fn run_config(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<RunCo
         retry_policy_json,
         retry_of,
         local_retry_at,
-    ) = row;
+    ) = columns;
     let retry_of = retry_of
         .map(|id| {
             id.parse()
@@ -187,13 +258,35 @@ pub fn run_config(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<RunCo
     })
 }
 
+/// The stored [`RunConfig`] of `exec_id` (issue #2029).
+pub fn run_config(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<RunConfig> {
+    let row = conn
+        .prepare_cached(
+            "SELECT execution_timeout_ms, deadline_at, start_at, workflow_attempt, \
+             retry_policy_json, retry_of_exec_id, local_retry_at \
+             FROM harvest_executions WHERE exec_id = ?1",
+        )?
+        .query_row(params![exec_id.to_string()], |r| {
+            Ok((
+                r.get::<_, Option<i64>>(0)?,
+                r.get::<_, Option<i64>>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<i64>>(6)?,
+            ))
+        })
+        .optional()?
+        .ok_or(SqliteError::ExecutionNotFound(exec_id))?;
+    run_config_of(row)
+}
+
 /// Park `exec_id` until the local-activity backoff ends at `at` (issue
 /// #2029).
 pub fn set_local_retry_at(conn: &Connection, exec_id: ExecutionId, at: i64) -> SqliteResult<()> {
-    conn.execute(
-        "UPDATE harvest_executions SET local_retry_at = ?2 WHERE exec_id = ?1",
-        params![exec_id.to_string(), at],
-    )?;
+    conn.prepare_cached("UPDATE harvest_executions SET local_retry_at = ?2 WHERE exec_id = ?1")?
+        .execute(params![exec_id.to_string(), at])?;
     Ok(())
 }
 
@@ -203,11 +296,12 @@ pub fn parent_link(
     exec_id: ExecutionId,
 ) -> SqliteResult<Option<(ExecutionId, Option<String>)>> {
     let row: Option<(Option<String>, Option<String>)> = conn
-        .query_row(
+        .prepare_cached(
             "SELECT parent_exec_id, parent_close_policy FROM harvest_executions WHERE exec_id = ?1",
-            params![exec_id.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
+        )?
+        .query_row(params![exec_id.to_string()], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
         .optional()?;
     match row {
         Some((Some(parent), policy)) => {
@@ -225,7 +319,7 @@ pub fn running_detached_children(
     conn: &Connection,
     parent: ExecutionId,
 ) -> SqliteResult<Vec<(ExecutionId, String)>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT exec_id, parent_close_policy FROM harvest_executions \
          WHERE parent_exec_id = ?1 AND parent_close_policy IS NOT NULL AND state = 'RUNNING' \
          ORDER BY rowid",
@@ -244,21 +338,16 @@ pub fn running_detached_children(
 
 pub fn execution_exists(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<bool> {
     let found: Option<i64> = conn
-        .query_row(
-            "SELECT 1 FROM harvest_executions WHERE exec_id = ?1",
-            params![exec_id.to_string()],
-            |row| row.get(0),
-        )
+        .prepare_cached("SELECT 1 FROM harvest_executions WHERE exec_id = ?1")?
+        .query_row(params![exec_id.to_string()], |row| row.get(0))
         .optional()?;
     Ok(found.is_some())
 }
 
 pub fn execution_input(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<Value> {
-    let raw: String = conn.query_row(
-        "SELECT input_json FROM harvest_executions WHERE exec_id = ?1",
-        params![exec_id.to_string()],
-        |row| row.get(0),
-    )?;
+    let raw: String = conn
+        .prepare_cached("SELECT input_json FROM harvest_executions WHERE exec_id = ?1")?
+        .query_row(params![exec_id.to_string()], |row| row.get(0))?;
     Ok(serde_json::from_str(&raw)?)
 }
 
@@ -268,21 +357,16 @@ pub fn execution_input(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<
 /// `QueryReturnedNoRows` (issue #1735). One query does the lookup and the
 /// existence check.
 pub fn execution_state(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<String> {
-    conn.query_row(
-        "SELECT state FROM harvest_executions WHERE exec_id = ?1",
-        params![exec_id.to_string()],
-        |row| row.get(0),
-    )
-    .optional()?
-    .ok_or(SqliteError::ExecutionNotFound(exec_id))
+    conn.prepare_cached("SELECT state FROM harvest_executions WHERE exec_id = ?1")?
+        .query_row(params![exec_id.to_string()], |row| row.get(0))
+        .optional()?
+        .ok_or(SqliteError::ExecutionNotFound(exec_id))
 }
 
 pub fn execution_output(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<Option<Value>> {
-    let raw: Option<String> = conn.query_row(
-        "SELECT output_json FROM harvest_executions WHERE exec_id = ?1",
-        params![exec_id.to_string()],
-        |row| row.get(0),
-    )?;
+    let raw: Option<String> = conn
+        .prepare_cached("SELECT output_json FROM harvest_executions WHERE exec_id = ?1")?
+        .query_row(params![exec_id.to_string()], |row| row.get(0))?;
     match raw {
         Some(s) => Ok(Some(serde_json::from_str(&s)?)),
         None => Ok(None),
@@ -290,19 +374,15 @@ pub fn execution_output(conn: &Connection, exec_id: ExecutionId) -> SqliteResult
 }
 
 pub fn execution_error(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<Option<String>> {
-    Ok(conn.query_row(
-        "SELECT error FROM harvest_executions WHERE exec_id = ?1",
-        params![exec_id.to_string()],
-        |row| row.get(0),
-    )?)
+    Ok(conn
+        .prepare_cached("SELECT error FROM harvest_executions WHERE exec_id = ?1")?
+        .query_row(params![exec_id.to_string()], |row| row.get(0))?)
 }
 
 pub fn workflow_name_of(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<String> {
-    Ok(conn.query_row(
-        "SELECT workflow_name FROM harvest_executions WHERE exec_id = ?1",
-        params![exec_id.to_string()],
-        |row| row.get(0),
-    )?)
+    Ok(conn
+        .prepare_cached("SELECT workflow_name FROM harvest_executions WHERE exec_id = ?1")?
+        .query_row(params![exec_id.to_string()], |row| row.get(0))?)
 }
 
 /// The run-scoped business `workflow_id` recorded at start (issue #698).
@@ -311,16 +391,14 @@ pub fn workflow_name_of(conn: &Connection, exec_id: ExecutionId) -> SqliteResult
 /// `ctx.info().workflow_id` is stable across replays and never empty. Without a
 /// business id from the caller, it is the `exec_id` string form.
 pub fn workflow_id_of(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<String> {
-    Ok(conn.query_row(
-        "SELECT workflow_id FROM harvest_executions WHERE exec_id = ?1",
-        params![exec_id.to_string()],
-        |row| row.get(0),
-    )?)
+    Ok(conn
+        .prepare_cached("SELECT workflow_id FROM harvest_executions WHERE exec_id = ?1")?
+        .query_row(params![exec_id.to_string()], |row| row.get(0))?)
 }
 
 /// The ids of every non-terminal (`RUNNING`) execution, oldest-first.
 pub fn running_executions(conn: &Connection) -> SqliteResult<Vec<ExecutionId>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT exec_id FROM harvest_executions WHERE state = 'RUNNING' ORDER BY exec_id",
     )?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -364,14 +442,15 @@ pub fn find_active_execution_by_key(
     workflow_id: &str,
 ) -> SqliteResult<Option<(ExecutionId, String)>> {
     let row = conn
-        .query_row(
+        .prepare_cached(
             "SELECT exec_id, state FROM harvest_executions \
              WHERE workflow_name = ?1 AND workflow_id = ?2 \
                AND state NOT IN ('CONTINUED_AS_NEW','TERMINATED') \
              ORDER BY rowid DESC LIMIT 1",
-            params![workflow_name, workflow_id],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-        )
+        )?
+        .query_row(params![workflow_name, workflow_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
         .optional()?;
     match row {
         None => Ok(None),
@@ -395,13 +474,14 @@ pub fn newest_execution_by_key(
     workflow_name: &str,
     workflow_id: &str,
 ) -> SqliteResult<Option<ExecutionId>> {
-    conn.query_row(
+    conn.prepare_cached(
         "SELECT exec_id FROM harvest_executions \
          WHERE workflow_name = ?1 AND workflow_id = ?2 \
          ORDER BY rowid DESC LIMIT 1",
-        params![workflow_name, workflow_id],
-        |r| r.get::<_, String>(0),
-    )
+    )?
+    .query_row(params![workflow_name, workflow_id], |r| {
+        r.get::<_, String>(0)
+    })
     .optional()?
     .map(|exec| exec.parse().map_err(|_| SqliteError::corrupt("exec_id")))
     .transpose()
@@ -426,7 +506,7 @@ pub fn find_active_executions_by_key(
     workflow_name: &str,
     workflow_id: &str,
 ) -> SqliteResult<Vec<(ExecutionId, String)>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT exec_id, state FROM harvest_executions \
          WHERE workflow_name = ?1 AND workflow_id = ?2 \
            AND state NOT IN ('CONTINUED_AS_NEW','TERMINATED') \
@@ -468,13 +548,13 @@ pub fn seal_execution(
     exec_id: ExecutionId,
     sealed_state: &str,
 ) -> SqliteResult<()> {
-    conn.execute(
+    conn.prepare_cached(
         // A reuse-policy seal can close a run that already ended. The first
         // close time stands (issue #2027).
         "UPDATE harvest_executions SET state = ?2, closed_at = coalesce(closed_at, ?3) \
          WHERE exec_id = ?1",
-        params![exec_id.to_string(), sealed_state, now_micros()],
-    )?;
+    )?
+    .execute(params![exec_id.to_string(), sealed_state, now_micros()])?;
     release_run(conn, exec_id)
 }
 
@@ -483,12 +563,12 @@ pub fn seal_execution(
 /// The first request wins. A repeat call changes nothing. The row also keeps
 /// the history length at the request, which bounds the cleanup.
 pub fn request_cancel(conn: &Connection, exec_id: ExecutionId, reason: &str) -> SqliteResult<()> {
-    conn.execute(
+    conn.prepare_cached(
         "UPDATE harvest_executions SET cancel_reason = ?2, cancel_from_seq = \
            (SELECT COALESCE(MAX(seq) + 1, 0) FROM harvest_events WHERE exec_id = ?1) \
          WHERE exec_id = ?1 AND state = 'RUNNING' AND cancel_reason IS NULL",
-        params![exec_id.to_string(), reason],
-    )?;
+    )?
+    .execute(params![exec_id.to_string(), reason])?;
     Ok(())
 }
 
@@ -499,15 +579,14 @@ pub fn cancel_request(
     conn: &Connection,
     exec_id: ExecutionId,
 ) -> SqliteResult<Option<(String, usize)>> {
-    let (reason, from): (Option<String>, Option<i64>) = conn.query_row(
-        "SELECT cancel_reason, cancel_from_seq FROM harvest_executions WHERE exec_id = ?1",
-        params![exec_id.to_string()],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    Ok(reason.map(|reason| {
-        let from = from.and_then(|seq| usize::try_from(seq).ok()).unwrap_or(0);
-        (reason, from)
-    }))
+    let (reason, from): (Option<String>, Option<i64>) = conn
+        .prepare_cached(
+            "SELECT cancel_reason, cancel_from_seq FROM harvest_executions WHERE exec_id = ?1",
+        )?
+        .query_row(params![exec_id.to_string()], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+    Ok(reason.map(|reason| (reason, cancel_from_seq(from))))
 }
 
 /// Put `exec_id` in a terminal `state` with `reason` as its error (issue
@@ -518,24 +597,24 @@ pub fn set_terminal_with_reason(
     state: &str,
     reason: &str,
 ) -> SqliteResult<()> {
-    conn.execute(
+    conn.prepare_cached(
         "UPDATE harvest_executions SET state = ?2, error = ?3, closed_at = ?4 \
          WHERE exec_id = ?1",
-        params![exec_id.to_string(), state, reason, now_micros()],
-    )?;
+    )?
+    .execute(params![exec_id.to_string(), state, reason, now_micros()])?;
     release_run(conn, exec_id)
 }
 
 pub fn set_completed(conn: &Connection, exec_id: ExecutionId, output: &Value) -> SqliteResult<()> {
-    conn.execute(
+    conn.prepare_cached(
         "UPDATE harvest_executions SET state = 'COMPLETED', output_json = ?2, closed_at = ?3 \
          WHERE exec_id = ?1",
-        params![
-            exec_id.to_string(),
-            serde_json::to_string(output)?,
-            now_micros()
-        ],
-    )?;
+    )?
+    .execute(params![
+        exec_id.to_string(),
+        serde_json::to_string(output)?,
+        now_micros()
+    ])?;
     release_run(conn, exec_id)
 }
 
@@ -544,21 +623,21 @@ pub fn set_completed(conn: &Connection, exec_id: ExecutionId, output: &Value) ->
 /// It records the close time and releases the run's mutex locks and waits,
 /// as every terminal setter does (issues #2027 and #2029).
 pub fn set_cancelled(conn: &Connection, exec_id: ExecutionId, reason: &str) -> SqliteResult<()> {
-    conn.execute(
+    conn.prepare_cached(
         "UPDATE harvest_executions SET state = 'CANCELLED', output_json = NULL, error = ?2, \
            closed_at = ?3 \
          WHERE exec_id = ?1",
-        params![exec_id.to_string(), reason, now_micros()],
-    )?;
+    )?
+    .execute(params![exec_id.to_string(), reason, now_micros()])?;
     release_run(conn, exec_id)
 }
 
 pub fn set_failed(conn: &Connection, exec_id: ExecutionId, error: &str) -> SqliteResult<()> {
-    conn.execute(
+    conn.prepare_cached(
         "UPDATE harvest_executions SET state = 'FAILED', error = ?2, closed_at = ?3 \
          WHERE exec_id = ?1",
-        params![exec_id.to_string(), error, now_micros()],
-    )?;
+    )?
+    .execute(params![exec_id.to_string(), error, now_micros()])?;
     release_run(conn, exec_id)
 }
 
@@ -585,16 +664,16 @@ pub fn set_start_fields(
     memo: Option<&Value>,
     search_attrs: Option<&serde_json::Map<String, Value>>,
 ) -> SqliteResult<()> {
-    conn.execute(
+    conn.prepare_cached(
         "UPDATE harvest_executions SET started_at = ?2, memo = ?3, search_attrs = ?4 \
          WHERE exec_id = ?1",
-        params![
-            exec_id.to_string(),
-            started_at,
-            memo.map(serde_json::to_string).transpose()?,
-            search_attrs.map(serde_json::to_string).transpose()?
-        ],
-    )?;
+    )?
+    .execute(params![
+        exec_id.to_string(),
+        started_at,
+        memo.map(serde_json::to_string).transpose()?,
+        search_attrs.map(serde_json::to_string).transpose()?
+    ])?;
     Ok(())
 }
 
@@ -606,13 +685,13 @@ pub fn copy_inherited_fields(
     from: ExecutionId,
     to: ExecutionId,
 ) -> SqliteResult<()> {
-    conn.execute(
+    conn.prepare_cached(
         "UPDATE harvest_executions SET \
            (memo, search_attrs, schedule_name) = \
            (SELECT memo, search_attrs, schedule_name FROM harvest_executions WHERE exec_id = ?1) \
          WHERE exec_id = ?2",
-        params![from.to_string(), to.to_string()],
-    )?;
+    )?
+    .execute(params![from.to_string(), to.to_string()])?;
     Ok(())
 }
 
@@ -622,10 +701,8 @@ pub fn set_schedule_name(
     exec_id: ExecutionId,
     workflow_name: &str,
 ) -> SqliteResult<()> {
-    conn.execute(
-        "UPDATE harvest_executions SET schedule_name = ?2 WHERE exec_id = ?1",
-        params![exec_id.to_string(), workflow_name],
-    )?;
+    conn.prepare_cached("UPDATE harvest_executions SET schedule_name = ?2 WHERE exec_id = ?1")?
+        .execute(params![exec_id.to_string(), workflow_name])?;
     Ok(())
 }
 
@@ -641,13 +718,12 @@ pub fn upsert_search_attrs(
     patch: &std::collections::HashMap<String, Option<Value>>,
 ) -> SqliteResult<()> {
     let stored: Option<Vec<u8>> = conn
-        .query_row(
+        .prepare_cached(
             "SELECT CASE WHEN typeof(search_attrs) = 'text' \
                     THEN cast(search_attrs as blob) END \
              FROM harvest_executions WHERE exec_id = ?1",
-            params![exec_id.to_string()],
-            |row| row.get(0),
-        )
+        )?
+        .query_row(params![exec_id.to_string()], |row| row.get(0))
         .optional()?
         .ok_or(SqliteError::ExecutionNotFound(exec_id))?;
     let mut merged = match stored.and_then(|bytes| serde_json::from_slice(&bytes).ok()) {
@@ -666,21 +742,20 @@ pub fn upsert_search_attrs(
             }
         }
     }
-    conn.execute(
-        "UPDATE harvest_executions SET search_attrs = ?2 WHERE exec_id = ?1",
-        params![exec_id.to_string(), serde_json::to_string(&merged)?],
-    )?;
+    conn.prepare_cached("UPDATE harvest_executions SET search_attrs = ?2 WHERE exec_id = ?1")?
+        .execute(params![
+            exec_id.to_string(),
+            serde_json::to_string(&merged)?
+        ])?;
     Ok(())
 }
 
 // ── Event log ────────────────────────────────────────────────────────────────
 
 pub fn next_seq(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<i64> {
-    let max: Option<i64> = conn.query_row(
-        "SELECT MAX(seq) FROM harvest_events WHERE exec_id = ?1",
-        params![exec_id.to_string()],
-        |row| row.get(0),
-    )?;
+    let max: Option<i64> = conn
+        .prepare_cached("SELECT MAX(seq) FROM harvest_events WHERE exec_id = ?1")?
+        .query_row(params![exec_id.to_string()], |row| row.get(0))?;
     Ok(max.map_or(0, |m| m + 1))
 }
 
@@ -701,16 +776,16 @@ pub fn append_event_seq(
     event: &WorkflowEvent,
 ) -> SqliteResult<i64> {
     let seq = next_seq(conn, exec_id)?;
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO harvest_events (exec_id, seq, event_json, recorded_at) \
          VALUES (?1, ?2, ?3, ?4)",
-        params![
-            exec_id.to_string(),
-            seq,
-            serde_json::to_string(event)?,
-            now_micros()
-        ],
-    )?;
+    )?
+    .execute(params![
+        exec_id.to_string(),
+        seq,
+        serde_json::to_string(event)?,
+        now_micros()
+    ])?;
     Ok(seq)
 }
 
@@ -776,11 +851,10 @@ pub fn retry_of(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<Option<
 
 fn last_event(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<Option<WorkflowEvent>> {
     let last: Option<String> = conn
-        .query_row(
+        .prepare_cached(
             "SELECT event_json FROM harvest_events WHERE exec_id = ?1 ORDER BY seq DESC LIMIT 1",
-            params![exec_id.to_string()],
-            |row| row.get(0),
-        )
+        )?
+        .query_row(params![exec_id.to_string()], |row| row.get(0))
         .optional()?;
     Ok(last.map(|json| serde_json::from_str(&json)).transpose()?)
 }
@@ -789,10 +863,16 @@ fn last_event(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<Option<Wo
 ///
 /// It keeps command application idempotent. A fresh `ScheduleActivity` mints a new
 /// id, so this matches only on a defensive re-application of the same cycle.
-pub fn history_has_activity_scheduled(events: &[WorkflowEvent], activity_id: &str) -> bool {
+///
+/// The ids are compared as values. A text form of each recorded id would
+/// cost one allocation for each event of the history, on each schedule.
+pub fn history_has_activity_scheduled(
+    events: &[WorkflowEvent],
+    activity_id: autumn_harvest::ActivityExecId,
+) -> bool {
     events.iter().any(|e| {
         matches!(e, WorkflowEvent::ActivityScheduled { activity_id: id, .. }
-            if id.to_string() == activity_id)
+            if *id == activity_id)
     })
 }
 
@@ -844,11 +924,17 @@ pub fn record_attempt(
         Ok(v) => (1_i64, serde_json::to_string(v)?),
         Err(e) => (0_i64, e.clone()),
     };
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO harvest_activity_attempts (exec_id, name, attempt, ok, detail) \
          VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![exec_id.to_string(), name, i64::from(attempt), ok, detail],
-    )?;
+    )?
+    .execute(params![
+        exec_id.to_string(),
+        name,
+        i64::from(attempt),
+        ok,
+        detail
+    ])?;
     Ok(())
 }
 
@@ -857,7 +943,7 @@ pub fn load_attempts(
     exec_id: ExecutionId,
     name: &str,
 ) -> SqliteResult<Vec<ActivityAttempt>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT attempt, ok, detail FROM harvest_activity_attempts \
          WHERE exec_id = ?1 AND name = ?2 ORDER BY attempt_seq",
     )?;
@@ -906,18 +992,18 @@ pub fn stage_signal(
     received_at: i64,
     idempotency_key: Option<&str>,
 ) -> SqliteResult<()> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO harvest_signals \
          (exec_id, name, payload_json, delivered, received_at, idempotency_key) \
          VALUES (?1, ?2, ?3, 0, ?4, ?5)",
-        params![
-            exec_id.to_string(),
-            name,
-            serde_json::to_string(payload)?,
-            received_at,
-            idempotency_key
-        ],
-    )?;
+    )?
+    .execute(params![
+        exec_id.to_string(),
+        name,
+        serde_json::to_string(payload)?,
+        received_at,
+        idempotency_key
+    ])?;
     Ok(())
 }
 
@@ -928,12 +1014,12 @@ pub fn stage_signal(
 ///
 /// Returns a persistence error if the query fails.
 pub fn has_signal_key(conn: &Connection, exec_id: ExecutionId, key: &str) -> SqliteResult<bool> {
-    Ok(conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM harvest_signals \
+    Ok(conn
+        .prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM harvest_signals \
          WHERE exec_id = ?1 AND idempotency_key = ?2)",
-        params![exec_id.to_string(), key],
-        |r| r.get(0),
-    )?)
+        )?
+        .query_row(params![exec_id.to_string(), key], |r| r.get(0))?)
 }
 
 /// The newest run of a `(workflow_name, workflow_id)` chain that holds a
@@ -953,14 +1039,15 @@ pub fn find_signal_key_in_chain(
     workflow_id: &str,
     key: &str,
 ) -> SqliteResult<Option<ExecutionId>> {
-    conn.query_row(
+    conn.prepare_cached(
         "SELECT s.exec_id FROM harvest_executions AS e \
          JOIN harvest_signals AS s ON s.exec_id = e.exec_id \
          WHERE e.workflow_name = ?1 AND e.workflow_id = ?2 AND s.idempotency_key = ?3 \
          ORDER BY s.signal_seq DESC LIMIT 1",
-        params![workflow_name, workflow_id, key],
-        |r| r.get::<_, String>(0),
-    )
+    )?
+    .query_row(params![workflow_name, workflow_id, key], |r| {
+        r.get::<_, String>(0)
+    })
     .optional()?
     .map(|id| id.parse().map_err(|_| SqliteError::corrupt("exec_id")))
     .transpose()
@@ -982,13 +1069,14 @@ pub fn resolve_run_by_key(
     workflow_id: &str,
 ) -> SqliteResult<Option<(ExecutionId, String)>> {
     let row = conn
-        .query_row(
+        .prepare_cached(
             "SELECT exec_id, state FROM harvest_executions \
              WHERE workflow_name = ?1 AND workflow_id = ?2 \
              ORDER BY state = 'RUNNING' DESC, rowid DESC LIMIT 1",
-            params![workflow_name, workflow_id],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-        )
+        )?
+        .query_row(params![workflow_name, workflow_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
         .optional()?;
     row.map(|(id, state)| {
         id.parse()
@@ -1066,10 +1154,8 @@ pub fn for_each_pending_signal(
 /// Mark a staged signal delivered (consumed). Call only after the matching
 /// `SignalReceived` has been appended in the same transaction.
 pub fn mark_signal_delivered(conn: &Connection, seq: i64) -> SqliteResult<()> {
-    conn.execute(
-        "UPDATE harvest_signals SET delivered = 1 WHERE signal_seq = ?1",
-        params![seq],
-    )?;
+    conn.prepare_cached("UPDATE harvest_signals SET delivered = 1 WHERE signal_seq = ?1")?
+        .execute(params![seq])?;
     Ok(())
 }
 
@@ -1114,5 +1200,68 @@ mod tests {
             pending_timer_arms(&[started(), cancelled(), started()], "x"),
             1
         );
+    }
+
+    /// The one cycle read returns what the separate lookups return.
+    #[test]
+    fn the_cycle_row_matches_the_separate_lookups() {
+        use autumn_harvest::ExecutionId;
+        use serde_json::json;
+
+        use super::RunConfig;
+        use crate::error::SqliteError;
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::schema::SCHEMA).unwrap();
+        let parent = ExecutionId::new();
+        let child = ExecutionId::new();
+        let config = RunConfig {
+            execution_timeout_ms: Some(5_000),
+            deadline_at: Some(9_000),
+            start_at: Some(4_000),
+            attempt: 2,
+            retry_policy_json: Some("{}".to_string()),
+            retry_of: Some(parent),
+            local_retry_at: None,
+        };
+        super::insert_execution(&conn, parent, "wf", "order-1", &json!({"n": 1})).unwrap();
+        super::insert_child_execution(&conn, child, "kid", &json!([2]), (parent, None), &config)
+            .unwrap();
+        super::append_event(&conn, child, &started()).unwrap();
+        super::request_cancel(&conn, child, "stop").unwrap();
+        super::set_local_retry_at(&conn, child, 7_000).unwrap();
+
+        for exec in [parent, child] {
+            let row = super::cycle_row(&conn, exec).unwrap();
+            assert_eq!(row.state, super::execution_state(&conn, exec).unwrap());
+            assert_eq!(
+                format!("{:?}", row.config),
+                format!("{:?}", super::run_config(&conn, exec).unwrap()),
+            );
+            assert_eq!(row.cancel, super::cancel_request(&conn, exec).unwrap());
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&row.input_json).unwrap(),
+                super::execution_input(&conn, exec).unwrap(),
+            );
+            assert_eq!(
+                row.workflow_name,
+                super::workflow_name_of(&conn, exec).unwrap()
+            );
+            assert_eq!(row.workflow_id, super::workflow_id_of(&conn, exec).unwrap());
+            assert_eq!(
+                row.parent,
+                super::parent_link(&conn, exec).unwrap().map(|(id, _)| id),
+            );
+        }
+        let child_row = super::cycle_row(&conn, child).unwrap();
+        assert_eq!(child_row.cancel, Some(("stop".to_string(), 1)));
+        assert_eq!(child_row.parent, Some(parent));
+        assert_eq!(child_row.config.local_retry_at, Some(7_000));
+
+        let unknown = ExecutionId::new();
+        assert!(matches!(
+            super::cycle_row(&conn, unknown),
+            Err(SqliteError::ExecutionNotFound(id)) if id == unknown
+        ));
     }
 }

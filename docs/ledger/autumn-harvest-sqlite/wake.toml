@@ -8,3 +8,4 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_executions", "harvest_schedules", "harvest_tasks", "harvest_timers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/wake.md"

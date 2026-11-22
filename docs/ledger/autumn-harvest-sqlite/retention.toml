@@ -6,6 +6,7 @@ backend = ["sqlite"]
 kind = ["read", "write"]
 tables = ["harvest_events", "harvest_tasks", "harvest_timers", "harvest_signals", "harvest_activity_attempts", "harvest_llm_ledger", "harvest_workflow_logs", "harvest_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/retention.md"
 
 ["purge_scope"]
 driver = "per_tick"
@@ -13,3 +14,4 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/retention.md"

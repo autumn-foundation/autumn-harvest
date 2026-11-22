@@ -2970,6 +2970,40 @@ enum PendingCancel {
     BehindOpenBlock,
 }
 
+/// The new events of a resident cycle (issue #1798). See
+/// [`WorkflowContext::begin_resident_cycle`].
+#[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))] // Resident paths need the worker or the test harness.
+pub(crate) enum ResidentDelta<'a> {
+    /// The matcher keeps a copy of each event. The workflow owns its
+    /// history.
+    #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
+    // Only the test harness resumes a workflow that owns its history.
+    Copied(&'a [WorkflowEvent]),
+    /// The matcher takes the events. Its driver lent it the history, and
+    /// gets these events back with it.
+    Lent(Vec<WorkflowEvent>),
+}
+
+#[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))] // As the enum.
+impl ResidentDelta<'_> {
+    /// The events, in history order.
+    pub(crate) fn events(&self) -> &[WorkflowEvent] {
+        match self {
+            Self::Copied(events) => events,
+            Self::Lent(events) => events,
+        }
+    }
+
+    /// The lent events, for a cycle that did not begin. A copied delta has
+    /// none to give back.
+    pub(crate) fn into_lent(self) -> Vec<WorkflowEvent> {
+        match self {
+            Self::Copied(_) => Vec::new(),
+            Self::Lent(events) => events,
+        }
+    }
+}
+
 /// Context passed to every workflow function.
 ///
 /// In **replay mode** (resuming from Postgres history): commands are matched
@@ -8346,7 +8380,8 @@ impl WorkflowContext {
     /// It also appends `delta` to the matcher as consumed events. The replay
     /// position, the history length and the history scans then match a cold
     /// replay. The call ordinals and sequence counters keep their values. A
-    /// replay from the top counts up to the same values.
+    /// replay from the top counts up to the same values. A lent matcher
+    /// takes the events of [`ResidentDelta::Lent`] and makes no copy.
     ///
     /// Last, it queues `waits`: the commands that park unresolved activities
     /// of a join again (issue #2008). A cold replay emits the same commands.
@@ -8358,7 +8393,7 @@ impl WorkflowContext {
     #[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))] // Resident paths need the worker or the test harness.
     pub(crate) fn begin_resident_cycle(
         &self,
-        delta: &[WorkflowEvent],
+        delta: ResidentDelta<'_>,
         waits: Vec<WorkflowCommand>,
     ) {
         self.set_suspending(false);
@@ -8368,14 +8403,17 @@ impl WorkflowContext {
             .store(0, std::sync::atomic::Ordering::Relaxed);
         self.durable_progress_queued
             .store(0, std::sync::atomic::Ordering::Relaxed);
-        self.matcher
-            .lock()
-            .expect("matcher lock poisoned")
-            .append_consumed(delta);
         crate::cancellation_scope::drop_resolved_members(
             &mut self.live_scopes.lock().expect("live scopes lock poisoned"),
-            delta,
+            delta.events(),
         );
+        {
+            let mut matcher = self.matcher.lock().expect("matcher lock poisoned");
+            match delta {
+                ResidentDelta::Copied(events) => matcher.append_consumed(events),
+                ResidentDelta::Lent(events) => matcher.append_consumed_owned(events),
+            }
+        }
         // The last cycle persisted its commands, so no undo entry applies now.
         self.timer_undo
             .lock()
@@ -15959,6 +15997,56 @@ impl WorkflowContext {
     /// The number of history events that this cycle can see.
     pub(crate) fn history_len(&self) -> usize {
         self.matcher.lock().expect("matcher lock poisoned").len()
+    }
+
+    /// Keep the replay history whole, so that
+    /// [`reclaim_history`](Self::reclaim_history) can return it. See
+    /// [`HistoryMatcher::lend_events`].
+    pub(crate) fn lend_history(&self) {
+        self.matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .lend_events();
+    }
+
+    /// Take the replay history back after the cycle. See
+    /// [`HistoryMatcher::reclaim_events`].
+    ///
+    /// The matcher holds no event after this call, so call it only when the
+    /// cycle is over and its handler future is gone.
+    pub(crate) fn reclaim_history(&self) -> Option<Vec<WorkflowEvent>> {
+        self.matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .reclaim_events()
+    }
+
+    /// True while the matcher holds none of its events. See
+    /// [`HistoryMatcher::events_released`].
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn history_is_released(&self) -> bool {
+        self.matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .events_released()
+    }
+
+    /// Lend the history again to a resident context that gave it back. See
+    /// [`HistoryMatcher::restore_events`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `history` unchanged when it is not the history that the
+    /// context gave back.
+    #[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))] // Resident paths need the worker or the test harness.
+    pub(crate) fn restore_history(
+        &self,
+        history: Vec<WorkflowEvent>,
+    ) -> Result<(), Vec<WorkflowEvent>> {
+        self.matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .restore_events(history)
     }
 
     /// Run `f` while the matcher sees only the first `horizon` events.
@@ -29181,7 +29269,7 @@ mod tests {
         ctx.publish_durable_progress(serde_json::json!(0))
             .expect("cycle 1");
         let _ = ctx.drain_commands();
-        ctx.begin_resident_cycle(&[], Vec::new());
+        ctx.begin_resident_cycle(ResidentDelta::Copied(&[]), Vec::new());
         ctx.publish_durable_progress(serde_json::json!(1))
             .expect("cycle 2");
         assert_eq!(
@@ -29189,7 +29277,7 @@ mod tests {
             vec![(1, serde_json::json!(1))],
             "a resident cycle does not re-run the body, so the counter continues"
         );
-        ctx.begin_resident_cycle(&[], Vec::new());
+        ctx.begin_resident_cycle(ResidentDelta::Copied(&[]), Vec::new());
         assert_eq!(
             ctx.durable_progress_queued
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -29203,7 +29291,7 @@ mod tests {
         let ctx = WorkflowContext::new_test();
         let (result_tx, _result_rx) = tokio::sync::oneshot::channel();
         ctx.begin_resident_cycle(
-            &[],
+            ResidentDelta::Copied(&[]),
             vec![WorkflowCommand::WaitForActivity {
                 activity_id: ActivityExecId::new(),
                 result_tx,

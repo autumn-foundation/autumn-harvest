@@ -1,5 +1,10 @@
 # `SqliteRuntime` decision-cycle drive: full-history reload dominates cost, no local fix clears the floor
 
+> **Later work.** The warm history that this page recommends has shipped,
+> with three more changes to this path. See
+> [`performance-sqlite-hot-path.md`](performance-sqlite-hot-path.md). The
+> numbers below describe the code before those changes.
+
 **Outcome: findings only — no production code changed.** This pass built the
 first CPU/allocation-count profiling harness for `autumn-harvest-sqlite`
 (previously zero benchmark/profiling infrastructure existed for this crate),

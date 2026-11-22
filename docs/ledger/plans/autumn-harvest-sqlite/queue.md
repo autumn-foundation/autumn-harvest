@@ -32,7 +32,7 @@ Statements: 1. Backend: SQLite. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `UPDATE harvest_tasks SET state = 'CANCELLED' WHERE exec_id = ?1 AND activity_id = ?2 AND state IN...` | `harvest_tasks`: Search on `idx_harvest_tasks_exec` |
+| 1 | `UPDATE harvest_tasks SET state = 'CANCELLED' WHERE exec_id = ?1 AND activity_id = ?2 AND state IN...` | `harvest_tasks`: Search on `idx_harvest_tasks_exec_state_seq` |
 
 ## `claim_next_ready_task_tx`
 
@@ -40,7 +40,7 @@ Statements: 2. Backend: SQLite. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT task_id, activity_id, name, input_json, attempt, max_attempts, retry_policy_json, start_to...` | `harvest_tasks`: Search on `idx_harvest_tasks_exec` |
+| 1 | `SELECT task_id, activity_id, name, input_json, attempt, max_attempts, retry_policy_json, start_to...` | `harvest_tasks`: Search on `idx_harvest_tasks_exec_state_seq` |
 | 2 | `UPDATE harvest_tasks SET state = 'RUNNING' WHERE task_id = ?1` | `harvest_tasks`: Search on `sqlite_autoindex_harvest_tasks_1` |
 
 ## `delete_pending_tasks_for_execution`
@@ -49,7 +49,7 @@ Statements: 1. Backend: SQLite. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `DELETE FROM harvest_tasks WHERE exec_id = ?1 AND state = 'PENDING'` | `harvest_tasks`: Search on `idx_harvest_tasks_exec` |
+| 1 | `DELETE FROM harvest_tasks WHERE exec_id = ?1 AND state = 'PENDING'` | `harvest_tasks`: Search on `idx_harvest_tasks_exec_state_seq` |
 
 ## `delete_pending_timer`
 
@@ -129,7 +129,7 @@ Statements: 1. Backend: SQLite. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT EXISTS(SELECT 1 FROM harvest_tasks WHERE exec_id = ?1 AND state = 'PENDING')` | `harvest_tasks`: Search on `idx_harvest_tasks_exec` |
+| 1 | `SELECT EXISTS(SELECT 1 FROM harvest_tasks WHERE exec_id = ?1 AND state = 'PENDING')` | `harvest_tasks`: Search on `idx_harvest_tasks_exec_state_seq` |
 
 ## `has_unfired_timer`
 
@@ -185,7 +185,7 @@ Statements: 1. Backend: SQLite. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT activity_id, name, attempt FROM harvest_tasks WHERE exec_id = ?1 AND state = 'PENDING' ORD...` | `harvest_tasks`: Search on `idx_harvest_tasks_exec` |
+| 1 | `SELECT activity_id, name, attempt FROM harvest_tasks WHERE exec_id = ?1 AND state = 'PENDING' ORD...` | `harvest_tasks`: Search on `idx_harvest_tasks_exec_state_seq` |
 
 ## `reclaim_orphaned_running`
 
@@ -201,7 +201,7 @@ Statements: 1. Backend: SQLite. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `UPDATE harvest_tasks SET state = 'PENDING' WHERE state = 'RUNNING' AND exec_id = ?1` | `harvest_tasks`: Search on `idx_harvest_tasks_exec` |
+| 1 | `UPDATE harvest_tasks SET state = 'PENDING' WHERE state = 'RUNNING' AND exec_id = ?1` | `harvest_tasks`: Search on `idx_harvest_tasks_exec_state_seq` |
 
 ## `record_heartbeat`
 

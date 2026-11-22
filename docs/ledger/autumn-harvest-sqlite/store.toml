@@ -16,6 +16,14 @@ tables = ["harvest_executions"]
 measured = "unmeasured"
 plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
 
+["cycle_row"]
+driver = "per_task"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_executions"]
+measured = "docs/performance-sqlite-hot-path.md"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"
+
 ["copy_inherited_fields"]
 driver = "per_task"
 backend = ["sqlite"]

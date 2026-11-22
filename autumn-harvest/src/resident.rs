@@ -82,7 +82,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use tokio::sync::oneshot;
 
-use crate::context::{WorkflowCommand, WorkflowContext};
+use crate::context::{ResidentDelta, WorkflowCommand, WorkflowContext};
 use crate::event::{SideEffectKind, WorkflowEvent};
 use crate::executor::{DriveResult, OwnedHandlerFuture, WorkflowExecuteSpanMeta, WorkflowOutcome};
 use crate::info::WorkflowHandlerFn;
@@ -91,8 +91,10 @@ use crate::types::{ActivityExecId, ExecutionId, TimerId};
 
 /// Why a resident workflow did not resume (issue #1798).
 ///
-/// A decline is never an error. The worker drops the resident state and runs
-/// a cold replay, which is always correct.
+/// A decline is not an error, with one exception. The worker drops the
+/// resident state and runs a cold replay, which is always correct.
+/// [`Self::HistoryNotReturned`] is the exception: the worker then has no
+/// whole history to replay, so it fails the task.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ResumeDeclined {
@@ -120,6 +122,12 @@ pub enum ResumeDeclined {
     /// (issue #2008). A branch ran a command, failed or dropped a sibling.
     /// A cold replay can read that history another way.
     SiblingStillParked,
+    /// The workflow shares the history of its driver, and the driver lent
+    /// none, or one that the workflow did not give back.
+    HistoryMismatch,
+    /// A drive did not give the lent history back. The driver cannot go on
+    /// with the history that it holds.
+    HistoryNotReturned,
 }
 
 /// The resident state of one suspension (issue #1798, issue #2007).
@@ -677,6 +685,10 @@ impl ResidentWorkflow {
     /// order (issue #2008). A cold replay matches results in that order. A
     /// branch that runs on after an early result thus faces the check of its
     /// own step. Each step but the last must only wait.
+    ///
+    /// Test and bench entry point, for a workflow that owns its history. The
+    /// worker uses [`Self::resume_lending_with`].
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) async fn resume_with(
         self,
         delta: &[WorkflowEvent],
@@ -686,21 +698,18 @@ impl ResidentWorkflow {
         if key.is_some_and(|key| *key != self.key) {
             return Err(ResumeDeclined::KeyChanged);
         }
-        let mut ends: Vec<usize> = self.resolutions(delta)?.into_iter().flatten().collect();
-        // A redundant wake runs one step that only waits again. A lone timer
-        // or signal cannot wait again, so the step declines it.
-        if ends.is_empty() {
-            return self.step(delta, span_meta).await;
+        // This workflow holds no history of its own. Only
+        // [`Self::resume_lending_with`] can resume it.
+        if self.ctx.history_is_released() {
+            return Err(ResumeDeclined::HistoryMismatch);
         }
-        ends.sort_unstable();
-        // The last step also takes the progress events after the last result.
-        if let Some(last) = ends.last_mut() {
-            *last = delta.len().saturating_sub(1);
-        }
+        let ends = self.step_ends(delta)?;
         let mut current = self;
         let mut start = 0;
         for (step, end) in ends.iter().enumerate() {
-            let drive = current.step(&delta[start..=*end], span_meta).await?;
+            let delta = ResidentDelta::Copied(&delta[start..*end]);
+            let (_, drive) = current.step(delta, span_meta).await;
+            let drive = drive?;
             if step + 1 == ends.len() {
                 return Ok(drive);
             }
@@ -708,9 +717,130 @@ impl ResidentWorkflow {
                 .resident
                 .into_workflow()
                 .ok_or(ResumeDeclined::SiblingStillParked)?;
-            start = end + 1;
+            start = *end;
         }
         Err(ResumeDeclined::NoResolution)
+    }
+
+    /// Where each step of a resume ends in `delta`: the index after its last
+    /// event. A delta with several results runs one step per result.
+    ///
+    /// A redundant wake resolves nothing and runs one step over the whole
+    /// delta. That step only waits again. A lone timer or signal cannot wait
+    /// again, so the step declines it.
+    fn step_ends(&self, delta: &[WorkflowEvent]) -> Result<Vec<usize>, ResumeDeclined> {
+        let mut ends: Vec<usize> = self
+            .resolutions(delta)?
+            .into_iter()
+            .flatten()
+            .map(|at| at + 1)
+            .collect();
+        ends.sort_unstable();
+        // The last step also takes the progress events after the last result.
+        match ends.last_mut() {
+            Some(end) => *end = delta.len(),
+            None => ends.push(delta.len()),
+        }
+        Ok(ends)
+    }
+
+    /// Resumes this workflow with the events written since it suspended. The
+    /// workflow shares the history of its driver.
+    ///
+    /// `key` is the key of this decision. `None` skips the key check.
+    ///
+    /// A delta with several results runs as one step per result, in history
+    /// order (issue #2008). A cold replay matches results in that order. A
+    /// branch that runs on after an early result thus faces the check of its
+    /// own step. Each step but the last must only wait.
+    ///
+    /// A driver that lends its history to each cold drive gets it back, and
+    /// the parked workflow then holds no events. This call lends the history
+    /// again. The events before `delta_start` are the ones that the workflow
+    /// gave back. The events from `delta_start` are the delta. Each step
+    /// takes its events with no copy. On return, `history` holds every event
+    /// again, in order, with a resumed workflow or with a decline.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason of the decline. After
+    /// [`ResumeDeclined::HistoryNotReturned`] alone, `history` is not whole,
+    /// and the driver must load it again.
+    pub(crate) async fn resume_lending_with(
+        self,
+        history: &mut Vec<WorkflowEvent>,
+        delta_start: usize,
+        key: Option<&ResidentKey>,
+        span_meta: Option<&WorkflowExecuteSpanMeta>,
+    ) -> Result<DriveResult, ResumeDeclined> {
+        if key.is_some_and(|key| *key != self.key) {
+            return Err(ResumeDeclined::KeyChanged);
+        }
+        let Some(delta) = history.get(delta_start..) else {
+            return Err(ResumeDeclined::HistoryMismatch);
+        };
+        let ends = self.step_ends(delta)?;
+        // Cut the delta into the events of each step, last step first, so
+        // that each event moves once.
+        let mut steps: Vec<Vec<WorkflowEvent>> = Vec::with_capacity(ends.len());
+        let starts: Vec<usize> = std::iter::once(0)
+            .chain(ends.iter().copied())
+            .take(ends.len())
+            .collect();
+        for start in starts.into_iter().rev() {
+            steps.push(history.split_off(delta_start + start));
+        }
+        steps.reverse();
+        // `history` now holds the events that the workflow gave back.
+        let ctx = Arc::clone(&self.ctx);
+        let mut held = Some(std::mem::take(history));
+        let mut current = Some(self);
+        let mut result = Err(ResumeDeclined::NoResolution);
+        let last_step = steps.len().saturating_sub(1);
+        for (index, step) in steps.iter_mut().enumerate() {
+            let Some(workflow) = current.take() else {
+                break;
+            };
+            let Some(events) = held.take() else {
+                break;
+            };
+            if let Err(events) = ctx.restore_history(events) {
+                held = Some(events);
+                result = Err(ResumeDeclined::HistoryMismatch);
+                break;
+            }
+            let (returned, drive) = workflow
+                .step(ResidentDelta::Lent(std::mem::take(step)), span_meta)
+                .await;
+            // A step that declined before its drive leaves its events here.
+            let (unused, returned) = returned;
+            *step = unused;
+            held = returned.or_else(|| ctx.reclaim_history());
+            match drive {
+                Ok(drive) if index == last_step => result = Ok(drive),
+                Ok(drive) => {
+                    let Some(workflow) = drive.resident.into_workflow() else {
+                        result = Err(ResumeDeclined::SiblingStillParked);
+                        break;
+                    };
+                    current = Some(workflow);
+                }
+                Err(declined) => {
+                    result = Err(declined);
+                    break;
+                }
+            }
+        }
+        // Put the history together again: what the workflow holds, then the
+        // events of each step that did not run.
+        let Some(mut whole) = held else {
+            return Err(ResumeDeclined::HistoryNotReturned);
+        };
+        for step in steps {
+            whole.extend(step);
+        }
+        *history = whole;
+        result
     }
 
     /// Runs one cycle that delivers the results in `delta`.
@@ -718,12 +848,23 @@ impl ResidentWorkflow {
     /// Each parked activity with no result waits again. Such a cycle runs
     /// as a speculation: it must only wait, and it must not read the replay
     /// position. A cold replay can read either one another way.
+    ///
+    /// Returns the events of a lent delta too, so that no path drops them.
+    /// The first list holds the events that the step did not take, because
+    /// it declined before its cycle began. The second holds the whole lent
+    /// history after the drive. A copied delta returns neither.
     async fn step(
         self,
-        delta: &[WorkflowEvent],
+        delta: ResidentDelta<'_>,
         span_meta: Option<&WorkflowExecuteSpanMeta>,
-    ) -> Result<DriveResult, ResumeDeclined> {
-        let resolved = self.resolutions(delta)?;
+    ) -> (
+        (Vec<WorkflowEvent>, Option<Vec<WorkflowEvent>>),
+        Result<DriveResult, ResumeDeclined>,
+    ) {
+        let resolved = match self.resolutions(delta.events()) {
+            Ok(resolved) => resolved,
+            Err(declined) => return ((delta.into_lent(), None), Err(declined)),
+        };
         let Self {
             future,
             parked,
@@ -735,12 +876,16 @@ impl ResidentWorkflow {
         let mut reparked = Vec::new();
         for (parked, at) in parked.into_iter().zip(resolved) {
             if let Some(at) = at {
-                parked.deliver(&delta[at])?;
+                if let Err(declined) = parked.deliver(&delta.events()[at]) {
+                    return ((delta.into_lent(), None), Err(declined));
+                }
                 continue;
             }
             // Only an activity can wait again. A lone timer or signal that
             // a redundant wake does not resolve declines here.
-            let wait = parked.into_wait().ok_or(ResumeDeclined::NoResolution)?;
+            let Some(wait) = parked.into_wait() else {
+                return ((delta.into_lent(), None), Err(ResumeDeclined::NoResolution));
+            };
             if let WorkflowCommand::WaitForActivity { activity_id, .. } = &wait {
                 reparked.push(*activity_id);
             }
@@ -748,13 +893,17 @@ impl ResidentWorkflow {
         }
         ctx.begin_resident_cycle(delta, waits);
         let speculation = Arc::clone(&ctx);
-        let drive = crate::executor::drive_resumed(ctx, future, span_meta, key).await;
+        let mut drive = crate::executor::drive_resumed(ctx, future, span_meta, key).await;
+        let returned = drive.history.take();
         let read_position = speculation.end_speculation();
         // Dropping the drive drops the future. The worker then replays cold.
         if !reparked.is_empty() && (read_position || !only_waits_again(&drive, &reparked)) {
-            return Err(ResumeDeclined::SiblingStillParked);
+            return (
+                (Vec::new(), returned),
+                Err(ResumeDeclined::SiblingStillParked),
+            );
         }
-        Ok(drive)
+        ((Vec::new(), returned), Ok(drive))
     }
 }
 
@@ -771,6 +920,31 @@ pub async fn start(
 ) -> (WorkflowOutcome, Option<ResidentWorkflow>) {
     let (outcome, residency) = start_residency(exec_id, history, handler, input).await;
     (outcome, residency.into_workflow())
+}
+
+/// [`start`], with the history lent to the context as the worker lends it.
+///
+/// Returns the history too, with a parked workflow or with none. A workflow
+/// that stays resident then holds no events, so the run has one history.
+/// Resume it with [`ResidentWorkflow::resume_lending`], which lends the
+/// history again. The history is `None` only when the context could not give
+/// it back whole.
+#[cfg(any(test, feature = "testing"))]
+pub async fn start_lending(
+    exec_id: ExecutionId,
+    history: Vec<WorkflowEvent>,
+    handler: WorkflowHandlerFn,
+    input: Value,
+) -> (
+    WorkflowOutcome,
+    Option<ResidentWorkflow>,
+    Option<Vec<WorkflowEvent>>,
+) {
+    let ctx = crate::executor::default_task_context(exec_id, history);
+    ctx.lend_history();
+    let key = ResidentKey::new(handler, None, &HashMap::new());
+    let drive = crate::executor::drive_workflow_keep(ctx, handler, input, None, Some(key)).await;
+    (drive.outcome, drive.resident.into_workflow(), drive.history)
 }
 
 /// [`start`] that also returns why the suspension did not stay resident.
@@ -800,6 +974,29 @@ impl ResidentWorkflow {
         delta: &[WorkflowEvent],
     ) -> Result<(WorkflowOutcome, Option<Self>), ResumeDeclined> {
         let drive = self.resume_with(delta, None, None).await?;
+        Ok((drive.outcome, drive.resident.into_workflow()))
+    }
+
+    /// [`Self::resume`] for a workflow from [`start_lending`], which shares
+    /// the history of its caller.
+    ///
+    /// `history` is the whole history. Its events before `delta_start` are
+    /// the ones that the last drive returned, and the rest were appended
+    /// since. The call lends them all and gives them all back in `history`,
+    /// with a resumed workflow or with a decline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResumeDeclined`] as [`Self::resume`] does. It also declines
+    /// a history that the workflow did not give back.
+    pub async fn resume_lending(
+        self,
+        history: &mut Vec<WorkflowEvent>,
+        delta_start: usize,
+    ) -> Result<(WorkflowOutcome, Option<Self>), ResumeDeclined> {
+        let drive = self
+            .resume_lending_with(history, delta_start, None, None)
+            .await?;
         Ok((drive.outcome, drive.resident.into_workflow()))
     }
 }
@@ -991,14 +1188,82 @@ mod tests {
         panic!("the run did not finish in 32 decisions");
     }
 
+    /// The stored form of each event. `WorkflowEvent` has no `PartialEq`.
+    fn stored_form(events: &[WorkflowEvent]) -> Vec<Value> {
+        events
+            .iter()
+            .map(|event| serde_json::to_value(event).expect("an event serializes"))
+            .collect()
+    }
+
+    /// A cold start that lends its history to the context, as the worker
+    /// does. The drive must give the history back unchanged, with a parked
+    /// workflow or with none.
+    async fn start_lent(
+        exec_id: ExecutionId,
+        history: Vec<WorkflowEvent>,
+        handler: WorkflowHandlerFn,
+        input: Value,
+    ) -> (WorkflowOutcome, Option<ResidentWorkflow>) {
+        let lent = stored_form(&history);
+        let (outcome, resident, returned) = start_lending(exec_id, history, handler, input).await;
+        let returned = returned.expect("a cold drive returns its history");
+        assert_eq!(
+            stored_form(&returned),
+            lent,
+            "the history comes back as lent"
+        );
+        (outcome, resident)
+    }
+
+    /// A warm step that lends the whole history to the workflow, as the
+    /// worker does. The step must give every event back in order, with a
+    /// resumed workflow or with a decline.
+    async fn resume_lent(
+        live: ResidentWorkflow,
+        history: &[WorkflowEvent],
+        delta_start: usize,
+    ) -> Option<(WorkflowOutcome, Option<ResidentWorkflow>)> {
+        let mut lent = history.to_vec();
+        let step = live.resume_lending(&mut lent, delta_start).await;
+        assert_eq!(
+            stored_form(&lent),
+            stored_form(history),
+            "a warm step returns the history as lent: {:?}",
+            step.as_ref().err()
+        );
+        step.ok()
+    }
+
+    /// A cold start that gives the context a history of its own, or lends it.
+    async fn cold_start(
+        lend: bool,
+        exec_id: ExecutionId,
+        history: Vec<WorkflowEvent>,
+        handler: WorkflowHandlerFn,
+        input: Value,
+    ) -> (WorkflowOutcome, Option<ResidentWorkflow>) {
+        if lend {
+            start_lent(exec_id, history, handler, input).await
+        } else {
+            start(exec_id, history, handler, input).await
+        }
+    }
+
     /// Drives a run that resumes the resident workflow when it can.
     async fn drive_warm(handler: WorkflowHandlerFn, input: Value) -> Trace {
+        drive_warm_from(false, handler, input).await
+    }
+
+    /// [`drive_warm`], with each cold start lending its history when `lend`
+    /// is set.
+    async fn drive_warm_from(lend: bool, handler: WorkflowHandlerFn, input: Value) -> Trace {
         let exec_id = ExecutionId::new();
         let mut history = vec![started(input.clone())];
         let mut shapes = Vec::new();
         let mut resumes = 0;
         let (mut outcome, mut resident) =
-            start(exec_id, history.clone(), handler, input.clone()).await;
+            cold_start(lend, exec_id, history.clone(), handler, input.clone()).await;
         for _ in 0..32 {
             shapes.push(outcome_shape(&outcome));
             let WorkflowOutcome::Suspended { commands } = &outcome else {
@@ -1013,9 +1278,9 @@ mod tests {
             history.extend(own_events(commands));
             history.push(decision_boundary());
             history.push(resolution(commands));
-            let delta = &history[start_len..];
             let warm_step = match resident.take() {
-                Some(live) => live.resume(delta).await.ok(),
+                Some(live) if lend => resume_lent(live, &history, start_len).await,
+                Some(live) => live.resume(&history[start_len..]).await.ok(),
                 None => None,
             };
             (outcome, resident) = match warm_step {
@@ -1023,7 +1288,7 @@ mod tests {
                     resumes += 1;
                     next
                 }
-                None => start(exec_id, history.clone(), handler, input.clone()).await,
+                None => cold_start(lend, exec_id, history.clone(), handler, input.clone()).await,
             };
         }
         panic!("the run did not finish in 32 decisions");
@@ -1031,10 +1296,17 @@ mod tests {
 
     /// Asserts that the warm run decided like the cold run, and that its
     /// history replays cold to the same end.
+    ///
+    /// A warm run that lends its history to each drive must decide the same,
+    /// and resume as often. Its parked workflow holds no events between two
+    /// decisions.
     async fn assert_warm_matches_cold(handler: WorkflowHandlerFn, input: Value) -> Trace {
         let cold = drive_cold(handler, input.clone()).await;
         let warm = drive_warm(handler, input.clone()).await;
         assert_eq!(warm.shapes, cold.shapes, "warm decisions must equal cold");
+        let lent = drive_warm_from(true, handler, input.clone()).await;
+        assert_eq!(lent.shapes, cold.shapes, "lent decisions must equal cold");
+        assert_eq!(lent.resumes, warm.resumes, "a lent run resumes as often");
         let replayed =
             crate::executor::run_workflow(ExecutionId::new(), warm.history.clone(), handler, input)
                 .await;
@@ -1766,6 +2038,129 @@ mod tests {
         );
     }
 
+    /// [`suspended_activity`], with the history lent, as the worker lends
+    /// it. Returns the history after the decision wrote its own events. The
+    /// delta starts at index 1.
+    async fn suspended_activity_lent() -> (ResidentWorkflow, Vec<WorkflowEvent>, ActivityExecId) {
+        let (outcome, resident, returned) = start_lending(
+            ExecutionId::new(),
+            vec![started(Value::Null)],
+            one_activity_workflow,
+            Value::Null,
+        )
+        .await;
+        let WorkflowOutcome::Suspended { commands } = outcome else {
+            panic!("the first decision must suspend");
+        };
+        let id = commands
+            .iter()
+            .find_map(|c| match c {
+                WorkflowCommand::ScheduleActivity { activity_id, .. } => Some(*activity_id),
+                _ => None,
+            })
+            .expect("the decision schedules an activity");
+        let mut history = returned.expect("a cold drive returns its history");
+        assert_eq!(history.len(), 1, "the drive returns the event that it got");
+        history.extend(own_events(&commands));
+        (
+            resident.expect("an activity suspension is resident"),
+            history,
+            id,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_workflow_that_shares_its_history_declines_a_resume_with_none() {
+        // The parked workflow holds no events. A resume that lends no
+        // history would replay against an empty one.
+        let (resident, history, id) = suspended_activity_lent().await;
+        let mut delta = history[1..].to_vec();
+        delta.extend([decision_boundary(), completed(id)]);
+        assert_eq!(
+            resident.resume(&delta).await.err(),
+            Some(ResumeDeclined::HistoryMismatch)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lent_resume_declines_a_history_that_the_workflow_did_not_give_back() {
+        // One event more before the delta than the workflow gave back.
+        let (resident, history, id) = suspended_activity_lent().await;
+        let mut longer = vec![started(Value::Null)];
+        longer.extend(history);
+        longer.extend([decision_boundary(), completed(id)]);
+        let lent = stored_form(&longer);
+        assert_eq!(
+            resident.resume_lending(&mut longer, 2).await.err(),
+            Some(ResumeDeclined::HistoryMismatch)
+        );
+        assert_eq!(stored_form(&longer), lent, "a decline returns every event");
+
+        // A delta that starts past the end of the history.
+        let (resident, mut history, _) = suspended_activity_lent().await;
+        let lent = stored_form(&history);
+        let past_the_end = history.len() + 1;
+        assert_eq!(
+            resident
+                .resume_lending(&mut history, past_the_end)
+                .await
+                .err(),
+            Some(ResumeDeclined::HistoryMismatch)
+        );
+        assert_eq!(stored_form(&history), lent, "a decline returns every event");
+    }
+
+    #[tokio::test]
+    async fn a_lent_resume_that_declines_its_delta_returns_every_event() {
+        // The delta lacks the own events of the suspension.
+        let (resident, _, id) = suspended_activity_lent().await;
+        let mut history = vec![started(Value::Null), decision_boundary(), completed(id)];
+        let lent = stored_form(&history);
+        assert_eq!(
+            resident.resume_lending(&mut history, 1).await.err(),
+            Some(ResumeDeclined::OwnEventsMismatch)
+        );
+        assert_eq!(stored_form(&history), lent, "a decline returns every event");
+    }
+
+    #[tokio::test]
+    async fn a_lent_wake_with_nothing_new_waits_again_on_one_history() {
+        // The redundant wake of `a_wake_with_nothing_new_waits_again`, with
+        // the history lent to each decision.
+        let (resident, mut history, id) = suspended_activity_lent().await;
+        let lent = stored_form(&history);
+        let (outcome, next) = resident
+            .resume_lending(&mut history, 1)
+            .await
+            .expect("a wake with nothing new must not decline");
+        assert!(
+            matches!(&outcome, WorkflowOutcome::Suspended { commands }
+                if matches!(commands.as_slice(), [WorkflowCommand::WaitForActivity { activity_id, .. }] if *activity_id == id)),
+            "the cycle must only wait again: {outcome:?}"
+        );
+        assert_eq!(stored_form(&history), lent, "the wake returns every event");
+
+        // The next delta starts after the events that the wake returned.
+        let delta_start = history.len();
+        history.extend([decision_boundary(), completed(id)]);
+        let lent = stored_form(&history);
+        let next = next.expect("the workflow stays resident");
+        let (outcome, _) = next
+            .resume_lending(&mut history, delta_start)
+            .await
+            .expect("the result resolves");
+        assert!(
+            matches!(&outcome, WorkflowOutcome::Completed { output, .. } if *output == json!(1)),
+            "{outcome:?}"
+        );
+        // The matched completion keeps its output in the one history.
+        assert_eq!(
+            stored_form(&history),
+            lent,
+            "the result stays in the history"
+        );
+    }
+
     #[tokio::test]
     async fn a_wake_with_nothing_new_declines_for_a_lone_timer() {
         let (outcome, resident) = start(
@@ -2010,6 +2405,19 @@ mod tests {
     async fn drive_arrivals(
         handler: WorkflowHandlerFn,
         input: Value,
+        mode: (Arrival, bool),
+        warm: bool,
+    ) -> Trace {
+        drive_arrivals_from(false, handler, input, mode, warm).await
+    }
+
+    /// [`drive_arrivals`], with a warm run that shares one history when
+    /// `lend` is set. Each cold start then lends its history, and each warm
+    /// step lends it again, as the worker does.
+    async fn drive_arrivals_from(
+        lend: bool,
+        handler: WorkflowHandlerFn,
+        input: Value,
         (arrival, progress): (Arrival, bool),
         warm: bool,
     ) -> Trace {
@@ -2023,7 +2431,7 @@ mod tests {
             _ => 0,
         };
         let (mut outcome, mut resident) = if warm {
-            start(exec_id, history.clone(), handler, input.clone()).await
+            cold_start(lend, exec_id, history.clone(), handler, input.clone()).await
         } else {
             let cold =
                 crate::executor::run_workflow(exec_id, history.clone(), handler, input.clone())
@@ -2055,14 +2463,27 @@ mod tests {
                 history.extend(heartbeats(&open, &picked));
             }
             let delta = history[start_len..].to_vec();
-            let warm_step = match resident.take() {
-                Some(live) => match live.resume(&delta).await {
-                    Ok(next) => Some(next),
-                    Err(reason) => {
-                        declines.push(reason);
-                        None
-                    }
-                },
+            let stepped = match resident.take() {
+                Some(live) if lend => {
+                    let mut shared = history.clone();
+                    let step = live.resume_lending(&mut shared, start_len).await;
+                    assert_eq!(
+                        stored_form(&shared),
+                        stored_form(&history),
+                        "a warm step returns the history as lent: {:?}",
+                        step.as_ref().err()
+                    );
+                    Some(step)
+                }
+                Some(live) => Some(live.resume(&delta).await),
+                None => None,
+            };
+            let warm_step = match stepped {
+                Some(Ok(next)) => Some(next),
+                Some(Err(reason)) => {
+                    declines.push(reason);
+                    None
+                }
                 None => None,
             };
             (outcome, resident) = match warm_step {
@@ -2070,7 +2491,9 @@ mod tests {
                     resumes += 1;
                     next
                 }
-                None if warm => start(exec_id, history.clone(), handler, input.clone()).await,
+                None if warm => {
+                    cold_start(lend, exec_id, history.clone(), handler, input.clone()).await
+                }
                 None => {
                     let cold = crate::executor::run_workflow(
                         exec_id,
@@ -2100,6 +2523,15 @@ mod tests {
             warm.shapes, cold.shapes,
             "{arrival:?}: warm decisions must equal cold"
         );
+        // A warm run that shares one history with its driver decides the
+        // same, resumes as often, and declines for the same reasons.
+        let lent = drive_arrivals_from(true, handler, input.clone(), mode, true).await;
+        assert_eq!(
+            lent.shapes, cold.shapes,
+            "{arrival:?}: lent decisions must equal cold"
+        );
+        assert_eq!(lent.resumes, warm.resumes, "{arrival:?}: lent resumes");
+        assert_eq!(lent.declines, warm.declines, "{arrival:?}: lent declines");
         let replayed =
             crate::executor::run_workflow(ExecutionId::new(), warm.history.clone(), handler, input)
                 .await;

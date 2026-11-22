@@ -18,18 +18,27 @@ A full scan of a partial index reads only the rows that match its predicate.
 
 The full statement text is in `docs/perf-artifacts/ledger-census/statements.json`.
 
-## `purge_terminal`
+## `delete_runs`
 
-Statements: 8. Backend: SQLite. Tables with no usable index: none.
+Statements: 9. Backend: SQLite. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
 | 1 | `DELETE FROM harvest_activity_attempts WHERE exec_id IN (SELECT value FROM json_each(?1))` | `harvest_activity_attempts`: Search on `idx_harvest_activity_attempts_exec` |
 | 2 | `DELETE FROM harvest_events WHERE exec_id IN (SELECT value FROM json_each(?1))` | `harvest_events`: Search on `sqlite_autoindex_harvest_events_1` |
 | 3 | `DELETE FROM harvest_executions WHERE exec_id IN (SELECT value FROM json_each(?1))` | `harvest_executions`: Search on `sqlite_autoindex_harvest_executions_1` |
-| 4 | `DELETE FROM harvest_llm_ledger WHERE exec_id IN (SELECT value FROM json_each(?1))` | `harvest_llm_ledger`: Search on `sqlite_autoindex_harvest_llm_ledger_1` |
-| 5 | `DELETE FROM harvest_signals WHERE exec_id IN (SELECT value FROM json_each(?1))` | `harvest_signals`: Search on `idx_harvest_signals_exec_arrival` |
-| 6 | `DELETE FROM harvest_tasks WHERE exec_id IN (SELECT value FROM json_each(?1))` | `harvest_tasks`: Search on `idx_harvest_tasks_exec` |
-| 7 | `DELETE FROM harvest_timers WHERE exec_id IN (SELECT value FROM json_each(?1))` | `harvest_timers`: Search on `sqlite_autoindex_harvest_timers_1` |
-| 8 | `SELECT closed_at, exec_id FROM harvest_executions WHERE closed_at IS NOT NULL AND closed_at < ?1 ...` | `harvest_executions`: Search on `idx_harvest_executions_closed` |
+| 4 | `DELETE FROM harvest_external_tasks WHERE exec_id IN (SELECT value FROM json_each(?1))` | `harvest_external_tasks`: Search on `idx_harvest_external_tasks_exec` |
+| 5 | `DELETE FROM harvest_llm_ledger WHERE exec_id IN (SELECT value FROM json_each(?1))` | `harvest_llm_ledger`: Search on `sqlite_autoindex_harvest_llm_ledger_1` |
+| 6 | `DELETE FROM harvest_signals WHERE exec_id IN (SELECT value FROM json_each(?1))` | `harvest_signals`: Search on `idx_harvest_signals_exec_arrival` |
+| 7 | `DELETE FROM harvest_tasks WHERE exec_id IN (SELECT value FROM json_each(?1))` | `harvest_tasks`: Search on `idx_harvest_tasks_exec_state_seq` |
+| 8 | `DELETE FROM harvest_timers WHERE exec_id IN (SELECT value FROM json_each(?1))` | `harvest_timers`: Search on `sqlite_autoindex_harvest_timers_1` |
+| 9 | `DELETE FROM harvest_workflow_logs WHERE exec_id IN (SELECT value FROM json_each(?1))` | `harvest_workflow_logs`: Search on `sqlite_autoindex_harvest_workflow_logs_1` |
+
+## `purge_scope`
+
+Statements: 1. Backend: SQLite. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT closed_at, exec_id, workflow_name FROM harvest_executions INDEXED BY idx_harvest_execution...` | `harvest_executions`: Search on `idx_harvest_executions_closed` |
 

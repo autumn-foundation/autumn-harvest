@@ -250,11 +250,21 @@ CREATE TABLE IF NOT EXISTS harvest_tasks (
 CREATE INDEX IF NOT EXISTS idx_harvest_tasks_seq
     ON harvest_tasks (seq);
 
+-- The tasks of one run, by state and then in claim order. The claim reads
+-- the oldest `PENDING` task of a run. A run keeps its `DONE` rows, so an
+-- index on `exec_id` alone made each claim read every task of the run and
+-- sort the ready ones. With this index a claim seeks to its first row.
+--
+-- The `exec_id` prefix also serves each statement that names only the run.
 -- A purge deletes the tasks of a batch of runs by `exec_id` (issue #2031).
--- Without this index, each batch scans the whole table, so a large purge is
--- quadratic. The column exists in every file, so the base schema builds it.
-CREATE INDEX IF NOT EXISTS idx_harvest_tasks_exec
-    ON harvest_tasks (exec_id);
+-- Without an index, each batch scans the whole table, so a large purge is
+-- quadratic. So the older index on `exec_id` alone has no use left, and the
+-- schema drops it. The columns exist in every file, so the base schema
+-- builds the index on each open. The first open of an older file builds it
+-- once from the stored tasks.
+CREATE INDEX IF NOT EXISTS idx_harvest_tasks_exec_state_seq
+    ON harvest_tasks (exec_id, state, seq);
+DROP INDEX IF EXISTS idx_harvest_tasks_exec;
 
 CREATE TABLE IF NOT EXISTS harvest_timers (
     timer_id TEXT NOT NULL,
@@ -1207,5 +1217,56 @@ mod tests {
             )
             .unwrap();
         assert_eq!(parent, None);
+    }
+
+    /// The names of the indexes on `harvest_tasks` that the schema made.
+    fn task_indexes(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'index' \
+                 AND tbl_name = 'harvest_tasks' AND name LIKE 'idx_%' ORDER BY name",
+            )
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// An older file has the task index on `exec_id` alone. An open replaces
+    /// it with the claim index and keeps each stored task.
+    #[test]
+    fn the_schema_replaces_the_task_index_of_an_older_file() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(OLD_HARVEST_EXECUTIONS_DDL).unwrap();
+        conn.execute_batch(OLD_HARVEST_TASKS_DDL).unwrap();
+        conn.execute_batch(OLD_HARVEST_SIGNALS_DDL).unwrap();
+        conn.execute_batch("CREATE INDEX idx_harvest_tasks_exec ON harvest_tasks (exec_id)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO harvest_tasks (task_id, exec_id, activity_id, name, input_json, queue, \
+             state, attempt, run_at, seq, scheduled_at) \
+             VALUES ('t1', 'e1', 'a1', 'act', 'null', 'default', 'PENDING', 0, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+
+        conn.execute_batch(SCHEMA).unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+
+        assert_eq!(
+            task_indexes(&conn),
+            ["idx_harvest_tasks_exec_state_seq", "idx_harvest_tasks_seq"],
+        );
+        let found: String = conn
+            .query_row(
+                "SELECT task_id FROM harvest_tasks INDEXED BY idx_harvest_tasks_exec_state_seq \
+                 WHERE exec_id = 'e1' AND state = 'PENDING' ORDER BY seq LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(found, "t1", "the new index holds the stored task");
     }
 }

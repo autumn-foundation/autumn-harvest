@@ -52,7 +52,7 @@ path = "tests/integration/mod.rs"
 # Deterministic (non-criterion) instruction/allocation-count profiling harness
 # for `SqliteRuntime::run_until_blocked` -- the end-to-end decision-cycle
 # driver (issue #135's replay workload, driven through this backend's
-# reload-and-replay-every-cycle path instead of a single `replay_from_events`
+# replay-every-cycle path instead of a single `replay_from_events`
 # pass). `harness = false` + its own `main()`, same shape as
 # `autumn-harvest/benches/replay_profile.rs`, so the compiled artifact is a
 # plain executable meant to be pointed at `valgrind --tool=callgrind` /
@@ -60,6 +60,12 @@ path = "tests/integration/mod.rs"
 # wall-clock timing loop. See `benches/runtime_drive_profile.rs`.
 [[bench]]
 name = "runtime_drive_profile"
+harness = false
+
+# The throughput shape: many short runs against one open database. See
+# `benches/runtime_throughput_profile.rs`.
+[[bench]]
+name = "runtime_throughput_profile"
 harness = false
 
 [lints]
