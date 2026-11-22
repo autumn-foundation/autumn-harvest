@@ -61,11 +61,12 @@ Statements: 1. Backend: SQLite. Tables with no usable index: `harvest_schedules`
 
 ## `list`
 
-Statements: 1. Backend: SQLite. Tables with no usable index: none.
+Statements: 2. Backend: SQLite. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT workflow_name, schedule_json, paused, next_run_at, last_run_at, max_active_runs FROM harve...` | `harvest_schedules`: full scan of index `sqlite_autoindex_harvest_schedules_1` |
+| 2 | `SELECT workflow_name, schedule_json, paused, next_run_at, last_run_at, max_active_runs, input_jso...` | `harvest_schedules`: full scan of index `sqlite_autoindex_harvest_schedules_1` |
 
 ## `load_code`
 
@@ -82,6 +83,14 @@ Statements: 1. Backend: SQLite. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT schedule_json, input_json, overlap_policy, max_active_runs, next_run_at FROM harvest_sched...` | `harvest_schedules`: Search on `sqlite_autoindex_harvest_schedules_1` |
+
+## `load_manual`
+
+Statements: 1. Backend: SQLite. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT input_json, overlap_policy, max_active_runs, paused FROM harvest_schedules WHERE workflow_...` | `harvest_schedules`: Search on `sqlite_autoindex_harvest_schedules_1` |
 
 ## `load_override`
 
@@ -102,13 +111,15 @@ Statements: 2. Backend: SQLite. Tables with no usable index: none.
 
 ## `set_paused`
 
-Statements: 3. Backend: SQLite. Tables with no usable index: none.
+Statements: 5. Backend: SQLite. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
 | 1 | `SELECT schedule_json, paused FROM harvest_schedules WHERE workflow_name = ?1` | `harvest_schedules`: Search on `sqlite_autoindex_harvest_schedules_1` |
 | 2 | `UPDATE harvest_schedules SET paused = 0, next_run_at = ?2 WHERE workflow_name = ?1` | `harvest_schedules`: Search on `sqlite_autoindex_harvest_schedules_1` |
-| 3 | `UPDATE harvest_schedules SET paused = 1 WHERE workflow_name = ?1` | `harvest_schedules`: Search on `sqlite_autoindex_harvest_schedules_1` |
+| 3 | `UPDATE harvest_schedules SET paused = 0, next_run_at = ?2, pause_reason = NULL WHERE workflow_nam...` | `harvest_schedules`: Search on `sqlite_autoindex_harvest_schedules_1` |
+| 4 | `UPDATE harvest_schedules SET paused = 1 WHERE workflow_name = ?1` | `harvest_schedules`: Search on `sqlite_autoindex_harvest_schedules_1` |
+| 5 | `UPDATE harvest_schedules SET paused = 1, pause_reason = ?2 WHERE workflow_name = ?1` | `harvest_schedules`: Search on `sqlite_autoindex_harvest_schedules_1` |
 
 ## `write_row`
 

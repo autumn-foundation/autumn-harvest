@@ -6,6 +6,7 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_events"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/history_page.md"
 
 ["history_page"]
 driver = "per_request"
@@ -13,3 +14,4 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_events"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/history_page.md"

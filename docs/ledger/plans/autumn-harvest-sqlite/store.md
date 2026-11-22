@@ -20,11 +20,12 @@ The full statement text is in `docs/perf-artifacts/ledger-census/statements.json
 
 ## `append_event_seq`
 
-Statements: 1. Backend: SQLite. Tables with no usable index: none.
+Statements: 2. Backend: SQLite. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
 | 1 | `INSERT INTO harvest_events (exec_id, seq, event_json) VALUES (?1, ?2, ?3)` | no table |
+| 2 | `INSERT INTO harvest_events (exec_id, seq, event_json, recorded_at) VALUES (?1, ?2, ?3, ?4)` | no table |
 
 ## `cancel_request`
 
@@ -177,6 +178,14 @@ Statements: 1. Backend: SQLite. Tables with no usable index: none.
 | # | Statement | Access |
 |---|---|---|
 | 1 | `UPDATE harvest_signals SET delivered = 1 WHERE signal_seq = ?1` | `harvest_signals`: Search on the primary key |
+
+## `newest_execution_by_key`
+
+Statements: 1. Backend: SQLite. Tables with no usable index: none.
+
+| # | Statement | Access |
+|---|---|---|
+| 1 | `SELECT exec_id FROM harvest_executions WHERE workflow_name = ?1 AND workflow_id = ?2 ORDER BY row...` | `harvest_executions`: Search on `idx_harvest_executions_key` |
 
 ## `next_seq`
 

@@ -326,3 +326,4 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/store.md"

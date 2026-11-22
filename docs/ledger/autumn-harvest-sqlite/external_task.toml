@@ -6,6 +6,7 @@ backend = ["sqlite"]
 kind = ["write"]
 tables = ["harvest_external_tasks"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/external_task.md"
 
 ["extend"]
 driver = "per_request"
@@ -13,6 +14,7 @@ backend = ["sqlite"]
 kind = ["write"]
 tables = ["harvest_events", "harvest_external_tasks", "harvest_timers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/external_task.md"
 
 ["find"]
 driver = "per_request"
@@ -20,6 +22,7 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_external_tasks"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/external_task.md"
 
 ["fire_deadline"]
 driver = "per_task"
@@ -27,6 +30,7 @@ backend = ["sqlite"]
 kind = ["read", "write"]
 tables = ["harvest_events", "harvest_external_tasks", "harvest_timers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/external_task.md"
 
 ["list"]
 driver = "per_request"
@@ -34,6 +38,7 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_executions", "harvest_external_tasks"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/external_task.md"
 
 ["record"]
 driver = "per_task"
@@ -41,6 +46,7 @@ backend = ["sqlite"]
 kind = ["write"]
 tables = ["harvest_events", "harvest_external_tasks", "harvest_timers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/external_task.md"
 
 ["settle"]
 driver = "per_request"
@@ -48,3 +54,4 @@ backend = ["sqlite"]
 kind = ["write"]
 tables = ["harvest_events", "harvest_external_tasks", "harvest_timers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/external_task.md"

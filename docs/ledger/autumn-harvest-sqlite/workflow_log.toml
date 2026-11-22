@@ -6,6 +6,7 @@ backend = ["sqlite"]
 kind = ["read", "write"]
 tables = ["harvest_workflow_logs"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/workflow_log.md"
 
 ["count"]
 driver = "per_request"
@@ -13,6 +14,7 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_workflow_logs"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/workflow_log.md"
 
 ["load"]
 driver = "per_request"
@@ -20,6 +22,7 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_workflow_logs"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/workflow_log.md"
 
 ["table_exists"]
 driver = "setup"
@@ -27,6 +30,7 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_workflow_logs"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/workflow_log.md"
 
 ["truncated_on"]
 driver = "per_task"
@@ -34,6 +38,7 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_workflow_logs"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/workflow_log.md"
 
 ["append_commands"]
 driver = "per_task"

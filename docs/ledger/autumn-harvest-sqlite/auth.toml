@@ -6,6 +6,7 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_connector_dead_letters"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/auth.md"
 
 ["SqliteAuthStore::insert_dead_letter"]
 driver = "per_request"
@@ -13,6 +14,7 @@ backend = ["sqlite"]
 kind = ["write"]
 tables = ["harvest_connector_dead_letters"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/auth.md"
 
 ["SqliteAuthStore::insert_audit"]
 driver = "per_request"
@@ -20,6 +22,7 @@ backend = ["sqlite"]
 kind = ["write"]
 tables = ["harvest_audit_log"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/auth.md"
 
 ["SqliteAuthStore::insert_token"]
 driver = "per_request"
@@ -27,6 +30,7 @@ backend = ["sqlite"]
 kind = ["write"]
 tables = ["harvest_api_tokens"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/auth.md"
 
 ["SqliteAuthStore::list_audit"]
 driver = "per_request"
@@ -34,6 +38,7 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_audit_log"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/auth.md"
 
 ["SqliteAuthStore::list_tokens"]
 driver = "per_request"
@@ -41,6 +46,7 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_api_tokens"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/auth.md"
 
 ["SqliteAuthStore::prepare"]
 driver = "setup"
@@ -55,6 +61,7 @@ backend = ["sqlite"]
 kind = ["write"]
 tables = ["harvest_api_tokens"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/auth.md"
 
 ["SqliteAuthStore::touch_token"]
 driver = "per_request"
@@ -62,6 +69,7 @@ backend = ["sqlite"]
 kind = ["write"]
 tables = ["harvest_api_tokens"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/auth.md"
 
 ["token_where"]
 driver = "per_request"
@@ -69,6 +77,7 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_api_tokens"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/auth.md"
 
 
 ["SqliteAuthStore::purge_audit_before"]
@@ -77,3 +86,4 @@ backend = ["sqlite"]
 kind = ["write"]
 tables = ["harvest_audit_log"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/auth.md"

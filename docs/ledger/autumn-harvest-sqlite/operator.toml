@@ -6,6 +6,7 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/operator.md"
 
 ["count"]
 driver = "per_request"
@@ -13,6 +14,7 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/operator.md"
 
 ["parents_with_children"]
 driver = "per_request"
@@ -20,6 +22,7 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/operator.md"
 
 ["buffered_signals"]
 driver = "per_request"
@@ -27,6 +30,7 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_signals"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/operator.md"
 
 ["pending_tasks"]
 driver = "per_request"
@@ -34,6 +38,7 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_tasks"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/operator.md"
 
 ["pending_timers"]
 driver = "per_request"
@@ -41,6 +46,7 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_timers"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/operator.md"
 
 ["timed_history"]
 driver = "per_request"
@@ -48,3 +54,4 @@ backend = ["sqlite"]
 kind = ["read"]
 tables = ["harvest_events", "harvest_executions"]
 measured = "unmeasured"
+plan = "docs/ledger/plans/autumn-harvest-sqlite/operator.md"
