@@ -214,6 +214,17 @@ fn step_cost(nanos: u128, rate: u64) -> u128 {
 }
 
 /// Convert nanoseconds to a `Duration`, saturating at `Duration::MAX`.
+///
+/// Clone-class note: this function repeats verbatim in
+/// [`crate::dag_leverage::to_duration`] and in the canonical
+/// [`crate::dag_slack::to_duration`], which carries `pub(crate)` for reuse.
+/// [`crate::dag_retry_envelope`] already imports the `dag_slack` copy
+/// instead of redefining it. Three instances exist, but this session's
+/// clone holds only 50 commits, so no co-change or missed-fix evidence
+/// covers this function. A saturating nanosecond-to-duration conversion
+/// names no documented domain rule either. The merge bar stays unmet on
+/// evidence grounds, not on instance count. Import `dag_slack::to_duration`
+/// here once a session with full history can confirm the merge.
 fn to_duration(nanos: u128) -> Duration {
     u64::try_from(nanos / 1_000_000_000).map_or(Duration::MAX, |secs| {
         // The remainder is below 1e9, so it fits in `u32`.

@@ -154,6 +154,11 @@ impl<'a> DagLeverage<'a> {
 }
 
 /// Convert nanoseconds to a `Duration`, saturating at `Duration::MAX`.
+///
+/// Clone-class note: this function repeats verbatim in
+/// [`crate::dag_crash::to_duration`] and in the canonical
+/// [`crate::dag_slack::to_duration`]. See the note there for the instance
+/// count and the evidence gap that keeps this a linked-copies record.
 fn to_duration(nanos: u128) -> Duration {
     u64::try_from(nanos / 1_000_000_000).map_or(Duration::MAX, |secs| {
         // The remainder is below 1e9, so it fits in `u32`.
