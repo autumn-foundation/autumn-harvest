@@ -43,7 +43,7 @@ fn build_shape(i: usize) -> Vec<WorkflowEvent> {
         });
         events.push(WorkflowEvent::TimerFired { timer_id });
     }
-    events.push(if i % 2 == 0 {
+    events.push(if i.is_multiple_of(2) {
         WorkflowEvent::WorkflowCompleted {
             output: serde_json::json!(1),
         }
@@ -90,5 +90,9 @@ fn main() {
         seen += verdict.seen + verdict.divergence.unwrap_or(0);
     }
     black_box((seen, census.distinct()));
-    println!("distinct={} total={} checksum={seen}", census.distinct(), census.total());
+    println!(
+        "distinct={} total={} checksum={seen}",
+        census.distinct(),
+        census.total()
+    );
 }

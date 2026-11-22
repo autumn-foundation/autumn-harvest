@@ -160,7 +160,21 @@ impl ShapeCensus {
     /// Return the most common shape, or `None` for an empty census.
     #[must_use]
     pub fn dominant(&self) -> Option<ShapeSummary> {
-        self.shapes().into_iter().next()
+        self.dominant_entry()
+            .map(|(path, entry)| self.summary(path, entry))
+    }
+
+    /// Return the first shape in shape order that has the highest count.
+    ///
+    /// It matches the head of `shapes()` and copies no path.
+    fn dominant_entry(&self) -> Option<(&Vec<&'static str>, &Entry)> {
+        let mut best: Option<(&Vec<&'static str>, &Entry)> = None;
+        for (path, entry) in &self.shapes {
+            if best.is_none_or(|(_, b)| entry.count > b.count) {
+                best = Some((path, entry));
+            }
+        }
+        best
     }
 
     /// Return the shapes whose share is `max_share` or less, the rarest first.
@@ -183,8 +197,8 @@ impl ShapeCensus {
         let path = path_of(events);
         let seen = self.shapes.get(&path).map_or(0, |e| e.count);
         let divergence = self
-            .dominant()
-            .and_then(|d| first_name_divergence(&d.path, &path));
+            .dominant_entry()
+            .and_then(|(dominant, _)| first_name_divergence(dominant, &path));
         ShapeVerdict {
             fingerprint: shape_fingerprint(events),
             seen,
