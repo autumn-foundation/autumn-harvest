@@ -62,5 +62,11 @@ path = "tests/integration/mod.rs"
 name = "runtime_drive_profile"
 harness = false
 
+# The throughput shape: many short runs against one open database. See
+# `benches/runtime_throughput_profile.rs`.
+[[bench]]
+name = "runtime_throughput_profile"
+harness = false
+
 [lints]
 workspace = true

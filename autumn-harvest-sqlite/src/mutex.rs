@@ -25,45 +25,41 @@ use crate::error::SqliteResult;
 /// A repeat call keeps the place of `exec` in the queue.
 pub fn acquire(conn: &Connection, exec: ExecutionId, key: &str) -> SqliteResult<Option<i64>> {
     let exec = exec.to_string();
-    conn.execute(
+    conn.prepare_cached(
         "INSERT OR IGNORE INTO harvest_mutex_waiters (lock_key, waiter_exec_id) VALUES (?1, ?2)",
-        params![key, exec],
-    )?;
+    )?
+    .execute(params![key, exec])?;
     let taken: Option<i64> = conn
-        .query_row(
-            "SELECT 1 FROM harvest_mutex_locks WHERE lock_key = ?1",
-            params![key],
-            |row| row.get(0),
-        )
+        .prepare_cached("SELECT 1 FROM harvest_mutex_locks WHERE lock_key = ?1")?
+        .query_row(params![key], |row| row.get(0))
         .optional()?;
     if taken.is_some() {
         return Ok(None);
     }
     let head: Option<String> = conn
-        .query_row(
+        .prepare_cached(
             "SELECT waiter_exec_id FROM harvest_mutex_waiters WHERE lock_key = ?1 \
              ORDER BY waiter_seq LIMIT 1",
-            params![key],
-            |row| row.get(0),
-        )
+        )?
+        .query_row(params![key], |row| row.get(0))
         .optional()?;
     if head.as_deref() != Some(exec.as_str()) {
         return Ok(None);
     }
-    let lock_seq: i64 = conn.query_row(
-        "INSERT INTO harvest_mutex_seq (id, last) VALUES (1, 1) \
+    let lock_seq: i64 = conn
+        .prepare_cached(
+            "INSERT INTO harvest_mutex_seq (id, last) VALUES (1, 1) \
          ON CONFLICT (id) DO UPDATE SET last = last + 1 RETURNING last",
-        [],
-        |row| row.get(0),
-    )?;
-    conn.execute(
+        )?
+        .query_row([], |row| row.get(0))?;
+    conn.prepare_cached(
         "INSERT INTO harvest_mutex_locks (lock_key, holder_exec_id, lock_seq) VALUES (?1, ?2, ?3)",
-        params![key, exec, lock_seq],
-    )?;
-    conn.execute(
+    )?
+    .execute(params![key, exec, lock_seq])?;
+    conn.prepare_cached(
         "DELETE FROM harvest_mutex_waiters WHERE lock_key = ?1 AND waiter_exec_id = ?2",
-        params![key, exec],
-    )?;
+    )?
+    .execute(params![key, exec])?;
     Ok(Some(lock_seq))
 }
 
@@ -78,11 +74,12 @@ pub fn release(
     key: &str,
     lock_seq: i64,
 ) -> SqliteResult<bool> {
-    let n = conn.execute(
-        "DELETE FROM harvest_mutex_locks \
+    let n = conn
+        .prepare_cached(
+            "DELETE FROM harvest_mutex_locks \
          WHERE lock_key = ?1 AND holder_exec_id = ?2 AND lock_seq = ?3",
-        params![key, exec.to_string(), lock_seq],
-    )?;
+        )?
+        .execute(params![key, exec.to_string(), lock_seq])?;
     Ok(n > 0)
 }
 
@@ -99,10 +96,10 @@ pub fn drop_stale_waits(conn: &Connection, exec: ExecutionId, keep: &[&str]) -> 
         .query_map(params![exec.to_string()], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     for key in queued.iter().filter(|key| !keep.contains(&key.as_str())) {
-        conn.execute(
+        conn.prepare_cached(
             "DELETE FROM harvest_mutex_waiters WHERE lock_key = ?1 AND waiter_exec_id = ?2",
-            params![key, exec.to_string()],
-        )?;
+        )?
+        .execute(params![key, exec.to_string()])?;
     }
     Ok(())
 }
@@ -113,14 +110,10 @@ pub fn drop_stale_waits(conn: &Connection, exec: ExecutionId, keep: &[&str]) -> 
 /// terminal transaction. A run that ends can then never block a key.
 pub fn release_all(conn: &Connection, exec: ExecutionId) -> SqliteResult<()> {
     let exec = exec.to_string();
-    conn.execute(
-        "DELETE FROM harvest_mutex_locks WHERE holder_exec_id = ?1",
-        params![exec],
-    )?;
-    conn.execute(
-        "DELETE FROM harvest_mutex_waiters WHERE waiter_exec_id = ?1",
-        params![exec],
-    )?;
+    conn.prepare_cached("DELETE FROM harvest_mutex_locks WHERE holder_exec_id = ?1")?
+        .execute(params![exec])?;
+    conn.prepare_cached("DELETE FROM harvest_mutex_waiters WHERE waiter_exec_id = ?1")?
+        .execute(params![exec])?;
     Ok(())
 }
 

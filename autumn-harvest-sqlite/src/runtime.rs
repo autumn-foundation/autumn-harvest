@@ -31,6 +31,7 @@ use autumn_harvest::{
 };
 use jiff::Timestamp;
 use rusqlite::Connection;
+use rusqlite::config::DbConfig;
 use serde_json::Value;
 
 use crate::error::{SqliteError, SqliteResult};
@@ -394,6 +395,13 @@ pub const UNSUPPORTED_FEATURE_ERROR_TYPE: &str = "UnsupportedFeature";
 /// `WorkflowTestEnv` mid-run limit.
 const UPDATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The size of the prepared-statement cache of the runtime connection.
+///
+/// It must exceed the distinct statements of the drive path, or the cache
+/// evicts a statement that the next cycle needs. The path has under 100. A
+/// cached statement holds a few kilobytes.
+const STATEMENT_CACHE_CAPACITY: usize = 128;
+
 /// Maximum driver iterations before declaring a runaway. This is a safety bound
 /// only; the supported scenarios converge in a handful of cycles.
 const MAX_ITERATIONS: usize = 10_000;
@@ -576,6 +584,18 @@ impl SqliteRuntime {
             // First, so no later statement of this connection checkpoints.
             conn.execute_batch("PRAGMA wal_autocheckpoint = 0;")?;
         }
+        // The drive sends each statement through `prepare_cached`. The default
+        // cache holds 16 statements, and one decision cycle uses more. An
+        // evicted statement is compiled again, which costs more than its run.
+        conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
+        // Keep one plan for each cached statement. Without this guarantee
+        // `SQLite` reads a bound value while it plans an index range. It then
+        // compiles the statement again each time a parameter is bound, even to
+        // the same value. A drive binds a run id to each statement, so each
+        // cached statement was compiled on each use. The guarantee turns off
+        // only the plans that depend on a bound value. This schema has no
+        // `ANALYZE` data and binds no `LIKE` pattern, so it has no such plan.
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG, true)?;
         // Durability & concurrency posture (issue #1068). This backend claims
         // that a committed transaction survives a crash or power loss. The
         // crash-then-reopen tests depend on it, so set it explicitly instead of

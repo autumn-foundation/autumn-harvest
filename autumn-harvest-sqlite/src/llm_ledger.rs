@@ -191,11 +191,10 @@ pub fn rows_between(
 
 fn table_exists(conn: &Connection) -> SqliteResult<bool> {
     let found: Option<i64> = conn
-        .query_row(
+        .prepare_cached(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'harvest_llm_ledger'",
-            [],
-            |row| row.get(0),
-        )
+        )?
+        .query_row([], |row| row.get(0))
         .optional()?;
     Ok(found.is_some())
 }

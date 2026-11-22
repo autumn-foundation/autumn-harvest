@@ -288,19 +288,16 @@ pub fn record(
             schedule_to_close_secs: handoff.schedule_to_close_secs,
         },
     )?;
-    conn.execute(
-        INSERT_SQL,
-        params![
-            handoff.token.to_string(),
-            exec.to_string(),
-            handoff.activity_id.to_string(),
-            handoff.name,
-            handoff.queue,
-            serde_json::to_string(handoff.input)?,
-            now,
-            deadline_at,
-        ],
-    )?;
+    conn.prepare_cached(INSERT_SQL)?.execute(params![
+        handoff.token.to_string(),
+        exec.to_string(),
+        handoff.activity_id.to_string(),
+        handoff.name,
+        handoff.queue,
+        serde_json::to_string(handoff.input)?,
+        now,
+        deadline_at,
+    ])?;
     queue::enqueue_timer(conn, exec, &deadline_timer_id(handoff.token), deadline_at)?;
     Ok(true)
 }
@@ -314,12 +311,13 @@ const INSERT_SQL: &str = "INSERT OR IGNORE INTO harvest_external_tasks \
 /// The stored state of `token`, or `None` for an unknown token.
 pub fn find(conn: &Connection, token: ExternalActivityToken) -> SqliteResult<Option<Task>> {
     let row: Option<(String, String, String, i64)> = conn
-        .query_row(
+        .prepare_cached(
             "SELECT exec_id, activity_id, state, deadline_at FROM harvest_external_tasks \
              WHERE token = ?1",
-            params![token.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
+        )?
+        .query_row(params![token.to_string()], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
         .optional()?;
     row.map(|(exec, activity_id, state, deadline_at)| {
         Ok(Task {
@@ -350,11 +348,12 @@ pub fn settle(
     event: &WorkflowEvent,
     now: i64,
 ) -> SqliteResult<bool> {
-    let changed = conn.execute(
-        "UPDATE harvest_external_tasks SET state = ?2, updated_at = ?3 \
+    let changed = conn
+        .prepare_cached(
+            "UPDATE harvest_external_tasks SET state = ?2, updated_at = ?3 \
          WHERE token = ?1 AND state = 'PENDING'",
-        params![token.to_string(), state.as_str(), now],
-    )?;
+        )?
+        .execute(params![token.to_string(), state.as_str(), now])?;
     if changed == 0 {
         return Ok(false);
     }
@@ -374,16 +373,20 @@ pub fn extend(
     now: i64,
 ) -> SqliteResult<()> {
     let deadline_at = bounded_deadline(deadline_at);
-    conn.execute(
+    conn.prepare_cached(
         "UPDATE harvest_external_tasks SET deadline_at = ?2, updated_at = ?3 \
          WHERE token = ?1 AND state = 'PENDING'",
-        params![token.to_string(), deadline_at, now],
-    )?;
-    conn.execute(
+    )?
+    .execute(params![token.to_string(), deadline_at, now])?;
+    conn.prepare_cached(
         "UPDATE harvest_timers SET fire_at = ?3 \
          WHERE exec_id = ?1 AND timer_id = ?2 AND fired = 0",
-        params![task.exec.to_string(), deadline_timer_id(token), deadline_at],
-    )?;
+    )?
+    .execute(params![
+        task.exec.to_string(),
+        deadline_timer_id(token),
+        deadline_at
+    ])?;
     store::append_event(conn, task.exec, &extended_event(token, task))
 }
 
@@ -409,11 +412,11 @@ pub fn fire_deadline(conn: &Connection, exec: ExecutionId, timer_id: &str) -> Sq
     {
         // The row times out at its own deadline. The timer row holds the same
         // instant.
-        conn.execute(
+        conn.prepare_cached(
             "UPDATE harvest_external_tasks SET state = 'TIMED_OUT', updated_at = deadline_at \
              WHERE token = ?1 AND state = 'PENDING'",
-            params![token.to_string()],
-        )?;
+        )?
+        .execute(params![token.to_string()])?;
         store::append_event(
             conn,
             exec,
@@ -449,11 +452,11 @@ pub fn time_out_if_due(
 /// transaction. Each terminal setter of a run calls it. A later settle of
 /// such a token returns `false`.
 pub fn cancel_pending(conn: &Connection, exec: ExecutionId) -> SqliteResult<()> {
-    conn.execute(
+    conn.prepare_cached(
         "UPDATE harvest_external_tasks SET state = 'CANCELLED', updated_at = ?2 \
          WHERE exec_id = ?1 AND state = 'PENDING'",
-        params![exec.to_string(), Timestamp::now().as_millisecond()],
-    )?;
+    )?
+    .execute(params![exec.to_string(), Timestamp::now().as_millisecond()])?;
     Ok(())
 }
 

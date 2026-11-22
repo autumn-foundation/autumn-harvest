@@ -107,17 +107,18 @@ fn write_row(
 ) -> SqliteResult<()> {
     let spec = serde_json::to_string(&effective.schedule)?;
     let stored: Option<(String, Option<i64>)> = conn
-        .query_row(
+        .prepare_cached(
             "SELECT schedule_json, next_run_at FROM harvest_schedules WHERE workflow_name = ?1",
-            [&effective.workflow_name],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
+        )?
+        .query_row([&effective.workflow_name], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
         .optional()?;
     let next_run_at = match stored {
         Some((old_spec, next)) if old_spec == spec => next,
         _ => first_slot(&effective.schedule, now),
     };
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO harvest_schedules (workflow_name, schedule_json, input_json, \
            overlap_policy, max_active_runs, paused, next_run_at, code_json) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
@@ -126,17 +127,17 @@ fn write_row(
            overlap_policy = excluded.overlap_policy, \
            max_active_runs = excluded.max_active_runs, next_run_at = excluded.next_run_at, \
            code_json = excluded.code_json",
-        params![
-            effective.workflow_name,
-            spec,
-            serde_json::to_string(&effective.input)?,
-            effective.overlap_policy.as_str(),
-            i64::from(effective.max_active_runs),
-            effective.paused,
-            next_run_at,
-            serde_json::to_string(code)?,
-        ],
-    )?;
+    )?
+    .execute(params![
+        effective.workflow_name,
+        spec,
+        serde_json::to_string(&effective.input)?,
+        effective.overlap_policy.as_str(),
+        i64::from(effective.max_active_runs),
+        effective.paused,
+        next_run_at,
+        serde_json::to_string(code)?,
+    ])?;
     Ok(())
 }
 
@@ -200,20 +201,19 @@ pub fn load_override(
     workflow_name: &str,
 ) -> SqliteResult<Option<ScheduleOverride>> {
     let row = conn
-        .query_row(
+        .prepare_cached(
             "SELECT fields_json, reason, updated_by, created_at, updated_at \
              FROM harvest_schedule_overrides WHERE workflow_name = ?1",
-            [workflow_name],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                ))
-            },
-        )
+        )?
+        .query_row([workflow_name], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
         .optional()?;
     let Some((fields, reason, updated_by, created_at, updated_at)) = row else {
         return Ok(None);
@@ -254,35 +254,31 @@ pub fn set_override(
     let merged = merge_workflow_fields(patch, &stored);
     let effective = effective_under(&code, &merged)?;
     if workflow_fields_are_empty(&merged) {
-        tx.execute(
-            "DELETE FROM harvest_schedule_overrides WHERE workflow_name = ?1",
-            [workflow_name],
-        )?;
+        tx.prepare_cached("DELETE FROM harvest_schedule_overrides WHERE workflow_name = ?1")?
+            .execute([workflow_name])?;
     } else {
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO harvest_schedule_overrides \
                (workflow_name, fields_json, reason, updated_by, created_at, updated_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?5) \
              ON CONFLICT (workflow_name) DO UPDATE SET \
                fields_json = excluded.fields_json, reason = excluded.reason, \
                updated_by = excluded.updated_by, updated_at = excluded.updated_at",
-            params![
-                workflow_name,
-                serde_json::to_string(&OverrideFieldsJson::from_fields(&merged))?,
-                reason,
-                actor,
-                now,
-            ],
-        )?;
+        )?
+        .execute(params![
+            workflow_name,
+            serde_json::to_string(&OverrideFieldsJson::from_fields(&merged))?,
+            reason,
+            actor,
+            now,
+        ])?;
     }
     write_row(&tx, &effective, &code, now)?;
     // `write_row` keeps the stored pause. Return that pause, not the code one.
     let mut effective = effective;
-    effective.paused = tx.query_row(
-        "SELECT paused FROM harvest_schedules WHERE workflow_name = ?1",
-        [workflow_name],
-        |row| row.get(0),
-    )?;
+    effective.paused = tx
+        .prepare_cached("SELECT paused FROM harvest_schedules WHERE workflow_name = ?1")?
+        .query_row([workflow_name], |row| row.get(0))?;
     tx.commit()?;
     Ok(effective)
 }
@@ -292,10 +288,9 @@ pub fn set_override(
 pub fn clear_override(conn: &Connection, workflow_name: &str, now: i64) -> SqliteResult<bool> {
     let tx = conn.unchecked_transaction()?;
     let code = load_code(&tx, workflow_name)?;
-    let removed = tx.execute(
-        "DELETE FROM harvest_schedule_overrides WHERE workflow_name = ?1",
-        [workflow_name],
-    )?;
+    let removed = tx
+        .prepare_cached("DELETE FROM harvest_schedule_overrides WHERE workflow_name = ?1")?
+        .execute([workflow_name])?;
     write_row(&tx, &code, &code, now)?;
     tx.commit()?;
     Ok(removed > 0)
@@ -304,11 +299,8 @@ pub fn clear_override(conn: &Connection, workflow_name: &str, now: i64) -> Sqlit
 /// The code value of a stored schedule.
 fn load_code(conn: &Connection, workflow_name: &str) -> SqliteResult<WorkflowSchedule> {
     let code: Option<Option<String>> = conn
-        .query_row(
-            "SELECT code_json FROM harvest_schedules WHERE workflow_name = ?1",
-            [workflow_name],
-            |row| row.get(0),
-        )
+        .prepare_cached("SELECT code_json FROM harvest_schedules WHERE workflow_name = ?1")?
+        .query_row([workflow_name], |row| row.get(0))
         .optional()?;
     match code {
         None => Err(SqliteError::ScheduleNotFound(workflow_name.to_string())),
@@ -380,16 +372,13 @@ fn refuse_unsupported_override(patch: &WorkflowSchedulePatch) -> SqliteResult<()
 /// Remove the schedule of `workflow_name`. Its runs keep running.
 pub fn delete(conn: &Connection, workflow_name: &str) -> SqliteResult<()> {
     let tx = conn.unchecked_transaction()?;
-    let removed = tx.execute(
-        "DELETE FROM harvest_schedules WHERE workflow_name = ?1",
-        [workflow_name],
-    )?;
+    let removed = tx
+        .prepare_cached("DELETE FROM harvest_schedules WHERE workflow_name = ?1")?
+        .execute([workflow_name])?;
     // An override outlives no schedule, so a new schedule of the name starts
     // from its code value (issue #2390).
-    tx.execute(
-        "DELETE FROM harvest_schedule_overrides WHERE workflow_name = ?1",
-        [workflow_name],
-    )?;
+    tx.prepare_cached("DELETE FROM harvest_schedule_overrides WHERE workflow_name = ?1")?
+        .execute([workflow_name])?;
     tx.commit()?;
     if removed == 0 {
         return Err(SqliteError::ScheduleNotFound(workflow_name.to_string()));
@@ -411,27 +400,28 @@ pub fn set_paused(
 ) -> SqliteResult<()> {
     let tx = conn.unchecked_transaction()?;
     let Some((spec, was_paused)) = tx
-        .query_row(
+        .prepare_cached(
             "SELECT schedule_json, paused FROM harvest_schedules WHERE workflow_name = ?1",
-            [workflow_name],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
-        )
+        )?
+        .query_row([workflow_name], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+        })
         .optional()?
     else {
         return Err(SqliteError::ScheduleNotFound(workflow_name.to_string()));
     };
     if paused {
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE harvest_schedules SET paused = 1, pause_reason = ?2 WHERE workflow_name = ?1",
-            params![workflow_name, reason],
-        )?;
+        )?
+        .execute(params![workflow_name, reason])?;
     } else if was_paused {
         let next = first_slot(&parse_spec(&spec)?, now);
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE harvest_schedules SET paused = 0, next_run_at = ?2, pause_reason = NULL \
              WHERE workflow_name = ?1",
-            params![workflow_name, next],
-        )?;
+        )?
+        .execute(params![workflow_name, next])?;
     }
     tx.commit()?;
     Ok(())
@@ -439,7 +429,7 @@ pub fn set_paused(
 
 /// Every stored schedule, by workflow name.
 pub fn list(conn: &Connection) -> SqliteResult<Vec<ScheduleSummary>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT workflow_name, schedule_json, paused, next_run_at, last_run_at, \
            max_active_runs, input_json, overlap_policy, pause_reason \
          FROM harvest_schedules ORDER BY workflow_name",
@@ -484,7 +474,7 @@ pub fn list(conn: &Connection) -> SqliteResult<Vec<ScheduleSummary>> {
 
 /// The names of the schedules due at `now`, oldest slot first.
 pub fn due_names(conn: &Connection, now: i64) -> SqliteResult<Vec<String>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT workflow_name FROM harvest_schedules \
          WHERE paused = 0 AND next_run_at <= ?1 ORDER BY next_run_at, workflow_name",
     )?;
@@ -498,21 +488,20 @@ pub fn due_names(conn: &Connection, now: i64) -> SqliteResult<Vec<String>> {
 /// reads it inside the fire transaction, so the slot cannot fire twice.
 pub fn load_due(conn: &Connection, workflow_name: &str, now: i64) -> SqliteResult<Option<Due>> {
     let row = conn
-        .query_row(
+        .prepare_cached(
             "SELECT schedule_json, input_json, overlap_policy, max_active_runs, next_run_at \
              FROM harvest_schedules \
              WHERE workflow_name = ?1 AND paused = 0 AND next_run_at <= ?2",
-            params![workflow_name, now],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                ))
-            },
-        )
+        )?
+        .query_row(params![workflow_name, now], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
         .optional()?;
     let Some((spec, input, overlap, max_active_runs, slot)) = row else {
         return Ok(None);
@@ -533,13 +522,13 @@ pub fn load_due(conn: &Connection, workflow_name: &str, now: i64) -> SqliteResul
 /// A run past its deadline or with a pending cancel does not count. Its next
 /// drive ends it, and Postgres has already ended it.
 pub fn active_runs(conn: &Connection, workflow_name: &str, now: i64) -> SqliteResult<i64> {
-    Ok(conn.query_row(
-        "SELECT COUNT(*) FROM harvest_executions \
+    Ok(conn
+        .prepare_cached(
+            "SELECT COUNT(*) FROM harvest_executions \
          WHERE schedule_name = ?1 AND state = 'RUNNING' AND cancel_reason IS NULL \
            AND (deadline_at IS NULL OR deadline_at > ?2)",
-        params![workflow_name, now],
-        |row| row.get(0),
-    )?)
+        )?
+        .query_row(params![workflow_name, now], |row| row.get(0))?)
 }
 
 /// Move `due` to its next slot after a fire at `now`. `dispatched` is `true`
@@ -548,12 +537,12 @@ pub fn advance(conn: &Connection, due: &Due, now: i64, dispatched: bool) -> Sqli
     let slot = to_time(due.slot);
     let next = schedule_plan::next_slot_after_fire(&due.schedule, slot, to_time(now))
         .map(jiff::Timestamp::as_millisecond);
-    conn.execute(
+    conn.prepare_cached(
         "UPDATE harvest_schedules SET next_run_at = ?2, \
            last_run_at = CASE WHEN ?3 THEN ?4 ELSE last_run_at END \
          WHERE workflow_name = ?1",
-        params![due.workflow_name, next, dispatched, due.slot],
-    )?;
+    )?
+    .execute(params![due.workflow_name, next, dispatched, due.slot])?;
     Ok(())
 }
 
@@ -594,19 +583,18 @@ pub struct Manual {
 /// The schedule `workflow_name` for a trigger, whatever its slot.
 pub fn load_manual(conn: &Connection, workflow_name: &str) -> SqliteResult<Option<Manual>> {
     let row = conn
-        .query_row(
+        .prepare_cached(
             "SELECT input_json, overlap_policy, max_active_runs, paused \
              FROM harvest_schedules WHERE workflow_name = ?1",
-            [workflow_name],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, bool>(3)?,
-                ))
-            },
-        )
+        )?
+        .query_row([workflow_name], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, bool>(3)?,
+            ))
+        })
         .optional()?;
     let Some((input, overlap, max_active_runs, paused)) = row else {
         return Ok(None);
