@@ -274,6 +274,8 @@ mod mutex_lease_reclaim_perf;
 mod mutex_terminal_sweep_db_tests;
 #[cfg(feature = "db")]
 mod mutex_tests;
+#[cfg(feature = "db")]
+mod mutex_waiter_holder_scan_perf;
 mod nd_block_tests;
 #[cfg(feature = "db")]
 mod notify_post_commit_tests;

@@ -1,0 +1,62 @@
+== up.sql on the 100,000-waiter fixture
+Timing is on.
+BEGIN
+Time: 0.263 ms
+SET
+Time: 0.122 ms
+DO
+Time: 51.401 ms
+ locktype |       relation        |   mode    
+----------+-----------------------+-----------
+ relation | harvest_mutex_waiters | ShareLock
+(1 row)
+
+Time: 1.185 ms
+COMMIT
+Time: 5.440 ms
+index size bytes: 3178496
+== up.sql again, with the index present
+Timing is on.
+BEGIN
+Time: 0.285 ms
+SET
+Time: 0.151 ms
+DO
+Time: 2.209 ms
+COMMIT
+Time: 0.119 ms
+== down.sql
+Timing is on.
+BEGIN
+Time: 0.194 ms
+SET
+Time: 0.098 ms
+DROP INDEX
+Time: 0.977 ms
+ locktype |       relation        |        mode         
+----------+-----------------------+---------------------
+ relation | harvest_mutex_waiters | AccessExclusiveLock
+(1 row)
+
+Time: 1.258 ms
+COMMIT
+Time: 4.294 ms
+== prebuilt CONCURRENTLY, then up.sql
+Timing is on.
+CREATE INDEX
+Time: 89.810 ms
+BEGIN
+Time: 0.177 ms
+SET
+Time: 0.124 ms
+DO
+Time: 1.788 ms
+COMMIT
+Time: 0.117 ms
+== wrong definition, then up.sql
+DROP INDEX
+CREATE INDEX
+BEGIN
+SET
+psql:20261121172305_harvest_mutex_waiters_waiter_index/up.sql:43: ERROR:  idx_harvest_mutex_waiters_waiter already exists with an unexpected definition -- rename or drop it before retrying this migration: CREATE INDEX idx_harvest_mutex_waiters_waiter ON public.harvest_mutex_waiters USING btree (lock_key)
+CONTEXT:  PL/pgSQL function inline_code_block line 16 at RAISE

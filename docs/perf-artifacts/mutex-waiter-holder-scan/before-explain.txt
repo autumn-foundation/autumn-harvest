@@ -1,0 +1,300 @@
+## 1000 fixture waiters, `without` arm
+
+### no-mutex execution
+
+    Sort  (cost=37.04..37.04 rows=2 width=15) (actual rows=0 loops=1)
+      Output: (0), harvest_mutex_locks.lock_key
+      Sort Key: (0), harvest_mutex_locks.lock_key
+      Sort Method: quicksort  Memory: 25kB
+      Buffers: shared hit=22
+      ->  Append  (cost=0.00..37.03 rows=2 width=15) (actual rows=0 loops=1)
+            Buffers: shared hit=22
+            ->  Seq Scan on public.harvest_mutex_locks  (cost=0.00..5.50 rows=1 width=13) (actual rows=0 loops=1)
+                  Output: 0, harvest_mutex_locks.lock_key
+                  Filter: (harvest_mutex_locks.holder_exec_id = $1)
+                  Rows Removed by Filter: 200
+                  Buffers: shared hit=3
+            ->  Unique  (cost=31.51..31.52 rows=1 width=17) (actual rows=0 loops=1)
+                  Output: 1, harvest_mutex_waiters.lock_key
+                  Buffers: shared hit=19
+                  ->  Sort  (cost=31.51..31.52 rows=1 width=17) (actual rows=0 loops=1)
+                        Output: 1, harvest_mutex_waiters.lock_key
+                        Sort Key: harvest_mutex_waiters.lock_key
+                        Sort Method: quicksort  Memory: 25kB
+                        Buffers: shared hit=19
+                        ->  Seq Scan on public.harvest_mutex_waiters  (cost=0.00..31.50 rows=1 width=17) (actual rows=0 loops=1)
+                              Output: 1, harvest_mutex_waiters.lock_key
+                              Filter: (harvest_mutex_waiters.waiter_exec_id = $1)
+                              Rows Removed by Filter: 1000
+                              Buffers: shared hit=19
+    Settings: plan_cache_mode = 'force_generic_plan'
+    Query Identifier: 3293878580710305693
+    Planning:
+      Buffers: shared hit=22
+    Planning Time: 0.303 ms
+    Execution Time: 0.264 ms
+
+### hot-key waiter
+
+    Sort  (cost=37.04..37.04 rows=2 width=15) (actual rows=1 loops=1)
+      Output: (0), harvest_mutex_locks.lock_key
+      Sort Key: (0), harvest_mutex_locks.lock_key
+      Sort Method: quicksort  Memory: 25kB
+      Buffers: shared hit=22
+      ->  Append  (cost=0.00..37.03 rows=2 width=15) (actual rows=1 loops=1)
+            Buffers: shared hit=22
+            ->  Seq Scan on public.harvest_mutex_locks  (cost=0.00..5.50 rows=1 width=13) (actual rows=0 loops=1)
+                  Output: 0, harvest_mutex_locks.lock_key
+                  Filter: (harvest_mutex_locks.holder_exec_id = $1)
+                  Rows Removed by Filter: 200
+                  Buffers: shared hit=3
+            ->  Unique  (cost=31.51..31.52 rows=1 width=17) (actual rows=1 loops=1)
+                  Output: 1, harvest_mutex_waiters.lock_key
+                  Buffers: shared hit=19
+                  ->  Sort  (cost=31.51..31.52 rows=1 width=17) (actual rows=1 loops=1)
+                        Output: 1, harvest_mutex_waiters.lock_key
+                        Sort Key: harvest_mutex_waiters.lock_key
+                        Sort Method: quicksort  Memory: 25kB
+                        Buffers: shared hit=19
+                        ->  Seq Scan on public.harvest_mutex_waiters  (cost=0.00..31.50 rows=1 width=17) (actual rows=1 loops=1)
+                              Output: 1, harvest_mutex_waiters.lock_key
+                              Filter: (harvest_mutex_waiters.waiter_exec_id = $1)
+                              Rows Removed by Filter: 999
+                              Buffers: shared hit=19
+    Settings: plan_cache_mode = 'force_generic_plan'
+    Query Identifier: 3293878580710305693
+    Planning:
+      Buffers: shared hit=39
+    Planning Time: 0.169 ms
+    Execution Time: 0.159 ms
+
+### one-row key holder
+
+    Sort  (cost=37.04..37.04 rows=2 width=15) (actual rows=2 loops=1)
+      Output: (0), harvest_mutex_locks.lock_key
+      Sort Key: (0), harvest_mutex_locks.lock_key
+      Sort Method: quicksort  Memory: 25kB
+      Buffers: shared hit=22
+      ->  Append  (cost=0.00..37.03 rows=2 width=15) (actual rows=2 loops=1)
+            Buffers: shared hit=22
+            ->  Seq Scan on public.harvest_mutex_locks  (cost=0.00..5.50 rows=1 width=13) (actual rows=1 loops=1)
+                  Output: 0, harvest_mutex_locks.lock_key
+                  Filter: (harvest_mutex_locks.holder_exec_id = $1)
+                  Rows Removed by Filter: 199
+                  Buffers: shared hit=3
+            ->  Unique  (cost=31.51..31.52 rows=1 width=17) (actual rows=1 loops=1)
+                  Output: 1, harvest_mutex_waiters.lock_key
+                  Buffers: shared hit=19
+                  ->  Sort  (cost=31.51..31.52 rows=1 width=17) (actual rows=1 loops=1)
+                        Output: 1, harvest_mutex_waiters.lock_key
+                        Sort Key: harvest_mutex_waiters.lock_key
+                        Sort Method: quicksort  Memory: 25kB
+                        Buffers: shared hit=19
+                        ->  Seq Scan on public.harvest_mutex_waiters  (cost=0.00..31.50 rows=1 width=17) (actual rows=1 loops=1)
+                              Output: 1, harvest_mutex_waiters.lock_key
+                              Filter: (harvest_mutex_waiters.waiter_exec_id = $1)
+                              Rows Removed by Filter: 999
+                              Buffers: shared hit=19
+    Settings: plan_cache_mode = 'force_generic_plan'
+    Query Identifier: 3293878580710305693
+    Planning Time: 0.051 ms
+    Execution Time: 0.137 ms
+
+## 10000 fixture waiters, `without` arm
+
+### no-mutex execution
+
+    Sort  (cost=320.33..320.34 rows=2 width=16) (actual rows=0 loops=1)
+      Output: (0), harvest_mutex_locks.lock_key
+      Sort Key: (0), harvest_mutex_locks.lock_key
+      Sort Method: quicksort  Memory: 25kB
+      Buffers: shared hit=189
+      ->  Append  (cost=0.28..320.32 rows=2 width=16) (actual rows=0 loops=1)
+            Buffers: shared hit=189
+            ->  Index Scan using idx_harvest_mutex_locks_holder on public.harvest_mutex_locks  (cost=0.28..8.30 rows=1 width=14) (actual rows=0 loops=1)
+                  Output: 0, harvest_mutex_locks.lock_key
+                  Index Cond: (harvest_mutex_locks.holder_exec_id = $1)
+                  Buffers: shared hit=2
+            ->  Unique  (cost=312.01..312.02 rows=1 width=17) (actual rows=0 loops=1)
+                  Output: 1, harvest_mutex_waiters.lock_key
+                  Buffers: shared hit=187
+                  ->  Sort  (cost=312.01..312.01 rows=1 width=17) (actual rows=0 loops=1)
+                        Output: 1, harvest_mutex_waiters.lock_key
+                        Sort Key: harvest_mutex_waiters.lock_key
+                        Sort Method: quicksort  Memory: 25kB
+                        Buffers: shared hit=187
+                        ->  Seq Scan on public.harvest_mutex_waiters  (cost=0.00..312.00 rows=1 width=17) (actual rows=0 loops=1)
+                              Output: 1, harvest_mutex_waiters.lock_key
+                              Filter: (harvest_mutex_waiters.waiter_exec_id = $1)
+                              Rows Removed by Filter: 10000
+                              Buffers: shared hit=187
+    Settings: plan_cache_mode = 'force_generic_plan'
+    Query Identifier: 5943700025951057820
+    Planning:
+      Buffers: shared hit=12
+    Planning Time: 0.183 ms
+    Execution Time: 0.783 ms
+
+### hot-key waiter
+
+    Sort  (cost=320.33..320.34 rows=2 width=16) (actual rows=1 loops=1)
+      Output: (0), harvest_mutex_locks.lock_key
+      Sort Key: (0), harvest_mutex_locks.lock_key
+      Sort Method: quicksort  Memory: 25kB
+      Buffers: shared hit=189
+      ->  Append  (cost=0.28..320.32 rows=2 width=16) (actual rows=1 loops=1)
+            Buffers: shared hit=189
+            ->  Index Scan using idx_harvest_mutex_locks_holder on public.harvest_mutex_locks  (cost=0.28..8.30 rows=1 width=14) (actual rows=0 loops=1)
+                  Output: 0, harvest_mutex_locks.lock_key
+                  Index Cond: (harvest_mutex_locks.holder_exec_id = $1)
+                  Buffers: shared hit=2
+            ->  Unique  (cost=312.01..312.02 rows=1 width=17) (actual rows=1 loops=1)
+                  Output: 1, harvest_mutex_waiters.lock_key
+                  Buffers: shared hit=187
+                  ->  Sort  (cost=312.01..312.01 rows=1 width=17) (actual rows=1 loops=1)
+                        Output: 1, harvest_mutex_waiters.lock_key
+                        Sort Key: harvest_mutex_waiters.lock_key
+                        Sort Method: quicksort  Memory: 25kB
+                        Buffers: shared hit=187
+                        ->  Seq Scan on public.harvest_mutex_waiters  (cost=0.00..312.00 rows=1 width=17) (actual rows=1 loops=1)
+                              Output: 1, harvest_mutex_waiters.lock_key
+                              Filter: (harvest_mutex_waiters.waiter_exec_id = $1)
+                              Rows Removed by Filter: 9999
+                              Buffers: shared hit=187
+    Settings: plan_cache_mode = 'force_generic_plan'
+    Query Identifier: 5943700025951057820
+    Planning:
+      Buffers: shared hit=7
+    Planning Time: 0.070 ms
+    Execution Time: 0.823 ms
+
+### one-row key holder
+
+    Sort  (cost=320.33..320.34 rows=2 width=16) (actual rows=2 loops=1)
+      Output: (0), harvest_mutex_locks.lock_key
+      Sort Key: (0), harvest_mutex_locks.lock_key
+      Sort Method: quicksort  Memory: 25kB
+      Buffers: shared hit=190
+      ->  Append  (cost=0.28..320.32 rows=2 width=16) (actual rows=2 loops=1)
+            Buffers: shared hit=190
+            ->  Index Scan using idx_harvest_mutex_locks_holder on public.harvest_mutex_locks  (cost=0.28..8.30 rows=1 width=14) (actual rows=1 loops=1)
+                  Output: 0, harvest_mutex_locks.lock_key
+                  Index Cond: (harvest_mutex_locks.holder_exec_id = $1)
+                  Buffers: shared hit=3
+            ->  Unique  (cost=312.01..312.02 rows=1 width=17) (actual rows=1 loops=1)
+                  Output: 1, harvest_mutex_waiters.lock_key
+                  Buffers: shared hit=187
+                  ->  Sort  (cost=312.01..312.01 rows=1 width=17) (actual rows=1 loops=1)
+                        Output: 1, harvest_mutex_waiters.lock_key
+                        Sort Key: harvest_mutex_waiters.lock_key
+                        Sort Method: quicksort  Memory: 25kB
+                        Buffers: shared hit=187
+                        ->  Seq Scan on public.harvest_mutex_waiters  (cost=0.00..312.00 rows=1 width=17) (actual rows=1 loops=1)
+                              Output: 1, harvest_mutex_waiters.lock_key
+                              Filter: (harvest_mutex_waiters.waiter_exec_id = $1)
+                              Rows Removed by Filter: 9999
+                              Buffers: shared hit=187
+    Settings: plan_cache_mode = 'force_generic_plan'
+    Query Identifier: 5943700025951057820
+    Planning Time: 0.030 ms
+    Execution Time: 0.617 ms
+
+## 100000 fixture waiters, `without` arm
+
+### no-mutex execution
+
+    Sort  (cost=3128.34..3128.35 rows=2 width=16) (actual rows=0 loops=1)
+      Output: (0), harvest_mutex_locks.lock_key
+      Sort Key: (0), harvest_mutex_locks.lock_key
+      Sort Method: quicksort  Memory: 25kB
+      Buffers: shared hit=1872
+      ->  Append  (cost=0.29..3128.33 rows=2 width=16) (actual rows=0 loops=1)
+            Buffers: shared hit=1872
+            ->  Index Scan using idx_harvest_mutex_locks_holder on public.harvest_mutex_locks  (cost=0.29..8.30 rows=1 width=15) (actual rows=0 loops=1)
+                  Output: 0, harvest_mutex_locks.lock_key
+                  Index Cond: (harvest_mutex_locks.holder_exec_id = $1)
+                  Buffers: shared hit=2
+            ->  Unique  (cost=3120.01..3120.02 rows=1 width=17) (actual rows=0 loops=1)
+                  Output: 1, harvest_mutex_waiters.lock_key
+                  Buffers: shared hit=1870
+                  ->  Sort  (cost=3120.01..3120.02 rows=1 width=17) (actual rows=0 loops=1)
+                        Output: 1, harvest_mutex_waiters.lock_key
+                        Sort Key: harvest_mutex_waiters.lock_key
+                        Sort Method: quicksort  Memory: 25kB
+                        Buffers: shared hit=1870
+                        ->  Seq Scan on public.harvest_mutex_waiters  (cost=0.00..3120.00 rows=1 width=17) (actual rows=0 loops=1)
+                              Output: 1, harvest_mutex_waiters.lock_key
+                              Filter: (harvest_mutex_waiters.waiter_exec_id = $1)
+                              Rows Removed by Filter: 100000
+                              Buffers: shared hit=1870
+    Settings: plan_cache_mode = 'force_generic_plan'
+    Query Identifier: 5477376688329965382
+    Planning:
+      Buffers: shared hit=12
+    Planning Time: 0.267 ms
+    Execution Time: 10.014 ms
+
+### hot-key waiter
+
+    Sort  (cost=3128.34..3128.35 rows=2 width=16) (actual rows=1 loops=1)
+      Output: (0), harvest_mutex_locks.lock_key
+      Sort Key: (0), harvest_mutex_locks.lock_key
+      Sort Method: quicksort  Memory: 25kB
+      Buffers: shared hit=1872
+      ->  Append  (cost=0.29..3128.33 rows=2 width=16) (actual rows=1 loops=1)
+            Buffers: shared hit=1872
+            ->  Index Scan using idx_harvest_mutex_locks_holder on public.harvest_mutex_locks  (cost=0.29..8.30 rows=1 width=15) (actual rows=0 loops=1)
+                  Output: 0, harvest_mutex_locks.lock_key
+                  Index Cond: (harvest_mutex_locks.holder_exec_id = $1)
+                  Buffers: shared hit=2
+            ->  Unique  (cost=3120.01..3120.02 rows=1 width=17) (actual rows=1 loops=1)
+                  Output: 1, harvest_mutex_waiters.lock_key
+                  Buffers: shared hit=1870
+                  ->  Sort  (cost=3120.01..3120.02 rows=1 width=17) (actual rows=1 loops=1)
+                        Output: 1, harvest_mutex_waiters.lock_key
+                        Sort Key: harvest_mutex_waiters.lock_key
+                        Sort Method: quicksort  Memory: 25kB
+                        Buffers: shared hit=1870
+                        ->  Seq Scan on public.harvest_mutex_waiters  (cost=0.00..3120.00 rows=1 width=17) (actual rows=1 loops=1)
+                              Output: 1, harvest_mutex_waiters.lock_key
+                              Filter: (harvest_mutex_waiters.waiter_exec_id = $1)
+                              Rows Removed by Filter: 99999
+                              Buffers: shared hit=1870
+    Settings: plan_cache_mode = 'force_generic_plan'
+    Query Identifier: 5477376688329965382
+    Planning:
+      Buffers: shared hit=7
+    Planning Time: 0.124 ms
+    Execution Time: 10.482 ms
+
+### one-row key holder
+
+    Sort  (cost=3128.34..3128.35 rows=2 width=16) (actual rows=2 loops=1)
+      Output: (0), harvest_mutex_locks.lock_key
+      Sort Key: (0), harvest_mutex_locks.lock_key
+      Sort Method: quicksort  Memory: 25kB
+      Buffers: shared hit=1873
+      ->  Append  (cost=0.29..3128.33 rows=2 width=16) (actual rows=2 loops=1)
+            Buffers: shared hit=1873
+            ->  Index Scan using idx_harvest_mutex_locks_holder on public.harvest_mutex_locks  (cost=0.29..8.30 rows=1 width=15) (actual rows=1 loops=1)
+                  Output: 0, harvest_mutex_locks.lock_key
+                  Index Cond: (harvest_mutex_locks.holder_exec_id = $1)
+                  Buffers: shared hit=3
+            ->  Unique  (cost=3120.01..3120.02 rows=1 width=17) (actual rows=1 loops=1)
+                  Output: 1, harvest_mutex_waiters.lock_key
+                  Buffers: shared hit=1870
+                  ->  Sort  (cost=3120.01..3120.02 rows=1 width=17) (actual rows=1 loops=1)
+                        Output: 1, harvest_mutex_waiters.lock_key
+                        Sort Key: harvest_mutex_waiters.lock_key
+                        Sort Method: quicksort  Memory: 25kB
+                        Buffers: shared hit=1870
+                        ->  Seq Scan on public.harvest_mutex_waiters  (cost=0.00..3120.00 rows=1 width=17) (actual rows=1 loops=1)
+                              Output: 1, harvest_mutex_waiters.lock_key
+                              Filter: (harvest_mutex_waiters.waiter_exec_id = $1)
+                              Rows Removed by Filter: 99999
+                              Buffers: shared hit=1870
+    Settings: plan_cache_mode = 'force_generic_plan'
+    Query Identifier: 5477376688329965382
+    Planning Time: 0.057 ms
+    Execution Time: 10.412 ms
+
