@@ -1250,8 +1250,8 @@ fn target_is_held(fact: &PassFact, blocks: &[MemoryBlock], label: &str) -> bool 
 ///
 /// A replace or a remove is an edit (ADR 0020). The write drops an edit
 /// that it may not apply, and it consumes the sources of a dropped edit.
-/// The causes are a remove of an entry with more labels than the pass, a
-/// target that another writer changed, and a target that is gone. A replace that does not fit is a refusal,
+/// It drops a remove of an entry with more labels than the pass. It drops
+/// an edit whose target another writer changed, or whose target is gone. A replace that does not fit is a refusal,
 /// as an add is.
 pub(crate) async fn write_facts(
     harness: &AgentHarness,
@@ -2067,7 +2067,7 @@ mod tests {
         let block = held(&memory).await;
         assert_eq!(
             block.entries,
-            [extended.clone()],
+            std::slice::from_ref(&extended),
             "the extended entry stays"
         );
         assert!(block.labels.get(&extended).unwrap().contains("secret"));
