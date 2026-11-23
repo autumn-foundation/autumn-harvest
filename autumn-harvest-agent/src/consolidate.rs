@@ -1178,18 +1178,35 @@ fn entry_labels(block: &MemoryBlock, entry: &str) -> BTreeSet<String> {
 
 /// Why the write drops the edit `fact`, or `None` when it may apply.
 ///
+/// The store matches `old` as a substring, as [`apply_op`] does. So the
+/// check resolves every entry that the edit would match, not only an equal
+/// one. Another writer can extend the target while the pass runs. The
+/// extended entry still contains the old text, and it can carry a new
+/// label. So the write drops an edit when a match differs from its target.
+///
 /// A remove of an entry with a label that the pass lacks would take the
 /// taint out of the block with the entry. That launders the taint, so the
 /// write drops it. A replace keeps the labels of its target, so it needs
-/// no such check. A target that is gone is no drop here: the store gives
+/// no such check. A target with no match is no drop here: the store gives
 /// the answer, so a retry of an applied edit finds its key.
+///
+/// [`apply_op`]: crate::memory::apply_op
 fn edit_drop(fact: &PassFact, blocks: &[MemoryBlock], write: &FactWrite) -> Option<String> {
     let target = fact.target.as_deref()?;
-    if fact.verb != FactVerb::Remove {
-        return None;
-    }
     let block = blocks.iter().find(|block| block.label == write.block)?;
-    if !block.entries.iter().any(|entry| entry == target) {
+    let matches: Vec<&String> = block
+        .entries
+        .iter()
+        .filter(|entry| entry.contains(target))
+        .collect();
+    let verb = fact.verb.as_str();
+    let hash = fact_hash(target);
+    if matches.iter().any(|entry| *entry != target) {
+        return Some(format!(
+            "{verb} of fact {hash} dropped: the entry changed during the pass"
+        ));
+    }
+    if fact.verb != FactVerb::Remove || matches.is_empty() {
         return None;
     }
     let extra: Vec<String> = entry_labels(block, target)
@@ -1201,27 +1218,22 @@ fn edit_drop(fact: &PassFact, blocks: &[MemoryBlock], write: &FactWrite) -> Opti
     }
     Some(crate::agent::cut(
         &format!(
-            "remove of fact {} dropped: the entry has the labels [{}] that the pass lacks",
-            fact_hash(target),
+            "remove of fact {hash} dropped: the entry has the labels [{}] that the pass lacks",
             extra.join(", ")
         ),
         MAX_REFUSAL_BYTES,
     ))
 }
 
-/// The target of the edit `fact` has one match in the block `label` of
-/// `blocks`, by the rule of [`apply_op`](crate::memory::apply_op).
-fn target_is_unique(fact: &PassFact, blocks: &[MemoryBlock], label: &str) -> bool {
+/// The target of the edit `fact` has a match in the block `label`.
+fn target_is_held(fact: &PassFact, blocks: &[MemoryBlock], label: &str) -> bool {
     let (Some(target), Some(block)) = (
         fact.target.as_deref(),
         blocks.iter().find(|block| block.label == label),
     ) else {
         return false;
     };
-    let mut matches = block.entries.iter().filter(|entry| entry.contains(target));
-    matches
-        .next()
-        .is_some_and(|first| matches.all(|other| other == first))
+    block.entries.iter().any(|entry| entry.contains(target))
 }
 
 /// Write the facts of a pass, then mark its episodes.
@@ -1238,8 +1250,8 @@ fn target_is_unique(fact: &PassFact, blocks: &[MemoryBlock], label: &str) -> boo
 ///
 /// A replace or a remove is an edit (ADR 0020). The write drops an edit
 /// that it may not apply, and it consumes the sources of a dropped edit.
-/// The causes are a remove of an entry with more labels than the pass,
-/// and a target that is gone. A replace that does not fit is a refusal,
+/// The causes are a remove of an entry with more labels than the pass, a
+/// target that another writer changed, and a target that is gone. A replace that does not fit is a refusal,
 /// as an add is.
 pub(crate) async fn write_facts(
     harness: &AgentHarness,
@@ -1273,7 +1285,7 @@ pub(crate) async fn write_facts(
                     out.edit_drops.push(reason);
                     continue;
                 }
-                !target_is_unique(fact, &blocks, &write.block)
+                !target_is_held(fact, &blocks, &write.block)
             };
             let applied = harness
                 .hooked_agent(
@@ -2006,6 +2018,59 @@ mod tests {
         assert!(written.edit_drops.iter().all(|r| !r.contains("bob")));
         assert_eq!(written.refusals.len(), 0);
         assert_eq!(held(&memory).await.entries.len(), 1);
+        let log = episodes.load(&read.episode_scope).await.unwrap();
+        assert_eq!(log.pending(10).len(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_edit_of_an_extended_target_is_dropped() {
+        use crate::episode::EpisodeStore;
+        let entry = "ada likes tea [episodes: e0]";
+        let (harness, memory, episodes, read) = edit_fixture(entry, &[]).await;
+        // A tainted writer extends the entry while the pass runs. The new
+        // entry still contains the target text.
+        let extended = format!("{entry} and secrets");
+        let replace = MemoryOp::Replace {
+            block: "memory".to_owned(),
+            old: entry.to_owned(),
+            text: extended.clone(),
+        };
+        crate::memory::MemoryStore::apply_labelled(
+            memory.as_ref(),
+            &MemoryScope::new("agent:desk/d1"),
+            replace,
+            &EditKey::new("tainted-run"),
+            &BTreeSet::from(["secret".to_owned()]),
+        )
+        .await
+        .unwrap();
+        let write = edit_write(
+            &read,
+            vec![
+                PassFact::remove(entry.to_owned(), Vec::new()),
+                PassFact::replace(
+                    entry.to_owned(),
+                    "ada likes coffee [episodes: e1]".to_owned(),
+                    vec!["e1".to_owned()],
+                ),
+            ],
+        );
+        let written = write_facts(&harness, write).await.unwrap();
+        assert_eq!(written.removed, 0);
+        assert_eq!(written.written, 0);
+        assert_eq!(written.edit_drops.len(), 2, "{:?}", written.edit_drops);
+        assert!(
+            written.edit_drops.iter().all(|r| r.contains("changed")),
+            "{:?}",
+            written.edit_drops
+        );
+        let block = held(&memory).await;
+        assert_eq!(
+            block.entries,
+            [extended.clone()],
+            "the extended entry stays"
+        );
+        assert!(block.labels.get(&extended).unwrap().contains("secret"));
         let log = episodes.load(&read.episode_scope).await.unwrap();
         assert_eq!(log.pending(10).len(), 0);
     }

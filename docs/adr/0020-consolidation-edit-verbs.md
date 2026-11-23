@@ -65,12 +65,15 @@ Accepted. littleguy idea #13 proposed it. The owner accepted it on
    serializes as before, and its edit key keeps the form
    `<pass>:<fact_hash>`. A replace or a remove puts its verb and target
    hash in its key.
-6. The write guards each remove. It loads the block first. When the
-   target has a label that the pass lacks, the write drops the remove and
-   keeps the entry. The step 3 filter makes this rare: it needs a write
+6. The write guards each remove. It loads the block first. The store
+   matches `old` as a substring, so the write resolves every entry that
+   the edit would match. When a match differs from the target, another
+   writer changed it, and the write drops the edit. When the target has a
+   label that the pass lacks, the write drops the remove and keeps the
+   entry. The step 3 filter makes this rare: it needs a write
    that adds a label to the entry while the pass runs.
 7. A dropped edit consumes its sources. The causes are the guard of
-   step 6 and a target that is gone. A retry finds the same state, so to
+   step 6, a target that changed and a target that is gone. A retry finds the same state, so to
    keep the sources would repeat the drop at each pass. An add that the
    store refuses, and a replace that does not fit, still keep their
    sources, as before.
