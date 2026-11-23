@@ -174,6 +174,13 @@ impl DagSlackAnalyzer {
 }
 
 /// Convert nanoseconds to a `Duration`, saturating at `Duration::MAX`.
+///
+/// Clone-class note: [`crate::dag_crash`] and [`crate::dag_leverage`] each
+/// define a private copy of this function instead of importing this one,
+/// the way [`crate::dag_retry_envelope`] does. Three instances exist, but
+/// this session's clone holds only 50 commits, so no co-change or
+/// missed-fix evidence covers the gap. Apply a behavior change here to
+/// both private copies too, or migrate them to import this function.
 pub(crate) fn to_duration(nanos: u128) -> Duration {
     u64::try_from(nanos / 1_000_000_000).map_or(Duration::MAX, |secs| {
         // The remainder is below 1e9, so it fits in `u32`.
