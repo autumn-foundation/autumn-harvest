@@ -37,3 +37,4 @@ them.
 | [0017](0017-inference-strategies.md) | Inference strategies are workflows over durable child runs |
 | [0018](0018-jiff-date-and-time.md) | Dates and times use jiff |
 | [0019](0019-sqlite-drive-path.md) | The SQLite drive path keeps plans, history and one sync fewer |
+| [0020](0020-consolidation-edit-verbs.md) | A consolidation pass can replace and remove facts |

@@ -2126,6 +2126,16 @@ fn support(
   budget of the agent mesh (issue #2272). It then calls the model once, and records one cost ledger call under the pass
   run. Each valid fact becomes one entry of `facts_block`:
   `<subject> <relation> <object> [episodes: <id>, ...]`.
+- **Edits.** A fact has a verb: `add`, `replace` or `remove` (ADR 0020).
+  No verb means `add`. The request lists each entry of `facts_block`
+  whose labels are a subset of the pass labels, as `<fact id="f1">`. A
+  replace or a remove names one of those ids. A remove also names the
+  subject of its entry, and needs no episode. The write drops a remove of
+  an entry with a label that the pass lacks, and an edit whose target is
+  gone. A dropped edit consumes its episodes. The report counts it under
+  `edits_dropped`, with a reason in `edit_drops`.
+- **Dates.** Each episode in the request has a UTC `date`. The pass writes
+  a value that can change, such as a setting, as of that date.
 - **Output cap.** The engine sets no cap on the reply of a pass. An app
   sets one with `EpisodeSettings::max_pass_output_tokens(n)` (issue #2695).
   0 sets no cap. With no cap, the provider default applies: Anthropic
