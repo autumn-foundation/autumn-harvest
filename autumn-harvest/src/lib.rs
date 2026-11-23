@@ -551,6 +551,8 @@ pub mod schema_contract;
 pub mod sessions;
 /// Shape census: the usual and the rare paths over many runs.
 pub mod shape_census;
+/// Shape surprise: per-step transition surprise against a corpus of runs.
+pub mod shape_surprise;
 pub mod shard;
 /// A task-local fence on the shards one request may reach (issue #1803).
 pub mod shard_fence;
