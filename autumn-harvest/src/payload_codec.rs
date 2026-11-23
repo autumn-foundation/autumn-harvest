@@ -2741,6 +2741,48 @@ mod tests {
         assert_eq!(fields, 26, "one field per payload slot");
     }
 
+    /// A codec changes the payload fields of an event, and no other key.
+    ///
+    /// SQL reads the id keys of a stored event under a codec. The usage report
+    /// and `idx_harvest_events_activity_started_lookup` read `activity_id`. The
+    /// `external_*_resolved` indexes read `signal_id`, `cancel_id` and
+    /// `await_id`. A codec that wraps one of these keys breaks those reads
+    /// with no error. See `docs/rnd/2026-11-23-activity-pending-loader-deferral.md`.
+    #[test]
+    fn a_codec_leaves_every_non_payload_key_in_clear() {
+        let mut codecs = PayloadCodecs::default();
+        codecs.set_default(Arc::new(ReverseCodec));
+        let mut ids = 0;
+        for event in every_payload_bearing_event() {
+            let plain = serde_json::to_value(&event).expect("serialize");
+            let encoded = codecs.encode_event(&event).expect("encode");
+            assert_eq!(encoded["type"], plain["type"]);
+            let plain_data = plain["data"].as_object().expect("data object");
+            let encoded_data = encoded["data"].as_object().expect("data object");
+            assert_eq!(
+                encoded_data.keys().collect::<Vec<_>>(),
+                plain_data.keys().collect::<Vec<_>>(),
+                "{}",
+                event.type_name()
+            );
+            for (key, value) in plain_data {
+                if crate::payload_store::PAYLOAD_FIELD_KEYS.contains(&key.as_str()) {
+                    continue;
+                }
+                assert_eq!(
+                    &encoded_data[key],
+                    value,
+                    "{} changed `{key}` under a codec",
+                    event.type_name()
+                );
+                if key.ends_with("_id") {
+                    ids += 1;
+                }
+            }
+        }
+        assert!(ids > 0, "the fixture holds no id key");
+    }
+
     /// A null payload and a key that the variant lacks both read as serde
     /// reads them.
     #[test]

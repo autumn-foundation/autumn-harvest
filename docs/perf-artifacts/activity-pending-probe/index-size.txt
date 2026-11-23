@@ -1,0 +1,1 @@
+candidate_index_size=22 MB started_lookup_size=32 MB
