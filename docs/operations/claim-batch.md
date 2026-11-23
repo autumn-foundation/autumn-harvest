@@ -1,4 +1,4 @@
-# Batch claim (issue #2693)
+# Batch claim
 
 A claim statement takes one task row by default. When almost every claim
 finds a row, the claim loop sets the throughput of a worker. A batch claim

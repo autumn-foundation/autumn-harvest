@@ -385,11 +385,11 @@ timers do (issue #2276). A `run_until_blocked_as_of` drive therefore keeps one
 clock: the timers, the activities, the ledger rows and the clock reads all use
 the time that the call names.
 
-### The stack of the caller thread (issue #2752)
+### The stack of the caller thread
 
 The runtime polls each workflow on the thread that awaits the drive. A debug
 build makes large poll frames, so that thread needs room. The Windows main
-thread has 1 MiB, and a durable agent op overflowed it before issue #2752.
+thread has 1 MiB, and a durable agent op could overflow it.
 
 The engine builds its large child futures on the heap, with
 [`autumn_harvest::frame::boxed`](../autumn-harvest/src/frame.rs). The

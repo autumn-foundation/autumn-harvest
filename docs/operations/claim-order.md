@@ -1,4 +1,4 @@
-# Claim order under overload (issue #1824)
+# Claim order under overload
 
 A worker claims tasks from a queue in a fixed order. Under overload, two
 rules keep in-flight work moving:
