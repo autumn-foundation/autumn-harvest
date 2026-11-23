@@ -3463,6 +3463,20 @@ enum DeadLetterCommand {
     ///
     /// At least one filter criterion must be provided. Use --dry-run to preview
     /// matching rows without performing any writes.
+    ///
+    /// Clone-class note: the eleven-field filter list below (`activity_name`
+    /// through `dry_run`) repeats verbatim in
+    /// [`DeadLetterCommand::BulkDiscard`]. jscpd (min-tokens 50) pairs the
+    /// two at 173 tokens, 35 lines. Apply any filter-field change to both
+    /// variants.
+    ///
+    /// Two instances only. This session's git history is shallow (50
+    /// commits), so no co-change or missed-fix evidence is available. The
+    /// merge-evidence bar (rule of three, or a missed-fix) is not met, so
+    /// the duplication stays. `dead_letter_request` already shares the
+    /// downstream mapping through `build_bulk_dlq_body`; only this field
+    /// declaration list is unmerged. Re-run jscpd before retrying, so a
+    /// missed-fix or a third instance is not missed.
     BulkReplay {
         /// Exact match on activity name.
         #[arg(long)]
@@ -3555,6 +3569,11 @@ enum DeadLetterCommand {
     ///
     /// At least one filter criterion must be provided. Use --dry-run to preview
     /// matching rows without performing any deletes.
+    ///
+    /// Clone-class note: the eleven-field filter list below repeats verbatim
+    /// in [`DeadLetterCommand::BulkReplay`]. Two instances only, so the
+    /// merge-evidence bar is not met. See the note on
+    /// [`DeadLetterCommand::BulkReplay`].
     BulkDiscard {
         /// Exact match on activity name.
         #[arg(long)]
