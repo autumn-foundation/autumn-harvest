@@ -55,7 +55,7 @@ jobs:
         timeout-minutes: 2
       # The same cargo-deny version as the `dependency-audit` gate in ci.yml.
       # A test checks that the two agree.
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         timeout-minutes: 3
         with:
           tool: cargo-deny@0.20.2
