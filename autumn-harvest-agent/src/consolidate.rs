@@ -1183,6 +1183,8 @@ fn entry_labels(block: &MemoryBlock, entry: &str) -> BTreeSet<String> {
 /// one. Another writer can extend the target while the pass runs. The
 /// extended entry still contains the old text, and it can carry a new
 /// label. So the write drops an edit when a match differs from its target.
+/// The new entry of a replace is the exception, so a retry stays
+/// idempotent.
 ///
 /// A remove of an entry with a label that the pass lacks would take the
 /// taint out of the block with the entry. That launders the taint, so the
@@ -1201,7 +1203,11 @@ fn edit_drop(fact: &PassFact, blocks: &[MemoryBlock], write: &FactWrite) -> Opti
         .collect();
     let verb = fact.verb.as_str();
     let hash = fact_hash(target);
-    if matches.iter().any(|entry| *entry != target) {
+    // A retry of an applied replace finds its own new entry, which can
+    // contain the target. That entry is no change by another writer. The
+    // store then finds the edit key and returns the stored result.
+    let own = |entry: &str| fact.verb == FactVerb::Replace && entry == fact.entry;
+    if matches.iter().any(|entry| *entry != target && !own(entry)) {
         return Some(format!(
             "{verb} of fact {hash} dropped: the entry changed during the pass"
         ));
@@ -2073,6 +2079,29 @@ mod tests {
         assert!(block.labels.get(&extended).unwrap().contains("secret"));
         let log = episodes.load(&read.episode_scope).await.unwrap();
         assert_eq!(log.pending(10).len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_retried_replace_that_contains_its_target_is_not_dropped() {
+        let entry = "ada likes tea";
+        let (harness, memory, _, read) = edit_fixture(entry, &[]).await;
+        let new = "ada likes tea every morning [episodes: e1]";
+        let write = edit_write(
+            &read,
+            vec![PassFact::replace(
+                entry.to_owned(),
+                new.to_owned(),
+                vec!["e1".to_owned()],
+            )],
+        );
+        let first = write_facts(&harness, write.clone()).await.unwrap();
+        assert_eq!(first.written, 1);
+        // A retry of the activity sees its own new entry, which contains
+        // the target text.
+        let again = write_facts(&harness, write).await.unwrap();
+        assert_eq!(again.written, 1, "{again:?}");
+        assert_eq!(again.edit_drops.len(), 0, "{:?}", again.edit_drops);
+        assert_eq!(held(&memory).await.entries, [new]);
     }
 
     #[tokio::test]
