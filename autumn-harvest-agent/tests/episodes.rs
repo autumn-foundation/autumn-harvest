@@ -720,6 +720,175 @@ async fn a_fact_from_a_labelled_episode_carries_its_labels() {
     assert_eq!(block.labels.get(entry), Some(&want));
 }
 
+/// Put `text` in the `memory` block with `labels`.
+async fn hold(store: &dyn MemoryStore, text: &str, labels: &[&str], key: &str) {
+    let labels: BTreeSet<String> = labels.iter().map(|l| (*l).to_owned()).collect();
+    let add = MemoryOp::Add {
+        block: "memory".to_owned(),
+        text: text.to_owned(),
+    };
+    store
+        .apply_labelled(&memory_scope(), add, &EditKey::new(key), &labels)
+        .await
+        .unwrap();
+}
+
+const STALE: &str = "agent memory capacity 2,200 characters [episodes: e0]";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pass_retracts_a_superseded_fact() {
+    let (_dir, db) = fresh_db();
+    let episodes = Arc::new(InMemoryEpisodeStore::default());
+    let memory = Arc::new(InMemoryMemoryStore::new());
+    hold(memory.as_ref(), STALE, &[], "seed").await;
+    hold(
+        memory.as_ref(),
+        "ada likes tea [episodes: e0]",
+        &[],
+        "seed2",
+    )
+    .await;
+    seed(
+        episodes.as_ref(),
+        &[episode("e1", "config shows memory_chars 32000", &[])],
+    )
+    .await;
+    // The model removes f1 and adds the newer value, dated.
+    let model = model(|ids| {
+        json!({"facts": [
+            {"verb": "remove", "fact": "f1", "subject": "agent memory capacity"},
+            {"subject": "agent", "relation": "memory capacity was",
+             "object": "32000 characters as of 2023-11-14", "episodes": ids},
+        ]})
+        .to_string()
+    });
+    let harness = AgentHarness::new(model.clone())
+        .memory(memory.clone())
+        .episodes(episodes.clone())
+        .agent(profile(Some(EpisodeSettings::default())));
+    let mut rt = runtime(&db, harness);
+    let exec = sqlite::consolidate(&mut rt, &agent()).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+
+    let sent = user_text(&model.requests()[0]);
+    assert!(
+        sent.contains(&format!("<fact id=\"f1\">{STALE}</fact>")),
+        "{sent}"
+    );
+    assert!(sent.contains("date=\"2023-11-14\""), "{sent}");
+    let report = report_of(&rt, exec).unwrap();
+    assert_eq!(report.stop, ConsolidationStop::Completed);
+    assert_eq!(report.facts_removed, 1);
+    assert_eq!(report.facts_written, 1);
+    assert_eq!(report.edits_dropped, 0);
+    assert_eq!(
+        facts(memory.as_ref()).await.entries,
+        [
+            "ada likes tea [episodes: e0]",
+            "agent memory capacity was 32000 characters as of 2023-11-14 [episodes: e1]",
+        ]
+    );
+    let log = episodes.load(&episode_scope()).await.unwrap();
+    assert_eq!(log.pending(10).len(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_remove_of_a_more_tainted_entry_is_dropped_and_its_episodes_consumed() {
+    let (_dir, db) = fresh_db();
+    let episodes = Arc::new(InMemoryEpisodeStore::default());
+    let memory = Arc::new(InMemoryMemoryStore::new());
+    hold(memory.as_ref(), STALE, &[], "seed").await;
+    seed(
+        episodes.as_ref(),
+        &[episode("e1", "config shows memory_chars 32000", &[])],
+    )
+    .await;
+    // While the model answers, a tainted run writes the same entry. The
+    // entry then has a label that the pass lacks.
+    let racer = memory.clone();
+    let model = TryFnModel::new(move |request| -> common::Reply {
+        assert!(is_pass(request), "only passes run here");
+        let labels: BTreeSet<String> = [LABEL.to_owned()].into();
+        let add = MemoryOp::Add {
+            block: "memory".to_owned(),
+            text: STALE.to_owned(),
+        };
+        futures::FutureExt::now_or_never(racer.apply_labelled(
+            &memory_scope(),
+            add,
+            &EditKey::new("tainted-run"),
+            &labels,
+        ))
+        .unwrap()
+        .unwrap();
+        let reply = json!({"facts": [
+            {"verb": "remove", "fact": "f1", "subject": "agent memory capacity"},
+        ]});
+        Ok(text_reply(&reply.to_string(), 40, 9))
+    });
+    let harness = AgentHarness::new(model.clone())
+        .memory(memory.clone())
+        .episodes(episodes.clone())
+        .agent(profile(Some(EpisodeSettings::default())));
+    let mut rt = runtime(&db, harness);
+    let exec = sqlite::consolidate(&mut rt, &agent()).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+
+    let report = report_of(&rt, exec).unwrap();
+    assert_eq!(report.stop, ConsolidationStop::Completed);
+    assert_eq!(report.facts_removed, 0);
+    assert_eq!(report.facts_refused, 0);
+    assert_eq!(report.edits_dropped, 1);
+    assert!(
+        report.edit_drops[0].contains(LABEL),
+        "{:?}",
+        report.edit_drops
+    );
+    let block = facts(memory.as_ref()).await;
+    assert_eq!(block.entries, [STALE], "the entry stays");
+    assert!(
+        block.labels.get(STALE).unwrap().contains(LABEL),
+        "with its taint"
+    );
+    let log = episodes.load(&episode_scope()).await.unwrap();
+    assert_eq!(log.pending(10).len(), 0, "the drop consumes the episode");
+
+    // The next pass has nothing to read, so it calls no model.
+    let next = sqlite::consolidate(&mut rt, &agent()).unwrap();
+    rt.run_until_blocked(next).await.unwrap();
+    assert_eq!(
+        report_of(&rt, next).unwrap().stop,
+        ConsolidationStop::NothingToDo
+    );
+    assert_eq!(model.requests().len(), 1, "no pass reads e1 again");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pass_never_reads_an_entry_with_more_labels() {
+    let (_dir, db) = fresh_db();
+    let episodes = Arc::new(InMemoryEpisodeStore::default());
+    let memory = Arc::new(InMemoryMemoryStore::new());
+    hold(memory.as_ref(), STALE, &[LABEL], "seed").await;
+    seed(episodes.as_ref(), &[episode("e1", "plain", &[])]).await;
+    // A blind guess at an id that the request never gave.
+    let model = model(|_| {
+        json!({"facts": [{"verb": "remove", "fact": "f1", "subject": "agent"}]}).to_string()
+    });
+    let harness = AgentHarness::new(model.clone())
+        .memory(memory.clone())
+        .episodes(episodes)
+        .agent(profile(Some(EpisodeSettings::default())));
+    let mut rt = runtime(&db, harness);
+    let exec = sqlite::consolidate(&mut rt, &agent()).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+
+    assert!(!user_text(&model.requests()[0]).contains("<fact"));
+    let report = report_of(&rt, exec).unwrap();
+    assert_eq!(report.facts_rejected, 1);
+    assert_eq!(report.facts_removed, 0);
+    assert_eq!(facts(memory.as_ref()).await.entries, [STALE]);
+}
+
 /// A memory store that keeps no labels and implements only `apply`.
 #[derive(Debug, Default)]
 struct PlainStore(InMemoryMemoryStore);

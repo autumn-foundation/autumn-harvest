@@ -1,0 +1,13 @@
+diff --git a/autumn-harvest-plugin/src/openapi.rs b/autumn-harvest-plugin/src/openapi.rs
+index 969ee84b..3acdbcef 100644
+--- a/autumn-harvest-plugin/src/openapi.rs
++++ b/autumn-harvest-plugin/src/openapi.rs
+@@ -83,7 +83,7 @@ pub struct OpenApiError(String);
+ /// The generated document, compiled in and served verbatim.
+ ///
+ /// Written by `cargo xtask dev regenerate-openapi`. Never edit it by hand.
+-const OPENAPI_JSON: &str = include_str!("../openapi.json");
++const OPENAPI_JSON: &str = include_str!(concat!(env!("OUT_DIR"), "/openapi.json"));
+ 
+ #[expect(clippy::expect_used, reason = "a unit test parses the generated file")]
+ static DOCUMENT: LazyLock<Value> = LazyLock::new(|| {

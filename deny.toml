@@ -131,21 +131,100 @@ ignore = [
     # anymore; `cargo tree --workspace --all-features` has zero h2 0.3.x
     # or 0.4.x-below-0.4.16 instances.
 
+    # RUSTSEC-2026-0592 — url 2.5.8, stack overflow in `Url::origin()` on
+    # deeply nested `blob:` URLs (each `blob:` prefix cost one recursive
+    # stack frame, uncapped). FIXED, not deferred: `cargo update -p url`
+    # (2.5.8 -> 2.5.9, the version named in the advisory's own fix) closes
+    # it for every instance in the graph — `url` resolves to one shared
+    # version workspace-wide, so this also fixes the copy reqwest, the AWS
+    # SDK, autumn-web and jsonwebtoken each pull transitively, not just a
+    # direct dependency's copy. Lockfile-only: `url = "2"` in
+    # autumn-harvest/Cargo.toml and autumn-harvest-cli/Cargo.toml needed no
+    # manifest change, and no other package version moved except
+    # form_urlencoded 1.2.2 -> 1.2.3 (url's own dependency, same advisory).
+    #
+    # Reachability in this repo's own code: NOT REACHABLE. `grep -rn
+    # '\.origin()'` across every `.rs` file in this repository (excluding
+    # `target/`) finds exactly two call sites, both in
+    # autumn-harvest-plugin: `remote_tasks.rs:261`
+    # (`response.url().origin() != endpoint.origin()`) and
+    # `vault_transit.rs:268` (`response.url().origin() != url.origin()`).
+    # Both compare the URL of a sent HTTP response against the URL we
+    # requested, to reject a cross-origin redirect. `response.url()` can
+    # only ever be `http` or `https`: reqwest's redirect policy
+    # (`reqwest-0.13.5/src/redirect.rs:320`) checks
+    # `next_url.scheme() != "http" && next_url.scheme() != "https"` and
+    # returns `Err(url_bad_scheme(..))` *before* following any redirect, so
+    # a `blob:` (or any other non-HTTP) `Location` never becomes
+    # `response.url()`. `endpoint`/`url` are each parsed from this
+    # process's own configuration (an RPC server endpoint, a Vault path),
+    # not from attacker input. The repo's other `url::Url`-returning public
+    # function, `completion_callback::validate_target_url`
+    # (autumn-harvest/src/completion_callback.rs:309), is the SSRF guard
+    # for operator-registered callback URLs; it rejects every scheme except
+    # `http`/`https` before returning the parsed `Url` and never calls
+    # `.origin()` on it at all.
+    #
+    # `url::Url` appears in autumn-harvest's own public API through that
+    # same function (`-> Result<url::Url, SsrfRejection>`), so this is also
+    # the "dependency whose types appear in the public surface" case: the
+    # advisory's fix is a pure behavior narrowing inside `Url::origin()`
+    # (opaque origin instead of a stack overflow on a scheme `url` 2.x's
+    # own public API already classifies as non-http/https/file); it adds
+    # and removes no public item, so the bump carries no breaking surface
+    # for a consumer of this crate's API either. Flagged here per the
+    # project's own "ask before bumping a dependency in the public API"
+    # rule rather than pushed without a note.
+    #
+    # The one path this repo cannot determine on its own: autumn-web (an
+    # external dependency, examples-only here) calls `.origin()` in a few
+    # places of its own, including `aeo/web_bot_auth.rs` on a
+    # `Signature-Agent` value that can come from an inbound request header
+    # on a host app's server — the same "undetermined from this repo
+    # alone" shape as RUSTSEC-2023-0071 and RUSTSEC-2026-0387 above. The
+    # `url` bump fixes autumn-web's copy too (one shared `url` version in
+    # the lock graph), so this is moot for the fix itself; recorded only so
+    # a future revisit of autumn-web's own advisories has the pointer.
+    #
+    # Rehearsal: `cargo deny --all-features check` ok (0 advisories,
+    # 0 duplicate-item warnings after the RUSTSEC-2026-0440/-0441 collapse
+    # below). `cargo check --workspace --all-features --locked` green
+    # after installing this sandbox's missing `libcurl4-openssl-dev`
+    # (needed only for `rdkafka-sys`'s vendored C build, unrelated to this
+    # change). Opened by the daily scan as issue #2783.
+
     # RUSTSEC-2026-0440 — astral-tokio-tar 0.6.4 is unmaintained (not a
-    # vulnerability). Pulled only by testcontainers, a dev dependency, and
-    # by the opt-in `test-utils` feature of autumn-harvest-redis. No shipped
-    # binary links it. "No safe upgrade is available" per the advisory.
-    # Revisit: when testcontainers moves to a maintained tar crate.
-    { id = "RUSTSEC-2026-0440", reason = "unmaintained, no safe upgrade exists; reached only through testcontainers (dev dependency and the opt-in test-utils feature), never shipped. Revisit: testcontainers moves to a maintained tar crate." },
+    # vulnerability). Astral ended maintenance on 2026-11-03, and the
+    # advisory names no safe upgrade. Only testcontainers 0.27.3 pulls it
+    # in, reached two ways: this repo's own dev-dependencies (tests), and
+    # the opt-in `test-utils` feature of autumn-harvest-redis plus the
+    # `test-support` feature of autumn-web, both turned on only by those
+    # dev-dependencies. No code here calls the crate, and no shipped
+    # binary links it. Revisit: testcontainers moves to a maintained tar
+    # crate, or a maintained fork appears.
+    #
+    # Ballast note (2026-11-23): three near-identical ignore entries for
+    # this id had accumulated here over time, each written without
+    # noticing the others — `cargo deny check advisories -s` flags that
+    # as "duplicate items detected" (harmless to the verdict, since all
+    # three agreed, but see the RUSTSEC-2024-0449 note below for why a
+    # self-disagreeing ledger is still a process bug). Collapsed to this
+    # one entry, keeping the union of what each one had traced.
+    { id = "RUSTSEC-2026-0440", reason = "unmaintained, not a vulnerability, no safe upgrade: astral-tokio-tar arrives only through testcontainers, reached by this repo's own dev-dependencies and by autumn-harvest-redis's test-utils / autumn-web's test-support features (both dev-dependency-only). No code here calls it, and no release build holds it. Revisit: testcontainers moves to a maintained tar crate." },
 
     # RUSTSEC-2026-0441 — pin-utils 0.1.1 is unmaintained (not a
-    # vulnerability). The upstream repository was archived on 2026-10-01.
-    # Pulled only by third-party crates: the aws-smithy runtime of the AWS
-    # SDK, loom and wasmtimer. No crate in this repo uses it directly.
-    # "No safe upgrade is available" per the advisory.
+    # vulnerability). The upstream repository was archived on 2026-10-01,
+    # and the advisory names no safe upgrade. Three paths pull it in: the
+    # AWS SDK crates (aws-smithy-http, -runtime and -types) of the
+    # optional sqs, aws-kms and object-store features, loom (only under
+    # `--cfg loom`), and wasmtimer through postgresql_archive (only the
+    # `dev-runtime-managed` feature). No code here calls the crate.
     # Revisit: when aws-smithy, loom and wasmtimer move to
     # `core::pin::pin!` or pin-project-lite.
-    { id = "RUSTSEC-2026-0441", reason = "unmaintained, no safe upgrade exists; reached only through aws-smithy, loom and wasmtimer, never used directly here. Revisit: those crates move to core::pin::pin! or pin-project-lite." },
+    #
+    # Ballast note (2026-11-23): same collapse as RUSTSEC-2026-0440 above,
+    # three duplicate entries down to one.
+    { id = "RUSTSEC-2026-0441", reason = "unmaintained, not a vulnerability, no safe upgrade: pin-utils arrives only through the AWS SDK crates of optional features (sqs, aws-kms, object-store), loom under --cfg loom, and wasmtimer under dev-runtime-managed. No code here calls it. Revisit: those crates move to core::pin::pin! or pin-project-lite." },
 
     # RUSTSEC-2026-0173 — GONE, not deferred. `cargo deny --all-features
     # check` (Ballast, 2026-11-16) flagged this ignore entry with
@@ -218,20 +297,6 @@ ignore = [
     # is gone with it. No manifest here changed; this is a lockfile-refresh
     # side effect of an upstream release, the same as the `proc-macro-error2`
     # entry above. No ignore entry needed.
-
-    # RUSTSEC-2026-0440: astral-tokio-tar 0.6.4 is unmaintained. It reports
-    # no vulnerability, and no safe upgrade exists. testcontainers 0.27 pulls
-    # it. Only tests use testcontainers: the dev-dependencies here, and the
-    # `test-support` feature of autumn-web, which only those dev-dependencies
-    # turn on. No release build holds it. Revisit: testcontainers moves to a
-    # maintained tar crate.
-    { id = "RUSTSEC-2026-0440", reason = "unmaintained, no safe upgrade exists; reached only through testcontainers in tests and autumn-web's test-support feature, never in a release build. Revisit: testcontainers moves to a maintained tar crate." },
-
-    # RUSTSEC-2026-0441: pin-utils 0.1.1 is unmaintained. It reports no
-    # vulnerability, and no safe upgrade exists. `std::pin::pin!` replaces it.
-    # Code here does not use it. loom, the AWS SDK and wasmtimer pull it.
-    # Revisit: those crates move to `std::pin::pin!`.
-    { id = "RUSTSEC-2026-0441", reason = "unmaintained, no safe upgrade exists; no vulnerability. A transitive dependency of loom, the AWS SDK and wasmtimer, not used directly here. Revisit: those crates move to std::pin::pin!." },
 
     # RUSTSEC-2026-0098 / -0099 / -0104 (rustls-webpki 0.101.7) and the
     # h2@0.3.27 half of RUSTSEC-2026-0258 — FIXED, not deferred. All four
@@ -319,25 +384,6 @@ ignore = [
     # also corrects that count. Neither correction changes the dependency
     # graph or the advisory verdict.
     { id = "RUSTSEC-2024-0449", reason = "unmaintained, not a vulnerability: unsafe-libyaml arrives only through the deprecated serde_yaml, which only our own dev-dependency pulls in since autumn-web 0.9.0 moved to serde-saphyr. It parses checked-in CI workflow YAML in 11 integration-test modules. Revisit: those guards move to a maintained parser." },
-
-    # RUSTSEC-2026-0440: `astral-tokio-tar` 0.6.4 is unmaintained. It is not
-    # a vulnerability. Astral ended maintenance on 2026-11-03, and the
-    # advisory names no safe upgrade. Only testcontainers 0.27.3 pulls it in.
-    # Each user is a dev-dependency, or the `test-support` feature of
-    # autumn-web, which only a dev-dependency of autumn-harvest-plugin
-    # turns on. No code here calls the crate. Revisit: testcontainers moves
-    # to another tar crate, or a maintained fork appears.
-    { id = "RUSTSEC-2026-0440", reason = "unmaintained, not a vulnerability, no safe upgrade: astral-tokio-tar arrives only through testcontainers, a test dependency. No code here calls it. Revisit: testcontainers drops it." },
-
-    # RUSTSEC-2026-0441: `pin-utils` 0.1.1 is unmaintained. It is not a
-    # vulnerability. Its repository was archived on 2026-10-01, and the
-    # advisory names no safe upgrade. Three paths pull it in: the AWS SDK
-    # crates (aws-smithy-http, -runtime and -types) of the optional sqs,
-    # aws-kms and object-store features, loom (only under `--cfg loom`), and
-    # wasmtimer through postgresql_archive (only `dev-runtime-managed`). No
-    # code here calls the crate. Revisit: the AWS SDK, loom and wasmtimer
-    # move to `core::pin::pin!` or pin-project-lite.
-    { id = "RUSTSEC-2026-0441", reason = "unmaintained, not a vulnerability, no safe upgrade: pin-utils arrives only through the AWS SDK crates of optional features, loom under --cfg loom, and wasmtimer under dev-runtime-managed. No code here calls it. Revisit: those crates drop it." },
 
     # RUSTSEC-2026-0249 — smartstring 1.0.1 is unmaintained (not a
     # vulnerability). Its repository was archived on 2026-05-03, and the
