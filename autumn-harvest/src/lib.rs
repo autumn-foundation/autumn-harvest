@@ -304,6 +304,7 @@ pub mod cross_shard_child;
 pub mod dag;
 pub mod dag_concurrency;
 pub mod dag_crash;
+pub mod dag_criticality;
 /// Export format types for Directed Acyclic Graphs (DAGs) representing workflows.
 pub mod dag_export;
 pub mod dag_leverage;
@@ -762,6 +763,9 @@ pub use dag_concurrency::{
     ConcurrencyProfile, Schedule as DagSchedule, Segment as ConcurrencySegment,
 };
 pub use dag_crash::{CrashOption, CrashPlan, CrashStep, DagCrashPlanner};
+pub use dag_criticality::{
+    CriticalityReport, DagCriticalityAnalyzer, DurationRange, TaskCriticality,
+};
 #[cfg(feature = "testing")]
 pub use dag_export::export_profile_mermaid_gantt;
 pub use dag_export::{export_dot, export_mermaid, export_mermaid_with_critical_path};
