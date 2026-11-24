@@ -189,7 +189,7 @@ pub fn rows_between(
     rows.map(|raw| parse(raw?)).collect()
 }
 
-fn table_exists(conn: &Connection) -> SqliteResult<bool> {
+pub(crate) fn table_exists(conn: &Connection) -> SqliteResult<bool> {
     let found: Option<i64> = conn
         .prepare_cached(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'harvest_llm_ledger'",

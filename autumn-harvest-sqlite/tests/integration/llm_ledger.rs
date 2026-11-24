@@ -20,7 +20,9 @@ use autumn_harvest::HarvestError;
 use autumn_harvest::llm_ledger::LlmCall;
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
-use autumn_harvest_sqlite::{LlmLedgerRow, RunState, SqliteError, SqliteReader, SqliteRuntime};
+use autumn_harvest_sqlite::{
+    LlmLedgerRow, RunState, SqliteError, SqliteReader, SqliteRuntime, StartOptions,
+};
 use jiff::Timestamp;
 use serde_json::{Value, json};
 
@@ -399,6 +401,11 @@ async fn an_older_file_gains_the_ledger_on_open() {
             .unwrap(),
         Vec::new()
     );
+    let total = reader
+        .llm_ledger_spend_for_search_attr("agent_mesh", &json!("support"), Timestamp::MIN)
+        .unwrap();
+    assert_eq!(total.tokens, 0);
+    assert_eq!(total.cost_usd_micros, 0);
     drop(reader);
 
     let mut rt = SqliteRuntime::open(&db).unwrap();
@@ -439,6 +446,79 @@ async fn the_reader_reads_the_rows_beside_a_live_runtime() {
         reader.llm_ledger(ExecutionId::new()),
         Err(SqliteError::ExecutionNotFound(_))
     ));
+}
+
+// Aggregate only matching executions, including the boundary and future rows.
+#[tokio::test]
+async fn spend_for_a_search_attribute_aggregates_matching_ledger_rows() {
+    let (_dir, db) = fresh_db();
+    let mut rt = SqliteRuntime::open(&db).unwrap();
+    register(&mut rt, &Arc::new(AtomicU32::new(0)), 0);
+    let since = autumn_harvest::time::utc_ymd_hms(2026, 10, 1, 12, 0, 0).unwrap();
+    let second = jiff::SignedDuration::from_secs(1);
+
+    for (mesh, n, at) in [
+        (Some("support"), 1, since - second),
+        (Some("support"), 2, since),
+        (Some("support"), 3, since + second),
+        (Some("other"), 4, since),
+        (None, 5, since),
+    ] {
+        let mut options = StartOptions::default();
+        if let Some(mesh) = mesh {
+            options
+                .search_attributes
+                .insert("agent_mesh".into(), json!(mesh));
+            options
+                .search_attributes
+                .insert("extra".into(), json!(true));
+        }
+        let exec = rt
+            .start_workflow_with_options("one_thought", json!(n), options)
+            .unwrap()
+            .exec_id;
+        rt.run_until_blocked_as_of(exec, at).await.unwrap();
+    }
+
+    let reader = SqliteReader::open(&db).unwrap();
+    let total = reader
+        .llm_ledger_spend_for_search_attr("agent_mesh", &json!("support"), since)
+        .unwrap();
+    assert_eq!(total.tokens, 70);
+    assert_eq!(total.cost_usd_micros, 500);
+    let after_boundary = reader
+        .llm_ledger_spend_for_search_attr(
+            "agent_mesh",
+            &json!("support"),
+            since + jiff::SignedDuration::from_nanos(1),
+        )
+        .unwrap();
+    assert_eq!(after_boundary.tokens, 42);
+    assert_eq!(after_boundary.cost_usd_micros, 300);
+    let empty = reader
+        .llm_ledger_spend_for_search_attr("agent_mesh", &json!("absent"), since)
+        .unwrap();
+    assert_eq!(empty.tokens, 0);
+    assert_eq!(empty.cost_usd_micros, 0);
+
+    // Bypass per-call bounds to exercise a sum above SQLite's integer range.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "PRAGMA ignore_check_constraints = ON;
+         UPDATE harvest_llm_ledger SET cost_usd_micros = 5000000000000000000;",
+    )
+    .unwrap();
+    let saturated = reader
+        .llm_ledger_spend_for_search_attr("agent_mesh", &json!("support"), since)
+        .unwrap();
+    assert_eq!(saturated.cost_usd_micros, i64::MAX as u64);
+    conn.execute("UPDATE harvest_llm_ledger SET cost_usd_micros = NULL", [])
+        .unwrap();
+    let unpriced = reader
+        .llm_ledger_spend_for_search_attr("agent_mesh", &json!("support"), since)
+        .unwrap();
+    assert_eq!(unpriced.tokens, 70);
+    assert_eq!(unpriced.cost_usd_micros, 0);
 }
 
 #[tokio::test]

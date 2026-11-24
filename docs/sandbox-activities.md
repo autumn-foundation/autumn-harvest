@@ -570,6 +570,14 @@ of each text output file. The bounds count the JSON text, so escaped
 characters cannot push the status out of the cut. An output entry that does
 not fit is only counted.
 
+On the engine activity path, `ToolContext::cancel` and `deadline` carry the
+attempt's cancellation and remaining time to the sandbox runtime. The
+activity heartbeats when configured and waits for cooperative cancellation
+cleanup. A deadline too short for the requested run plus overhead and
+cleanup refuses the run before the backend starts; it does not shorten the
+requested wall-clock limit. Direct tool callers can use
+`..ToolContext::default()` for a fresh token and no deadline.
+
 ## Durability
 
 - The registration sets `start_to_close` to `max_attempt_time`. That is the

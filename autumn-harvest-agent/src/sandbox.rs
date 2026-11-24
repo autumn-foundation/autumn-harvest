@@ -25,7 +25,6 @@ use autumn_harvest::sandbox::{
     SandboxOutcome, SandboxRequest, SandboxRuntime,
 };
 use base64::Engine as _;
-use tokio_util::sync::CancellationToken;
 
 use crate::error::{AgentError, ErrorKind};
 use crate::model::BoxFuture;
@@ -193,11 +192,13 @@ impl Tool for SandboxTool {
             );
             let options = RunOptions {
                 engine_env,
-                time_left: None,
+                time_left: ctx
+                    .deadline
+                    .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now())),
             };
             let outcome = self
                 .runtime
-                .run_with(&request, options, &CancellationToken::new())
+                .run_with(&request, options, &ctx.cancel)
                 .await
                 .map_err(|e| tool_error(&e))?;
             if let Some(workspace) = &ctx.workspace {
@@ -423,6 +424,8 @@ const fn json_char_len(c: char) -> usize {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
 
     use autumn_harvest::sandbox::runtime::BoxFuture as SandboxFuture;
     use autumn_harvest::sandbox::{
@@ -494,7 +497,122 @@ mod tests {
             session_id: None,
             step: 0,
             workspace: None,
+            ..ToolContext::default()
         }
+    }
+
+    #[derive(Default)]
+    struct WaitingBackend {
+        started: tokio::sync::Notify,
+        cleaned_up: AtomicBool,
+    }
+
+    impl SandboxBackend for WaitingBackend {
+        fn isolation(&self) -> IsolationLevel {
+            IsolationLevel::MicroVm
+        }
+
+        fn execute(
+            &self,
+            _job: SandboxJob,
+            cancel: CancellationToken,
+        ) -> SandboxFuture<'_, Result<SandboxOutcome, SandboxError>> {
+            Box::pin(async move {
+                self.started.notify_one();
+                cancel.cancelled().await;
+                self.cleaned_up.store(true, Ordering::SeqCst);
+                Err(SandboxError::Cancelled)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_call_does_not_start_backend() {
+        let backend = Arc::new(EchoBackend::default());
+        let runtime = SandboxRuntime::new(backend.clone(), SandboxPolicy::default()).unwrap();
+        let tool = SandboxTool::new(Arc::new(runtime));
+        let ctx = ctx();
+        ctx.cancel.cancel();
+        let error = tool
+            .execute(json!({"runtime": "sh", "code": "true"}), &ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unavailable);
+        assert!(backend.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn in_flight_cancellation_waits_for_backend_cleanup() {
+        let backend = Arc::new(WaitingBackend::default());
+        let runtime = SandboxRuntime::new(backend.clone(), SandboxPolicy::default()).unwrap();
+        let tool = SandboxTool::new(Arc::new(runtime));
+        let ctx = ctx();
+        let call = tool.execute(json!({"runtime": "sh", "code": "true"}), &ctx);
+        let cancel = async {
+            backend.started.notified().await;
+            ctx.cancel.cancel();
+        };
+        let (result, ()) =
+            tokio::time::timeout(Duration::from_secs(1), async { tokio::join!(call, cancel) })
+                .await
+                .expect("cancelled call must finish");
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::Unavailable);
+        assert!(backend.cleaned_up.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn expired_deadline_does_not_start_backend() {
+        let backend = Arc::new(EchoBackend::default());
+        let runtime = SandboxRuntime::new(backend.clone(), SandboxPolicy::default()).unwrap();
+        let tool = SandboxTool::new(Arc::new(runtime));
+        let ctx = ToolContext {
+            deadline: Some(Instant::now()),
+            ..ctx()
+        };
+        let error = tool
+            .execute(json!({"runtime": "sh", "code": "true"}), &ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unavailable);
+        assert!(backend.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deadline_shorter_than_run_budget_does_not_start_backend() {
+        let backend = Arc::new(EchoBackend::default());
+        let runtime = SandboxRuntime::new(backend.clone(), SandboxPolicy::default()).unwrap();
+        let tool = SandboxTool::new(Arc::new(runtime));
+        let ctx = ToolContext {
+            deadline: Some(Instant::now() + Duration::from_secs(15)),
+            ..ctx()
+        };
+        let error = tool
+            .execute(json!({"runtime": "sh", "code": "true"}), &ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unavailable);
+        assert!(backend.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sufficient_deadline_preserves_requested_wall_clock() {
+        let backend = Arc::new(EchoBackend::default());
+        let runtime = SandboxRuntime::new(backend.clone(), SandboxPolicy::default()).unwrap();
+        let tool = SandboxTool::new(Arc::new(runtime));
+        let ctx = ToolContext {
+            deadline: Some(Instant::now() + Duration::from_secs(120)),
+            ..ctx()
+        };
+        tool.execute(
+            json!({"runtime": "sh", "code": "true", "limits": {"timeout_ms": 5000}}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            backend.seen.lock().unwrap()[0].plan.limits.wall_clock_ms,
+            5000
+        );
     }
 
     #[test]

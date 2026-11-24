@@ -22,7 +22,7 @@ postgres = ["autumn-harvest/db"]
 # test engine, so it needs the engine's `testing` surface.
 eval = ["autumn-harvest/testing"]
 # A tool that runs agent code in a sandbox. See `docs/sandbox-activities.md`.
-sandbox = ["autumn-harvest/sandbox-activities", "dep:tokio-util"]
+sandbox = ["autumn-harvest/sandbox-activities"]
 # A Claude model over the Anthropic Messages API. It adds an HTTP client, so
 # it is off by default. See `docs/agent-adapter.md`.
 anthropic = ["dep:reqwest", "dep:rustls"]
@@ -45,9 +45,8 @@ sha2 = "0.11"
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-# The cancellation token of a sandbox run. The core crate already depends on
-# this version.
-tokio-util = { version = "0.7", optional = true }
+# Cancellation for tool calls, including sandbox runs.
+tokio-util = "0.7"
 # The HTTP client of the `anthropic` and `openai` features. The examples already lock
 # these versions. The TLS provider is `ring`.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"], optional = true }
@@ -62,8 +61,6 @@ proptest = { workspace = true }
 tempfile = "3"
 # The store tests read the rows of the SQLite file. Already in the lockfile.
 rusqlite = { workspace = true }
-# The sandbox tool tests pass a cancellation token.
-tokio-util = "0.7"
 # Measures gzip against delta encoding (issue #2009). Already in the lockfile.
 flate2 = "1"
 tokio = { workspace = true }

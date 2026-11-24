@@ -319,6 +319,7 @@ mod tests {
             )),
             step: 0,
             workspace: None,
+            ..ToolContext::default()
         }
     }
 

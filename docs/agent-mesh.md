@@ -792,9 +792,12 @@ database of `pg`.
 | Labelled memory | A memory entry keeps the flow labels of the run that wrote it. A run that reads the entry takes the labels. |
 
 - `sqlite::LedgerSpend` sums the cost ledger of every run with the mesh
-  attribute, child runs included. `postgres::LedgerSpend` sums
-  `harvest_llm_ledger` the same way, with one read for each database. The
-  GIN index on `search_attrs` and the `recorded_at` index serve the read.
+  attribute, child runs included, using a SQL join and aggregate rather
+  than loading the runs or ledger rows. `postgres::LedgerSpend` sums
+  `harvest_llm_ledger` the same way, with one read for each database. Both
+  include rows at or after the period start, with no upper time bound.
+  The GIN index on Postgres `search_attrs` and the `recorded_at` index serve
+  the read.
 - The budget is a soft cap, as the run budgets are. Turns that start before
   any of them records can all pass the check.
 - A refused message runs again only when no tool ran in its op. Any other

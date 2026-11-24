@@ -115,7 +115,7 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
             let model = request.model.clone();
             // The budget window reads the drive clock, as the ledger rows do.
             let (turn, latency) = h
-                .model_turn_timed_in(request, tenant, |_| {}, None, at)
+                .model_turn_timed_in(request, tenant, |_| {}, None, at, None)
                 .await?;
             // A cache hit calls no model, so it has no latency and no call.
             let calls = latency
@@ -715,40 +715,12 @@ impl LedgerSpend {
 
     fn read(&self, mesh: &str, since: Timestamp) -> SqliteResult<Spend> {
         let reader = SqliteReader::open(&self.path)?;
-        let filter = ExecutionFilter::new().search_attribute(MESH_ATTR, serde_json::json!(mesh));
-        let mut runs = std::collections::HashSet::new();
-        let mut cursor = None;
-        loop {
-            let page =
-                cursor.map_or_else(|| filter.clone(), |cursor| filter.clone().before(cursor));
-            let found = reader.list_executions(&page)?;
-            runs.extend(
-                found
-                    .executions
-                    .iter()
-                    .filter_map(autumn_harvest_sqlite::ExecutionSummary::execution_id),
-            );
-            match found.next {
-                Some(next) => cursor = Some(next),
-                None => break,
-            }
-        }
-        // A row of a simulated drive can be later than the wall clock, so the
-        // read has no upper bound (issue #2272).
-        let rows = reader.llm_ledger_between(since, Timestamp::MAX)?;
-        let spend = rows.iter().filter(|row| runs.contains(&row.exec_id)).fold(
-            Spend::default(),
-            |spend, row| Spend {
-                tokens: spend
-                    .tokens
-                    .saturating_add(row.input_tokens)
-                    .saturating_add(row.output_tokens),
-                cost_usd_micros: spend
-                    .cost_usd_micros
-                    .saturating_add(row.cost_usd_micros.unwrap_or(0)),
-            },
-        );
-        Ok(spend)
+        let total =
+            reader.llm_ledger_spend_for_search_attr(MESH_ATTR, &serde_json::json!(mesh), since)?;
+        Ok(Spend {
+            tokens: total.tokens,
+            cost_usd_micros: total.cost_usd_micros,
+        })
     }
 }
 
