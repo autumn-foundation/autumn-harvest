@@ -2,7 +2,7 @@
 //!
 //! Slack and leverage assume that each task has one fixed duration. Real tasks
 //! vary from run to run. A task with a little slack can join the critical path
-//! when it runs slow, and a critical task can leave it when it runs fast.
+//! when it runs slow. A critical task can leave it when it runs fast.
 //!
 //! This module gives each task a range of durations instead of one value. Each
 //! range is a triangular distribution with a minimum, a most likely value and a
@@ -122,7 +122,10 @@ impl CriticalityReport {
         if n == 0 {
             return Duration::ZERO;
         }
-        let rank = (q.clamp(0.0, 1.0) * n as f64).ceil() as usize;
+        let rank = (q.clamp(0.0, 1.0) * count_f64(n)).ceil();
+        // The rank lies in `[0, n]`, so the cast neither wraps nor truncates.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let rank = rank as usize;
         self.makespans[rank.saturating_sub(1).min(n - 1)]
     }
 
@@ -133,14 +136,14 @@ impl CriticalityReport {
             return 1.0;
         }
         let met = self.makespans.partition_point(|m| *m <= deadline);
-        met as f64 / self.makespans.len() as f64
+        count_f64(met) / count_f64(self.makespans.len())
     }
 
     /// Tasks by descending criticality. Ties keep topological order.
     #[must_use]
     pub fn ranked(&self) -> Vec<&TaskCriticality> {
         let mut ranked: Vec<&TaskCriticality> = self.tasks.iter().collect();
-        ranked.sort_by(|x, y| y.critical_trials.cmp(&x.critical_trials));
+        ranked.sort_by_key(|task| std::cmp::Reverse(task.critical_trials));
         ranked
     }
 }
@@ -285,11 +288,16 @@ impl DagCriticalityAnalyzer {
     }
 }
 
+/// Convert a count to `f64`. A count above `u32::MAX` saturates.
+fn count_f64(n: usize) -> f64 {
+    f64::from(u32::try_from(n).unwrap_or(u32::MAX))
+}
+
 /// `SplitMix64` generator. It is small, fast and needs no dependency.
 struct SplitMix64(u64);
 
 impl SplitMix64 {
-    fn next_u64(&mut self) -> u64 {
+    const fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -297,9 +305,11 @@ impl SplitMix64 {
         z ^ (z >> 31)
     }
 
-    /// Uniform sample in `[0, 1)` from the top 53 bits.
+    /// Uniform sample in `[0, 1)` from the top 52 bits.
+    ///
+    /// The bits fill the mantissa of a number in `[1, 2)`, so no cast is needed.
     fn next_unit(&mut self) -> f64 {
-        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+        f64::from_bits(0x3FF0_0000_0000_0000 | (self.next_u64() >> 12)) - 1.0
     }
 }
 
@@ -370,7 +380,7 @@ mod tests {
         let critical: Vec<usize> = report
             .tasks
             .iter()
-            .filter(|t| t.criticality == 1.0)
+            .filter(|t| t.critical_trials == report.trials)
             .map(|t| t.index)
             .collect();
         assert_eq!(critical, slack.critical_indices());
@@ -460,7 +470,7 @@ mod tests {
             .with_trials(NonZeroU32::new(3).unwrap())
             .analyze();
 
-        assert!(report.tasks.is_empty());
+        assert_eq!(report.tasks, Vec::new());
         assert_eq!(report.percentile(0.5), Duration::ZERO);
         assert_eq!(report.probability_within(Duration::ZERO), 1.0);
     }
