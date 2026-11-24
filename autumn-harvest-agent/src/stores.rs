@@ -41,7 +41,10 @@ use crate::episode::{
     Appended, Cleared, Episode, EpisodeLog, EpisodeStore, MAX_KEPT_KEYS, PassMark,
 };
 use crate::error::{AgentError, ErrorKind};
-use crate::memory::{EditKey, MemoryBlock, MemoryOp, MemoryScope, MemoryStore, apply_to, current};
+use crate::memory::{
+    ConsolidationWrite, EditKey, MemoryBlock, MemoryOp, MemoryScope, MemoryStore, apply_to,
+    consolidation_drop, current, next_reset_generation,
+};
 use crate::message::{ChatMessage, SessionId};
 use crate::model::BoxFuture;
 use crate::transcript::{DEFAULT_KEEP_PER_RUN, DEFAULT_MAX_AGE, TranscriptStore, WindowOwner};
@@ -394,9 +397,8 @@ impl StoredError {
 
 /// The document of one memory scope.
 ///
-/// A clear keeps the document with no blocks and no keys. It holds no
-/// entry text. Its version still grows, so a writer that read the scope
-/// before the clear cannot write over it.
+/// A clear keeps the document with no blocks or keys and a reset generation.
+/// The generation fences consolidation even when its CAS retries after a clear.
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct MemoryDoc {
@@ -407,6 +409,40 @@ struct MemoryDoc {
     /// The applied keys, oldest first.
     #[serde(skip_serializing_if = "VecDeque::is_empty")]
     applied: VecDeque<Applied>,
+    /// Incremented by every clear; absent in documents written before the guard.
+    reset_generation: u64,
+}
+
+impl MemoryDoc {
+    fn apply(
+        &mut self,
+        op: &MemoryOp,
+        key: &EditKey,
+        labels: &BTreeSet<String>,
+        template: &[MemoryBlock],
+    ) -> Result<MemoryBlock, AgentError> {
+        let blocks = self.blocks.get_or_insert_with(|| template.to_vec());
+        if let Some(applied) = self.applied.iter().find(|held| held.key == key.as_str()) {
+            return applied
+                .error
+                .as_ref()
+                .map_or_else(|| current(blocks, op), |error| Err(error.to_error()));
+        }
+        let result = apply_to(blocks, op, labels).map_err(|err| {
+            AgentError::new(
+                err.kind(),
+                crate::agent::cut(err.message(), MAX_STORED_ERROR_BYTES),
+            )
+        });
+        self.applied.push_back(Applied {
+            key: key.as_str().to_owned(),
+            error: result.as_ref().err().map(StoredError::of),
+        });
+        while self.applied.len() > MAX_KEPT_KEYS {
+            self.applied.pop_front();
+        }
+        result
+    }
 }
 
 /// A [`MemoryStore`] on a database. Use [`SqliteMemoryStore`] or
@@ -457,30 +493,7 @@ impl<D: AgentStoreDb> DbMemoryStore<D> {
             STORE_MEMORY,
             scope.as_str(),
             MemoryDoc::default,
-            |doc: &mut MemoryDoc| {
-                let blocks = doc.blocks.get_or_insert_with(|| self.template.clone());
-                if let Some(applied) = doc.applied.iter().find(|held| held.key == key.as_str()) {
-                    return applied
-                        .error
-                        .as_ref()
-                        .map_or_else(|| current(blocks, op), |error| Err(error.to_error()));
-                }
-                // The first call returns the error that a retry reads back.
-                let result = apply_to(blocks, op, labels).map_err(|err| {
-                    AgentError::new(
-                        err.kind(),
-                        crate::agent::cut(err.message(), MAX_STORED_ERROR_BYTES),
-                    )
-                });
-                doc.applied.push_back(Applied {
-                    key: key.as_str().to_owned(),
-                    error: result.as_ref().err().map(StoredError::of),
-                });
-                while doc.applied.len() > MAX_KEPT_KEYS {
-                    doc.applied.pop_front();
-                }
-                result
-            },
+            |doc: &mut MemoryDoc| doc.apply(op, key, labels, &self.template),
         )
         .await?
     }
@@ -517,6 +530,49 @@ impl<D: AgentStoreDb> MemoryStore for DbMemoryStore<D> {
         Box::pin(async move { self.apply_now(scope, &op, key, labels).await })
     }
 
+    fn reset_generation<'a>(
+        &'a self,
+        scope: &'a MemoryScope,
+    ) -> BoxFuture<'a, Result<u64, AgentError>> {
+        Box::pin(async move {
+            let doc: MemoryDoc =
+                read(&self.db, STORE_MEMORY, scope.as_str(), MemoryDoc::default).await?;
+            Ok(doc.reset_generation)
+        })
+    }
+
+    fn apply_consolidation<'a>(
+        &'a self,
+        scope: &'a MemoryScope,
+        op: MemoryOp,
+        key: &'a EditKey,
+        labels: &'a BTreeSet<String>,
+        expected_generation: u64,
+    ) -> BoxFuture<'a, Result<ConsolidationWrite, AgentError>> {
+        Box::pin(async move {
+            update(
+                &self.db,
+                STORE_MEMORY,
+                scope.as_str(),
+                MemoryDoc::default,
+                |doc: &mut MemoryDoc| {
+                    if doc.reset_generation != expected_generation {
+                        return Ok(ConsolidationWrite::Reset);
+                    }
+                    if !doc.applied.iter().any(|held| held.key == key.as_str()) {
+                        let blocks = doc.blocks.as_deref().unwrap_or(&self.template);
+                        if let Some(reason) = consolidation_drop(blocks, &op, labels) {
+                            return Ok(ConsolidationWrite::Dropped(reason));
+                        }
+                    }
+                    doc.apply(&op, key, labels, &self.template)
+                        .map(ConsolidationWrite::Applied)
+                },
+            )
+            .await?
+        })
+    }
+
     fn ensure_block<'a>(
         &'a self,
         scope: &'a MemoryScope,
@@ -542,9 +598,17 @@ impl<D: AgentStoreDb> MemoryStore for DbMemoryStore<D> {
 
     fn clear<'a>(&'a self, scope: &'a MemoryScope) -> BoxFuture<'a, Result<(), AgentError>> {
         Box::pin(async move {
-            let empty = encode(&MemoryDoc::default())?;
-            replace(&self.db, STORE_MEMORY, scope.as_str(), |_| {
-                Ok((empty.clone(), ()))
+            // Read only the counter so an undecodable block never prevents erase.
+            replace(&self.db, STORE_MEMORY, scope.as_str(), |body| {
+                let generation = body
+                    .and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
+                    .and_then(|doc| doc["reset_generation"].as_u64())
+                    .unwrap_or(0);
+                let empty = MemoryDoc {
+                    reset_generation: next_reset_generation(generation)?,
+                    ..MemoryDoc::default()
+                };
+                Ok((encode(&empty)?, ()))
             })
             .await
         })
@@ -1075,6 +1139,8 @@ mod tests {
         rival: AtomicBool,
         lose: AtomicU32,
         swaps: AtomicU32,
+        mutation: Option<MemoryOp>,
+        reset: bool,
     }
 
     #[cfg(feature = "sqlite")]
@@ -1085,6 +1151,8 @@ mod tests {
                 rival: AtomicBool::new(rival),
                 lose: AtomicU32::new(lose),
                 swaps: AtomicU32::new(0),
+                mutation: None,
+                reset: false,
             }
         }
     }
@@ -1112,9 +1180,20 @@ mod tests {
             Box::pin(async move {
                 self.swaps.fetch_add(1, Ordering::SeqCst);
                 if self.rival.swap(false, Ordering::SeqCst) {
-                    DbMemoryStore::on(self.inner.clone())
-                        .apply(&MemoryScope::new(scope), add("rival"), &EditKey::new("r"))
-                        .await?;
+                    let memory = DbMemoryStore::on(self.inner.clone());
+                    let scope = MemoryScope::new(scope);
+                    if self.reset {
+                        memory.clear(&scope).await?;
+                    } else {
+                        memory
+                            .apply_labelled(
+                                &scope,
+                                self.mutation.clone().unwrap_or_else(|| add("rival")),
+                                &EditKey::new("r"),
+                                &BTreeSet::from(["secret".to_owned()]),
+                            )
+                            .await?;
+                    }
                 }
                 if self
                     .lose
@@ -1166,6 +1245,67 @@ mod tests {
             2,
             "one lost swap, one won"
         );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn memory_consolidation_rechecks_taint_after_a_lost_cas() {
+        for op in [
+            MemoryOp::Remove {
+                block: "memory".into(),
+                old: "tea".into(),
+            },
+            MemoryOp::Replace {
+                block: "memory".into(),
+                old: "tea".into(),
+                text: "coffee".into(),
+            },
+        ] {
+            let mut store = DbMemoryStore::on(Racing::new(false, 0));
+            let scope = MemoryScope::new("race");
+            store
+                .apply(&scope, add("tea"), &EditKey::new("seed"))
+                .await
+                .unwrap();
+            store.db.mutation = Some(add("tea"));
+            store.db.rival.store(true, Ordering::SeqCst);
+            let result = store
+                .apply_consolidation(&scope, op, &EditKey::new("pass"), &BTreeSet::new(), 0)
+                .await
+                .unwrap();
+            assert!(matches!(result, ConsolidationWrite::Dropped(_)));
+            let blocks = store.load(&scope).await.unwrap();
+            assert_eq!(entries(&blocks), ["tea"]);
+            assert_eq!(
+                blocks[0].labels["tea"],
+                BTreeSet::from(["secret".to_owned()])
+            );
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn memory_consolidation_rechecks_reset_after_a_lost_cas() {
+        let mut store = DbMemoryStore::on(Racing::new(false, 0));
+        let scope = MemoryScope::new("race");
+        store
+            .apply(&scope, add("tea"), &EditKey::new("seed"))
+            .await
+            .unwrap();
+        store.db.reset = true;
+        store.db.rival.store(true, Ordering::SeqCst);
+        let result = store
+            .apply_consolidation(
+                &scope,
+                add("resurrected"),
+                &EditKey::new("pass"),
+                &BTreeSet::new(),
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, ConsolidationWrite::Reset);
+        assert!(entries(&store.load(&scope).await.unwrap()).is_empty());
     }
 
     /// A scope that loses every race gives up with a retryable error, and
@@ -1247,7 +1387,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(row.body, b"{}", "the tombstone holds no text");
+        assert!(!String::from_utf8(row.body).unwrap().contains("secret"));
         assert_eq!(store.load(&scope).await.unwrap(), MemoryBlock::defaults());
     }
 

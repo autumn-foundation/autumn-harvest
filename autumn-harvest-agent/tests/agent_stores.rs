@@ -238,7 +238,13 @@ async fn an_erase_removes_the_rows_of_the_agent_and_counts_them() {
             .unwrap();
         String::from_utf8(body).unwrap()
     };
-    assert_eq!(body("agent:desk/d1"), "{}", "the memory tombstone is empty");
+    let memory_body = body("agent:desk/d1");
+    for text in ["noted", "thing", "prefers mornings"] {
+        assert!(
+            !memory_body.contains(text),
+            "the tombstone holds no memory text: {memory_body}"
+        );
+    }
     let episodes_body = body("agent:desk/d1:episodes");
     for text in ["noted", "thing"] {
         assert!(

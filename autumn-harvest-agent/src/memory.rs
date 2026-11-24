@@ -511,6 +511,17 @@ impl EditKey {
     }
 }
 
+/// The outcome of an atomic consolidation write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsolidationWrite {
+    /// The edit applied, or its key was already applied.
+    Applied(MemoryBlock),
+    /// The live target changed or has labels the pass cannot edit.
+    Dropped(String),
+    /// A clear changed the memory reset generation.
+    Reset,
+}
+
 /// Storage for memory blocks.
 pub trait MemoryStore: Send + Sync + std::fmt::Debug {
     /// Load every block of a scope. A new scope gets the default blocks.
@@ -612,6 +623,50 @@ pub trait MemoryStore: Send + Sync + std::fmt::Debug {
              labels: implement MemoryStore::apply_labelled",
         ))))
     }
+
+    /// Read the reset generation, which changes on every successful clear.
+    ///
+    /// Capture this before checking the episode generation: a reset clears
+    /// episodes before memory. The default refuses unsupported stores.
+    ///
+    /// # Errors
+    ///
+    /// Returns a read error or a `Config` error for an unsupported store.
+    fn reset_generation<'a>(
+        &'a self,
+        scope: &'a MemoryScope,
+    ) -> BoxFuture<'a, Result<u64, AgentError>> {
+        let _ = scope;
+        Box::pin(std::future::ready(Err(AgentError::new(
+            ErrorKind::Config,
+            "this memory store cannot guard consolidation: implement MemoryStore::reset_generation",
+        ))))
+    }
+
+    /// Apply a consolidation edit atomically with its live-target guards.
+    ///
+    /// Under the write lock or on every CAS attempt, reject a changed reset
+    /// generation, then honor an already applied key. Otherwise drop a replace
+    /// or remove whose target is gone, changed, or has labels outside `labels`.
+    /// Never fall back to an unguarded write.
+    ///
+    /// # Errors
+    ///
+    /// Returns an edit/store error, or `Config` for an unsupported store.
+    fn apply_consolidation<'a>(
+        &'a self,
+        scope: &'a MemoryScope,
+        op: MemoryOp,
+        key: &'a EditKey,
+        labels: &'a BTreeSet<String>,
+        expected_generation: u64,
+    ) -> BoxFuture<'a, Result<ConsolidationWrite, AgentError>> {
+        let _ = (scope, op, key, labels, expected_generation);
+        Box::pin(std::future::ready(Err(AgentError::new(
+            ErrorKind::Config,
+            "this memory store cannot guard consolidation: implement MemoryStore::apply_consolidation",
+        ))))
+    }
 }
 
 /// A [`MemoryStore`] in process memory. Its contents go when the process
@@ -628,6 +683,7 @@ pub struct InMemoryMemoryStore {
 struct State {
     scopes: HashMap<MemoryScope, Vec<MemoryBlock>>,
     applied: HashMap<(MemoryScope, EditKey), Option<AgentError>>,
+    reset_generations: HashMap<MemoryScope, u64>,
 }
 
 impl std::fmt::Debug for InMemoryMemoryStore {
@@ -702,6 +758,48 @@ impl MemoryStore for InMemoryMemoryStore {
         Box::pin(std::future::ready(self.apply_now(scope, &op, key, labels)))
     }
 
+    fn reset_generation<'a>(
+        &'a self,
+        scope: &'a MemoryScope,
+    ) -> BoxFuture<'a, Result<u64, AgentError>> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let generation = state.reset_generations.get(scope).copied().unwrap_or(0);
+        drop(state);
+        Box::pin(std::future::ready(Ok(generation)))
+    }
+
+    fn apply_consolidation<'a>(
+        &'a self,
+        scope: &'a MemoryScope,
+        op: MemoryOp,
+        key: &'a EditKey,
+        labels: &'a BTreeSet<String>,
+        expected_generation: u64,
+    ) -> BoxFuture<'a, Result<ConsolidationWrite, AgentError>> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let result =
+            if state.reset_generations.get(scope).copied().unwrap_or(0) == expected_generation {
+                let blocks = state.scopes.get(scope).unwrap_or(&self.template);
+                let dropped = if state.applied.contains_key(&(scope.clone(), key.clone())) {
+                    None
+                } else {
+                    consolidation_drop(blocks, &op, labels)
+                };
+                dropped.map_or_else(
+                    || {
+                        state
+                            .apply(scope, &op, key, labels, &self.template)
+                            .map(ConsolidationWrite::Applied)
+                    },
+                    |reason| Ok(ConsolidationWrite::Dropped(reason)),
+                )
+            } else {
+                Ok(ConsolidationWrite::Reset)
+            };
+        drop(state);
+        Box::pin(std::future::ready(result))
+    }
+
     fn ensure_block<'a>(
         &'a self,
         scope: &'a MemoryScope,
@@ -718,10 +816,16 @@ impl MemoryStore for InMemoryMemoryStore {
 
     fn clear<'a>(&'a self, scope: &'a MemoryScope) -> BoxFuture<'a, Result<(), AgentError>> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.scopes.remove(scope);
-        state.applied.retain(|(applied, _), _| applied != scope);
+        let result = next_reset_generation(
+            state.reset_generations.get(scope).copied().unwrap_or(0),
+        )
+        .map(|generation| {
+            state.reset_generations.insert(scope.clone(), generation);
+            state.scopes.remove(scope);
+            state.applied.retain(|(applied, _), _| applied != scope);
+        });
         drop(state);
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(std::future::ready(result))
     }
 }
 
@@ -735,12 +839,27 @@ impl InMemoryMemoryStore {
         labels: &BTreeSet<String>,
     ) -> Result<MemoryBlock, AgentError> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let State { scopes, applied } = &mut *state;
+        state.apply(scope, op, key, labels, &self.template)
+    }
+}
+
+impl State {
+    fn apply(
+        &mut self,
+        scope: &MemoryScope,
+        op: &MemoryOp,
+        key: &EditKey,
+        labels: &BTreeSet<String>,
+        template: &[MemoryBlock],
+    ) -> Result<MemoryBlock, AgentError> {
+        let Self {
+            scopes, applied, ..
+        } = self;
         let blocks = scopes
             .entry(scope.clone())
-            .or_insert_with(|| self.template.clone());
+            .or_insert_with(|| template.to_vec());
         let done = (scope.clone(), key.clone());
-        let result = match applied.get(&done) {
+        match applied.get(&done) {
             Some(Some(error)) => Err(error.clone()),
             Some(None) => current(blocks, op),
             None => {
@@ -748,10 +867,62 @@ impl InMemoryMemoryStore {
                 applied.insert(done, result.as_ref().err().cloned());
                 result
             }
-        };
-        drop(state);
-        result
+        }
     }
+}
+
+pub(crate) fn next_reset_generation(generation: u64) -> Result<u64, AgentError> {
+    generation.checked_add(1).ok_or_else(|| {
+        AgentError::new(
+            ErrorKind::Config,
+            "the memory reset generation is exhausted",
+        )
+    })
+}
+
+/// Validate the live edit target while holding the store's write boundary.
+pub(crate) fn consolidation_drop(
+    blocks: &[MemoryBlock],
+    op: &MemoryOp,
+    allowed_remove_labels: &BTreeSet<String>,
+) -> Option<String> {
+    let (old, verb) = match op {
+        MemoryOp::Add { .. } => return None,
+        MemoryOp::Replace { old, .. } => (old, "replace"),
+        MemoryOp::Remove { old, .. } => (old, "remove"),
+    };
+    let block = blocks.iter().find(|block| block.label == op.block())?;
+    let hash = || crate::episode::fact_hash(old);
+    let Ok(index) = find_unique(block, old) else {
+        return Some(format!(
+            "{verb} of fact {} dropped: no single entry of the block matches it",
+            hash(),
+        ));
+    };
+    let entry = &block.entries[index];
+    if entry != old {
+        return Some(format!(
+            "{verb} of fact {} dropped: the entry changed during the pass",
+            hash(),
+        ));
+    }
+    if let Some(labels) = block.labels.get(entry)
+        && !labels.is_subset(allowed_remove_labels)
+    {
+        let extra = labels
+            .difference(allowed_remove_labels)
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        return Some(crate::agent::cut(
+            &format!(
+                "{verb} of fact {} dropped: the entry has the labels [{}] that the pass lacks",
+                hash(),
+                extra.join(", ")
+            ),
+            crate::consolidate::MAX_REFUSAL_BYTES,
+        ));
+    }
+    None
 }
 
 /// The block that `op` names, unchanged.
@@ -908,6 +1079,30 @@ mod tests {
             block: "memory".into(),
             text: text.into(),
         }
+    }
+
+    #[tokio::test]
+    async fn consolidation_fences_even_empty_resets_and_allows_a_fresh_pass() {
+        let store = InMemoryMemoryStore::new();
+        let scope = MemoryScope::new("reset");
+        let stale = store.reset_generation(&scope).await.unwrap();
+        store.clear(&scope).await.unwrap();
+        store.clear(&scope).await.unwrap();
+        let labels = BTreeSet::new();
+        let key = EditKey::new("pass");
+        let result = store
+            .apply_consolidation(&scope, add("tea"), &key, &labels, stale)
+            .await
+            .unwrap();
+        assert_eq!(result, ConsolidationWrite::Reset);
+        assert!(store.load(&scope).await.unwrap()[0].entries.is_empty());
+        let fresh = store.reset_generation(&scope).await.unwrap();
+        let result = store
+            .apply_consolidation(&scope, add("coffee"), &key, &labels, fresh)
+            .await
+            .unwrap();
+        assert!(matches!(result, ConsolidationWrite::Applied(_)));
+        assert_eq!(store.load(&scope).await.unwrap()[0].entries, ["coffee"]);
     }
 
     #[test]
