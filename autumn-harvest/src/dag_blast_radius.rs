@@ -12,6 +12,14 @@
 //! lost. A task that succeeds only in the outage is activated. An activated
 //! task is often a fallback that waits on `OneFailed` or `AllFailed`.
 //!
+//! A signal gate dispatches no activity, so the analysis never fails one.
+//! A signal name is not an activity, so it gets no outage entry either.
+//!
+//! A `condition` predicate reads upstream outputs, and a static analysis has
+//! none. The analysis therefore assumes that each condition passes. Each such
+//! task is listed in [`DagBlastRadius::conditional`]. A result that names one
+//! of them holds only when its condition passes.
+//!
 //! The ranking tells an operator which dependency to guard first. An activity
 //! with a large blast radius is a good candidate for a fallback branch or a
 //! `Defer` breaker.
@@ -47,6 +55,8 @@ impl ActivityOutage {
 pub struct DagBlastRadius {
     /// Status of each task when every task succeeds, by topological index.
     pub baseline: Vec<TaskStatus>,
+    /// Tasks with a `condition`, which the analysis assumes to pass.
+    pub conditional: Vec<usize>,
     /// One entry per activity, largest blast radius first.
     ///
     /// Ties sort by activity name, so the order is deterministic.
@@ -61,6 +71,7 @@ impl DagBlastRadius {
         let mut activities: Vec<&str> = dag
             .tasks()
             .iter()
+            .filter(|t| t.signal.is_none())
             .map(|t| t.activity_name.as_str())
             .collect();
         activities.sort_unstable();
@@ -89,7 +100,18 @@ impl DagBlastRadius {
             .collect();
         // The sort is stable, so ties keep the name order from above.
         outages.sort_by_key(|o| std::cmp::Reverse(o.blast_radius()));
-        Self { baseline, outages }
+        let conditional = dag
+            .tasks()
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.condition.is_some())
+            .map(|(i, _)| i)
+            .collect();
+        Self {
+            baseline,
+            conditional,
+            outages,
+        }
     }
 
     /// The outage entry of `activity`, if the DAG calls it.
@@ -101,7 +123,8 @@ impl DagBlastRadius {
 
 /// Final status of each task when the `down` activity fails.
 ///
-/// A task that runs succeeds unless it calls the `down` activity.
+/// A task that runs succeeds unless it calls the `down` activity. A signal
+/// gate calls no activity, so it always succeeds.
 fn propagate(dag: &DagDefinition, down: Option<&str>) -> Vec<TaskStatus> {
     let tasks = dag.tasks();
     let mut states = vec![TaskStatus::Skipped; tasks.len()];
@@ -110,7 +133,7 @@ fn propagate(dag: &DagDefinition, down: Option<&str>) -> Vec<TaskStatus> {
         let upstreams = task.upstreams.iter().map(|&up| &states[up]);
         states[i] = if !task.trigger_rule.should_run(upstreams) {
             TaskStatus::Skipped
-        } else if down == Some(task.activity_name.as_str()) {
+        } else if task.signal.is_none() && down == Some(task.activity_name.as_str()) {
             TaskStatus::Failed
         } else {
             TaskStatus::Succeeded
@@ -246,6 +269,34 @@ mod tests {
 
         assert_eq!(report.outage("load").unwrap().blast_radius(), 0);
         assert_eq!(report.outage("load").unwrap().failed, Vec::<usize>::new());
+    }
+
+    #[test]
+    fn a_signal_gate_is_not_an_activity() {
+        let mut b = DagBuilder::new();
+        let g = b.signal_gate("extract");
+        let e = b.activity(extract).upstream(&g);
+        let report = DagBlastRadius::analyze(&b.build().unwrap());
+
+        assert_eq!(report.outages.len(), 1);
+        let outage = report.outage("extract").unwrap();
+        assert_eq!(outage.failed, vec![e.index()]);
+        assert_eq!(outage.lost, vec![e.index()]);
+    }
+
+    #[test]
+    fn a_conditional_task_is_listed_as_an_assumption() {
+        let mut b = DagBuilder::new();
+        let e = b.activity(extract);
+        let f = b
+            .activity(fallback)
+            .upstream(&e)
+            .trigger_rule(TriggerRule::OneFailed)
+            .condition(|_| false);
+        let report = DagBlastRadius::analyze(&b.build().unwrap());
+
+        assert_eq!(report.conditional, vec![f.index()]);
+        assert_eq!(report.outage("extract").unwrap().activated, vec![f.index()]);
     }
 
     #[test]
