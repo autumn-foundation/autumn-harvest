@@ -15,6 +15,13 @@
 //! A signal gate dispatches no activity, so the analysis never fails one.
 //! A signal name is not an activity, so it gets no outage entry either.
 //!
+//! A mapped node follows the engine rules. A mapped upstream that did not
+//! succeed leaves no array, so the node fails before it dispatches. With
+//! `CollectAll`, an outage of the mapped activity fails each item, not the
+//! node. With `FailFast`, the outage fails the node. The analysis assumes that
+//! each mapped upstream yields a non-empty array. An empty array dispatches
+//! nothing, so the node succeeds even during an outage.
+//!
 //! A `condition` predicate reads upstream outputs, and a static analysis has
 //! none. The analysis therefore assumes that each condition passes. Each such
 //! task is listed in [`DagBlastRadius::conditional`]. A result that names one
@@ -27,14 +34,14 @@
 //! The module is pure. It sends no SQL and reads no clock.
 
 use crate::dag::DagDefinition;
-use crate::policy::TaskStatus;
+use crate::policy::{MapFailurePolicy, TaskStatus};
 
 /// The effect of one activity outage on a DAG run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivityOutage {
     /// Name of the activity that is down.
     pub activity: String,
-    /// Tasks that run and fail, by topological index.
+    /// Tasks that pass their trigger rule and fail, by topological index.
     pub failed: Vec<usize>,
     /// Tasks that succeed in the baseline but not in the outage.
     pub lost: Vec<usize>,
@@ -124,7 +131,9 @@ impl DagBlastRadius {
 /// Final status of each task when the `down` activity fails.
 ///
 /// A task that runs succeeds unless it calls the `down` activity. A signal
-/// gate calls no activity, so it always succeeds.
+/// gate calls no activity, so it always succeeds. A mapped node fails when
+/// its mapped upstream did not succeed. A `CollectAll` mapped node survives
+/// an outage of its own activity.
 fn propagate(dag: &DagDefinition, down: Option<&str>) -> Vec<TaskStatus> {
     let tasks = dag.tasks();
     let mut states = vec![TaskStatus::Skipped; tasks.len()];
@@ -133,7 +142,16 @@ fn propagate(dag: &DagDefinition, down: Option<&str>) -> Vec<TaskStatus> {
         let upstreams = task.upstreams.iter().map(|&up| &states[up]);
         states[i] = if !task.trigger_rule.should_run(upstreams) {
             TaskStatus::Skipped
-        } else if task.signal.is_none() && down == Some(task.activity_name.as_str()) {
+        } else if task
+            .map_upstream
+            .is_some_and(|up| states[up] != TaskStatus::Succeeded)
+        {
+            TaskStatus::Failed
+        } else if task.signal.is_none()
+            && down == Some(task.activity_name.as_str())
+            && !(task.map_upstream.is_some()
+                && task.map_failure_policy == MapFailurePolicy::CollectAll)
+        {
             TaskStatus::Failed
         } else {
             TaskStatus::Succeeded
@@ -297,6 +315,52 @@ mod tests {
 
         assert_eq!(report.conditional, vec![f.index()]);
         assert_eq!(report.outage("extract").unwrap().activated, vec![f.index()]);
+    }
+
+    #[test]
+    fn a_collect_all_mapped_node_survives_its_outage() {
+        let mut b = DagBuilder::new();
+        let e = b.activity(extract);
+        let m = b
+            .map_activity(transform)
+            .over(&e)
+            .map_failure_policy(MapFailurePolicy::CollectAll);
+        let l = b.activity(load).upstream(&m);
+        let report = DagBlastRadius::analyze(&b.build().unwrap());
+
+        let outage = report.outage("transform").unwrap();
+        assert_eq!(outage.failed, Vec::<usize>::new());
+        assert_eq!(outage.lost, Vec::<usize>::new());
+        assert_eq!(report.baseline[l.index()], TaskStatus::Succeeded);
+    }
+
+    #[test]
+    fn a_fail_fast_mapped_node_fails_in_its_outage() {
+        let mut b = DagBuilder::new();
+        let e = b.activity(extract);
+        let m = b.map_activity(transform).over(&e);
+        let l = b.activity(load).upstream(&m);
+        let report = DagBlastRadius::analyze(&b.build().unwrap());
+
+        let outage = report.outage("transform").unwrap();
+        assert_eq!(outage.failed, vec![m.index()]);
+        assert_eq!(outage.lost, vec![m.index(), l.index()]);
+    }
+
+    #[test]
+    fn a_mapped_node_fails_without_its_array() {
+        let mut b = DagBuilder::new();
+        let e = b.activity(extract);
+        let m = b
+            .map_activity(transform)
+            .over(&e)
+            .trigger_rule(TriggerRule::AllDone);
+        let l = b.activity(load).upstream(&m);
+        let report = DagBlastRadius::analyze(&b.build().unwrap());
+
+        let outage = report.outage("extract").unwrap();
+        assert_eq!(outage.failed, vec![e.index(), m.index()]);
+        assert_eq!(outage.lost, vec![e.index(), m.index(), l.index()]);
     }
 
     #[test]
