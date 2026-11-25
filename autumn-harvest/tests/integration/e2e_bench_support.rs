@@ -332,6 +332,17 @@ pub const SHARD_FILTER_ENV_VAR: &str = "HARVEST_BENCH_SHARDS";
 /// nothing.
 pub const STATS_DIR_ENV_VAR: &str = "HARVEST_BENCH_STATS_DIR";
 
+/// A SQL file that loads a background history into each shard database.
+///
+/// When set, setup runs the file after the migrations and before the stats
+/// reset. So the scenario runs against production-shaped tables, not empty
+/// ones. The file vacuums only the tables that it fills. A vacuumed empty
+/// queue table gets zero-row statistics, and the cached generic plans of the
+/// claim path then scan it.
+/// Unset loads nothing. The Ledger fixture in
+/// `docs/perf-artifacts/background-history/` is one such file.
+pub const BACKGROUND_SQL_ENV_VAR: &str = "HARVEST_BENCH_BACKGROUND_SQL";
+
 /// The stats directory from the raw value of [`STATS_DIR_ENV_VAR`]. A blank
 /// value means no snapshot.
 #[must_use]
@@ -3035,9 +3046,9 @@ pub mod db {
     use super::super::claim_bench_support::LatencyStats;
     use super::super::pg_stats_snapshot::ResetOutcome;
     use super::{
-        BENCH_ACTIVITIES, BENCH_NOOP_WORKFLOW, BENCH_QUEUE, BENCH_SIGNAL, BENCH_SIGNAL_WORKFLOW,
-        BENCH_WORKFLOW, BenchScenario, DISPATCH_WORKFLOWS_PER_SHARD, FEEDER_CONNECTIONS_PER_SHARD,
-        MAX_CONCURRENT_ACTIVITIES, MAX_CONCURRENT_WORKFLOWS, Metric,
+        BACKGROUND_SQL_ENV_VAR, BENCH_ACTIVITIES, BENCH_NOOP_WORKFLOW, BENCH_QUEUE, BENCH_SIGNAL,
+        BENCH_SIGNAL_WORKFLOW, BENCH_WORKFLOW, BenchScenario, DISPATCH_WORKFLOWS_PER_SHARD,
+        FEEDER_CONNECTIONS_PER_SHARD, MAX_CONCURRENT_ACTIVITIES, MAX_CONCURRENT_WORKFLOWS, Metric,
         PACED_STARTS_PER_SEC_PER_SHARD, POLL_INTERVAL_MS, POOL_SIZE_PER_SHARD, Pacing,
         SCENARIO_BUDGET_SECS, SHARD_URLS_ENV_VAR, SIGNAL_PARK_SETTLE, SIGNAL_SOCKET_TIMEOUT,
         SIGNAL_WORKFLOWS_PER_SHARD, STATS_DIR_ENV_VAR, ScenarioReport, TeardownReport,
@@ -3309,6 +3320,33 @@ pub mod db {
         Ok((url, name, conn))
     }
 
+    /// Run the file of [`BACKGROUND_SQL_ENV_VAR`].
+    ///
+    /// `VACUUM` cannot run inside the implicit transaction of a batch. So
+    /// each line that starts with `VACUUM` runs as its own statement, and the
+    /// lines between them run as one batch, in file order.
+    async fn load_background(conn: &mut AsyncPgConnection) -> Result<(), String> {
+        let Some(path) = std::env::var_os(BACKGROUND_SQL_ENV_VAR).filter(|p| !p.is_empty()) else {
+            return Ok(());
+        };
+        let sql = std::fs::read_to_string(&path)
+            .map_err(|e| format!("read {}: {e}", std::path::Path::new(&path).display()))?;
+        let mut batch = String::new();
+        for line in sql.lines() {
+            if line.trim_start().starts_with("VACUUM") {
+                conn.batch_execute(&batch)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                batch.clear();
+                conn.batch_execute(line).await.map_err(|e| e.to_string())?;
+            } else {
+                batch.push_str(line);
+                batch.push('\n');
+            }
+        }
+        conn.batch_execute(&batch).await.map_err(|e| e.to_string())
+    }
+
     /// Provision one shard database: sweep and create it under the
     /// stale-database sweep lock, then migrate it after releasing that lock.
     ///
@@ -3328,6 +3366,11 @@ pub mod db {
             drop(conn);
             drop_created(&[(admin_url.to_owned(), name)]).await;
             return Err(SkipReason(format!("migrate shard database: {e}")));
+        }
+        if let Err(e) = load_background(&mut conn).await {
+            drop(conn);
+            drop_created(&[(admin_url.to_owned(), name)]).await;
+            return Err(SkipReason(format!("load background history: {e}")));
         }
         // With a stats snapshot to come, clear the setup out of both views.
         // The teardown snapshot then holds the scenario only, warmup included.
