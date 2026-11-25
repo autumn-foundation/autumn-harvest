@@ -33,7 +33,7 @@
 //!
 //! The module is pure. It sends no SQL and reads no clock.
 
-use crate::dag::DagDefinition;
+use crate::dag::{DagDefinition, DagTask};
 use crate::policy::{MapFailurePolicy, TaskStatus};
 
 /// The effect of one activity outage on a DAG run.
@@ -142,22 +142,26 @@ fn propagate(dag: &DagDefinition, down: Option<&str>) -> Vec<TaskStatus> {
         let upstreams = task.upstreams.iter().map(|&up| &states[up]);
         states[i] = if !task.trigger_rule.should_run(upstreams) {
             TaskStatus::Skipped
-        } else if task
-            .map_upstream
-            .is_some_and(|up| states[up] != TaskStatus::Succeeded)
-        {
-            TaskStatus::Failed
-        } else if task.signal.is_none()
-            && down == Some(task.activity_name.as_str())
-            && !(task.map_upstream.is_some()
-                && task.map_failure_policy == MapFailurePolicy::CollectAll)
-        {
+        } else if fails(task, &states, down) {
             TaskStatus::Failed
         } else {
             TaskStatus::Succeeded
         };
     }
     states
+}
+
+/// Whether `task` fails once its trigger rule passes.
+fn fails(task: &DagTask, states: &[TaskStatus], down: Option<&str>) -> bool {
+    if let Some(up) = task.map_upstream {
+        if states[up] != TaskStatus::Succeeded {
+            return true;
+        }
+        if task.map_failure_policy == MapFailurePolicy::CollectAll {
+            return false;
+        }
+    }
+    task.signal.is_none() && down == Some(task.activity_name.as_str())
 }
 
 #[cfg(test)]
