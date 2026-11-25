@@ -37046,6 +37046,121 @@ macro_rules! reject_pacing_override {
     }};
 }
 
+/// Audit a completed pacing-override fan-out, then build its response.
+///
+/// Every one of the four pacing-override mutation handlers (set/clear,
+/// throttle/rate-limit) reaches this same tail once its per-shard loop
+/// finishes. It writes one audit row for the fan-out outcome, then turns
+/// `shard_errors`/`persisted_baseline` into the route's response. The loop
+/// itself stays in each handler, since its per-shard SQL and bind arity
+/// differ (a single clear key vs. an upsert's six bound values); only the
+/// identical mechanism after it moves here. Every argument is passed
+/// explicitly, the same discipline `reject_pacing_override!` above already
+/// follows for this same handler family.
+#[allow(clippy::too_many_arguments)]
+async fn finish_pacing_override_write(
+    pool: &HarvestDbPool,
+    actor: &str,
+    source: &str,
+    request_id: Option<&str>,
+    operation: &'static str,
+    target_type: &'static str,
+    route: &str,
+    key: String,
+    declared_refill_rate: f64,
+    declared_burst: f64,
+    override_refill_rate: Option<f64>,
+    override_burst: Option<f64>,
+    expires_at: Option<jiff::Timestamp>,
+    any_success: bool,
+    shard_errors: Vec<String>,
+    persisted_baseline: Option<(f64, f64)>,
+) -> axum::response::Response {
+    // Attempt the audit write *before* deciding the response, even on total
+    // shard failure (issue #945). A fully failed administrative override
+    // attempt must still leave an audit trail. So the early `503` below waits
+    // until this write is attempted and can never bypass it.
+    let status = if shard_errors.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    let error_summary = if shard_errors.is_empty() {
+        None
+    } else {
+        Some(shard_errors.join("; "))
+    };
+    let ar = NewAuditRecord {
+        actor,
+        operation,
+        target_type,
+        target_id: Some(key.as_str()),
+        route_or_command: route,
+        request_id,
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source,
+    };
+    match acquire_conn(pool.default_pool()).await {
+        Ok(mut conn) => {
+            if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+                tracing::error!(error = %audit_err, "audit insert failed for {operation}");
+                return AutumnError::service_unavailable_msg(format!(
+                    "audit insert failed: {audit_err}"
+                ))
+                .into_response();
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "audit DB connection unavailable for {operation}");
+            return AutumnError::service_unavailable_msg("audit DB connection unavailable")
+                .into_response();
+        }
+    }
+
+    if !shard_errors.is_empty() && !any_success {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "errors": shard_errors })),
+        )
+            .into_response();
+    }
+
+    // `persisted_baseline` reports the last fan-out write or read that
+    // returned a row. It falls back to the declared baseline in two cases.
+    // A clear finds no row when the bucket never existed on any reachable
+    // shard. That is the documented idempotent clear of an unset bucket. The
+    // registry declaration is exactly correct there (issue #945). A set
+    // falls back only in the pathological case where every reachable
+    // shard's write raced past the `any_success` check above without
+    // returning a row.
+    let (baseline_refill_rate, baseline_burst) =
+        persisted_baseline.unwrap_or((declared_refill_rate, declared_burst));
+    let response = PacingOverrideResponse::build(
+        key,
+        baseline_refill_rate,
+        baseline_burst,
+        override_refill_rate,
+        override_burst,
+        expires_at,
+    );
+
+    if shard_errors.is_empty() {
+        (axum::http::StatusCode::OK, axum::Json(response)).into_response()
+    } else {
+        (
+            axum::http::StatusCode::MULTI_STATUS,
+            axum::Json(serde_json::json!({
+                "override": response,
+                "shard_errors": shard_errors,
+            })),
+        )
+            .into_response()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StartThrottlePacingOverrideRequest {
@@ -37297,91 +37412,25 @@ async fn set_start_throttle_pacing_override(
         }
     }
 
-    // Attempt the audit write *before* deciding the response, even on total
-    // shard failure (issue #945). A fully failed administrative override
-    // attempt must still leave an audit trail. So the early `503` below waits
-    // until this write is attempted and can never bypass it.
-    let status = if shard_errors.is_empty() {
-        STATUS_SUCCEEDED
-    } else {
-        STATUS_FAILED
-    };
-    let error_summary = if shard_errors.is_empty() {
-        None
-    } else {
-        Some(shard_errors.join("; "))
-    };
-    let ar = NewAuditRecord {
-        actor: &actor,
-        operation: OP_START_THROTTLE_PACING_OVERRIDE_SET,
-        target_type: TARGET_THROTTLE,
-        target_id: Some(key.as_str()),
-        route_or_command: route,
-        request_id: request_id.as_deref(),
-        idempotency_key: None,
-        status,
-        error_summary: error_summary.as_deref(),
-        shard_id: None,
-        source: &source,
-    };
-    match acquire_conn(pool.default_pool()).await {
-        Ok(mut conn) => {
-            if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
-                tracing::error!(
-                    error = %audit_err,
-                    "audit insert failed for start_throttle.pacing_override.set"
-                );
-                return AutumnError::service_unavailable_msg(format!(
-                    "audit insert failed: {audit_err}"
-                ))
-                .into_response();
-            }
-        }
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                "audit DB connection unavailable for start_throttle.pacing_override.set"
-            );
-            return AutumnError::service_unavailable_msg("audit DB connection unavailable")
-                .into_response();
-        }
-    }
-
-    if !shard_errors.is_empty() && !any_success {
-        return (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(serde_json::json!({ "errors": shard_errors })),
-        )
-            .into_response();
-    }
-
-    // Report the persisted baseline that the write just confirmed (issue #945).
-    // Fall back to the registry only in the pathological case: every reachable
-    // shard's write raced past the `!any_success` guard above without ever
-    // returning a row.
-    let (baseline_refill_rate, baseline_burst) =
-        persisted_baseline.unwrap_or((declared_refill_rate, declared_burst));
-    let response = PacingOverrideResponse::build(
+    finish_pacing_override_write(
+        &pool,
+        &actor,
+        &source,
+        request_id.as_deref(),
+        OP_START_THROTTLE_PACING_OVERRIDE_SET,
+        TARGET_THROTTLE,
+        route,
         key,
-        baseline_refill_rate,
-        baseline_burst,
+        declared_refill_rate,
+        declared_burst,
         request.refill_per_sec,
         request.burst,
         Some(expires_at),
-    );
-
-    if shard_errors.is_empty() {
-        (axum::http::StatusCode::OK, axum::Json(response)).into_response()
-    } else {
-        (
-            axum::http::StatusCode::MULTI_STATUS,
-            axum::Json(serde_json::json!({
-                "override": response,
-                "shard_errors": shard_errors,
-            })),
-        )
-            .into_response()
-    }
+        any_success,
+        shard_errors,
+        persisted_baseline,
+    )
+    .await
 }
 
 /// `DELETE /admin/start-throttle/{workflow_name}/override` — clear a TTL'd
@@ -37507,86 +37556,25 @@ async fn clear_start_throttle_pacing_override(
         }
     }
 
-    // Attempt the audit write *before* deciding the response, even on total
-    // shard failure (issue #945). A fully failed administrative override
-    // attempt must still leave an audit trail. So the early `503` below waits
-    // until this write is attempted and can never bypass it.
-    let status = if shard_errors.is_empty() {
-        STATUS_SUCCEEDED
-    } else {
-        STATUS_FAILED
-    };
-    let error_summary = if shard_errors.is_empty() {
-        None
-    } else {
-        Some(shard_errors.join("; "))
-    };
-    let ar = NewAuditRecord {
-        actor: &actor,
-        operation: OP_START_THROTTLE_PACING_OVERRIDE_CLEAR,
-        target_type: TARGET_THROTTLE,
-        target_id: Some(key.as_str()),
-        route_or_command: route,
-        request_id: request_id.as_deref(),
-        idempotency_key: None,
-        status,
-        error_summary: error_summary.as_deref(),
-        shard_id: None,
-        source: &source,
-    };
-    match acquire_conn(pool.default_pool()).await {
-        Ok(mut conn) => {
-            if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
-                tracing::error!(
-                    error = %audit_err,
-                    "audit insert failed for start_throttle.pacing_override.clear"
-                );
-                return AutumnError::service_unavailable_msg(format!(
-                    "audit insert failed: {audit_err}"
-                ))
-                .into_response();
-            }
-        }
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                "audit DB connection unavailable for start_throttle.pacing_override.clear"
-            );
-            return AutumnError::service_unavailable_msg("audit DB connection unavailable")
-                .into_response();
-        }
-    }
-
-    if !shard_errors.is_empty() && !any_success {
-        return (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(serde_json::json!({ "errors": shard_errors })),
-        )
-            .into_response();
-    }
-
-    // Report the persisted (now-reverted) baseline that the clear just
-    // confirmed (issue #945). `persisted_baseline` is `None` only when the
-    // bucket never existed on any reachable shard. That is the documented
-    // idempotent clear of an unset bucket. The registry declaration is then
-    // exactly correct, since a never-written bucket can only agree with it.
-    let (baseline_refill_rate, baseline_burst) =
-        persisted_baseline.unwrap_or((declared_refill_rate, declared_burst));
-    let response =
-        PacingOverrideResponse::build(key, baseline_refill_rate, baseline_burst, None, None, None);
-
-    if shard_errors.is_empty() {
-        (axum::http::StatusCode::OK, axum::Json(response)).into_response()
-    } else {
-        (
-            axum::http::StatusCode::MULTI_STATUS,
-            axum::Json(serde_json::json!({
-                "override": response,
-                "shard_errors": shard_errors,
-            })),
-        )
-            .into_response()
-    }
+    finish_pacing_override_write(
+        &pool,
+        &actor,
+        &source,
+        request_id.as_deref(),
+        OP_START_THROTTLE_PACING_OVERRIDE_CLEAR,
+        TARGET_THROTTLE,
+        route,
+        key,
+        declared_refill_rate,
+        declared_burst,
+        None,
+        None,
+        None,
+        any_success,
+        shard_errors,
+        persisted_baseline,
+    )
+    .await
 }
 
 async fn pending_event_batches(
@@ -38501,91 +38489,25 @@ async fn set_rate_limit_pacing_override(
         }
     }
 
-    // Attempt the audit write *before* deciding the response, even on total
-    // shard failure (issue #945). A fully failed administrative override
-    // attempt must still leave an audit trail. So the early `503` below waits
-    // until this write is attempted and can never bypass it.
-    let status = if shard_errors.is_empty() {
-        STATUS_SUCCEEDED
-    } else {
-        STATUS_FAILED
-    };
-    let error_summary = if shard_errors.is_empty() {
-        None
-    } else {
-        Some(shard_errors.join("; "))
-    };
-    let ar = NewAuditRecord {
-        actor: &actor,
-        operation: OP_RATE_LIMIT_PACING_OVERRIDE_SET,
-        target_type: TARGET_RATE_LIMIT,
-        target_id: Some(key.as_str()),
-        route_or_command: route,
-        request_id: request_id.as_deref(),
-        idempotency_key: None,
-        status,
-        error_summary: error_summary.as_deref(),
-        shard_id: None,
-        source: &source,
-    };
-    match acquire_conn(pool.default_pool()).await {
-        Ok(mut conn) => {
-            if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
-                tracing::error!(
-                    error = %audit_err,
-                    "audit insert failed for rate_limit.pacing_override.set"
-                );
-                return AutumnError::service_unavailable_msg(format!(
-                    "audit insert failed: {audit_err}"
-                ))
-                .into_response();
-            }
-        }
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                "audit DB connection unavailable for rate_limit.pacing_override.set"
-            );
-            return AutumnError::service_unavailable_msg("audit DB connection unavailable")
-                .into_response();
-        }
-    }
-
-    if !shard_errors.is_empty() && !any_success {
-        return (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(serde_json::json!({ "errors": shard_errors })),
-        )
-            .into_response();
-    }
-
-    // Report the persisted baseline that the write just confirmed (issue #945).
-    // Fall back to the registry only in the pathological case: every reachable
-    // shard's write raced past the `!any_success` guard above without ever
-    // returning a row.
-    let (baseline_refill_rate, baseline_burst) =
-        persisted_baseline.unwrap_or((declared_refill_rate, declared_burst));
-    let response = PacingOverrideResponse::build(
+    finish_pacing_override_write(
+        &pool,
+        &actor,
+        &source,
+        request_id.as_deref(),
+        OP_RATE_LIMIT_PACING_OVERRIDE_SET,
+        TARGET_RATE_LIMIT,
+        route,
         key,
-        baseline_refill_rate,
-        baseline_burst,
+        declared_refill_rate,
+        declared_burst,
         request.refill_rate,
         request.burst,
         Some(expires_at),
-    );
-
-    if shard_errors.is_empty() {
-        (axum::http::StatusCode::OK, axum::Json(response)).into_response()
-    } else {
-        (
-            axum::http::StatusCode::MULTI_STATUS,
-            axum::Json(serde_json::json!({
-                "override": response,
-                "shard_errors": shard_errors,
-            })),
-        )
-            .into_response()
-    }
+        any_success,
+        shard_errors,
+        persisted_baseline,
+    )
+    .await
 }
 
 /// `DELETE /admin/rate-limits/{activity_name}/override` — clear a TTL'd
@@ -38712,86 +38634,25 @@ async fn clear_rate_limit_pacing_override(
         }
     }
 
-    // Attempt the audit write *before* deciding the response, even on total
-    // shard failure (issue #945). A fully failed administrative override
-    // attempt must still leave an audit trail. So the early `503` below waits
-    // until this write is attempted and can never bypass it.
-    let status = if shard_errors.is_empty() {
-        STATUS_SUCCEEDED
-    } else {
-        STATUS_FAILED
-    };
-    let error_summary = if shard_errors.is_empty() {
-        None
-    } else {
-        Some(shard_errors.join("; "))
-    };
-    let ar = NewAuditRecord {
-        actor: &actor,
-        operation: OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR,
-        target_type: TARGET_RATE_LIMIT,
-        target_id: Some(key.as_str()),
-        route_or_command: route,
-        request_id: request_id.as_deref(),
-        idempotency_key: None,
-        status,
-        error_summary: error_summary.as_deref(),
-        shard_id: None,
-        source: &source,
-    };
-    match acquire_conn(pool.default_pool()).await {
-        Ok(mut conn) => {
-            if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
-                tracing::error!(
-                    error = %audit_err,
-                    "audit insert failed for rate_limit.pacing_override.clear"
-                );
-                return AutumnError::service_unavailable_msg(format!(
-                    "audit insert failed: {audit_err}"
-                ))
-                .into_response();
-            }
-        }
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                "audit DB connection unavailable for rate_limit.pacing_override.clear"
-            );
-            return AutumnError::service_unavailable_msg("audit DB connection unavailable")
-                .into_response();
-        }
-    }
-
-    if !shard_errors.is_empty() && !any_success {
-        return (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(serde_json::json!({ "errors": shard_errors })),
-        )
-            .into_response();
-    }
-
-    // Report the persisted (now-reverted) baseline that the clear just
-    // confirmed (issue #945). `persisted_baseline` is `None` only when the
-    // bucket never existed on any reachable shard. That is the documented
-    // idempotent clear of an unset bucket. The registry declaration is then
-    // exactly correct, since a never-written bucket can only agree with it.
-    let (baseline_refill_rate, baseline_burst) =
-        persisted_baseline.unwrap_or((declared_refill_rate, declared_burst));
-    let response =
-        PacingOverrideResponse::build(key, baseline_refill_rate, baseline_burst, None, None, None);
-
-    if shard_errors.is_empty() {
-        (axum::http::StatusCode::OK, axum::Json(response)).into_response()
-    } else {
-        (
-            axum::http::StatusCode::MULTI_STATUS,
-            axum::Json(serde_json::json!({
-                "override": response,
-                "shard_errors": shard_errors,
-            })),
-        )
-            .into_response()
-    }
+    finish_pacing_override_write(
+        &pool,
+        &actor,
+        &source,
+        request_id.as_deref(),
+        OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR,
+        TARGET_RATE_LIMIT,
+        route,
+        key,
+        declared_refill_rate,
+        declared_burst,
+        None,
+        None,
+        None,
+        any_success,
+        shard_errors,
+        persisted_baseline,
+    )
+    .await
 }
 
 // ── Circuit Breaker Management (issue #369) ─────────────────────────────────
