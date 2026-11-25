@@ -302,6 +302,7 @@ pub mod critical_path;
 #[cfg(feature = "db")]
 pub mod cross_shard_child;
 pub mod dag;
+pub mod dag_blast_radius;
 pub mod dag_concurrency;
 pub mod dag_crash;
 /// Export format types for Directed Acyclic Graphs (DAGs) representing workflows.
@@ -758,6 +759,7 @@ pub use dag::{
     DagBuildError, DagBuilder, DagCondition, DagDefinition, DagDispatchDecision, DagInputBinding,
     DagMapTaskRef, DagMergeSource, DagSignalGate, DagTask, DagTaskRef, GateTimeoutAction,
 };
+pub use dag_blast_radius::{ActivityOutage, DagBlastRadius};
 pub use dag_concurrency::{
     ConcurrencyProfile, Schedule as DagSchedule, Segment as ConcurrencySegment,
 };

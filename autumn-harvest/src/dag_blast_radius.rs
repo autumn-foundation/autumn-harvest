@@ -1,0 +1,259 @@
+//! Outage blast radius for DAG definitions.
+//!
+//! A circuit breaker trips per activity, not per task. When a downstream
+//! service goes hard-down, every task that calls its activity fails at once.
+//! One activity name can back many nodes of a DAG. This module asks what that
+//! outage costs the run.
+//!
+//! For each activity, the analysis fails every task of that activity. It then
+//! walks the execution levels and applies each trigger rule, as the worker
+//! does. It compares the result with a baseline run in which every task
+//! succeeds. A task that succeeds in the baseline but not in the outage is
+//! lost. A task that succeeds only in the outage is activated. An activated
+//! task is often a fallback that waits on `OneFailed` or `AllFailed`.
+//!
+//! The ranking tells an operator which dependency to guard first. An activity
+//! with a large blast radius is a good candidate for a fallback branch or a
+//! `Defer` breaker.
+//!
+//! The module is pure. It sends no SQL and reads no clock.
+
+use crate::dag::DagDefinition;
+use crate::policy::TaskStatus;
+
+/// The effect of one activity outage on a DAG run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityOutage {
+    /// Name of the activity that is down.
+    pub activity: String,
+    /// Tasks that run and fail, by topological index.
+    pub failed: Vec<usize>,
+    /// Tasks that succeed in the baseline but not in the outage.
+    pub lost: Vec<usize>,
+    /// Tasks that succeed only in the outage.
+    pub activated: Vec<usize>,
+}
+
+impl ActivityOutage {
+    /// Number of tasks that the outage costs the run.
+    #[must_use]
+    pub const fn blast_radius(&self) -> usize {
+        self.lost.len()
+    }
+}
+
+/// Blast radius of every activity of a DAG.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DagBlastRadius {
+    /// Status of each task when every task succeeds, by topological index.
+    pub baseline: Vec<TaskStatus>,
+    /// One entry per activity, largest blast radius first.
+    ///
+    /// Ties sort by activity name, so the order is deterministic.
+    pub outages: Vec<ActivityOutage>,
+}
+
+impl DagBlastRadius {
+    /// Analyze an outage of each activity of `dag`.
+    #[must_use]
+    pub fn analyze(dag: &DagDefinition) -> Self {
+        let baseline = propagate(dag, None);
+        let mut activities: Vec<&str> = dag
+            .tasks()
+            .iter()
+            .map(|t| t.activity_name.as_str())
+            .collect();
+        activities.sort_unstable();
+        activities.dedup();
+
+        let mut outages: Vec<ActivityOutage> = activities
+            .into_iter()
+            .map(|activity| {
+                let states = propagate(dag, Some(activity));
+                let pick = |keep: fn(TaskStatus, TaskStatus) -> bool| -> Vec<usize> {
+                    (0..states.len())
+                        .filter(|&i| keep(baseline[i], states[i]))
+                        .collect()
+                };
+                ActivityOutage {
+                    activity: activity.to_string(),
+                    failed: pick(|_, now| now == TaskStatus::Failed),
+                    lost: pick(|was, now| {
+                        was == TaskStatus::Succeeded && now != TaskStatus::Succeeded
+                    }),
+                    activated: pick(|was, now| {
+                        was != TaskStatus::Succeeded && now == TaskStatus::Succeeded
+                    }),
+                }
+            })
+            .collect();
+        // The sort is stable, so ties keep the name order from above.
+        outages.sort_by_key(|o| std::cmp::Reverse(o.blast_radius()));
+        Self { baseline, outages }
+    }
+
+    /// The outage entry of `activity`, if the DAG calls it.
+    #[must_use]
+    pub fn outage(&self, activity: &str) -> Option<&ActivityOutage> {
+        self.outages.iter().find(|o| o.activity == activity)
+    }
+}
+
+/// Final status of each task when the `down` activity fails.
+///
+/// A task that runs succeeds unless it calls the `down` activity.
+fn propagate(dag: &DagDefinition, down: Option<&str>) -> Vec<TaskStatus> {
+    let tasks = dag.tasks();
+    let mut states = vec![TaskStatus::Skipped; tasks.len()];
+    for &i in dag.execution_levels().iter().flatten() {
+        let task = &tasks[i];
+        let upstreams = task.upstreams.iter().map(|&up| &states[up]);
+        states[i] = if !task.trigger_rule.should_run(upstreams) {
+            TaskStatus::Skipped
+        } else if down == Some(task.activity_name.as_str()) {
+            TaskStatus::Failed
+        } else {
+            TaskStatus::Succeeded
+        };
+    }
+    states
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dag::DagBuilder;
+    use crate::policy::TriggerRule;
+
+    fn extract() {}
+    fn transform() {}
+    fn load() {}
+    fn notify() {}
+    fn fallback() {}
+
+    #[test]
+    fn a_linear_chain_loses_everything_downstream() {
+        let mut b = DagBuilder::new();
+        let e = b.activity(extract);
+        let t = b.activity(transform).upstream(&e);
+        let l = b.activity(load).upstream(&t);
+        let report = DagBlastRadius::analyze(&b.build().unwrap());
+
+        assert_eq!(report.baseline, vec![TaskStatus::Succeeded; 3]);
+        let head = &report.outages[0];
+        assert_eq!(head.activity, "extract");
+        assert_eq!(head.failed, vec![e.index()]);
+        assert_eq!(head.lost, vec![e.index(), t.index(), l.index()]);
+        assert_eq!(head.activated, Vec::<usize>::new());
+        assert_eq!(report.outage("load").unwrap().blast_radius(), 1);
+    }
+
+    #[test]
+    fn outages_rank_by_blast_radius() {
+        let mut b = DagBuilder::new();
+        let e = b.activity(extract);
+        let t = b.activity(transform).upstream(&e);
+        let _ = b.activity(load).upstream(&t);
+        let report = DagBlastRadius::analyze(&b.build().unwrap());
+
+        let order: Vec<_> = report.outages.iter().map(|o| o.activity.as_str()).collect();
+        assert_eq!(order, ["extract", "transform", "load"]);
+    }
+
+    #[test]
+    fn ties_sort_by_activity_name() {
+        let mut b = DagBuilder::new();
+        let _ = b.activity(transform);
+        let _ = b.activity(extract);
+        let report = DagBlastRadius::analyze(&b.build().unwrap());
+
+        let order: Vec<_> = report.outages.iter().map(|o| o.activity.as_str()).collect();
+        assert_eq!(order, ["extract", "transform"]);
+    }
+
+    #[test]
+    fn one_activity_on_many_nodes_fails_them_all() {
+        let mut b = DagBuilder::new();
+        let n1 = b.activity(notify);
+        let e = b.activity(extract).upstream(&n1);
+        let n2 = b.activity(notify).upstream(&e);
+        let report = DagBlastRadius::analyze(&b.build().unwrap());
+
+        let outage = report.outage("notify").unwrap();
+        // The second node never runs, because its upstream is skipped.
+        assert_eq!(outage.failed, vec![n1.index()]);
+        assert_eq!(outage.lost, vec![n1.index(), e.index(), n2.index()]);
+    }
+
+    #[test]
+    fn a_fallback_branch_is_activated() {
+        let mut b = DagBuilder::new();
+        let e = b.activity(extract);
+        let f = b
+            .activity(fallback)
+            .upstream(&e)
+            .trigger_rule(TriggerRule::OneFailed);
+        let l = b.activity(load).upstream(&e);
+        let report = DagBlastRadius::analyze(&b.build().unwrap());
+
+        assert_eq!(report.baseline[f.index()], TaskStatus::Skipped);
+        let outage = report.outage("extract").unwrap();
+        assert_eq!(outage.activated, vec![f.index()]);
+        assert_eq!(outage.lost, vec![e.index(), l.index()]);
+    }
+
+    #[test]
+    fn an_all_done_task_survives_the_outage() {
+        let mut b = DagBuilder::new();
+        let e = b.activity(extract);
+        let n = b
+            .activity(notify)
+            .upstream(&e)
+            .trigger_rule(TriggerRule::AllDone);
+        let report = DagBlastRadius::analyze(&b.build().unwrap());
+
+        let outage = report.outage("extract").unwrap();
+        assert_eq!(outage.lost, vec![e.index()]);
+        assert!(!outage.lost.contains(&n.index()));
+    }
+
+    #[test]
+    fn one_success_survives_one_failed_branch() {
+        let mut b = DagBuilder::new();
+        let e = b.activity(extract);
+        let t = b.activity(transform);
+        let l = b
+            .activity(load)
+            .upstream(&e)
+            .upstream(&t)
+            .trigger_rule(TriggerRule::OneSuccess);
+        let report = DagBlastRadius::analyze(&b.build().unwrap());
+
+        let outage = report.outage("extract").unwrap();
+        assert_eq!(outage.lost, vec![e.index()]);
+        assert!(!outage.lost.contains(&l.index()));
+    }
+
+    #[test]
+    fn a_manual_node_is_never_lost() {
+        let mut b = DagBuilder::new();
+        let e = b.activity(extract);
+        let _ = b
+            .activity(load)
+            .upstream(&e)
+            .trigger_rule(TriggerRule::Manual);
+        let report = DagBlastRadius::analyze(&b.build().unwrap());
+
+        assert_eq!(report.outage("load").unwrap().blast_radius(), 0);
+        assert_eq!(report.outage("load").unwrap().failed, Vec::<usize>::new());
+    }
+
+    #[test]
+    fn an_unknown_activity_has_no_outage() {
+        let mut b = DagBuilder::new();
+        let _ = b.activity(extract);
+        let report = DagBlastRadius::analyze(&b.build().unwrap());
+
+        assert!(report.outage("missing").is_none());
+    }
+}
