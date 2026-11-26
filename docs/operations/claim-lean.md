@@ -165,6 +165,9 @@ a deep backlog only.
 
 ## Evidence
 
+- [`performance-claim-lean-tier.md`](../performance-claim-lean-tier.md)
+  measures the lean statement alone, in the e2e bench and in a loop of
+  mixed claim kinds.
 - `docs/perf-artifacts/claim-window-split/claim_forms.sql` counts the claim
   statements of a run by form: lean, window and full.
 

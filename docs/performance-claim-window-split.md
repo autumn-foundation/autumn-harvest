@@ -260,6 +260,7 @@ send both statements. The exact flag is worth 5%.
 > lean form hands each doubtful case to the unchanged window form.
 > `queue::claim_form_step` sends the lean text and the window text for
 > `claim_task_one_statement`. See
+> [the lean claim tier](performance-claim-lean-tier.md) and
 > [Lean claim](operations/claim-lean.md).
 
 **2. An activity start and an activity completion lock the task row

@@ -61,3 +61,7 @@ keyed row at its head, over two claim kinds, and of a worker with queue
 weights. It counts the lean claims that a paused queue, a
 paused activity and each `$6` name decided. It pins the plan of each lean
 text on a deep backlog of one queue, with fresh and with idle statistics.
+
+Measured: `docs/performance-claim-lean-tier.md`. One lean claim alone costs
+0.55 ms against 0.80 ms for the window form. On the e2e `throughput` cell,
+the lean form is faster in six of six rounds, by a median of 1.17 times.
