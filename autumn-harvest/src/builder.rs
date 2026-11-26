@@ -5296,10 +5296,14 @@ impl WorkerConfig {
     /// The lean statement is a smaller form of the default claim. It reads
     /// the rows at the head of the polled queues. It is exact when none of
     /// them has a concurrency key, a rate-limit key, a build pin or a
-    /// capability requirement. In every other case it takes no row and no
-    /// lock, and the claim sends the usual statement in the same transaction. Each claim loop then sends
-    /// the usual statement first for its next claims: 1 claim, then 2, then
-    /// 4, up to 64. A lean statement that takes a row ends that skip.
+    /// capability requirement. When its window holds a row and it locks
+    /// none, it claims no row and changes no row. The causes are a row with
+    /// one of those features, a parked row of a paused or expired run, and
+    /// rows that peer claims hold. The claim then sends the usual statement
+    /// in the same transaction. Each claim loop then sends the usual
+    /// statement first for its next claims. Each such lean statement adds 4
+    /// claims to that skip, up to 64. Each lean statement that takes a row
+    /// takes 1 claim off the next skip.
     ///
     /// Both statements take the same row, so the switch changes cost only.
     /// With `false`, each claim sends the usual statement first. Use `false`

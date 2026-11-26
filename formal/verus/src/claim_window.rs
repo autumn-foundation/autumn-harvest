@@ -306,10 +306,10 @@ proof fn lemma_an_outcome_is_its_window_step(row: Option<int>, flag: bool)
 /// no window row passes them.
 proof fn lemma_the_first_row_is_a_window_row(rows: Seq<WindowRow>, lean: bool)
     ensures
-        match first_row(rows, lean) {
+        (match first_row(rows, lean) {
             Some(c) => exists|i: int| 0 <= i < rows.len() && #[trigger] rows[i] == c && passes(c, lean),
             None => forall|i: int| 0 <= i < rows.len() ==> !passes(#[trigger] rows[i], lean),
-        },
+        }),
     decreases rows.len(),
 {
     if rows.len() > 0 && !passes(rows[0], lean) {
@@ -395,8 +395,12 @@ pub proof fn theorem_a_keyed_window_falls_back(w: Window)
     assert(w.rows.len() > 0);
 }
 
-/// A set flag means that the lean form locked no row. So the window form
-/// after it is a fresh claim attempt.
+/// A set flag means that the lean form took no candidate row. So the
+/// window form after it is a fresh claim attempt.
+///
+/// The model has one snapshot. In Postgres, a peer can commit a change of
+/// a window row before the row lock. The lean form then skips that row and
+/// keeps its lock, as the window form does.
 pub proof fn theorem_a_lean_fallback_took_no_row(w: Window)
     requires
         lean_form(w) is Fallback,
@@ -426,11 +430,14 @@ pub proof fn theorem_the_lean_claim_takes_the_window_form_row(first: Window, sec
 /// The longest run of claims that skip the lean form.
 pub const LEAN_SKIP_CAP: u32 = 64;
 
-/// The skip state of one claim loop.
+/// The claims that one fallback adds to the skip.
+pub const LEAN_SKIP_STEP: u32 = 4;
+
+/// One skip of a claim loop. The loop holds one for each claim kind.
 pub struct LeanSkip {
     /// The claims left that send the window form first.
     pub left: u32,
-    /// The length of the last skip, or 0 after a claimed row.
+    /// The length that the next skip grows from.
     pub span: u32,
 }
 
@@ -440,12 +447,10 @@ pub open spec fn skip_ok(s: LeanSkip) -> bool {
 }
 
 pub open spec fn spec_lean_skip_span(span: int) -> int {
-    if span == 0 {
-        1
-    } else if span < 32 {
-        span * 2
-    } else {
+    if span >= 60 {
         64
+    } else {
+        span + 4
     }
 }
 
@@ -456,7 +461,14 @@ pub open spec fn spec_lean_skip_after(skip: LeanSkip, lean: Option<WindowStep>) 
         } else {
             LeanSkip { left: (skip.left - 1) as u32, span: skip.span }
         },
-        Some(WindowStep::Claimed) => LeanSkip { left: 0, span: 0 },
+        Some(WindowStep::Claimed) => LeanSkip {
+            left: 0,
+            span: if skip.span == 0 {
+                0
+            } else {
+                (skip.span - 1) as u32
+            },
+        },
         Some(WindowStep::Empty) => skip,
         Some(WindowStep::Fallback) => LeanSkip {
             left: spec_lean_skip_span(skip.span as int) as u32,
@@ -477,15 +489,13 @@ pub fn lean_first(skip: LeanSkip) -> (r: bool)
 pub fn lean_skip_span(span: u32) -> (r: u32)
     ensures
         r == spec_lean_skip_span(span as int),
-        1 <= r <= LEAN_SKIP_CAP,
+        LEAN_SKIP_STEP <= r <= LEAN_SKIP_CAP,
         span <= LEAN_SKIP_CAP ==> span <= r,
 {
-    if span == 0 {
-        1
-    } else if span < LEAN_SKIP_CAP / 2 {
-        span * 2
-    } else {
+    if span >= LEAN_SKIP_CAP - LEAN_SKIP_STEP {
         LEAN_SKIP_CAP
+    } else {
+        span + LEAN_SKIP_STEP
     }
 }
 
@@ -506,7 +516,10 @@ pub fn lean_skip_after(skip: LeanSkip, lean: Option<WindowStep>) -> (r: LeanSkip
                 }
             }
         }
-        Some(WindowStep::Claimed) => LeanSkip { left: 0, span: 0 },
+        Some(WindowStep::Claimed) => LeanSkip {
+            left: 0,
+            span: skip.span.saturating_sub(1),
+        },
         Some(WindowStep::Empty) => skip,
         Some(WindowStep::Fallback) => {
             let span = lean_skip_span(skip.span);
@@ -538,21 +551,42 @@ pub proof fn theorem_the_skip_stays_in_its_bound(skip: LeanSkip, lean: Option<Wi
 {
 }
 
-/// The first fallback starts a skip. Each next fallback doubles the skip
-/// up to the cap. A claimed row ends it, and an empty poll keeps it.
-pub proof fn theorem_a_fallback_doubles_the_skip_and_a_claim_resets_it(skip: LeanSkip)
+/// Each fallback starts a skip of four claims or more. It adds four claims
+/// to the span, up to the cap. A claimed row sends the lean form first
+/// again and takes one claim off the span. An empty poll keeps the skip.
+pub proof fn theorem_a_fallback_lengthens_the_skip_and_a_claim_shortens_it(skip: LeanSkip)
     requires
         skip_ok(skip),
     ensures
-        spec_lean_skip_after(skip, Some(WindowStep::Fallback)).left >= 1,
-        skip.span == 0 ==> spec_lean_skip_after(skip, Some(WindowStep::Fallback)).span == 1,
-        0 < skip.span < 32 ==> spec_lean_skip_after(skip, Some(WindowStep::Fallback)).span == 2
-            * skip.span,
-        skip.span >= 32 ==> spec_lean_skip_after(skip, Some(WindowStep::Fallback)).span
+        spec_lean_skip_after(skip, Some(WindowStep::Fallback)).left >= LEAN_SKIP_STEP,
+        spec_lean_skip_after(skip, Some(WindowStep::Fallback)).left == spec_lean_skip_after(
+            skip,
+            Some(WindowStep::Fallback),
+        ).span,
+        skip.span < 60 ==> spec_lean_skip_after(skip, Some(WindowStep::Fallback)).span
+            == skip.span + LEAN_SKIP_STEP,
+        skip.span >= 60 ==> spec_lean_skip_after(skip, Some(WindowStep::Fallback)).span
             == LEAN_SKIP_CAP,
-        spec_lean_skip_after(skip, Some(WindowStep::Claimed)) == (LeanSkip { left: 0, span: 0 }),
+        spec_lean_skip_after(skip, Some(WindowStep::Claimed)).left == 0,
+        skip.span == 0 ==> spec_lean_skip_after(skip, Some(WindowStep::Claimed)).span == 0,
+        skip.span > 0 ==> spec_lean_skip_after(skip, Some(WindowStep::Claimed)).span == skip.span
+            - 1,
         spec_lean_skip_after(skip, Some(WindowStep::Empty)) == skip,
 {
+}
+
+/// A loop sends one lean form that falls back in five claims at most. Each
+/// fallback starts a skip, and the next four claims at least send the
+/// window form first.
+pub proof fn theorem_four_claims_follow_each_fallback(skip: LeanSkip, n: nat)
+    requires
+        skip_ok(skip),
+        n < LEAN_SKIP_STEP,
+    ensures
+        after_skips(spec_lean_skip_after(skip, Some(WindowStep::Fallback)), n).left > 0,
+{
+    let started = spec_lean_skip_after(skip, Some(WindowStep::Fallback));
+    lemma_each_skipped_claim_counts_down(started, n);
 }
 
 /// Each claim that skips the lean form takes one claim off the skip.

@@ -109,6 +109,9 @@ Start with [Chapter 1 →](01-project-skeleton.md)
   runtime.
 - **Batch claim.** [`claim-batch.md`](../operations/claim-batch.md) lets
   one claim statement take up to 2, 4 or 8 task rows. It is off by default.
+- **Lean claim.** [`claim-lean.md`](../operations/claim-lean.md) puts a
+  smaller claim statement in front of the default claim. It is on by
+  default.
 - **Pre-deploy analyses.**
   [`dag-and-retry-analyses.md`](../dag-and-retry-analyses.md) checks DAG
   slack, retry envelopes, retry storms, throttle waits, run shapes and

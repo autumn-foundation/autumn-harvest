@@ -16,7 +16,7 @@ census=$($PSQL -F' ' -c "
 SELECT coalesce(sum(calls),0), coalesce(sum(rows),0)
   FROM pg_stat_statements
  WHERE dbid NOT IN (SELECT oid FROM pg_database)
-   AND query LIKE 'WITH worker_info AS%'")
+   AND (query LIKE 'WITH worker_info AS%' OR query LIKE 'WITH %claim_lean_fallback%')")
 set -- $census
 calls=$1; rows=$2
 wall=$(echo "$end - $start" | bc)

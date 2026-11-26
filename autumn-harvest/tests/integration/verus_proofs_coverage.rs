@@ -541,6 +541,25 @@ fn render(tokens: &[String]) -> String {
     out
 }
 
+/// `item_contracts` reads the first `{` outside parentheses as the body of
+/// a fn. An `ensures` clause with a bare `match` would end the contract at
+/// that brace: the stored line would lose the arms and gain the proof body.
+/// So the lean claim model writes such a clause inside parentheses.
+#[test]
+fn the_claim_window_contracts_keep_each_ensures_arm() {
+    let list = contracts(&read("formal/verus/src/claim_window.rs"));
+    let cut: Vec<&String> = list.iter().filter(|c| c.starts_with(',')).collect();
+    assert!(cut.is_empty(), "a contract was cut at a brace: {cut:?}");
+    let lemma = list
+        .iter()
+        .find(|c| c.contains("fn lemma_the_first_row_is_a_window_row"))
+        .expect("the lemma has a contract");
+    assert!(
+        lemma.contains("None => forall") && lemma.contains("decreases rows.len()"),
+        "the contract holds each arm and the decreases clause: {lemma}"
+    );
+}
+
 /// The text that [`CONTRACTS`] must hold.
 fn contract_inventory() -> String {
     let mut out = String::from(CONTRACTS_HEADER);

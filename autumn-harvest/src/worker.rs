@@ -35940,8 +35940,8 @@ struct DispatchLoopState {
     reconcile_cursors: std::collections::HashMap<String, crate::queue::DispatchCursor>,
     /// The degraded-mode window for a failing channel.
     degraded: DispatchDegradation,
-    /// The lean-claim skip of the Postgres drain of this loop (issue #2680).
-    lean: queue::LeanSkip,
+    /// The lean-claim state of the Postgres drain of this loop (issue #2680).
+    lean: LoopLean,
 }
 
 impl DispatchLoopState {
@@ -35965,7 +35965,7 @@ impl DispatchLoopState {
             error_logged: None,
             reconcile_cursors: std::collections::HashMap::new(),
             degraded: DispatchDegradation::new(),
-            lean: queue::LeanSkip::new(),
+            lean: LoopLean::new(),
         }
     }
 
@@ -36506,16 +36506,62 @@ const fn dispatch_kind_admitted(
     }
 }
 
-/// Store the lean-claim skip that one claim returned (issue #2680).
+/// The lean-claim state of one claim loop for one claim target (issue
+/// #2680).
+///
+/// A claim over every queue of the worker uses one [`queue::LeanSkips`]. A
+/// worker with queue weights claims queue by queue, and each queue then has
+/// its own. A keyed queue makes each of its lean claims fall back. With one
+/// state for every queue, each lean claim of a plain queue would shorten
+/// that skip. The keyed queue would then pay a wasted lean statement again.
+///
+/// The type is public only for [`Worker::dst_poll_once`]. It is not a
+/// stable API.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LoopLean {
+    /// The skips of a claim over every queue of the worker.
+    all: queue::LeanSkips,
+    /// The skips of the single-queue claims of a weighted worker. Entry `i`
+    /// belongs to queue `i` of the worker config. The list grows on demand.
+    queues: Vec<queue::LeanSkips>,
+}
+
+impl LoopLean {
+    /// The state of a new claim loop. Its first claims send the lean form.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            all: queue::LeanSkips::new(),
+            queues: Vec::new(),
+        }
+    }
+
+    /// The skips of the single-queue claims of queue `name`.
+    ///
+    /// `configured` is the queue list of the worker config. A name that the
+    /// list does not hold gets the skips of the claim over every queue.
+    fn of_queue(&mut self, configured: &[String], name: &str) -> &mut queue::LeanSkips {
+        let Some(at) = configured.iter().position(|queue| queue == name) else {
+            return &mut self.all;
+        };
+        if self.queues.len() <= at {
+            self.queues.resize(at + 1, queue::LeanSkips::new());
+        }
+        &mut self.queues[at]
+    }
+}
+
+/// Store the lean-claim skips that one claim returned (issue #2680).
 ///
 /// A claim runs inside the conflict retry, which may run it again. So the
-/// claim works on a copy of the skip of its loop and returns the new skip
-/// beside its result. This function stores that skip in `lean`, the state
-/// of the loop, and returns the result alone. A failed claim returns no
-/// skip, so the loop keeps the state that it had.
+/// claim works on a copy of the skips of its loop and returns the new skips
+/// beside its result. This function stores them in `lean`, the state of the
+/// loop, and returns the result alone. A failed claim returns no skips, so
+/// the loop keeps the state that it had.
 fn keep_lean_skip<T>(
-    lean: Option<&mut queue::LeanSkip>,
-    claimed: HarvestResult<(T, Option<queue::LeanSkip>)>,
+    lean: Option<&mut queue::LeanSkips>,
+    claimed: HarvestResult<(T, Option<queue::LeanSkips>)>,
 ) -> HarvestResult<T> {
     claimed.map(|(claim, skip)| {
         if let (Some(lean), Some(skip)) = (lean, skip) {
@@ -38768,9 +38814,9 @@ impl Worker {
             .iter()
             .map(|_| DispatchLoopState::new())
             .collect();
-        // One lean-claim skip per shard (issue #2680). A fallback on one
+        // One lean-claim state per shard (issue #2680). A fallback on one
         // shard says nothing about the rows of the next shard.
-        let mut lean = vec![queue::LeanSkip::new(); n];
+        let mut lean = vec![LoopLean::new(); n];
 
         while !self.shutdown.is_cancelled() {
             let mut any_claimed = false;
@@ -40870,7 +40916,7 @@ impl Worker {
         pool: &DbPool,
         shard: Option<crate::types::ShardId>,
         shard_count: usize,
-        lean: &mut queue::LeanSkip,
+        lean: &mut LoopLean,
     ) -> u32 {
         let mut dispatched = 0u32;
         let mut idle = false;
@@ -41286,9 +41332,9 @@ impl Worker {
         let mut dispatch_state = DispatchLoopState::new();
         // A channel this loop refuses is logged once, not once per iteration.
         let mut dispatch_refusal_logged = false;
-        // The lean-claim skip of this loop (issue #2680). Each follower
+        // The lean-claim state of this loop (issue #2680). Each follower
         // holds its own.
-        let mut lean = queue::LeanSkip::new();
+        let mut lean = LoopLean::new();
 
         while !self.shutdown.is_cancelled() {
             // Do not claim while this pool's registration is unverified. An
@@ -42642,9 +42688,9 @@ impl Worker {
     ) {
         let _poller = self.poller_guard();
         let mut start = 0usize;
-        // One lean-claim skip per target, for this follower alone (issue
-        // #2680). The skip lasts over the waits between runs.
-        let mut lean = vec![queue::LeanSkip::new(); targets.len()];
+        // One lean-claim state per target, for this follower alone (issue
+        // #2680). The state lasts over the waits between runs.
+        let mut lean = vec![LoopLean::new(); targets.len()];
         loop {
             tokio::select! {
                 biased;
@@ -42669,12 +42715,12 @@ impl Worker {
     /// target with an unverified registration or with a dispatch channel.
     /// Returns `true` when it claimed and dispatched one task.
     ///
-    /// `lean` holds the lean-claim skip of this follower for each target.
+    /// `lean` holds the lean-claim state of this follower for each target.
     async fn follower_claim(
         &self,
         targets: &[ClaimTarget<'_>],
         start: &mut usize,
-        lean: &mut [queue::LeanSkip],
+        lean: &mut [LoopLean],
     ) -> bool {
         let n = targets.len();
         for i in 0..n {
@@ -43067,7 +43113,7 @@ impl Worker {
     /// See `shard_acquire_bound`. A timeout increments
     /// `harvest.db.pool_acquire_timeout{site="claim"}`.
     ///
-    /// `lean` is the lean-claim skip of the calling claim loop for this
+    /// `lean` is the lean-claim state of the calling claim loop for this
     /// claim target (issue #2680). Each loop holds its own state, so no two
     /// loops share one. `None` sends the window form first.
     async fn poll_once(
@@ -43075,7 +43121,7 @@ impl Worker {
         pool: &DbPool,
         acquire_bound: Option<Duration>,
         shard: Option<crate::types::ShardId>,
-        lean: Option<&mut queue::LeanSkip>,
+        lean: Option<&mut LoopLean>,
     ) -> u32 {
         self.poll_once_as(PollRole::Leader, pool, acquire_bound, shard, lean)
             .await
@@ -43083,10 +43129,7 @@ impl Worker {
 
     /// The lean state that a poll passes to its claims: the state of its
     /// loop, or `None` when [`WorkerRuntimeConfig::claim_lean`] is off.
-    fn poll_lean<'a>(
-        &self,
-        lean: Option<&'a mut queue::LeanSkip>,
-    ) -> Option<&'a mut queue::LeanSkip> {
+    fn poll_lean<'a>(&self, lean: Option<&'a mut LoopLean>) -> Option<&'a mut LoopLean> {
         lean.filter(|_| self.config.claim_lean)
     }
 
@@ -43105,7 +43148,7 @@ impl Worker {
         pool: &DbPool,
         acquire_bound: Option<Duration>,
         shard: Option<crate::types::ShardId>,
-        lean: Option<&mut queue::LeanSkip>,
+        lean: Option<&mut LoopLean>,
     ) -> u32 {
         let mut lean = self.poll_lean(lean);
         // Claim only against a free local permit (issue #1787). See
@@ -43199,8 +43242,12 @@ impl Worker {
                 // (typically highest-weight) queue never pays for the rest.
                 let single_queue = [(*queue_name).to_owned()];
                 let claim_started = std::time::Instant::now();
-                // Every queue of the permutation shares the skip of the loop.
-                let skip = lean.as_deref().copied();
+                // Each queue of the permutation has its own skips. A keyed
+                // queue then leaves the lean form of a plain queue alone.
+                let skips = lean
+                    .as_deref_mut()
+                    .map(|lean| lean.of_queue(&self.config.queues, queue_name));
+                let skip = skips.as_deref().copied();
                 let claimed = self
                     .claim_with_conflict_retry(&mut conn, async |conn| {
                         let mut skip = skip;
@@ -43223,7 +43270,7 @@ impl Worker {
                         Ok((claimed, skip))
                     })
                     .await;
-                let claimed = keep_lean_skip(lean.as_deref_mut(), claimed);
+                let claimed = keep_lean_skip(skips, claimed);
                 // Every queue shares the slots of the shard. So a miss on one
                 // queue ends the poll, and the loop tries its next target.
                 let Some(claimed) = self.slotted(shard, claimed) else {
@@ -43280,9 +43327,10 @@ impl Worker {
 
         // --- Default (unweighted) path: original single ANY($2) query ---
         let claim_started = std::time::Instant::now();
-        // The claim gets a copy of the skip of the loop and returns the new
-        // one. A run after a conflict abort starts from the same copy.
-        let skip = lean.as_deref().copied();
+        // The claim gets a copy of the skips of the loop and returns the new
+        // ones. A run after a conflict abort starts from the same copy.
+        let skips = lean.map(|lean| &mut lean.all);
+        let skip = skips.as_deref().copied();
         let claimed = self
             .claim_with_conflict_retry(&mut conn, async |conn| {
                 let mut skip = skip;
@@ -43305,7 +43353,7 @@ impl Worker {
                 Ok((claimed, skip))
             })
             .await;
-        let claimed = keep_lean_skip(lean, claimed);
+        let claimed = keep_lean_skip(skips, claimed);
         // A miss returns `false` with no throttle check. The caller then
         // tries its next claim target.
         let Some(claimed) = self.slotted(shard, claimed) else {
@@ -44484,11 +44532,16 @@ impl Worker {
     /// Call [`Self::dst_register`] first. Never call this on a worker that
     /// runs [`Self::run`]: a drain closes the same task tracker.
     ///
+    /// `lean` is the lean-claim state that the simulation holds for this
+    /// worker, as a claim loop holds its own. The state reads no clock and
+    /// no random number, so a seed still fixes each claim. `None` sends the
+    /// window form first.
+    ///
     /// Returns `true` when the poll claimed a task. Returns `false` with no
     /// claim when the worker is not registered, has a slot tuner, or shuts
     /// down.
     #[doc(hidden)]
-    pub async fn dst_poll_once(&self, pool: &DbPool) -> bool {
+    pub async fn dst_poll_once(&self, pool: &DbPool, lean: Option<&mut LoopLean>) -> bool {
         let registered = std::sync::atomic::AtomicBool::load(
             &self.monitoring_started,
             std::sync::atomic::Ordering::SeqCst,
@@ -44500,9 +44553,9 @@ impl Worker {
             [shard, ..] => Some(*shard),
             [] => None,
         };
-        // The hook holds no claim loop, so it passes no lean state. Its
-        // claims send the window form first.
-        let claimed = self.poll_once(pool, None, shard, None).await > 0;
+        // The caller holds the lean state, as a claim loop does. So a
+        // simulated claim sends the form that a claim of `run` sends.
+        let claimed = self.poll_once(pool, None, shard, lean).await > 0;
         // A closed tracker waits for every body that it holds. It then
         // reopens, so the next poll can spawn again.
         self.dispatched.tracker.close();
@@ -60648,7 +60701,7 @@ mod tests {
             Worker::new(cfg, Arc::new(HandlerRegistry::new(vec![], vec![]))).expect("valid config")
         };
         assert!(default_runtime_config().claim_lean, "on by default");
-        let mut skip = queue::LeanSkip::new();
+        let mut skip = LoopLean::new();
         assert!(build(true).poll_lean(Some(&mut skip)).is_some());
         assert!(build(true).poll_lean(None).is_none(), "no loop, no state");
         assert!(
@@ -60658,13 +60711,36 @@ mod tests {
     }
 
     #[test]
+    fn a_weighted_poll_keeps_one_lean_skip_for_each_queue() {
+        let configured = ["a".to_owned(), "b".to_owned()];
+        let mut lean = LoopLean::new();
+        let fell_back = queue::LeanSkips::new().after_fallback(None);
+        *lean.of_queue(&configured, "b") = fell_back;
+        assert!(
+            lean.of_queue(&configured, "a").sends_lean(None),
+            "a fallback on queue b leaves the lean form of queue a alone"
+        );
+        assert!(!lean.of_queue(&configured, "b").sends_lean(None));
+        assert_eq!(
+            lean.all,
+            queue::LeanSkips::new(),
+            "no claim over every queue"
+        );
+        // The skips of a queue last from one poll of the loop to the next.
+        assert_eq!(*lean.of_queue(&configured, "b"), fell_back);
+        // A name that the config does not hold uses the shared skips.
+        *lean.of_queue(&configured, "c") = fell_back;
+        assert_eq!(lean.all, fell_back);
+    }
+
+    #[test]
     fn a_claim_stores_its_lean_skip_in_the_loop_state() {
-        let new = queue::LeanSkip::new();
-        let skipping = new.after_fallback();
+        let new = queue::LeanSkips::new();
+        let skipping = new.after_fallback(None);
         assert_ne!(skipping, new);
 
         let mut state = skipping;
-        let failed: HarvestResult<((), Option<queue::LeanSkip>)> =
+        let failed: HarvestResult<((), Option<queue::LeanSkips>)> =
             Err(HarvestError::Database("the claim failed".into()));
         assert!(keep_lean_skip(Some(&mut state), failed).is_err());
         assert_eq!(
@@ -61769,7 +61845,7 @@ mod tests {
         // An earlier shard's poll was gated, and its permit then freed.
         worker.record_gate_refusal(PollAdmission::Only(TaskType::Workflow));
         assert_eq!(worker.poll_admission_now(), PollAdmission::Any);
-        let mut lean = queue::LeanSkip::new();
+        let mut lean = LoopLean::new();
         let dispatched = worker.drain_postgres(&pool, None, 2, &mut lean).await;
         assert_eq!(dispatched, 0);
         assert!(

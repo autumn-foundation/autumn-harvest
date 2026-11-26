@@ -27,7 +27,7 @@ use crate::shared_json::SharedJson;
 use crate::telemetry::TraceContextCarrier;
 use crate::types::{ExecutionId, Priority};
 
-pub use claim_window::LeanSkip;
+pub use claim_window::LeanSkips;
 
 mod claim_window {
     //! Postgres initializes every CTE subplan at executor startup, run or not,
@@ -42,9 +42,13 @@ mod claim_window {
     //! nothing, so the full statement is just a fresh attempt.
     //!
     //! The lean form goes in front of the window form (issue #2680). It is a
-    //! smaller statement that is exact for a window of plain rows. In every
-    //! other case it locks no row and sets its flag, and the unchanged
-    //! window form runs. See `lean_claim_sql` and [`LeanSkip`].
+    //! smaller statement that is exact for a window of plain rows. When its
+    //! window holds a row and it locks none, it sets its flag. It then
+    //! claimed no row and changed no row, and the unchanged window form runs.
+    //! A window with a row that is not plain locks no row. After a peer
+    //! commit on a window row, the claim keeps its lock on the skipped row.
+    //! The window form does the same: see `claim_seek_rows_sql`.
+    //! See `lean_claim_sql` and [`LeanSkips`].
     //! `LEAN_PLAN_REWRITES` then changes how the lean text reads the pauses.
     //! `formal/verus/src/claim_window.rs` proves the model of both steps.
 
@@ -987,56 +991,125 @@ mod claim_window {
     /// The longest run of claims that skip the lean form.
     pub(super) const LEAN_SKIP_CAP: u32 = 64;
 
-    /// The lean-form skip of one claim loop (issue #2680).
+    /// The claims that one lean fallback adds to the skip.
+    ///
+    /// A lean statement that sets its flag costs more than a lean claim
+    /// saves. So a loop keeps the lean form first only while it takes more
+    /// rows than this for each fallback.
+    pub(super) const LEAN_SKIP_STEP: u32 = 4;
+
+    /// One lean-form skip (issue #2680). A claim loop holds one for each
+    /// claim kind, in its [`LeanSkips`].
     ///
     /// A lean fallback costs one statement more than a claim that sends the
     /// window form first. A queue that holds keyed rows would pay that on
-    /// each claim. So after a fallback, the next claims of the loop send the
-    /// window form first. The first fallback skips one claim. Each next
-    /// fallback doubles the skip, up to 64 claims. A lean claim that takes a
-    /// row ends the skip, and an empty poll keeps it.
+    /// each claim. So after a fallback, the next claims send the window form
+    /// first. Each fallback adds 4 claims to the skip, up to 64 claims. Each
+    /// lean claim that takes a row takes 1 claim off the next skip. An empty
+    /// poll keeps the skip.
+    ///
+    /// A lean claim does not end the skip. A loop can see plain windows and
+    /// keyed windows in turn. A skip that ended on each lean claim would
+    /// send a wasted lean statement on one claim in three. Here at least 4
+    /// window-first claims follow each fallback.
     ///
     /// The skip changes the cost of a claim only. Both forms are exact, so
-    /// a claim takes the same row in every skip state. Each claim loop holds
-    /// its own state, so one loop never changes the skip of another loop.
+    /// a claim takes the same row in every skip state.
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-    pub struct LeanSkip {
+    pub(super) struct LeanSkip {
         /// The claims left that send the window form first.
         left: u32,
-        /// The length of the last skip, or 0 after a claimed row.
+        /// The length that the next skip grows from.
         span: u32,
     }
 
     impl LeanSkip {
-        /// The state of a new claim loop. Its first claim sends the lean
-        /// form.
-        #[must_use]
-        pub const fn new() -> Self {
+        /// A skip that sends the lean form first.
+        pub(super) const fn new() -> Self {
             Self { left: 0, span: 0 }
         }
+    }
 
-        /// True when the next windowed claim of the loop sends the lean
-        /// form first.
+    /// The lean-form skips of one claim loop (issue #2680), one for each
+    /// claim kind.
+    ///
+    /// A loop can claim any kind in one poll and one kind in the next. A
+    /// claim of each kind reads its own seek window. A keyed activity row
+    /// makes each lean claim of any kind fall back, and a workflow claim
+    /// still reads plain rows only. With one skip for both, each lean
+    /// workflow claim would shorten the skip of the other kind. So each kind
+    /// has its own skip. See `LeanSkip` for the rule of one skip.
+    ///
+    /// Each claim loop holds its own state, so one loop never changes the
+    /// skip of another loop. A worker with queue weights claims queue by
+    /// queue, and its loop holds one `LeanSkips` for each queue.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct LeanSkips {
+        /// The skip of the claims of any kind, of workflow rows only and of
+        /// activity rows only, in the order of `LeanSkips::slot`.
+        kinds: [LeanSkip; 3],
+    }
+
+    impl LeanSkips {
+        /// The state of a new claim loop. Its first claim of each kind sends
+        /// the lean form.
         #[must_use]
-        pub const fn sends_lean(self) -> bool {
-            lean_first(self)
+        pub const fn new() -> Self {
+            Self {
+                kinds: [LeanSkip::new(); 3],
+            }
+        }
+
+        /// True when the next windowed claim of `kind` sends the lean form
+        /// first.
+        #[must_use]
+        pub const fn sends_lean(self, kind: Option<super::TaskType>) -> bool {
+            lean_first(self.of(kind))
+        }
+
+        /// The place of the skip of `kind` in `kinds`.
+        const fn slot(kind: Option<super::TaskType>) -> usize {
+            match kind {
+                None => 0,
+                Some(super::TaskType::Workflow) => 1,
+                Some(super::TaskType::Activity) => 2,
+            }
+        }
+
+        /// The skip of the claims of `kind`.
+        pub(super) const fn of(self, kind: Option<super::TaskType>) -> LeanSkip {
+            self.kinds[Self::slot(kind)]
+        }
+
+        /// Records one claim of `kind`. `lean` is the step of its lean form,
+        /// or `None` when the claim did not send it. Only the skip of `kind`
+        /// changes.
+        pub(super) const fn record(
+            &mut self,
+            kind: Option<super::TaskType>,
+            lean: Option<WindowStep>,
+        ) {
+            let slot = Self::slot(kind);
+            self.kinds[slot] = lean_skip_after(self.kinds[slot], lean);
         }
     }
 
     #[cfg(test)]
-    impl LeanSkip {
-        /// The skip after one lean fallback, for a test of another module.
-        pub(crate) const fn after_fallback(self) -> Self {
-            lean_skip_after(self, Some(WindowStep::Fallback))
+    impl LeanSkips {
+        /// The state after one lean fallback of `kind`, for a test of
+        /// another module.
+        pub(crate) const fn after_fallback(mut self, kind: Option<super::TaskType>) -> Self {
+            self.record(kind, Some(WindowStep::Fallback));
+            self
         }
     }
 
     /// True when a claim sends the lean form before the window form.
     ///
     /// `windowed` is false for an ageing claim and for a fair claim. Those
-    /// send neither form. `lean` is the skip of the calling claim loop. A
-    /// caller with no loop state passes `None`, and its claim sends the
-    /// window form first.
+    /// send neither form. `lean` is the skip of the calling claim loop for
+    /// the kind of the claim. A caller with no loop state passes `None`,
+    /// and its claim sends the window form first.
     pub(super) const fn sends_lean_first(windowed: bool, lean: Option<LeanSkip>) -> bool {
         match lean {
             Some(skip) => windowed && lean_first(skip),
@@ -1044,24 +1117,22 @@ mod claim_window {
         }
     }
 
-    /// True when the next claim of the loop sends the lean form first.
+    /// True when the next claim of the skip sends the lean form first.
     ///
     /// `formal/verus/src/claim_window.rs` holds the proved copy.
     pub(super) const fn lean_first(skip: LeanSkip) -> bool {
         skip.left == 0
     }
 
-    /// The length of the skip after one more fallback: 1, then double, up
-    /// to [`LEAN_SKIP_CAP`].
+    /// The length of the skip after one more fallback: [`LEAN_SKIP_STEP`]
+    /// claims more, up to [`LEAN_SKIP_CAP`].
     ///
     /// `formal/verus/src/claim_window.rs` holds the proved copy.
     pub(super) const fn lean_skip_span(span: u32) -> u32 {
-        if span == 0 {
-            1
-        } else if span < LEAN_SKIP_CAP / 2 {
-            span * 2
-        } else {
+        if span >= LEAN_SKIP_CAP - LEAN_SKIP_STEP {
             LEAN_SKIP_CAP
+        } else {
+            span + LEAN_SKIP_STEP
         }
     }
 
@@ -1081,7 +1152,10 @@ mod claim_window {
                     }
                 }
             }
-            Some(WindowStep::Claimed) => LeanSkip { left: 0, span: 0 },
+            Some(WindowStep::Claimed) => LeanSkip {
+                left: 0,
+                span: skip.span.saturating_sub(1),
+            },
             Some(WindowStep::Empty) => skip,
             Some(WindowStep::Fallback) => {
                 let span = lean_skip_span(skip.span);
@@ -2098,18 +2172,31 @@ mod claim_window {
             ));
         }
 
+        /// The three claim kinds of a claim loop.
+        const KINDS: [Option<crate::queue::TaskType>; 3] = [
+            None,
+            Some(crate::queue::TaskType::Workflow),
+            Some(crate::queue::TaskType::Activity),
+        ];
+
         #[test]
         fn a_new_claim_loop_sends_the_lean_form_first() {
             let skip = LeanSkip::new();
             assert_eq!(skip, LeanSkip::default());
             assert!(lean_first(skip));
+            let skips = LeanSkips::new();
+            assert_eq!(skips, LeanSkips::default());
+            for kind in KINDS {
+                assert!(skips.sends_lean(kind));
+                assert_eq!(skips.of(kind), skip);
+            }
         }
 
         #[test]
-        fn a_lean_fallback_skips_the_lean_form_for_a_doubling_run() {
+        fn a_lean_fallback_skips_the_lean_form_for_a_longer_run_each_time() {
             let mut skip = LeanSkip::new();
             let mut spans = Vec::new();
-            for _ in 0..9 {
+            for _ in 0..18 {
                 assert!(lean_first(skip));
                 skip = lean_skip_after(skip, Some(WindowStep::Fallback));
                 let mut skipped = 0_u32;
@@ -2119,12 +2206,14 @@ mod claim_window {
                 }
                 spans.push(skipped);
             }
-            assert_eq!(spans, [1, 2, 4, 8, 16, 32, 64, 64, 64]);
+            let want: Vec<u32> = (1..=18).map(|n| (n * LEAN_SKIP_STEP).min(64)).collect();
+            assert_eq!(spans, want);
+            assert_eq!(spans.first(), Some(&LEAN_SKIP_STEP));
             assert_eq!(spans.iter().max(), Some(&LEAN_SKIP_CAP));
         }
 
         #[test]
-        fn a_lean_claim_resets_the_skip_and_an_empty_poll_keeps_it() {
+        fn a_lean_claim_shortens_the_skip_and_an_empty_poll_keeps_it() {
             let mut skip = LeanSkip::new();
             for _ in 0..3 {
                 skip = lean_skip_after(skip, Some(WindowStep::Fallback));
@@ -2132,14 +2221,26 @@ mod claim_window {
                     skip = lean_skip_after(skip, None);
                 }
             }
+            assert_eq!(skip, LeanSkip { left: 0, span: 12 });
             assert_eq!(lean_skip_after(skip, Some(WindowStep::Empty)), skip);
             let next = lean_skip_after(skip, Some(WindowStep::Fallback));
-            assert_eq!(lean_skip_span(4), 8);
-            assert!(!lean_first(next));
-            let reset = lean_skip_after(skip, Some(WindowStep::Claimed));
-            assert_eq!(reset, LeanSkip::new());
-            let again = lean_skip_after(reset, Some(WindowStep::Fallback));
-            assert!(lean_first(lean_skip_after(again, None)));
+            assert_eq!(next, LeanSkip { left: 16, span: 16 });
+            // One lean claim takes one claim off the next skip, and no more.
+            let claimed = lean_skip_after(skip, Some(WindowStep::Claimed));
+            assert_eq!(claimed, LeanSkip { left: 0, span: 11 });
+            assert!(lean_first(claimed));
+            let again = lean_skip_after(claimed, Some(WindowStep::Fallback));
+            assert_eq!(again, LeanSkip { left: 15, span: 15 });
+            // Twelve lean claims in a row clear the span. It stops at zero.
+            let mut cleared = skip;
+            for _ in 0..12 {
+                cleared = lean_skip_after(cleared, Some(WindowStep::Claimed));
+            }
+            assert_eq!(cleared, LeanSkip::new());
+            assert_eq!(
+                lean_skip_after(cleared, Some(WindowStep::Claimed)),
+                LeanSkip::new()
+            );
         }
 
         #[test]
@@ -2162,14 +2263,53 @@ mod claim_window {
         #[test]
         fn a_windowed_claim_follows_the_skip_of_its_loop() {
             let skip = LeanSkip::new();
-            assert!(skip.sends_lean());
             assert!(sends_lean_first(true, Some(skip)));
-            let skipping = lean_skip_after(skip, Some(WindowStep::Fallback));
-            assert!(!skipping.sends_lean());
-            assert!(!sends_lean_first(true, Some(skipping)));
-            let back = lean_skip_after(skipping, None);
-            assert!(back.sends_lean());
-            assert!(sends_lean_first(true, Some(back)));
+            let mut skipping = lean_skip_after(skip, Some(WindowStep::Fallback));
+            for _ in 0..LEAN_SKIP_STEP {
+                assert!(!sends_lean_first(true, Some(skipping)));
+                skipping = lean_skip_after(skipping, None);
+            }
+            assert!(sends_lean_first(true, Some(skipping)));
+        }
+
+        #[test]
+        fn each_claim_kind_of_a_loop_keeps_its_own_skip() {
+            use crate::queue::TaskType;
+            // The lean form of a claim of any kind falls back each time. The
+            // lean form of a workflow claim takes a row each time.
+            let mut skips = LeanSkips::new();
+            let mut any_lean = Vec::new();
+            for n in 1..=600_u32 {
+                let (kind, answer) = if n % 2 == 1 {
+                    (None, WindowStep::Fallback)
+                } else {
+                    (Some(TaskType::Workflow), WindowStep::Claimed)
+                };
+                let lean = sends_lean_first(true, Some(skips.of(kind))).then_some(answer);
+                if kind.is_some() {
+                    assert!(lean.is_some(), "workflow claim {n} sends the lean form");
+                } else if lean.is_some() {
+                    any_lean.push(n.div_ceil(2));
+                }
+                skips.record(kind, lean);
+            }
+            assert_eq!(
+                any_lean,
+                [1, 6, 15, 28, 45, 66, 91, 120, 153, 190, 231, 276],
+                "a lean workflow claim leaves the skip of the other kind alone"
+            );
+            assert!(skips.sends_lean(Some(TaskType::Workflow)));
+            assert!(skips.sends_lean(Some(TaskType::Activity)));
+        }
+
+        #[test]
+        fn a_fallback_of_one_kind_changes_the_skip_of_that_kind_only() {
+            for kind in KINDS {
+                let skips = LeanSkips::new().after_fallback(kind);
+                for other in KINDS {
+                    assert_eq!(skips.sends_lean(other), other != kind, "{kind:?} {other:?}");
+                }
+            }
         }
 
         /// The claims of one loop that send the lean form, when the lean
@@ -2189,22 +2329,60 @@ mod claim_window {
 
         #[test]
         fn a_loop_that_always_falls_back_sends_the_lean_form_at_a_bounded_rate() {
-            let sent = lean_claims(330, |_| WindowStep::Fallback);
-            assert_eq!(sent, [1, 3, 6, 11, 20, 37, 70, 135, 200, 265, 330]);
+            let sent = lean_claims(626, |_| WindowStep::Fallback);
+            assert_eq!(
+                sent,
+                [
+                    1, 6, 15, 28, 45, 66, 91, 120, 153, 190, 231, 276, 325, 378, 435, 496, 561, 626
+                ]
+            );
             assert!(sent.windows(2).all(|w| w[1] - w[0] <= LEAN_SKIP_CAP + 1));
         }
 
         #[test]
-        fn a_lean_claim_at_the_cap_starts_the_skip_from_one_again() {
-            // Claim 200 is the first lean attempt after a skip of 64 claims.
-            let sent = lean_claims(206, |n| {
-                if n == 200 {
+        fn a_lean_claim_at_the_cap_takes_one_claim_off_the_skip() {
+            // Claim 561 is the first lean attempt after a skip of 64 claims.
+            let sent = lean_claims(627, |n| {
+                if n == 561 {
                     WindowStep::Claimed
                 } else {
                     WindowStep::Fallback
                 }
             });
-            assert_eq!(sent[8..], [200, 201, 203, 206]);
+            assert_eq!(sent[16..], [561, 562, 627]);
+        }
+
+        #[test]
+        fn a_lean_fallback_is_one_claim_in_five_at_most() {
+            // Each sequence of lean answers of up to 12 claims. Claim `n`
+            // reads digit `n` of `code` when it sends the lean form.
+            let answers = [WindowStep::Claimed, WindowStep::Empty, WindowStep::Fallback];
+            for claims in 1..=12_u32 {
+                for code in 0..3_usize.pow(claims) {
+                    let answer = |n: u32| answers[code / 3_usize.pow(n - 1) % 3];
+                    let fallbacks = lean_fallbacks(claims, answer);
+                    assert!(
+                        5 * fallbacks <= usize::try_from(claims).expect("a small count") + 4,
+                        "{fallbacks} fallbacks in {claims} claims, code {code}"
+                    );
+                }
+            }
+            // The worst steady loop: a fallback at each clear span, and a
+            // lean claim on each other lean attempt. It pays one in nine.
+            let mut skip = LeanSkip::new();
+            let mut fallbacks = 0;
+            for _ in 0..900 {
+                let lean = lean_first(skip).then(|| {
+                    if skip.span == 0 {
+                        fallbacks += 1;
+                        WindowStep::Fallback
+                    } else {
+                        WindowStep::Claimed
+                    }
+                });
+                skip = lean_skip_after(skip, lean);
+            }
+            assert_eq!(fallbacks, 100);
         }
 
         #[test]
@@ -2219,11 +2397,63 @@ mod claim_window {
             assert_eq!(sent, (1..=40).collect::<Vec<_>>());
         }
 
+        /// The lean statements of `claims` claims that set the flag.
+        fn lean_fallbacks(claims: u32, answer: impl Fn(u32) -> WindowStep) -> usize {
+            lean_claims(claims, &answer)
+                .into_iter()
+                .filter(|n| answer(*n) == WindowStep::Fallback)
+                .count()
+        }
+
+        #[test]
+        fn a_loop_of_plain_and_keyed_windows_in_turn_keeps_the_window_form_first() {
+            // Each second window holds a keyed row.
+            let turn = |n: u32| {
+                if n % 2 == 1 {
+                    WindowStep::Fallback
+                } else {
+                    WindowStep::Claimed
+                }
+            };
+            let sent = lean_claims(600, turn);
+            assert!(sent.len() <= 30, "{} lean statements", sent.len());
+            // One window in three holds a keyed row.
+            let third = |n: u32| {
+                if n % 3 == 2 {
+                    WindowStep::Fallback
+                } else {
+                    WindowStep::Claimed
+                }
+            };
+            let sent = lean_claims(600, third);
+            assert!(sent.len() <= 60, "{} lean statements", sent.len());
+            assert!(lean_fallbacks(600, third) <= 30);
+        }
+
+        #[test]
+        fn a_loop_with_a_rare_fallback_keeps_the_lean_form_first() {
+            let rare = |n: u32| {
+                if n.is_multiple_of(20) {
+                    WindowStep::Fallback
+                } else {
+                    WindowStep::Claimed
+                }
+            };
+            let sent = lean_claims(600, rare);
+            assert!(sent.len() >= 450, "{} lean statements", sent.len());
+        }
+
         #[test]
         fn the_skip_span_never_passes_its_cap() {
-            assert_eq!(lean_skip_span(0), 1);
-            assert_eq!(lean_skip_span(LEAN_SKIP_CAP / 2 - 1), LEAN_SKIP_CAP - 2);
-            assert_eq!(lean_skip_span(LEAN_SKIP_CAP / 2), LEAN_SKIP_CAP);
+            assert_eq!(lean_skip_span(0), LEAN_SKIP_STEP);
+            assert_eq!(
+                lean_skip_span(LEAN_SKIP_CAP - LEAN_SKIP_STEP - 1),
+                LEAN_SKIP_CAP - 1
+            );
+            assert_eq!(
+                lean_skip_span(LEAN_SKIP_CAP - LEAN_SKIP_STEP),
+                LEAN_SKIP_CAP
+            );
             assert_eq!(lean_skip_span(LEAN_SKIP_CAP), LEAN_SKIP_CAP);
             assert_eq!(lean_skip_span(u32::MAX), LEAN_SKIP_CAP);
         }
@@ -5083,13 +5313,22 @@ pub async fn claim_task_with_slots(
 /// [`claim_task_with_slots`] with the lean form in front (issue #2680).
 ///
 /// `lean` is the skip state of the calling claim loop. Each claim loop holds
-/// its own [`LeanSkip`] and passes it to each of its claims. The claim sends
-/// [`lean_claim_query_for`] first when the state allows it. A lean statement
-/// can take a row, or find an empty window. Either one ends the claim as
-/// the window form does: the same rechecks, the same hints and the same
-/// result. A lean statement that sets its flag locked no row. The claim
-/// then sends the unchanged window form in the same transaction. The next
-/// claims of the loop send the window form first. See [`LeanSkip`].
+/// its own [`LeanSkips`] and passes it to each of its claims. The state
+/// holds one skip for each claim kind, and a claim reads and changes the
+/// skip of `kind` only. A loop that claims queue by queue holds one state
+/// for each queue. The claim sends [`lean_claim_query_for`] first when the
+/// skip allows it. A lean statement can take a row, or find an empty
+/// window. Either one ends the claim as the window form does: the same
+/// rechecks, the same hints and the same result.
+///
+/// A lean statement that sets its flag claimed no row and changed no row.
+/// The claim then sends the unchanged window form in the same transaction.
+/// The next claims of `kind` send the window form first. See [`LeanSkips`].
+///
+/// A window with a row that is not plain locks no row. A peer can commit a
+/// change of a window row before the row lock of the lean statement. The
+/// claim then keeps its lock on the row that it skipped, until the
+/// transaction ends. The window form does the same.
 ///
 /// `None` is a caller with no claim loop. Its claim sends the window form
 /// first, as [`claim_task_with_slots`] does. An ageing claim and a fair
@@ -5119,7 +5358,7 @@ pub async fn claim_task_with_lean(
     fairness: ClaimFairness,
     owned: Option<&OwnedClaim>,
     slots: Option<ClaimSlots>,
-    mut lean: Option<&mut LeanSkip>,
+    mut lean: Option<&mut LeanSkips>,
 ) -> HarvestResult<SlottedClaim> {
     if fairness == ClaimFairness::Keys {
         for queue in queues {
@@ -5254,7 +5493,7 @@ async fn claim_task_one_statement(
     fairness: ClaimFairness,
     owned: Option<&OwnedClaim>,
     slots: Option<ClaimSlots>,
-    lean: Option<&mut LeanSkip>,
+    lean: Option<&mut LeanSkips>,
 ) -> HarvestResult<SlottedClaim> {
     // Two-phase claim using a CTE to avoid holding advisory locks during
     // broad WHERE filtering.
@@ -5454,20 +5693,26 @@ async fn claim_task_one_statement(
         let task = if windowed {
             let (fenced, owner_form) = (fence.is_some(), owned.is_some());
             // The lean form goes first when the claim loop allows it (issue
-            // #2680). A statement error returns here, before the skip
-            // changes, and rolls the transaction back.
-            let lean_step = if claim_window::sends_lean_first(windowed, lean.as_deref().copied()) {
+            // #2680). The loop holds one skip for each claim kind, and this
+            // claim reads the skip of its kind only. A statement error
+            // returns here, before the skip changes, and rolls the
+            // transaction back.
+            let skip = lean.as_deref().map(|skips| skips.of(kind));
+            let lean_step = if claim_window::sends_lean_first(windowed, skip) {
                 let lean_form = lean_claim_query_for(kind, fenced, owner_form);
                 Some(claim_form_step(conn, query(lean_form)).await?)
             } else {
                 None
             };
-            if let Some(skip) = lean {
+            if let Some(skips) = lean {
                 let answer = lean_step.as_ref().map(ClaimFormStep::step);
-                *skip = claim_window::lean_skip_after(*skip, answer);
+                skips.record(kind, answer);
             }
-            // A lean fallback locked no row and changed no row. So the
-            // window form is a fresh attempt in the same transaction.
+            // A lean fallback claimed no row and changed no row. So the
+            // window form is a fresh attempt in the same transaction. After
+            // a peer commit on a window row, the claim still holds the lock
+            // of the row that the lean form skipped. That lock is its own,
+            // so the window form can still take the row.
             let step = match lean_step {
                 Some(step @ (ClaimFormStep::Claimed(_) | ClaimFormStep::Empty)) => step,
                 Some(ClaimFormStep::Fallback) | None => {

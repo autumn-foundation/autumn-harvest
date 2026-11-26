@@ -1,8 +1,11 @@
 //! The lean form of the default claim (issue #2680).
 //!
 //! The lean form is a smaller statement in front of the window form. It is
-//! exact for a window of plain rows. In every other case it locks no row and
-//! sets its flag, and the window form runs in the same transaction.
+//! exact for a window of plain rows. When its window holds a row and it
+//! locks none, it sets its flag. It then claimed no row and changed no row,
+//! and the window form runs in the same transaction. A window with a row
+//! that is not plain locks no row. After a peer commit on a window row, the
+//! claim keeps its lock on the row that it skipped, as the window form does.
 //!
 //! The form tests send one form alone through the cached claim query, with
 //! the binds of the window form. The claim tests go through
@@ -13,7 +16,9 @@
 //! A claim keeps one prepared statement per form on its connection.
 //! `pg_prepared_statements` counts the plans that each one ran, and each
 //! run takes one plan. So a test reads the forms that its own connection
-//! sent, with no extension and no hook in the claim.
+//! sent, with no extension and no hook in the claim. The count reads the
+//! `generic_plans` and `custom_plans` columns, so these tests need Postgres
+//! 14 or newer.
 //!
 //! Set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run against it.
 //! Otherwise a fresh testcontainers Postgres boots with the migrations. The
@@ -36,7 +41,7 @@ use autumn_harvest::decision_owner::{
 };
 use autumn_harvest::models::TaskQueueItem;
 use autumn_harvest::queue::{
-    self, ClaimFairness, ClaimFormBinds, ClaimFormProbe, ClaimFormStep, EnqueueParams, LeanSkip,
+    self, ClaimFairness, ClaimFormBinds, ClaimFormProbe, ClaimFormStep, EnqueueParams, LeanSkips,
     OwnedClaim, TaskType,
 };
 use autumn_harvest::replication::FenceRegistry;
@@ -428,7 +433,7 @@ async fn runs_of(conn: &mut AsyncPgConnection, marker: &str) -> i64 {
     .bind::<diesel::sql_types::Text, _>(marker)
     .get_result::<Count>(conn)
     .await
-    .expect("read the prepared statements")
+    .expect("read the prepared statements (needs Postgres 14 or newer)")
     .n
 }
 
@@ -450,7 +455,7 @@ async fn claim(
     conn: &mut AsyncPgConnection,
     queues: &[String],
     kind: Option<TaskType>,
-    lean: Option<&mut LeanSkip>,
+    lean: Option<&mut LeanSkips>,
 ) -> Option<TaskQueueItem> {
     queue::claim_task_with_lean(
         conn,
@@ -512,7 +517,7 @@ async fn a_plain_queue_sends_the_lean_form_only() {
     let queues = [unique_queue("lean-census")];
     seed_plain(&mut conn, &queues[0], 12).await;
 
-    let mut skip = LeanSkip::new();
+    let mut skip = LeanSkips::new();
     let mut claimed = Vec::new();
     while let Some(task) = claim(&mut conn, &queues, None, Some(&mut skip)).await {
         assert_eq!(task.state, "RUNNING");
@@ -529,7 +534,7 @@ async fn a_plain_queue_sends_the_lean_form_only() {
         },
         "twelve claims and one empty poll, all in the lean form"
     );
-    assert!(skip.sends_lean(), "no fallback, so no skip");
+    assert!(skip.sends_lean(None), "no fallback, so no skip");
 
     assert!(claim(&mut conn, &queues, None, None).await.is_none());
     assert_eq!(
@@ -546,16 +551,16 @@ async fn a_plain_queue_sends_the_lean_form_only() {
 
 /// A keyed row that stays at the head makes each lean attempt fall back.
 /// The loop then sends the window form first, and tries the lean form
-/// again after 1, 2, 4 and so on up to 64 claims. Each claim still takes
+/// again after 4, 8, 12 and so on up to 64 claims. Each claim still takes
 /// the next plain row. When the keyed row goes, the next lean attempt
-/// takes a row, and the loop sends the lean form alone again.
+/// takes a row, and the loop sends the lean form first again.
 #[tokio::test]
 async fn a_keyed_row_at_the_head_moves_the_loop_to_the_window_form() {
     let (url, _container) = setup_db().await;
     let mut conn = connect(&url).await;
     let queue = unique_queue("lean-converge");
     let queues = [queue.clone()];
-    seed_plain(&mut conn, &queue, 210).await;
+    seed_plain(&mut conn, &queue, 241).await;
     // One running row holds the only slot of the key. The pending row of
     // the key has the top priority, so it stays in the window.
     exec(
@@ -572,10 +577,10 @@ async fn a_keyed_row_at_the_head_moves_the_loop_to_the_window_form() {
     )
     .await;
 
-    let mut skip = LeanSkip::new();
+    let mut skip = LeanSkips::new();
     let mut lean_claims: Vec<usize> = Vec::new();
     let mut sent = Forms::default();
-    for n in 1..=199_usize {
+    for n in 1..=230_usize {
         let task = claim(&mut conn, &queues, None, Some(&mut skip))
             .await
             .unwrap_or_else(|| panic!("claim {n} takes a plain row"));
@@ -593,8 +598,8 @@ async fn a_keyed_row_at_the_head_moves_the_loop_to_the_window_form() {
     }
     assert_eq!(
         lean_claims,
-        [1, 3, 6, 11, 20, 37, 70, 135],
-        "the first fallback starts the skip, and each next one doubles it"
+        [1, 6, 15, 28, 45, 66, 91, 120, 153, 190],
+        "each fallback adds four claims to the skip"
     );
     assert!(
         lean_claims.windows(2).all(|w| w[1] - w[0] <= SKIP_CAP + 1),
@@ -602,8 +607,12 @@ async fn a_keyed_row_at_the_head_moves_the_loop_to_the_window_form() {
     );
     assert_eq!(sent.full, 0, "the window form finds each row");
     assert!(
-        skip.sends_lean(),
-        "the skip of 64 claims is over, so claim 200 is the next lean attempt"
+        skip.sends_lean(None),
+        "the skip of 40 claims is over, so claim 231 is the next lean attempt"
+    );
+    assert!(
+        skip.sends_lean(Some(TaskType::Workflow)) && skip.sends_lean(Some(TaskType::Activity)),
+        "the fallbacks of one claim kind leave the other kinds alone"
     );
 
     exec(
@@ -614,7 +623,7 @@ async fn a_keyed_row_at_the_head_moves_the_loop_to_the_window_form() {
         ),
     )
     .await;
-    for n in 200..=210_usize {
+    for n in 231..=241_usize {
         let task = claim(&mut conn, &queues, None, Some(&mut skip))
             .await
             .unwrap_or_else(|| panic!("claim {n} takes a plain row"));
@@ -624,10 +633,162 @@ async fn a_keyed_row_at_the_head_moves_the_loop_to_the_window_form() {
     assert_eq!(
         (end.lean, end.window, end.full),
         (sent.lean + 11, sent.window, 0),
-        "claim 200 is the next lean attempt; it takes a row, and the skip ends"
+        "claim 231 is the next lean attempt; each lean claim sends the lean form first again"
     );
-    assert!(skip.sends_lean());
+    assert!(skip.sends_lean(None));
     forget(&mut conn, &queues, &[]).await;
+}
+
+/// `n` plain due workflow rows in `queue`, with no run. Row 1 is the oldest.
+async fn seed_plain_workflows(conn: &mut AsyncPgConnection, queue: &str, n: i64) {
+    exec(
+        conn,
+        &format!(
+            "INSERT INTO harvest_task_queue \
+               (queue_name, task_type, input, state, priority, max_attempts, scheduled_at) \
+             SELECT '{queue}', 'workflow', jsonb_build_object('n', g), 'PENDING', 0, 3, \
+                    NOW() - make_interval(secs => 100000 - g) \
+             FROM generate_series(1, {n}) g"
+        ),
+    )
+    .await;
+}
+
+/// A loop holds one skip for each claim kind. A keyed activity row stays at
+/// the head, so each lean claim of any kind falls back. A workflow claim
+/// reads no activity row, so its lean form takes a row each time. The lean
+/// claims of the workflow kind leave the skip of the other kind alone. So
+/// the claims of any kind move to the window form first.
+#[tokio::test]
+async fn a_loop_of_two_claim_kinds_keeps_one_skip_for_each_kind() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue = unique_queue("lean-kinds");
+    let queues = [queue.clone()];
+    seed_plain(&mut conn, &queue, 600).await;
+    seed_plain_workflows(&mut conn, &queue, 600).await;
+    exec(
+        &mut conn,
+        &format!(
+            "INSERT INTO harvest_task_queue \
+               (queue_name, task_type, activity_name, input, state, attempt, max_attempts, \
+                priority, worker_id, started_at, concurrency_key, concurrency_cap) \
+             VALUES ('{queue}', 'activity', 'noop', '{{}}'::jsonb, 'RUNNING', 1, 3, 0, 'holder', \
+                     NOW(), '{queue}-key', 1), \
+                    ('{queue}', 'activity', 'noop', '{{}}'::jsonb, 'PENDING', 0, 3, 9, NULL, \
+                     NULL, '{queue}-key', 1)"
+        ),
+    )
+    .await;
+
+    let mut skip = LeanSkips::new();
+    let mut any_lean: Vec<usize> = Vec::new();
+    let mut sent = Forms::default();
+    for n in 1..=600_usize {
+        let kind = n.is_multiple_of(2).then_some(TaskType::Workflow);
+        let task = claim(&mut conn, &queues, kind, Some(&mut skip))
+            .await
+            .unwrap_or_else(|| panic!("claim {n} takes a plain row"));
+        assert!(
+            task.concurrency_key.is_none(),
+            "claim {n} takes a plain row"
+        );
+        let now = forms(&mut conn).await;
+        if kind.is_some() {
+            assert_eq!(
+                (now.lean, now.window),
+                (sent.lean + 1, sent.window),
+                "workflow claim {n} sends the lean form alone"
+            );
+        } else if now.lean > sent.lean {
+            any_lean.push(n.div_ceil(2));
+        }
+        sent = now;
+    }
+    assert_eq!(
+        any_lean,
+        [1, 6, 15, 28, 45, 66, 91, 120, 153, 190, 231, 276],
+        "the claims of any kind keep their own skip"
+    );
+    assert_eq!(
+        sent,
+        Forms {
+            lean: 312,
+            window: 300,
+            full: 0
+        },
+        "300 lean workflow claims, 12 lean attempts of any kind, 300 window claims"
+    );
+    forget(&mut conn, &queues, &[]).await;
+}
+
+/// One due workflow task in `queue`, of a new paused run. The row is plain.
+/// Returns the id of the run.
+async fn seed_parked_row(conn: &mut AsyncPgConnection, queue: &str) -> Uuid {
+    let run = Uuid::new_v4();
+    exec(
+        conn,
+        &format!(
+            "INSERT INTO harvest_workflow_executions \
+               (id, workflow_name, workflow_id, shard_id, input, state) \
+             VALUES ('{run}', 'lean-parked', '{run}', 0, 'null'::jsonb, 'PAUSED'); \
+             INSERT INTO harvest_task_queue \
+               (queue_name, task_type, input, state, priority, max_attempts, workflow_exec_id) \
+             VALUES ('{queue}', 'workflow', '{{}}'::jsonb, 'PENDING', 0, 3, '{run}')"
+        ),
+    )
+    .await;
+    run
+}
+
+/// A window of plain rows can still set the lean flag. The only due row is
+/// the workflow task of a paused run. Its window is not empty, and no row
+/// passes the run gate. So the lean form sets its flag, where the window
+/// form returns no row and a clear flag.
+#[tokio::test]
+async fn a_parked_plain_row_of_a_paused_run_sets_the_lean_flag() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue = unique_queue("lean-parked");
+    let run = seed_parked_row(&mut conn, &queue).await;
+
+    assert_eq!(
+        probe(&mut conn, ClaimFormProbe::Lean, Variant::BASE, &queue).await,
+        Outcome::Fallback,
+        "the window holds a row, and the lean form locks none"
+    );
+    assert_eq!(
+        probe(&mut conn, ClaimFormProbe::Window, Variant::BASE, &queue).await,
+        Outcome::Empty
+    );
+    assert_eq!(rows_in_state(&mut conn, &queue, "PENDING").await, 1);
+
+    forget(&mut conn, std::slice::from_ref(&queue), &[]).await;
+    exec(
+        &mut conn,
+        &format!("DELETE FROM harvest_workflow_executions WHERE id = '{run}'"),
+    )
+    .await;
+}
+
+/// The committed census scripts count the lean form. Each one filters
+/// `pg_stat_statements` by text, and the lean text does not start with the
+/// `worker_info` CTE. So each script names the lean marker.
+#[test]
+fn the_committed_census_scripts_name_the_lean_marker() {
+    let root = crate::ci_run_coverage::repo_root();
+    for script in [
+        "docs/perf-artifacts/claim-window-split/claim_forms.sql",
+        "docs/perf-artifacts/claim-batch/claim_forms.sql",
+        "docs/perf-artifacts/notify-cuts-settle/run_cell.sh",
+    ] {
+        let text = std::fs::read_to_string(root.join(script))
+            .unwrap_or_else(|e| panic!("read {script}: {e}"));
+        assert!(
+            text.contains(LEAN_MARKER),
+            "{script} must count the statements that hold {LEAN_MARKER}"
+        );
+    }
 }
 
 // ── Fallback exactness ──────────────────────────────────────────────────────
@@ -830,7 +991,7 @@ async fn a_claim_that_falls_back_takes_the_row_of_a_claim_with_no_lean_form() {
         let lean_buckets = seed_one_feature(&mut lean_conn, &lean_queues[0], feature).await;
         let window_buckets = seed_one_feature(&mut window_conn, &window_queues[0], feature).await;
 
-        let mut skip = LeanSkip::new();
+        let mut skip = LeanSkips::new();
         let with_lean = claim(&mut lean_conn, &lean_queues, None, Some(&mut skip)).await;
         let without = claim(&mut window_conn, &window_queues, None, None).await;
         assert_eq!(
@@ -844,7 +1005,10 @@ async fn a_claim_that_falls_back_takes_the_row_of_a_claim_with_no_lean_form() {
             digest(&mut window_conn, &window_queues, &window_buckets).await,
             "{feature:?}"
         );
-        assert!(!skip.sends_lean(), "{feature:?}: the first fallback skips");
+        assert!(
+            !skip.sends_lean(None),
+            "{feature:?}: the first fallback skips"
+        );
 
         let now = forms(&mut lean_conn).await;
         assert_eq!(
@@ -1040,6 +1204,14 @@ async fn a_lean_claim_takes_the_next_row_after_a_peer_commits_the_head_row() {
         Outcome::Claimed(next),
         "the lean form skips the row that the peer took, and takes the next row"
     );
+    // The row lock found the head row first and checked its new version.
+    // So the claim holds the lock of that row too. A statement that started
+    // after the peer commit never locks the head row.
+    assert_eq!(
+        free_rows(&mut check, &queue).await,
+        0,
+        "the claim holds the row that it took and the row that it skipped"
+    );
     close(&mut slow, true).await;
 
     assert_eq!(
@@ -1080,7 +1252,17 @@ async fn a_lean_claim_defers_when_a_peer_commits_its_only_row() {
     );
     let window = send(&mut slow, ClaimFormProbe::Window, Variant::BASE, &queue).await;
     assert_eq!(outcome(&window), Outcome::Empty);
+    assert_eq!(
+        free_rows(&mut check, &queue).await,
+        0,
+        "the claim keeps its lock on the row that it skipped, as the window form does"
+    );
     close(&mut slow, true).await;
+    assert_eq!(
+        free_rows(&mut check, &queue).await,
+        1,
+        "the end of the claim transaction frees the row"
+    );
 
     assert_eq!(
         row_state(&mut check, only).await,
@@ -1116,14 +1298,19 @@ async fn pool_forms(pool: &DbPool) -> Forms {
     total
 }
 
-/// Runs a worker with no handler on an empty queue until its claim loop
-/// has polled a few times. Returns the claim forms that its pool sent.
-async fn forms_of_an_idle_worker(url: &str, claim_lean: bool) -> Forms {
+/// Runs a worker with no handler over `queues` until its pool has sent
+/// `enough` windowed claim statements. No row of `queues` may be claimable.
+/// Returns the claim forms that its pool sent.
+async fn forms_of_a_worker_with_no_claim(
+    url: &str,
+    config: WorkerConfig,
+    queues: Vec<String>,
+    enough: i64,
+) -> Forms {
     let pool = small_pool(url);
-    let mut config: WorkerRuntimeConfig =
-        WorkerConfig::default().with_claim_lean(claim_lean).into();
+    let mut config: WorkerRuntimeConfig = config.into();
     config.worker_id = unique_queue("lean-loop-worker");
-    config.queues = vec![unique_queue("lean-loop")];
+    config.queues = queues;
     config.poll_interval = Duration::from_millis(20);
     config.shutdown_timeout = Duration::from_secs(5);
     config.shard_assignments = vec![ShardId::new(0)];
@@ -1139,13 +1326,20 @@ async fn forms_of_an_idle_worker(url: &str, claim_lean: bool) -> Forms {
     for _ in 0..60 {
         tokio::time::sleep(Duration::from_millis(250)).await;
         let seen = pool_forms(&pool).await;
-        if seen.lean + seen.window >= 5 {
+        if seen.lean + seen.window >= enough {
             break;
         }
     }
     worker.shutdown();
     handle.await.expect("the worker joins");
     pool_forms(&pool).await
+}
+
+/// Runs a worker with no handler on an empty queue until its claim loop
+/// has polled a few times. Returns the claim forms that its pool sent.
+async fn forms_of_an_idle_worker(url: &str, claim_lean: bool) -> Forms {
+    let config = WorkerConfig::default().with_claim_lean(claim_lean);
+    forms_of_a_worker_with_no_claim(url, config, vec![unique_queue("lean-loop")], 5).await
 }
 
 /// Each claim loop of a worker holds lean state, so an idle worker polls
@@ -1178,6 +1372,44 @@ async fn a_worker_claim_loop_sends_the_lean_form_unless_the_switch_is_off() {
         (0, 0),
         "the switch keeps the lean form off: {off:?}"
     );
+    db.drop_db().await;
+}
+
+/// A worker with queue weights claims queue by queue, and its loop holds
+/// one lean state for each queue. One queue is empty. The other holds the
+/// parked row of a paused run, so each lean claim of that queue sets its
+/// flag. Each poll claims from both queues, and neither claim takes a row.
+///
+/// The loop sends the window form once in each poll, for the parked queue.
+/// It sends the lean form alone for the empty queue in each poll. So the
+/// pool sent the lean form at least as often as the window form. With one
+/// state for both queues, the flags of the parked queue would also move
+/// the claims of the empty queue to the window form.
+#[tokio::test]
+async fn a_weighted_worker_keeps_the_lean_form_on_its_plain_queue() {
+    let _registry = clear_fence_registry().await;
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    let empty = unique_queue("lean-weighted-empty");
+    let parked = unique_queue("lean-weighted-parked");
+    seed_parked_row(&mut conn, &parked).await;
+
+    let config =
+        WorkerConfig::default().with_queue_weights([(empty.as_str(), 1), (parked.as_str(), 1)]);
+    let sent =
+        forms_of_a_worker_with_no_claim(&db.url, config, vec![empty, parked.clone()], 40).await;
+    assert!(sent.window >= 5, "the worker polled: {sent:?}");
+    assert!(
+        sent.lean >= sent.window,
+        "the empty queue keeps the lean form in each poll: {sent:?}"
+    );
+    assert_eq!(sent.full, 0, "{sent:?}");
+    assert_eq!(
+        rows_in_state(&mut conn, &parked, "PENDING").await,
+        1,
+        "no claim takes the parked row"
+    );
+    drop(conn);
     db.drop_db().await;
 }
 
@@ -1974,7 +2206,7 @@ async fn state_claim(
     state: &Written,
     kind: Option<TaskType>,
     owner: Option<&OwnedClaim>,
-    lean: Option<&mut LeanSkip>,
+    lean: Option<&mut LeanSkips>,
 ) -> Option<i64> {
     let (breakers, ineligible) = activity_binds();
     queue::claim_task_with_lean(
@@ -2026,7 +2258,7 @@ async fn random_drains_take_the_same_rows_with_and_without_the_lean_form() {
             let lean_copy = write_state(&mut lean_conn, &spec, &format!("a{mode}-{seed}")).await;
             let window_copy =
                 write_state(&mut window_conn, &spec, &format!("b{mode}-{seed}")).await;
-            let mut skip = LeanSkip::new();
+            let mut skip = LeanSkips::new();
             for step in 0..spec.rows.len().min(36) + 4 {
                 let kind = [
                     None,

@@ -68,6 +68,11 @@ saturated-activity gate.
   Postgres initializes every CTE subplan at startup, so the single
   statement paid for 110 plan nodes that never ran. See
   [the claim window split](performance-claim-window-split.md).
+* **A worker claim loop now sends a lean form in front of the window
+  form** (`claim_lean`, on by default). The lean form is exact for a
+  window of plain rows, and it hands each other case to the unchanged
+  window form. A caller of `queue::claim_task` still sends the window form
+  first. See [Lean claim](operations/claim-lean.md).
 * **A worker now runs up to `max_concurrent_claims` claims at once (default
   2).** One serial loop kept 0.94 claims in flight and capped throughput. On
   assay #14's workload, two loops raise throughput 21% to 35%, and four
