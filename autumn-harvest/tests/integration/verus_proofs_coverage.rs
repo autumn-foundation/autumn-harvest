@@ -1030,3 +1030,21 @@ fn the_crate_root_check_counts_only_active_modules() {
         assert!(root_modules(bad).is_err(), "{bad}");
     }
 }
+
+/// `item_contracts` reads the first `{` outside parentheses as the body of
+/// a fn. A bare `if` or a bare block in an `ensures` clause ends the
+/// contract at that brace. The stored line then loses the rest of the clause
+/// and gains the proof body. So each such clause goes inside parentheses.
+#[test]
+fn no_stored_contract_is_cut_at_a_brace() {
+    for file in verus_files() {
+        let cut: Vec<String> = contracts(&read(&file))
+            .into_iter()
+            .filter(|c| c.starts_with(','))
+            .collect();
+        assert!(
+            cut.is_empty(),
+            "{file}: a contract was cut at a brace: {cut:?}"
+        );
+    }
+}
