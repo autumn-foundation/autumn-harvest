@@ -237,6 +237,8 @@ mod keyed_claim_running_counts_tests;
 #[cfg(feature = "db")]
 mod late_signal_completion_tests;
 #[cfg(feature = "db")]
+mod lean_claim_db_tests;
+#[cfg(feature = "db")]
 mod legal_hold_tests;
 #[cfg(feature = "db")]
 mod lifecycle_model_props;

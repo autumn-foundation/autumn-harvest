@@ -27,6 +27,8 @@ use crate::shared_json::SharedJson;
 use crate::telemetry::TraceContextCarrier;
 use crate::types::{ExecutionId, Priority};
 
+pub use claim_window::LeanSkip;
+
 mod claim_window {
     //! Postgres initializes every CTE subplan at executor startup, run or not,
     //! and the deep and full-scan fallbacks almost never run. So a claim first
@@ -38,6 +40,12 @@ mod claim_window {
     //! the rest of those gates, so a clear flag means the full statement takes
     //! nothing either. A set flag means the window form locked and debited
     //! nothing, so the full statement is just a fresh attempt.
+    //!
+    //! The lean form goes in front of the window form (issue #2680). It is a
+    //! smaller statement that is exact for a window of plain rows. In every
+    //! other case it locks no row and sets its flag, and the unchanged
+    //! window form runs. See `lean_claim_sql` and [`LeanSkip`].
+    //! `formal/verus/src/claim_window.rs` proves the model of both steps.
 
     pub(super) const WINDOW_DROPPED_CTES: [&str; 9] = [
         "concurrency_pending_keys",
@@ -358,6 +366,410 @@ mod claim_window {
         format!("WITH {} {tail}", kept.join(", "))
     }
 
+    /// The CTEs of a window text that the lean form has no copy of.
+    pub(super) const LEAN_DROPPED_CTES: [&str; 7] = [
+        "worker_info",
+        "seek_pending_keys",
+        "seek_running_counts",
+        "seek_held",
+        "seek_contended",
+        "rate_limit_debit",
+        "claim_window_fallback",
+    ];
+
+    /// The CTEs of a window text that the lean form keeps or edits.
+    const LEAN_NEEDED_CTES: [&str; 7] = [
+        "seek_heads",
+        "seek_bounds",
+        "seek_candidate",
+        "candidate",
+        "fresh_now",
+        "run_expired_now",
+        "claimed",
+    ];
+
+    /// One gate of `seek_candidate` that passes each row with a NULL column.
+    struct LeanGate {
+        /// The column. A plain row has NULL in it.
+        column: &'static str,
+        /// The name of the gate in a panic message.
+        what: &'static str,
+        /// The gate, as `claim_candidate_gates_sql!` writes it on one line.
+        text: &'static str,
+    }
+
+    /// The gates that the lean form replaces with the NULL test of a column.
+    ///
+    /// A row is plain when each column here is NULL. Each gate starts with
+    /// that NULL test, so it passes a plain row. A new feature gate needs an
+    /// entry here, or the lean form must keep it.
+    /// `the_lean_form_decides_each_gate_of_the_window_candidate` fails until
+    /// someone makes that choice.
+    const LEAN_GATES: [LeanGate; 4] = [
+        LeanGate {
+            column: "concurrency_key",
+            what: "the concurrency gate",
+            text: "AND ( concurrency_key IS NULL OR concurrency_cap IS NULL OR COALESCE(( \
+                   SELECT rc.running_count FROM seek_running_counts rc \
+                   WHERE rc.concurrency_key = harvest_task_queue.concurrency_key \
+                   AND rc.task_type = harvest_task_queue.task_type ), 0) \
+                   < harvest_task_queue.concurrency_cap ) ",
+        },
+        LeanGate {
+            column: "required_build_id",
+            what: "the build gate",
+            text: "AND ( required_build_id IS NULL OR ($3 <> '' AND ( required_build_id = $3 \
+                   OR EXISTS ( SELECT 1 FROM harvest_build_compat WHERE build_id = $3 \
+                   AND compatible_with = harvest_task_queue.required_build_id ) )) ) ",
+        },
+        LeanGate {
+            column: "required_capabilities",
+            what: "the capability gate",
+            text: "AND ( required_capabilities IS NULL OR NOT EXISTS ( SELECT 1 \
+                   FROM jsonb_array_elements(required_capabilities) AS r(value) WHERE ( \
+                   r.value ? 'Exact' AND ( \
+                   worker_info.labels->>(r.value->'Exact'->>'key') IS NULL \
+                   OR worker_info.labels->>(r.value->'Exact'->>'key') \
+                   != (r.value->'Exact'->>'value') ) ) OR ( r.value ? 'In' AND ( \
+                   worker_info.labels->>(r.value->'In'->>'key') IS NULL OR NOT ( \
+                   (r.value->'In'->'values') \
+                   @> jsonb_build_array(worker_info.labels->>(r.value->'In'->>'key')) \
+                   ) ) ) ) ) ",
+        },
+        LeanGate {
+            column: "rate_limit_key",
+            what: "the rate-limit gate",
+            text: super::CLAIM_RATE_LIMIT_GATE_SQL,
+        },
+    ];
+
+    /// The row columns of each head scan, up to the table name.
+    const LEAN_HEAD_ROW: &str = "task_type AS seek_task_type FROM harvest_task_queue";
+
+    /// The column list of `seek_heads`, where `seek_plain` goes.
+    const LEAN_HEAD_LIST: &str = "h.seek_task_type, h.head_queue";
+
+    /// The join that only the capability gate reads.
+    const LEAN_WORKER_JOIN: &str = "CROSS JOIN worker_info ";
+
+    /// The start of the sort of `seek_candidate`. The one-time gate goes in
+    /// front of it, after the last row gate.
+    const LEAN_CANDIDATE_SORT: &str = "ORDER BY CASE WHEN sticky_worker_id = $1 ";
+
+    /// The one-time gate of the lean `seek_candidate`: each window row is
+    /// plain.
+    const LEAN_PLAIN_WINDOW_GATE: &str =
+        "AND NOT EXISTS (SELECT 1 FROM seek_heads np WHERE NOT np.seek_plain) ";
+
+    /// The bucket lock of `fresh_now`. A plain row has no bucket.
+    const LEAN_BUCKET_LOCK: &str = "LEFT JOIN ( SELECT 1 AS x FROM harvest_rate_limit_buckets b \
+         JOIN candidate c ON b.key = c.rate_limit_key WHERE NOT (c.activity_name = ANY($5)) \
+         FOR UPDATE OF b ) locked ON TRUE";
+
+    /// The lean join of `fresh_now`. It reads `candidate`, so the clock read
+    /// still follows the candidate lock.
+    const LEAN_CANDIDATE_READ: &str = "LEFT JOIN ( SELECT 1 AS x FROM candidate c ) locked ON TRUE";
+
+    /// The key lock and the cap re-check of `claimed`. A plain row has no
+    /// key.
+    const LEAN_KEY_LOCK_TEST: &str = "AND ( candidate.concurrency_key IS NULL OR ( \
+         pg_try_advisory_xact_lock(hashtext(candidate.concurrency_key)::bigint) AND ( \
+         candidate.concurrency_cap IS NULL OR ( SELECT COUNT(*) FROM harvest_task_queue recheck \
+         WHERE recheck.concurrency_key = candidate.concurrency_key \
+         AND recheck.task_type = candidate.task_type AND recheck.state = 'RUNNING' \
+         AND recheck.worker_id IS NOT NULL ) < candidate.concurrency_cap ) ) ) ";
+
+    /// The debit test of `claimed`. A plain row takes no token.
+    const LEAN_DEBIT_TEST: &str = "AND ( candidate.rate_limit_key IS NULL \
+         OR candidate.activity_name = ANY($5) OR EXISTS (SELECT 1 FROM rate_limit_debit \
+         WHERE debited_key = candidate.rate_limit_key) ) ";
+
+    /// The tests that the lean `claimed` keeps.
+    const LEAN_CLAIM_TESTS: &str = "FROM candidate WHERE harvest_task_queue.id = candidate.id \
+         AND NOT (SELECT expired FROM run_expired_now) RETURNING harvest_task_queue.* )";
+
+    /// The flag of the lean form. An empty window with ageing off leaves it
+    /// clear, and the window form would return no row and no flag either.
+    const LEAN_FALLBACK_SQL: &str = "NOT EXISTS (SELECT 1 FROM seek_candidate) \
+         AND (EXISTS (SELECT 1 FROM seek_heads) \
+              OR ($4::BIGINT IS NOT NULL AND $4::BIGINT > 0))";
+
+    /// The source of the flag in the final query of a window text.
+    const WINDOW_FLAG_SOURCE: &str = "FROM claim_window_fallback fb";
+
+    /// The owned gate of a scan, by the one text that only it holds.
+    const OWNED_GATE_MARK: &str = "(SELECT owner_on FROM owner_gate)";
+
+    /// The holder check of a scan, by the one text that only it holds.
+    const HOLDER_CHECK_MARK: &str = "FROM harvest_decision_owner o ";
+
+    /// The kind test that the kind splice adds to a scan.
+    const KIND_TEST_MARK: &str = "AND harvest_task_queue.task_type = '";
+
+    /// The test that a row is plain: each column of `LEAN_GATES` is NULL.
+    fn lean_plain_sql() -> String {
+        let tests: Vec<String> = LEAN_GATES
+            .iter()
+            .map(|gate| format!("{} IS NULL", gate.column))
+            .collect();
+        format!("({})", tests.join(" AND "))
+    }
+
+    /// Replaces `piece` in `text`, which must hold it `count` times.
+    ///
+    /// The count assertion turns an edit of the shared claim text into a
+    /// panic at first use. A silent miss would leave a gate in the lean
+    /// form, or take one out of it.
+    fn replace_exact(text: &str, piece: &str, count: usize, with: &str, what: &str) -> String {
+        assert_eq!(
+            text.matches(piece).count(),
+            count,
+            "the lean claim needs {what} {count} time(s)"
+        );
+        text.replace(piece, with)
+    }
+
+    /// `seek_heads` with the `seek_plain` flag of each window row.
+    fn lean_seek_heads(heads: &str) -> String {
+        let row = format!(
+            "task_type AS seek_task_type, {} AS seek_plain FROM harvest_task_queue",
+            lean_plain_sql()
+        );
+        let heads = replace_exact(heads, LEAN_HEAD_ROW, 2, &row, "the head row columns");
+        replace_exact(
+            &heads,
+            LEAN_HEAD_LIST,
+            1,
+            "h.seek_task_type, h.seek_plain, h.head_queue",
+            "the head column list",
+        )
+    }
+
+    /// `seek_candidate` with a NULL test in place of each gate of
+    /// `LEAN_GATES`, and with the one-time gate.
+    ///
+    /// `fenced` and `owned` count the `fence` and `owner_gate` CTEs of the
+    /// window text: 0 or 1 each. The scan must keep the fence join, the owned
+    /// gate and the holder check that many times. Without the assertions, a
+    /// lean claim could run unfenced, or take a row of another owner.
+    fn lean_seek_candidate(seek: &str, fenced: usize, owned: usize) -> String {
+        let kind_tests = seek.matches(KIND_TEST_MARK).count();
+        let mut lean = replace_exact(seek, LEAN_WORKER_JOIN, 1, "", "the worker join");
+        for gate in &LEAN_GATES {
+            let test = format!("AND {} IS NULL ", gate.column);
+            lean = replace_exact(&lean, gate.text, 1, &test, gate.what);
+        }
+        let gated = format!("{LEAN_PLAIN_WINDOW_GATE}{LEAN_CANDIDATE_SORT}");
+        lean = replace_exact(&lean, LEAN_CANDIDATE_SORT, 1, &gated, "the candidate sort");
+        for (mark, count, what) in [
+            (SEEK_CANDIDATE_LOCK, 1, "the row lock"),
+            ("CROSS JOIN fence ", fenced, "the fence join"),
+            (OWNED_GATE_MARK, owned, "the owned gate"),
+            (HOLDER_CHECK_MARK, owned, "the holder check"),
+            (KIND_TEST_MARK, kind_tests, "the kind test"),
+        ] {
+            assert_eq!(
+                lean.matches(mark).count(),
+                count,
+                "the lean claim keeps {what} {count} time(s)"
+            );
+        }
+        lean
+    }
+
+    /// `claimed` with the id match and the expiry test only.
+    fn lean_claimed(claimed: &str) -> String {
+        let claimed = replace_exact(claimed, LEAN_KEY_LOCK_TEST, 1, "", "the key lock test");
+        let claimed = replace_exact(&claimed, LEAN_DEBIT_TEST, 1, "", "the debit test");
+        assert!(
+            claimed.ends_with(LEAN_CLAIM_TESTS),
+            "the lean claim keeps the id match and the expiry test only: {claimed}"
+        );
+        claimed
+    }
+
+    /// The lean form of a window text (issue #2680): a smaller statement
+    /// that is exact for a window of plain rows.
+    ///
+    /// Postgres initializes every plan node at executor startup. It does so
+    /// again when a peer commits a window row before the row lock. Many
+    /// nodes of the window form serve only a row with a concurrency key, a
+    /// rate-limit key, a build pin or a capability list. A plain row has
+    /// NULL in each of those columns. Each gate of `LEAN_GATES` passes a
+    /// plain row, so the lean form holds the NULL test in place of the gate.
+    ///
+    /// `seek_heads` carries `seek_plain` for each window row. A one-time
+    /// gate in `seek_candidate` passes no row when a window row is not
+    /// plain. The form then locks no row and claims no row. The flag is set
+    /// when no candidate exists and the window holds a row, or ageing is on.
+    /// The caller then sends the window form, a fresh attempt in the same
+    /// transaction. An empty window with ageing off returns no row and a
+    /// clear flag, as the window form does.
+    ///
+    /// The NULL tests are row tests, not only a part of the one-time gate.
+    /// A row lock can re-check a newer version of a row. The re-check
+    /// applies each row test to that version.
+    ///
+    /// `fresh_now` reads `candidate` before the clock, so the clock read
+    /// still follows the candidate lock. A plain row has no bucket and no
+    /// key. So `fresh_now` locks no bucket, no debit runs, and `claimed`
+    /// keeps the id match and the expiry test only.
+    ///
+    /// The lean form reads binds `$1`, `$2`, `$4` and `$6`, and it keeps the
+    /// bind numbers of the window form. The caller binds every value of the
+    /// window form. `CachedClaimQuery` sends the type of each bind, so
+    /// Postgres accepts a bind that the text does not read.
+    ///
+    /// Each edit replaces one exact text and asserts its count, as
+    /// `splice_dr_fence` does. The batch form has no lean form. It keeps
+    /// the text that `batch_claim_sql` derives.
+    ///
+    /// # Panics
+    ///
+    /// When `window` is not a window text. Every input is a constant.
+    #[must_use]
+    pub(super) fn lean_claim_sql(window: &str) -> String {
+        let (ctes, tail) = split_ctes(window);
+        let defined = |name: &str| ctes.iter().filter(|c| c.name == name).count();
+        for name in LEAN_DROPPED_CTES.into_iter().chain(LEAN_NEEDED_CTES) {
+            assert_eq!(defined(name), 1, "a window text defines CTE {name} once");
+        }
+        let (fenced, owned) = (defined("fence"), defined("owner_gate"));
+        assert!(
+            fenced <= 1 && owned <= 1,
+            "a window text has one fence and one owner gate at most"
+        );
+        let mut kept = Vec::with_capacity(ctes.len());
+        for cte in &ctes {
+            match cte.name {
+                name if LEAN_DROPPED_CTES.contains(&name) => {}
+                "seek_heads" => kept.push(lean_seek_heads(&squash(cte.text))),
+                "seek_candidate" => {
+                    kept.push(lean_seek_candidate(&squash(cte.text), fenced, owned));
+                }
+                "candidate" => {
+                    assert_eq!(squash(cte.text), WINDOW_CANDIDATE_CTE);
+                    kept.push(cte.text.to_owned());
+                }
+                "fresh_now" => kept.push(replace_exact(
+                    &squash(cte.text),
+                    LEAN_BUCKET_LOCK,
+                    1,
+                    LEAN_CANDIDATE_READ,
+                    "the bucket lock",
+                )),
+                "claimed" => kept.push(lean_claimed(&squash(cte.text))),
+                _ => kept.push(cte.text.to_owned()),
+            }
+        }
+        kept.push(format!(
+            "claim_lean_fallback AS MATERIALIZED ( SELECT {LEAN_FALLBACK_SQL} AS \
+             {WINDOW_FALLBACK_COLUMN} )"
+        ));
+        for cte in &kept {
+            for dropped in LEAN_DROPPED_CTES {
+                assert!(
+                    !names(cte, dropped),
+                    "a lean claim CTE reads dropped CTE {dropped}: {cte}"
+                );
+            }
+        }
+        let tail = replace_exact(
+            tail,
+            WINDOW_FLAG_SOURCE,
+            1,
+            "FROM claim_lean_fallback fb",
+            "the flag source",
+        );
+        format!("WITH {} {tail}", kept.join(", "))
+    }
+
+    /// The longest run of claims that skip the lean form.
+    pub(super) const LEAN_SKIP_CAP: u32 = 64;
+
+    /// The lean-form skip of one claim loop (issue #2680).
+    ///
+    /// A lean fallback costs one statement more than a claim that sends the
+    /// window form first. A queue that holds keyed rows would pay that on
+    /// each claim. So after a fallback, the next claims of the loop send the
+    /// window form first. The first fallback skips one claim. Each next
+    /// fallback doubles the skip, up to 64 claims. A lean claim that takes a
+    /// row ends the skip, and an empty poll keeps it.
+    ///
+    /// The skip changes the cost of a claim only. Both forms are exact, so
+    /// a claim takes the same row in every skip state. Each claim loop holds
+    /// its own state, so one loop never changes the skip of another loop.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct LeanSkip {
+        /// The claims left that send the window form first.
+        left: u32,
+        /// The length of the last skip, or 0 after a claimed row.
+        span: u32,
+    }
+
+    impl LeanSkip {
+        /// The state of a new claim loop. Its first claim sends the lean
+        /// form.
+        #[must_use]
+        pub const fn new() -> Self {
+            Self { left: 0, span: 0 }
+        }
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the claim does not send the lean form yet")
+    )]
+    /// True when the next claim of the loop sends the lean form first.
+    ///
+    /// `formal/verus/src/claim_window.rs` holds the proved copy.
+    pub(super) const fn lean_first(skip: LeanSkip) -> bool {
+        skip.left == 0
+    }
+
+    /// The length of the skip after one more fallback: 1, then double, up
+    /// to [`LEAN_SKIP_CAP`].
+    ///
+    /// `formal/verus/src/claim_window.rs` holds the proved copy.
+    pub(super) const fn lean_skip_span(span: u32) -> u32 {
+        if span == 0 {
+            1
+        } else if span < LEAN_SKIP_CAP / 2 {
+            span * 2
+        } else {
+            LEAN_SKIP_CAP
+        }
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the claim does not send the lean form yet")
+    )]
+    /// The skip after one claim. `lean` is the step of the lean form, or
+    /// `None` when the claim did not send it.
+    ///
+    /// `formal/verus/src/claim_window.rs` holds the proved copy.
+    pub(super) const fn lean_skip_after(skip: LeanSkip, lean: Option<WindowStep>) -> LeanSkip {
+        match lean {
+            None => {
+                if skip.left == 0 {
+                    skip
+                } else {
+                    LeanSkip {
+                        left: skip.left - 1,
+                        span: skip.span,
+                    }
+                }
+            }
+            Some(WindowStep::Claimed) => LeanSkip { left: 0, span: 0 },
+            Some(WindowStep::Empty) => skip,
+            Some(WindowStep::Fallback) => {
+                let span = lean_skip_span(skip.span);
+                LeanSkip { left: span, span }
+            }
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -581,6 +993,484 @@ mod claim_window {
                 "{} AS claim_due",
                 squash(super::super::CLAIM_ORDER_DUE_SQL)
             )));
+        }
+
+        /// The squashed text of CTE `name`.
+        fn cte_text(ctes: &[Cte<'_>], name: &str) -> String {
+            ctes.iter()
+                .find(|c| c.name == name)
+                .map_or_else(|| panic!("CTE {name}"), |c| squash(c.text))
+        }
+
+        /// The top-level `AND` terms of the `WHERE` clause of a candidate
+        /// scan, up to its `ORDER BY`.
+        fn where_terms(cte_text: &str) -> Vec<String> {
+            let bytes = cte_text.as_bytes();
+            let mut depth = 0_usize;
+            let mut in_literal = false;
+            let mut start = None;
+            let mut terms = Vec::new();
+            for (i, &byte) in bytes.iter().enumerate() {
+                match byte {
+                    b'\'' => in_literal = !in_literal,
+                    b'(' if !in_literal => depth += 1,
+                    b')' if !in_literal => depth -= 1,
+                    _ => {}
+                }
+                if in_literal || depth != 1 {
+                    continue;
+                }
+                let rest = &cte_text[i..];
+                match start {
+                    None if rest.starts_with(" WHERE ") => start = Some(i + " WHERE ".len()),
+                    Some(from) if rest.starts_with(" AND ") => {
+                        terms.push(cte_text[from..i].to_owned());
+                        start = Some(i + " AND ".len());
+                    }
+                    Some(from) if rest.starts_with(" ORDER BY ") => {
+                        terms.push(cte_text[from..i].to_owned());
+                        return terms;
+                    }
+                    _ => {}
+                }
+            }
+            panic!("the scan has no WHERE clause with an ORDER BY: {cte_text}");
+        }
+
+        #[test]
+        fn where_terms_splits_the_top_level_only() {
+            let scan = "c AS ( SELECT 1 FROM t WHERE a = ' AND ' AND ( b OR ( c AND d ) ) \
+                        AND e = ANY(ARRAY( SELECT 1 WHERE f AND g )) ORDER BY a LIMIT 1 )";
+            assert_eq!(
+                where_terms(scan),
+                [
+                    "a = ' AND '",
+                    "( b OR ( c AND d ) )",
+                    "e = ANY(ARRAY( SELECT 1 WHERE f AND g ))"
+                ]
+            );
+        }
+
+        const LEAN_FLAG_CTE: &str = "claim_lean_fallback AS MATERIALIZED ( SELECT NOT EXISTS \
+             (SELECT 1 FROM seek_candidate) AND (EXISTS (SELECT 1 FROM seek_heads) \
+             OR ($4::BIGINT IS NOT NULL AND $4::BIGINT > 0)) AS claim_fallback )";
+
+        const LEAN_PLAIN: &str = "(concurrency_key IS NULL AND required_build_id IS NULL \
+             AND required_capabilities IS NULL AND rate_limit_key IS NULL)";
+
+        /// The start of each gate that the lean form replaces, and the row
+        /// test that replaces it.
+        const LEAN_GATE_TESTS: [(&str, &str); 4] = [
+            ("( concurrency_key IS NULL OR ", "concurrency_key IS NULL"),
+            (
+                "( required_build_id IS NULL OR ",
+                "required_build_id IS NULL",
+            ),
+            (
+                "( required_capabilities IS NULL OR ",
+                "required_capabilities IS NULL",
+            ),
+            ("( rate_limit_key IS NULL OR ", "rate_limit_key IS NULL"),
+        ];
+
+        #[test]
+        #[allow(clippy::too_many_lines)]
+        fn lean_claim_sql_holds_for_every_variant() {
+            use crate::queue::{TaskType, lean_claim_query_for, window_claim_query_for};
+            for kind in [None, Some(TaskType::Workflow), Some(TaskType::Activity)] {
+                for fenced in [false, true] {
+                    for owned in [false, true] {
+                        let case = format!("kind {kind:?}, fenced {fenced}, owned {owned}");
+                        let window = window_claim_query_for(kind, fenced, owned);
+                        let lean = lean_claim_query_for(kind, fenced, owned);
+                        let (window_ctes, window_tail) = split_ctes(window);
+                        let (ctes, tail) = split_ctes(lean);
+                        let text = |name: &str| cte_text(&ctes, name);
+                        let window_text = |name: &str| cte_text(&window_ctes, name);
+
+                        for dropped in LEAN_DROPPED_CTES {
+                            assert!(names(window, dropped), "{case}: the window has {dropped}");
+                            assert!(
+                                !names(lean, dropped),
+                                "{case}: the lean form keeps {dropped}"
+                            );
+                        }
+                        let mut want: Vec<&str> = window_ctes
+                            .iter()
+                            .map(|c| c.name)
+                            .filter(|name| !LEAN_DROPPED_CTES.contains(name))
+                            .collect();
+                        want.push("claim_lean_fallback");
+                        let found: Vec<&str> = ctes.iter().map(|c| c.name).collect();
+                        assert_eq!(found, want, "{case}: the CTE list");
+                        let changed = ["seek_heads", "seek_candidate", "fresh_now", "claimed"];
+                        for cte in &window_ctes {
+                            if want.contains(&cte.name) && !changed.contains(&cte.name) {
+                                assert_eq!(
+                                    text(cte.name),
+                                    squash(cte.text),
+                                    "{case}: {}",
+                                    cte.name
+                                );
+                            }
+                        }
+
+                        let heads = text("seek_heads");
+                        let head_row = format!(
+                            "task_type AS seek_task_type, {LEAN_PLAIN} AS seek_plain \
+                             FROM harvest_task_queue"
+                        );
+                        assert_eq!(heads.matches(&head_row).count(), 2, "{case}: both heads");
+                        assert_eq!(
+                            heads
+                                .matches("h.seek_task_type, h.seek_plain, h.head_queue")
+                                .count(),
+                            1,
+                            "{case}: the outer list"
+                        );
+                        assert_eq!(
+                            heads
+                                .replace(&format!(", {LEAN_PLAIN} AS seek_plain"), "")
+                                .replace("h.seek_plain, ", ""),
+                            window_text("seek_heads"),
+                            "{case}: the heads change in the plain flag only"
+                        );
+
+                        let seek = text("seek_candidate");
+                        let window_seek = window_text("seek_candidate");
+                        let from = |scan: &str| {
+                            scan.split_once(" WHERE ")
+                                .map(|(from, _)| from.to_owned())
+                                .unwrap_or_default()
+                        };
+                        assert_eq!(
+                            from(&seek),
+                            from(&window_seek).replace("CROSS JOIN worker_info ", ""),
+                            "{case}: the row source"
+                        );
+                        let mut replaced = 0;
+                        let mut want_terms: Vec<String> = where_terms(&window_seek)
+                            .into_iter()
+                            .map(|term| {
+                                LEAN_GATE_TESTS
+                                    .iter()
+                                    .find(|(gate, _)| term.starts_with(gate))
+                                    .map_or(term, |(_, test)| {
+                                        replaced += 1;
+                                        (*test).to_owned()
+                                    })
+                            })
+                            .collect();
+                        assert_eq!(replaced, 4, "{case}: four gates become row tests");
+                        want_terms.push(
+                            "NOT EXISTS (SELECT 1 FROM seek_heads np WHERE NOT np.seek_plain)"
+                                .to_owned(),
+                        );
+                        assert_eq!(where_terms(&seek), want_terms, "{case}: the gates");
+                        let sort = |scan: &str| {
+                            scan.rsplit_once(" ORDER BY ")
+                                .map(|(_, sort)| sort.to_owned())
+                                .unwrap_or_default()
+                        };
+                        assert_eq!(sort(&seek), sort(&window_seek), "{case}: the sort");
+                        assert!(
+                            seek.ends_with("LIMIT 1 FOR UPDATE SKIP LOCKED )"),
+                            "{case}: the lock"
+                        );
+
+                        assert_eq!(
+                            seek.matches("CROSS JOIN fence ").count(),
+                            usize::from(fenced),
+                            "{case}: the candidate scan joins the fence"
+                        );
+                        assert_eq!(
+                            lean.matches("CROSS JOIN fence ").count(),
+                            usize::from(fenced),
+                            "{case}: no other scan joins the fence"
+                        );
+                        assert_eq!(names(lean, "fence"), fenced, "{case}: the fence CTE");
+                        if owned {
+                            let (holder, partitions) =
+                                if fenced { ("$9", "$10") } else { ("$7", "$8") };
+                            assert!(
+                                lean.starts_with("WITH owner_gate AS MATERIALIZED"),
+                                "{case}: the owner gate CTE"
+                            );
+                            assert_eq!(
+                                seek.matches(&format!(
+                                    "AND ( task_type <> 'workflow' OR ( (SELECT owner_on FROM \
+                                     owner_gate) AND ( decision_partition IS NULL OR \
+                                     get_bit({partitions}::bytea, decision_partition) = 1 ) ) )"
+                                ))
+                                .count(),
+                                1,
+                                "{case}: the owned gate"
+                            );
+                            assert_eq!(
+                                seek.matches(&format!(
+                                    "AND ( task_type <> 'workflow' OR decision_partition IS NULL \
+                                     OR EXISTS ( SELECT 1 FROM harvest_decision_owner o WHERE \
+                                     o.partition = harvest_task_queue.decision_partition AND \
+                                     o.holder = {holder}::text ) )"
+                                ))
+                                .count(),
+                                1,
+                                "{case}: the holder check"
+                            );
+                        } else {
+                            assert!(!names(lean, "owner_gate"), "{case}: no owner gate");
+                            assert!(!lean.contains("harvest_decision_owner"), "{case}");
+                        }
+                        if let Some(kind) = kind {
+                            let row =
+                                format!("AND harvest_task_queue.task_type = '{}' ", kind.as_str());
+                            let head = format!("AND k.head_kind = '{}' ", kind.as_str());
+                            let (lean, window) = (squash(lean), squash(window));
+                            assert_eq!(seek.matches(&row).count(), 1, "{case}: the kind test");
+                            assert_eq!(
+                                lean.matches(&row).count()
+                                    + window_text("seek_held").matches(&row).count(),
+                                window.matches(&row).count(),
+                                "{case}: each kept scan keeps its kind test"
+                            );
+                            assert_eq!(lean.matches(&head).count(), 1, "{case}: the kind heads");
+                            assert_eq!(window.matches(&head).count(), 1, "{case}");
+                        }
+
+                        assert_eq!(
+                            text("fresh_now"),
+                            "fresh_now AS MATERIALIZED ( SELECT clock_timestamp() AS ts \
+                             FROM (SELECT 1 AS one) base LEFT JOIN ( SELECT 1 AS x \
+                             FROM candidate c ) locked ON TRUE )",
+                            "{case}: the clock read follows the candidate lock"
+                        );
+                        let claimed = text("claimed");
+                        let window_claimed = window_text("claimed");
+                        let split = |update: &str| {
+                            update
+                                .split_once(" FROM candidate WHERE ")
+                                .map(|(set, tests)| (set.to_owned(), tests.to_owned()))
+                                .unwrap_or_default()
+                        };
+                        assert_eq!(split(&claimed).0, split(&window_claimed).0, "{case}");
+                        assert_eq!(
+                            split(&claimed).1,
+                            "harvest_task_queue.id = candidate.id \
+                             AND NOT (SELECT expired FROM run_expired_now) \
+                             RETURNING harvest_task_queue.* )",
+                            "{case}: the claim keeps the id match and the expiry test"
+                        );
+                        assert_eq!(text("claim_lean_fallback"), LEAN_FLAG_CTE, "{case}");
+                        assert_eq!(
+                            tail,
+                            window_tail.replace("claim_window_fallback", "claim_lean_fallback"),
+                            "{case}: the same result columns and the same flag column"
+                        );
+                        assert!(
+                            tail.ends_with(&format!(
+                                "fb.{WINDOW_FALLBACK_COLUMN} FROM claim_lean_fallback fb \
+                                 LEFT JOIN claimed ON TRUE"
+                            )),
+                            "{case}: the lean form returns its flag"
+                        );
+
+                        let mut want_binds = binds(window);
+                        want_binds.retain(|bind| ![3, 5].contains(bind));
+                        assert_eq!(
+                            binds(lean),
+                            want_binds,
+                            "{case}: the lean form reads no build bind and no breaker bind"
+                        );
+                        assert!(!lean.contains("--") && !lean.contains("/*"), "{case}");
+                        assert!(
+                            lean.len() * 3 < window.len() * 2,
+                            "{case}: {} of {}",
+                            lean.len(),
+                            window.len()
+                        );
+                    }
+                }
+            }
+        }
+
+        /// Each `WHERE` term of the window `seek_candidate`, by its start.
+        /// `true` marks a gate that the lean form replaces with a row test.
+        ///
+        /// A new gate of `claim_candidate_gates_sql!` fails this test. Then
+        /// decide: the lean form keeps the gate, or the plain test covers its
+        /// column. Add the gate here with that decision.
+        const WINDOW_CANDIDATE_TERMS: [(&str, bool); 16] = [
+            ("harvest_task_queue.state = (SELECT 'PENDING'::text)", false),
+            ("scheduled_at <= NOW()", false),
+            (
+                "NOT (harvest_task_queue.queue_name = ANY(paused_queues.names))",
+                false,
+            ),
+            (
+                "harvest_task_queue.ctid = ANY(ARRAY( SELECT w.seek_ctid",
+                false,
+            ),
+            ("( schedule_to_close_at IS NULL OR ", false),
+            ("( sticky_worker_id IS NULL OR ", false),
+            ("( session_id IS NULL OR ", false),
+            (
+                "( task_type != 'activity' OR activity_name IS NULL \
+                 OR required_capabilities IS NOT NULL OR NOT (activity_name = ANY($6)) )",
+                false,
+            ),
+            (
+                "( task_type != 'activity' OR activity_name IS NULL \
+                 OR NOT (activity_name = ANY(ARRAY( SELECT substr(marked, 2)",
+                false,
+            ),
+            (
+                "( task_type != 'activity' OR activity_name IS NULL \
+                 OR NOT (activity_name = ANY(paused_activities.names)) )",
+                false,
+            ),
+            ("( concurrency_key IS NULL OR ", true),
+            ("( required_build_id IS NULL OR ", true),
+            (
+                "( task_type <> 'workflow' OR workflow_exec_id IS NULL OR ",
+                false,
+            ),
+            (
+                "( workflow_exec_id IS NULL OR NOT EXISTS ( SELECT 1 FROM expired_runs",
+                false,
+            ),
+            ("( required_capabilities IS NULL OR ", true),
+            ("( rate_limit_key IS NULL OR ", true),
+        ];
+
+        #[test]
+        fn the_lean_form_decides_each_gate_of_the_window_candidate() {
+            let window = crate::queue::window_claim_query_for(None, false, false);
+            let (ctes, _) = split_ctes(window);
+            let terms = where_terms(&cte_text(&ctes, "seek_candidate"));
+            assert_eq!(
+                terms.len(),
+                WINDOW_CANDIDATE_TERMS.len(),
+                "seek_candidate has a new gate, or lost one. Decide whether the lean form \
+                 keeps it or the plain test covers it: {terms:#?}"
+            );
+            for (term, (start, _)) in terms.iter().zip(WINDOW_CANDIDATE_TERMS) {
+                assert!(term.starts_with(start), "{term} is not the gate {start}");
+            }
+            let dropped: Vec<&str> = WINDOW_CANDIDATE_TERMS
+                .iter()
+                .filter(|(_, dropped)| *dropped)
+                .map(|(start, _)| *start)
+                .collect();
+            let replaced: Vec<&str> = LEAN_GATE_TESTS.iter().map(|(gate, _)| *gate).collect();
+            assert_eq!(dropped, replaced);
+            // Each dropped gate passes a row whose column is NULL, and each
+            // plain column has its gate.
+            let columns: Vec<String> = dropped
+                .iter()
+                .map(|gate| gate.replace("( ", "").replace(" IS NULL OR ", ""))
+                .collect();
+            let plain: Vec<&str> = LEAN_GATES.iter().map(|gate| gate.column).collect();
+            assert_eq!(columns, plain);
+            assert_eq!(lean_plain_sql(), LEAN_PLAIN);
+        }
+
+        #[test]
+        #[should_panic(expected = "the lean claim needs the concurrency gate 1 time(s)")]
+        fn a_window_text_with_another_gate_text_panics() {
+            let window = crate::queue::window_claim_query_for(None, false, false);
+            let _ = lean_claim_sql(&window.replace(
+                "OR concurrency_cap IS NULL",
+                "OR concurrency_cap IS NOT DISTINCT FROM NULL",
+            ));
+        }
+
+        #[test]
+        #[should_panic(expected = "the lean claim keeps the fence join 1 time(s)")]
+        fn a_window_text_that_lost_its_fence_join_panics() {
+            let window = crate::queue::window_claim_query_for(None, true, false);
+            let _ = lean_claim_sql(&window.replace(
+                "CROSS JOIN worker_info CROSS JOIN fence ",
+                "CROSS JOIN worker_info ",
+            ));
+        }
+
+        #[test]
+        #[should_panic(expected = "the lean claim keeps the holder check 1 time(s)")]
+        fn a_window_text_that_lost_its_holder_check_panics() {
+            let window = crate::queue::window_claim_query_for(None, false, true);
+            let _ = lean_claim_sql(&window.replace(
+                "FROM harvest_decision_owner o ",
+                "FROM harvest_decision_owner own ",
+            ));
+        }
+
+        #[test]
+        #[should_panic(expected = "the lean claim keeps the owned gate 1 time(s)")]
+        fn a_window_text_that_lost_its_owned_gate_panics() {
+            let window = crate::queue::window_claim_query_for(None, false, true);
+            let _ = lean_claim_sql(&window.replace(
+                "(SELECT owner_on FROM owner_gate)",
+                "(SELECT owner_on FROM owner_gate LIMIT 1)",
+            ));
+        }
+
+        #[test]
+        fn a_new_claim_loop_sends_the_lean_form_first() {
+            let skip = LeanSkip::new();
+            assert_eq!(skip, LeanSkip::default());
+            assert!(lean_first(skip));
+        }
+
+        #[test]
+        fn a_lean_fallback_skips_the_lean_form_for_a_doubling_run() {
+            let mut skip = LeanSkip::new();
+            let mut spans = Vec::new();
+            for _ in 0..9 {
+                assert!(lean_first(skip));
+                skip = lean_skip_after(skip, Some(WindowStep::Fallback));
+                let mut skipped = 0_u32;
+                while !lean_first(skip) {
+                    skip = lean_skip_after(skip, None);
+                    skipped += 1;
+                }
+                spans.push(skipped);
+            }
+            assert_eq!(spans, [1, 2, 4, 8, 16, 32, 64, 64, 64]);
+            assert_eq!(spans.iter().max(), Some(&LEAN_SKIP_CAP));
+        }
+
+        #[test]
+        fn a_lean_claim_resets_the_skip_and_an_empty_poll_keeps_it() {
+            let mut skip = LeanSkip::new();
+            for _ in 0..3 {
+                skip = lean_skip_after(skip, Some(WindowStep::Fallback));
+                while !lean_first(skip) {
+                    skip = lean_skip_after(skip, None);
+                }
+            }
+            assert_eq!(lean_skip_after(skip, Some(WindowStep::Empty)), skip);
+            let next = lean_skip_after(skip, Some(WindowStep::Fallback));
+            assert_eq!(lean_skip_span(4), 8);
+            assert!(!lean_first(next));
+            let reset = lean_skip_after(skip, Some(WindowStep::Claimed));
+            assert_eq!(reset, LeanSkip::new());
+            let again = lean_skip_after(reset, Some(WindowStep::Fallback));
+            assert!(lean_first(lean_skip_after(again, None)));
+        }
+
+        #[test]
+        fn a_claim_with_no_lean_form_leaves_a_clear_skip_alone() {
+            let skip = LeanSkip::new();
+            assert_eq!(lean_skip_after(skip, None), skip);
+        }
+
+        #[test]
+        fn the_skip_span_never_passes_its_cap() {
+            assert_eq!(lean_skip_span(0), 1);
+            assert_eq!(lean_skip_span(LEAN_SKIP_CAP / 2 - 1), LEAN_SKIP_CAP - 2);
+            assert_eq!(lean_skip_span(LEAN_SKIP_CAP / 2), LEAN_SKIP_CAP);
+            assert_eq!(lean_skip_span(LEAN_SKIP_CAP), LEAN_SKIP_CAP);
+            assert_eq!(lean_skip_span(u32::MAX), LEAN_SKIP_CAP);
         }
 
         #[test]
@@ -1948,6 +2838,19 @@ macro_rules! claim_candidate_gates_sql {
         )
     };
 }
+
+/// The rate-limit gate of `claim_candidate_gates_sql!`, on one line.
+///
+/// The lean claim replaces this exact text with a NULL test. See
+/// `claim_window::lean_claim_sql`. The macro keeps its own copy, so a change
+/// there makes the lean derivation panic at first use.
+const CLAIM_RATE_LIMIT_GATE_SQL: &str = concat!(
+    "AND ( rate_limit_key IS NULL OR harvest_task_queue.activity_name = ANY($5) \
+     OR EXISTS ( SELECT 1 FROM harvest_rate_limit_buckets b \
+     WHERE b.key = harvest_task_queue.rate_limit_key AND ",
+    rate_limit_available_sql!(),
+    " >= 1.0 ) ) "
+);
 
 /// A candidate scan of the claim query: the full scan or the window scan.
 ///
@@ -4113,13 +5016,43 @@ pub fn window_claim_query_for(kind: Option<TaskType>, fenced: bool, owned: bool)
         }
         variants
     });
-    let slot = match kind {
+    &WINDOW[windowed_claim_slot(kind, fenced, owned)]
+}
+
+/// The place of one `(kind, fenced, owned)` choice in a list of the twelve
+/// windowed claim texts.
+fn windowed_claim_slot(kind: Option<TaskType>, fenced: bool, owned: bool) -> usize {
+    let kind = match kind {
         None => 0,
         Some(TaskType::Workflow) => 4,
         Some(TaskType::Activity) => 8,
-    } + 2 * usize::from(fenced)
-        + usize::from(owned);
-    &WINDOW[slot]
+    };
+    kind + 2 * usize::from(fenced) + usize::from(owned)
+}
+
+/// The lean form of the default claim; see `claim_window::lean_claim_sql`.
+///
+/// It is exact for a window of plain rows. In every other case it claims
+/// no row and sets `claim_fallback`, and the caller sends
+/// [`window_claim_query_for`] in the same transaction. It returns the columns
+/// of the window form and takes the same binds.
+#[must_use]
+pub fn lean_claim_query_for(kind: Option<TaskType>, fenced: bool, owned: bool) -> &'static str {
+    use std::sync::LazyLock;
+    static LEAN: LazyLock<Vec<String>> = LazyLock::new(|| {
+        let mut variants = Vec::with_capacity(12);
+        for kind in [None, Some(TaskType::Workflow), Some(TaskType::Activity)] {
+            for fenced in [false, true] {
+                for owned in [false, true] {
+                    variants.push(claim_window::lean_claim_sql(window_claim_query_for(
+                        kind, fenced, owned,
+                    )));
+                }
+            }
+        }
+        variants
+    });
+    &LEAN[windowed_claim_slot(kind, fenced, owned)]
 }
 
 /// The most rows that one batch claim may take.
@@ -4326,6 +5259,117 @@ impl diesel::deserialize::QueryableByName<diesel::pg::Pg> for WindowClaimRow {
         };
         Ok(Self { task, fallback })
     }
+}
+
+/// What one windowed claim form returned.
+///
+/// The lean form and the window form return the same columns, so one type
+/// holds the step of each.
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum ClaimFormStep {
+    /// The form claimed this row.
+    Claimed(Box<TaskQueueItem>),
+    /// The form claimed no row and left its flag clear.
+    Empty,
+    /// The form claimed no row and set its flag. The next form must run.
+    Fallback,
+}
+
+/// Sends one windowed claim form and decodes its one row.
+///
+/// `query` holds the lean text or the window text. Both return the task
+/// columns and the `claim_fallback` flag, so `WindowClaimRow` reads both.
+async fn claim_form_step(
+    conn: &mut AsyncPgConnection,
+    query: CachedClaimQuery<'_>,
+) -> HarvestResult<ClaimFormStep> {
+    let row: Option<WindowClaimRow> = query
+        .load::<WindowClaimRow>(conn)
+        .await
+        .map_err(crate::error::database_error)?
+        .into_iter()
+        .next();
+    let (task, fallback) = row.map_or((None, false), |r| (r.task, r.fallback));
+    Ok(
+        match (claim_window::window_step(task.is_some(), fallback), task) {
+            (claim_window::WindowStep::Fallback, _) => ClaimFormStep::Fallback,
+            (_, Some(task)) => ClaimFormStep::Claimed(Box::new(task)),
+            (_, None) => ClaimFormStep::Empty,
+        },
+    )
+}
+
+/// The windowed claim form that a test sends alone.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimFormProbe {
+    /// [`lean_claim_query_for`].
+    Lean,
+    /// [`window_claim_query_for`].
+    Window,
+}
+
+/// The variant and the binds of one windowed claim form, for a test.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct ClaimFormBinds<'a> {
+    /// `$1`, the worker id.
+    pub worker_id: &'a str,
+    /// `$2`, the polled queues.
+    pub queues: &'a [String],
+    /// `$3`, the build id of the worker.
+    pub worker_build_id: &'a str,
+    /// `$5`, the activities that a circuit breaker tracks.
+    pub circuit_breaker_activities: &'a [String],
+    /// `$6`, the ineligible activities.
+    pub ineligible_activities: &'a [String],
+    /// The task kind of the text.
+    pub kind: Option<TaskType>,
+    /// The shards and the generations of the DR fence. `Some` picks the
+    /// fenced text.
+    pub fence: Option<(&'a [i32], &'a [i64])>,
+    /// The holder and the partitions of an owned claim. `Some` picks the
+    /// owned text.
+    pub owned: Option<&'a OwnedClaim>,
+}
+
+/// Sends one windowed claim form alone, for a test.
+///
+/// The statement goes through `CachedClaimQuery`, as a claim sends it. The
+/// caller opens the transaction and sets the plan settings. Priority ageing
+/// is off, because an ageing claim sends neither form.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] when the statement fails.
+#[doc(hidden)]
+pub async fn claim_form_step_for_test(
+    conn: &mut AsyncPgConnection,
+    form: ClaimFormProbe,
+    binds: ClaimFormBinds<'_>,
+) -> HarvestResult<ClaimFormStep> {
+    let (fenced, owned) = (binds.fence.is_some(), binds.owned.is_some());
+    let sql = match form {
+        ClaimFormProbe::Lean => lean_claim_query_for(binds.kind, fenced, owned),
+        ClaimFormProbe::Window => window_claim_query_for(binds.kind, fenced, owned),
+    };
+    let query = CachedClaimQuery {
+        sql,
+        ageing: false,
+        worker_id: binds.worker_id,
+        queues: binds.queues,
+        worker_build_id: binds.worker_build_id,
+        aging_secs: None,
+        circuit_breaker_activities: binds.circuit_breaker_activities,
+        ineligible_activities: binds.ineligible_activities,
+        fence: binds
+            .fence
+            .map(|(shards, generations)| (shards.to_vec(), generations.to_vec())),
+        by_id: None,
+        owned: binds.owned.map(|o| (o.holder.as_str(), o.mask())),
+    };
+    claim_form_step(conn, query).await
 }
 
 pub use crate::decision_owner::OwnedClaim;

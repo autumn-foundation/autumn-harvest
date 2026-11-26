@@ -55,6 +55,13 @@ tables = ["harvest_rate_limit_buckets", "harvest_task_queue"]
 measured = "unmeasured"
 plan = "docs/ledger/plans/autumn-harvest/queue.md"
 
+["claim_form_step"]
+driver = "per_task"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_activity_pauses", "harvest_build_compat", "harvest_queue_pauses", "harvest_rate_limit_buckets", "harvest_task_queue", "harvest_workers", "harvest_workflow_executions"]
+measured = "unmeasured"
+
 ["claim_handler_started"]
 driver = "per_task"
 backend = ["postgres"]
