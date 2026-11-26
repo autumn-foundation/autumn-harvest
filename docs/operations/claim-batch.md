@@ -1,26 +1,40 @@
 # Batch claim
 
-A claim statement takes one task row by default. When almost every claim
-finds a row, the claim loop sets the throughput of a worker. A batch claim
-lets one statement take up to 2, 4 or 8 rows. It is off by default.
+When almost every claim finds a row, the claim loop sets the throughput of
+a worker. A batch claim lets one claim statement take 2, 4 or 8 task rows.
 
-## Turn it on
+The batch claim is on by default. A claim loop takes up to 4 rows in one
+statement (`builder::DEFAULT_CLAIM_BATCH_MAX`). A claim of one row is a
+single claim. A worker with the batch claim off sends single claims only.
+
+## Change the cap or turn it off
 
 ```rust
-use autumn_harvest::builder::WorkerConfig;
+use autumn_harvest::builder::{DEFAULT_CLAIM_BATCH_MAX, WorkerConfig};
 
-let config = WorkerConfig::default().with_claim_batch_max(8);
-assert_eq!(config.claim_batch_max.map(std::num::NonZeroU8::get), Some(8));
+let rows = |config: WorkerConfig| config.claim_batch_max.map(std::num::NonZeroU8::get);
+// The default: up to 4 rows.
+assert_eq!(rows(WorkerConfig::default()), Some(DEFAULT_CLAIM_BATCH_MAX));
+// Off: one row per claim.
+assert_eq!(rows(WorkerConfig::default().with_claim_batch_max(1)), None);
+// A higher cap: up to 8 rows.
+assert_eq!(rows(WorkerConfig::default().with_claim_batch_max(8)), Some(8));
 ```
 
 - `with_claim_batch_max(n)` sets the field `claim_batch_max`, an
   `Option<NonZeroU8>`. `0` and `1` set `None`, one row per claim.
-- A batch holds 2, 4 or 8 rows. A value above 8 claims at most 8 rows.
-- The knob belongs to each worker. Workers with and without it can share a
-  shard, and no migration is needed.
+- A batch holds 2, 4 or 8 rows. A value above 8 claims at most 8 rows. The
+  field keeps the value as given.
+- The code is the only switch. No environment variable, CLI flag or
+  config-file key sets the cap.
+- The knob belongs to each worker. Workers with different values can share
+  a shard, and no migration is needed.
 - `GET /admin/config` reports the value as `claim_batch_max`.
 - `WorkerRuntimeConfig` has the same field. A struct literal of
-  `WorkerConfig` or `WorkerRuntimeConfig` needs `claim_batch_max: None`.
+  `WorkerConfig` or `WorkerRuntimeConfig` names its own value.
+  `NonZeroU8::new(builder::DEFAULT_CLAIM_BATCH_MAX)` gives the default, and
+  `None` gives one row per claim.
+- The SQLite backend reads no claim knob. The value has no effect there.
 
 ## Batch size
 
@@ -30,19 +44,30 @@ rounded up. The batch is the smallest share over those kinds, capped at
 `claim_batch_max`. It then rounds down to 2, 4 or 8. A share under 2 sends
 the single claim.
 
-For example, a worker with 8 free workflow permits, 16 free activity
-permits and two claim loops gets a share of 4 rows. A loop with one free
-permit of one kind claims one row, however many permits of the other kind
-are free.
+A default worker has 20 workflow permits, 50 activity permits and two claim
+loops. Its idle claim loop has a share of 10 rows, so it asks for 4 rows,
+the default cap. With a cap of 8 it asks for 8.
+
+An idle default worker therefore sends the batch statement on each poll. It
+sends no [lean statement](claim-lean.md). A loop with one free permit of
+one kind claims one row, however many permits of the other kind are free.
 
 The loop holds one permit per row across the claim. So a slot tuner shrink
 cannot take the permit of a claimed row. The loop gives back the permits of
 the rows that it did not get.
 
+No task runs on a permit that a poll holds. So the slot gauges, the slot
+tuner and the `in_flight_count` of the worker row leave those permits out.
+See [Telemetry](../telemetry.md).
+
 ## Forms that keep one row per claim
 
-Only the default claim has a batch form. A worker claims one row per
-statement when any of these applies:
+The default claim is the claim with no priority ageing, no fairness keys
+and no owned gate. The name is older than the batch default. It names a
+statement family, not the claim of a default worker. Only the default claim
+has a batch form.
+
+A worker claims one row per statement when any of these applies:
 
 - queue weights (`with_queue_weights`);
 - fairness keys (`with_fairness_keys`). See
@@ -92,30 +117,155 @@ A batch claim takes one [claim slot](claim-slots.md) per statement, as a
 single claim does. A claim that gets no slot sends no statement.
 
 `formal/verus/src/claim_batch.rs` proves the batch size bounds and the key
-cut. See [`testing/formal-methods.md`](../testing/formal-methods.md). The
-tests `a_run_that_expires_during_the_claim_stops_only_its_own_row` and
-`an_expired_row_takes_no_key_lock_and_its_peers_still_claim` in
-`claim_batch_db_tests.rs` check the expired-row rule.
+cut. See [`testing/formal-methods.md`](../testing/formal-methods.md).
+`claim_batch_db_tests.rs` holds the database tests:
+
+- `a_run_that_expires_during_the_claim_stops_only_its_own_row` and
+  `an_expired_row_takes_no_key_lock_and_its_peers_still_claim` check the
+  expired-row rule.
+- `each_batch_text_keeps_a_bounded_plan_on_a_deep_backlog_of_one_queue`
+  pins the plan of each batch text, with fresh and with idle statistics.
+- `random_states_give_a_batch_the_rows_of_a_run_of_single_claims` compares
+  a batch with a run of single claims over random queue states. A batch
+  takes a prefix of the rows that the single claims take. With no keyed row
+  in the state, it takes each of them. It holds one keyed row at most, in
+  first place.
+- `a_default_worker_claims_a_backlog_in_batches_and_one_row_turns_it_off`
+  proves the default and the switch.
+
+## Measurements
+
+Each figure is a reference measurement from one 4-core box, not an SLO. See
+[`performance-claim-batch.md`](../performance-claim-batch.md).
+
+**Against the lean single claim.** These rounds ran on the `throughput`
+cell of the bench: six rotated rounds of one binary for each load level.
+The table compares a cap of 4 with the lean single claim, which is a worker
+with `with_claim_batch_max(1)`.
+
+| workflows in flight | throughput, cap of 4 over the lean single claim | rounds faster |
+|--:|--:|--:|
+| 4 | 1.09x | 4 of 6 |
+| 32 | 1.07x | 6 of 6 |
+| 64 | 1.07x | 6 of 6 |
+
+Caps of 2 and 8 measure the same as 4, within noise. The bench worker has 8
+workflow permits, 16 activity permits and two claim loops. No share passes
+4 there, so 4 is the largest batch that the bench formed. That is why the
+default is 4.
+
+**Against the window-first claim.** An older run compared a cap of 8 with
+one row per claim, before the lean statement existed. The median rose from
+100.0 to 118.7 workflows/s over six alternating pairs, and every pair was
+faster. Claim statements fell 37%, and their execution time fell 29%. One
+statement for eight rows costs about 1.19 times one statement for one row.
+Its single claim sent the window statement first, so the gain over the lean
+single claim is smaller.
+
+**A queue of keyed rows.** On a queue where every row has a concurrency
+key, one batch statement costs 1.16 ms against 1.13 ms for the window
+statement, as `pgbench` transaction latency. The key cut keeps one row of
+such a batch.
+
+**A backlog on a default worker.** In one run of the default worker test, a
+backlog of 120 tasks took 44 claim statements that took a row. With one row
+per claim it took 120.
 
 ## Choose a value
 
-On the `throughput` cell of the bench, `8` raised the median from 100.0 to
-118.7 workflows/s over six alternating pairs. Every pair was faster. Claim
-statements fell 37%, and their execution time fell 29%. One statement for
-eight rows costs about 1.19 times one statement for one row. See
-[`performance-claim-batch.md`](../performance-claim-batch.md).
+Keep the default unless one of these applies:
 
-Use the batch when most claims find a row and the claim loop is the limit.
-It gains little when the queue is often empty, or when a worker has few
-free permits per loop.
+- **You compare the two, or you rule the batch out of a problem.** Set
+  `with_claim_batch_max(1)`. Each claim then takes one row.
+- **A small backlog must spread over the fleet.** One worker can take a
+  burst that single claims spread over the claim loops of the fleet. See
+  the first known limit. A lower cap, or one row per claim, narrows it.
+- **Each row of a queue has a concurrency key or a rate-limit key.** The
+  key cut keeps one row per statement, so the batch gains nothing there.
+  The measured cost of the statement is about the same. Set
+  `with_claim_batch_max(1)` when the row locks of the rows that the cut
+  drops matter.
+- **Many workers claim one deep head of one kind.** See the limit on window
+  rows below. A lower cap locks fewer rows per claim.
+- **Memory per connection is tight.** A lower cap caches fewer batch plans.
+  See [Memory](#memory).
+- **Each claim loop often has 8 or more free permits of each kind, and the
+  claim loop is the limit.** `with_claim_batch_max(8)` then takes up to 8
+  rows. The bench could not form such a batch, so measure it on your
+  workload.
 
-Known limits:
+The batch gains most when most claims find a row and the claim loop is the
+limit. It gains little when the queue is often empty, or when a worker has
+few free permits per loop.
 
+## Known limits
+
+- **One worker can take a burst.** A share reads the free permits of its
+  own worker only. Nothing bounds it by the size of the fleet. The two
+  loops of an idle default worker can take 8 rows of a burst in two
+  statements. With one row per claim, each of those rows is its own race
+  between the claim loops of the fleet. In the worst case one default
+  worker fills its 20 workflow slots and 50 activity slots, 70 rows, while
+  its peers idle. That takes 18 statements at the least. [Sticky
+  routing](../sticky-routing.md) then keeps the next workflow tasks of
+  those runs on that worker for the sticky window, 5 s by default.
+- **A rate-limit key in first place holds the other rows.** A batch whose
+  first row has a rate-limit key can wait on the bucket lock. During the
+  wait it holds the row locks of the other rows of the batch, up to 3 at
+  the default cap. A peer claim skips those rows. Their `started_at` is the
+  start of the claim transaction, so their start-to-close and heartbeat
+  clocks run during the wait. The claim transactions of the peers on the
+  same bucket bound the wait.
+- **A crash right after a claim gives a strike to each row of the batch.**
+  The reclaim gives one crash strike to each `RUNNING` row of a dead
+  worker, started or not. That is not new, and it covers every running row
+  of the worker. Take a row that kills the process when its handler
+  starts. The batch adds the rows after it in the same statement: up to 3
+  at the default cap. The default `poison_pill_threshold` is 3 strikes.
+- **More window rows are locked per claim in flight.** `seek_candidate`
+  locks up to 4 rows of the 32-row seek window at the default cap. A single
+  claim locks 1. So fewer claims in flight can hold a whole head of one
+  kind: 8 at a cap of 4, and 4 at a cap of 8. The next claim then falls
+  back to the full statement and takes one row at most. On a deep head of
+  one kind with several workers, more claims can fall back. On the bench,
+  with one worker and the knob at 8, full statements rose from 4 to 19 per
+  run. No fleet run has measured this.
+- **A claim that finds one row costs more than the lean single claim.** A
+  batch statement of 4 costs about 1.09 times a window statement: 1.104 ms
+  against 1.014 ms. A lean statement costs about 0.69 of one: 0.55 ms
+  against 0.80 ms on the harness of
+  [its own page](../performance-claim-lean-tier.md). The two pairs come
+  from different harnesses, so a ratio across them is an estimate. The
+  bench cell at 4 workflows in flight did not show a loss.
+- **Each connection caches more plans.** See [Memory](#memory).
 - Rows of equal claim key rank by id inside a batch. A single claim takes
   any of them.
 - `seek_candidate` locks rows that the cut then drops. A peer claim skips
   such a row for one statement.
 - The batch does not split by kind.
+
+## Memory
+
+Each pooled connection caches one plan for each batch text that it runs.
+The batch has one text for each claim kind and each batch size. So one
+connection can cache this many batch plans:
+
+| `claim_batch_max` | batch sizes | batch plans per connection |
+|--:|:--|--:|
+| 2 or 3 | 2 | 3 |
+| 4 to 7 | 2 and 4 | 6 |
+| 8 or more | 2, 4 and 8 | 9 |
+
+A claim with a DR fence runs the fenced texts, a second set of the same
+size. These plans are in addition to the lean, window and full plans of a
+claim of one row. A worker still sends that claim when a share is under 2.
+
+The size of a batch plan is not measured. A batch text derives from the
+window text, so its plan is at least as large as a window plan.
+[Lean claim](claim-lean.md#memory) puts a window plan at about 1.4 MB to
+2.0 MB on PostgreSQL 16. By that estimate, a default worker adds 8 MB to
+12 MB per connection in the worst case. `with_claim_batch_max(1)` keeps a
+connection from building them.
 
 ## See also
 

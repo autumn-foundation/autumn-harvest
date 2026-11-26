@@ -828,7 +828,7 @@ kani_proofs` beside the code that it proves.
 | `supersede_plan_sheds_only_candidates_and_meets_the_limit` | `concurrency.rs` | A latest-wins plan sheds at most the candidates and the scan limit. A full shed meets the limit. |
 | `apply_action_stays_in_band_and_reports_the_move` | `slot_tuner.rs` | A tuner step lands in the band, even a degenerate band, and its decision names the real move. |
 | `initial_target_lands_in_the_band` | `slot_tuner.rs` | The initial target is in the band, and a target in the band keeps its value. |
-| `slot_occupancy_partitions_the_target` | `slot_tuner.rs` | `in_use + available == target` for every semaphore reading. |
+| `slot_occupancy_partitions_the_target` | `slot_tuner.rs` | `in_use + available == target` for every semaphore reading and every count of permits that polls hold. |
 | `counter_growth_is_one_byte_at_a_power_of_ten` | `entity.rs` | A counter grows by 1 byte exactly when `n + 1` gains a digit, else by 0. |
 
 ### Scope of each proof

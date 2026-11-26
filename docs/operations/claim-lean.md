@@ -1,10 +1,17 @@
 # Lean claim
 
-The default claim sends a window statement, and the full statement only
+A claim of one row sends a window statement, and the full statement only
 when the window statement asks for it. See
 [`performance-claim-window-split.md`](../performance-claim-window-split.md)
 (issue #2680). The lean claim puts a third, smaller statement in front of
 both. It is on by default.
+
+A [batch claim](claim-batch.md) is also on by default, and it sends no lean
+statement. So a claim loop sends the lean statement only for a claim of one
+row. A claim takes one row when its share of the free permits is under 2.
+It also takes one row with a feature that
+[keeps one row per claim](claim-batch.md#forms-that-keep-one-row-per-claim).
+An idle default worker polls with the batch statement.
 
 Postgres starts every plan node of a statement on each run. Many nodes of
 the window statement serve features that a row may not use: concurrency
@@ -130,7 +137,7 @@ of that claim.
 
 - a claim with priority ageing (`with_priority_aging_secs` above zero);
 - a claim with fairness keys (`with_fairness_keys`);
-- a [batch claim](claim-batch.md);
+- a [batch claim](claim-batch.md), which is on by default;
 - a dispatch-channel claim of one named row, and an owner decider take;
 - a caller of `queue::claim_task` and of the other claim functions that
   take no loop state. Only `queue::claim_task_with_lean` takes one.
@@ -144,8 +151,8 @@ let config = WorkerConfig::default().with_claim_lean(false);
 assert!(!config.claim_lean);
 ```
 
-- `with_claim_lean(false)` makes each claim send the window statement
-  first, as before this change.
+- `with_claim_lean(false)` makes each claim of one row send the window
+  statement first, as before this change.
 - The switch belongs to each worker. Workers with and without it can share
   a shard, and no migration is needed.
 - `GET /admin/config` reports the value as `claim_lean`.
@@ -158,13 +165,19 @@ gains nothing from the lean statement, so turn it off there too. The `e2e_bench`
 `HARVEST_BENCH_CLAIM_LEAN`: `0` or `off` runs the same binary with the lean
 statement off.
 
+For that comparison, also set `with_claim_batch_max(1)`. A batch claim
+sends no lean statement with either value, so a worker that batches shows a
+smaller difference. The `e2e_bench` binary keeps one row per claim unless
+`HARVEST_BENCH_CLAIM_BATCH` is set.
+
 ## Memory
 
 Each pooled connection keeps one more cached plan for each lean variant
 that it runs. A lean plan is about half the size of the window plan of its
 variant: 0.7 MB to 1.0 MB on PostgreSQL 16. A claim loop can run three
 variants, one for each claim kind. `with_claim_lean(false)` keeps a
-connection from building them.
+connection from building them. The plans of a batch claim are separate. See
+[Batch claim](claim-batch.md#memory).
 
 ## Known limits
 
@@ -179,7 +192,7 @@ a deep backlog only.
 
 - [`performance-claim-lean-tier.md`](../performance-claim-lean-tier.md)
   measures the lean statement alone, in the e2e bench and in a loop of
-  mixed claim kinds.
+  mixed claim kinds. Each of them runs with one row per claim.
 - `docs/perf-artifacts/claim-window-split/claim_forms.sql` counts the claim
   statements of a run by form: lean, window and full.
 
@@ -189,7 +202,9 @@ a deep backlog only.
 - `lean_claim_db_tests.rs` compares both orders over random queue states,
   for each of the twelve statement variants. It also commits a peer claim
   between the snapshot and the row lock of a lean statement, and it counts
-  the statements that a claim loop sends. It counts the lean claims that
+  the statements that a claim loop sends. Its worker test sets one row per
+  claim for the lean legs. A third leg proves that an idle default worker
+  sends batch statements only. It counts the lean claims that
   each pause gate decided. On a deep backlog of one queue, it pins the plan
   of each variant: a `Tid Scan` for the candidate and a bounded index scan
   for each queue head.
@@ -197,6 +212,6 @@ a deep backlog only.
 ## See also
 
 - [`claim-batch.md`](claim-batch.md): one claim statement takes up to 2, 4
-  or 8 rows.
+  or 8 rows. It is on by default.
 - [`claim-slots.md`](claim-slots.md): a fleet-wide cap on the claims that
   run at once on one shard.

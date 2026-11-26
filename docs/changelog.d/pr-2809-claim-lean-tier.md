@@ -1,7 +1,8 @@
 ## Lean claim tier (follows issue #2680)
 
-A worker claim loop now sends a lean claim statement in front of the window
-statement of issue #2680. The lean statement drops the plan nodes of
+A worker claim of one row now sends a lean claim statement in front of the
+window statement of issue #2680. A batch claim sends none. See the second
+entry of this file. The lean statement drops the plan nodes of
 concurrency keys, rate limits, build pins and capability requirements. It
 is exact for a seek window whose rows use none of those. When its window
 holds a row and it locks none, it claims no row and changes no row, and it
@@ -65,4 +66,99 @@ text on a deep backlog of one queue, with fresh and with idle statistics.
 
 Measured: `docs/performance-claim-lean-tier.md`. One lean claim alone costs
 0.55 ms against 0.80 ms for the window form. On the e2e `throughput` cell,
-the lean form is faster in six of six rounds, by a median of 1.17 times.
+with one row per claim, the lean form is faster in six of six rounds, by a
+median of 1.17 times.
+
+## Batch claim on by default (follows issue #2693)
+
+The batch claim of issue #2693 is now on by default.
+`WorkerConfig::default()` sets `claim_batch_max` to the new public const
+`builder::DEFAULT_CLAIM_BATCH_MAX`, 4 rows. `worker` re-exports the const.
+A claim loop takes up to its share of the free slots in one statement, 2 or
+4 rows. A batch claim sends no lean statement. So the lean statement of the
+entry above serves the claims of one row.
+
+- **The cap and why.** 4 is the largest batch that the end-to-end bench
+  formed. Its worker has 8 workflow permits, 16 activity permits and 2
+  claim loops, so a share never passes 4. The worker has no backlog gate
+  and no slow start.
+- **Switch.** `with_claim_batch_max(1)` keeps one row per claim, and so
+  does `0`. `with_claim_batch_max(8)` raises the cap. A value above 8 still
+  claims 8 rows at most, and the field keeps the value as given. No
+  environment variable or config key sets the cap. A struct literal of
+  `WorkerConfig` or `WorkerRuntimeConfig` names its own value:
+  `NonZeroU8::new(builder::DEFAULT_CLAIM_BATCH_MAX)` gives the default.
+- **Unchanged.** Queue weights, fairness keys, priority ageing, an owned
+  workflow claim, an adaptive limit, a cost hold and a dispatch channel
+  keep one row per claim. The SQLite backend reads no claim knob. The
+  change adds no migration and no `WorkflowEvent` variant.
+- **Slot counts.** A Postgres poll holds one permit for each row that it
+  may claim, and no task runs on those permits. The slot gauges, the slot
+  tuner and the fleet heartbeat read raw `available_permits`, so they
+  counted those permits as slots in use. `slot_tuner::PollHeldPermits` now
+  counts them, and `slot_tuner::slots_in_use` takes them off each reading.
+  `harvest.worker.slots_in_use`, `SlotObservations::in_use` and
+  `harvest_workers.in_flight_count` then count the slots that a task holds.
+  An idle worker reads 0. `slots_in_use + slots_available` still equals the
+  target. A reading keeps the larger of two reads of the count around the
+  semaphore read. So a moving poll can hide a task for one sample, and it
+  never reads as a task. Admission does not change: the semaphores decide
+  what a poll may claim.
+- **Public API.** `workers::compute_in_flight` takes a fifth argument,
+  `&PollHeldPermits`. `workers::spawn_worker_heartbeat` takes a last
+  argument, a `PollHeldPermits`. `slot_tuner::TunedSlot` gains the public
+  field `poll_held`. `PollHeldPermits::default()` counts none, for a caller
+  that does not poll.
+- **Telemetry.** Nothing new is recorded. A batch statement records one
+  `harvest.db.query.duration{op="claim"}` sample for all its rows. Its
+  `kind` is `workflow` when any row is a workflow task. So the sample count
+  is a statement count, and `harvest.queue.dispatched` counts the rows.
+- **Bench variable.** `e2e_bench` and the capacity bench keep one row per
+  claim when `HARVEST_BENCH_CLAIM_BATCH` is unset, as for `0`, `1` and
+  `off`. The published baselines were taken that way, and the reproduction
+  check is two-sided. A number above 1 sets that cap. The word `default`
+  takes the worker default. The report header prints the claim loops and
+  the rows per claim statement. `docs/benchmarks.md` lists the variable and
+  the row `rows per claim statement` of the published configuration.
+- **Known limits.** One worker can take a burst that single claims spread
+  over the fleet: 8 rows in two statements on a default worker. A batch
+  whose first row has a rate-limit key holds the row locks of its other
+  rows while it waits on the bucket lock. A crash right after a claim gives
+  one crash strike to each row of the batch. A claim in flight locks up to
+  4 rows of the seek window. Each pooled connection can cache 6 more claim
+  plans. `docs/operations/claim-batch.md` states each limit.
+- **Supersedes.** `CHANGELOG.md` `[0.11.0]` says of claim slots and the
+  batch claim: "Both are off by default." `docs/shipped-work.md` heads the
+  entry of issue #2693 "Batch claim, off by default", and it says to add
+  `claim_batch_max: None` to a struct literal. The batch claim is now on by
+  default. The collation corrects those lines.
+
+Evidence: `claim_batch_db_tests.rs` gains three tests.
+`each_batch_text_keeps_a_bounded_plan_on_a_deep_backlog_of_one_queue` pins
+the plan of each batch text on a deep backlog, with fresh and with idle
+statistics. `random_states_give_a_batch_the_rows_of_a_run_of_single_claims`
+compares a batch with a run of single claims over random queue states. A
+batch takes a prefix of those rows: each row when the state has no keyed
+row, and one keyed row at most, in first place.
+`a_default_worker_claims_a_backlog_in_batches_and_one_row_turns_it_off`
+runs a worker from `WorkerConfig::default()` on a backlog. In
+`lean_claim_db_tests.rs`,
+`a_worker_claim_loop_sends_the_lean_form_unless_the_switch_is_off` gains a
+leg: an idle default worker sends batch statements only. Unit tests cover
+the default (`claim_batch_max_is_on_by_default_and_one_row_is_off`,
+`a_worker_from_the_default_config_claims_in_batches`), the kind of a batch
+sample and the slot counts.
+`an_idle_tuned_worker_with_batch_claims_shows_no_slot_in_use` runs a tuned
+worker with batch claims. Some tests count or time single claims, and they
+pin one row per claim. They are the claim slot suite, the claim concurrency
+suite, two legs of the lean worker test and the owner decider claim count.
+The conformance worker takes the default.
+
+Measured: `docs/performance-claim-batch.md`, section "On by default". The
+rounds ran on the e2e `throughput` cell: six rotated rounds of one binary
+for each load level. A cap of 4 gives 1.09 times the throughput of the lean
+single claim at 4 workflows in flight. It gives 1.07 times at 32 and at 64.
+It is faster in 4 of 6, 6 of 6 and 6 of 6 rounds. Caps of 2 and 8 measure
+the same within noise. Take a queue where every row has a concurrency key.
+One batch statement costs 1.16 ms there, against 1.13 ms for the window
+statement.

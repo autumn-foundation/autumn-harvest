@@ -403,6 +403,8 @@ deferred concurrency work grows while downstream owners report elevated errors.
 utilisation (`slots_in_use / (slots_in_use + slots_available)`) for either
 `slot_type` (`workflow` or `activity`) stays above 90 % for 5 minutes. This
 means the worker itself is the bottleneck — not the queue or the database.
+The gauge counts the slots that a task holds. A permit that a poll holds
+across its claim is not in use.
 
 ### Triage steps
 

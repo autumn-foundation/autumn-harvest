@@ -23,7 +23,8 @@ initializes, and it puts a smaller statement in front of it.
 * **Alone, a lean claim costs 0.55 ms against 0.80 ms.** That is the
   median of twelve alternating `pgbench` rounds of each form, with
   executor startup. The lean form is faster in twelve of twelve.
-* **The `throughput` cell moves from 75.4 to 88.0 workflows/s.** That is
+* **The `throughput` cell moves from 75.4 to 88.0 workflows/s, with one
+  row per claim.** That is
   the median of six rounds of one binary with the lean form off and on.
   The lean form is faster in six of six, by 1.13 to 1.22 times (median
   1.17). The median start-to-completion time falls from 390 ms to 328 ms.
@@ -49,6 +50,11 @@ The workload is the `throughput` cell of `e2e_bench` at one shard, as in
 the [issue #2651 audit](performance-hot-path-statement-cache.md#the-method).
 It runs one in-process worker with 8 workflow slots, 16 activity slots and
 2 claim loops. 32 workflows are in flight.
+
+Each arm claims one row per statement. The bench keeps one row per claim
+when `HARVEST_BENCH_CLAIM_BATCH` is unset. A default worker claims in
+batches, and a [batch claim](performance-claim-batch.md) sends no lean
+form. So each figure of this page is for a claim of one row.
 
 Host: 4 logical CPUs, 15 GB. PostgreSQL 16.15 on the same host, with
 `fsync = off`, `synchronous_commit = off` and `max_connections = 200`, as in
@@ -348,10 +354,10 @@ probes, not a measurement of the cell.
 window that peer claims hold both set it. An exact flag needs the parts
 that the lean form drops. The skip bounds the cost.
 
-**2. The batch claim stays off by default.** One batch claim takes up to
-8 rows in one statement. [Its page](performance-claim-batch.md) measures
-the gain and records why the knob is off by default. A change of that
-default is a product decision, not a tuning step.
+**2. A batch claim sends no lean form.** The batch claim is on by default.
+So a claim loop sends the lean form only for a claim of one row. A lean
+batch text is not built. [Its page](performance-claim-batch.md) measures
+the batch claim against the lean single claim.
 
 **3. A continued workflow task still goes through the queue.** An activity
 completion wakes the workflow task, and a claim loop then claims it. A

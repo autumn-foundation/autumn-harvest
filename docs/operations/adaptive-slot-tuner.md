@@ -71,7 +71,10 @@ signals harvest already owns in-process** — no new external dependency, no
 `execution.id` sampling:
 
 1. **Slot utilization** (issue #531) — is every currently-targeted dispatch
-   slot occupied?
+   slot occupied? A slot is occupied when a task holds it. A poll holds
+   permits across its claim, one for each row of a
+   [batch claim](claim-batch.md). The tuner leaves those permits out, so a
+   claim on a pool with free slots does not read as saturated.
 2. **Worker DB-pool pressure** (`pool.rs` / the worker's `deadpool` pool
    `status()`) — is the pool at capacity, or does it have callers waiting for
    a connection?

@@ -108,10 +108,11 @@ Start with [Chapter 1 →](01-project-skeleton.md)
   changes the retry policy, the timeouts and the cap of an activity type at
   runtime.
 - **Batch claim.** [`claim-batch.md`](../operations/claim-batch.md) lets
-  one claim statement take up to 2, 4 or 8 task rows. It is off by default.
+  one claim statement take up to 2, 4 or 8 task rows. It is on by default.
+  `with_claim_batch_max(1)` turns it off.
 - **Lean claim.** [`claim-lean.md`](../operations/claim-lean.md) puts a
-  smaller claim statement in front of the default claim. It is on by
-  default.
+  smaller claim statement in front of a claim of one row. It is on by
+  default. A batch claim sends no lean statement.
 - **Pre-deploy analyses.**
   [`dag-and-retry-analyses.md`](../dag-and-retry-analyses.md) checks DAG
   slack, retry envelopes, retry storms, throttle waits, run shapes and

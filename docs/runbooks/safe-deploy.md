@@ -29,7 +29,8 @@ harvest worker list --queue email-workers --shard-id 0
 
 Key fields in the response:
 - `worker_id` — the string passed to `--drain` below.
-- `in_flight_count` — tasks currently executing on this worker.
+- `in_flight_count` — tasks currently executing on this worker. A permit
+  that a poll holds across its claim is not counted.
 - `status` — `Active`, `Draining`, or `Stopped`.
 - `health` — `healthy` (heartbeat recent) or `stale` (heartbeat expired).
 
