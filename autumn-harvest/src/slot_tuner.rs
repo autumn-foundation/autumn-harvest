@@ -423,11 +423,13 @@ impl PollHeldPermits {
     }
 
     /// Count `permits` more held permits of `slot_type`.
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
     pub(crate) fn add(&self, slot_type: SlotType, permits: usize) {
         self.cell(slot_type).fetch_add(permits, Ordering::Relaxed);
     }
 
     /// Count `permits` fewer held permits of `slot_type`.
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
     pub(crate) fn sub(&self, slot_type: SlotType, permits: usize) {
         self.cell(slot_type).fetch_sub(permits, Ordering::Relaxed);
     }
