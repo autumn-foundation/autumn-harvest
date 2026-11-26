@@ -3245,6 +3245,9 @@ pub fn spawn_worker_heartbeat(
     held_gate: Option<crate::types::ShardId>,
     // Issue #1815: publishes task stats and sets the outlier gauge each tick.
     outliers: OutlierProbe,
+    // The permits that polls hold across their claims. The tick does not
+    // count them as tasks in flight. The default counts none.
+    poll_held: crate::slot_tuner::PollHeldPermits,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         // Retires the verdict on every exit, an abort included.
@@ -3274,6 +3277,7 @@ pub fn spawn_worker_heartbeat(
                 AtomicUsize::load(&wf_max, Ordering::Relaxed),
                 &act_semaphore,
                 AtomicUsize::load(&act_max, Ordering::Relaxed),
+                &poll_held,
             );
             let in_use_sessions = crate::sessions::session_slot_count(&session_slots_in_use);
             // Selected against `cancel` (issue #1209). A pool may have no
@@ -3417,15 +3421,25 @@ async fn sync_drain_deadline(
 }
 
 /// Compute the number of tasks currently in flight from semaphore permits.
+///
+/// A poll holds permits across its claim, and no task runs on them.
+/// `poll_held` counts those permits, and they are not in flight. See
+/// [`crate::slot_tuner::slots_in_use`].
 #[must_use]
 pub fn compute_in_flight(
     wf_semaphore: &Semaphore,
     wf_max: usize,
     act_semaphore: &Semaphore,
     act_max: usize,
+    poll_held: &crate::slot_tuner::PollHeldPermits,
 ) -> i32 {
-    let wf_in_flight = wf_max.saturating_sub(wf_semaphore.available_permits());
-    let act_in_flight = act_max.saturating_sub(act_semaphore.available_permits());
+    use crate::telemetry::SlotType;
+    let (wf_available, wf_held) =
+        poll_held.reading(SlotType::Workflow, || wf_semaphore.available_permits());
+    let (act_available, act_held) =
+        poll_held.reading(SlotType::Activity, || act_semaphore.available_permits());
+    let wf_in_flight = crate::slot_tuner::slots_in_use(wf_max, wf_available, wf_held);
+    let act_in_flight = crate::slot_tuner::slots_in_use(act_max, act_available, act_held);
     i32::try_from(wf_in_flight + act_in_flight).unwrap_or(i32::MAX)
 }
 
@@ -5776,7 +5790,8 @@ mod tests {
     fn compute_in_flight_zero_when_idle() {
         let wf_sem = Semaphore::new(10);
         let act_sem = Semaphore::new(20);
-        assert_eq!(compute_in_flight(&wf_sem, 10, &act_sem, 20), 0);
+        let no_poll = crate::slot_tuner::PollHeldPermits::default();
+        assert_eq!(compute_in_flight(&wf_sem, 10, &act_sem, 20, &no_poll), 0);
     }
 
     #[test]
@@ -5788,7 +5803,27 @@ mod tests {
         let _wf_permits = wf_sem.try_acquire_many(3).unwrap();
         let _act_permits = act_sem.try_acquire_many(5).unwrap();
 
-        assert_eq!(compute_in_flight(&wf_sem, 10, &act_sem, 20), 8);
+        let no_poll = crate::slot_tuner::PollHeldPermits::default();
+        assert_eq!(compute_in_flight(&wf_sem, 10, &act_sem, 20, &no_poll), 8);
+    }
+
+    /// A poll holds permits across its claim. No task runs on them, so the
+    /// fleet row does not count them as tasks in flight.
+    #[test]
+    fn compute_in_flight_leaves_out_the_permits_that_polls_hold() {
+        use crate::telemetry::SlotType;
+        let wf_sem = Arc::new(Semaphore::new(10));
+        let act_sem = Arc::new(Semaphore::new(20));
+        let poll_held = crate::slot_tuner::PollHeldPermits::default();
+
+        // Three workflow tasks and five activities run. A batch poll holds
+        // four more permits of each kind.
+        let _wf_permits = wf_sem.try_acquire_many(3 + 4).unwrap();
+        let _act_permits = act_sem.try_acquire_many(5 + 4).unwrap();
+        poll_held.add(SlotType::Workflow, 4);
+        poll_held.add(SlotType::Activity, 4);
+
+        assert_eq!(compute_in_flight(&wf_sem, 10, &act_sem, 20, &poll_held), 8);
     }
 
     /// Run one heartbeat tick per entry of `latencies`, with the loop shape of

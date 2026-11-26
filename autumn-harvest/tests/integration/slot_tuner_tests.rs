@@ -68,14 +68,20 @@ fn build_pool(database_url: &str) -> DbPool {
 // Metrics capture
 // -------------------------------------------------------------------------
 
-/// Records every `record_worker_slot_target` sample, keyed by slot type.
+/// Records every `record_worker_slot_target` sample, keyed by slot type,
+/// and the `in_use` value of every `record_worker_slots` sample.
 #[derive(Debug, Default)]
 struct RecordingMetrics {
     workflow_targets: Mutex<Vec<u64>>,
     activity_targets: Mutex<Vec<u64>>,
+    slots_in_use: Mutex<Vec<u64>>,
 }
 
 impl MetricsRecorder for RecordingMetrics {
+    fn record_worker_slots(&self, _slot_type: SlotType, in_use: u64, _available: u64) {
+        self.slots_in_use.lock().unwrap().push(in_use);
+    }
+
     fn record_worker_slot_target(&self, slot_type: SlotType, target: u64) {
         match slot_type {
             SlotType::Workflow => self.workflow_targets.lock().unwrap().push(target),
@@ -391,6 +397,75 @@ async fn tuner_grows_under_load_and_drains_cleanly() {
     // Graceful shutdown: drain must still succeed cleanly with a tuner
     // installed (a shrink never cancels in-flight work, so nothing here
     // should be left half-finished).
+    worker.shutdown();
+    worker_task
+        .await
+        .expect("worker task must shut down cleanly");
+}
+
+/// An idle tuned worker with batch claims shows no slot in use, and the
+/// tuner never grows a pool.
+///
+/// Each poll of a batch claim holds permits of both kinds across its claim.
+/// No task runs on them. The slot gauges and the tuner must not read them
+/// as slots in use. The poll interval is short, so the sampler reads the
+/// pools many times while a poll holds its permits. The worker then runs
+/// one workflow, so the batch claim and the tuner work together.
+///
+/// The tuner can shrink a pool here. Its polls and samplers use the
+/// database pool at this interval, and pool pressure is a shrink signal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_idle_tuned_worker_with_batch_claims_shows_no_slot_in_use() {
+    let (db_url, _container) = setup_test_db().await;
+
+    let recording = Arc::new(RecordingMetrics::default());
+    let telemetry = Arc::new(
+        TelemetryConfig::builder()
+            .metrics(Arc::clone(&recording) as Arc<dyn MetricsRecorder>)
+            .build(),
+    );
+    let registry = build_registry(telemetry);
+    let pool = build_pool(&db_url);
+
+    // Ten workflow permits, four activity permits and two claim loops give
+    // each poll a batch of two rows. It holds two permits of each kind.
+    let mut cfg = runtime_config("slot-tuner-batch-worker", Some(SlotTunerConfig::new(2, 40)));
+    cfg.claim_batch_max = std::num::NonZeroU8::new(4);
+    cfg.poll_interval = Duration::from_millis(5);
+    let worker = Arc::new(Worker::new(cfg, registry).expect("worker build"));
+
+    let worker_ref = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let worker_task = tokio::spawn(async move {
+        worker_ref.run(&pool_for_run).await;
+    });
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let idle_samples = recording.slots_in_use.lock().unwrap().clone();
+    assert!(
+        idle_samples.len() >= 100,
+        "the sampler read the pools: {} samples",
+        idle_samples.len()
+    );
+    assert_eq!(
+        idle_samples.iter().copied().max(),
+        Some(0),
+        "an idle worker runs no task, so no sample shows a slot in use"
+    );
+    for (targets, initial) in [
+        (&recording.workflow_targets, 10),
+        (&recording.activity_targets, 4),
+    ] {
+        let targets = targets.lock().unwrap().clone();
+        assert!(!targets.is_empty(), "the tuner ticked");
+        assert!(
+            targets.iter().all(|target| *target <= initial),
+            "a load of claims alone never grows the target {initial}: {targets:?}"
+        );
+    }
+
+    let exec_id = start_workflow(&db_url, "slot-tuner-batch-1").await;
+    wait_for_state(&db_url, exec_id, "COMPLETED").await;
     worker.shutdown();
     worker_task
         .await

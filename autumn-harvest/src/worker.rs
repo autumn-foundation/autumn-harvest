@@ -33082,11 +33082,18 @@ fn spawn_schedule_overdue_sampler(
 /// directly from the live target and the raw available-permits reading. The
 /// doc comment of that function says why no separate "subtract withheld"
 /// step is needed.
+///
+/// A poll holds permits across its claim, and no task runs on them.
+/// `poll_held` counts those permits. The sampler reads them as available,
+/// not as in use. Without that step, a worker that only claims reads as
+/// busy.
+#[allow(clippy::too_many_arguments)]
 fn spawn_worker_slot_sampler(
     workflow_semaphore: Arc<Semaphore>,
     workflow_slot_target: Arc<AtomicUsize>,
     activity_semaphore: Arc<Semaphore>,
     activity_slot_target: Arc<AtomicUsize>,
+    poll_held: crate::slot_tuner::PollHeldPermits,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     interval: Duration,
@@ -33102,10 +33109,11 @@ fn spawn_worker_slot_sampler(
             // UFCS avoids ambiguity with `RunQueryDsl::load` (in scope in this
             // module), which also matches a by-value `.load(...)` call.
             let wf_target = AtomicUsize::load(&workflow_slot_target, Ordering::Relaxed);
-            let (wf_in_use, wf_available) = crate::slot_tuner::slot_occupancy(
-                wf_target,
-                workflow_semaphore.available_permits(),
-            );
+            let (wf_free, wf_held) = poll_held.reading(SlotType::Workflow, || {
+                workflow_semaphore.available_permits()
+            });
+            let (wf_in_use, wf_available) =
+                crate::slot_tuner::slot_occupancy(wf_target, wf_free, wf_held);
             telemetry
                 .metrics
                 .record_worker_slots(SlotType::Workflow, wf_in_use, wf_available);
@@ -33113,10 +33121,11 @@ fn spawn_worker_slot_sampler(
             // Activity read is a separate snapshot; cross-type totals may reflect
             // different instants when a task is dispatched between the two reads.
             let act_target = AtomicUsize::load(&activity_slot_target, Ordering::Relaxed);
-            let (act_in_use, act_available) = crate::slot_tuner::slot_occupancy(
-                act_target,
-                activity_semaphore.available_permits(),
-            );
+            let (act_free, act_held) = poll_held.reading(SlotType::Activity, || {
+                activity_semaphore.available_permits()
+            });
+            let (act_in_use, act_available) =
+                crate::slot_tuner::slot_occupancy(act_target, act_free, act_held);
             telemetry
                 .metrics
                 .record_worker_slots(SlotType::Activity, act_in_use, act_available);
@@ -34381,6 +34390,10 @@ pub struct Worker {
     /// Activity tasks claimed through the dispatch channel that do not hold
     /// their permit yet (issue #1312). See [`DispatchReservation`].
     dispatch_reserved_activity: Arc<AtomicUsize>,
+    /// The permits that polls hold across their claims (issue #1787). The
+    /// slot gauges, the slot tuner and the heartbeat take them off the slots
+    /// in use. See [`PollPermits`].
+    poll_held: crate::slot_tuner::PollHeldPermits,
     /// Wakes a saturated poll loop when a task releases its permit (issue
     /// #1787). See [`CapacityPermit`].
     capacity_freed: Arc<tokio::sync::Notify>,
@@ -37040,10 +37053,17 @@ const fn decider_gate(admission: PollAdmission) -> PollAdmission {
 /// a held permit. A slot tuner shrink therefore cannot leave a claimed row
 /// without a permit while its timeout runs. Each claimed row's permit moves
 /// into its spawned task. The other permits go back when this value drops.
+///
+/// No task runs on a held permit, so it is not a slot in use. `held` counts
+/// the held permits for the slot readers. This value counts its permits
+/// before it takes them. It takes off each permit that it hands to a task,
+/// and each permit that it gave back. `Drop` takes off the rest, so a
+/// cancelled poll leaves no count behind.
 #[derive(Debug)]
 struct PollPermits {
     workflow: Vec<tokio::sync::OwnedSemaphorePermit>,
     activity: Vec<tokio::sync::OwnedSemaphorePermit>,
+    held: crate::slot_tuner::PollHeldPermits,
 }
 
 impl PollPermits {
@@ -37054,36 +37074,48 @@ impl PollPermits {
         workflow: &Arc<Semaphore>,
         activity: &Arc<Semaphore>,
     ) -> Self {
-        Self::acquire_up_to(admission, workflow, activity, 1)
+        let held = crate::slot_tuner::PollHeldPermits::default();
+        Self::acquire_up_to(admission, workflow, activity, 1, &held)
     }
 
     /// Take up to `per_kind` free permits of each kind that `admission`
-    /// allows.
+    /// allows. `held` counts them until this value hands them on.
+    ///
+    /// The count goes up by `per_kind` before the first permit is taken, and
+    /// the permits that were not free come off after. So the count is never
+    /// below the permits that this poll holds.
     fn acquire_up_to(
         admission: PollAdmission,
         workflow: &Arc<Semaphore>,
         activity: &Arc<Semaphore>,
         per_kind: usize,
+        held: &crate::slot_tuner::PollHeldPermits,
     ) -> Self {
         use crate::queue::TaskType;
-        let take = |kind: TaskType, semaphore: &Arc<Semaphore>| {
+        let take = |kind: TaskType, slot_type: SlotType, semaphore: &Arc<Semaphore>| {
             let admitted = match admission {
                 PollAdmission::Saturated => false,
                 PollAdmission::Any => true,
                 PollAdmission::Only(only) => only == kind,
             };
             let mut permits = Vec::new();
-            while admitted && permits.len() < per_kind {
+            if !admitted {
+                return permits;
+            }
+            held.add(slot_type, per_kind);
+            while permits.len() < per_kind {
                 match Arc::clone(semaphore).try_acquire_owned() {
                     Ok(permit) => permits.push(permit),
                     Err(_) => break,
                 }
             }
+            held.sub(slot_type, per_kind - permits.len());
             permits
         };
         Self {
-            workflow: take(TaskType::Workflow, workflow),
-            activity: take(TaskType::Activity, activity),
+            workflow: take(TaskType::Workflow, SlotType::Workflow, workflow),
+            activity: take(TaskType::Activity, SlotType::Activity, activity),
+            held: held.clone(),
         }
     }
 
@@ -37105,23 +37137,39 @@ impl PollPermits {
     }
 
     /// Drop every held permit. Returns how many of each kind went back.
+    ///
+    /// The permits go back before the count goes down, so the count is
+    /// never below the permits that this poll holds.
     fn release(&mut self) -> (usize, usize) {
         let returned = (self.workflow.len(), self.activity.len());
         self.workflow.clear();
         self.activity.clear();
+        self.held.sub(SlotType::Workflow, returned.0);
+        self.held.sub(SlotType::Activity, returned.1);
         returned
     }
 
-    /// Take the permit for the `task_type` of a claimed row.
+    /// Take the permit for the `task_type` of a claimed row. The task then
+    /// holds it, so it is a slot in use.
     fn take(&mut self, task_type: &str) -> Option<tokio::sync::OwnedSemaphorePermit> {
         use crate::queue::TaskType;
-        if task_type == TaskType::Workflow.as_str() {
-            self.workflow.pop()
+        let (permit, slot_type) = if task_type == TaskType::Workflow.as_str() {
+            (self.workflow.pop(), SlotType::Workflow)
         } else if task_type == TaskType::Activity.as_str() {
-            self.activity.pop()
+            (self.activity.pop(), SlotType::Activity)
         } else {
-            None
+            return None;
+        };
+        if permit.is_some() {
+            self.held.sub(slot_type, 1);
         }
+        permit
+    }
+}
+
+impl Drop for PollPermits {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -37742,6 +37790,7 @@ impl Worker {
             activity_permit_wait_micros: activity_parts.permit_wait_micros,
             dispatch_reserved_workflow: Arc::new(AtomicUsize::new(0)),
             dispatch_reserved_activity: Arc::new(AtomicUsize::new(0)),
+            poll_held: crate::slot_tuner::PollHeldPermits::default(),
             capacity_freed,
             deferral_due,
             owner_woken: Arc::new(tokio::sync::Notify::new()),
@@ -40181,12 +40230,14 @@ impl Worker {
                         permit_wait_micros: workflow_permit_wait,
                         slot_type: SlotType::Workflow,
                         capacity_freed: Some(Arc::clone(&self.capacity_freed)),
+                        poll_held: self.poll_held.clone(),
                     },
                     crate::slot_tuner::TunedSlot {
                         runtime: activity_runtime,
                         permit_wait_micros: activity_permit_wait,
                         slot_type: SlotType::Activity,
                         capacity_freed: Some(Arc::clone(&self.capacity_freed)),
+                        poll_held: self.poll_held.clone(),
                     },
                     Arc::clone(&tuner_cfg.tuner),
                     move || {
@@ -40226,6 +40277,7 @@ impl Worker {
                 Arc::clone(&workflow_slot_target),
                 Arc::clone(&self.activity_semaphore),
                 Arc::clone(&activity_slot_target),
+                self.poll_held.clone(),
                 self.shutdown.clone(),
                 self.registry.telemetry().clone(),
                 self.config.poll_interval,
@@ -40480,6 +40532,7 @@ impl Worker {
             }
             // Issue #1815: enter the cohort before any task runs.
             .seeded(),
+            self.poll_held.clone(),
         )
     }
 
@@ -43175,6 +43228,7 @@ impl Worker {
             &self.workflow_semaphore,
             &self.activity_semaphore,
             batch_rows,
+            &self.poll_held,
         );
         let admission = permits.admission();
         self.record_gate_refusal(if decider_runs {
@@ -60614,9 +60668,13 @@ mod tests {
         use crate::queue::TaskType;
         let workflow = Arc::new(Semaphore::new(3));
         let activity = Arc::new(Semaphore::new(8));
-        let mut permits = PollPermits::acquire_up_to(PollAdmission::Any, &workflow, &activity, 4);
+        let held = crate::slot_tuner::PollHeldPermits::default();
+        let count = || (held.held(SlotType::Workflow), held.held(SlotType::Activity));
+        let mut permits =
+            PollPermits::acquire_up_to(PollAdmission::Any, &workflow, &activity, 4, &held);
         assert_eq!(workflow.available_permits(), 0);
         assert_eq!(activity.available_permits(), 4);
+        assert_eq!(count(), (3, 4), "the count holds each permit of the poll");
         assert_eq!(permits.rows(), 3, "a row of either kind has a permit");
         let kept: Vec<_> = (0..3)
             .map(|_| {
@@ -60626,29 +60684,166 @@ mod tests {
             })
             .collect();
         assert!(permits.take(TaskType::Workflow.as_str()).is_none());
+        assert_eq!(count(), (0, 4), "a permit that a task holds is not counted");
+        assert!(permits.take("other").is_none());
+        assert_eq!(count(), (0, 4), "a row of no kind takes no permit");
         assert_eq!(permits.admission(), PollAdmission::Only(TaskType::Activity));
         drop(permits);
         assert_eq!(activity.available_permits(), 8, "unused permits go back");
+        assert_eq!(count(), (0, 0), "a drop takes off the rest");
 
         let only = PollPermits::acquire_up_to(
             PollAdmission::Only(TaskType::Activity),
             &workflow,
             &activity,
             8,
+            &held,
         );
         assert_eq!(only.rows(), 8);
         assert_eq!(workflow.available_permits(), 0);
+        assert_eq!(count(), (0, 8), "a kind with no admission adds no count");
         drop(kept);
         assert_eq!(workflow.available_permits(), 3);
 
-        let mut held = only;
-        assert_eq!(held.release(), (0, 8));
+        let mut poll = only;
+        assert_eq!(poll.release(), (0, 8));
         assert_eq!(
             activity.available_permits(),
             8,
             "a release returns every permit"
         );
-        assert_eq!(held.release(), (0, 0));
+        assert_eq!(count(), (0, 0));
+        assert_eq!(poll.release(), (0, 0));
+        drop(poll);
+        assert_eq!(count(), (0, 0), "a drop after a release takes off nothing");
+    }
+
+    /// Records each sample of the slot gauges.
+    #[derive(Default)]
+    struct SlotSamples(std::sync::Mutex<Vec<(SlotType, u64, u64)>>);
+
+    impl crate::telemetry::MetricsRecorder for SlotSamples {
+        fn record_worker_slots(&self, slot_type: SlotType, in_use: u64, available: u64) {
+            self.0.lock().unwrap().push((slot_type, in_use, available));
+        }
+    }
+
+    /// A slot tuner that records each `in_use` reading and holds the target.
+    #[derive(Default)]
+    struct InUseReadings(std::sync::Mutex<Vec<usize>>);
+
+    impl crate::slot_tuner::SlotTuner for InUseReadings {
+        fn decide(
+            &self,
+            observations: &crate::slot_tuner::SlotObservations,
+        ) -> crate::slot_tuner::SlotTunerAction {
+            self.0.lock().unwrap().push(observations.in_use);
+            crate::slot_tuner::SlotTunerAction::Hold
+        }
+    }
+
+    /// A poll that holds permits and claims nothing runs no task. The slot
+    /// gauges, the fleet heartbeat and the slot tuner then read no slot in
+    /// use. A cancelled poll leaves no count behind.
+    #[allow(clippy::significant_drop_tightening)]
+    #[tokio::test(start_paused = true)]
+    async fn the_permits_of_a_poll_are_not_slots_in_use() {
+        let interval = Duration::from_millis(20);
+        let mut cfg = default_runtime_config();
+        cfg.max_concurrent_workflows = 20;
+        cfg.max_concurrent_activities = 50;
+        let worker =
+            Worker::new(cfg, Arc::new(HandlerRegistry::new(vec![], vec![]))).expect("valid config");
+        let in_flight = || {
+            crate::workers::compute_in_flight(
+                &worker.workflow_semaphore,
+                20,
+                &worker.activity_semaphore,
+                50,
+                &worker.poll_held,
+            )
+        };
+
+        // One workflow task runs. A batch poll of four rows is mid-claim.
+        let task = Arc::clone(&worker.workflow_semaphore)
+            .try_acquire_owned()
+            .expect("a free permit");
+        let poll = PollPermits::acquire_up_to(
+            worker.poll_admission_now(),
+            &worker.workflow_semaphore,
+            &worker.activity_semaphore,
+            4,
+            &worker.poll_held,
+        );
+        assert_eq!(worker.workflow_semaphore.available_permits(), 15);
+        assert_eq!(worker.activity_semaphore.available_permits(), 46);
+        assert_eq!(in_flight(), 1, "the heartbeat counts the task alone");
+
+        let slots = Arc::new(SlotSamples::default());
+        let telemetry = Arc::new(crate::telemetry::TelemetryConfig {
+            metrics: slots.clone(),
+            ..crate::telemetry::TelemetryConfig::default()
+        });
+        let cancel = CancellationToken::new();
+        let sampler = spawn_worker_slot_sampler(
+            Arc::clone(&worker.workflow_semaphore),
+            Arc::new(AtomicUsize::new(20)),
+            Arc::clone(&worker.activity_semaphore),
+            Arc::new(AtomicUsize::new(50)),
+            worker.poll_held.clone(),
+            cancel.clone(),
+            telemetry.clone(),
+            interval,
+        );
+        let seen = Arc::new(InUseReadings::default());
+        let slot = |semaphore: &Arc<Semaphore>, total, slot_type| crate::slot_tuner::TunedSlot {
+            runtime: crate::slot_tuner::TunedSlotRuntime::new(
+                Arc::clone(semaphore),
+                total,
+                1,
+                total,
+            ),
+            permit_wait_micros: Arc::new(AtomicU64::new(0)),
+            slot_type,
+            capacity_freed: None,
+            poll_held: worker.poll_held.clone(),
+        };
+        let tuner = crate::slot_tuner::spawn_slot_tuner_loop(
+            slot(&worker.workflow_semaphore, 20, SlotType::Workflow),
+            slot(&worker.activity_semaphore, 50, SlotType::Activity),
+            seen.clone(),
+            || None,
+            cancel.clone(),
+            interval,
+            telemetry,
+        );
+        tokio::time::sleep(interval + interval / 2).await;
+        assert_eq!(
+            *slots.0.lock().unwrap(),
+            vec![(SlotType::Workflow, 1, 19), (SlotType::Activity, 0, 50)],
+            "the gauges read the task alone"
+        );
+        assert_eq!(
+            *seen.0.lock().unwrap(),
+            vec![1, 0],
+            "the tuner reads the task alone"
+        );
+
+        // The poll ends with no row, as a cancelled poll does.
+        drop(poll);
+        assert_eq!(worker.poll_held.held(SlotType::Workflow), 0);
+        assert_eq!(worker.poll_held.held(SlotType::Activity), 0);
+        assert_eq!(in_flight(), 1);
+        tokio::time::sleep(interval).await;
+        assert_eq!(
+            slots.0.lock().unwrap()[2..],
+            [(SlotType::Workflow, 1, 19), (SlotType::Activity, 0, 50)],
+            "a poll that ends moves no gauge"
+        );
+        cancel.cancel();
+        sampler.await.expect("the sampler ends");
+        tuner.await.expect("the tuner ends");
+        drop(task);
     }
 
     /// Unused batch permits wake a loop and a decider that wait now. They
@@ -60667,6 +60862,7 @@ mod tests {
             &worker.workflow_semaphore,
             &worker.activity_semaphore,
             2,
+            &worker.poll_held,
         );
         worker.return_batch_permits(&mut permits);
         assert!(futures::FutureExt::now_or_never(loop_wait).is_some());
