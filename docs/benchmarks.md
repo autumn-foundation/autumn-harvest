@@ -182,6 +182,7 @@ here rather than only in the output of a run you have not done yet.
 | connections per shard pool | 32 | at or above total worker concurrency, so no measurement includes pool-checkout queueing |
 | workflows in flight per shard | 32 | four times the workflow slots — see [bounded load](#methodology) |
 | paced start rate per shard | 8/sec | well below the saturated rate (about 15% on 0.8.0), so the latency scenarios measure the path and not the queue |
+| rows per claim statement | 1 | the published numbers were taken with one row per claim, and a run with no knob keeps it. A default worker claims in batches. Set `HARVEST_BENCH_CLAIM_BATCH=default` to measure that |
 | poll interval | 25 ms | with LISTEN/NOTIFY wired per shard, so this bounds a *missed* notification rather than every wake |
 | durability | `fsync=off`, `synchronous_commit=off` | see [known limitations](#known-limitations) |
 
@@ -222,6 +223,7 @@ HARVEST_BENCH_SCENARIOS=signal_roundtrip HARVEST_BENCH_SHARDS=1 cargo xtask benc
 | `HARVEST_BENCH_INFLIGHT` | closed-loop in-flight workflows per shard — the load level. `throughput` only |
 | `HARVEST_BENCH_WORKFLOWS` | measured completions per shard. `throughput` only |
 | `HARVEST_BENCH_CLAIM_LOOPS` | claim loops per worker; unset keeps the worker default. The [resident hit-rate record](rnd/2026-10-11-resident-hit-rate.md) compares `1` against the default |
+| `HARVEST_BENCH_CLAIM_BATCH` | the most rows of one claim statement (`WorkerConfig::with_claim_batch_max`). Unset, `0`, `1` or `off` keeps one row per claim, as the published numbers were taken. A number above 1 sets that cap. `default` takes the worker default. The report header prints the rows per claim statement |
 | `HARVEST_BENCH_CLAIM_LEAN` | `0` or `off` turns the lean claim statement off (`WorkerConfig::with_claim_lean(false)`), so one binary runs both arms of a comparison. Unset keeps the worker default, which is on |
 | `HARVEST_BENCH_WORKER_PROCESSES` | worker processes per shard. Capacity arms only; the default is 4. Each process adds 33 connections per shard, and a cell refuses to run past `max_connections` |
 | `HARVEST_BENCH_CHECK` | also print the reproduction verdict |

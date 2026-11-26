@@ -381,7 +381,7 @@ fn build_registry(metrics: Arc<dyn MetricsRecorder>) -> Arc<HandlerRegistry> {
 }
 
 /// A worker config with `claims` claim loops, 16 slots of each kind and the
-/// cap `cap` on one queue.
+/// cap `cap` on one queue. Each claim takes one row.
 fn runtime_config(
     worker_id: &str,
     queue: &str,
@@ -394,6 +394,8 @@ fn runtime_config(
     config.max_concurrent_workflows = 16;
     config.max_concurrent_activities = 16;
     config.max_concurrent_claims = claims;
+    // One row per claim: these tests count one claim sample for each task.
+    config.claim_batch_max = None;
     config.claim_slots_per_shard = cap;
     config.poll_interval = Duration::from_millis(25);
     config.shutdown_timeout = Duration::from_secs(5);

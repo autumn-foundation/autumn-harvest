@@ -826,7 +826,11 @@ async fn an_owner_takes_workflow_tasks_off_the_claim_path() {
     enable(&mut conn).await;
     let pool: DbPool = build_test_pool(&db.url);
     let queue = unique("decider-steps");
-    let mut node = Node::new(&db.url, &queue, 2);
+    // One row per claim: this test counts one claim sample for each activity.
+    let config = WorkerConfig::default()
+        .with_queues([queue.as_str()])
+        .with_claim_batch_max(1);
+    let mut node = Node::with_config(&db.url, config, 2);
     node.run(&pool);
     eventually("the owner owns every partition", async || {
         live_partitions(&mut conn).await == 512

@@ -3,15 +3,25 @@
 //! Set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run against it.
 //! Otherwise a fresh testcontainers Postgres boots with the migrations.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use autumn_harvest::prelude::*;
 use autumn_harvest::queue::{self, ClaimBatch, EnqueueParams, SlottedBatch, TaskType};
+use autumn_harvest::telemetry::{ClaimKind, MetricsRecorder, TelemetryConfig};
+use autumn_harvest::types::ShardId;
+use autumn_harvest::worker::{Worker, WorkerRuntimeConfig};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use uuid::Uuid;
+
+use crate::decision_owner_claim_tests::OwnDb;
+use crate::integration_e2e::{build_test_pool, wait_for_execution_state_with_timeout};
+use crate::lean_claim_db_tests as lean;
 
 async fn connect(url: &str) -> AsyncPgConnection {
     AsyncPgConnection::establish(url).await.expect("connect")
@@ -521,4 +531,594 @@ async fn an_expired_row_takes_no_key_lock_and_its_peers_still_claim() {
     .expect("locks");
     assert_eq!(locks.n, 0, "a skipped row holds no concurrency-key lock");
     conn.batch_execute("ROLLBACK").await.expect("rollback");
+}
+
+// ── The plan on a deep backlog ──────────────────────────────────────────────
+
+const BATCHES: [ClaimBatch; 3] = [ClaimBatch::Two, ClaimBatch::Four, ClaimBatch::Eight];
+const KINDS: [Option<TaskType>; 3] = [None, Some(TaskType::Workflow), Some(TaskType::Activity)];
+
+/// The `EXPLAIN (ANALYZE, BUFFERS)` plan of one batch claim, rolled back.
+///
+/// The statement is prepared under the planner settings of a claim
+/// transaction, so the plan is the generic plan that a real claim reuses.
+/// The fence binds match the generation row of `lean::write_shared_rows`.
+async fn batch_plan(
+    conn: &mut AsyncPgConnection,
+    kind: Option<TaskType>,
+    fenced: bool,
+    batch: ClaimBatch,
+    queue: &str,
+) -> serde_json::Value {
+    #[derive(diesel::QueryableByName)]
+    struct Plan {
+        #[diesel(sql_type = diesel::sql_types::Json, column_name = "QUERY PLAN")]
+        plan: serde_json::Value,
+    }
+    let mut binds = vec![format!(
+        "'{}', ARRAY['{queue}'], '', NULL, ARRAY[]::text[], ARRAY[]::text[]",
+        lean::WORKER
+    )];
+    if fenced {
+        binds.push(format!(
+            "ARRAY[{}]::int4[], ARRAY[{}]::int8[]",
+            lean::FENCE_SHARD,
+            lean::FENCE_GENERATION
+        ));
+    }
+    let binds = binds.join(", ");
+    lean::exec(
+        conn,
+        &format!(
+            "BEGIN; {}; \
+             PREPARE batch_plan_probe(text, text[], text, bigint, text[], text[]) AS {}",
+            queue::CLAIM_PLAN_SETTINGS_SQL,
+            queue::batch_claim_query_for(kind, fenced, batch)
+        ),
+    )
+    .await;
+    let rows: Vec<Plan> = diesel::sql_query(format!(
+        "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE batch_plan_probe({binds})"
+    ))
+    .load(conn)
+    .await
+    .unwrap_or_else(|e| panic!("explain the batch claim of {kind:?}, {batch:?}: {e}"));
+    lean::exec(conn, "ROLLBACK; DEALLOCATE batch_plan_probe;").await;
+    let plan = rows.into_iter().next().expect("one plan row").plan;
+    plan[0]["Plan"].clone()
+}
+
+/// Asserts the plan shape of one batch claim over the deep backlog.
+fn assert_the_batch_plan_is_bounded(plan: &serde_json::Value, case: &str, batch: ClaimBatch) {
+    let mut all = Vec::new();
+    lean::plan_nodes(plan, None, false, &mut all);
+    let on_the_queue_table =
+        |node: &serde_json::Value| node["Relation Name"].as_str() == Some("harvest_task_queue");
+    let node_type = |node: &serde_json::Value| -> String {
+        node["Node Type"].as_str().unwrap_or_default().to_owned()
+    };
+    // Four queue heads and the pin head make the window.
+    let window = 4 * lean::HEAD_LIMIT + lean::DEEP_PINNED_ROWS;
+
+    let claimed = all
+        .iter()
+        .find(|(_, node)| node["Subplan Name"].as_str() == Some("CTE claimed"))
+        .map(|(_, node)| lean::per_loop(node, "Actual Rows"));
+    assert_eq!(
+        claimed,
+        i64::try_from(batch.rows()).ok(),
+        "{case}: the batch claims a row for each of its slots"
+    );
+
+    // No scan reads the whole queue table, in a branch that ran or not.
+    for (_, node) in &all {
+        assert!(
+            !(on_the_queue_table(node) && node_type(node) == "Seq Scan"),
+            "{case}: a sequential scan of the queue table: {node}"
+        );
+    }
+
+    // The ranking of the batch sorts its own rows only. No sort reads more
+    // than the window, and no sort goes to disk.
+    for (_, node) in &all {
+        if !node_type(node).contains("Sort") {
+            continue;
+        }
+        assert!(
+            node["Sort Space Type"].as_str() != Some("Disk"),
+            "{case}: a sort on disk: {node}"
+        );
+        assert!(
+            lean::per_loop(node, "Actual Rows") <= window,
+            "{case}: a sort reads more than the window: {node}"
+        );
+    }
+
+    // Each head reads its ordered index, and reads one window of it.
+    let mut queue_heads = 0;
+    for (cte, head) in &all {
+        if *cte != Some("seek_heads") || !on_the_queue_table(head) {
+            continue;
+        }
+        let index = head["Index Name"].as_str().unwrap_or("none");
+        assert!(
+            node_type(head) == "Index Scan"
+                && (index == "idx_harvest_tq_claim_seek" || index == "idx_harvest_tq_sticky_poll"),
+            "{case}: a head scan reads {index}, not its ordered index: {head}"
+        );
+        if index == "idx_harvest_tq_claim_seek" {
+            queue_heads += 1;
+            let read = lean::per_loop(head, "Actual Rows")
+                + lean::per_loop(head, "Rows Removed by Filter");
+            assert!(
+                lean::per_loop(head, "Actual Loops") > 0 && read <= lean::HEAD_LIMIT,
+                "{case}: a queue head reads {read} rows for each loop: {head}"
+            );
+        }
+    }
+    assert_eq!(queue_heads, 1, "{case}: one scan serves the queue heads");
+
+    // Each scan of the queue table that ran reads a window at most.
+    for (cte, node) in &all {
+        if !on_the_queue_table(node) || lean::per_loop(node, "Actual Loops") == 0 {
+            continue;
+        }
+        let read =
+            lean::per_loop(node, "Actual Rows") + lean::per_loop(node, "Rows Removed by Filter");
+        assert!(
+            read <= window,
+            "{case}: a scan in {cte:?} reads {read} rows for each loop: {node}"
+        );
+    }
+
+    let buffers =
+        lean::per_loop(plan, "Shared Hit Blocks") + lean::per_loop(plan, "Shared Read Blocks");
+    assert!(
+        buffers <= lean::DEEP_ROWS / 20,
+        "{case}: the claim reads {buffers} buffers of a backlog of {} rows",
+        lean::DEEP_ROWS
+    );
+}
+
+/// The batch form keeps a bounded plan on a deep backlog of one queue.
+///
+/// A default worker sends the batch text on most claims, so its plan is the
+/// claim plan of a default fleet. The batch text adds a `row_number()` sort
+/// to the window text, under planner settings that turn sorts off. This
+/// test pins the plan of each of the eighteen batch texts:
+///
+/// - No scan of the queue table is sequential.
+/// - Each head scan reads `idx_harvest_tq_claim_seek`, or the pin index,
+///   and a queue head reads one window of rows.
+/// - No sort reads more than the window, and no sort goes to disk.
+/// - The claim takes a row for each slot of its batch.
+///
+/// It does so with fresh statistics, and with the statistics of an idle
+/// system. There an `ANALYZE` sees terminal rows only, and then a backlog
+/// arrives. Each plan is the generic plan under the claim settings.
+#[tokio::test]
+async fn each_batch_text_keeps_a_bounded_plan_on_a_deep_backlog_of_one_queue() {
+    #[derive(diesel::QueryableByName)]
+    struct Mcv {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        vals: String,
+    }
+    let _registry = lean::clear_fence_registry().await;
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    lean::write_shared_rows(&mut conn).await;
+    let queue = "batch-deep";
+    let terminal = lean::deep_rows_sql(queue, lean::DEEP_TERMINAL_ROWS, "COMPLETED");
+    let backlog = format!(
+        "{}; UPDATE harvest_task_queue SET sticky_worker_id = '{}', \
+           sticky_until = NOW() + INTERVAL '1 hour' \
+         WHERE id IN (SELECT id FROM harvest_task_queue WHERE state = 'PENDING' \
+                      LIMIT {})",
+        lean::deep_rows_sql(queue, lean::DEEP_ROWS, "PENDING"),
+        lean::WORKER,
+        lean::DEEP_PINNED_ROWS
+    );
+    lean::exec(
+        &mut conn,
+        "ALTER TABLE harvest_task_queue SET (autovacuum_enabled = off)",
+    )
+    .await;
+    let mut plans = 0;
+    for statistics in ["fresh", "idle"] {
+        lean::exec(&mut conn, "TRUNCATE harvest_task_queue CASCADE").await;
+        lean::exec(&mut conn, &terminal).await;
+        if statistics == "fresh" {
+            lean::exec(&mut conn, &backlog).await;
+            lean::exec(&mut conn, "VACUUM ANALYZE harvest_task_queue").await;
+        } else {
+            lean::exec(&mut conn, "VACUUM ANALYZE harvest_task_queue").await;
+            lean::exec(&mut conn, &backlog).await;
+        }
+        let mcv: Mcv = diesel::sql_query(
+            "SELECT COALESCE(most_common_vals::text, '') AS vals FROM pg_stats \
+             WHERE tablename = 'harvest_task_queue' AND attname = 'state'",
+        )
+        .get_result(&mut conn)
+        .await
+        .expect("read the state statistics");
+        assert_eq!(
+            mcv.vals.contains("PENDING"),
+            statistics == "fresh",
+            "{statistics} statistics show a PENDING row: {}",
+            mcv.vals
+        );
+        for kind in KINDS {
+            for fenced in [false, true] {
+                for batch in BATCHES {
+                    let case = format!(
+                        "{statistics} statistics, kind {kind:?}, fenced {fenced}, {batch:?}"
+                    );
+                    let plan = batch_plan(&mut conn, kind, fenced, batch, queue).await;
+                    assert_the_batch_plan_is_bounded(&plan, &case, batch);
+                    plans += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(plans, 36, "eighteen texts under two sets of statistics");
+    db.drop_db().await;
+}
+
+// ── Random states ───────────────────────────────────────────────────────────
+
+/// The seeds of the batch comparison. The list is fixed, so each run builds
+/// the same states.
+const BATCH_SEEDS: std::ops::RangeInclusive<u64> = 1..=64;
+
+/// The most steps of the comparison on one state. A state ends sooner when
+/// a claim of each kind finds no row.
+const BATCH_STEPS: usize = 45;
+
+/// The fewest batches of two rows or more that each property must compare.
+const BATCH_FLOOR: u32 = 150;
+
+/// The fewest batches that must end before the rows of the single claims.
+const CUT_FLOOR: u32 = 20;
+
+/// The fewest batches of two rows or more that a keyed row must lead.
+const KEYED_FIRST_FLOOR: u32 = 8;
+
+/// True when row `n` of `spec` carries a concurrency key or a rate-limit
+/// key. Only the first row of a batch may be such a row.
+fn keyed_row(spec: &lean::StateSpec, n: i64) -> bool {
+    let row = usize::try_from(n).expect("an ordinal is not negative");
+    matches!(
+        spec.rows[row].extra,
+        lean::Extra::Key(_) | lean::Extra::Rate(_)
+    )
+}
+
+/// One batch claim of the worker of the differential tests over a written
+/// state. Returns the ordinals of its rows.
+async fn state_batch(
+    conn: &mut AsyncPgConnection,
+    state: &lean::Written,
+    kind: Option<TaskType>,
+    batch: ClaimBatch,
+) -> HashSet<i64> {
+    let (breakers, ineligible) = lean::activity_binds();
+    let claimed = queue::claim_task_batch_with_slots(
+        conn,
+        &state.queues,
+        lean::WORKER,
+        lean::BUILD,
+        &breakers,
+        &ineligible,
+        None,
+        kind,
+        None,
+        batch,
+    )
+    .await
+    .expect("batch claim");
+    match claimed {
+        SlottedBatch::Claimed(tasks) => {
+            let rows: HashSet<i64> = tasks
+                .iter()
+                .map(|task| task.input["n"].as_i64().expect("a row holds its ordinal"))
+                .collect();
+            assert_eq!(rows.len(), tasks.len(), "a batch holds each row once");
+            assert!(rows.len() <= batch.rows(), "a batch stays at its size");
+            rows
+        }
+        SlottedBatch::Empty => HashSet::new(),
+        SlottedBatch::NoSlot => panic!("no claim slots were asked for"),
+    }
+}
+
+/// What the comparison saw over the states of one property.
+#[derive(Debug, Default)]
+struct BatchTally {
+    states: u32,
+    /// The batches of two rows or more.
+    batches: u32,
+    /// The batches that took a row for each of their slots.
+    full: u32,
+    /// The batches that took fewer rows than the single claims took.
+    shorter: u32,
+    /// The batches of two rows or more whose first row carries a key.
+    keyed_first: u32,
+    /// The steps where neither side took a row.
+    empty: u32,
+}
+
+/// A batch takes the rows that a run of single claims takes, over random
+/// states.
+///
+/// Each seed writes two copies of its state. The single side sends up to
+/// `n` window-first single claims over one copy. The batch side sends one
+/// batch claim of `n` rows over the other copy. The claims change kind and
+/// size as the permits of a worker do.
+///
+/// In each step the batch takes a prefix of the rows of the single claims:
+/// its `k` rows are their first `k` rows. A batch takes no row only when a
+/// single claim takes none.
+///
+/// A state with no keyed row holds plain rows with distinct claim keys. It
+/// also holds paused queues and activities, pins, sessions and the parked
+/// rows of paused and expired runs. There the batch takes each row that the
+/// single claims take.
+///
+/// A state with keyed rows also holds concurrency keys and rate-limit keys.
+/// There the batch holds one keyed row at most, and that row is its first
+/// row. That is the key cut.
+///
+/// After each step the batch side takes the other rows by single claims.
+/// Both copies must then hold the same state.
+#[tokio::test]
+async fn random_states_give_a_batch_the_rows_of_a_run_of_single_claims() {
+    let _registry = lean::clear_fence_registry().await;
+    let db = OwnDb::new().await;
+    let mut batch_conn = db.conn().await;
+    let mut single_conn = db.conn().await;
+    lean::write_shared_rows(&mut batch_conn).await;
+    let mut plain = BatchTally::default();
+    let mut keyed = BatchTally::default();
+    for seed in BATCH_SEEDS {
+        let spec = lean::state_spec(seed);
+        let has_keys = (0..spec.rows.len())
+            .any(|n| keyed_row(&spec, i64::try_from(n).expect("a row count fits")));
+        let tally = if has_keys { &mut keyed } else { &mut plain };
+        tally.states += 1;
+        let batch_copy = lean::write_state(&mut batch_conn, &spec, &format!("ba-{seed}")).await;
+        let single_copy = lean::write_state(&mut single_conn, &spec, &format!("bb-{seed}")).await;
+        let mut empty_run = 0;
+        for step in 0..BATCH_STEPS {
+            // Three empty steps in a row are one of each kind.
+            if empty_run == KINDS.len() {
+                break;
+            }
+            let kind = KINDS[step % 3];
+            let batch = BATCHES[(step / 3) % 3];
+            let case = format!("seed {seed}, step {step}, kind {kind:?}, {batch:?}");
+
+            let mut singles = Vec::new();
+            while singles.len() < batch.rows() {
+                let Some(row) =
+                    lean::state_claim(&mut single_conn, &single_copy, kind, None, None).await
+                else {
+                    break;
+                };
+                singles.push(row);
+            }
+            let taken = state_batch(&mut batch_conn, &batch_copy, kind, batch).await;
+
+            assert!(
+                taken.len() <= singles.len(),
+                "{case}: the batch took {taken:?}, the single claims took {singles:?}"
+            );
+            let prefix: HashSet<i64> = singles[..taken.len()].iter().copied().collect();
+            assert_eq!(
+                taken, prefix,
+                "{case}: the batch takes the first rows of the single claims {singles:?}"
+            );
+            assert!(
+                !taken.is_empty() || singles.is_empty(),
+                "{case}: the batch took no row, the single claims took {singles:?}"
+            );
+            if has_keys {
+                let keyed_rows: Vec<i64> = taken
+                    .iter()
+                    .copied()
+                    .filter(|n| keyed_row(&spec, *n))
+                    .collect();
+                assert!(
+                    keyed_rows.is_empty() || keyed_rows == [singles[0]],
+                    "{case}: only the first row of a batch may carry a key: {keyed_rows:?} of \
+                     {singles:?}"
+                );
+                tally.keyed_first += u32::from(taken.len() >= 2 && !keyed_rows.is_empty());
+            } else {
+                assert_eq!(
+                    taken.len(),
+                    singles.len(),
+                    "{case}: with no keyed row, the batch takes each row of the single claims \
+                     {singles:?}"
+                );
+            }
+            tally.batches += u32::from(taken.len() >= 2);
+            tally.full += u32::from(taken.len() == batch.rows());
+            tally.shorter += u32::from(taken.len() < singles.len());
+            tally.empty += u32::from(singles.is_empty());
+            empty_run = if singles.is_empty() { empty_run + 1 } else { 0 };
+
+            // The batch side takes the rest by single claims, in the same order.
+            for expected in &singles[taken.len()..] {
+                let row = lean::state_claim(&mut batch_conn, &batch_copy, kind, None, None).await;
+                assert_eq!(row, Some(*expected), "{case}: the rest of {singles:?}");
+            }
+            assert_eq!(
+                lean::digest(&mut batch_conn, &batch_copy.queues, &batch_copy.buckets).await,
+                lean::digest(&mut single_conn, &single_copy.queues, &single_copy.buckets).await,
+                "{case}: the copies hold the same state"
+            );
+        }
+    }
+    // Each property must compare real batches, or it proves little.
+    println!("states with no keyed row: {plain:?}");
+    println!("states with keyed rows: {keyed:?}");
+    assert!(
+        plain.batches >= BATCH_FLOOR && plain.full >= BATCH_FLOOR && plain.empty >= 1,
+        "the seeds give too few batches with no keyed row: {plain:?}"
+    );
+    assert_eq!(plain.shorter, 0, "{plain:?}");
+    assert!(
+        keyed.batches >= BATCH_FLOOR
+            && keyed.shorter >= CUT_FLOOR
+            && keyed.keyed_first >= KEYED_FIRST_FLOOR,
+        "the seeds give too few batches with keyed rows, or too few key cuts: {keyed:?}"
+    );
+    db.drop_db().await;
+}
+
+// ── The default worker ──────────────────────────────────────────────────────
+
+#[activity(start_to_close = "30s")]
+async fn batch_default_step(_ctx: &ActivityContext, n: u64) -> Result<u64, String> {
+    tokio::task::yield_now().await;
+    Ok(n)
+}
+
+/// One activity. Two workflow tasks and one activity task for each run.
+#[workflow]
+async fn batch_default_flow(ctx: &WorkflowContext, queue: String) -> Result<String, String> {
+    ctx.execute_activity_raw("batch_default_step", serde_json::json!(1), &queue)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok("done".to_string())
+}
+
+/// The tasks that one run of [`batch_default_flow`] dispatches.
+const TASKS_PER_RUN: u64 = 3;
+
+/// Counts the claim statements of one worker that took a row, by kind.
+#[derive(Default, Clone)]
+struct RowClaims(Arc<Mutex<BTreeMap<&'static str, u64>>>);
+
+impl RowClaims {
+    fn with_a_row(&self) -> u64 {
+        let counts = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        [ClaimKind::Workflow, ClaimKind::Activity]
+            .iter()
+            .map(|kind| counts.get(kind.as_str()).copied().unwrap_or(0))
+            .sum()
+    }
+}
+
+impl MetricsRecorder for RowClaims {
+    fn record_claim_duration(&self, kind: ClaimKind, _shard: u16, _seconds: f64) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(kind.as_str())
+            .or_default() += 1;
+    }
+}
+
+/// Queues `runs` runs of [`batch_default_flow`], then runs a worker with
+/// `config` until each run is complete.
+///
+/// Returns the claim forms that the pool of the worker sent, and the claim
+/// statements that took a row.
+async fn drain_a_backlog(db: &OwnDb, config: WorkerConfig, runs: u64) -> (lean::Forms, u64) {
+    let queue = unique_queue("batch-default");
+    let pool = build_test_pool(&db.url);
+    let mut conn = db.conn().await;
+    let client = WorkflowHandleClient::single(pool.clone(), db.url.clone());
+    let mut started = Vec::new();
+    for _ in 0..runs {
+        let exec = BatchDefaultFlowStub::start_with_options(
+            &mut conn,
+            &client,
+            &unique_queue("batch-default-wf"),
+            queue.clone(),
+            TypedStartOptions {
+                queue_name: Some(queue.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("start")
+        .exec_id();
+        started.push(exec);
+    }
+
+    let claims = RowClaims::default();
+    let built = HarvestBuilder::new()
+        .workflows(workflows![batch_default_flow])
+        .activities(activities![batch_default_step])
+        .worker(config.with_queues([queue.as_str()]))
+        .telemetry(
+            TelemetryConfig::builder()
+                .metrics(Arc::new(claims.clone()))
+                .build(),
+        )
+        .build();
+    let (registry, _dags, _schedules, worker_config) = built.into_worker_parts();
+    let mut runtime: WorkerRuntimeConfig = worker_config.into();
+    runtime.worker_id = unique_queue("batch-default-worker");
+    runtime.poll_interval = Duration::from_millis(50);
+    runtime.shutdown_timeout = Duration::from_secs(5);
+    runtime.shard_assignments = vec![ShardId::new(0)];
+    let worker = Arc::new(Worker::new(runtime, Arc::new(registry)).expect("the worker builds"));
+    let runner = Arc::clone(&worker);
+    let run_pool = pool.clone();
+    let handle = tokio::spawn(async move { runner.run(&run_pool).await });
+    for exec in started {
+        wait_for_execution_state_with_timeout(&db.url, exec, "COMPLETED", Duration::from_secs(60))
+            .await;
+    }
+    worker.shutdown();
+    handle.await.expect("the worker joins");
+    (lean::pool_forms(&pool).await, claims.with_a_row())
+}
+
+/// A worker with no knob set claims in batches, and it completes each task.
+///
+/// `WorkerConfig::default()` sets no claim knob. On a backlog its claim
+/// loops send batch statements, and some of them take two rows or more. So
+/// the statements that took a row are fewer than the tasks.
+///
+/// The same worker with `with_claim_batch_max(1)` sends no batch statement.
+/// Each of its claim statements that took a row took one task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_default_worker_claims_a_backlog_in_batches_and_one_row_turns_it_off() {
+    const RUNS: u64 = 40;
+    let _registry = lean::clear_fence_registry().await;
+    let db = OwnDb::new().await;
+
+    let (sent, with_a_row) = drain_a_backlog(&db, WorkerConfig::default(), RUNS).await;
+    println!("default worker: {sent:?}, {with_a_row} claim statements took a row");
+    assert!(
+        sent.batch >= 5,
+        "a default worker sends batch statements: {sent:?}"
+    );
+    assert!(
+        with_a_row < TASKS_PER_RUN * RUNS,
+        "some statement took two rows or more: {with_a_row} statements, {sent:?}"
+    );
+
+    let one_row = WorkerConfig::default().with_claim_batch_max(1);
+    let (sent, with_a_row) = drain_a_backlog(&db, one_row, RUNS).await;
+    println!("one row per claim: {sent:?}, {with_a_row} claim statements took a row");
+    assert_eq!(sent.batch, 0, "one row per claim: {sent:?}");
+    assert!(
+        sent.lean + sent.window >= i64::try_from(TASKS_PER_RUN * RUNS).expect("fits"),
+        "each task has its own claim statement: {sent:?}"
+    );
+    assert_eq!(
+        with_a_row,
+        TASKS_PER_RUN * RUNS,
+        "each claim statement that took a row took one task"
+    );
+    db.drop_db().await;
 }

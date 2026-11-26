@@ -1083,7 +1083,7 @@ async fn deep_backlog_on_one_shard_does_not_starve_the_others() {
     }
 
     // Keep shard 0 hot for the whole run: a tight-loop feeder outpaces the
-    // worker, which claims at most one task per loop iteration.
+    // worker, which claims at most one batch per loop iteration.
     let stop = Arc::new(AtomicBool::new(false));
     let feeder = {
         let pool0 = pool0.clone();

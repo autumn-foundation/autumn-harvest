@@ -347,6 +347,21 @@ fn print_environment(capacity_ran: bool) {
         e2e_bench_support::MAX_CONCURRENT_ACTIVITIES,
     );
     println!(
+        "| Claim | {} claim loop(s) per worker, {} row(s) per claim statement (`{}`) |",
+        e2e_bench_support::claim_loops_override(
+            std::env::var(e2e_bench_support::CLAIM_LOOPS_ENV_VAR)
+                .ok()
+                .as_deref()
+        )
+        .unwrap_or(autumn_harvest::builder::DEFAULT_MAX_CONCURRENT_CLAIMS),
+        e2e_bench_support::rows_per_claim_label(
+            std::env::var(e2e_bench_support::CLAIM_BATCH_ENV_VAR)
+                .ok()
+                .as_deref()
+        ),
+        e2e_bench_support::CLAIM_BATCH_ENV_VAR,
+    );
+    println!(
         "| Poll interval | {} ms (LISTEN/NOTIFY wired per shard) |",
         e2e_bench_support::POLL_INTERVAL_MS
     );

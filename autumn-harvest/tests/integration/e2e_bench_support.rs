@@ -287,15 +287,44 @@ pub fn claim_loops_override(raw: Option<&str>) -> Option<usize> {
         .filter(|v| *v > 0)
 }
 
-/// The most rows of one claim statement. Unset keeps one row per claim.
+/// The most rows of one claim statement.
+///
+/// Unset keeps one row per claim. So do `0`, `1` and `off`. The published
+/// baselines were taken with one row per claim, and the reproduction check
+/// compares against them. A number above `1` sets that cap.
+/// [`CLAIM_BATCH_WORKER_DEFAULT`] takes the worker default, which claims in
+/// batches.
 pub const CLAIM_BATCH_ENV_VAR: &str = "HARVEST_BENCH_CLAIM_BATCH";
 
-/// The batch size that `raw` asks for, or `None` for one row per claim.
+/// The [`CLAIM_BATCH_ENV_VAR`] value that takes the worker default,
+/// `WorkerConfig::default().claim_batch_max`.
+pub const CLAIM_BATCH_WORKER_DEFAULT: &str = "default";
+
+/// The batch cap that `raw` asks for, or `None` for one row per claim.
+///
+/// Only a number above `1` and [`CLAIM_BATCH_WORKER_DEFAULT`] give a cap.
+/// Every other value keeps one row per claim, so a typo does not change the
+/// arm that a run measures.
 #[must_use]
 pub fn claim_batch_override(raw: Option<&str>) -> Option<std::num::NonZeroU8> {
-    raw.and_then(|v| v.trim().parse::<u8>().ok())
-        .filter(|v| *v > 1)
+    let value = raw?.trim();
+    if value.eq_ignore_ascii_case(CLAIM_BATCH_WORKER_DEFAULT) {
+        return autumn_harvest::builder::WorkerConfig::default().claim_batch_max;
+    }
+    value
+        .parse::<u8>()
+        .ok()
+        .filter(|rows| *rows > 1)
         .and_then(std::num::NonZeroU8::new)
+}
+
+/// The rows per claim statement that `raw` gives, for the report header.
+///
+/// `raw` is the [`CLAIM_BATCH_ENV_VAR`] value. A report of a batch run and a
+/// report of a run with one row per claim then differ in their headers.
+#[must_use]
+pub fn rows_per_claim_label(raw: Option<&str>) -> String {
+    claim_batch_override(raw).map_or_else(|| "1".to_owned(), |rows| format!("up to {rows}"))
 }
 
 /// Set to `0` or `off` to turn the lean claim statement off. Unset keeps
@@ -415,7 +444,9 @@ pub fn commit_probe_notes(persist: &[f64], claim: &[f64], workflows: usize) -> V
 /// The claim notes of one cell, one per claim kind with samples (issue
 /// #2248).
 ///
-/// Each pair is a kind and a duration in seconds.
+/// Each pair is a kind and a duration in seconds. A sample is one claim
+/// statement, not one row. A batch statement gives one sample for all its
+/// rows. Its kind is `workflow` when any of its rows is a workflow task.
 #[must_use]
 pub fn claim_kind_notes(claims: &[(autumn_harvest::telemetry::ClaimKind, f64)]) -> Vec<String> {
     autumn_harvest::telemetry::ClaimKind::ALL
@@ -2048,13 +2079,44 @@ mod tests {
         assert_eq!(claim_loops_override(Some("0")), None);
         assert_eq!(claim_loops_override(Some("two")), None);
         assert_eq!(claim_loops_override(None), None);
+    }
+
+    #[test]
+    fn the_claim_batch_knob_keeps_one_row_unless_it_names_a_cap_or_the_default() {
         let rows = |raw| claim_batch_override(raw).map(std::num::NonZeroU8::get);
+        for one_row in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("1"),
+            Some("off"),
+            Some(" 1 "),
+        ] {
+            assert_eq!(rows(one_row), None, "{one_row:?} keeps one row per claim");
+            assert_eq!(rows_per_claim_label(one_row), "1");
+        }
+        for typo in ["many", "defualt", "-4", "4 rows", "2.0", "256"] {
+            assert_eq!(rows(Some(typo)), None, "a typo keeps one row: {typo}");
+        }
+        assert_eq!(rows(Some("2")), Some(2));
+        assert_eq!(rows(Some("4")), Some(4));
         assert_eq!(rows(Some("8")), Some(8));
         assert_eq!(rows(Some(" 4 ")), Some(4));
-        assert_eq!(rows(Some("1")), None);
-        assert_eq!(rows(Some("0")), None);
-        assert_eq!(rows(Some("many")), None);
-        assert_eq!(rows(None), None);
+        assert_eq!(rows_per_claim_label(Some("8")), "up to 8");
+
+        let worker_default = autumn_harvest::builder::WorkerConfig::default().claim_batch_max;
+        assert_eq!(
+            worker_default.map(std::num::NonZeroU8::get),
+            Some(autumn_harvest::builder::DEFAULT_CLAIM_BATCH_MAX),
+            "the worker default claims in batches"
+        );
+        for word in ["default", " Default ", "DEFAULT"] {
+            assert_eq!(claim_batch_override(Some(word)), worker_default, "{word}");
+        }
+        assert_eq!(
+            rows_per_claim_label(Some("default")),
+            format!("up to {}", autumn_harvest::builder::DEFAULT_CLAIM_BATCH_MAX)
+        );
     }
 
     #[test]
@@ -4340,6 +4402,8 @@ pub mod db {
         {
             runtime.max_concurrent_claims = loops;
         }
+        // Unset keeps one row per claim, not the worker default. The
+        // published baselines were taken that way.
         runtime.claim_batch_max =
             super::claim_batch_override(std::env::var(super::CLAIM_BATCH_ENV_VAR).ok().as_deref());
         if !super::claim_lean_enabled(std::env::var(super::CLAIM_LEAN_ENV_VAR).ok().as_deref()) {

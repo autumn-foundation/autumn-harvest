@@ -1,3 +1,8 @@
+// The state generator and the plan helpers are `pub(crate)`, so that
+// `claim_batch_db_tests` can use them. The `redundant_pub_crate` nursery
+// lint flags that pattern in a private module. The reuse is intended.
+#![allow(clippy::redundant_pub_crate)]
+
 //! The lean form of the default claim (issue #2680).
 //!
 //! The lean form is a smaller statement in front of the window form. It is
@@ -61,7 +66,7 @@ use uuid::Uuid;
 use crate::cross_region_dr_tests::{RegistryGuard, registry_guard};
 use crate::decision_owner_claim_tests::OwnDb;
 
-const WORKER: &str = "lean-worker";
+pub(crate) const WORKER: &str = "lean-worker";
 
 /// The fallback CTE of the lean text. No other claim text holds the name.
 const LEAN_MARKER: &str = "claim_lean_fallback";
@@ -71,6 +76,10 @@ const WINDOW_MARKER: &str = "claim_window_fallback";
 
 /// A CTE that only the full statement holds.
 const FULL_MARKER: &str = "legacy_candidate";
+
+/// A CTE that only a batch text holds. A batch text also holds
+/// [`WINDOW_MARKER`], because it derives from the window text.
+pub(crate) const BATCH_MARKER: &str = "claim_ranked";
 
 /// The longest run of claims that skip the lean form.
 const SKIP_CAP: usize = 64;
@@ -408,7 +417,7 @@ async fn a_keyed_row_in_the_window_makes_the_lean_form_defer() {
 /// whole process. Such a pin fences each claim and each owner acquisition
 /// of a database with another generation. The guard keeps the tests that
 /// pin a generation out until it drops, and it clears the registry then.
-async fn clear_fence_registry() -> RegistryGuard {
+pub(crate) async fn clear_fence_registry() -> RegistryGuard {
     let guard = registry_guard().await;
     FenceRegistry::clear();
     guard
@@ -418,10 +427,13 @@ async fn clear_fence_registry() -> RegistryGuard {
 
 /// The claim statements that one connection ran, by form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-struct Forms {
-    lean: i64,
-    window: i64,
-    full: i64,
+pub(crate) struct Forms {
+    pub(crate) lean: i64,
+    /// The window statements of single claims. A batch statement is not one.
+    pub(crate) window: i64,
+    pub(crate) full: i64,
+    /// The batch statements, of each size.
+    pub(crate) batch: i64,
 }
 
 /// The runs of the prepared statements of `conn` whose text holds `marker`.
@@ -439,10 +451,12 @@ async fn runs_of(conn: &mut AsyncPgConnection, marker: &str) -> i64 {
 
 /// The claim forms that `conn` sent since it connected.
 async fn forms(conn: &mut AsyncPgConnection) -> Forms {
+    let batch = runs_of(conn, BATCH_MARKER).await;
     Forms {
         lean: runs_of(conn, LEAN_MARKER).await,
-        window: runs_of(conn, WINDOW_MARKER).await,
+        window: runs_of(conn, WINDOW_MARKER).await - batch,
         full: runs_of(conn, FULL_MARKER).await,
+        batch,
     }
 }
 
@@ -484,7 +498,7 @@ fn ordinal(task: &TaskQueueItem) -> i64 {
         .unwrap_or_else(|| panic!("row {} has no ordinal: {}", task.id, task.input))
 }
 
-async fn exec(conn: &mut AsyncPgConnection, sql: &str) {
+pub(crate) async fn exec(conn: &mut AsyncPgConnection, sql: &str) {
     conn.batch_execute(sql)
         .await
         .unwrap_or_else(|e| panic!("{e}: {sql}"));
@@ -530,7 +544,8 @@ async fn a_plain_queue_sends_the_lean_form_only() {
         Forms {
             lean: 13,
             window: 0,
-            full: 0
+            full: 0,
+            batch: 0,
         },
         "twelve claims and one empty poll, all in the lean form"
     );
@@ -542,7 +557,8 @@ async fn a_plain_queue_sends_the_lean_form_only() {
         Forms {
             lean: 13,
             window: 1,
-            full: 0
+            full: 0,
+            batch: 0,
         },
         "a caller with no loop state sends the window form first"
     );
@@ -715,7 +731,8 @@ async fn a_loop_of_two_claim_kinds_keeps_one_skip_for_each_kind() {
         Forms {
             lean: 312,
             window: 300,
-            full: 0
+            full: 0,
+            batch: 0,
         },
         "300 lean workflow claims, 12 lean attempts of any kind, 300 window claims"
     );
@@ -798,7 +815,11 @@ fn the_committed_census_scripts_name_the_lean_marker() {
 ///
 /// Each seeded row holds its ordinal in `input`. A copy of a state under
 /// other names gives the same text.
-async fn digest(conn: &mut AsyncPgConnection, queues: &[String], buckets: &[String]) -> String {
+pub(crate) async fn digest(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+    buckets: &[String],
+) -> String {
     #[derive(diesel::QueryableByName)]
     struct Digest {
         #[diesel(sql_type = diesel::sql_types::Text)]
@@ -1284,7 +1305,7 @@ fn small_pool(url: &str) -> DbPool {
 }
 
 /// The claim forms that the idle connections of `pool` sent.
-async fn pool_forms(pool: &DbPool) -> Forms {
+pub(crate) async fn pool_forms(pool: &DbPool) -> Forms {
     let mut held = Vec::new();
     for _ in 0..pool.status().size {
         held.push(pool.get().await.expect("a pool connection"));
@@ -1295,12 +1316,14 @@ async fn pool_forms(pool: &DbPool) -> Forms {
         total.lean += sent.lean;
         total.window += sent.window;
         total.full += sent.full;
+        total.batch += sent.batch;
     }
     total
 }
 
 /// Runs a worker with no handler over `queues` until its pool has sent
-/// `enough` windowed claim statements. No row of `queues` may be claimable.
+/// `enough` windowed or batch claim statements. No row of `queues` may be
+/// claimable.
 /// Returns the claim forms that its pool sent.
 async fn forms_of_a_worker_with_no_claim(
     url: &str,
@@ -1327,7 +1350,7 @@ async fn forms_of_a_worker_with_no_claim(
     for _ in 0..60 {
         tokio::time::sleep(Duration::from_millis(250)).await;
         let seen = pool_forms(&pool).await;
-        if seen.lean + seen.window >= enough {
+        if seen.lean + seen.window + seen.batch >= enough {
             break;
         }
     }
@@ -1338,40 +1361,55 @@ async fn forms_of_a_worker_with_no_claim(
 
 /// Runs a worker with no handler on an empty queue until its claim loop
 /// has polled a few times. Returns the claim forms that its pool sent.
-async fn forms_of_an_idle_worker(url: &str, claim_lean: bool) -> Forms {
-    let config = WorkerConfig::default().with_claim_lean(claim_lean);
+async fn forms_of_an_idle_worker(url: &str, config: WorkerConfig) -> Forms {
     forms_of_a_worker_with_no_claim(url, config, vec![unique_queue("lean-loop")], 5).await
 }
 
-/// Each claim loop of a worker holds lean state, so an idle worker polls
-/// with the lean form alone. With the switch off, the worker sends the
-/// window form first and never the lean form.
+/// Each claim loop of a worker holds lean state, so an idle worker that
+/// claims one row polls with the lean form alone. With the switch off, the
+/// worker sends the window form first and never the lean form.
+///
+/// A default worker claims in batches, and a batch claim sends no lean
+/// statement. So an idle default worker polls with the batch form alone.
 #[tokio::test]
 async fn a_worker_claim_loop_sends_the_lean_form_unless_the_switch_is_off() {
     let _registry = clear_fence_registry().await;
     let db = OwnDb::new().await;
     let url = db.url.clone();
+    // One row per claim: only a single claim sends the lean form.
+    let one_row = WorkerConfig::default().with_claim_batch_max(1);
 
-    let on = forms_of_an_idle_worker(&url, true).await;
+    let on = forms_of_an_idle_worker(&url, one_row.clone().with_claim_lean(true)).await;
     assert!(
         on.lean >= 5,
         "the claim loop polls in the lean form: {on:?}"
     );
     assert_eq!(
-        (on.window, on.full),
-        (0, 0),
+        (on.window, on.full, on.batch),
+        (0, 0, 0),
         "an empty queue never needs the window form: {on:?}"
     );
 
-    let off = forms_of_an_idle_worker(&url, false).await;
+    let off = forms_of_an_idle_worker(&url, one_row.with_claim_lean(false)).await;
     assert!(
         off.window >= 5,
         "the claim loop polls in the window form: {off:?}"
     );
     assert_eq!(
-        (off.lean, off.full),
-        (0, 0),
+        (off.lean, off.full, off.batch),
+        (0, 0, 0),
         "the switch keeps the lean form off: {off:?}"
+    );
+
+    let default = forms_of_an_idle_worker(&url, WorkerConfig::default()).await;
+    assert!(
+        default.batch >= 5,
+        "a default claim loop polls in the batch form: {default:?}"
+    );
+    assert_eq!(
+        (default.lean, default.window, default.full),
+        (0, 0, 0),
+        "a batch claim sends no single claim form: {default:?}"
     );
     db.drop_db().await;
 }
@@ -1417,7 +1455,7 @@ async fn a_weighted_worker_keeps_the_lean_form_on_its_plain_queue() {
 // ── Random states ───────────────────────────────────────────────────────────
 
 /// The build id of the worker of the differential tests.
-const BUILD: &str = "lean-diff-b1";
+pub(crate) const BUILD: &str = "lean-diff-b1";
 /// A build that `BUILD` is declared compatible with.
 const COMPATIBLE_BUILD: &str = "lean-diff-b3";
 const PAUSED_ACTIVITY: &str = "lean-diff-paused";
@@ -1433,8 +1471,8 @@ const OWN_PARTITION: i16 = 11;
 const STALE_PARTITION: i16 = 12;
 /// A partition that is not in the list of the worker.
 const OTHER_PARTITION: i16 = 13;
-const FENCE_SHARD: i32 = 7;
-const FENCE_GENERATION: i64 = 3;
+pub(crate) const FENCE_SHARD: i32 = 7;
+pub(crate) const FENCE_GENERATION: i64 = 3;
 
 /// The seeds of the differential tests. The list is fixed, so each run
 /// builds the same states.
@@ -1486,7 +1524,7 @@ enum Run {
 
 /// What makes a row not plain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Extra {
+pub(crate) enum Extra {
     Plain,
     /// The index of a concurrency key of the state.
     Key(usize),
@@ -1500,7 +1538,7 @@ enum Extra {
 // struct_excessive_bools: each flag is an independent trait of one row.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
-struct RowSpec {
+pub(crate) struct RowSpec {
     queue: usize,
     workflow: bool,
     activity: Activity,
@@ -1513,7 +1551,7 @@ struct RowSpec {
     new_start: bool,
     pin: Pin,
     session: bool,
-    extra: Extra,
+    pub(crate) extra: Extra,
     run: Run,
     partition: Option<i16>,
     /// The schedule-to-close deadline of the row has passed.
@@ -1529,13 +1567,13 @@ struct KeySpec {
 
 /// One random queue state, with no names.
 #[derive(Debug)]
-struct StateSpec {
+pub(crate) struct StateSpec {
     queues: usize,
     paused_queue: Option<usize>,
     keys: Vec<KeySpec>,
     /// The tokens of each rate-limit bucket. No bucket refills.
     buckets: Vec<u32>,
-    rows: Vec<RowSpec>,
+    pub(crate) rows: Vec<RowSpec>,
 }
 
 /// True for `percent` of the calls.
@@ -1666,7 +1704,7 @@ fn held_head_rows(queue: usize) -> Vec<RowSpec> {
 /// rows of a full head stay outside the window. Many of them at any
 /// priority put one in most windows. A state with gates also holds the rows
 /// of [`held_head_rows`].
-fn state_spec(seed: u64) -> StateSpec {
+pub(crate) fn state_spec(seed: u64) -> StateSpec {
     let mut rng = StdRng::seed_from_u64(seed);
     let queues = rng.random_range(1..=3_usize);
     let paused_queue = (queues > 1 && roll(&mut rng, 25)).then(|| rng.random_range(0..queues));
@@ -1709,9 +1747,9 @@ fn state_spec(seed: u64) -> StateSpec {
 
 /// The names of one written copy of a state.
 #[derive(Debug)]
-struct Written {
-    queues: Vec<String>,
-    buckets: Vec<String>,
+pub(crate) struct Written {
+    pub(crate) queues: Vec<String>,
+    pub(crate) buckets: Vec<String>,
 }
 
 /// The `VALUES` tuple of row `n` of a copy with the names of `tag`.
@@ -1789,7 +1827,11 @@ fn row_values(spec: &StateSpec, n: usize, tag: &str, run: Option<Uuid>) -> Strin
 ///
 /// Two copies of a state differ in their names only: queues, keys, buckets
 /// and run ids. Row `n` of each copy holds `n` in its input.
-async fn write_state(conn: &mut AsyncPgConnection, spec: &StateSpec, tag: &str) -> Written {
+pub(crate) async fn write_state(
+    conn: &mut AsyncPgConnection,
+    spec: &StateSpec,
+    tag: &str,
+) -> Written {
     let queues: Vec<String> = (0..spec.queues).map(|q| format!("{tag}-q{q}")).collect();
     let buckets: Vec<String> = (0..spec.buckets.len())
         .map(|b| format!("{tag}-rate-{b}"))
@@ -1857,7 +1899,7 @@ async fn write_state(conn: &mut AsyncPgConnection, spec: &StateSpec, tag: &str) 
 /// The rows that every state of a differential database reads. They are
 /// the paused activity, the labels and the compatible build of the worker,
 /// and one shard generation for the fence.
-async fn write_shared_rows(conn: &mut AsyncPgConnection) {
+pub(crate) async fn write_shared_rows(conn: &mut AsyncPgConnection) {
     exec(
         conn,
         &format!(
@@ -1922,7 +1964,7 @@ async fn turn_owner_mode_on(conn: &mut AsyncPgConnection) -> OwnedClaim {
 }
 
 /// The `$5` and `$6` binds of the differential tests.
-fn activity_binds() -> (Vec<String>, Vec<String>) {
+pub(crate) fn activity_binds() -> (Vec<String>, Vec<String>) {
     (
         vec![BREAKER_ACTIVITY.to_owned()],
         vec![
@@ -2202,7 +2244,7 @@ async fn random_states_claim_the_same_row_through_either_first_form() {
 }
 
 /// One claim of the worker of the differential tests over a written state.
-async fn state_claim(
+pub(crate) async fn state_claim(
     conn: &mut AsyncPgConnection,
     state: &Written,
     kind: Option<TaskType>,
@@ -2313,13 +2355,13 @@ async fn random_drains_take_the_same_rows_with_and_without_the_lean_form() {
 // ── The plan on a deep backlog ──────────────────────────────────────────────
 
 /// The pending rows of the deep backlog, all on one queue.
-const DEEP_ROWS: i64 = 40_000;
+pub(crate) const DEEP_ROWS: i64 = 40_000;
 /// The terminal rows of the deep backlog.
-const DEEP_TERMINAL_ROWS: i64 = 20_000;
+pub(crate) const DEEP_TERMINAL_ROWS: i64 = 20_000;
 /// The rows of the deep backlog with a live pin to the worker.
-const DEEP_PINNED_ROWS: i64 = 3;
+pub(crate) const DEEP_PINNED_ROWS: i64 = 3;
 /// The rows that one queue head reads: the `LIMIT` of each head scan.
-const HEAD_LIMIT: i64 = 32;
+pub(crate) const HEAD_LIMIT: i64 = 32;
 
 /// `INSERT` of `rows` plain rows in `state` on `queue`.
 ///
@@ -2327,7 +2369,7 @@ const HEAD_LIMIT: i64 = 32;
 /// start. No activity row is a new start, so one of the four heads of the
 /// queue is empty. An empty head on a deep queue reads the whole queue when
 /// its scan has no ordered index.
-fn deep_rows_sql(queue: &str, rows: i64, state: &str) -> String {
+pub(crate) fn deep_rows_sql(queue: &str, rows: i64, state: &str) -> String {
     format!(
         "INSERT INTO harvest_task_queue \
            (queue_name, task_type, activity_name, input, state, priority, max_attempts, \
@@ -2348,7 +2390,7 @@ fn plan_children(node: &serde_json::Value) -> &[serde_json::Value] {
 ///
 /// With `main_tree`, the walk leaves out each init plan and each subplan of
 /// a node, so it reads the row source of a CTE only.
-fn plan_nodes<'a>(
+pub(crate) fn plan_nodes<'a>(
     plan: &'a serde_json::Value,
     cte: Option<&'a str>,
     main_tree: bool,
@@ -2375,7 +2417,7 @@ fn plan_nodes<'a>(
 }
 
 /// A count that a plan node reports for each of its loops.
-fn per_loop(node: &serde_json::Value, key: &str) -> i64 {
+pub(crate) fn per_loop(node: &serde_json::Value, key: &str) -> i64 {
     node[key].as_i64().unwrap_or(0)
 }
 

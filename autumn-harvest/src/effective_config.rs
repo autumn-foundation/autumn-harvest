@@ -152,9 +152,11 @@ pub struct WorkerConfigView {
     /// The most claims that run at once on one shard, across the fleet.
     /// `None` when the cap is off.
     pub claim_slots_per_shard: Option<u16>,
-    /// The most rows that one claim statement takes. `None` takes one.
+    /// The most rows that one claim statement takes. `None` takes one. The
+    /// worker default is [`crate::builder::DEFAULT_CLAIM_BATCH_MAX`].
     pub claim_batch_max: Option<u8>,
-    /// Whether a claim loop sends the lean claim statement first.
+    /// Whether a claim of one row sends the lean claim statement first. A
+    /// batch claim sends no lean statement.
     pub claim_lean: bool,
     /// Worker poll interval, milliseconds.
     pub poll_interval_ms: u64,
@@ -1180,11 +1182,16 @@ mod tests {
         let view = |config: &WorkerConfig| {
             WorkerConfigView::from_worker_config(config, Duration::from_millis(500)).claim_batch_max
         };
-        assert_eq!(view(&WorkerConfig::default()), None);
         assert_eq!(
-            view(&WorkerConfig::default().with_claim_batch_max(4)),
-            Some(4)
+            view(&WorkerConfig::default()),
+            Some(crate::builder::DEFAULT_CLAIM_BATCH_MAX),
+            "the view reports the default batch"
         );
+        assert_eq!(
+            view(&WorkerConfig::default().with_claim_batch_max(8)),
+            Some(8)
+        );
+        assert_eq!(view(&WorkerConfig::default().with_claim_batch_max(1)), None);
     }
 
     #[test]

@@ -1068,6 +1068,10 @@ pub(crate) fn build_runtime_worker_with_capability_miss_budget(
 
 /// Build a `WorkerRuntimeConfig` with the standard test defaults.
 ///
+/// Each claim takes one row (`claim_batch_max: None`). A default worker
+/// claims in batches. `claim_batch_db_tests` and the suites that start from
+/// `WorkerConfig::default()` cover that path.
+///
 /// Some tests inspect the `Result` of `Worker::new`, such as the issue #699
 /// worker-startup rate-limit validation tests. They pass a registry directly,
 /// without the `.expect(...)` that `build_runtime_worker*` applies.

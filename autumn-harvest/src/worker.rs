@@ -85,7 +85,9 @@ pub type DbPool = deadpool::managed::Pool<
 /// write-once `GLOBAL_DEFAULT_WORKFLOW_QUEUE`.
 pub const DEFAULT_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-pub use crate::builder::{DEFAULT_GAUGE_SAMPLE_INTERVAL, DEFAULT_MAX_CONCURRENT_CLAIMS};
+pub use crate::builder::{
+    DEFAULT_CLAIM_BATCH_MAX, DEFAULT_GAUGE_SAMPLE_INTERVAL, DEFAULT_MAX_CONCURRENT_CLAIMS,
+};
 
 /// Ceiling for the overdue-schedule gauge's adaptive sampling interval (issue
 /// #696).
@@ -189,10 +191,14 @@ pub struct WorkerRuntimeConfig {
     /// `None` takes no slot. See
     /// [`crate::builder::WorkerConfig::with_claim_slots_per_shard`].
     pub claim_slots_per_shard: Option<std::num::NonZeroU16>,
-    /// The most rows that one claim statement takes. `None` takes one. See
+    /// The most rows that one claim statement takes. `None` takes one. The
+    /// conversion from [`crate::builder::WorkerConfig`] carries its value,
+    /// which is [`DEFAULT_CLAIM_BATCH_MAX`] by default. A struct literal
+    /// names its own value. See
     /// [`crate::builder::WorkerConfig::with_claim_batch_max`].
     pub claim_batch_max: Option<std::num::NonZeroU8>,
-    /// Whether a claim loop sends the lean claim statement first. See
+    /// Whether a claim of one row sends the lean claim statement first. A
+    /// batch claim sends no lean statement. See
     /// [`crate::builder::WorkerConfig::with_claim_lean`].
     pub claim_lean: bool,
     /// Interval between queue poll attempts when idle.
@@ -17814,6 +17820,23 @@ const fn claim_batch_share(workflow: usize, activity: usize, loops: usize, max: 
         1
     } else {
         max
+    }
+}
+
+/// The claim kind of the one duration sample of a batch statement.
+///
+/// A batch statement gives one sample for all its rows. The sample reads as
+/// a workflow claim when any row is a workflow task. So a batch of both
+/// kinds adds no activity sample, and a sample count is a statement count,
+/// not a row count. `harvest.queue.dispatched` counts each row.
+fn batch_claim_kind<'a>(task_types: impl IntoIterator<Item = &'a str>) -> ClaimKind {
+    if task_types
+        .into_iter()
+        .any(|task_type| task_type == TaskType::Workflow.as_str())
+    {
+        ClaimKind::Workflow
+    } else {
+        ClaimKind::Activity
     }
 }
 
@@ -43520,14 +43543,7 @@ impl Worker {
                 return 0;
             }
             Ok(queue::SlottedBatch::Claimed(tasks)) => {
-                if tasks
-                    .iter()
-                    .any(|task| task.task_type == TaskType::Workflow.as_str())
-                {
-                    ClaimKind::Workflow
-                } else {
-                    ClaimKind::Activity
-                }
+                batch_claim_kind(tasks.iter().map(|task| task.task_type.as_str()))
             }
             Ok(queue::SlottedBatch::Empty) => ClaimKind::Empty,
             Err(_) => ClaimKind::Error,
@@ -48778,7 +48794,7 @@ mod tests {
             max_concurrent_activities: 15,
             max_concurrent_claims: 3,
             claim_slots_per_shard: None,
-            claim_batch_max: None,
+            claim_batch_max: std::num::NonZeroU8::new(6),
             claim_lean: false,
             shutdown_timeout: Duration::from_secs(60),
             workflow_cache_size: 500,
@@ -48833,6 +48849,11 @@ mod tests {
         assert_eq!(runtime_cfg.max_concurrent_activities, 15);
         assert_eq!(runtime_cfg.max_concurrent_claims, 3);
         assert!(!runtime_cfg.claim_lean, "the switch passes through");
+        assert_eq!(
+            runtime_cfg.claim_batch_max,
+            std::num::NonZeroU8::new(6),
+            "the batch cap passes through"
+        );
         assert_eq!(runtime_cfg.shutdown_timeout, Duration::from_secs(60));
         assert_eq!(runtime_cfg.poll_interval, Duration::from_millis(500));
         assert_eq!(runtime_cfg.gauge_sample_interval, Duration::from_secs(20));
@@ -60889,6 +60910,25 @@ mod tests {
         );
     }
 
+    /// One batch statement gives one claim sample. A workflow task in the
+    /// batch makes it a workflow sample.
+    #[test]
+    fn a_batch_of_both_kinds_records_one_workflow_claim_sample() {
+        use super::batch_claim_kind;
+        assert_eq!(
+            batch_claim_kind(["activity", "workflow", "activity"]),
+            ClaimKind::Workflow
+        );
+        assert_eq!(
+            batch_claim_kind(["workflow", "workflow"]),
+            ClaimKind::Workflow
+        );
+        assert_eq!(
+            batch_claim_kind(["activity", "activity"]),
+            ClaimKind::Activity
+        );
+    }
+
     #[test]
     fn a_poll_passes_the_lean_state_of_its_loop_unless_the_switch_is_off() {
         let build = |claim_lean: bool| {
@@ -60974,7 +61014,11 @@ mod tests {
             edit(&mut cfg);
             Worker::new(cfg, Arc::new(HandlerRegistry::new(vec![], vec![]))).expect("valid config")
         };
-        assert_eq!(build(|_| {}).claim_batch_rows(false), 1, "off by default");
+        assert_eq!(
+            build(|_| {}).claim_batch_rows(false),
+            1,
+            "one row with the knob off: `default_runtime_config` is a literal with no batch"
+        );
         let on = |cfg: &mut WorkerRuntimeConfig| cfg.claim_batch_max = std::num::NonZeroU8::new(8);
         assert_eq!(
             build(on).claim_batch_rows(false),
@@ -61010,6 +61054,47 @@ mod tests {
                 .expect("valid config");
             assert_eq!(worker.claim_batch_rows(false), 1);
         }
+    }
+
+    /// A worker from `WorkerConfig::default()` claims in batches. The
+    /// conversion to the runtime config carries the default cap. With the
+    /// default 20 and 50 permits and two claim loops, each loop asks for the
+    /// cap. `with_claim_batch_max(1)` gives one row per claim.
+    #[test]
+    fn a_worker_from_the_default_config_claims_in_batches() {
+        let build = |config: WorkerConfig| {
+            let cfg = WorkerRuntimeConfig::from(config);
+            let shape = (
+                cfg.max_concurrent_workflows,
+                cfg.max_concurrent_activities,
+                cfg.max_concurrent_claims,
+                cfg.claim_batch_max.map(std::num::NonZeroU8::get),
+            );
+            let worker = Worker::new(cfg, Arc::new(HandlerRegistry::new(vec![], vec![])))
+                .expect("valid config");
+            (shape, worker)
+        };
+        let (shape, worker) = build(WorkerConfig::default());
+        assert_eq!(
+            shape,
+            (20, 50, 2, Some(crate::builder::DEFAULT_CLAIM_BATCH_MAX))
+        );
+        assert_eq!(crate::builder::DEFAULT_CLAIM_BATCH_MAX, 4);
+        assert_eq!(
+            worker.claim_batch_rows(false),
+            4,
+            "a share of ten workflow permits, capped at the default"
+        );
+        assert_eq!(
+            worker.claim_batch_rows(true),
+            4,
+            "a share of twenty-five activity permits, capped at the default"
+        );
+
+        let (shape, worker) = build(WorkerConfig::default().with_claim_batch_max(1));
+        assert_eq!(shape.3, None, "one row turns the batch off");
+        assert_eq!(worker.claim_batch_rows(false), 1);
+        assert_eq!(worker.claim_batch_rows(true), 1);
     }
 
     /// A permit that frees while a gated poll claims must still wake the idle
