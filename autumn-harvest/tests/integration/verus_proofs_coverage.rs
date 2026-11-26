@@ -543,7 +543,7 @@ fn render(tokens: &[String]) -> String {
 
 /// `item_contracts` reads the first `{` outside parentheses as the body of
 /// a fn. An `ensures` clause with a bare `match` would end the contract at
-/// that brace: the stored line would lose the arms and gain the proof body.
+/// that brace. The stored line would lose the arms and gain the proof body.
 /// So the lean claim model writes such a clause inside parentheses.
 #[test]
 fn the_claim_window_contracts_keep_each_ensures_arm() {
