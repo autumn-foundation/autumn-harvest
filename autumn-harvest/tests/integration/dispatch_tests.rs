@@ -303,6 +303,7 @@ fn worker_config(queue: &str, shards: Vec<ShardId>) -> WorkerRuntimeConfig {
         max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
         claim_slots_per_shard: None,
         claim_batch_max: None,
+        claim_lean: true,
         poll_interval: Duration::from_millis(20),
         shutdown_timeout: Duration::from_secs(2),
         cancellation_grace_period: Duration::from_secs(2),

@@ -3935,6 +3935,11 @@ pub struct StickyRoutingConfig {
 pub const DEFAULT_OWNER_DISK_CACHE_MIN_EVENTS: usize = 100;
 
 /// Worker concurrency and queue configuration.
+///
+/// Each boolean is an independent switch of one feature. The switches are
+/// not the states of one machine, so the excessive-bools lint does not
+/// apply.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
     /// Queues this worker polls. Defaults to `["default"]`.
@@ -3993,6 +3998,10 @@ pub struct WorkerConfig {
     ///
     /// Default: `None`, one row per claim. See [`Self::with_claim_batch_max`].
     pub claim_batch_max: Option<std::num::NonZeroU8>,
+    /// Whether a claim loop sends the lean claim statement first.
+    ///
+    /// Default: `true`. See [`Self::with_claim_lean`].
+    pub claim_lean: bool,
     /// The drain budget on shutdown or on a remote drain without a deadline.
     ///
     /// Default: [`DEFAULT_SHUTDOWN_TIMEOUT`] (25 s). Keep it at least 5 s
@@ -4583,6 +4592,7 @@ impl Default for WorkerConfig {
             max_concurrent_claims: DEFAULT_MAX_CONCURRENT_CLAIMS,
             claim_slots_per_shard: None,
             claim_batch_max: None,
+            claim_lean: true,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
             workflow_cache_size: 1000,
             resident_workflows: true,
@@ -5281,6 +5291,37 @@ impl WorkerConfig {
         self
     }
 
+    /// Turn the lean claim statement on or off. It is on by default.
+    ///
+    /// The lean statement is a smaller form of the default claim. It reads
+    /// the rows at the head of the polled queues. It is exact when none of
+    /// them has a concurrency key, a rate-limit key, a build pin or a
+    /// capability requirement. In every other case it takes no row and no
+    /// lock, and the claim sends the usual statement in the same transaction. Each claim loop then sends
+    /// the usual statement first for its next claims: 1 claim, then 2, then
+    /// 4, up to 64. A lean statement that takes a row ends that skip.
+    ///
+    /// Both statements take the same row, so the switch changes cost only.
+    /// With `false`, each claim sends the usual statement first. Use `false`
+    /// to compare the two, or to rule the lean statement out of a problem.
+    /// A claim with priority ageing, fairness keys or a batch sends no lean
+    /// statement with either value.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// assert!(WorkerConfig::default().claim_lean);
+    /// let config = WorkerConfig::default().with_claim_lean(false);
+    /// assert!(!config.claim_lean);
+    /// ```
+    #[must_use]
+    pub const fn with_claim_lean(mut self, on: bool) -> Self {
+        self.claim_lean = on;
+        self
+    }
+
     /// Cap the claims that run at once on one shard, across the fleet.
     ///
     /// Each claim first takes one of `slots` advisory locks of its shard. A
@@ -5841,6 +5882,14 @@ mod tests {
         );
         assert_eq!(rows(WorkerConfig::default().with_claim_batch_max(1)), None);
         assert_eq!(rows(WorkerConfig::default().with_claim_batch_max(0)), None);
+    }
+
+    #[test]
+    fn the_lean_claim_is_on_by_default_and_the_switch_turns_it_off() {
+        assert!(WorkerConfig::default().claim_lean);
+        let off = WorkerConfig::default().with_claim_lean(false);
+        assert!(!off.claim_lean);
+        assert!(off.with_claim_lean(true).claim_lean);
     }
 
     #[test]

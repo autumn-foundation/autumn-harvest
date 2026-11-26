@@ -29,7 +29,7 @@ use super::capacity_bench_support::{
 };
 use super::e2e_bench_support::CapacityArm;
 use super::e2e_bench_support::{
-    BenchScenario, CHECK_ENV_VAR, CLAIM_LOOPS_ENV_VAR, COMMIT_PROBE_ENV_VAR,
+    BenchScenario, CHECK_ENV_VAR, CLAIM_LEAN_ENV_VAR, CLAIM_LOOPS_ENV_VAR, COMMIT_PROBE_ENV_VAR,
     DISPATCHES_PER_WORKFLOW, INFLIGHT_ENV_VAR, MAX_CONCURRENT_ACTIVITIES, MAX_CONCURRENT_WORKFLOWS,
     POOL_SIZE_PER_SHARD, PUBLISHED_BASELINES, PUBLISHED_RESULTS_VERSION, REPRO_TOLERANCE_PCT,
     SCENARIO_FILTER_ENV_VAR, SHARD_COUNTS, SHARD_FILTER_ENV_VAR, SHARD_URLS_ENV_VAR,
@@ -152,6 +152,7 @@ fn every_documented_environment_variable_is_one_the_harness_reads() {
         STATS_DIR_ENV_VAR,
         COMMIT_PROBE_ENV_VAR,
         CLAIM_LOOPS_ENV_VAR,
+        CLAIM_LEAN_ENV_VAR,
     ] {
         assert!(
             doc.contains(var),

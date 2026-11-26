@@ -121,5 +121,7 @@ Known limits:
 
 - [`claim-slots.md`](claim-slots.md): a fleet-wide cap on the claims that
   run at once on one shard.
+- [`claim-lean.md`](claim-lean.md): the lean statement in front of the
+  single claim. A batch claim sends no lean statement.
 - [`docs/architecture.md`](../architecture.md#sharding): the claim loops of
   a worker.

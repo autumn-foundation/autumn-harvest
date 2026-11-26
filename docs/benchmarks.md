@@ -222,6 +222,7 @@ HARVEST_BENCH_SCENARIOS=signal_roundtrip HARVEST_BENCH_SHARDS=1 cargo xtask benc
 | `HARVEST_BENCH_INFLIGHT` | closed-loop in-flight workflows per shard — the load level. `throughput` only |
 | `HARVEST_BENCH_WORKFLOWS` | measured completions per shard. `throughput` only |
 | `HARVEST_BENCH_CLAIM_LOOPS` | claim loops per worker; unset keeps the worker default. The [resident hit-rate record](rnd/2026-10-11-resident-hit-rate.md) compares `1` against the default |
+| `HARVEST_BENCH_CLAIM_LEAN` | `0` or `off` turns the lean claim statement off (`WorkerConfig::with_claim_lean(false)`), so one binary runs both arms of a comparison. Unset keeps the worker default, which is on |
 | `HARVEST_BENCH_WORKER_PROCESSES` | worker processes per shard. Capacity arms only; the default is 4. Each process adds 33 connections per shard, and a cell refuses to run past `max_connections` |
 | `HARVEST_BENCH_CHECK` | also print the reproduction verdict |
 | `HARVEST_BENCH_KEEP` | leave the containers running afterwards |

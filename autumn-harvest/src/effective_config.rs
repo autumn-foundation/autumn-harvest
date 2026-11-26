@@ -154,6 +154,8 @@ pub struct WorkerConfigView {
     pub claim_slots_per_shard: Option<u16>,
     /// The most rows that one claim statement takes. `None` takes one.
     pub claim_batch_max: Option<u8>,
+    /// Whether a claim loop sends the lean claim statement first.
+    pub claim_lean: bool,
     /// Worker poll interval, milliseconds.
     pub poll_interval_ms: u64,
     /// Population sampler interval, milliseconds (issue #2668).
@@ -439,6 +441,7 @@ impl WorkerConfigView {
             max_concurrent_claims,
             claim_slots_per_shard,
             claim_batch_max,
+            claim_lean,
             shutdown_timeout,
             workflow_cache_size,
             resident_workflows,
@@ -501,6 +504,7 @@ impl WorkerConfigView {
             max_concurrent_claims: *max_concurrent_claims,
             claim_slots_per_shard: claim_slots_per_shard.map(std::num::NonZeroU16::get),
             claim_batch_max: claim_batch_max.map(std::num::NonZeroU8::get),
+            claim_lean: *claim_lean,
             poll_interval_ms: dur_ms(poll_interval),
             gauge_sample_interval_ms: dur_ms(*gauge_sample_interval),
             shutdown_timeout_ms: dur_ms(*shutdown_timeout),
@@ -1181,6 +1185,15 @@ mod tests {
             view(&WorkerConfig::default().with_claim_batch_max(4)),
             Some(4)
         );
+    }
+
+    #[test]
+    fn view_reports_the_lean_claim_switch() {
+        let view = |config: &WorkerConfig| {
+            WorkerConfigView::from_worker_config(config, Duration::from_millis(500)).claim_lean
+        };
+        assert!(view(&WorkerConfig::default()));
+        assert!(!view(&WorkerConfig::default().with_claim_lean(false)));
     }
 
     #[test]

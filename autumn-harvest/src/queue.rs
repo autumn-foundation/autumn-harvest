@@ -714,12 +714,36 @@ mod claim_window {
         pub const fn new() -> Self {
             Self { left: 0, span: 0 }
         }
+
+        /// True when the next windowed claim of the loop sends the lean
+        /// form first.
+        #[must_use]
+        pub const fn sends_lean(self) -> bool {
+            lean_first(self)
+        }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the claim does not send the lean form yet")
-    )]
+    #[cfg(test)]
+    impl LeanSkip {
+        /// The skip after one lean fallback, for a test of another module.
+        pub(crate) const fn after_fallback(self) -> Self {
+            lean_skip_after(self, Some(WindowStep::Fallback))
+        }
+    }
+
+    /// True when a claim sends the lean form before the window form.
+    ///
+    /// `windowed` is false for an ageing claim and for a fair claim. Those
+    /// send neither form. `lean` is the skip of the calling claim loop. A
+    /// caller with no loop state passes `None`, and its claim sends the
+    /// window form first.
+    pub(super) const fn sends_lean_first(windowed: bool, lean: Option<LeanSkip>) -> bool {
+        match lean {
+            Some(skip) => windowed && lean_first(skip),
+            None => false,
+        }
+    }
+
     /// True when the next claim of the loop sends the lean form first.
     ///
     /// `formal/verus/src/claim_window.rs` holds the proved copy.
@@ -741,10 +765,6 @@ mod claim_window {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the claim does not send the lean form yet")
-    )]
     /// The skip after one claim. `lean` is the step of the lean form, or
     /// `None` when the claim did not send it.
     ///
@@ -1306,10 +1326,9 @@ mod claim_window {
                 "NOT (harvest_task_queue.queue_name = ANY(paused_queues.names))",
                 false,
             ),
-            (
-                "harvest_task_queue.ctid = ANY(ARRAY( SELECT w.seek_ctid",
-                false,
-            ),
+            // This start holds no parenthesis. The walk of `row_guard` reads
+            // a line that names the table up to its closing parenthesis.
+            ("harvest_task_queue.ctid = ANY", false),
             ("( schedule_to_close_at IS NULL OR ", false),
             ("( sticky_worker_id IS NULL OR ", false),
             ("( session_id IS NULL OR ", false),
@@ -1462,6 +1481,77 @@ mod claim_window {
         fn a_claim_with_no_lean_form_leaves_a_clear_skip_alone() {
             let skip = LeanSkip::new();
             assert_eq!(lean_skip_after(skip, None), skip);
+        }
+
+        #[test]
+        fn a_claim_with_no_loop_state_sends_the_window_form_first() {
+            assert!(!sends_lean_first(true, None));
+            assert!(!sends_lean_first(false, None));
+        }
+
+        #[test]
+        fn an_ageing_or_fair_claim_never_sends_the_lean_form() {
+            assert!(!sends_lean_first(false, Some(LeanSkip::new())));
+        }
+
+        #[test]
+        fn a_windowed_claim_follows_the_skip_of_its_loop() {
+            let skip = LeanSkip::new();
+            assert!(skip.sends_lean());
+            assert!(sends_lean_first(true, Some(skip)));
+            let skipping = lean_skip_after(skip, Some(WindowStep::Fallback));
+            assert!(!skipping.sends_lean());
+            assert!(!sends_lean_first(true, Some(skipping)));
+            let back = lean_skip_after(skipping, None);
+            assert!(back.sends_lean());
+            assert!(sends_lean_first(true, Some(back)));
+        }
+
+        /// The claims of one loop that send the lean form, when the lean
+        /// form answers claim `n` with `answer(n)`.
+        fn lean_claims(claims: u32, answer: impl Fn(u32) -> WindowStep) -> Vec<u32> {
+            let mut skip = LeanSkip::new();
+            let mut sent = Vec::new();
+            for n in 1..=claims {
+                let lean = sends_lean_first(true, Some(skip)).then(|| answer(n));
+                if lean.is_some() {
+                    sent.push(n);
+                }
+                skip = lean_skip_after(skip, lean);
+            }
+            sent
+        }
+
+        #[test]
+        fn a_loop_that_always_falls_back_sends_the_lean_form_at_a_bounded_rate() {
+            let sent = lean_claims(330, |_| WindowStep::Fallback);
+            assert_eq!(sent, [1, 3, 6, 11, 20, 37, 70, 135, 200, 265, 330]);
+            assert!(sent.windows(2).all(|w| w[1] - w[0] <= LEAN_SKIP_CAP + 1));
+        }
+
+        #[test]
+        fn a_lean_claim_at_the_cap_starts_the_skip_from_one_again() {
+            // Claim 200 is the first lean attempt after a skip of 64 claims.
+            let sent = lean_claims(206, |n| {
+                if n == 200 {
+                    WindowStep::Claimed
+                } else {
+                    WindowStep::Fallback
+                }
+            });
+            assert_eq!(sent[8..], [200, 201, 203, 206]);
+        }
+
+        #[test]
+        fn a_loop_that_never_falls_back_sends_the_lean_form_on_each_claim() {
+            let sent = lean_claims(40, |n| {
+                if n % 3 == 0 {
+                    WindowStep::Empty
+                } else {
+                    WindowStep::Claimed
+                }
+            });
+            assert_eq!(sent, (1..=40).collect::<Vec<_>>());
         }
 
         #[test]
@@ -4307,6 +4397,65 @@ pub async fn claim_task_with_slots(
     owned: Option<&OwnedClaim>,
     slots: Option<ClaimSlots>,
 ) -> HarvestResult<SlottedClaim> {
+    claim_task_with_lean(
+        conn,
+        queues,
+        worker_id,
+        worker_build_id,
+        priority_aging_secs,
+        circuit_breaker_activities,
+        ineligible_activities,
+        shard,
+        kind,
+        fairness,
+        owned,
+        slots,
+        None,
+    )
+    .await
+}
+
+/// [`claim_task_with_slots`] with the lean form in front (issue #2680).
+///
+/// `lean` is the skip state of the calling claim loop. Each claim loop holds
+/// its own [`LeanSkip`] and passes it to each of its claims. The claim sends
+/// [`lean_claim_query_for`] first when the state allows it. A lean statement
+/// can take a row, or find an empty window. Either one ends the claim as
+/// the window form does: the same rechecks, the same hints and the same
+/// result. A lean statement that sets its flag locked no row. The claim
+/// then sends the unchanged window form in the same transaction. The next
+/// claims of the loop send the window form first. See [`LeanSkip`].
+///
+/// `None` is a caller with no claim loop. Its claim sends the window form
+/// first, as [`claim_task_with_slots`] does. An ageing claim and a fair
+/// claim send neither form, and leave `lean` as it is.
+///
+/// Only this claim has a lean form. The batch claim
+/// ([`claim_task_batch_with_slots`]), the by-id claim and the by-execution
+/// claim keep their texts and send no lean statement.
+///
+/// A lean statement that fails leaves `lean` as it was. The error rolls the
+/// claim transaction back, as an error of the window form does.
+///
+/// # Errors
+///
+/// As [`claim_task_with_fairness`].
+#[allow(clippy::too_many_arguments)]
+pub async fn claim_task_with_lean(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+    worker_id: &str,
+    worker_build_id: &str,
+    priority_aging_secs: Option<u32>,
+    circuit_breaker_activities: &[String],
+    ineligible_activities: &[String],
+    shard: Option<crate::types::ShardId>,
+    kind: Option<TaskType>,
+    fairness: ClaimFairness,
+    owned: Option<&OwnedClaim>,
+    slots: Option<ClaimSlots>,
+    mut lean: Option<&mut LeanSkip>,
+) -> HarvestResult<SlottedClaim> {
     if fairness == ClaimFairness::Keys {
         for queue in queues {
             crate::queue_fairness::validate_fairness_queue_name(queue)?;
@@ -4330,6 +4479,7 @@ pub async fn claim_task_with_slots(
                 fairness,
                 owned,
                 slots,
+                lean.as_deref_mut(),
             )
             .await?;
             if !matches!(claimed, SlottedClaim::Empty) {
@@ -4351,6 +4501,7 @@ pub async fn claim_task_with_slots(
         fairness,
         owned,
         slots,
+        lean,
     )
     .await
 }
@@ -4438,6 +4589,7 @@ async fn claim_task_one_statement(
     fairness: ClaimFairness,
     owned: Option<&OwnedClaim>,
     slots: Option<ClaimSlots>,
+    lean: Option<&mut LeanSkip>,
 ) -> HarvestResult<SlottedClaim> {
     // Two-phase claim using a CTE to avoid holding advisory locks during
     // broad WHERE filtering.
@@ -4635,17 +4787,33 @@ async fn claim_task_one_statement(
         // Ageing and fair claims have no seek window.
         let windowed = !ageing && fairness == ClaimFairness::Off;
         let task = if windowed {
-            let window = window_claim_query_for(kind, fence.is_some(), owned.is_some());
-            let row: Option<WindowClaimRow> = query(window)
-                .load::<WindowClaimRow>(conn)
-                .await
-                .map_err(crate::error::database_error)?
-                .into_iter()
-                .next();
-            let (task, fallback) = row.map_or((None, false), |r| (r.task, r.fallback));
-            match claim_window::window_step(task.is_some(), fallback) {
-                claim_window::WindowStep::Claimed | claim_window::WindowStep::Empty => task,
-                claim_window::WindowStep::Fallback => {
+            let (fenced, owner_form) = (fence.is_some(), owned.is_some());
+            // The lean form goes first when the claim loop allows it (issue
+            // #2680). A statement error returns here, before the skip
+            // changes, and rolls the transaction back.
+            let lean_step = if claim_window::sends_lean_first(windowed, lean.as_deref().copied()) {
+                let lean_form = lean_claim_query_for(kind, fenced, owner_form);
+                Some(claim_form_step(conn, query(lean_form)).await?)
+            } else {
+                None
+            };
+            if let Some(skip) = lean {
+                let answer = lean_step.as_ref().map(ClaimFormStep::step);
+                *skip = claim_window::lean_skip_after(*skip, answer);
+            }
+            // A lean fallback locked no row and changed no row. So the
+            // window form is a fresh attempt in the same transaction.
+            let step = match lean_step {
+                Some(step @ (ClaimFormStep::Claimed(_) | ClaimFormStep::Empty)) => step,
+                Some(ClaimFormStep::Fallback) | None => {
+                    let window = window_claim_query_for(kind, fenced, owner_form);
+                    claim_form_step(conn, query(window)).await?
+                }
+            };
+            match step {
+                ClaimFormStep::Claimed(task) => Some(*task),
+                ClaimFormStep::Empty => None,
+                ClaimFormStep::Fallback => {
                     let result: Vec<TaskQueueItem> = query(sql)
                         .load(conn)
                         .await
@@ -5151,6 +5319,9 @@ pub enum SlottedBatch {
 /// and sets the fallback flag, the full statement runs and takes one row
 /// at most.
 ///
+/// The batch claim has no lean form. Its text derives from the window form,
+/// and it sends no lean statement. See [`claim_task_with_lean`].
+///
 /// # Errors
 ///
 /// As [`claim_task_with_fairness`].
@@ -5276,6 +5447,17 @@ pub enum ClaimFormStep {
     Fallback,
 }
 
+impl ClaimFormStep {
+    /// The step with no row, as the skip kernels read it.
+    const fn step(&self) -> claim_window::WindowStep {
+        match self {
+            Self::Claimed(_) => claim_window::WindowStep::Claimed,
+            Self::Empty => claim_window::WindowStep::Empty,
+            Self::Fallback => claim_window::WindowStep::Fallback,
+        }
+    }
+}
+
 /// Sends one windowed claim form and decodes its one row.
 ///
 /// `query` holds the lean text or the window text. Both return the task
@@ -5300,7 +5482,7 @@ async fn claim_form_step(
     )
 }
 
-/// The windowed claim form that a test sends alone.
+/// The claim form that a test sends alone.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimFormProbe {
@@ -5308,6 +5490,9 @@ pub enum ClaimFormProbe {
     Lean,
     /// [`window_claim_query_for`].
     Window,
+    /// The full statement: [`claim_query_for`] or [`owned_claim_query_for`].
+    /// It has no flag, so its step is never [`ClaimFormStep::Fallback`].
+    Full,
 }
 
 /// The variant and the binds of one windowed claim form, for a test.
@@ -5334,11 +5519,11 @@ pub struct ClaimFormBinds<'a> {
     pub owned: Option<&'a OwnedClaim>,
 }
 
-/// Sends one windowed claim form alone, for a test.
+/// Sends one claim form alone, for a test.
 ///
 /// The statement goes through `CachedClaimQuery`, as a claim sends it. The
 /// caller opens the transaction and sets the plan settings. Priority ageing
-/// is off, because an ageing claim sends neither form.
+/// is off, because an ageing claim sends neither windowed form.
 ///
 /// # Errors
 ///
@@ -5353,6 +5538,10 @@ pub async fn claim_form_step_for_test(
     let sql = match form {
         ClaimFormProbe::Lean => lean_claim_query_for(binds.kind, fenced, owned),
         ClaimFormProbe::Window => window_claim_query_for(binds.kind, fenced, owned),
+        ClaimFormProbe::Full if owned => {
+            owned_claim_query_for(binds.kind, fenced, ClaimFairness::Off)
+        }
+        ClaimFormProbe::Full => claim_query_for(binds.kind, fenced, ClaimFairness::Off),
     };
     let query = CachedClaimQuery {
         sql,
@@ -5369,6 +5558,18 @@ pub async fn claim_form_step_for_test(
         by_id: None,
         owned: binds.owned.map(|o| (o.holder.as_str(), o.mask())),
     };
+    if form == ClaimFormProbe::Full {
+        let rows: Vec<TaskQueueItem> = query
+            .load(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        return Ok(rows
+            .into_iter()
+            .next()
+            .map_or(ClaimFormStep::Empty, |task| {
+                ClaimFormStep::Claimed(Box::new(task))
+            }));
+    }
     claim_form_step(conn, query).await
 }
 

@@ -298,6 +298,22 @@ pub fn claim_batch_override(raw: Option<&str>) -> Option<std::num::NonZeroU8> {
         .and_then(std::num::NonZeroU8::new)
 }
 
+/// Set to `0` or `off` to turn the lean claim statement off. Unset keeps
+/// the worker default, which is on.
+pub const CLAIM_LEAN_ENV_VAR: &str = "HARVEST_BENCH_CLAIM_LEAN";
+
+/// Whether the [`CLAIM_LEAN_ENV_VAR`] value leaves the lean claim on.
+///
+/// Only `0` and `off` turn it off. Every other value keeps the worker
+/// default, so a typo does not change the arm that a run measures.
+#[must_use]
+pub fn claim_lean_enabled(raw: Option<&str>) -> bool {
+    !raw.is_some_and(|value| {
+        let value = value.trim();
+        value == "0" || value.eq_ignore_ascii_case("off")
+    })
+}
+
 /// Set to `1` to run the throughput scenario in owner mode (issue #2252).
 ///
 /// The bench turns owner mode on in each shard database before the fleet
@@ -2039,6 +2055,19 @@ mod tests {
         assert_eq!(rows(Some("0")), None);
         assert_eq!(rows(Some("many")), None);
         assert_eq!(rows(None), None);
+    }
+
+    #[test]
+    fn the_lean_claim_knob_turns_the_lean_claim_off_and_nothing_else() {
+        assert!(claim_lean_enabled(None), "unset keeps the default");
+        assert!(claim_lean_enabled(Some("")));
+        assert!(claim_lean_enabled(Some("1")));
+        assert!(claim_lean_enabled(Some("on")));
+        assert!(claim_lean_enabled(Some("offf")), "a typo keeps the default");
+        assert!(!claim_lean_enabled(Some("0")));
+        assert!(!claim_lean_enabled(Some(" 0 ")));
+        assert!(!claim_lean_enabled(Some("off")));
+        assert!(!claim_lean_enabled(Some(" OFF ")));
     }
 
     #[test]
@@ -4313,6 +4342,9 @@ pub mod db {
         }
         runtime.claim_batch_max =
             super::claim_batch_override(std::env::var(super::CLAIM_BATCH_ENV_VAR).ok().as_deref());
+        if !super::claim_lean_enabled(std::env::var(super::CLAIM_LEAN_ENV_VAR).ok().as_deref()) {
+            runtime.claim_lean = false;
+        }
         runtime.sharded_pool = Some(sharded.clone());
         Arc::new(Worker::new(runtime, Arc::clone(registry)).expect("bench worker should build"))
     }
