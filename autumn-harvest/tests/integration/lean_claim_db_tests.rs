@@ -25,6 +25,7 @@
 //! The fence registry is one per process. A test here that needs it clear
 //! takes the registry guard of `cross_region_dr_tests` first.
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1393,12 +1394,45 @@ fn row_spec(
     }
 }
 
+/// Three held activity rows in front of each other row of a state.
+///
+/// One row has the paused activity, one the marked name and one the
+/// unmarked name.
+///
+/// A random row of such an activity is seldom first in the claim order. So
+/// with random rows only, a seed list can leave a gate with no claim to
+/// decide. These rows have the top priority and the greatest age. Each
+/// claim of an activity row in their state then passes all three. They
+/// draw no random number, so the other rows of a seed do not change.
+fn held_head_rows(queue: usize) -> Vec<RowSpec> {
+    [Activity::Paused, Activity::Marked, Activity::Unmarked]
+        .into_iter()
+        .zip(0_u32..)
+        .map(|(activity, n)| RowSpec {
+            queue,
+            workflow: false,
+            activity,
+            priority: 3,
+            age_ms: 9_000 + n,
+            future: false,
+            new_start: false,
+            pin: Pin::None,
+            session: false,
+            extra: Extra::Plain,
+            run: Run::None,
+            partition: None,
+            closed: false,
+        })
+        .collect()
+}
+
 /// The state of `seed`.
 ///
 /// A seed picks how many rows are not plain, and where they sit. No such
 /// row gives the lean form every answer. A few of them under the plain
 /// rows of a full head stay outside the window. Many of them at any
-/// priority put one in most windows.
+/// priority put one in most windows. A state with gates also holds the rows
+/// of [`held_head_rows`].
 fn state_spec(seed: u64) -> StateSpec {
     let mut rng = StdRng::seed_from_u64(seed);
     let queues = rng.random_range(1..=3_usize);
@@ -1421,10 +1455,16 @@ fn state_spec(seed: u64) -> StateSpec {
         .collect();
     let mut ages: Vec<u32> = (0..count).map(|i| 1_000 + 17 * i).collect();
     ages.shuffle(&mut rng);
-    let rows = ages
+    let mut rows: Vec<RowSpec> = ages
         .into_iter()
         .map(|age_ms| row_spec(&mut rng, queues, special, deep, gates, age_ms))
         .collect();
+    if gates {
+        let live_queue = (0..queues)
+            .find(|queue| Some(*queue) != paused_queue)
+            .unwrap_or(0);
+        rows.extend(held_head_rows(live_queue));
+    }
     StateSpec {
         queues,
         paused_queue,
@@ -1740,6 +1780,9 @@ async fn chain(
     )
 }
 
+/// The fewest lean claims that each gate of [`GateCover`] must decide.
+const GATE_COVER_FLOOR: u32 = 20;
+
 /// The answers of the lean form over a test.
 #[derive(Debug, Default)]
 struct Tally {
@@ -1749,6 +1792,74 @@ struct Tally {
     /// The fallbacks after which a later form claimed a row. A lean form
     /// that read its own fallback as an empty poll would lose these rows.
     fallback_then_claimed: u32,
+}
+
+/// The lean claims of a test that a pause gate or a `$6` gate decided.
+///
+/// A gate decides a claim when a held row is ahead of the claimed row in
+/// the claim order. Without the gate, the claim takes the held row. The
+/// window form behind a lean fallback does not count, so each count is an
+/// answer of the lean text alone.
+#[derive(Debug, Default)]
+struct GateCover {
+    /// A row of a paused queue is ahead.
+    paused_queue: u32,
+    /// A row of a paused activity is ahead.
+    paused_activity: u32,
+    /// A row of an activity that `$6` marks with `chr(1)` is ahead.
+    marked: u32,
+    /// A row of an activity that `$6` names with no mark is ahead.
+    unmarked: u32,
+    /// The claimed row is a workflow row, which has no activity name. The
+    /// paused activity and both `$6` names are in the arrays of each claim.
+    workflow_row: u32,
+}
+
+/// True when only its pause gate or its `$6` gate keeps `row` from a claim
+/// of `kind`.
+fn held_by_a_gate_only(row: &RowSpec, kind: Option<TaskType>) -> bool {
+    let kind_reads_it = match kind {
+        None => true,
+        Some(TaskType::Workflow) => row.workflow,
+        Some(TaskType::Activity) => !row.workflow,
+    };
+    kind_reads_it
+        && row.extra == Extra::Plain
+        && row.pin == Pin::None
+        && !row.future
+        && !row.closed
+        && matches!(row.run, Run::None | Run::Running)
+        && row.partition.is_none()
+}
+
+/// The claim order of two rows with no live pin: true when `a` is first.
+fn claims_before(a: &RowSpec, b: &RowSpec) -> bool {
+    // A new start is due 30 seconds after its schedule time.
+    let due = |row: &RowSpec| i64::from(row.new_start) * 30_000 - i64::from(row.age_ms);
+    (b.priority, due(a)) < (a.priority, due(b))
+}
+
+impl GateCover {
+    /// Counts the gates that decided the lean claim of row `claimed`.
+    fn count(&mut self, spec: &StateSpec, kind: Option<TaskType>, claimed: usize) {
+        let taken = &spec.rows[claimed];
+        self.workflow_row += u32::from(taken.workflow);
+        // A row with a live pin to the worker is first in each order.
+        if taken.pin == Pin::Own {
+            return;
+        }
+        let ahead = |held: &dyn Fn(&RowSpec) -> bool| {
+            u32::from(spec.rows.iter().any(|row| {
+                held(row) && held_by_a_gate_only(row, kind) && claims_before(row, taken)
+            }))
+        };
+        self.paused_queue += ahead(&|row| Some(row.queue) == spec.paused_queue);
+        let in_live_queue = |row: &RowSpec| Some(row.queue) != spec.paused_queue && !row.workflow;
+        self.paused_activity +=
+            ahead(&|row| in_live_queue(row) && row.activity == Activity::Paused);
+        self.marked += ahead(&|row| in_live_queue(row) && row.activity == Activity::Marked);
+        self.unmarked += ahead(&|row| in_live_queue(row) && row.activity == Activity::Unmarked);
+    }
 }
 
 /// The lean form in front changes no claim, over random states.
@@ -1777,6 +1888,7 @@ async fn random_states_claim_the_same_row_through_either_first_form() {
         partitions: vec![OWN_PARTITION, STALE_PARTITION],
     };
     let mut tally = Tally::default();
+    let mut cover = GateCover::default();
     for owner_mode in [false, true] {
         if owner_mode {
             owner = turn_owner_mode_on(&mut conn).await;
@@ -1798,7 +1910,14 @@ async fn random_states_claim_the_same_row_through_either_first_form() {
                          form answered {lean:?}"
                     );
                     match lean {
-                        Some(Outcome::Claimed(_)) => tally.claimed += 1,
+                        Some(Outcome::Claimed(_)) => {
+                            tally.claimed += 1;
+                            let row = lean_first
+                                .claimed
+                                .and_then(|n| usize::try_from(n).ok())
+                                .expect("a lean claim returns the ordinal of its row");
+                            cover.count(&spec, variant.kind, row);
+                        }
                         Some(Outcome::Empty) => tally.empty += 1,
                         Some(Outcome::Fallback) => {
                             tally.fallback += 1;
@@ -1834,6 +1953,17 @@ async fn random_states_claim_the_same_row_through_either_first_form() {
             && tally.fallback >= 100
             && tally.fallback_then_claimed >= 50,
         "the seeds give too few of one answer: {tally:?}"
+    );
+    // Each pause gate and each `$6` gate must decide lean claims. A change
+    // of the generator that stops one of them fails here.
+    println!("gates that decided a lean claim: {cover:?}");
+    assert!(
+        cover.paused_queue >= GATE_COVER_FLOOR
+            && cover.paused_activity >= GATE_COVER_FLOOR
+            && cover.marked >= GATE_COVER_FLOOR
+            && cover.unmarked >= GATE_COVER_FLOOR
+            && cover.workflow_row >= GATE_COVER_FLOOR,
+        "the seeds give too few lean claims that one gate decided: {cover:?}"
     );
     db.drop_db().await;
 }
@@ -1944,6 +2074,316 @@ async fn random_drains_take_the_same_rows_with_and_without_the_lean_form() {
         lean_alone >= 100 && sent.lean - lean_alone >= 20,
         "the seeds must give lean answers and lean fallbacks: {sent:?} over {claims} claims"
     );
+    db.drop_db().await;
+}
+
+// ── The plan on a deep backlog ──────────────────────────────────────────────
+
+/// The pending rows of the deep backlog, all on one queue.
+const DEEP_ROWS: i64 = 40_000;
+/// The terminal rows of the deep backlog.
+const DEEP_TERMINAL_ROWS: i64 = 20_000;
+/// The rows of the deep backlog with a live pin to the worker.
+const DEEP_PINNED_ROWS: i64 = 3;
+/// The rows that one queue head reads: the `LIMIT` of each head scan.
+const HEAD_LIMIT: i64 = 32;
+
+/// `INSERT` of `rows` plain rows in `state` on `queue`.
+///
+/// Three of each four rows are workflow rows, and one of them is a new
+/// start. No activity row is a new start, so one of the four heads of the
+/// queue is empty. An empty head on a deep queue reads the whole queue when
+/// its scan has no ordered index.
+fn deep_rows_sql(queue: &str, rows: i64, state: &str) -> String {
+    format!(
+        "INSERT INTO harvest_task_queue \
+           (queue_name, task_type, activity_name, input, state, priority, max_attempts, \
+            scheduled_at, new_start) \
+         SELECT '{queue}', CASE WHEN i % 4 = 3 THEN 'activity' ELSE 'workflow' END, \
+                CASE WHEN i % 4 = 3 THEN 'noop' END, '{{}}'::jsonb, '{state}', i % 3, 3, \
+                NOW() - make_interval(secs => 1 + (i % 3600)), i % 4 = 0 \
+         FROM generate_series(1, {rows}) AS i"
+    )
+}
+
+/// The child nodes of one plan node.
+fn plan_children(node: &serde_json::Value) -> &[serde_json::Value] {
+    node["Plans"].as_array().map_or(&[], Vec::as_slice)
+}
+
+/// Each node of `plan`, with the CTE that it runs in.
+///
+/// With `main_tree`, the walk leaves out each init plan and each subplan of
+/// a node, so it reads the row source of a CTE only.
+fn plan_nodes<'a>(
+    plan: &'a serde_json::Value,
+    cte: Option<&'a str>,
+    main_tree: bool,
+    found: &mut Vec<(Option<&'a str>, &'a serde_json::Value)>,
+) {
+    let named = plan["Subplan Name"]
+        .as_str()
+        .and_then(|name| name.strip_prefix("CTE "));
+    let cte = named.or(cte);
+    found.push((cte, plan));
+    for child in plan_children(plan) {
+        let side = matches!(
+            child["Parent Relationship"].as_str(),
+            Some("InitPlan" | "SubPlan")
+        );
+        let starts_a_cte = child["Subplan Name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("CTE "));
+        if main_tree && side && !starts_a_cte {
+            continue;
+        }
+        plan_nodes(child, cte, main_tree, found);
+    }
+}
+
+/// A count that a plan node reports for each of its loops.
+fn per_loop(node: &serde_json::Value, key: &str) -> i64 {
+    node[key].as_i64().unwrap_or(0)
+}
+
+/// The `EXPLAIN (ANALYZE, BUFFERS)` plan of one lean claim, rolled back.
+///
+/// The statement is prepared under the planner settings of a claim
+/// transaction, so the plan is the generic plan that a real claim reuses.
+/// The fence binds match the generation row of `write_shared_rows`.
+async fn lean_plan(
+    conn: &mut AsyncPgConnection,
+    variant: Variant,
+    queue: &str,
+    owner: &OwnedClaim,
+) -> serde_json::Value {
+    #[derive(diesel::QueryableByName)]
+    struct Plan {
+        #[diesel(sql_type = diesel::sql_types::Json, column_name = "QUERY PLAN")]
+        plan: serde_json::Value,
+    }
+    let mut binds = vec![format!(
+        "'{WORKER}', ARRAY['{queue}'], '', NULL, ARRAY[]::text[], ARRAY[]::text[]"
+    )];
+    if variant.fenced {
+        binds.push(format!(
+            "ARRAY[{FENCE_SHARD}]::int4[], ARRAY[{FENCE_GENERATION}]::int8[]"
+        ));
+    }
+    if variant.owned {
+        let mask = owner.mask().iter().fold(String::new(), |mut hex, byte| {
+            // A write to a string cannot fail.
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        });
+        binds.push(format!("'{}', '\\x{mask}'::bytea", owner.holder));
+    }
+    let binds = binds.join(", ");
+    exec(
+        conn,
+        &format!(
+            "BEGIN; {}; \
+             PREPARE lean_plan_probe(text, text[], text, bigint, text[], text[]) AS {}",
+            queue::CLAIM_PLAN_SETTINGS_SQL,
+            queue::lean_claim_query_for(variant.kind, variant.fenced, variant.owned)
+        ),
+    )
+    .await;
+    let rows: Vec<Plan> = diesel::sql_query(format!(
+        "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE lean_plan_probe({binds})"
+    ))
+    .load(conn)
+    .await
+    .unwrap_or_else(|e| panic!("explain the lean claim of {variant:?}: {e}"));
+    exec(conn, "ROLLBACK; DEALLOCATE lean_plan_probe;").await;
+    let plan = rows.into_iter().next().expect("one plan row").plan;
+    plan[0]["Plan"].clone()
+}
+
+/// Asserts the plan shape of one lean claim over the deep backlog.
+fn assert_the_lean_plan_is_bounded(plan: &serde_json::Value, case: &str, fenced: bool) {
+    let mut all = Vec::new();
+    plan_nodes(plan, None, false, &mut all);
+    let mut rows = Vec::new();
+    plan_nodes(plan, None, true, &mut rows);
+    let on_the_queue_table =
+        |node: &serde_json::Value| node["Relation Name"].as_str() == Some("harvest_task_queue");
+
+    let claimed = all
+        .iter()
+        .find(|(_, node)| node["Subplan Name"].as_str() == Some("CTE claimed"))
+        .map(|(_, node)| per_loop(node, "Actual Rows"));
+    assert_eq!(claimed, Some(1), "{case}: the lean form claims a row");
+
+    // The candidate scan reads the window rows by their row ids.
+    let candidate: Vec<&str> = rows
+        .iter()
+        .filter(|(cte, node)| *cte == Some("seek_candidate") && on_the_queue_table(node))
+        .map(|(_, node)| node["Node Type"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(candidate, ["Tid Scan"], "{case}: the candidate scan");
+    let joins = rows
+        .iter()
+        .filter(|(cte, node)| {
+            *cte == Some("seek_candidate")
+                && node["Node Type"]
+                    .as_str()
+                    .is_some_and(|kind| kind.contains("Join") || kind == "Nested Loop")
+        })
+        .count();
+    assert_eq!(
+        joins,
+        usize::from(fenced),
+        "{case}: the candidate scan joins the fence only"
+    );
+
+    // Each head reads its ordered index, and reads one window of it.
+    let heads: Vec<&serde_json::Value> = all
+        .iter()
+        .filter(|(cte, node)| *cte == Some("seek_heads") && on_the_queue_table(node))
+        .map(|(_, node)| *node)
+        .collect();
+    let mut queue_heads = 0;
+    for head in &heads {
+        let index = head["Index Name"].as_str().unwrap_or("none");
+        assert!(
+            head["Node Type"].as_str() == Some("Index Scan")
+                && (index == "idx_harvest_tq_claim_seek" || index == "idx_harvest_tq_sticky_poll"),
+            "{case}: a head scan reads {index}, not its ordered index: {head}"
+        );
+        if index == "idx_harvest_tq_claim_seek" {
+            queue_heads += 1;
+            let read = per_loop(head, "Actual Rows") + per_loop(head, "Rows Removed by Filter");
+            assert!(
+                per_loop(head, "Actual Loops") > 0 && read <= HEAD_LIMIT,
+                "{case}: a queue head reads {read} rows for each loop: {head}"
+            );
+        }
+    }
+    assert_eq!(queue_heads, 1, "{case}: one scan serves the queue heads");
+    // Four queue heads and the pin head make the window.
+    let window = 4 * HEAD_LIMIT + DEEP_PINNED_ROWS;
+    assert!(
+        !all.iter().any(|(cte, node)| *cte == Some("seek_heads")
+            && node["Node Type"].as_str() == Some("Sort")
+            && per_loop(node, "Actual Rows") > window),
+        "{case}: no sort in the heads reads more than the window"
+    );
+
+    // Each reader takes a pause array once, as a parameter of its scan.
+    let pause_reads: Vec<&serde_json::Value> = all
+        .iter()
+        .filter(|(_, node)| {
+            node["Node Type"].as_str() == Some("CTE Scan")
+                && matches!(
+                    node["CTE Name"].as_str(),
+                    Some("paused_queues" | "paused_activities")
+                )
+        })
+        .map(|(_, node)| *node)
+        .collect();
+    assert!(!pause_reads.is_empty(), "{case}: the plan reads the pauses");
+    for read in pause_reads {
+        assert!(
+            read["Parent Relationship"].as_str() == Some("InitPlan")
+                && per_loop(read, "Actual Loops") <= 1,
+            "{case}: a scan joins a pause array: {read}"
+        );
+    }
+
+    let buffers = per_loop(plan, "Shared Hit Blocks") + per_loop(plan, "Shared Read Blocks");
+    assert!(
+        buffers <= DEEP_ROWS / 20,
+        "{case}: the claim reads {buffers} buffers of a backlog of {DEEP_ROWS} rows"
+    );
+}
+
+/// The lean form keeps its plan on a deep backlog of one queue (issue
+/// #2680).
+///
+/// The lean text reads each pause array through a scalar subquery. So the
+/// pause tests are tests of each scan, not of a join. The planner then
+/// estimates the queue test of a table with one queue name at no row. An
+/// estimate that low once moved a head scan off its ordered index (issue
+/// #1971). This test pins the plan of each of the twelve lean texts:
+///
+/// - The candidate scan is a `Tid Scan`, and it joins the fence only.
+/// - Each head scan reads `idx_harvest_tq_claim_seek`, or the pin index,
+///   and a queue head reads one window of rows.
+/// - No scan joins a pause array.
+///
+/// It does so with fresh statistics, and with the statistics of an idle
+/// system. There an `ANALYZE` sees terminal rows only, and then a backlog
+/// arrives. Each plan is the generic plan under the claim settings.
+#[tokio::test]
+async fn the_lean_form_keeps_its_plan_on_a_deep_backlog_of_one_queue() {
+    #[derive(diesel::QueryableByName)]
+    struct Mcv {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        vals: String,
+    }
+    let _registry = clear_fence_registry().await;
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    write_shared_rows(&mut conn).await;
+    let queue = "lean-deep";
+    let terminal = deep_rows_sql(queue, DEEP_TERMINAL_ROWS, "COMPLETED");
+    let backlog = format!(
+        "{}; UPDATE harvest_task_queue SET sticky_worker_id = '{WORKER}', \
+           sticky_until = NOW() + INTERVAL '1 hour' \
+         WHERE id IN (SELECT id FROM harvest_task_queue WHERE state = 'PENDING' \
+                      LIMIT {DEEP_PINNED_ROWS})",
+        deep_rows_sql(queue, DEEP_ROWS, "PENDING")
+    );
+    exec(
+        &mut conn,
+        "ALTER TABLE harvest_task_queue SET (autovacuum_enabled = off)",
+    )
+    .await;
+    let mut owner = OwnedClaim {
+        holder: "lean-no-holder".to_owned(),
+        partitions: Vec::new(),
+    };
+    // With owner mode on, the claim guard refuses a workflow row to a claim
+    // with no owner. So the owned texts run in owner mode, and the other
+    // texts run before it.
+    for owner_mode in [false, true] {
+        if owner_mode {
+            owner = turn_owner_mode_on(&mut conn).await;
+        }
+        for statistics in ["fresh", "idle"] {
+            exec(&mut conn, "TRUNCATE harvest_task_queue CASCADE").await;
+            exec(&mut conn, &terminal).await;
+            if statistics == "fresh" {
+                exec(&mut conn, &backlog).await;
+                exec(&mut conn, "VACUUM ANALYZE harvest_task_queue").await;
+            } else {
+                exec(&mut conn, "VACUUM ANALYZE harvest_task_queue").await;
+                exec(&mut conn, &backlog).await;
+            }
+            let mcv: Mcv = diesel::sql_query(
+                "SELECT COALESCE(most_common_vals::text, '') AS vals FROM pg_stats \
+                 WHERE tablename = 'harvest_task_queue' AND attname = 'state'",
+            )
+            .get_result(&mut conn)
+            .await
+            .expect("read the state statistics");
+            assert_eq!(
+                mcv.vals.contains("PENDING"),
+                statistics == "fresh",
+                "{statistics} statistics show a PENDING row: {}",
+                mcv.vals
+            );
+            for variant in variants() {
+                if variant.owned != owner_mode {
+                    continue;
+                }
+                let case = format!("{statistics} statistics, {}", variant.name());
+                let plan = lean_plan(&mut conn, variant, queue, &owner).await;
+                assert_the_lean_plan_is_bounded(&plan, &case, variant.fenced);
+            }
+        }
+    }
     db.drop_db().await;
 }
 

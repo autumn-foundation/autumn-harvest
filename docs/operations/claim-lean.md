@@ -19,14 +19,34 @@ statement reads the same seek window as the window statement, in its own
 snapshot:
 
 - When each row of the window is plain, it takes the row that the window
-  statement takes. Each pause gate, pin gate and deadline gate is the same
-  text.
+  statement takes. Each pin gate and deadline gate is the same text. Each
+  pause gate gives the same result. See
+  [How it reads the pauses](#how-it-reads-the-pauses).
 - When the window is empty, it takes no row, as the window statement does.
 - In every other case it takes no row and no lock, and it sets a flag. The
   claim then sends the unchanged window statement in the same transaction.
 
 So both orders claim the same row. The lean statement changes the cost of a
 claim only.
+
+## How it reads the pauses
+
+The lean statement reads the pause lists in a way that needs fewer plan
+nodes. The window statement keeps its text.
+
+- **One read for each scan.** The lean statement reads each pause list
+  through a scalar subquery. Postgres runs it once, and each pause gate is
+  a test of its own scan. The window statement joins each list to each
+  scan.
+- **No aggregate.** The lean statement builds each list with
+  `ARRAY(SELECT ...)`. An empty list is an empty array in both forms.
+- **One list of held activities.** A worker names each activity at its
+  adaptive limit in the claim. The lean statement adds those names to the
+  list of paused activities. A claim holds a row of either kind in the same
+  way, so one test does the work of two.
+
+These change the plan of the lean statement only. A paused queue, a paused
+activity and an activity at its limit hold the same rows as before.
 
 ## The skip
 
@@ -82,7 +102,10 @@ statement off.
 - `lean_claim_db_tests.rs` compares both orders over random queue states,
   for each of the twelve statement variants. It also commits a peer claim
   between the snapshot and the row lock of a lean statement, and it counts
-  the statements that a claim loop sends.
+  the statements that a claim loop sends. It counts the lean claims that
+  each pause gate decided. On a deep backlog of one queue, it pins the plan
+  of each variant: a `Tid Scan` for the candidate and a bounded index scan
+  for each queue head.
 
 ## See also
 

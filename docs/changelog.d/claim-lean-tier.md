@@ -13,6 +13,13 @@ the same row with and without the lean statement.
   exact text and asserts its count, so a changed gate panics at first use.
   No existing claim text changed. The batch claim, the by-id claim and the
   by-execution claim have no lean form.
+- **Plan shape.** A second step of the derivation changes how the lean
+  text reads the pauses. It reads each pause array through a scalar
+  subquery, with no join. It builds each array with `ARRAY(SELECT ...)`,
+  with no aggregate. The paused activity array also holds the saturated
+  names of `$6`, so each scan has one activity test less. Each step is one
+  entry of `LEAN_PLAN_REWRITES`, and it asserts the count of each text that
+  it replaces.
 - **Dispatch.** `queue::claim_task_with_lean` takes the `LeanSkip` of the
   calling claim loop. A lean flag makes the next claims of that loop send
   the window statement first: 1 claim, then 2, then 4, up to 64. A lean
@@ -34,4 +41,6 @@ claim with the window-first claim over random queue states for the twelve
 variants, in owner mode and with an open and a closed fence. It commits a
 peer claim between the snapshot and the row lock of a lean statement. It
 counts the statements of a claim loop on a plain queue and on a queue with
-a keyed row at its head.
+a keyed row at its head. It counts the lean claims that a paused queue, a
+paused activity and each `$6` name decided. It pins the plan of each lean
+text on a deep backlog of one queue, with fresh and with idle statistics.
