@@ -533,6 +533,8 @@ pub mod retention;
 pub mod retry_budget;
 /// Retry envelope analysis: which configured attempts fit the deadline.
 pub mod retry_envelope;
+/// Outage ride-through: the longest outage that one retrying call survives.
+pub mod retry_ride_through;
 /// Retry storm forecast: how much load an outage adds, and where it lands.
 pub mod retry_storm;
 /// Continue-as-new run-chain assembly (issue #701).
