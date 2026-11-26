@@ -305,7 +305,8 @@ the change found this, and timed it.
 **The shipped rule** keeps one skip for each claim kind, and for each
 queue of a worker with queue weights. Each flag adds 4 claims to the
 skip, up to 64. Each lean claim that takes a row takes 1 claim off the
-next skip. So at least 4 window-first claims follow each flag.
+next skip. So at least 4 window-first claims of that skip follow each
+flag.
 
 [`mixed-kinds/run.sh`](perf-artifacts/claim-lean-tier/mixed-kinds/run.sh)
 replays a loop of 1,200 claims against the shipped texts, with a keyed

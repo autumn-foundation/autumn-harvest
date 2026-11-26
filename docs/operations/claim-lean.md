@@ -31,12 +31,15 @@ snapshot:
 So both orders claim the same row. The lean statement changes the cost of a
 claim only.
 
-Three causes set the flag:
+These causes set the flag:
 
 - a window row that is not plain;
 - a parked row: the workflow task of a paused run, or a task of a run past
   its deadline;
-- window rows that peer claims hold, when no other window row is free.
+- window rows that peer claims hold, when no other window row is free;
+- a closed DR fence, when the generation pin of the process is stale;
+- in owner mode, a workflow row of a partition that the claim lists and
+  another holder owns.
 
 So a queue of plain rows only can still set the flag.
 
@@ -83,24 +86,30 @@ measurement it cost a quarter to a half of a window statement. A queue that
 keeps a keyed row or a parked row at its head would pay that on each claim.
 So each claim loop keeps a skip:
 
-- After a lean statement sets its flag, the next claims of the loop send
+- After a lean statement sets its flag, the next claims of that skip send
   the window statement first.
 - Each flag adds 4 claims to the skip, up to 64. The first flag skips 4
   claims. A second flag with no lean claim before it skips 8.
 - Each lean statement that takes a row takes 1 claim off the next skip. An
   empty poll keeps it.
 
-At least 4 claims with no lean statement follow each flag. So a loop sends
-one wasted lean statement in 5 claims at most. A cause that stays, such as
-a keyed row at a queue head, costs about one statement in 65 claims.
+At least 4 claims of the same skip follow each flag with no lean statement.
+So one skip sends one wasted lean statement in 5 of its claims at most. A
+loop holds more than one skip, as the list below shows. Each skip can set
+its first flag on its first claim. A cause that stays, such as a keyed row
+at a queue head, costs about one statement in 65 claims.
 
 A loop can see plain windows and other windows in turn. Examples are a
 shallow queue of plain and keyed rows, and a parked row at a head while
 plain rows arrive one at a time. One lean claim takes only 1 claim off the
-skip, so such a loop moves to the window statement first. A loop keeps the
-lean statement first while it takes more than 4 rows for each flag. A loop
-with more flags than that sends the window statement first on most claims,
-as a worker with the lean statement off does.
+skip, so such a loop moves to the window statement first.
+
+The skip gets shorter only while lean statements take more than 4 rows for
+each flag. A row that the window statement takes does not count. When one
+window in 20 holds a cause of the flag, the loop sends the lean statement
+first on about 8 claims in 10. With one window in 10, it does so on about 6
+claims in 10. With one window in 5, the loop sends the window statement
+first on most claims. A worker with the lean statement off does the same.
 
 The skip counts claims. It reads no clock and no random number. A claim
 loop holds one skip:
@@ -110,9 +119,12 @@ loop holds one skip:
 - for each queue, when the worker has queue weights. Such a worker claims
   queue by queue.
 
-So one loop never changes the skip of another loop. A keyed queue does not
-take the lean statement away from a plain queue of the same worker, and a
-keyed activity head does not take it away from a workflow-only claim.
+So one loop never changes the skip of another loop. A keyed activity head
+does not take the lean statement away from a workflow-only claim. With
+queue weights, a keyed queue does not take it away from a plain queue of
+the same worker. With no queue weights, one claim reads the heads of every
+queue of the worker. A keyed row at one of those heads then sets the flag
+of that claim.
 
 ## Claims that send no lean statement
 

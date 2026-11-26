@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Usage: run_cell.sh <label> <binary> <scenarios> <outdir>
 # Runs one e2e_bench invocation at 1 shard, and records the claim census.
+# The census is exact for a build before issue #2680 only.
+# The window form and the lean form return one row for each call.
+# So claimed_rows counts those statements, and empty_polls counts the full form only.
 set -u
 label=$1; bin=$2; scen=$3; out=$4
 mkdir -p "$out"

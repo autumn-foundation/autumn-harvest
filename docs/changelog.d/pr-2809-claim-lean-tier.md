@@ -31,8 +31,9 @@ until its transaction ends, as the window statement does.
   calling claim loop. A lean flag makes the next claims of that loop send
   the window statement first. Each flag adds 4 claims to the skip, up to
   64. Each lean statement that takes a row takes 1 claim off the next skip.
-  So a loop sends one wasted lean statement in 5 claims at most, and a loop
-  of plain and keyed windows in turn moves to the window statement first.
+  So one skip sends one wasted lean statement in 5 of its claims at most. A
+  loop of plain and keyed windows in turn moves to the window statement
+  first.
   The skip counts claims and reads no clock. Each poll loop and each
   follower holds one skip per shard and per claim kind. A worker with queue
   weights also holds one skip per queue. A caller with no state, such as

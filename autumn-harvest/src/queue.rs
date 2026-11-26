@@ -994,8 +994,8 @@ mod claim_window {
     /// The claims that one lean fallback adds to the skip.
     ///
     /// A lean statement that sets its flag costs more than a lean claim
-    /// saves. So a loop keeps the lean form first only while it takes more
-    /// rows than this for each fallback.
+    /// saves. So a loop keeps the lean form first only while its lean claims
+    /// take more rows than this for each fallback.
     pub(super) const LEAN_SKIP_STEP: u32 = 4;
 
     /// One lean-form skip (issue #2680). A claim loop holds one for each
@@ -1038,7 +1038,12 @@ mod claim_window {
     /// makes each lean claim of any kind fall back, and a workflow claim
     /// still reads plain rows only. With one skip for both, each lean
     /// workflow claim would shorten the skip of the other kind. So each kind
-    /// has its own skip. See `LeanSkip` for the rule of one skip.
+    /// has its own skip.
+    ///
+    /// After a lean fallback, the next claims of that kind send the window
+    /// form first. Each fallback adds 4 claims to the skip, up to 64 claims.
+    /// Each lean claim that takes a row takes 1 claim off the next skip. An
+    /// empty poll keeps the skip.
     ///
     /// Each claim loop holds its own state, so one loop never changes the
     /// skip of another loop. A worker with queue weights claims queue by

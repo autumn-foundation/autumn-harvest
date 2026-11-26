@@ -773,10 +773,11 @@ async fn a_parked_plain_row_of_a_paused_run_sets_the_lean_flag() {
 
 /// The committed census scripts count the lean form. Each one filters
 /// `pg_stat_statements` by text, and the lean text does not start with the
-/// `worker_info` CTE. So each script names the lean marker.
+/// `worker_info` CTE. So the filter of each script names the lean marker.
 #[test]
 fn the_committed_census_scripts_name_the_lean_marker() {
     let root = crate::ci_run_coverage::repo_root();
+    let filter = format!("OR query LIKE 'WITH %{LEAN_MARKER}%'");
     for script in [
         "docs/perf-artifacts/claim-window-split/claim_forms.sql",
         "docs/perf-artifacts/claim-batch/claim_forms.sql",
@@ -785,8 +786,8 @@ fn the_committed_census_scripts_name_the_lean_marker() {
         let text = std::fs::read_to_string(root.join(script))
             .unwrap_or_else(|e| panic!("read {script}: {e}"));
         assert!(
-            text.contains(LEAN_MARKER),
-            "{script} must count the statements that hold {LEAN_MARKER}"
+            text.contains(&filter),
+            "the filter of {script} must keep the statements that hold {LEAN_MARKER}"
         );
     }
 }
