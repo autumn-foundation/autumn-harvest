@@ -12,5 +12,6 @@ guaranteed, possible or exhausted for every jitter seed.
 `worst_recovery_lag` gives the longest wait after the outage ends. The module
 is pure and in-memory. It adds no event, no migration and no query.
 
-Ten unit tests and one doctest in `retry_ride_through.rs` cover the windows,
-the deadline, jitter, a hang, the recovery lag and the attempt horizon.
+Twelve unit tests and one doctest in `retry_ride_through.rs` cover the windows,
+the deadline, jitter, a hang, the conditional failure window, the recovery
+lag and the attempt horizon.

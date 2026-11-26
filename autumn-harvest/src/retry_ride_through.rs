@@ -19,6 +19,11 @@
 //! delay at each retry. The latest start takes the longest. So every bound
 //! below holds for every jitter seed, and the report needs no sampling.
 //!
+//! A window alone is not enough to judge an outage. An attempt that starts
+//! after the outage succeeds, so no later attempt runs on that seed. Only the
+//! part of a window before the outage end can lead to a retry. The bounds
+//! below use that conditional part, so they are tight.
+//!
 //! ## Example
 //!
 //! ```rust
@@ -52,6 +57,11 @@ pub struct StartWindow {
     pub earliest: Duration,
     /// The latest time this attempt can start.
     pub latest: Duration,
+    /// The longest time from this start to the next start, if it fails.
+    ///
+    /// It is the failure cost plus the longest backoff. It is `None` when no
+    /// later attempt is known.
+    pub max_next_gap: Option<Duration>,
 }
 
 /// The outcome of one call through an outage of a given length.
@@ -61,7 +71,7 @@ pub enum Recovery {
     Guaranteed {
         /// The earliest time that a healthy attempt can start.
         earliest: Duration,
-        /// The latest time that the first healthy attempt can start.
+        /// The first healthy attempt starts no later than this time.
         latest: Duration,
     },
     /// Some jitter seeds give a healthy attempt. Other seeds use up the
@@ -107,47 +117,69 @@ impl RideThroughProfile {
         if first.attempt > 1 && self.schedule_to_close.is_some_and(|d| earliest >= d) {
             return Recovery::Exhausted;
         }
-        // The first attempt that must start after the outage bounds the worst case.
-        match self.windows.iter().find(|w| w.earliest >= outage) {
-            Some(sure) if self.starts_for_sure(sure) => Recovery::Guaranteed {
-                earliest,
-                latest: sure.latest,
-            },
-            _ => Recovery::Possible { earliest },
+        if outage > self.guaranteed_ride_through() {
+            return Recovery::Possible { earliest };
         }
+        // A seed reaches its first healthy attempt one gap after its last
+        // failed attempt. That failed attempt started before the outage end.
+        let latest = self
+            .windows
+            .iter()
+            .filter(|w| w.earliest < outage)
+            .filter_map(|w| {
+                w.max_next_gap
+                    .map(|gap| w.latest.min(outage).saturating_add(gap))
+            })
+            .max()
+            .unwrap_or(Duration::ZERO);
+        Recovery::Guaranteed { earliest, latest }
     }
 
-    /// `true` when every jitter seed starts `window` before the deadline.
-    fn starts_for_sure(&self, window: &StartWindow) -> bool {
-        window.attempt == 1 || self.schedule_to_close.is_none_or(|d| window.latest < d)
-    }
-
-    /// The windows that every jitter seed starts before the deadline.
-    fn sure_windows(&self) -> impl Iterator<Item = &StartWindow> {
-        self.windows.iter().take_while(|w| self.starts_for_sure(w))
+    /// The longest outage that a failure at `window` lets every seed survive.
+    ///
+    /// It is `None` when a failure at this window never stops a recovery.
+    fn ride_through_cap(&self, window: &StartWindow) -> Option<Duration> {
+        let Some(gap) = window.max_next_gap else {
+            // No later attempt is known, so this attempt must not fail.
+            return Some(window.earliest);
+        };
+        let deadline = self.schedule_to_close?;
+        // A failure at `s` starts the next attempt before `s + gap`. The
+        // failure happens only when `s` is before the outage end.
+        match deadline.checked_sub(gap) {
+            Some(bound) if window.latest < bound => None,
+            Some(bound) => Some(window.earliest.max(bound)),
+            None => Some(window.earliest),
+        }
     }
 
     /// The longest outage that every jitter seed survives.
     ///
-    /// It is zero when no retry is sure to start before the deadline.
+    /// It is zero when no retry is sure to start before the deadline. A
+    /// truncated profile counts its last listed attempt as the final one.
     #[must_use]
     pub fn guaranteed_ride_through(&self) -> Duration {
-        self.sure_windows()
-            .last()
-            .map_or(Duration::ZERO, |w| w.earliest)
+        self.windows
+            .iter()
+            .filter_map(|w| self.ride_through_cap(w))
+            .min()
+            .unwrap_or(Duration::ZERO)
     }
 
     /// The longest time that a healed dependency can wait for the next try.
     ///
-    /// It covers only the outages that every seed survives. It is `None`
-    /// when the profile has no guaranteed retry.
+    /// It covers only the outages that every seed survives. A wait can come
+    /// as close to this bound as you like. It is `None` when the profile has
+    /// no guaranteed retry.
     #[must_use]
     pub fn worst_recovery_lag(&self) -> Option<Duration> {
-        // An outage that ends just after the earliest start of one attempt can
-        // wait until the latest start of the next attempt.
-        let sure: Vec<_> = self.sure_windows().collect();
-        sure.windows(2)
-            .map(|pair| pair[1].latest.saturating_sub(pair[0].earliest))
+        // Each attempt that can fail inside a survived outage can wait one
+        // full gap. Different seeds never add up, so the lag is one gap.
+        let ride = self.guaranteed_ride_through();
+        self.windows
+            .iter()
+            .filter(|w| w.earliest < ride)
+            .filter_map(|w| w.max_next_gap)
             .max()
     }
 }
@@ -167,6 +199,12 @@ pub fn profile(
     let mut earliest = Duration::ZERO;
     let mut latest = Duration::ZERO;
     let mut truncated = false;
+    let gap_after = |attempt: u32| {
+        (attempt < configured_attempts).then(|| {
+            let (_, max_backoff) = retry_delay_bounds(policy, attempt);
+            failure_cost.saturating_add(max_backoff)
+        })
+    };
     for attempt in 1..=configured_attempts {
         if attempt > MAX_LISTED_ATTEMPTS {
             truncated = true;
@@ -188,7 +226,11 @@ pub fn profile(
             attempt,
             earliest,
             latest,
+            max_next_gap: gap_after(attempt),
         });
+    }
+    if truncated && let Some(last) = windows.last_mut() {
+        last.max_next_gap = None;
     }
     RideThroughProfile {
         schedule_to_close,
@@ -282,9 +324,38 @@ mod tests {
             ride.recovery(secs(7)),
             Recovery::Guaranteed {
                 earliest: secs(7),
-                latest: secs(20)
+                latest: secs(17)
             }
         );
+    }
+
+    #[test]
+    fn a_failed_attempt_must_start_before_the_outage_end() {
+        // Starts in [0, 0], [5, 10], [10, 20] and [15, 30] s. The deadline is 25 s.
+        let ride = profile(
+            &fixed(4, 10, JitterPolicy::Equal),
+            Duration::ZERO,
+            Some(secs(25)),
+        );
+        assert_eq!(ride.guaranteed_ride_through(), secs(15));
+        assert_eq!(
+            ride.recovery(secs(15)),
+            Recovery::Guaranteed {
+                earliest: secs(15),
+                latest: secs(25)
+            }
+        );
+        let longer = secs(15) + Duration::from_millis(1);
+        assert_eq!(
+            ride.recovery(longer),
+            Recovery::Possible { earliest: longer }
+        );
+    }
+
+    #[test]
+    fn jitter_uncertainty_does_not_count_as_lag() {
+        let ride = profile(&fixed(6, 10, JitterPolicy::Equal), Duration::ZERO, None);
+        assert_eq!(ride.worst_recovery_lag(), Some(secs(10)));
     }
 
     #[test]
@@ -327,6 +398,7 @@ mod tests {
         let policy = fixed(6, 10, JitterPolicy::Equal);
         let ride = profile(&policy, secs(1), Some(secs(40)));
         let limit = ride.guaranteed_ride_through();
+        assert_eq!(limit, secs(29));
         assert!(matches!(ride.recovery(limit), Recovery::Guaranteed { .. }));
         let longer = limit + Duration::from_millis(1);
         assert!(!matches!(
