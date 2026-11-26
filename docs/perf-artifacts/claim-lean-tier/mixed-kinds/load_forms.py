@@ -1,4 +1,4 @@
-"""Write forms.sql: a table of the dumped claim texts, and one PREPARE per text.
+"""Write forms.sql: one PREPARE for each dumped claim text.
 
 Usage: load_forms.py <dir of <variant>-{lean,window}.sql> > forms.sql
 Only the three plain variants (any, workflow, activity) are prepared.

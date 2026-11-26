@@ -6,8 +6,9 @@
 # settings, then a rollback. The two forms run in turn, and the order swaps
 # each round. <texts dir> holds <variant>-window.sql and <variant>-lean.sql,
 # as lean_claim_db_tests::write_every_windowed_claim_text writes them.
-# The fixture is pgbench-seed.sql on a copy of a migrated database. The run
-# ends with the plan node count of each form, from EXPLAIN of a generic plan.
+# The fixture is pgbench-seed.sql on a copy of the migrated database that
+# TEMPLATE names. The run ends with the plan node count of each form, from
+# EXPLAIN of a generic plan.
 set -eu
 texts=$1; out=$2; rounds=$3; secs=$4; variant=${5:-any}
 here=$(cd "$(dirname "$0")" && pwd)

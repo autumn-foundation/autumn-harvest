@@ -72,7 +72,7 @@ saturated-activity gate.
   form** (`claim_lean`, on by default). The lean form is exact for a
   window of plain rows, and it hands each other case to the unchanged
   window form. A caller of `queue::claim_task` still sends the window form
-  first. On the e2e bench the lean form answers 10,117 of 10,153 claim
+  first. On the e2e bench the lean form is 10,117 of 10,153 claim
   statements, and the `throughput` cell gains 1.17 times. See
   [the lean claim tier](performance-claim-lean-tier.md) and
   [Lean claim](operations/claim-lean.md).

@@ -14,8 +14,8 @@ initializes, and it puts a smaller statement in front of it.
 
 * **The window form still starts plan nodes that most claims never use.**
   One window claim initializes 131 plan nodes, and 56 of them never run.
-  They serve concurrency keys, rate limits, build pins and capability
-  requirements.
+  Most of them serve concurrency keys, rate limits, build pins and
+  capability requirements.
 * **The lean form drops them.** It is exact for a seek window of plain
   rows, and it initializes 69 plan nodes. In each other case it claims no
   row, changes no row and sets a flag. The unchanged window form then
@@ -135,8 +135,9 @@ each pause gate gives the same result.
   row is other than plain. So the gates that it drops pass for each row
   of that window, and the window form takes the same row from the same
   snapshot.
-* **No row, and the flag is clear.** The window holds no row at all. The
-  window form finds no row either. With no window row, it does not ask
+* **No row, and the flag is clear.** The window holds no row, or the run
+  of the locked row is past its deadline at the clock read. The window
+  form answers the same from that snapshot. In neither case does it ask
   for the full statement.
 * **The flag is set.** The lean form claimed no row and changed no row. It
   debited no token and took no advisory lock. The window form then reads a
@@ -188,7 +189,7 @@ rollback after each claim
 
 The lean form is faster in twelve of twelve rounds.
 
-**The plan rewrites are about 0.08 ms of that.** A second set of runs compares
+**The plan rewrites are 0.05 to 0.08 ms of that.** A second set of runs compares
 the lean text before and after the rewrites
 ([`rewrites/results.txt`](perf-artifacts/claim-lean-tier/rewrites/results.txt)).
 The `base` rows there are the lean text with no rewrite, and the `all` rows
@@ -200,8 +201,10 @@ are the shipped text:
 | interleaved statements, plain fixture | 0.781 ms | 0.703 ms | -0.076 ms | 15 of 15 |
 | interleaved statements, live gates | 1.285 ms | 1.167 ms | -0.105 ms | 15 of 15 |
 
-The interleaved runs keep one cached plan for each text in one backend, so
-their absolute latency is higher. The paired difference is the result.
+The absolute latency differs between the runs, as the `base` rows show.
+The paired difference is the result. The file also holds three other runs
+on the plain fixture. Their paired medians are -0.051, -0.056 and
+-0.072 ms.
 
 ### Paired runs
 
@@ -283,7 +286,7 @@ So the startup cost of one workflow falls by more than the shares show.
 now starts the subplans of a smaller statement.
 
 `GetCachedPlan` rises, and the planner under it (`pg_plan_queries`) holds
-4.9% and 5.1% of the lean profiles against 2.1% and 3.3%. See
+5.1% and 4.9% of the lean profiles against 2.1% and 3.3%. See
 [item 6](#what-this-audit-did-not-change) below.
 
 ## 4. The skip
@@ -299,8 +302,8 @@ ended it. A worker picks the claim kind for each poll: any kind when both
 slot pools have room, and workflow rows only when the activity pool is
 full. With one keyed activity row at the head of a queue, each lean claim
 of any kind sets its flag, and each lean claim of workflow rows takes a
-row. Each such claim ended the skip, so the skip never grew. A review of
-the change found this, and timed it.
+row. Each such claim ended the skip, so the skip never grew past 2
+claims. A review of the change found this, and timed it.
 
 **The shipped rule** keeps one skip for each claim kind, and for each
 queue of a worker with queue weights. Each flag adds 4 claims to the
@@ -389,6 +392,9 @@ HARVEST_CLAIM_TEXT_DIR=<texts> cargo test -p autumn-harvest --features db,testin
 bash docs/perf-artifacts/claim-lean-tier/pgbench.sh <texts> <outdir> 12 5
 ```
 
+`pgbench.sh` and `mixed-kinds/run.sh` copy a migrated database. `TEMPLATE`
+names it, and the default is `harvest_schema`.
+
 Run the three arms against a server with `pg_stat_statements` loaded:
 
 ```bash
@@ -421,11 +427,11 @@ The tests of the change:
 | Test | Proves |
 |:--|:--|
 | `formal/verus/src/claim_window.rs` | a lean claim takes the row of the window form for every input of the model, and the skip stays in its bound |
-| `queue::claim_window::tests::lean_claim_sql_holds_for_every_variant` | each of the twelve lean texts keeps each gate of its window text, binds the same parameters and returns its flag |
+| `queue::claim_window::tests::lean_claim_sql_holds_for_every_variant` | each of the twelve lean texts keeps or replaces each window gate, reads no new bind and returns its flag |
 | `lean_claim_db_tests::random_states_claim_the_same_row_through_either_first_form` | both orders take the same row over random queue states, for each variant, in owner mode and with a closed fence |
 | `lean_claim_db_tests::random_drains_take_the_same_rows_with_and_without_the_lean_form` | a drain through the public claim takes the same rows in the same order |
 | `lean_claim_db_tests::a_lean_claim_takes_the_next_row_after_a_peer_commits_the_head_row` | the recheck after a peer commit |
-| `lean_claim_db_tests::a_loop_of_two_claim_kinds_keeps_one_skip_for_each_kind` | the statement counts of the `N W` loop above, through `queue::claim_task_with_lean` |
+| `lean_claim_db_tests::a_loop_of_two_claim_kinds_keeps_one_skip_for_each_kind` | the statement counts of an `N W` loop of 600 claims, through `queue::claim_task_with_lean` |
 | `lean_claim_db_tests::a_weighted_worker_keeps_the_lean_form_on_its_plain_queue` | one skip for each queue of a weighted worker |
 | `queue::claim_window::tests::a_lean_fallback_is_one_claim_in_five_at_most` | the bound of the skip, over each sequence of answers |
 | `lean_claim_db_tests::the_lean_form_keeps_its_plan_on_a_deep_backlog_of_one_queue` | a `Tid Scan` candidate and bounded head scans on a deep backlog |

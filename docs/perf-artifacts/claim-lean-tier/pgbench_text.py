@@ -3,7 +3,8 @@
 Usage: pgbench_text.py <claim text file> > script.sql
 The script sends the claim the way a claim loop does: the claim plan
 settings, the claim, then a rollback. The binds become pgbench variables:
-w (worker), q (queues), a (ageing, null), r (breaker names), m (marked names).
+w (worker), q (queues), r (breaker names), m (marked names). The build id is
+'' and the ageing bind is NULL.
 """
 import re
 import sys

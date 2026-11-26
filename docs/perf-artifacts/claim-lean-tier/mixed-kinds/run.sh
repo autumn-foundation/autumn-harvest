@@ -2,9 +2,10 @@
 # Usage: run.sh <texts dir> <outdir> <rounds> <claims> <pattern> [<pattern> ...]
 #
 # Times a claim loop of mixed claim kinds under three skip rules (see gen.py).
-# Each round seeds the fixture again, then runs the three rules in a rotated
-# order. One psql session sends each statement as its own round trip, and the
-# BEGIN batch as one, as a worker does. The time is the wall time of psql.
+# Each run seeds the fixture again. Each round runs the three rules in a
+# rotated order. TEMPLATE names a migrated database to copy. One psql
+# session sends each statement as its own round trip, and the BEGIN batch
+# as one, as a worker does. The time is the wall time of psql.
 set -eu
 texts=$1; out=$2; rounds=$3; claims=$4; shift 4
 here=$(cd "$(dirname "$0")" && pwd)
