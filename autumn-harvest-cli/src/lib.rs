@@ -3975,6 +3975,8 @@ impl ApiRequest {
 
 mod agent_profile;
 mod agents;
+/// Breaker tape: replay a traffic trace through one circuit-breaker policy.
+pub mod breaker_tape;
 pub mod debug;
 pub mod debug_tui;
 pub mod tui;

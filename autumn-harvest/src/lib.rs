@@ -241,8 +241,6 @@ pub mod backup_verify;
 pub mod batch;
 /// Batch workflow start types: caps and per-item request/result structs (issue #357).
 pub mod batch_start;
-/// Breaker tape: replay a traffic trace through one circuit-breaker policy.
-pub mod breaker_tape;
 /// Worker build-id routing for safe rolling deploys (issue #171).
 #[cfg(feature = "db")]
 pub mod build_routing;

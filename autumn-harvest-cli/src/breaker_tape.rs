@@ -4,7 +4,7 @@
 //! against another. A low threshold trips fast but wastes few calls. A long
 //! cooldown shields the dependency but keeps a healed dependency dark. Sparse
 //! traffic makes every recovery slower, because only a call can probe.
-//! [`crate::retry_ride_through`] asks how one retrying call meets an outage.
+//! [`autumn_harvest::retry_ride_through`] asks how one retrying call meets an outage.
 //! This module asks how one breaker policy meets a whole traffic trace.
 //!
 //! ## Model
@@ -22,7 +22,7 @@
 //!
 //! ```rust
 //! use std::time::Duration;
-//! use autumn_harvest::breaker_tape::{Outage, replay};
+//! use autumn_harvest_cli::breaker_tape::{Outage, replay};
 //! use autumn_harvest::policy::CircuitBreakerPolicy;
 //!
 //! let s = Duration::from_secs;
@@ -42,10 +42,10 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::circuit_breaker::{
+use autumn_harvest::circuit_breaker::{
     AttemptOutcome, CircuitBreakerRegistry, CircuitTransition, DispatchDecision,
 };
-use crate::policy::CircuitBreakerPolicy;
+use autumn_harvest::policy::CircuitBreakerPolicy;
 
 /// The activity name under which the replay registers its one breaker.
 const TAPE_ACTIVITY: &str = "breaker_tape";
