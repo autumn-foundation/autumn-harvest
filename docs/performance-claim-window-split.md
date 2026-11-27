@@ -255,6 +255,14 @@ over-approximate each time a window row fails a gate that is not
 row-local, such as a concurrency cap. Each empty poll of such a queue would
 send both statements. The exact flag is worth 5%.
 
+> **Follow-up (lean claim):** the window form keeps `seek_held`. A claim
+> of one row now sends a lean form with no `seek_held` in front of it. The
+> lean form hands each doubtful case to the unchanged window form.
+> `queue::claim_form_step` sends the lean text and the window text for
+> `claim_task_one_statement`. See
+> [the lean claim tier](performance-claim-lean-tier.md) and
+> [Lean claim](operations/claim-lean.md).
+
 **2. An activity start and an activity completion lock the task row
 twice.** Each runs `lock_claim_for_update`, a `SELECT ... FOR UPDATE` with
 the claim test, and then a fenced `UPDATE` of the same row. The fenced
@@ -306,6 +314,11 @@ Run one census with
 [`claim_forms.sql`](perf-artifacts/claim-window-split/claim_forms.sql)
 before the next reset. [`pgbench.sh`](perf-artifacts/claim-window-split/pgbench.sh)
 runs one claim form alone, with the `pgbench-claim-*.sql` scripts.
+
+The bench claims one row per statement unless `HARVEST_BENCH_CLAIM_BATCH`
+is set. A run of the split alone also needs `HARVEST_BENCH_CLAIM_LEAN=0`.
+With the default of that switch, a claim of one row sends the lean form
+first, and `claim_forms.sql` also prints a `lean` row.
 
 The tests of the change:
 

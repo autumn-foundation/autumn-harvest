@@ -68,6 +68,22 @@ saturated-activity gate.
   Postgres initializes every CTE subplan at startup, so the single
   statement paid for 110 plan nodes that never ran. See
   [the claim window split](performance-claim-window-split.md).
+* **A claim of one row now sends a lean form in front of the window
+  form** (`claim_lean`, on by default). The lean form is exact for a
+  window of plain rows, and it hands each other case to the unchanged
+  window form. A caller of `queue::claim_task` still sends the window form
+  first. On the e2e bench, with one row per claim, the lean form is 10,117
+  of 10,153 claim statements, and the `throughput` cell gains 1.17 times.
+  See [the lean claim tier](performance-claim-lean-tier.md) and
+  [Lean claim](operations/claim-lean.md).
+* **A claim loop takes its share of the free slots in one statement**
+  (`claim_batch_max`, on by default, cap 8). A batch claim sends no lean
+  form. Against the lean single claim, a cap of 4 gives 1.07 to 1.09 times
+  the throughput of the `throughput` cell at 4, 32 and 64 workflows in
+  flight. A cap of 8 gives 1.16 times a cap of 4 on a worker with 64
+  workflow and 128 activity slots. It measures the same within noise on a
+  default worker. See [the batch claim](performance-claim-batch.md) and
+  [Batch claim](operations/claim-batch.md).
 * **A worker now runs up to `max_concurrent_claims` claims at once (default
   2).** One serial loop kept 0.94 claims in flight and capped throughput. On
   assay #14's workload, two loops raise throughput 21% to 35%, and four

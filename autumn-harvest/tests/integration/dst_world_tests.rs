@@ -38,7 +38,7 @@ use autumn_harvest::schema::{harvest_schedules, harvest_workflow_executions};
 use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics, TelemetryConfig};
 use autumn_harvest::time::sql::NullableTimestamp;
 use autumn_harvest::types::{ExecutionId, ShardId};
-use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker};
+use autumn_harvest::worker::{DbPool, HandlerRegistry, LoopLean, Worker};
 use autumn_harvest::{ActivityContext, StartSource, StartWorkflowParams, WorkflowContext};
 use diesel::prelude::*;
 use diesel::sql_types::Text;
@@ -411,6 +411,10 @@ struct SimWorker {
     pool: DbPool,
     counts: Arc<CacheCounts>,
     tag: Arc<WorkerTag>,
+    /// The lean-claim state of the worker, as its claim loop would hold it.
+    /// A restart builds a new worker, so it starts a new state. The state
+    /// reads no clock and no random number, so a seed still replays.
+    lean: std::sync::Mutex<LoopLean>,
 }
 
 /// A schedule row that a scan read, with what the scan knew.
@@ -549,6 +553,7 @@ impl PgWorld {
             pool,
             counts,
             tag,
+            lean: std::sync::Mutex::new(LoopLean::new()),
         }
     }
 
@@ -587,7 +592,12 @@ impl PgWorld {
             read(&sim.tag.body_starts),
             read(&sim.tag.activities),
         ];
-        if !sim.worker.dst_poll_once(&sim.pool).await {
+        // One actor runs at a time, so no other poll reads the state
+        // between the copy and the store.
+        let mut lean = sim.lean.lock().expect("the lean state").clone();
+        let claimed = sim.worker.dst_poll_once(&sim.pool, Some(&mut lean)).await;
+        *sim.lean.lock().expect("the lean state") = lean;
+        if !claimed {
             return Effect::Idle;
         }
         let after = [
@@ -943,6 +953,38 @@ async fn first_planted_failure(harness: &Harness) -> Box<world::WorldSweepFailur
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
+/// The runs of the lean claim statement on the idle connections of `pool`.
+///
+/// A claim keeps one prepared statement for each form on its connection.
+/// `pg_prepared_statements` counts the plans that each statement ran, and
+/// each run takes one plan. The two plan columns need Postgres 14 or newer.
+/// The count binds the marker, so its own text does not hold it.
+async fn lean_claim_runs(pool: &DbPool) -> i64 {
+    #[derive(QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let mut held = Vec::new();
+    for _ in 0..pool.status().size {
+        held.push(pool.get().await.expect("a pool connection"));
+    }
+    let mut total = 0;
+    for conn in &mut held {
+        let conn: &mut AsyncPgConnection = conn;
+        total += diesel::sql_query(
+            "SELECT COALESCE(SUM(generic_plans + custom_plans), 0)::bigint AS n \
+             FROM pg_prepared_statements WHERE statement LIKE '%' || $1 || '%'",
+        )
+        .bind::<Text, _>("claim_lean_fallback")
+        .get_result::<Count>(conn)
+        .await
+        .expect("read the prepared statements (needs Postgres 14 or newer)")
+        .n;
+    }
+    total
+}
+
 /// The hook runs one claim and the whole task body before it returns.
 #[tokio::test]
 async fn dst_poll_once_runs_the_claimed_task_to_completion() {
@@ -955,6 +997,11 @@ async fn dst_poll_once_runs_the_claimed_task_to_completion() {
     let mut world = harness.world(&config).await;
 
     assert_eq!(world.poll(0).await, Effect::Polled(Ran::Cold));
+    let sim = world.workers[0].as_ref().expect("worker 1 runs");
+    assert!(
+        lean_claim_runs(&sim.pool).await >= 1,
+        "a simulated poll sends the lean form first, as a claim loop does"
+    );
     let after_decision = world.read_snapshot().await;
     let chain = &after_decision.executions[0];
     assert_eq!(

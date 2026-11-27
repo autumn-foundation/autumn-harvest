@@ -1,0 +1,17 @@
+# A scratch patch for the cap runs, not part of the tree. Apply it, build e2e_bench, then set
+# SCRATCH_WF_SLOTS and SCRATCH_ACT_SLOTS to give the bench worker other slot counts.
+diff --git a/autumn-harvest/tests/integration/e2e_bench_support.rs b/autumn-harvest/tests/integration/e2e_bench_support.rs
+index d7f1fb5..acb8b07 100644
+--- a/autumn-harvest/tests/integration/e2e_bench_support.rs
++++ b/autumn-harvest/tests/integration/e2e_bench_support.rs
+@@ -4414,8 +4414,8 @@ pub mod db {
+         runtime.worker_id = worker_id;
+         runtime.poll_interval = std::time::Duration::from_millis(POLL_INTERVAL_MS);
+         runtime.shutdown_timeout = std::time::Duration::from_secs(5);
+-        runtime.max_concurrent_workflows = MAX_CONCURRENT_WORKFLOWS;
+-        runtime.max_concurrent_activities = MAX_CONCURRENT_ACTIVITIES;
++        runtime.max_concurrent_workflows = std::env::var("SCRATCH_WF_SLOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_CONCURRENT_WORKFLOWS);
++        runtime.max_concurrent_activities = std::env::var("SCRATCH_ACT_SLOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_CONCURRENT_ACTIVITIES);
+         if let Some(loops) =
+             super::claim_loops_override(std::env::var(super::CLAIM_LOOPS_ENV_VAR).ok().as_deref())
+         {

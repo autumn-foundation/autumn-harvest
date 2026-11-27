@@ -175,6 +175,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          integration_e2e
 linux        autumn-harvest         integration                      -                          keyed_claim_running_counts_tests
 linux        autumn-harvest         integration                      -                          late_signal_completion_tests
+linux        autumn-harvest         integration                      -                          lean_claim_db_tests
 linux        autumn-harvest         integration                      -                          legal_hold_tests
 linux        autumn-harvest         integration                      -                          lifecycle_model_props
 linux        autumn-harvest         integration                      -                          lineage_store_tests

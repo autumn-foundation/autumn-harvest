@@ -1,0 +1,6 @@
+rule=off pattern=NW claims=1200 lean_claimed=0 lean_flag=0 window=1200 statements=1200
+rule=shared pattern=NW claims=1200 lean_claimed=200 lean_flag=400 window=1000 statements=1600
+rule=final pattern=NW claims=1200 lean_claimed=600 lean_flag=17 window=600 statements=1217
+rule=off pattern=NWW claims=1200 lean_claimed=0 lean_flag=0 window=1200 statements=1200
+rule=shared pattern=NWW claims=1200 lean_claimed=400 lean_flag=400 window=800 statements=1600
+rule=final pattern=NWW claims=1200 lean_claimed=800 lean_flag=14 window=400 statements=1214

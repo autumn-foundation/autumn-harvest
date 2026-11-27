@@ -92,7 +92,10 @@ fn worker_config(queue: &str) -> WorkerRuntimeConfig {
         max_concurrent_activities: 4,
         max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
         claim_slots_per_shard: None,
-        claim_batch_max: None,
+        // The worker default, so this arm runs the default claim path. With
+        // 4 permits of each kind and 2 claim loops, a batch holds 2 rows.
+        claim_batch_max: autumn_harvest::builder::WorkerConfig::default().claim_batch_max,
+        claim_lean: true,
         poll_interval: POLL,
         shutdown_timeout: Duration::from_secs(1),
         cancellation_grace_period: Duration::from_secs(1),

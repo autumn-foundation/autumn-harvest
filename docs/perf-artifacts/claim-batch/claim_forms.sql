@@ -1,7 +1,9 @@
 -- The claim statements of one e2e_bench run, by form. The batch form carries
 -- claim_ranked, the window form claim_window_fallback alone, the full form
--- legacy_candidate.
-SELECT CASE WHEN query LIKE '%claim_ranked%' THEN 'batch'
+-- legacy_candidate. The lean form carries the claim_lean_fallback CTE. It
+-- does not start with worker_info, so the filter names it.
+SELECT CASE WHEN query LIKE '%claim_lean_fallback%' THEN 'lean'
+            WHEN query LIKE '%claim_ranked%' THEN 'batch'
             WHEN query LIKE '%claim_window_fallback%' THEN 'window'
             WHEN query LIKE '%legacy_candidate%' THEN 'full'
             ELSE 'other' END AS form,
@@ -11,7 +13,7 @@ SELECT CASE WHEN query LIKE '%claim_ranked%' THEN 'batch'
        sum(rows) AS rows
   FROM pg_stat_statements
  WHERE dbid NOT IN (SELECT oid FROM pg_database)
-   AND query LIKE 'WITH worker_info AS%'
+   AND (query LIKE 'WITH worker_info AS%' OR query LIKE 'WITH %claim_lean_fallback%')
  GROUP BY 1
  ORDER BY 1;
 SELECT sum(calls) AS all_calls, round(sum(total_exec_time)::numeric, 1) AS all_exec_ms

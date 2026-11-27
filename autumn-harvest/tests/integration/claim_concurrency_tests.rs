@@ -448,6 +448,8 @@ fn build_worker(
     config.max_concurrent_workflows = knobs.workflows;
     config.max_concurrent_activities = knobs.activities;
     config.max_concurrent_claims = knobs.claims;
+    // One row per claim: the probes of this suite time and count each claim.
+    config.claim_batch_max = None;
     config.poll_interval = knobs.poll_interval;
     config.shutdown_timeout = Duration::from_secs(5);
     config.shard_assignments = vec![ShardId::new(0)];
@@ -681,6 +683,8 @@ async fn a_multi_shard_worker_overlaps_claims_up_to_its_cap() {
     config.max_concurrent_workflows = knobs.workflows;
     config.max_concurrent_activities = knobs.activities;
     config.max_concurrent_claims = knobs.claims;
+    // One row per claim: the probes of this suite time and count each claim.
+    config.claim_batch_max = None;
     config.poll_interval = knobs.poll_interval;
     config.shutdown_timeout = Duration::from_secs(5);
     config.shard_assignments = vec![ShardId::new(0), ShardId::new(1)];

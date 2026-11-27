@@ -29,11 +29,12 @@ use super::capacity_bench_support::{
 };
 use super::e2e_bench_support::CapacityArm;
 use super::e2e_bench_support::{
-    BenchScenario, CHECK_ENV_VAR, CLAIM_LOOPS_ENV_VAR, COMMIT_PROBE_ENV_VAR,
-    DISPATCHES_PER_WORKFLOW, INFLIGHT_ENV_VAR, MAX_CONCURRENT_ACTIVITIES, MAX_CONCURRENT_WORKFLOWS,
-    POOL_SIZE_PER_SHARD, PUBLISHED_BASELINES, PUBLISHED_RESULTS_VERSION, REPRO_TOLERANCE_PCT,
-    SCENARIO_FILTER_ENV_VAR, SHARD_COUNTS, SHARD_FILTER_ENV_VAR, SHARD_URLS_ENV_VAR,
-    STATS_DIR_ENV_VAR, THROUGHPUT_INFLIGHT_PER_SHARD, WORKERS_PER_SHARD, WORKFLOWS_ENV_VAR,
+    BenchScenario, CHECK_ENV_VAR, CLAIM_BATCH_ENV_VAR, CLAIM_BATCH_WORKER_DEFAULT,
+    CLAIM_LEAN_ENV_VAR, CLAIM_LOOPS_ENV_VAR, COMMIT_PROBE_ENV_VAR, DISPATCHES_PER_WORKFLOW,
+    INFLIGHT_ENV_VAR, MAX_CONCURRENT_ACTIVITIES, MAX_CONCURRENT_WORKFLOWS, POOL_SIZE_PER_SHARD,
+    PUBLISHED_BASELINES, PUBLISHED_RESULTS_VERSION, REPRO_TOLERANCE_PCT, SCENARIO_FILTER_ENV_VAR,
+    SHARD_COUNTS, SHARD_FILTER_ENV_VAR, SHARD_URLS_ENV_VAR, STATS_DIR_ENV_VAR,
+    THROUGHPUT_INFLIGHT_PER_SHARD, WORKERS_PER_SHARD, WORKFLOWS_ENV_VAR, rows_per_claim_label,
 };
 
 fn repo_root() -> PathBuf {
@@ -152,12 +153,43 @@ fn every_documented_environment_variable_is_one_the_harness_reads() {
         STATS_DIR_ENV_VAR,
         COMMIT_PROBE_ENV_VAR,
         CLAIM_LOOPS_ENV_VAR,
+        CLAIM_BATCH_ENV_VAR,
+        CLAIM_LEAN_ENV_VAR,
     ] {
         assert!(
             doc.contains(var),
             "`{var}` is read by the harness but never documented in docs/benchmarks.md"
         );
     }
+}
+
+/// The published numbers were taken with one row per claim, and a run with
+/// no knob still claims that way. A default worker claims in batches. So the
+/// page must state the rows per claim, and how a run takes the worker
+/// default.
+#[test]
+fn the_doc_states_the_rows_per_claim_of_the_published_numbers() {
+    let doc = benchmarks_doc();
+    let unset = rows_per_claim_label(None);
+    assert_eq!(unset, "1", "a run with no knob keeps one row per claim");
+    let config_row = format!("| rows per claim statement | {unset} |");
+    assert!(
+        doc.contains(&config_row),
+        "docs/benchmarks.md must carry the configuration row `{config_row}`"
+    );
+    let knob_row = doc
+        .lines()
+        .find(|line| line.starts_with(&format!("| `{CLAIM_BATCH_ENV_VAR}` |")))
+        .unwrap_or_else(|| panic!("the knob table has no `{CLAIM_BATCH_ENV_VAR}` row"));
+    assert!(
+        knob_row.contains(&format!("`{CLAIM_BATCH_WORKER_DEFAULT}`")),
+        "the `{CLAIM_BATCH_ENV_VAR}` row must name the value that takes the worker default: \
+         {knob_row}"
+    );
+    assert!(
+        knob_row.contains("one row per claim"),
+        "the `{CLAIM_BATCH_ENV_VAR}` row must say what an unset variable means: {knob_row}"
+    );
 }
 
 #[test]

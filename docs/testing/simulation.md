@@ -201,7 +201,7 @@ simulation drives whole actors, and its workers run the real worker loop.
 
 | Action | Code that runs |
 |---|---|
-| `Poll` | `Worker::dst_poll_once`: one `poll_once`, then the task body to its end. |
+| `Poll` | `Worker::dst_poll_once`: one `poll_once`, then the task body to its end. Each simulated worker holds one lean-claim state, as a claim loop does. |
 | `Beat` | `workers::heartbeat_worker`. |
 | `Signal` | `signal::send_signal`. |
 | `ScheduleScan` | `scheduler::due_workflow_schedules`, the due list of the scheduler tick. |

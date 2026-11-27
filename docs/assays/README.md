@@ -24,3 +24,15 @@ entry for its pre-registration commit, apparatus, and verdict.
 | 16 | The engine half of ledger #15's open stub: do the DB integration suites that run without Docker give the same results on PG 12.22 and PG 14.24 as on PG 16.15? | **undetermined** — the validity line failed. The PG 16 control passed 79.0% of in-scope tests (1,796 of 2,273) against a 90% line, because the file-level scope includes tests that still start a Docker container and modules that share one database. The sweep stopped after control run 1. No PG 14 or full PG 12 run was graded. An ungraded PG 12 probe on the claim, queue, sweep and partition modules shows server errors for PG 13 and PG 15 functions that need triage. A per-test scope with a database per module is the named re-charter. | [0016-postgres-12-engine-paths.md](0016-postgres-12-engine-paths.md) |
 | 18 | The riskiest assumption that #17 names, tested alone: on PG 12.22, can an operator install the core schema outside `public` and run the engine's runtime `gen_random_uuid()` call, under five search-path setups? | **kill**, for an unqualified "12+". Two of four blind cells fail in 3 of 3 runs with `42883: function gen_random_uuid() does not exist`. One is a worker path pinned to one schema while `pgcrypto` sits in `public` (the `throttle.rs:634` insert). The other is a second install in one database. The PG 16.15 control and PG 14.24 pass all 15 cells. A single `public` install is not affected. #17's PG 12 exclusion 2 would hide this defect. | [0018-postgres-12-pgcrypto-schema.md](0018-postgres-12-pgcrypto-schema.md) |
 | 19 | Keystone census finding 1 (2026-11-16): can the build derive `autumn-harvest-plugin/openapi.json` from a multi-line copy inside the crate, with byte-identical served bytes, unchanged `cargo package` behavior and no material build time? | **pursue** — a dependency-free whitespace stripper reproduces the committed compact bytes at 57 of 57 `trunk-dev` commits (0 differ vs a 1-commit kill line; a naive control differs at 57 of 57). `cargo package` packs the in-crate source and `build.rs`. `openapi_spec` passes 25 of 25. Build-script median 5.16 ms vs a 100 ms line. Merge benefit cited from the census, not re-measured. | [0019-openapi-compact-build-derivation.md](0019-openapi-compact-build-derivation.md) |
+
+## A re-run on a later tree
+
+An apparatus depends on the crate by path. So a re-run takes the worker
+defaults of the tree that it builds against, not those of the recorded run.
+
+The batch claim is on by default. The apparatus
+of entries 8, 10, 13 and 14 build their workers from
+`WorkerConfig::default()`. On a current tree they claim in batches. To
+reproduce a recorded arm, set `claim_batch_max = None` in the
+`runtime_config` of the apparatus. See
+[Batch claim](../operations/claim-batch.md).

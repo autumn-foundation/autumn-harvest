@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Usage: run_cell.sh <label> <binary> <scenarios> <outdir>
 # Runs one e2e_bench invocation at 1 shard, and records the claim census.
+# The census is exact for a build before issue #2680 only.
+# The window form and the lean form return one row for each call.
+# So claimed_rows counts those statements, and empty_polls counts the full form only.
 set -u
 label=$1; bin=$2; scen=$3; out=$4
 mkdir -p "$out"
@@ -16,7 +19,7 @@ census=$($PSQL -F' ' -c "
 SELECT coalesce(sum(calls),0), coalesce(sum(rows),0)
   FROM pg_stat_statements
  WHERE dbid NOT IN (SELECT oid FROM pg_database)
-   AND query LIKE 'WITH worker_info AS%'")
+   AND (query LIKE 'WITH worker_info AS%' OR query LIKE 'WITH %claim_lean_fallback%')")
 set -- $census
 calls=$1; rows=$2
 wall=$(echo "$end - $start" | bc)

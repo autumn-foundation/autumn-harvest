@@ -152,8 +152,12 @@ pub struct WorkerConfigView {
     /// The most claims that run at once on one shard, across the fleet.
     /// `None` when the cap is off.
     pub claim_slots_per_shard: Option<u16>,
-    /// The most rows that one claim statement takes. `None` takes one.
+    /// The most rows that one claim statement takes. `None` takes one. The
+    /// worker default is [`crate::builder::DEFAULT_CLAIM_BATCH_MAX`].
     pub claim_batch_max: Option<u8>,
+    /// Whether a claim of one row sends the lean claim statement first. A
+    /// batch claim sends no lean statement.
+    pub claim_lean: bool,
     /// Worker poll interval, milliseconds.
     pub poll_interval_ms: u64,
     /// Population sampler interval, milliseconds (issue #2668).
@@ -439,6 +443,7 @@ impl WorkerConfigView {
             max_concurrent_claims,
             claim_slots_per_shard,
             claim_batch_max,
+            claim_lean,
             shutdown_timeout,
             workflow_cache_size,
             resident_workflows,
@@ -501,6 +506,7 @@ impl WorkerConfigView {
             max_concurrent_claims: *max_concurrent_claims,
             claim_slots_per_shard: claim_slots_per_shard.map(std::num::NonZeroU16::get),
             claim_batch_max: claim_batch_max.map(std::num::NonZeroU8::get),
+            claim_lean: *claim_lean,
             poll_interval_ms: dur_ms(poll_interval),
             gauge_sample_interval_ms: dur_ms(*gauge_sample_interval),
             shutdown_timeout_ms: dur_ms(*shutdown_timeout),
@@ -1176,11 +1182,30 @@ mod tests {
         let view = |config: &WorkerConfig| {
             WorkerConfigView::from_worker_config(config, Duration::from_millis(500)).claim_batch_max
         };
-        assert_eq!(view(&WorkerConfig::default()), None);
+        assert_eq!(
+            view(&WorkerConfig::default()),
+            Some(crate::builder::DEFAULT_CLAIM_BATCH_MAX),
+            "the view reports the default batch"
+        );
+        assert_eq!(
+            view(&WorkerConfig::default()),
+            Some(8),
+            "the default batch is eight rows"
+        );
         assert_eq!(
             view(&WorkerConfig::default().with_claim_batch_max(4)),
             Some(4)
         );
+        assert_eq!(view(&WorkerConfig::default().with_claim_batch_max(1)), None);
+    }
+
+    #[test]
+    fn view_reports_the_lean_claim_switch() {
+        let view = |config: &WorkerConfig| {
+            WorkerConfigView::from_worker_config(config, Duration::from_millis(500)).claim_lean
+        };
+        assert!(view(&WorkerConfig::default()));
+        assert!(!view(&WorkerConfig::default().with_claim_lean(false)));
     }
 
     #[test]

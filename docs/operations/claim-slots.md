@@ -57,7 +57,16 @@ uncontended shard. See [`docs/performance.md`](../performance.md) §
 "Claim slots" for a measurement. Use the cap when claim latency rises with
 the number of claimers, for example after a `VACUUM` or a lock stall.
 
+A slot caps statements, not rows. A [batch claim](claim-batch.md) is on by
+default, and it takes one slot for all its rows. So one slot count admits
+more row locks than it did with one row per claim. A claim reads a seek
+window of 32 rows from a queue head. When the claims in flight lock each
+row of a window, the next claim falls back to the full statement. Keep the
+slots times the batch cap at or under 32 to keep the claims on one deep
+head in the window. The default batch cap of 8 gives 4 slots. A cap of 4
+gives 8 slots.
+
 ## See also
 
 - [`claim-batch.md`](claim-batch.md): one claim statement takes up to 2, 4
-  or 8 rows. A batch takes one slot per statement.
+  or 8 rows. It is on by default. A batch takes one slot per statement.

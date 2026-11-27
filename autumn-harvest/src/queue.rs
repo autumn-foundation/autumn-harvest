@@ -27,6 +27,8 @@ use crate::shared_json::SharedJson;
 use crate::telemetry::TraceContextCarrier;
 use crate::types::{ExecutionId, Priority};
 
+pub use claim_window::LeanSkips;
+
 mod claim_window {
     //! Postgres initializes every CTE subplan at executor startup, run or not,
     //! and the deep and full-scan fallbacks almost never run. So a claim first
@@ -38,6 +40,17 @@ mod claim_window {
     //! the rest of those gates, so a clear flag means the full statement takes
     //! nothing either. A set flag means the window form locked and debited
     //! nothing, so the full statement is just a fresh attempt.
+    //!
+    //! The lean form goes in front of the window form (issue #2680). It is a
+    //! smaller statement that is exact for a window of plain rows. When its
+    //! window holds a row and it locks none, it sets its flag. It then
+    //! claimed no row and changed no row, and the unchanged window form runs.
+    //! A window with a row that is not plain locks no row. After a peer
+    //! commit on a window row, the claim keeps its lock on the skipped row.
+    //! The window form does the same: see `claim_seek_rows_sql`.
+    //! See `lean_claim_sql` and [`LeanSkips`].
+    //! `LEAN_PLAN_REWRITES` then changes how the lean text reads the pauses.
+    //! `formal/verus/src/claim_window.rs` proves the model of both steps.
 
     pub(super) const WINDOW_DROPPED_CTES: [&str; 9] = [
         "concurrency_pending_keys",
@@ -358,6 +371,804 @@ mod claim_window {
         format!("WITH {} {tail}", kept.join(", "))
     }
 
+    /// The CTEs of a window text that the lean form has no copy of.
+    pub(super) const LEAN_DROPPED_CTES: [&str; 7] = [
+        "worker_info",
+        "seek_pending_keys",
+        "seek_running_counts",
+        "seek_held",
+        "seek_contended",
+        "rate_limit_debit",
+        "claim_window_fallback",
+    ];
+
+    /// The CTEs of a window text that the lean form keeps or edits.
+    const LEAN_NEEDED_CTES: [&str; 7] = [
+        "seek_heads",
+        "seek_bounds",
+        "seek_candidate",
+        "candidate",
+        "fresh_now",
+        "run_expired_now",
+        "claimed",
+    ];
+
+    /// One gate of `seek_candidate` that passes each row with a NULL column.
+    struct LeanGate {
+        /// The column. A plain row has NULL in it.
+        column: &'static str,
+        /// The name of the gate in a panic message.
+        what: &'static str,
+        /// The gate, as `claim_candidate_gates_sql!` writes it on one line.
+        text: &'static str,
+    }
+
+    /// The gates that the lean form replaces with the NULL test of a column.
+    ///
+    /// A row is plain when each column here is NULL. Each gate starts with
+    /// that NULL test, so it passes a plain row. A new feature gate needs an
+    /// entry here, or the lean form must keep it.
+    /// `the_lean_form_decides_each_gate_of_the_window_candidate` fails until
+    /// someone makes that choice.
+    const LEAN_GATES: [LeanGate; 4] = [
+        LeanGate {
+            column: "concurrency_key",
+            what: "the concurrency gate",
+            text: "AND ( concurrency_key IS NULL OR concurrency_cap IS NULL OR COALESCE(( \
+                   SELECT rc.running_count FROM seek_running_counts rc \
+                   WHERE rc.concurrency_key = harvest_task_queue.concurrency_key \
+                   AND rc.task_type = harvest_task_queue.task_type ), 0) \
+                   < harvest_task_queue.concurrency_cap ) ",
+        },
+        LeanGate {
+            column: "required_build_id",
+            what: "the build gate",
+            text: "AND ( required_build_id IS NULL OR ($3 <> '' AND ( required_build_id = $3 \
+                   OR EXISTS ( SELECT 1 FROM harvest_build_compat WHERE build_id = $3 \
+                   AND compatible_with = harvest_task_queue.required_build_id ) )) ) ",
+        },
+        LeanGate {
+            column: "required_capabilities",
+            what: "the capability gate",
+            text: "AND ( required_capabilities IS NULL OR NOT EXISTS ( SELECT 1 \
+                   FROM jsonb_array_elements(required_capabilities) AS r(value) WHERE ( \
+                   r.value ? 'Exact' AND ( \
+                   worker_info.labels->>(r.value->'Exact'->>'key') IS NULL \
+                   OR worker_info.labels->>(r.value->'Exact'->>'key') \
+                   != (r.value->'Exact'->>'value') ) ) OR ( r.value ? 'In' AND ( \
+                   worker_info.labels->>(r.value->'In'->>'key') IS NULL OR NOT ( \
+                   (r.value->'In'->'values') \
+                   @> jsonb_build_array(worker_info.labels->>(r.value->'In'->>'key')) \
+                   ) ) ) ) ) ",
+        },
+        LeanGate {
+            column: "rate_limit_key",
+            what: "the rate-limit gate",
+            text: super::CLAIM_RATE_LIMIT_GATE_SQL,
+        },
+    ];
+
+    /// The row columns of each head scan, up to the table name.
+    const LEAN_HEAD_ROW: &str = "task_type AS seek_task_type FROM harvest_task_queue";
+
+    /// The column list of `seek_heads`, where `seek_plain` goes.
+    const LEAN_HEAD_LIST: &str = "h.seek_task_type, h.head_queue";
+
+    /// The join that only the capability gate reads.
+    const LEAN_WORKER_JOIN: &str = "CROSS JOIN worker_info ";
+
+    /// The start of the sort of `seek_candidate`. The one-time gate goes in
+    /// front of it, after the last row gate.
+    const LEAN_CANDIDATE_SORT: &str = "ORDER BY CASE WHEN sticky_worker_id = $1 ";
+
+    /// The one-time gate of the lean `seek_candidate`: each window row is
+    /// plain.
+    const LEAN_PLAIN_WINDOW_GATE: &str =
+        "AND NOT EXISTS (SELECT 1 FROM seek_heads np WHERE NOT np.seek_plain) ";
+
+    /// The bucket lock of `fresh_now`. A plain row has no bucket.
+    const LEAN_BUCKET_LOCK: &str = "LEFT JOIN ( SELECT 1 AS x FROM harvest_rate_limit_buckets b \
+         JOIN candidate c ON b.key = c.rate_limit_key WHERE NOT (c.activity_name = ANY($5)) \
+         FOR UPDATE OF b ) locked ON TRUE";
+
+    /// The lean join of `fresh_now`. It reads `candidate`, so the clock read
+    /// still follows the candidate lock.
+    const LEAN_CANDIDATE_READ: &str = "LEFT JOIN ( SELECT 1 AS x FROM candidate c ) locked ON TRUE";
+
+    /// The key lock and the cap re-check of `claimed`. A plain row has no
+    /// key.
+    const LEAN_KEY_LOCK_TEST: &str = "AND ( candidate.concurrency_key IS NULL OR ( \
+         pg_try_advisory_xact_lock(hashtext(candidate.concurrency_key)::bigint) AND ( \
+         candidate.concurrency_cap IS NULL OR ( SELECT COUNT(*) FROM harvest_task_queue recheck \
+         WHERE recheck.concurrency_key = candidate.concurrency_key \
+         AND recheck.task_type = candidate.task_type AND recheck.state = 'RUNNING' \
+         AND recheck.worker_id IS NOT NULL ) < candidate.concurrency_cap ) ) ) ";
+
+    /// The debit test of `claimed`. A plain row takes no token.
+    const LEAN_DEBIT_TEST: &str = "AND ( candidate.rate_limit_key IS NULL \
+         OR candidate.activity_name = ANY($5) OR EXISTS (SELECT 1 FROM rate_limit_debit \
+         WHERE debited_key = candidate.rate_limit_key) ) ";
+
+    /// The tests that the lean `claimed` keeps.
+    const LEAN_CLAIM_TESTS: &str = "FROM candidate WHERE harvest_task_queue.id = candidate.id \
+         AND NOT (SELECT expired FROM run_expired_now) RETURNING harvest_task_queue.* )";
+
+    /// The flag of the lean form. An empty window with ageing off leaves it
+    /// clear, and the window form would return no row and no flag either.
+    const LEAN_FALLBACK_SQL: &str = "NOT EXISTS (SELECT 1 FROM seek_candidate) \
+         AND (EXISTS (SELECT 1 FROM seek_heads) \
+              OR ($4::BIGINT IS NOT NULL AND $4::BIGINT > 0))";
+
+    /// The source of the flag in the final query of a window text.
+    const WINDOW_FLAG_SOURCE: &str = "FROM claim_window_fallback fb";
+
+    /// The owned gate of a scan, by the one text that only it holds.
+    const OWNED_GATE_MARK: &str = "(SELECT owner_on FROM owner_gate)";
+
+    /// The holder check of a scan, by the one text that only it holds.
+    const HOLDER_CHECK_MARK: &str = "FROM harvest_decision_owner o ";
+
+    /// The kind test that the kind splice adds to a scan.
+    const KIND_TEST_MARK: &str = "AND harvest_task_queue.task_type = '";
+
+    /// The test that a row is plain: each column of `LEAN_GATES` is NULL.
+    fn lean_plain_sql() -> String {
+        let tests: Vec<String> = LEAN_GATES
+            .iter()
+            .map(|gate| format!("{} IS NULL", gate.column))
+            .collect();
+        format!("({})", tests.join(" AND "))
+    }
+
+    /// Replaces `piece` in `text`, which must hold it `count` times.
+    ///
+    /// The count assertion turns an edit of the shared claim text into a
+    /// panic at first use. A silent miss would leave a gate in the lean
+    /// form, or take one out of it.
+    fn replace_exact(text: &str, piece: &str, count: usize, with: &str, what: &str) -> String {
+        assert_eq!(
+            text.matches(piece).count(),
+            count,
+            "the lean claim needs {what} {count} time(s)"
+        );
+        text.replace(piece, with)
+    }
+
+    /// `seek_heads` with the `seek_plain` flag of each window row.
+    fn lean_seek_heads(heads: &str) -> String {
+        let row = format!(
+            "task_type AS seek_task_type, {} AS seek_plain FROM harvest_task_queue",
+            lean_plain_sql()
+        );
+        let heads = replace_exact(heads, LEAN_HEAD_ROW, 2, &row, "the head row columns");
+        replace_exact(
+            &heads,
+            LEAN_HEAD_LIST,
+            1,
+            "h.seek_task_type, h.seek_plain, h.head_queue",
+            "the head column list",
+        )
+    }
+
+    /// `seek_candidate` with a NULL test in place of each gate of
+    /// `LEAN_GATES`, and with the one-time gate.
+    ///
+    /// `fenced` and `owned` count the `fence` and `owner_gate` CTEs of the
+    /// window text: 0 or 1 each. The scan must keep the fence join, the owned
+    /// gate and the holder check that many times. Without the assertions, a
+    /// lean claim could run unfenced, or take a row of another owner.
+    fn lean_seek_candidate(seek: &str, fenced: usize, owned: usize) -> String {
+        let kind_tests = seek.matches(KIND_TEST_MARK).count();
+        let mut lean = replace_exact(seek, LEAN_WORKER_JOIN, 1, "", "the worker join");
+        for gate in &LEAN_GATES {
+            let test = format!("AND {} IS NULL ", gate.column);
+            lean = replace_exact(&lean, gate.text, 1, &test, gate.what);
+        }
+        let gated = format!("{LEAN_PLAIN_WINDOW_GATE}{LEAN_CANDIDATE_SORT}");
+        lean = replace_exact(&lean, LEAN_CANDIDATE_SORT, 1, &gated, "the candidate sort");
+        for (mark, count, what) in [
+            (SEEK_CANDIDATE_LOCK, 1, "the row lock"),
+            ("CROSS JOIN fence ", fenced, "the fence join"),
+            (OWNED_GATE_MARK, owned, "the owned gate"),
+            (HOLDER_CHECK_MARK, owned, "the holder check"),
+            (KIND_TEST_MARK, kind_tests, "the kind test"),
+        ] {
+            assert_eq!(
+                lean.matches(mark).count(),
+                count,
+                "the lean claim keeps {what} {count} time(s)"
+            );
+        }
+        lean
+    }
+
+    /// `claimed` with the id match and the expiry test only.
+    fn lean_claimed(claimed: &str) -> String {
+        let claimed = replace_exact(claimed, LEAN_KEY_LOCK_TEST, 1, "", "the key lock test");
+        let claimed = replace_exact(&claimed, LEAN_DEBIT_TEST, 1, "", "the debit test");
+        assert!(
+            claimed.ends_with(LEAN_CLAIM_TESTS),
+            "the lean claim keeps the id match and the expiry test only: {claimed}"
+        );
+        claimed
+    }
+
+    /// One CTE of a lean text: its name and its text.
+    type LeanCte<'a> = (&'a str, String);
+
+    /// One plan-shape rewrite of the lean text. It edits the CTEs in place.
+    type LeanRewrite = fn(&mut [LeanCte<'_>]);
+
+    /// The plan-shape rewrites of the lean text, in the order of their use
+    /// (issue #2680).
+    ///
+    /// Each one changes how the plan reads a value, and none changes a
+    /// result. They touch the lean text only. The window text, the full
+    /// text and the batch text keep the shared form.
+    ///
+    /// Each one stands alone. Without its entry here, the others still
+    /// apply. `each_set_of_plan_rewrites_gives_a_lean_text` holds that.
+    const LEAN_PLAN_REWRITES: [LeanRewrite; 3] = [
+        lean_scalar_pause_reads,
+        lean_pause_arrays,
+        lean_held_activity_names,
+    ];
+
+    /// The guards of a lean text. No plan-shape rewrite can change the
+    /// count of one of them in a CTE.
+    ///
+    /// They are the row lock, the fence join, the owned gate, the holder
+    /// check, both kind tests and the one-time gate.
+    const LEAN_GUARD_MARKS: [&str; 7] = [
+        SEEK_CANDIDATE_LOCK,
+        "CROSS JOIN fence ",
+        OWNED_GATE_MARK,
+        HOLDER_CHECK_MARK,
+        KIND_TEST_MARK,
+        "AND k.head_kind = '",
+        LEAN_PLAIN_WINDOW_GATE,
+    ];
+
+    /// The count of each text of `LEAN_GUARD_MARKS` in each CTE.
+    fn lean_guard_counts(ctes: &[LeanCte<'_>]) -> Vec<(String, Vec<usize>)> {
+        ctes.iter()
+            .map(|(name, text)| {
+                let counts = LEAN_GUARD_MARKS
+                    .iter()
+                    .map(|mark| text.matches(mark).count())
+                    .collect();
+                ((*name).to_owned(), counts)
+            })
+            .collect()
+    }
+
+    /// Applies `edit` to the squashed text of CTE `name`, which the lean
+    /// text defines once.
+    fn edit_lean_cte(ctes: &mut [LeanCte<'_>], name: &str, edit: impl FnOnce(&str) -> String) {
+        let mut found = ctes.iter_mut().filter(|(cte, _)| *cte == name);
+        let (Some((_, text)), None) = (found.next(), found.next()) else {
+            panic!("the lean claim defines CTE {name} once");
+        };
+        *text = edit(&squash(text));
+    }
+
+    /// The pause joins of a scan. Each pause CTE holds one row.
+    const LEAN_PAUSE_JOINS: &str = "CROSS JOIN paused_queues CROSS JOIN paused_activities ";
+
+    /// The pause joins of the pin head, up to its lateral scan.
+    const LEAN_PIN_PAUSE_JOINS: &str =
+        "FROM paused_queues CROSS JOIN paused_activities CROSS JOIN LATERAL ( ";
+
+    /// The pin head with no pause join. Its scan then reads no column of
+    /// another relation, so it is not lateral.
+    const LEAN_PIN_SOURCE: &str = "FROM ( ";
+
+    /// The array of each pause CTE: the CTE, the read through a join, and
+    /// the read through a scalar subquery.
+    ///
+    /// The cast makes `ANY` take an array. With no cast, Postgres reads
+    /// `ANY ((SELECT ...))` as a test against each row of the subquery.
+    const LEAN_PAUSE_READS: [(&str, &str, &str); 2] = [
+        (
+            "paused_queues",
+            "paused_queues.names",
+            "(SELECT names FROM paused_queues)::text[]",
+        ),
+        (
+            "paused_activities",
+            "paused_activities.names",
+            "(SELECT names FROM paused_activities)::text[]",
+        ),
+    ];
+
+    /// `scan` with a scalar subquery for each of its `count` reads of each
+    /// pause array.
+    fn lean_scalar_reads(scan: &str, count: usize) -> String {
+        let mut scan = scan.to_owned();
+        for (_, joined, scalar) in LEAN_PAUSE_READS {
+            scan = replace_exact(&scan, joined, count, scalar, "the read of a pause array");
+        }
+        scan
+    }
+
+    /// Reads each pause array through a scalar subquery, not through a
+    /// join.
+    ///
+    /// Each pause CTE holds one row, so the subquery reads the value that
+    /// the join reads. A join is one more plan node to start on each claim,
+    /// and it scans its CTE again for each outer row. A scalar subquery is
+    /// an init plan. It runs once, and each pause test becomes a test of
+    /// its own scan.
+    ///
+    /// The planner cannot read an array of either form at plan time. The
+    /// activity tests of a head stay in their `CASE`, which has a fixed
+    /// default estimate. A queue head holds no queue test. So a queue head
+    /// keeps its estimate and its bounded index scan.
+    ///
+    /// The queue test is now a test of the pin scan and of the candidate
+    /// scan. On a table with one queue name, the planner estimates that it
+    /// passes one row. Neither scan stops early on an estimate. The pin
+    /// scan reads each live pin of the worker. The candidate scan reads the
+    /// window by row id.
+    /// `the_lean_form_keeps_its_plan_on_a_deep_backlog_of_one_queue` pins
+    /// each plan.
+    fn lean_scalar_pause_reads(ctes: &mut [LeanCte<'_>]) {
+        edit_lean_cte(ctes, "seek_heads", |heads| {
+            let heads = replace_exact(
+                heads,
+                LEAN_PAUSE_JOINS,
+                1,
+                "",
+                "the pause joins of the queue heads",
+            );
+            let heads = replace_exact(
+                &heads,
+                LEAN_PIN_PAUSE_JOINS,
+                1,
+                LEAN_PIN_SOURCE,
+                "the pause joins of the pin head",
+            );
+            lean_scalar_reads(&heads, 2)
+        });
+        edit_lean_cte(ctes, "seek_candidate", |seek| {
+            let seek = replace_exact(
+                seek,
+                LEAN_PAUSE_JOINS,
+                1,
+                "",
+                "the pause joins of the candidate scan",
+            );
+            lean_scalar_reads(&seek, 1)
+        });
+        for (name, text) in ctes.iter() {
+            for (pauses, _, scalar) in LEAN_PAUSE_READS {
+                assert!(
+                    *name == pauses || text.matches(pauses).count() == text.matches(scalar).count(),
+                    "the lean claim reads {pauses} through a scalar subquery only: {name}"
+                );
+            }
+        }
+    }
+
+    /// The array of each pause CTE: the CTE, the aggregate form and the
+    /// `ARRAY` form.
+    const LEAN_PAUSE_ARRAYS: [(&str, &str, &str); 2] = [
+        (
+            "paused_queues",
+            "SELECT COALESCE(array_agg(queue_name), ARRAY[]::text[]) AS names \
+             FROM harvest_queue_pauses WHERE queue_name = ANY($2)",
+            "SELECT ARRAY( SELECT queue_name FROM harvest_queue_pauses \
+             WHERE queue_name = ANY($2) ) AS names",
+        ),
+        (
+            "paused_activities",
+            "SELECT COALESCE(array_agg(activity_name), ARRAY[]::text[]) AS names \
+             FROM harvest_activity_pauses",
+            "SELECT ARRAY( SELECT activity_name FROM harvest_activity_pauses ) AS names",
+        ),
+    ];
+
+    /// Builds each pause array with `ARRAY(SELECT ...)`, not with an
+    /// aggregate.
+    ///
+    /// Both forms give an empty array for no row, not NULL. Both name
+    /// columns are `text NOT NULL`, so both forms give a `text[]` with no
+    /// NULL element. An aggregate node finds its function and builds its
+    /// state on each claim. The `ARRAY` form has no such node.
+    fn lean_pause_arrays(ctes: &mut [LeanCte<'_>]) {
+        for (name, aggregate, array) in LEAN_PAUSE_ARRAYS {
+            edit_lean_cte(ctes, name, |cte| {
+                replace_exact(cte, aggregate, 1, array, "the aggregate of a pause array")
+            });
+        }
+    }
+
+    /// The names that `$6` marks as saturated, with no marker.
+    const LEAN_MARKED_NAMES: &str = "SELECT substr(marked, 2) FROM unnest($6::text[]) AS marked \
+         WHERE left(marked, 1) = chr(1)";
+
+    /// The rows of the paused activity array.
+    const LEAN_ACTIVITY_PAUSES: &str = "FROM harvest_activity_pauses";
+
+    /// The text in front of the one read of the held activity names in
+    /// each head, and how many heads `seek_heads` has.
+    const LEAN_HEAD_ACTIVITY_GUARD: (&str, usize) =
+        ("WHEN task_type = 'activity' AND activity_name = ANY(", 2);
+
+    /// The text in front of the one read of the held activity names in
+    /// `seek_candidate`.
+    const LEAN_CANDIDATE_ACTIVITY_GUARD: (&str, usize) = (
+        "( task_type != 'activity' OR activity_name IS NULL OR NOT (activity_name = ANY(",
+        1,
+    );
+
+    /// Puts the saturated names of `$6` into the paused activity array.
+    ///
+    /// The window text unpacks the marked names of `$6` three times: in
+    /// each head and in the candidate scan. Each copy is a subquery that
+    /// starts on each claim. Each one stands beside a test of the paused
+    /// activity array, under the same activity guard, with the same result:
+    /// the claim holds the row. So the array holds both lists here, and the
+    /// three tests of the marked names go.
+    ///
+    /// Neither list holds a NULL. A pause row has a name, and a marked
+    /// element passed a test of its first character. So one test of the
+    /// joined array equals the two tests, for a NULL activity name too.
+    ///
+    /// This is exact only while each reader of the array holds an activity
+    /// row for each name in it. A reader that must tell a paused name from
+    /// a saturated name cannot read this array. The assertions make such a
+    /// reader, and a reader with no activity guard, a panic at first use.
+    fn lean_held_activity_names(ctes: &mut [LeanCte<'_>]) {
+        let held = format!(
+            "FROM ( SELECT activity_name FROM harvest_activity_pauses UNION ALL \
+             {LEAN_MARKED_NAMES} ) AS held(activity_name)"
+        );
+        let head_test = format!(
+            " WHEN task_type = 'activity' AND activity_name = ANY(ARRAY( {LEAN_MARKED_NAMES} )) \
+             THEN FALSE"
+        );
+        let gate = format!(
+            "AND ( task_type != 'activity' OR activity_name IS NULL \
+             OR NOT (activity_name = ANY(ARRAY( {LEAN_MARKED_NAMES} ))) ) "
+        );
+        edit_lean_cte(ctes, "paused_activities", |cte| {
+            replace_exact(
+                cte,
+                LEAN_ACTIVITY_PAUSES,
+                1,
+                &held,
+                "the paused activity rows",
+            )
+        });
+        edit_lean_cte(ctes, "seek_heads", |heads| {
+            replace_exact(heads, &head_test, 2, "", "the marked-name test of a head")
+        });
+        edit_lean_cte(ctes, "seek_candidate", |seek| {
+            replace_exact(seek, &gate, 1, "", "the marked-name gate")
+        });
+        let [_, (pauses, joined, scalar)] = LEAN_PAUSE_READS;
+        for (name, text) in ctes.iter() {
+            let (guard, reads) = match *name {
+                "paused_activities" => continue,
+                "seek_heads" => LEAN_HEAD_ACTIVITY_GUARD,
+                "seek_candidate" => LEAN_CANDIDATE_ACTIVITY_GUARD,
+                _ => ("", 0),
+            };
+            let found: usize = [joined, scalar]
+                .iter()
+                .map(|read| text.matches(read).count())
+                .sum();
+            let guarded: usize = [joined, scalar]
+                .iter()
+                .map(|read| text.matches(&format!("{guard}{read}")).count())
+                .sum();
+            assert!(
+                found == reads && guarded == reads && (reads > 0 || !names(text, pauses)),
+                "the lean claim reads the held activity names under the activity guard, \
+                 {reads} time(s): {name}"
+            );
+            assert!(
+                !text.contains("unnest($6"),
+                "the lean claim unpacks the marked names once: {name}"
+            );
+        }
+    }
+
+    /// The lean form of a window text (issue #2680): a smaller statement
+    /// that is exact for a window of plain rows.
+    ///
+    /// Postgres initializes every plan node at executor startup. It does so
+    /// again when a peer commits a window row before the row lock. Many
+    /// nodes of the window form serve only a row with a concurrency key, a
+    /// rate-limit key, a build pin or a capability list. A plain row has
+    /// NULL in each of those columns. Each gate of `LEAN_GATES` passes a
+    /// plain row, so the lean form holds the NULL test in place of the gate.
+    ///
+    /// `seek_heads` carries `seek_plain` for each window row. A one-time
+    /// gate in `seek_candidate` passes no row when a window row is not
+    /// plain. The form then locks no row and claims no row. The flag is set
+    /// when no candidate exists and the window holds a row, or ageing is on.
+    /// The caller then sends the window form, a fresh attempt in the same
+    /// transaction. An empty window with ageing off returns no row and a
+    /// clear flag, as the window form does.
+    ///
+    /// The NULL tests are row tests, not only a part of the one-time gate.
+    /// A row lock can re-check a newer version of a row. The re-check
+    /// applies each row test to that version.
+    ///
+    /// `fresh_now` reads `candidate` before the clock, so the clock read
+    /// still follows the candidate lock. A plain row has no bucket and no
+    /// key. So `fresh_now` locks no bucket, no debit runs, and `claimed`
+    /// keeps the id match and the expiry test only.
+    ///
+    /// The lean form reads binds `$1`, `$2`, `$4` and `$6`, and it keeps the
+    /// bind numbers of the window form. The caller binds every value of the
+    /// window form. `CachedClaimQuery` sends the type of each bind, so
+    /// Postgres accepts a bind that the text does not read.
+    ///
+    /// A second step applies each rewrite of `LEAN_PLAN_REWRITES` to the
+    /// derived text. The rewrites change the shape of the plan only.
+    ///
+    /// Each edit replaces one exact text and asserts its count, as
+    /// `splice_dr_fence` does. The batch form has no lean form. It keeps
+    /// the text that `batch_claim_sql` derives.
+    ///
+    /// # Panics
+    ///
+    /// When `window` is not a window text. Every input is a constant.
+    #[must_use]
+    pub(super) fn lean_claim_sql(window: &str) -> String {
+        lean_claim_sql_with(window, &LEAN_PLAN_REWRITES)
+    }
+
+    /// [`lean_claim_sql`] with `rewrites` as its plan-shape rewrites.
+    fn lean_claim_sql_with(window: &str, rewrites: &[LeanRewrite]) -> String {
+        let (ctes, tail) = split_ctes(window);
+        let defined = |name: &str| ctes.iter().filter(|c| c.name == name).count();
+        for name in LEAN_DROPPED_CTES.into_iter().chain(LEAN_NEEDED_CTES) {
+            assert_eq!(defined(name), 1, "a window text defines CTE {name} once");
+        }
+        let (fenced, owned) = (defined("fence"), defined("owner_gate"));
+        assert!(
+            fenced <= 1 && owned <= 1,
+            "a window text has one fence and one owner gate at most"
+        );
+        let mut lean: Vec<LeanCte<'_>> = Vec::with_capacity(ctes.len());
+        for cte in &ctes {
+            let text = match cte.name {
+                name if LEAN_DROPPED_CTES.contains(&name) => continue,
+                "seek_heads" => lean_seek_heads(&squash(cte.text)),
+                "seek_candidate" => lean_seek_candidate(&squash(cte.text), fenced, owned),
+                "candidate" => {
+                    assert_eq!(squash(cte.text), WINDOW_CANDIDATE_CTE);
+                    cte.text.to_owned()
+                }
+                "fresh_now" => replace_exact(
+                    &squash(cte.text),
+                    LEAN_BUCKET_LOCK,
+                    1,
+                    LEAN_CANDIDATE_READ,
+                    "the bucket lock",
+                ),
+                "claimed" => lean_claimed(&squash(cte.text)),
+                _ => cte.text.to_owned(),
+            };
+            lean.push((cte.name, text));
+        }
+        let guards = lean_guard_counts(&lean);
+        for rewrite in rewrites {
+            rewrite(&mut lean);
+        }
+        assert_eq!(
+            lean_guard_counts(&lean),
+            guards,
+            "a plan rewrite of the lean claim keeps each guard of each CTE"
+        );
+        let mut kept: Vec<String> = lean.into_iter().map(|(_, text)| text).collect();
+        kept.push(format!(
+            "claim_lean_fallback AS MATERIALIZED ( SELECT {LEAN_FALLBACK_SQL} AS \
+             {WINDOW_FALLBACK_COLUMN} )"
+        ));
+        for cte in &kept {
+            for dropped in LEAN_DROPPED_CTES {
+                assert!(
+                    !names(cte, dropped),
+                    "a lean claim CTE reads dropped CTE {dropped}: {cte}"
+                );
+            }
+        }
+        let tail = replace_exact(
+            tail,
+            WINDOW_FLAG_SOURCE,
+            1,
+            "FROM claim_lean_fallback fb",
+            "the flag source",
+        );
+        format!("WITH {} {tail}", kept.join(", "))
+    }
+
+    /// The longest run of claims that skip the lean form.
+    pub(super) const LEAN_SKIP_CAP: u32 = 64;
+
+    /// The claims that one lean fallback adds to the skip.
+    ///
+    /// A lean statement that sets its flag costs more than a lean claim
+    /// saves. So a loop keeps the lean form first only while its lean claims
+    /// take more rows than this for each fallback.
+    pub(super) const LEAN_SKIP_STEP: u32 = 4;
+
+    /// One lean-form skip (issue #2680). A claim loop holds one for each
+    /// claim kind, in its [`LeanSkips`].
+    ///
+    /// A lean fallback costs one statement more than a claim that sends the
+    /// window form first. A queue that holds keyed rows would pay that on
+    /// each claim. So after a fallback, the next claims send the window form
+    /// first. Each fallback adds 4 claims to the skip, up to 64 claims. Each
+    /// lean claim that takes a row takes 1 claim off the next skip. An empty
+    /// poll keeps the skip.
+    ///
+    /// A lean claim does not end the skip. A loop can see plain windows and
+    /// keyed windows in turn. A skip that ended on each lean claim would
+    /// send a wasted lean statement on one claim in three. Here at least 4
+    /// window-first claims follow each fallback.
+    ///
+    /// The skip changes the cost of a claim only. Both forms are exact, so
+    /// a claim takes the same row in every skip state.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub(super) struct LeanSkip {
+        /// The claims left that send the window form first.
+        left: u32,
+        /// The length that the next skip grows from.
+        span: u32,
+    }
+
+    impl LeanSkip {
+        /// A skip that sends the lean form first.
+        pub(super) const fn new() -> Self {
+            Self { left: 0, span: 0 }
+        }
+    }
+
+    /// The lean-form skips of one claim loop (issue #2680), one for each
+    /// claim kind.
+    ///
+    /// A loop can claim any kind in one poll and one kind in the next. A
+    /// claim of each kind reads its own seek window. A keyed activity row
+    /// makes each lean claim of any kind fall back, and a workflow claim
+    /// still reads plain rows only. With one skip for both, each lean
+    /// workflow claim would shorten the skip of the other kind. So each kind
+    /// has its own skip.
+    ///
+    /// After a lean fallback, the next claims of that kind send the window
+    /// form first. Each fallback adds 4 claims to the skip, up to 64 claims.
+    /// Each lean claim that takes a row takes 1 claim off the next skip. An
+    /// empty poll keeps the skip.
+    ///
+    /// Each claim loop holds its own state, so one loop never changes the
+    /// skip of another loop. A worker with queue weights claims queue by
+    /// queue, and its loop holds one `LeanSkips` for each queue.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct LeanSkips {
+        /// The skip of the claims of any kind, of workflow rows only and of
+        /// activity rows only, in the order of `LeanSkips::slot`.
+        kinds: [LeanSkip; 3],
+    }
+
+    impl LeanSkips {
+        /// The state of a new claim loop. Its first claim of each kind sends
+        /// the lean form.
+        #[must_use]
+        pub const fn new() -> Self {
+            Self {
+                kinds: [LeanSkip::new(); 3],
+            }
+        }
+
+        /// True when the next windowed claim of `kind` sends the lean form
+        /// first.
+        #[must_use]
+        pub const fn sends_lean(self, kind: Option<super::TaskType>) -> bool {
+            lean_first(self.of(kind))
+        }
+
+        /// The place of the skip of `kind` in `kinds`.
+        const fn slot(kind: Option<super::TaskType>) -> usize {
+            match kind {
+                None => 0,
+                Some(super::TaskType::Workflow) => 1,
+                Some(super::TaskType::Activity) => 2,
+            }
+        }
+
+        /// The skip of the claims of `kind`.
+        pub(super) const fn of(self, kind: Option<super::TaskType>) -> LeanSkip {
+            self.kinds[Self::slot(kind)]
+        }
+
+        /// Records one claim of `kind`. `lean` is the step of its lean form,
+        /// or `None` when the claim did not send it. Only the skip of `kind`
+        /// changes.
+        pub(super) const fn record(
+            &mut self,
+            kind: Option<super::TaskType>,
+            lean: Option<WindowStep>,
+        ) {
+            let slot = Self::slot(kind);
+            self.kinds[slot] = lean_skip_after(self.kinds[slot], lean);
+        }
+    }
+
+    #[cfg(test)]
+    impl LeanSkips {
+        /// The state after one lean fallback of `kind`, for a test of
+        /// another module.
+        pub(crate) const fn after_fallback(mut self, kind: Option<super::TaskType>) -> Self {
+            self.record(kind, Some(WindowStep::Fallback));
+            self
+        }
+    }
+
+    /// True when a claim sends the lean form before the window form.
+    ///
+    /// `windowed` is false for an ageing claim and for a fair claim. Those
+    /// send neither form. `lean` is the skip of the calling claim loop for
+    /// the kind of the claim. A caller with no loop state passes `None`,
+    /// and its claim sends the window form first.
+    pub(super) const fn sends_lean_first(windowed: bool, lean: Option<LeanSkip>) -> bool {
+        match lean {
+            Some(skip) => windowed && lean_first(skip),
+            None => false,
+        }
+    }
+
+    /// True when the next claim of the skip sends the lean form first.
+    ///
+    /// `formal/verus/src/claim_window.rs` holds the proved copy.
+    pub(super) const fn lean_first(skip: LeanSkip) -> bool {
+        skip.left == 0
+    }
+
+    /// The length of the skip after one more fallback: [`LEAN_SKIP_STEP`]
+    /// claims more, up to [`LEAN_SKIP_CAP`].
+    ///
+    /// `formal/verus/src/claim_window.rs` holds the proved copy.
+    pub(super) const fn lean_skip_span(span: u32) -> u32 {
+        if span >= LEAN_SKIP_CAP - LEAN_SKIP_STEP {
+            LEAN_SKIP_CAP
+        } else {
+            span + LEAN_SKIP_STEP
+        }
+    }
+
+    /// The skip after one claim. `lean` is the step of the lean form, or
+    /// `None` when the claim did not send it.
+    ///
+    /// `formal/verus/src/claim_window.rs` holds the proved copy.
+    pub(super) const fn lean_skip_after(skip: LeanSkip, lean: Option<WindowStep>) -> LeanSkip {
+        match lean {
+            None => {
+                if skip.left == 0 {
+                    skip
+                } else {
+                    LeanSkip {
+                        left: skip.left - 1,
+                        span: skip.span,
+                    }
+                }
+            }
+            Some(WindowStep::Claimed) => LeanSkip {
+                left: 0,
+                span: skip.span.saturating_sub(1),
+            },
+            Some(WindowStep::Empty) => skip,
+            Some(WindowStep::Fallback) => {
+                let span = lean_skip_span(skip.span);
+                LeanSkip { left: span, span }
+            }
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -581,6 +1392,1075 @@ mod claim_window {
                 "{} AS claim_due",
                 squash(super::super::CLAIM_ORDER_DUE_SQL)
             )));
+        }
+
+        /// The squashed text of CTE `name`.
+        fn cte_text(ctes: &[Cte<'_>], name: &str) -> String {
+            ctes.iter()
+                .find(|c| c.name == name)
+                .map_or_else(|| panic!("CTE {name}"), |c| squash(c.text))
+        }
+
+        /// The top-level `AND` terms of the `WHERE` clause of a candidate
+        /// scan, up to its `ORDER BY`.
+        fn where_terms(cte_text: &str) -> Vec<String> {
+            let bytes = cte_text.as_bytes();
+            let mut depth = 0_usize;
+            let mut in_literal = false;
+            let mut start = None;
+            let mut terms = Vec::new();
+            for (i, &byte) in bytes.iter().enumerate() {
+                match byte {
+                    b'\'' => in_literal = !in_literal,
+                    b'(' if !in_literal => depth += 1,
+                    b')' if !in_literal => depth -= 1,
+                    _ => {}
+                }
+                if in_literal || depth != 1 {
+                    continue;
+                }
+                let rest = &cte_text[i..];
+                match start {
+                    None if rest.starts_with(" WHERE ") => start = Some(i + " WHERE ".len()),
+                    Some(from) if rest.starts_with(" AND ") => {
+                        terms.push(cte_text[from..i].to_owned());
+                        start = Some(i + " AND ".len());
+                    }
+                    Some(from) if rest.starts_with(" ORDER BY ") => {
+                        terms.push(cte_text[from..i].to_owned());
+                        return terms;
+                    }
+                    _ => {}
+                }
+            }
+            panic!("the scan has no WHERE clause with an ORDER BY: {cte_text}");
+        }
+
+        #[test]
+        fn where_terms_splits_the_top_level_only() {
+            let scan = "c AS ( SELECT 1 FROM t WHERE a = ' AND ' AND ( b OR ( c AND d ) ) \
+                        AND e = ANY(ARRAY( SELECT 1 WHERE f AND g )) ORDER BY a LIMIT 1 )";
+            assert_eq!(
+                where_terms(scan),
+                [
+                    "a = ' AND '",
+                    "( b OR ( c AND d ) )",
+                    "e = ANY(ARRAY( SELECT 1 WHERE f AND g ))"
+                ]
+            );
+        }
+
+        const LEAN_FLAG_CTE: &str = "claim_lean_fallback AS MATERIALIZED ( SELECT NOT EXISTS \
+             (SELECT 1 FROM seek_candidate) AND (EXISTS (SELECT 1 FROM seek_heads) \
+             OR ($4::BIGINT IS NOT NULL AND $4::BIGINT > 0)) AS claim_fallback )";
+
+        const LEAN_PLAIN: &str = "(concurrency_key IS NULL AND required_build_id IS NULL \
+             AND required_capabilities IS NULL AND rate_limit_key IS NULL)";
+
+        /// The start of each gate that the lean form replaces, and the row
+        /// test that replaces it.
+        const LEAN_GATE_TESTS: [(&str, &str); 4] = [
+            ("( concurrency_key IS NULL OR ", "concurrency_key IS NULL"),
+            (
+                "( required_build_id IS NULL OR ",
+                "required_build_id IS NULL",
+            ),
+            (
+                "( required_capabilities IS NULL OR ",
+                "required_capabilities IS NULL",
+            ),
+            ("( rate_limit_key IS NULL OR ", "rate_limit_key IS NULL"),
+        ];
+
+        /// The read of the paused queue array in a lean scan.
+        const PAUSED_QUEUES_READ: &str = "(SELECT names FROM paused_queues)::text[]";
+
+        /// The read of the paused activity array in a lean scan.
+        const PAUSED_ACTIVITIES_READ: &str = "(SELECT names FROM paused_activities)::text[]";
+
+        /// The pause CTEs of each lean text.
+        const LEAN_PAUSE_CTES: [(&str, &str); 2] = [
+            (
+                "paused_queues",
+                "paused_queues AS MATERIALIZED ( SELECT ARRAY( SELECT queue_name \
+                 FROM harvest_queue_pauses WHERE queue_name = ANY($2) ) AS names )",
+            ),
+            (
+                "paused_activities",
+                "paused_activities AS MATERIALIZED ( SELECT ARRAY( SELECT activity_name \
+                 FROM ( SELECT activity_name FROM harvest_activity_pauses UNION ALL \
+                 SELECT substr(marked, 2) FROM unnest($6::text[]) AS marked \
+                 WHERE left(marked, 1) = chr(1) ) AS held(activity_name) ) AS names )",
+            ),
+        ];
+
+        /// The head test of the window text for a name that `$6` marks.
+        const WINDOW_HEAD_MARKED_TEST: &str = " WHEN task_type = 'activity' AND activity_name \
+             = ANY(ARRAY( SELECT substr(marked, 2) FROM unnest($6::text[]) AS marked \
+             WHERE left(marked, 1) = chr(1) )) THEN FALSE";
+
+        /// The start of the candidate gate of the window text for a name
+        /// that `$6` marks.
+        const WINDOW_MARKED_GATE_START: &str = "( task_type != 'activity' \
+             OR activity_name IS NULL OR NOT (activity_name = ANY(ARRAY( SELECT substr(marked, 2)";
+
+        /// The text in front of each read of the held activity names in a
+        /// lean head, and in the lean candidate scan.
+        const HELD_ACTIVITY_GUARDS: [(&str, usize, &str); 2] = [
+            (
+                "seek_heads",
+                2,
+                "WHEN task_type = 'activity' AND activity_name = ANY(",
+            ),
+            (
+                "seek_candidate",
+                1,
+                "( task_type != 'activity' OR activity_name IS NULL OR NOT (activity_name = ANY(",
+            ),
+        ];
+
+        /// The activity tests of a lean head. A `CASE` holds each of them,
+        /// so the planner gives the head its fixed default estimate.
+        const LEAN_HEAD_CASE: &str = "AND CASE WHEN task_type = 'activity' AND activity_name \
+             = ANY((SELECT names FROM paused_activities)::text[]) THEN FALSE \
+             WHEN task_type = 'activity' AND required_capabilities IS NULL \
+             AND activity_name = ANY($6) THEN FALSE \
+             ELSE TRUE END";
+
+        /// A scan of the window text, as the lean form reads the pauses. It
+        /// has no pause join, and it reads each array through its scalar
+        /// subquery. A head has no test of its own for a marked name.
+        fn with_lean_pause_reads(scan: &str) -> String {
+            scan.replace("CROSS JOIN paused_queues CROSS JOIN paused_activities ", "")
+                .replace(
+                    "FROM paused_queues CROSS JOIN paused_activities CROSS JOIN LATERAL ( ",
+                    "FROM ( ",
+                )
+                .replace("paused_queues.names", PAUSED_QUEUES_READ)
+                .replace("paused_activities.names", PAUSED_ACTIVITIES_READ)
+                .replace(WINDOW_HEAD_MARKED_TEST, "")
+        }
+
+        #[test]
+        #[allow(clippy::too_many_lines)]
+        fn lean_claim_sql_holds_for_every_variant() {
+            use crate::queue::{TaskType, lean_claim_query_for, window_claim_query_for};
+            for kind in [None, Some(TaskType::Workflow), Some(TaskType::Activity)] {
+                for fenced in [false, true] {
+                    for owned in [false, true] {
+                        let case = format!("kind {kind:?}, fenced {fenced}, owned {owned}");
+                        let window = window_claim_query_for(kind, fenced, owned);
+                        let lean = lean_claim_query_for(kind, fenced, owned);
+                        let (window_ctes, window_tail) = split_ctes(window);
+                        let (ctes, tail) = split_ctes(lean);
+                        let text = |name: &str| cte_text(&ctes, name);
+                        let window_text = |name: &str| cte_text(&window_ctes, name);
+
+                        for dropped in LEAN_DROPPED_CTES {
+                            assert!(names(window, dropped), "{case}: the window has {dropped}");
+                            assert!(
+                                !names(lean, dropped),
+                                "{case}: the lean form keeps {dropped}"
+                            );
+                        }
+                        let mut want: Vec<&str> = window_ctes
+                            .iter()
+                            .map(|c| c.name)
+                            .filter(|name| !LEAN_DROPPED_CTES.contains(name))
+                            .collect();
+                        want.push("claim_lean_fallback");
+                        let found: Vec<&str> = ctes.iter().map(|c| c.name).collect();
+                        assert_eq!(found, want, "{case}: the CTE list");
+                        let changed = [
+                            "paused_queues",
+                            "paused_activities",
+                            "seek_heads",
+                            "seek_candidate",
+                            "fresh_now",
+                            "claimed",
+                        ];
+                        for cte in &window_ctes {
+                            if want.contains(&cte.name) && !changed.contains(&cte.name) {
+                                assert_eq!(
+                                    text(cte.name),
+                                    squash(cte.text),
+                                    "{case}: {}",
+                                    cte.name
+                                );
+                            }
+                        }
+
+                        let heads = text("seek_heads");
+                        let head_row = format!(
+                            "task_type AS seek_task_type, {LEAN_PLAIN} AS seek_plain \
+                             FROM harvest_task_queue"
+                        );
+                        assert_eq!(heads.matches(&head_row).count(), 2, "{case}: both heads");
+                        assert_eq!(
+                            heads
+                                .matches("h.seek_task_type, h.seek_plain, h.head_queue")
+                                .count(),
+                            1,
+                            "{case}: the outer list"
+                        );
+                        assert_eq!(
+                            heads
+                                .replace(&format!(", {LEAN_PLAIN} AS seek_plain"), "")
+                                .replace("h.seek_plain, ", ""),
+                            with_lean_pause_reads(&window_text("seek_heads")),
+                            "{case}: the heads change in the plain flag and the pause reads only"
+                        );
+                        for (name, pauses) in LEAN_PAUSE_CTES {
+                            assert_eq!(text(name), pauses, "{case}: {name}");
+                        }
+
+                        let seek = text("seek_candidate");
+                        let window_seek = window_text("seek_candidate");
+                        let from = |scan: &str| {
+                            scan.split_once(" WHERE ")
+                                .map(|(from, _)| from.to_owned())
+                                .unwrap_or_default()
+                        };
+                        assert_eq!(
+                            from(&seek),
+                            from(&with_lean_pause_reads(
+                                &window_seek.replace("CROSS JOIN worker_info ", "")
+                            )),
+                            "{case}: the row source"
+                        );
+                        let mut replaced = 0;
+                        let window_terms = where_terms(&window_seek);
+                        // The paused activity array holds each marked name,
+                        // so the lean scan has no gate of its own for them.
+                        let mut want_terms: Vec<String> = window_terms
+                            .iter()
+                            .filter(|term| !term.starts_with(WINDOW_MARKED_GATE_START))
+                            .map(|term| {
+                                LEAN_GATE_TESTS
+                                    .iter()
+                                    .find(|(gate, _)| term.starts_with(gate))
+                                    .map_or_else(
+                                        || with_lean_pause_reads(term),
+                                        |(_, test)| {
+                                            replaced += 1;
+                                            (*test).to_owned()
+                                        },
+                                    )
+                            })
+                            .collect();
+                        assert_eq!(replaced, 4, "{case}: four gates become row tests");
+                        assert_eq!(
+                            want_terms.len() + 1,
+                            window_terms.len(),
+                            "{case}: one gate reads the marked names"
+                        );
+                        want_terms.push(
+                            "NOT EXISTS (SELECT 1 FROM seek_heads np WHERE NOT np.seek_plain)"
+                                .to_owned(),
+                        );
+                        assert_eq!(where_terms(&seek), want_terms, "{case}: the gates");
+                        let sort = |scan: &str| {
+                            scan.rsplit_once(" ORDER BY ")
+                                .map(|(_, sort)| sort.to_owned())
+                                .unwrap_or_default()
+                        };
+                        assert_eq!(sort(&seek), sort(&window_seek), "{case}: the sort");
+                        assert!(
+                            seek.ends_with("LIMIT 1 FOR UPDATE SKIP LOCKED )"),
+                            "{case}: the lock"
+                        );
+
+                        assert_eq!(
+                            seek.matches("CROSS JOIN fence ").count(),
+                            usize::from(fenced),
+                            "{case}: the candidate scan joins the fence"
+                        );
+                        assert_eq!(
+                            lean.matches("CROSS JOIN fence ").count(),
+                            usize::from(fenced),
+                            "{case}: no other scan joins the fence"
+                        );
+                        assert_eq!(names(lean, "fence"), fenced, "{case}: the fence CTE");
+                        if owned {
+                            let (holder, partitions) =
+                                if fenced { ("$9", "$10") } else { ("$7", "$8") };
+                            assert!(
+                                lean.starts_with("WITH owner_gate AS MATERIALIZED"),
+                                "{case}: the owner gate CTE"
+                            );
+                            assert_eq!(
+                                seek.matches(&format!(
+                                    "AND ( task_type <> 'workflow' OR ( (SELECT owner_on FROM \
+                                     owner_gate) AND ( decision_partition IS NULL OR \
+                                     get_bit({partitions}::bytea, decision_partition) = 1 ) ) )"
+                                ))
+                                .count(),
+                                1,
+                                "{case}: the owned gate"
+                            );
+                            assert_eq!(
+                                seek.matches(&format!(
+                                    "AND ( task_type <> 'workflow' OR decision_partition IS NULL \
+                                     OR EXISTS ( SELECT 1 FROM harvest_decision_owner o WHERE \
+                                     o.partition = harvest_task_queue.decision_partition AND \
+                                     o.holder = {holder}::text ) )"
+                                ))
+                                .count(),
+                                1,
+                                "{case}: the holder check"
+                            );
+                        } else {
+                            assert!(!names(lean, "owner_gate"), "{case}: no owner gate");
+                            assert!(!lean.contains("harvest_decision_owner"), "{case}");
+                        }
+                        if let Some(kind) = kind {
+                            let row =
+                                format!("AND harvest_task_queue.task_type = '{}' ", kind.as_str());
+                            let head = format!("AND k.head_kind = '{}' ", kind.as_str());
+                            let (lean, window) = (squash(lean), squash(window));
+                            assert_eq!(seek.matches(&row).count(), 1, "{case}: the kind test");
+                            assert_eq!(
+                                lean.matches(&row).count()
+                                    + window_text("seek_held").matches(&row).count(),
+                                window.matches(&row).count(),
+                                "{case}: each kept scan keeps its kind test"
+                            );
+                            assert_eq!(lean.matches(&head).count(), 1, "{case}: the kind heads");
+                            assert_eq!(window.matches(&head).count(), 1, "{case}");
+                        }
+
+                        assert_eq!(
+                            text("fresh_now"),
+                            "fresh_now AS MATERIALIZED ( SELECT clock_timestamp() AS ts \
+                             FROM (SELECT 1 AS one) base LEFT JOIN ( SELECT 1 AS x \
+                             FROM candidate c ) locked ON TRUE )",
+                            "{case}: the clock read follows the candidate lock"
+                        );
+                        let claimed = text("claimed");
+                        let window_claimed = window_text("claimed");
+                        let split = |update: &str| {
+                            update
+                                .split_once(" FROM candidate WHERE ")
+                                .map(|(set, tests)| (set.to_owned(), tests.to_owned()))
+                                .unwrap_or_default()
+                        };
+                        assert_eq!(split(&claimed).0, split(&window_claimed).0, "{case}");
+                        assert_eq!(
+                            split(&claimed).1,
+                            "harvest_task_queue.id = candidate.id \
+                             AND NOT (SELECT expired FROM run_expired_now) \
+                             RETURNING harvest_task_queue.* )",
+                            "{case}: the claim keeps the id match and the expiry test"
+                        );
+                        assert_eq!(text("claim_lean_fallback"), LEAN_FLAG_CTE, "{case}");
+                        assert_eq!(
+                            tail,
+                            window_tail.replace("claim_window_fallback", "claim_lean_fallback"),
+                            "{case}: the same result columns and the same flag column"
+                        );
+                        assert!(
+                            tail.ends_with(&format!(
+                                "fb.{WINDOW_FALLBACK_COLUMN} FROM claim_lean_fallback fb \
+                                 LEFT JOIN claimed ON TRUE"
+                            )),
+                            "{case}: the lean form returns its flag"
+                        );
+
+                        let mut want_binds = binds(window);
+                        want_binds.retain(|bind| ![3, 5].contains(bind));
+                        assert_eq!(
+                            binds(lean),
+                            want_binds,
+                            "{case}: the lean form reads no build bind and no breaker bind"
+                        );
+                        assert!(!lean.contains("--") && !lean.contains("/*"), "{case}");
+                        assert!(
+                            lean.len() * 3 < window.len() * 2,
+                            "{case}: {} of {}",
+                            lean.len(),
+                            window.len()
+                        );
+                    }
+                }
+            }
+        }
+
+        /// Each of the twelve lean texts, with its case name.
+        fn each_lean_text() -> Vec<(String, &'static str)> {
+            use crate::queue::{TaskType, lean_claim_query_for};
+            let mut texts = Vec::with_capacity(12);
+            for kind in [None, Some(TaskType::Workflow), Some(TaskType::Activity)] {
+                for fenced in [false, true] {
+                    for owned in [false, true] {
+                        texts.push((
+                            format!("kind {kind:?}, fenced {fenced}, owned {owned}"),
+                            lean_claim_query_for(kind, fenced, owned),
+                        ));
+                    }
+                }
+            }
+            texts
+        }
+
+        #[test]
+        fn the_lean_form_joins_no_pause_array() {
+            for (case, lean) in each_lean_text() {
+                let (ctes, _) = split_ctes(lean);
+                for join in [
+                    "CROSS JOIN paused_queues",
+                    "CROSS JOIN paused_activities",
+                    "FROM paused_queues CROSS",
+                    "FROM paused_activities CROSS",
+                    "paused_queues.names",
+                    "paused_activities.names",
+                ] {
+                    assert!(!lean.contains(join), "{case}: the lean form holds {join}");
+                }
+                // The queue heads keep their lateral scan. The pin head
+                // reads no row of another relation, so it has none.
+                let heads = cte_text(&ctes, "seek_heads");
+                assert_eq!(heads.matches("CROSS JOIN LATERAL").count(), 1, "{case}");
+                assert_eq!(
+                    heads
+                        .matches(
+                            "SELECT p.*, TRUE, NULL, NULL, NULL FROM ( SELECT * FROM ( SELECT id"
+                        )
+                        .count(),
+                    1,
+                    "{case}: the pin head"
+                );
+                for (cte, reads) in [("seek_heads", 2), ("seek_candidate", 1)] {
+                    let scan = cte_text(&ctes, cte);
+                    for read in [PAUSED_QUEUES_READ, PAUSED_ACTIVITIES_READ] {
+                        assert_eq!(scan.matches(read).count(), reads, "{case}: {cte}, {read}");
+                    }
+                }
+                // No other text names a pause CTE.
+                for (name, read) in [
+                    ("paused_queues", PAUSED_QUEUES_READ),
+                    ("paused_activities", PAUSED_ACTIVITIES_READ),
+                ] {
+                    let lean = squash(lean);
+                    assert_eq!(
+                        lean.matches(name).count(),
+                        lean.matches(read).count() + 1,
+                        "{case}: each reader of {name} is a scalar subquery"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn the_lean_form_builds_each_pause_array_with_no_aggregate() {
+            for (case, lean) in each_lean_text() {
+                let (ctes, _) = split_ctes(lean);
+                assert!(!lean.contains("array_agg"), "{case}: an aggregate");
+                for (name, pauses) in LEAN_PAUSE_CTES {
+                    assert_eq!(cte_text(&ctes, name), pauses, "{case}: {name}");
+                }
+            }
+        }
+
+        #[test]
+        fn the_lean_form_reads_the_held_activity_names_under_the_activity_guard() {
+            for (case, lean) in each_lean_text() {
+                let (ctes, _) = split_ctes(lean);
+                let lean = squash(lean);
+                // One subquery unpacks the marked names of `$6`, in the
+                // paused activity array.
+                assert_eq!(lean.matches("unnest($6").count(), 1, "{case}");
+                assert!(
+                    cte_text(&ctes, "paused_activities").contains("unnest($6"),
+                    "{case}: the paused activity array holds the marked names"
+                );
+                // A name in that array is paused or saturated. Both hold an
+                // activity row only, so each reader tests the task type.
+                let mut reads = 0;
+                for (cte, count, guard) in HELD_ACTIVITY_GUARDS {
+                    let scan = cte_text(&ctes, cte);
+                    let guarded = format!("{guard}{PAUSED_ACTIVITIES_READ}");
+                    assert_eq!(scan.matches(&guarded).count(), count, "{case}: {cte}");
+                    assert_eq!(
+                        scan.matches(PAUSED_ACTIVITIES_READ).count(),
+                        count,
+                        "{case}: {cte} reads the array with no activity guard"
+                    );
+                    reads += count;
+                }
+                assert_eq!(
+                    lean.matches(PAUSED_ACTIVITIES_READ).count(),
+                    reads,
+                    "{case}: another CTE reads the array"
+                );
+            }
+        }
+
+        #[test]
+        fn each_activity_test_of_a_lean_head_stays_in_its_case() {
+            for (case, lean) in each_lean_text() {
+                let (ctes, _) = split_ctes(lean);
+                let heads = cte_text(&ctes, "seek_heads");
+                assert_eq!(
+                    heads.matches(LEAN_HEAD_CASE).count(),
+                    2,
+                    "{case}: the queue heads and the pin head hold the same CASE"
+                );
+                assert_eq!(
+                    heads.matches(" CASE WHEN task_type = 'activity'").count(),
+                    2
+                );
+                // Outside the two CASE texts, no head test reads an activity
+                // name. A bare test would get its own estimate.
+                let rest = heads.replace(LEAN_HEAD_CASE, "");
+                assert!(
+                    !rest.contains("activity_name") && !rest.contains("paused_activities"),
+                    "{case}: an activity test outside the CASE"
+                );
+            }
+        }
+
+        /// Each subset of `LEAN_PLAN_REWRITES` derives a lean text, so each
+        /// rewrite stands alone. The CTE list, the result columns and the
+        /// binds do not depend on the subset.
+        #[test]
+        fn each_set_of_plan_rewrites_gives_a_lean_text() {
+            use crate::queue::{TaskType, lean_claim_query_for, window_claim_query_for};
+            let pause_readers = [
+                "paused_queues",
+                "paused_activities",
+                "seek_heads",
+                "seek_candidate",
+            ];
+            for kind in [None, Some(TaskType::Workflow), Some(TaskType::Activity)] {
+                for fenced in [false, true] {
+                    for owned in [false, true] {
+                        let window = window_claim_query_for(kind, fenced, owned);
+                        let all = lean_claim_query_for(kind, fenced, owned);
+                        let (all_ctes, all_tail) = split_ctes(all);
+                        for mask in 0..(1_usize << LEAN_PLAN_REWRITES.len()) {
+                            let used = |entry: usize| mask & (1 << entry) != 0;
+                            let set: Vec<LeanRewrite> = LEAN_PLAN_REWRITES
+                                .iter()
+                                .enumerate()
+                                .filter(|(entry, _)| used(*entry))
+                                .map(|(_, rewrite)| *rewrite)
+                                .collect();
+                            let lean = lean_claim_sql_with(window, &set);
+                            let case = format!(
+                                "kind {kind:?}, fenced {fenced}, owned {owned}, rewrites {mask:03b}"
+                            );
+                            let (ctes, tail) = split_ctes(&lean);
+                            assert_eq!(tail, all_tail, "{case}");
+                            assert_eq!(binds(&lean), binds(all), "{case}");
+                            assert_eq!(ctes.len(), all_ctes.len(), "{case}");
+                            for (cte, with_all) in ctes.iter().zip(&all_ctes) {
+                                assert_eq!(cte.name, with_all.name, "{case}");
+                                if !pause_readers.contains(&cte.name) {
+                                    assert_eq!(squash(cte.text), squash(with_all.text), "{case}");
+                                }
+                            }
+                            assert_eq!(
+                                lean.contains("CROSS JOIN paused_queues"),
+                                !used(0),
+                                "{case}: the scalar reads"
+                            );
+                            assert_eq!(lean.contains("array_agg"), !used(1), "{case}: the arrays");
+                            assert_eq!(
+                                lean.matches("unnest($6").count(),
+                                if used(2) { 1 } else { 3 },
+                                "{case}: the held names"
+                            );
+                            assert_eq!(
+                                set.len() == LEAN_PLAN_REWRITES.len(),
+                                lean == all,
+                                "{case}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        #[should_panic(
+            expected = "the lean claim needs the pause joins of the queue heads 1 time(s)"
+        )]
+        fn a_window_text_with_another_pause_join_panics() {
+            let window = squash(crate::queue::window_claim_query_for(None, false, false));
+            let _ = lean_claim_sql(&window.replace(
+                "AS q CROSS JOIN paused_queues CROSS JOIN paused_activities ",
+                "AS q CROSS JOIN paused_activities CROSS JOIN paused_queues ",
+            ));
+        }
+
+        #[test]
+        #[should_panic(
+            expected = "the lean claim reads paused_activities through a scalar subquery only: \
+                        seek_bounds"
+        )]
+        fn a_window_text_with_another_reader_of_a_pause_array_panics() {
+            let window = squash(crate::queue::window_claim_query_for(None, false, false));
+            let _ = lean_claim_sql(&window.replace(
+                "FROM seek_heads WHERE seek_rn = 32",
+                "FROM seek_heads CROSS JOIN paused_activities WHERE seek_rn = 32",
+            ));
+        }
+
+        #[test]
+        #[should_panic(expected = "the lean claim needs the aggregate of a pause array 1 time(s)")]
+        fn a_window_text_with_another_pause_aggregate_panics() {
+            let window = squash(crate::queue::window_claim_query_for(None, false, false));
+            let _ = lean_claim_sql(&window.replace(
+                "COALESCE(array_agg(queue_name), ARRAY[]::text[])",
+                "COALESCE(array_agg(DISTINCT queue_name), ARRAY[]::text[])",
+            ));
+        }
+
+        #[test]
+        #[should_panic(
+            expected = "the lean claim reads the held activity names under the activity guard"
+        )]
+        fn a_reader_of_the_held_names_with_no_activity_guard_panics() {
+            let window = squash(crate::queue::window_claim_query_for(None, false, false));
+            let _ = lean_claim_sql(&window.replace(
+                "( task_type != 'activity' OR activity_name IS NULL \
+                 OR NOT (activity_name = ANY(paused_activities.names)) )",
+                "( activity_name IS NULL OR NOT (activity_name = ANY(paused_activities.names)) )",
+            ));
+        }
+
+        /// What the lean form does with one gate of the window
+        /// `seek_candidate`.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum LeanGateUse {
+            /// The lean scan holds the gate. It can read a pause array in
+            /// another way.
+            Kept,
+            /// The lean scan holds the NULL test of the column of the gate.
+            PlainTest,
+            /// The lean scan has no such gate. The paused activity array
+            /// holds the names, so the paused activity gate does its work.
+            HeldNames,
+        }
+
+        /// Each `WHERE` term of the window `seek_candidate`, by its start,
+        /// with the use of the lean form.
+        ///
+        /// A new gate of `claim_candidate_gates_sql!` fails this test. Then
+        /// decide: the lean form keeps the gate, or the plain test covers its
+        /// column. Add the gate here with that decision.
+        const WINDOW_CANDIDATE_TERMS: [(&str, LeanGateUse); 16] = [
+            (
+                "harvest_task_queue.state = (SELECT 'PENDING'::text)",
+                LeanGateUse::Kept,
+            ),
+            ("scheduled_at <= NOW()", LeanGateUse::Kept),
+            (
+                "NOT (harvest_task_queue.queue_name = ANY(paused_queues.names))",
+                LeanGateUse::Kept,
+            ),
+            // This start holds no parenthesis. The walk of `row_guard` reads
+            // a line that names the table up to its closing parenthesis.
+            ("harvest_task_queue.ctid = ANY", LeanGateUse::Kept),
+            ("( schedule_to_close_at IS NULL OR ", LeanGateUse::Kept),
+            ("( sticky_worker_id IS NULL OR ", LeanGateUse::Kept),
+            ("( session_id IS NULL OR ", LeanGateUse::Kept),
+            (
+                "( task_type != 'activity' OR activity_name IS NULL \
+                 OR required_capabilities IS NOT NULL OR NOT (activity_name = ANY($6)) )",
+                LeanGateUse::Kept,
+            ),
+            (WINDOW_MARKED_GATE_START, LeanGateUse::HeldNames),
+            (
+                "( task_type != 'activity' OR activity_name IS NULL \
+                 OR NOT (activity_name = ANY(paused_activities.names)) )",
+                LeanGateUse::Kept,
+            ),
+            ("( concurrency_key IS NULL OR ", LeanGateUse::PlainTest),
+            ("( required_build_id IS NULL OR ", LeanGateUse::PlainTest),
+            (
+                "( task_type <> 'workflow' OR workflow_exec_id IS NULL OR ",
+                LeanGateUse::Kept,
+            ),
+            (
+                "( workflow_exec_id IS NULL OR NOT EXISTS ( SELECT 1 FROM expired_runs",
+                LeanGateUse::Kept,
+            ),
+            (
+                "( required_capabilities IS NULL OR ",
+                LeanGateUse::PlainTest,
+            ),
+            ("( rate_limit_key IS NULL OR ", LeanGateUse::PlainTest),
+        ];
+
+        #[test]
+        fn the_lean_form_decides_each_gate_of_the_window_candidate() {
+            let window = crate::queue::window_claim_query_for(None, false, false);
+            let (ctes, _) = split_ctes(window);
+            let terms = where_terms(&cte_text(&ctes, "seek_candidate"));
+            assert_eq!(
+                terms.len(),
+                WINDOW_CANDIDATE_TERMS.len(),
+                "seek_candidate has a new gate, or lost one. Decide whether the lean form \
+                 keeps it or the plain test covers it: {terms:#?}"
+            );
+            for (term, (start, _)) in terms.iter().zip(WINDOW_CANDIDATE_TERMS) {
+                assert!(term.starts_with(start), "{term} is not the gate {start}");
+            }
+            let with_use = |wanted: LeanGateUse| -> Vec<&str> {
+                WINDOW_CANDIDATE_TERMS
+                    .iter()
+                    .filter(|(_, lean)| *lean == wanted)
+                    .map(|(start, _)| *start)
+                    .collect()
+            };
+            let dropped = with_use(LeanGateUse::PlainTest);
+            let replaced: Vec<&str> = LEAN_GATE_TESTS.iter().map(|(gate, _)| *gate).collect();
+            assert_eq!(dropped, replaced);
+            // Each dropped gate passes a row whose column is NULL, and each
+            // plain column has its gate.
+            let columns: Vec<String> = dropped
+                .iter()
+                .map(|gate| gate.replace("( ", "").replace(" IS NULL OR ", ""))
+                .collect();
+            let plain: Vec<&str> = LEAN_GATES.iter().map(|gate| gate.column).collect();
+            assert_eq!(columns, plain);
+            assert_eq!(lean_plain_sql(), LEAN_PLAIN);
+            assert_eq!(with_use(LeanGateUse::HeldNames), [WINDOW_MARKED_GATE_START]);
+            // The lean scan holds each kept gate, each plain test and the
+            // one-time gate of the plain window.
+            let lean = crate::queue::lean_claim_query_for(None, false, false);
+            let (lean_ctes, _) = split_ctes(lean);
+            assert_eq!(
+                where_terms(&cte_text(&lean_ctes, "seek_candidate")).len(),
+                with_use(LeanGateUse::Kept).len() + dropped.len() + 1
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "the lean claim needs the concurrency gate 1 time(s)")]
+        fn a_window_text_with_another_gate_text_panics() {
+            let window = crate::queue::window_claim_query_for(None, false, false);
+            let _ = lean_claim_sql(&window.replace(
+                "OR concurrency_cap IS NULL",
+                "OR concurrency_cap IS NOT DISTINCT FROM NULL",
+            ));
+        }
+
+        #[test]
+        #[should_panic(expected = "the lean claim keeps the fence join 1 time(s)")]
+        fn a_window_text_that_lost_its_fence_join_panics() {
+            let window = crate::queue::window_claim_query_for(None, true, false);
+            let _ = lean_claim_sql(&window.replace(
+                "CROSS JOIN worker_info CROSS JOIN fence ",
+                "CROSS JOIN worker_info ",
+            ));
+        }
+
+        #[test]
+        #[should_panic(expected = "the lean claim keeps the holder check 1 time(s)")]
+        fn a_window_text_that_lost_its_holder_check_panics() {
+            let window = crate::queue::window_claim_query_for(None, false, true);
+            let _ = lean_claim_sql(&window.replace(
+                "FROM harvest_decision_owner o ",
+                "FROM harvest_decision_owner own ",
+            ));
+        }
+
+        #[test]
+        #[should_panic(expected = "the lean claim keeps the owned gate 1 time(s)")]
+        fn a_window_text_that_lost_its_owned_gate_panics() {
+            let window = crate::queue::window_claim_query_for(None, false, true);
+            let _ = lean_claim_sql(&window.replace(
+                "(SELECT owner_on FROM owner_gate)",
+                "(SELECT owner_on FROM owner_gate LIMIT 1)",
+            ));
+        }
+
+        /// The three claim kinds of a claim loop.
+        const KINDS: [Option<crate::queue::TaskType>; 3] = [
+            None,
+            Some(crate::queue::TaskType::Workflow),
+            Some(crate::queue::TaskType::Activity),
+        ];
+
+        #[test]
+        fn a_new_claim_loop_sends_the_lean_form_first() {
+            let skip = LeanSkip::new();
+            assert_eq!(skip, LeanSkip::default());
+            assert!(lean_first(skip));
+            let skips = LeanSkips::new();
+            assert_eq!(skips, LeanSkips::default());
+            for kind in KINDS {
+                assert!(skips.sends_lean(kind));
+                assert_eq!(skips.of(kind), skip);
+            }
+        }
+
+        #[test]
+        fn a_lean_fallback_skips_the_lean_form_for_a_longer_run_each_time() {
+            let mut skip = LeanSkip::new();
+            let mut spans = Vec::new();
+            for _ in 0..18 {
+                assert!(lean_first(skip));
+                skip = lean_skip_after(skip, Some(WindowStep::Fallback));
+                let mut skipped = 0_u32;
+                while !lean_first(skip) {
+                    skip = lean_skip_after(skip, None);
+                    skipped += 1;
+                }
+                spans.push(skipped);
+            }
+            let want: Vec<u32> = (1..=18).map(|n| (n * LEAN_SKIP_STEP).min(64)).collect();
+            assert_eq!(spans, want);
+            assert_eq!(spans.first(), Some(&LEAN_SKIP_STEP));
+            assert_eq!(spans.iter().max(), Some(&LEAN_SKIP_CAP));
+        }
+
+        #[test]
+        fn a_lean_claim_shortens_the_skip_and_an_empty_poll_keeps_it() {
+            let mut skip = LeanSkip::new();
+            for _ in 0..3 {
+                skip = lean_skip_after(skip, Some(WindowStep::Fallback));
+                while !lean_first(skip) {
+                    skip = lean_skip_after(skip, None);
+                }
+            }
+            assert_eq!(skip, LeanSkip { left: 0, span: 12 });
+            assert_eq!(lean_skip_after(skip, Some(WindowStep::Empty)), skip);
+            let next = lean_skip_after(skip, Some(WindowStep::Fallback));
+            assert_eq!(next, LeanSkip { left: 16, span: 16 });
+            // One lean claim takes one claim off the next skip, and no more.
+            let claimed = lean_skip_after(skip, Some(WindowStep::Claimed));
+            assert_eq!(claimed, LeanSkip { left: 0, span: 11 });
+            assert!(lean_first(claimed));
+            let again = lean_skip_after(claimed, Some(WindowStep::Fallback));
+            assert_eq!(again, LeanSkip { left: 15, span: 15 });
+            // Twelve lean claims in a row clear the span. It stops at zero.
+            let mut cleared = skip;
+            for _ in 0..12 {
+                cleared = lean_skip_after(cleared, Some(WindowStep::Claimed));
+            }
+            assert_eq!(cleared, LeanSkip::new());
+            assert_eq!(
+                lean_skip_after(cleared, Some(WindowStep::Claimed)),
+                LeanSkip::new()
+            );
+        }
+
+        #[test]
+        fn a_claim_with_no_lean_form_leaves_a_clear_skip_alone() {
+            let skip = LeanSkip::new();
+            assert_eq!(lean_skip_after(skip, None), skip);
+        }
+
+        #[test]
+        fn a_claim_with_no_loop_state_sends_the_window_form_first() {
+            assert!(!sends_lean_first(true, None));
+            assert!(!sends_lean_first(false, None));
+        }
+
+        #[test]
+        fn an_ageing_or_fair_claim_never_sends_the_lean_form() {
+            assert!(!sends_lean_first(false, Some(LeanSkip::new())));
+        }
+
+        #[test]
+        fn a_windowed_claim_follows_the_skip_of_its_loop() {
+            let skip = LeanSkip::new();
+            assert!(sends_lean_first(true, Some(skip)));
+            let mut skipping = lean_skip_after(skip, Some(WindowStep::Fallback));
+            for _ in 0..LEAN_SKIP_STEP {
+                assert!(!sends_lean_first(true, Some(skipping)));
+                skipping = lean_skip_after(skipping, None);
+            }
+            assert!(sends_lean_first(true, Some(skipping)));
+        }
+
+        #[test]
+        fn each_claim_kind_of_a_loop_keeps_its_own_skip() {
+            use crate::queue::TaskType;
+            // The lean form of a claim of any kind falls back each time. The
+            // lean form of a workflow claim takes a row each time.
+            let mut skips = LeanSkips::new();
+            let mut any_lean = Vec::new();
+            for n in 1..=600_u32 {
+                let (kind, answer) = if n % 2 == 1 {
+                    (None, WindowStep::Fallback)
+                } else {
+                    (Some(TaskType::Workflow), WindowStep::Claimed)
+                };
+                let lean = sends_lean_first(true, Some(skips.of(kind))).then_some(answer);
+                if kind.is_some() {
+                    assert!(lean.is_some(), "workflow claim {n} sends the lean form");
+                } else if lean.is_some() {
+                    any_lean.push(n.div_ceil(2));
+                }
+                skips.record(kind, lean);
+            }
+            assert_eq!(
+                any_lean,
+                [1, 6, 15, 28, 45, 66, 91, 120, 153, 190, 231, 276],
+                "a lean workflow claim leaves the skip of the other kind alone"
+            );
+            assert!(skips.sends_lean(Some(TaskType::Workflow)));
+            assert!(skips.sends_lean(Some(TaskType::Activity)));
+        }
+
+        #[test]
+        fn a_fallback_of_one_kind_changes_the_skip_of_that_kind_only() {
+            for kind in KINDS {
+                let skips = LeanSkips::new().after_fallback(kind);
+                for other in KINDS {
+                    assert_eq!(skips.sends_lean(other), other != kind, "{kind:?} {other:?}");
+                }
+            }
+        }
+
+        /// The claims of one loop that send the lean form, when the lean
+        /// form answers claim `n` with `answer(n)`.
+        fn lean_claims(claims: u32, answer: impl Fn(u32) -> WindowStep) -> Vec<u32> {
+            let mut skip = LeanSkip::new();
+            let mut sent = Vec::new();
+            for n in 1..=claims {
+                let lean = sends_lean_first(true, Some(skip)).then(|| answer(n));
+                if lean.is_some() {
+                    sent.push(n);
+                }
+                skip = lean_skip_after(skip, lean);
+            }
+            sent
+        }
+
+        #[test]
+        fn a_loop_that_always_falls_back_sends_the_lean_form_at_a_bounded_rate() {
+            let sent = lean_claims(626, |_| WindowStep::Fallback);
+            assert_eq!(
+                sent,
+                [
+                    1, 6, 15, 28, 45, 66, 91, 120, 153, 190, 231, 276, 325, 378, 435, 496, 561, 626
+                ]
+            );
+            assert!(sent.windows(2).all(|w| w[1] - w[0] <= LEAN_SKIP_CAP + 1));
+        }
+
+        #[test]
+        fn a_lean_claim_at_the_cap_takes_one_claim_off_the_skip() {
+            // Claim 561 is the first lean attempt after a skip of 64 claims.
+            let sent = lean_claims(627, |n| {
+                if n == 561 {
+                    WindowStep::Claimed
+                } else {
+                    WindowStep::Fallback
+                }
+            });
+            assert_eq!(sent[16..], [561, 562, 627]);
+        }
+
+        #[test]
+        fn a_lean_fallback_is_one_claim_in_five_at_most() {
+            // Each sequence of lean answers of up to 12 claims. Claim `n`
+            // reads digit `n` of `code` when it sends the lean form.
+            let answers = [WindowStep::Claimed, WindowStep::Empty, WindowStep::Fallback];
+            for claims in 1..=12_u32 {
+                for code in 0..3_usize.pow(claims) {
+                    let answer = |n: u32| answers[code / 3_usize.pow(n - 1) % 3];
+                    let fallbacks = lean_fallbacks(claims, answer);
+                    assert!(
+                        5 * fallbacks <= usize::try_from(claims).expect("a small count") + 4,
+                        "{fallbacks} fallbacks in {claims} claims, code {code}"
+                    );
+                }
+            }
+            // The worst steady loop: a fallback at each clear span, and a
+            // lean claim on each other lean attempt. It pays one in nine.
+            let mut skip = LeanSkip::new();
+            let mut fallbacks = 0;
+            for _ in 0..900 {
+                let lean = lean_first(skip).then(|| {
+                    if skip.span == 0 {
+                        fallbacks += 1;
+                        WindowStep::Fallback
+                    } else {
+                        WindowStep::Claimed
+                    }
+                });
+                skip = lean_skip_after(skip, lean);
+            }
+            assert_eq!(fallbacks, 100);
+        }
+
+        #[test]
+        fn a_loop_that_never_falls_back_sends_the_lean_form_on_each_claim() {
+            let sent = lean_claims(40, |n| {
+                if n % 3 == 0 {
+                    WindowStep::Empty
+                } else {
+                    WindowStep::Claimed
+                }
+            });
+            assert_eq!(sent, (1..=40).collect::<Vec<_>>());
+        }
+
+        /// The lean statements of `claims` claims that set the flag.
+        fn lean_fallbacks(claims: u32, answer: impl Fn(u32) -> WindowStep) -> usize {
+            lean_claims(claims, &answer)
+                .into_iter()
+                .filter(|n| answer(*n) == WindowStep::Fallback)
+                .count()
+        }
+
+        #[test]
+        fn a_loop_of_plain_and_keyed_windows_in_turn_keeps_the_window_form_first() {
+            // Each second window holds a keyed row.
+            let turn = |n: u32| {
+                if n % 2 == 1 {
+                    WindowStep::Fallback
+                } else {
+                    WindowStep::Claimed
+                }
+            };
+            let sent = lean_claims(600, turn);
+            assert!(sent.len() <= 30, "{} lean statements", sent.len());
+            // One window in three holds a keyed row.
+            let third = |n: u32| {
+                if n % 3 == 2 {
+                    WindowStep::Fallback
+                } else {
+                    WindowStep::Claimed
+                }
+            };
+            let sent = lean_claims(600, third);
+            assert!(sent.len() <= 60, "{} lean statements", sent.len());
+            assert!(lean_fallbacks(600, third) <= 30);
+        }
+
+        #[test]
+        fn a_loop_with_a_rare_fallback_keeps_the_lean_form_first() {
+            let rare = |n: u32| {
+                if n.is_multiple_of(20) {
+                    WindowStep::Fallback
+                } else {
+                    WindowStep::Claimed
+                }
+            };
+            let sent = lean_claims(600, rare);
+            assert!(sent.len() >= 450, "{} lean statements", sent.len());
+        }
+
+        #[test]
+        fn the_skip_span_never_passes_its_cap() {
+            assert_eq!(lean_skip_span(0), LEAN_SKIP_STEP);
+            assert_eq!(
+                lean_skip_span(LEAN_SKIP_CAP - LEAN_SKIP_STEP - 1),
+                LEAN_SKIP_CAP - 1
+            );
+            assert_eq!(
+                lean_skip_span(LEAN_SKIP_CAP - LEAN_SKIP_STEP),
+                LEAN_SKIP_CAP
+            );
+            assert_eq!(lean_skip_span(LEAN_SKIP_CAP), LEAN_SKIP_CAP);
+            assert_eq!(lean_skip_span(u32::MAX), LEAN_SKIP_CAP);
         }
 
         #[test]
@@ -1948,6 +3828,19 @@ macro_rules! claim_candidate_gates_sql {
         )
     };
 }
+
+/// The rate-limit gate of `claim_candidate_gates_sql!`, on one line.
+///
+/// The lean claim replaces this exact text with a NULL test. See
+/// `claim_window::lean_claim_sql`. The macro keeps its own copy, so a change
+/// there makes the lean derivation panic at first use.
+const CLAIM_RATE_LIMIT_GATE_SQL: &str = concat!(
+    "AND ( rate_limit_key IS NULL OR harvest_task_queue.activity_name = ANY($5) \
+     OR EXISTS ( SELECT 1 FROM harvest_rate_limit_buckets b \
+     WHERE b.key = harvest_task_queue.rate_limit_key AND ",
+    rate_limit_available_sql!(),
+    " >= 1.0 ) ) "
+);
 
 /// A candidate scan of the claim query: the full scan or the window scan.
 ///
@@ -3404,6 +5297,74 @@ pub async fn claim_task_with_slots(
     owned: Option<&OwnedClaim>,
     slots: Option<ClaimSlots>,
 ) -> HarvestResult<SlottedClaim> {
+    claim_task_with_lean(
+        conn,
+        queues,
+        worker_id,
+        worker_build_id,
+        priority_aging_secs,
+        circuit_breaker_activities,
+        ineligible_activities,
+        shard,
+        kind,
+        fairness,
+        owned,
+        slots,
+        None,
+    )
+    .await
+}
+
+/// [`claim_task_with_slots`] with the lean form in front (issue #2680).
+///
+/// `lean` is the skip state of the calling claim loop. Each claim loop holds
+/// its own [`LeanSkips`] and passes it to each of its claims. The state
+/// holds one skip for each claim kind, and a claim reads and changes the
+/// skip of `kind` only. A loop that claims queue by queue holds one state
+/// for each queue. The claim sends [`lean_claim_query_for`] first when the
+/// skip allows it. A lean statement can take a row, or find an empty
+/// window. Either one ends the claim as the window form does: the same
+/// rechecks, the same hints and the same result.
+///
+/// A lean statement that sets its flag claimed no row and changed no row.
+/// The claim then sends the unchanged window form in the same transaction.
+/// The next claims of `kind` send the window form first. See [`LeanSkips`].
+///
+/// A window with a row that is not plain locks no row. A peer can commit a
+/// change of a window row before the row lock of the lean statement. The
+/// claim then keeps its lock on the row that it skipped, until the
+/// transaction ends. The window form does the same.
+///
+/// `None` is a caller with no claim loop. Its claim sends the window form
+/// first, as [`claim_task_with_slots`] does. An ageing claim and a fair
+/// claim send neither form, and leave `lean` as it is.
+///
+/// Only this claim has a lean form. The batch claim
+/// ([`claim_task_batch_with_slots`]), the by-id claim and the by-execution
+/// claim keep their texts and send no lean statement.
+///
+/// A lean statement that fails leaves `lean` as it was. The error rolls the
+/// claim transaction back, as an error of the window form does.
+///
+/// # Errors
+///
+/// As [`claim_task_with_fairness`].
+#[allow(clippy::too_many_arguments)]
+pub async fn claim_task_with_lean(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+    worker_id: &str,
+    worker_build_id: &str,
+    priority_aging_secs: Option<u32>,
+    circuit_breaker_activities: &[String],
+    ineligible_activities: &[String],
+    shard: Option<crate::types::ShardId>,
+    kind: Option<TaskType>,
+    fairness: ClaimFairness,
+    owned: Option<&OwnedClaim>,
+    slots: Option<ClaimSlots>,
+    mut lean: Option<&mut LeanSkips>,
+) -> HarvestResult<SlottedClaim> {
     if fairness == ClaimFairness::Keys {
         for queue in queues {
             crate::queue_fairness::validate_fairness_queue_name(queue)?;
@@ -3427,6 +5388,7 @@ pub async fn claim_task_with_slots(
                 fairness,
                 owned,
                 slots,
+                lean.as_deref_mut(),
             )
             .await?;
             if !matches!(claimed, SlottedClaim::Empty) {
@@ -3448,6 +5410,7 @@ pub async fn claim_task_with_slots(
         fairness,
         owned,
         slots,
+        lean,
     )
     .await
 }
@@ -3535,6 +5498,7 @@ async fn claim_task_one_statement(
     fairness: ClaimFairness,
     owned: Option<&OwnedClaim>,
     slots: Option<ClaimSlots>,
+    lean: Option<&mut LeanSkips>,
 ) -> HarvestResult<SlottedClaim> {
     // Two-phase claim using a CTE to avoid holding advisory locks during
     // broad WHERE filtering.
@@ -3732,17 +5696,39 @@ async fn claim_task_one_statement(
         // Ageing and fair claims have no seek window.
         let windowed = !ageing && fairness == ClaimFairness::Off;
         let task = if windowed {
-            let window = window_claim_query_for(kind, fence.is_some(), owned.is_some());
-            let row: Option<WindowClaimRow> = query(window)
-                .load::<WindowClaimRow>(conn)
-                .await
-                .map_err(crate::error::database_error)?
-                .into_iter()
-                .next();
-            let (task, fallback) = row.map_or((None, false), |r| (r.task, r.fallback));
-            match claim_window::window_step(task.is_some(), fallback) {
-                claim_window::WindowStep::Claimed | claim_window::WindowStep::Empty => task,
-                claim_window::WindowStep::Fallback => {
+            let (fenced, owner_form) = (fence.is_some(), owned.is_some());
+            // The lean form goes first when the claim loop allows it (issue
+            // #2680). The loop holds one skip for each claim kind, and this
+            // claim reads the skip of its kind only. A statement error
+            // returns here, before the skip changes, and rolls the
+            // transaction back.
+            let skip = lean.as_deref().map(|skips| skips.of(kind));
+            let lean_step = if claim_window::sends_lean_first(windowed, skip) {
+                let lean_form = lean_claim_query_for(kind, fenced, owner_form);
+                Some(claim_form_step(conn, query(lean_form)).await?)
+            } else {
+                None
+            };
+            if let Some(skips) = lean {
+                let answer = lean_step.as_ref().map(ClaimFormStep::step);
+                skips.record(kind, answer);
+            }
+            // A lean fallback claimed no row and changed no row. So the
+            // window form is a fresh attempt in the same transaction. After
+            // a peer commit on a window row, the claim still holds the lock
+            // of the row that the lean form skipped. That lock is its own,
+            // so the window form can still take the row.
+            let step = match lean_step {
+                Some(step @ (ClaimFormStep::Claimed(_) | ClaimFormStep::Empty)) => step,
+                Some(ClaimFormStep::Fallback) | None => {
+                    let window = window_claim_query_for(kind, fenced, owner_form);
+                    claim_form_step(conn, query(window)).await?
+                }
+            };
+            match step {
+                ClaimFormStep::Claimed(task) => Some(*task),
+                ClaimFormStep::Empty => None,
+                ClaimFormStep::Fallback => {
                     let result: Vec<TaskQueueItem> = query(sql)
                         .load(conn)
                         .await
@@ -4113,13 +6099,43 @@ pub fn window_claim_query_for(kind: Option<TaskType>, fenced: bool, owned: bool)
         }
         variants
     });
-    let slot = match kind {
+    &WINDOW[windowed_claim_slot(kind, fenced, owned)]
+}
+
+/// The place of one `(kind, fenced, owned)` choice in a list of the twelve
+/// windowed claim texts.
+fn windowed_claim_slot(kind: Option<TaskType>, fenced: bool, owned: bool) -> usize {
+    let kind = match kind {
         None => 0,
         Some(TaskType::Workflow) => 4,
         Some(TaskType::Activity) => 8,
-    } + 2 * usize::from(fenced)
-        + usize::from(owned);
-    &WINDOW[slot]
+    };
+    kind + 2 * usize::from(fenced) + usize::from(owned)
+}
+
+/// The lean form of the default claim; see `claim_window::lean_claim_sql`.
+///
+/// It is exact for a window of plain rows. In every other case it claims
+/// no row and sets `claim_fallback`, and the caller sends
+/// [`window_claim_query_for`] in the same transaction. It returns the columns
+/// of the window form and takes the same binds.
+#[must_use]
+pub fn lean_claim_query_for(kind: Option<TaskType>, fenced: bool, owned: bool) -> &'static str {
+    use std::sync::LazyLock;
+    static LEAN: LazyLock<Vec<String>> = LazyLock::new(|| {
+        let mut variants = Vec::with_capacity(12);
+        for kind in [None, Some(TaskType::Workflow), Some(TaskType::Activity)] {
+            for fenced in [false, true] {
+                for owned in [false, true] {
+                    variants.push(claim_window::lean_claim_sql(window_claim_query_for(
+                        kind, fenced, owned,
+                    )));
+                }
+            }
+        }
+        variants
+    });
+    &LEAN[windowed_claim_slot(kind, fenced, owned)]
 }
 
 /// The most rows that one batch claim may take.
@@ -4217,6 +6233,9 @@ pub enum SlottedBatch {
 /// they give back is hinted after the commit. When the batch finds no row
 /// and sets the fallback flag, the full statement runs and takes one row
 /// at most.
+///
+/// The batch claim has no lean form. Its text derives from the window form,
+/// and it sends no lean statement. See [`claim_task_with_lean`].
 ///
 /// # Errors
 ///
@@ -4326,6 +6345,147 @@ impl diesel::deserialize::QueryableByName<diesel::pg::Pg> for WindowClaimRow {
         };
         Ok(Self { task, fallback })
     }
+}
+
+/// What one windowed claim form returned.
+///
+/// The lean form and the window form return the same columns, so one type
+/// holds the step of each.
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum ClaimFormStep {
+    /// The form claimed this row.
+    Claimed(Box<TaskQueueItem>),
+    /// The form claimed no row and left its flag clear.
+    Empty,
+    /// The form claimed no row and set its flag. The next form must run.
+    Fallback,
+}
+
+impl ClaimFormStep {
+    /// The step with no row, as the skip kernels read it.
+    const fn step(&self) -> claim_window::WindowStep {
+        match self {
+            Self::Claimed(_) => claim_window::WindowStep::Claimed,
+            Self::Empty => claim_window::WindowStep::Empty,
+            Self::Fallback => claim_window::WindowStep::Fallback,
+        }
+    }
+}
+
+/// Sends one windowed claim form and decodes its one row.
+///
+/// `query` holds the lean text or the window text. Both return the task
+/// columns and the `claim_fallback` flag, so `WindowClaimRow` reads both.
+async fn claim_form_step(
+    conn: &mut AsyncPgConnection,
+    query: CachedClaimQuery<'_>,
+) -> HarvestResult<ClaimFormStep> {
+    let row: Option<WindowClaimRow> = query
+        .load::<WindowClaimRow>(conn)
+        .await
+        .map_err(crate::error::database_error)?
+        .into_iter()
+        .next();
+    let (task, fallback) = row.map_or((None, false), |r| (r.task, r.fallback));
+    Ok(
+        match (claim_window::window_step(task.is_some(), fallback), task) {
+            (claim_window::WindowStep::Fallback, _) => ClaimFormStep::Fallback,
+            (_, Some(task)) => ClaimFormStep::Claimed(Box::new(task)),
+            (_, None) => ClaimFormStep::Empty,
+        },
+    )
+}
+
+/// The claim form that a test sends alone.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimFormProbe {
+    /// [`lean_claim_query_for`].
+    Lean,
+    /// [`window_claim_query_for`].
+    Window,
+    /// The full statement: [`claim_query_for`] or [`owned_claim_query_for`].
+    /// It has no flag, so its step is never [`ClaimFormStep::Fallback`].
+    Full,
+}
+
+/// The variant and the binds of one windowed claim form, for a test.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct ClaimFormBinds<'a> {
+    /// `$1`, the worker id.
+    pub worker_id: &'a str,
+    /// `$2`, the polled queues.
+    pub queues: &'a [String],
+    /// `$3`, the build id of the worker.
+    pub worker_build_id: &'a str,
+    /// `$5`, the activities that a circuit breaker tracks.
+    pub circuit_breaker_activities: &'a [String],
+    /// `$6`, the ineligible activities.
+    pub ineligible_activities: &'a [String],
+    /// The task kind of the text.
+    pub kind: Option<TaskType>,
+    /// The shards and the generations of the DR fence. `Some` picks the
+    /// fenced text.
+    pub fence: Option<(&'a [i32], &'a [i64])>,
+    /// The holder and the partitions of an owned claim. `Some` picks the
+    /// owned text.
+    pub owned: Option<&'a OwnedClaim>,
+}
+
+/// Sends one claim form alone, for a test.
+///
+/// The statement goes through `CachedClaimQuery`, as a claim sends it. The
+/// caller opens the transaction and sets the plan settings. Priority ageing
+/// is off, because an ageing claim sends neither windowed form.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] when the statement fails.
+#[doc(hidden)]
+pub async fn claim_form_step_for_test(
+    conn: &mut AsyncPgConnection,
+    form: ClaimFormProbe,
+    binds: ClaimFormBinds<'_>,
+) -> HarvestResult<ClaimFormStep> {
+    let (fenced, owned) = (binds.fence.is_some(), binds.owned.is_some());
+    let sql = match form {
+        ClaimFormProbe::Lean => lean_claim_query_for(binds.kind, fenced, owned),
+        ClaimFormProbe::Window => window_claim_query_for(binds.kind, fenced, owned),
+        ClaimFormProbe::Full if owned => {
+            owned_claim_query_for(binds.kind, fenced, ClaimFairness::Off)
+        }
+        ClaimFormProbe::Full => claim_query_for(binds.kind, fenced, ClaimFairness::Off),
+    };
+    let query = CachedClaimQuery {
+        sql,
+        ageing: false,
+        worker_id: binds.worker_id,
+        queues: binds.queues,
+        worker_build_id: binds.worker_build_id,
+        aging_secs: None,
+        circuit_breaker_activities: binds.circuit_breaker_activities,
+        ineligible_activities: binds.ineligible_activities,
+        fence: binds
+            .fence
+            .map(|(shards, generations)| (shards.to_vec(), generations.to_vec())),
+        by_id: None,
+        owned: binds.owned.map(|o| (o.holder.as_str(), o.mask())),
+    };
+    if form == ClaimFormProbe::Full {
+        let rows: Vec<TaskQueueItem> = query
+            .load(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        return Ok(rows
+            .into_iter()
+            .next()
+            .map_or(ClaimFormStep::Empty, |task| {
+                ClaimFormStep::Claimed(Box::new(task))
+            }));
+    }
+    claim_form_step(conn, query).await
 }
 
 pub use crate::decision_owner::OwnedClaim;

@@ -356,6 +356,43 @@ pub open spec fn split_claim(first: Snapshot, second: Snapshot) -> Option < int 
 proof fn lemma_a_clear_flag_means_no_row(s: Snapshot) requires s.window is None, ! window_flag(s), ensures full_statement(s) is None,
 proof fn lemma_a_set_flag_took_no_row(s: Snapshot) requires window_flag(s), ensures s.window is None,
 pub proof fn theorem_the_split_claim_takes_the_full_statement_row(first: Snapshot, second: Snapshot,) ensures split_claim(first, first) == full_statement(first), window_flag(first) ==> split_claim(first, second) == full_statement(second), ! window_flag(first) ==> split_claim(first, second) == full_statement(first),
+pub struct WindowRow { pub id: int, pub plain: bool, pub kept_gates: bool, pub dropped_gates: bool, pub run_live: bool, pub key_tests: bool, }
+pub struct Window { pub rows: Seq < WindowRow >, pub contended: bool, pub bounds: bool, pub ageing: bool, }
+pub open spec fn well_formed(w: Window) -> bool { &&& forall | i: int | 0 <= i < w.rows.len() && (#[trigger] w.rows [i]).plain ==> w.rows [i].dropped_gates && w.rows [i].key_tests &&& w.rows.len() == 0 ==>! w.contended &&! w.bounds }
+pub open spec fn all_plain(rows: Seq < WindowRow >) -> bool { forall | i: int | 0 <= i < rows.len() ==> (#[trigger] rows [i]).plain }
+pub open spec fn passes(r: WindowRow, lean: bool) -> bool { r.kept_gates && if lean { r.plain } else { r.dropped_gates } }
+pub open spec fn first_row(rows: Seq < WindowRow >, lean: bool) -> Option < WindowRow > decreases rows.len(), { if rows.len() == 0 { None } else if passes(rows [0], lean) { Some(rows [0]) } else { first_row(rows.drop_first(), lean) } }
+pub enum Outcome { Claimed(int), Empty, Fallback, }
+pub open spec fn outcome(row: Option < int >, flag: bool) -> Outcome { match row { Some(id) => Outcome::Claimed(id), None => if flag { Outcome::Fallback } else { Outcome::Empty }, } }
+pub open spec fn window_candidate(w: Window) -> Option < WindowRow > { first_row(w.rows, false) }
+pub open spec fn window_form(w: Window) -> Outcome { match window_candidate(w) { Some(c) => outcome(if c.run_live && c.key_tests { Some(c.id) } else { None }, false,), None => outcome(None, w.contended || w.bounds || w.ageing), } }
+pub open spec fn lean_candidate(w: Window) -> Option < WindowRow > { if all_plain(w.rows) { first_row(w.rows, true) } else { None } }
+pub open spec fn lean_form(w: Window) -> Outcome { match lean_candidate(w) { Some(c) => outcome(if c.run_live { Some(c.id) } else { None }, false,), None => outcome(None, w.rows.len() > 0 || w.ageing), } }
+pub open spec fn lean_then_window(first: Window, second: Window) -> Outcome { match lean_form(first) { Outcome::Fallback => window_form(second), taken => taken, } }
+proof fn lemma_an_outcome_is_its_window_step(row: Option < int >, flag: bool) ensures outcome(row, flag) is Claimed <==> spec_window_step(row is Some, flag) is Claimed, outcome(row, flag) is Fallback <==> spec_window_step(row is Some, flag) is Fallback, outcome(row, flag) is Empty <==> spec_window_step(row is Some, flag) is Empty,
+proof fn lemma_the_first_row_is_a_window_row(rows: Seq < WindowRow >, lean: bool) ensures (match first_row(rows, lean) { Some(c) => exists | i: int | 0 <= i < rows.len() && #[trigger] rows [i] == c && passes(c, lean), None => forall | i: int | 0 <= i < rows.len() ==>! passes(#[trigger] rows [i], lean), }), decreases rows.len(),
+proof fn lemma_plain_rows_pass_the_same_gates(rows: Seq < WindowRow >) requires forall | i: int | 0 <= i < rows.len() ==> (#[trigger] rows [i]).plain && rows [i].dropped_gates, ensures first_row(rows, true) == first_row(rows, false), decreases rows.len(),
+pub proof fn theorem_a_plain_window_takes_the_window_form_row(w: Window) requires well_formed(w), all_plain(w.rows), ensures lean_candidate(w) == window_candidate(w), lean_form(w) is Claimed ==> lean_form(w) == window_form(w), window_form(w) is Claimed ==> lean_form(w) == window_form(w), lean_form(w) is Empty ==> window_form(w) is Empty,
+pub proof fn theorem_a_keyed_window_falls_back(w: Window) requires ! all_plain(w.rows), ensures lean_candidate(w) is None, lean_form(w) is Fallback,
+pub proof fn theorem_a_lean_fallback_took_no_row(w: Window) requires lean_form(w) is Fallback, ensures lean_candidate(w) is None,
+pub proof fn theorem_the_lean_claim_takes_the_window_form_row(first: Window, second: Window) requires well_formed(first), ensures lean_then_window(first, first) == window_form(first), lean_form(first) is Fallback ==> lean_then_window(first, second) == window_form(second), ! (lean_form(first) is Fallback) ==> lean_then_window(first, second) == window_form(first),
+pub const LEAN_SKIP_CAP: u32 = 64;
+pub const LEAN_SKIP_STEP: u32 = 4;
+pub struct LeanSkip { pub left: u32, pub span: u32, }
+pub open spec fn skip_ok(s: LeanSkip) -> bool { s.left <= s.span <= LEAN_SKIP_CAP }
+pub open spec fn spec_lean_skip_span(span: int) -> int { if span >= 60 { 64 } else { span + 4 } }
+pub open spec fn spec_lean_skip_after(skip: LeanSkip, lean: Option < WindowStep >) -> LeanSkip { match lean { None => if skip.left == 0 { skip } else { LeanSkip { left: (skip.left - 1) as u32, span: skip.span } }, Some(WindowStep::Claimed) => LeanSkip { left: 0, span: if skip.span == 0 { 0 } else { (skip.span - 1) as u32 }, }, Some(WindowStep::Empty) => skip, Some(WindowStep::Fallback) => LeanSkip { left: spec_lean_skip_span(skip.span as int) as u32, span: spec_lean_skip_span(skip.span as int) as u32, }, } }
+pub fn lean_first(skip: LeanSkip) -> (r: bool) ensures r == (skip.left == 0),
+pub fn lean_skip_span(span: u32) -> (r: u32) ensures r == spec_lean_skip_span(span as int), LEAN_SKIP_STEP <= r <= LEAN_SKIP_CAP, span <= LEAN_SKIP_CAP ==> span <= r,
+pub fn lean_skip_after(skip: LeanSkip, lean: Option < WindowStep >) -> (r: LeanSkip) ensures r == spec_lean_skip_after(skip, lean), skip_ok(skip) ==> skip_ok(r),
+pub open spec fn after_skips(skip: LeanSkip, n: nat) -> LeanSkip decreases n, { if n == 0 { skip } else { after_skips(spec_lean_skip_after(skip, None), (n - 1) as nat) } }
+pub proof fn theorem_the_skip_stays_in_its_bound(skip: LeanSkip, lean: Option < WindowStep >) requires skip_ok(skip), ensures skip_ok(LeanSkip { left: 0, span: 0 }), skip_ok(spec_lean_skip_after(skip, lean)), spec_lean_skip_after(skip, lean).left <= LEAN_SKIP_CAP,
+pub proof fn theorem_a_fallback_lengthens_the_skip_and_a_claim_shortens_it(skip: LeanSkip) requires skip_ok(skip), ensures spec_lean_skip_after(skip, Some(WindowStep::Fallback)).left >= LEAN_SKIP_STEP, spec_lean_skip_after(skip, Some(WindowStep::Fallback)).left == spec_lean_skip_after(skip, Some(WindowStep::Fallback),).span, skip.span < 60 ==> spec_lean_skip_after(skip, Some(WindowStep::Fallback)).span == skip.span + LEAN_SKIP_STEP, skip.span >= 60 ==> spec_lean_skip_after(skip, Some(WindowStep::Fallback)).span == LEAN_SKIP_CAP, spec_lean_skip_after(skip, Some(WindowStep::Claimed)).left == 0, skip.span == 0 ==> spec_lean_skip_after(skip, Some(WindowStep::Claimed)).span == 0, skip.span > 0 ==> spec_lean_skip_after(skip, Some(WindowStep::Claimed)).span == skip.span - 1, spec_lean_skip_after(skip, Some(WindowStep::Empty)) == skip,
+pub proof fn theorem_four_claims_follow_each_fallback(skip: LeanSkip, n: nat) requires skip_ok(skip), n < LEAN_SKIP_STEP, ensures after_skips(spec_lean_skip_after(skip, Some(WindowStep::Fallback)), n).left > 0,
+proof fn lemma_each_skipped_claim_counts_down(skip: LeanSkip, n: nat) requires n <= skip.left, ensures after_skips(skip, n).left == skip.left - n, after_skips(skip, n).span == skip.span, decreases n,
+pub proof fn theorem_the_lean_form_returns_within_the_cap(skip: LeanSkip, n: nat) requires skip_ok(skip), n <= skip.left, ensures skip.left <= LEAN_SKIP_CAP, n < skip.left ==> after_skips(skip, n).left > 0, after_skips(skip, skip.left as nat).left == 0,
+pub open spec fn skipped_claim(skip: LeanSkip, first: Window, second: Window) -> Outcome { if skip.left == 0 { lean_then_window(first, second) } else { window_form(first) } }
+pub proof fn theorem_the_skip_never_changes_the_row(skip: LeanSkip, first: Window, second: Window) requires well_formed(first), ensures skipped_claim(skip, first, first) == window_form(first), skipped_claim(skip, first, second) == window_form(first) || skipped_claim(skip, first, second,) == window_form(second),
 
 ## formal/verus/src/depth_cap.rs
 pub open spec fn capped(n: int, cap: int) -> int { if n > cap { cap } else { n } }

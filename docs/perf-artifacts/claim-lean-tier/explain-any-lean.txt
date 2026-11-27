@@ -1,0 +1,133 @@
+Nested Loop Left Join (actual rows=1 loops=1)
+  CTE paused_queues
+    ->  Result (actual rows=1 loops=1)
+          InitPlan 1 (returns $0)
+            ->  Seq Scan on harvest_queue_pauses (actual rows=0 loops=1)
+                  Filter: (queue_name = ANY ($2))
+  CTE paused_activities
+    ->  Result (actual rows=1 loops=1)
+          InitPlan 3 (returns $2)
+            ->  Append (actual rows=0 loops=1)
+                  ->  Seq Scan on harvest_activity_pauses (actual rows=0 loops=1)
+                  ->  Function Scan on unnest marked (actual rows=0 loops=1)
+                        Filter: ("left"(marked, 1) = ''::text)
+  CTE expired_runs
+    ->  Append (never executed)
+          ->  Index Scan using idx_harvest_we_canary_order on harvest_workflow_executions (never executed)
+                Filter: (deadline_at < now())
+          ->  Index Scan using idx_harvest_we_canary_order on harvest_workflow_executions harvest_workflow_executions_1 (never executed)
+                Filter: (chain_deadline_at < now())
+  CTE seek_heads
+    ->  WindowAgg (actual rows=24 loops=1)
+          ->  Sort (actual rows=24 loops=1)
+                Sort Key: "*SELECT* 1_1".head_queue, "*SELECT* 1_1".head_kind, "*SELECT* 1_1".head_new_start, "*SELECT* 1_1".seek_priority DESC, "*SELECT* 1_1".seek_due
+                Sort Method: quicksort  Memory: 27kB
+                ->  Result (actual rows=24 loops=1)
+                      ->  Append (actual rows=24 loops=1)
+                            ->  Result (actual rows=24 loops=1)
+                                  One-Time Filter: (($4 IS NULL) OR ($4 <= 0))
+                                  ->  Subquery Scan on "*SELECT* 1_1" (actual rows=24 loops=1)
+                                        ->  Nested Loop (actual rows=24 loops=1)
+                                              InitPlan 6 (returns $5)
+                                                ->  CTE Scan on paused_queues (actual rows=1 loops=1)
+                                              ->  HashAggregate (actual rows=1 loops=1)
+                                                    Group Key: u.name
+                                                    Batches: 1  Memory Usage: 24kB
+                                                    ->  Function Scan on unnest u (actual rows=1 loops=1)
+                                                          Filter: (name <> ALL ($5))
+                                              ->  Nested Loop (actual rows=24 loops=1)
+                                                    ->  Values Scan on "*VALUES*" (actual rows=4 loops=1)
+                                                    ->  Limit (actual rows=6 loops=4)
+                                                          InitPlan 7 (returns $6)
+                                                            ->  CTE Scan on paused_activities (actual rows=1 loops=1)
+                                                          ->  Index Scan using idx_harvest_tq_claim_seek on harvest_task_queue (actual rows=6 loops=4)
+                                                                Index Cond: ((queue_name = u.name) AND (task_type = "*VALUES*".column1) AND ((new_start AND (attempt = 0)) >= "*VALUES*".column2) AND ((new_start AND (attempt = 0)) <= "*VALUES*".column2) AND (scheduled_at <= now()))
+                                                                Filter: (((session_id IS NULL) OR (sticky_worker_id = $1)) AND ((schedule_to_close_at IS NULL) OR (schedule_to_close_at > now())) AND ((sticky_worker_id IS NULL) OR (sticky_worker_id = $1) OR (sticky_until IS NULL) OR (sticky_until <= now())) AND CASE WHEN ((task_type = 'activity'::text) AND (activity_name = ANY ($6))) THEN false WHEN ((task_type = 'activity'::text) AND (required_capabilities IS NULL) AND (activity_name = ANY ($6))) THEN false ELSE true END)
+                            ->  Result (actual rows=0 loops=1)
+                                  One-Time Filter: (($4 IS NULL) OR ($4 <= 0))
+                                  ->  Subquery Scan on p (actual rows=0 loops=1)
+                                        ->  Limit (actual rows=0 loops=1)
+                                              ->  Sort (actual rows=0 loops=1)
+                                                    Sort Key: pins.seek_priority DESC, pins.seek_due
+                                                    Sort Method: quicksort  Memory: 25kB
+                                                    ->  Subquery Scan on pins (actual rows=0 loops=1)
+                                                          ->  Index Scan using idx_harvest_tq_sticky_poll on harvest_task_queue harvest_task_queue_1 (actual rows=0 loops=1)
+                                                                Index Cond: ((sticky_worker_id >= $1) AND (sticky_worker_id <= $1) AND (scheduled_at <= now()))
+                                                                Filter: (((session_id IS NULL) OR (sticky_worker_id = $1)) AND (sticky_until > now()) AND ((schedule_to_close_at IS NULL) OR (schedule_to_close_at > now())) AND ((sticky_worker_id IS NULL) OR (sticky_worker_id = $1) OR (sticky_until IS NULL) OR (sticky_until <= now())) AND (queue_name = ANY ($2)) AND (queue_name <> ALL ($10)) AND CASE WHEN ((task_type = 'activity'::text) AND (activity_name = ANY ($11))) THEN false WHEN ((task_type = 'activity'::text) AND (required_capabilities IS NULL) AND (activity_name = ANY ($6))) THEN false ELSE true END)
+                                                                InitPlan 8 (returns $10)
+                                                                  ->  CTE Scan on paused_queues paused_queues_1 (never executed)
+                                                                InitPlan 9 (returns $11)
+                                                                  ->  CTE Scan on paused_activities paused_activities_1 (never executed)
+  CTE seek_bounds
+    ->  CTE Scan on seek_heads (actual rows=0 loops=1)
+          Filter: (seek_rn = 32)
+          Rows Removed by Filter: 24
+  CTE seek_candidate
+    ->  Limit (actual rows=1 loops=1)
+          InitPlan 12 (returns $14)
+            ->  Result (actual rows=1 loops=1)
+          InitPlan 13 (returns $15)
+            ->  CTE Scan on paused_queues paused_queues_2 (actual rows=1 loops=1)
+          InitPlan 14 (returns $16)
+            ->  Nested Loop Anti Join (actual rows=24 loops=1)
+                  Join Filter: ((b.bound_pinned OR (w.seek_rank = 0)) AND ((b.bound_pinned AND (w.seek_rank = 0)) OR (w.seek_priority < b.bound_priority) OR ((w.seek_priority = b.bound_priority) AND (w.seek_due > b.bound_due))))
+                  ->  CTE Scan on seek_heads w (actual rows=24 loops=1)
+                  ->  CTE Scan on seek_bounds b (actual rows=0 loops=24)
+          InitPlan 15 (returns $17)
+            ->  CTE Scan on paused_activities paused_activities_2 (actual rows=1 loops=1)
+          InitPlan 20 (returns $22)
+            ->  CTE Scan on seek_heads np (actual rows=0 loops=1)
+                  Filter: (NOT seek_plain)
+                  Rows Removed by Filter: 24
+          ->  LockRows (actual rows=1 loops=1)
+                ->  Sort (actual rows=1 loops=1)
+                      Sort Key: (CASE WHEN ((harvest_task_queue_2.sticky_worker_id = $1) AND (harvest_task_queue_2.sticky_until > now())) THEN 1 ELSE 0 END) DESC, (CASE WHEN (($4 IS NOT NULL) AND ($4 > 0)) THEN (harvest_task_queue_2.priority + (floor((EXTRACT(epoch FROM (now() - harvest_task_queue_2.scheduled_at)) / ($4)::numeric)))::integer) ELSE harvest_task_queue_2.priority END) DESC, ((harvest_task_queue_2.scheduled_at + CASE WHEN (harvest_task_queue_2.new_start AND (harvest_task_queue_2.attempt = 0)) THEN '00:00:30'::interval ELSE '00:00:00'::interval END))
+                      Sort Method: quicksort  Memory: 27kB
+                      ->  Result (actual rows=24 loops=1)
+                            One-Time Filter: (NOT $22)
+                            ->  Tid Scan on harvest_task_queue harvest_task_queue_2 (actual rows=24 loops=1)
+                                  TID Cond: (ctid = ANY ($16))
+                                  Filter: ((concurrency_key IS NULL) AND (required_build_id IS NULL) AND (required_capabilities IS NULL) AND (rate_limit_key IS NULL) AND ((session_id IS NULL) OR (sticky_worker_id = $1)) AND (state = $14) AND (scheduled_at <= now()) AND ((schedule_to_close_at IS NULL) OR (schedule_to_close_at > now())) AND ((sticky_worker_id IS NULL) OR (sticky_worker_id = $1) OR (sticky_until IS NULL) OR (sticky_until <= now())) AND (queue_name <> ALL ($15)) AND ((task_type <> 'activity'::text) OR (activity_name IS NULL) OR (required_capabilities IS NOT NULL) OR (activity_name <> ALL ($6))) AND ((task_type <> 'activity'::text) OR (activity_name IS NULL) OR (activity_name <> ALL ($17))) AND ((workflow_exec_id IS NULL) OR (NOT (hashed SubPlan 19))) AND ((task_type <> 'workflow'::text) OR (workflow_exec_id IS NULL) OR (NOT (hashed SubPlan 17))))
+                                  SubPlan 19
+                                    ->  CTE Scan on expired_runs x (never executed)
+                                  SubPlan 17
+                                    ->  Index Only Scan using idx_harvest_we_paused on harvest_workflow_executions e (never executed)
+                                          Heap Fetches: 0
+  CTE candidate
+    ->  CTE Scan on seek_candidate (actual rows=1 loops=1)
+  CTE fresh_now
+    ->  Nested Loop Left Join (never executed)
+          ->  Result (never executed)
+          ->  CTE Scan on candidate c (never executed)
+  CTE run_expired_now
+    ->  Result (actual rows=1 loops=1)
+          InitPlan 26 (returns $29)
+            ->  Nested Loop (actual rows=0 loops=1)
+                  Join Filter: (c_1.workflow_exec_id = e_1.id)
+                  InitPlan 24 (returns $27)
+                    ->  CTE Scan on fresh_now (never executed)
+                  InitPlan 25 (returns $28)
+                    ->  CTE Scan on fresh_now fresh_now_1 (never executed)
+                  ->  CTE Scan on candidate c_1 (actual rows=1 loops=1)
+                  ->  Index Scan using idx_harvest_we_canary_order on harvest_workflow_executions e_1 (actual rows=0 loops=1)
+                        Filter: ((deadline_at < $27) OR (chain_deadline_at < $28))
+  CTE claimed
+    ->  Update on harvest_task_queue harvest_task_queue_3 (actual rows=1 loops=1)
+          InitPlan 28 (returns $31)
+            ->  CTE Scan on run_expired_now (actual rows=1 loops=1)
+          ->  Result (actual rows=1 loops=1)
+                One-Time Filter: (NOT $31)
+                ->  Nested Loop (actual rows=1 loops=1)
+                      ->  CTE Scan on candidate (actual rows=1 loops=1)
+                      ->  Index Scan using harvest_task_queue_pkey on harvest_task_queue harvest_task_queue_3 (actual rows=1 loops=1)
+                            Index Cond: (id = candidate.id)
+  CTE claim_lean_fallback
+    ->  Result (actual rows=1 loops=1)
+          InitPlan 30 (returns $35)
+            ->  CTE Scan on seek_candidate seek_candidate_1 (actual rows=1 loops=1)
+          InitPlan 31 (returns $36)
+            ->  CTE Scan on seek_heads seek_heads_1 (never executed)
+  ->  CTE Scan on claim_lean_fallback fb (actual rows=1 loops=1)
+  ->  CTE Scan on claimed (actual rows=1 loops=1)
+Planning Time: 7.152 ms
+Execution Time: 1.595 ms

@@ -1,0 +1,76 @@
+== main-empty-m
+base   n= 8 stmt median 0.704 ms  min 0.617  max 0.790  tps median 915
+i      n= 8 stmt median 0.631 ms  min 0.602  max 0.694  tps median 988  | paired vs base: median -0.039 ms, range -0.139..-0.010, faster in 8/8 rounds
+ii     n= 8 stmt median 0.681 ms  min 0.630  max 0.736  tps median 922  | paired vs base: median -0.023 ms, range -0.127..+0.119, faster in 5/8 rounds
+iii    n= 8 stmt median 0.675 ms  min 0.644  max 0.691  tps median 942  | paired vs base: median -0.042 ms, range -0.100..+0.066, faster in 6/8 rounds
+i_ii   n= 8 stmt median 0.617 ms  min 0.589  max 0.675  tps median 1005  | paired vs base: median -0.084 ms, range -0.177..+0.058, faster in 7/8 rounds
+all    n= 8 stmt median 0.632 ms  min 0.598  max 0.647  tps median 980  | paired vs base: median -0.072 ms, range -0.163..+0.011, faster in 7/8 rounds
+== short-empty-m
+base   n=24 stmt median 0.650 ms  min 0.586  max 0.829  tps median 975
+i      n=24 stmt median 0.591 ms  min 0.542  max 0.662  tps median 1051  | paired vs base: median -0.066 ms, range -0.180..+0.016, faster in 22/24 rounds
+ii     n=24 stmt median 0.633 ms  min 0.569  max 0.690  tps median 995  | paired vs base: median -0.022 ms, range -0.139..+0.091, faster in 14/24 rounds
+iii    n=24 stmt median 0.641 ms  min 0.572  max 0.746  tps median 983  | paired vs base: median -0.005 ms, range -0.149..+0.054, faster in 14/24 rounds
+i_ii   n=24 stmt median 0.605 ms  min 0.544  max 0.653  tps median 1024  | paired vs base: median -0.045 ms, range -0.216..+0.009, faster in 22/24 rounds
+all    n=24 stmt median 0.595 ms  min 0.546  max 0.731  tps median 1032  | paired vs base: median -0.051 ms, range -0.243..+0.094, faster in 18/24 rounds
+== rot-empty-m
+base   n=32 stmt median 0.696 ms  min 0.589  max 0.837  tps median 930
+i      n=32 stmt median 0.627 ms  min 0.564  max 0.749  tps median 1008  | paired vs base: median -0.060 ms, range -0.150..+0.048, faster in 28/32 rounds
+i_ii   n=32 stmt median 0.617 ms  min 0.542  max 0.777  tps median 1017  | paired vs base: median -0.065 ms, range -0.180..+0.076, faster in 31/32 rounds
+all    n=32 stmt median 0.609 ms  min 0.545  max 0.768  tps median 1013  | paired vs base: median -0.076 ms, range -0.141..+0.042, faster in 30/32 rounds
+== il-empty-m
+base   n=12 stmt median 0.702 ms  min 0.674  max 0.755  tps median 157
+i      n=12 stmt median 0.671 ms  min 0.639  max 0.738  tps median 157  | paired vs base: median -0.031 ms, range -0.047..-0.017, faster in 12/12 rounds
+ii     n=12 stmt median 0.691 ms  min 0.662  max 0.749  tps median 157  | paired vs base: median -0.011 ms, range -0.024..+0.006, faster in 10/12 rounds
+iii    n=12 stmt median 0.689 ms  min 0.664  max 0.748  tps median 157  | paired vs base: median -0.011 ms, range -0.036..+0.000, faster in 11/12 rounds
+i_ii   n=12 stmt median 0.671 ms  min 0.636  max 0.721  tps median 157  | paired vs base: median -0.034 ms, range -0.043..-0.009, faster in 12/12 rounds
+all    n=12 stmt median 0.648 ms  min 0.612  max 0.700  tps median 157  | paired vs base: median -0.056 ms, range -0.078..-0.044, faster in 12/12 rounds
+== il2-empty-m
+base   n=15 stmt median 0.781 ms  min 0.679  max 0.870  tps median 175
+i      n=15 stmt median 0.748 ms  min 0.647  max 0.810  tps median 175  | paired vs base: median -0.035 ms, range -0.060..-0.018, faster in 15/15 rounds
+i_ii   n=15 stmt median 0.726 ms  min 0.631  max 0.787  tps median 175  | paired vs base: median -0.062 ms, range -0.083..-0.026, faster in 15/15 rounds
+i_iii  n=15 stmt median 0.713 ms  min 0.617  max 0.781  tps median 175  | paired vs base: median -0.069 ms, range -0.091..-0.056, faster in 15/15 rounds
+all    n=15 stmt median 0.703 ms  min 0.617  max 0.791  tps median 175  | paired vs base: median -0.076 ms, range -0.093..-0.062, faster in 15/15 rounds
+== il-gates
+base   n=15 stmt median 1.285 ms  min 1.191  max 1.394  tps median 124
+i      n=15 stmt median 1.223 ms  min 1.142  max 1.327  tps median 124  | paired vs base: median -0.062 ms, range -0.090..-0.033, faster in 15/15 rounds
+i_ii   n=15 stmt median 1.194 ms  min 1.106  max 1.281  tps median 124  | paired vs base: median -0.085 ms, range -0.122..-0.064, faster in 15/15 rounds
+i_iii  n=15 stmt median 1.176 ms  min 1.093  max 1.277  tps median 124  | paired vs base: median -0.098 ms, range -0.117..-0.073, faster in 15/15 rounds
+all    n=15 stmt median 1.167 ms  min 1.081  max 1.270  tps median 124  | paired vs base: median -0.105 ms, range -0.128..-0.091, faster in 15/15 rounds
+== short-empty-m pairs
+i - base: median -0.0655 ms, mean -0.0688, sd 0.0503, range -0.180..+0.016, i faster in 22/24 rounds
+ii - base: median -0.0215 ms, mean -0.0280, sd 0.0632, range -0.139..+0.091, ii faster in 14/24 rounds
+iii - base: median -0.0045 ms, mean -0.0202, sd 0.0609, range -0.149..+0.054, iii faster in 14/24 rounds
+i_ii - i: median +0.0180 ms, mean +0.0080, sd 0.0414, range -0.098..+0.085, i_ii faster in 10/24 rounds
+all - i_ii: median +0.0075 ms, mean +0.0110, sd 0.0428, range -0.071..+0.124, all faster in 10/24 rounds
+all - i: median +0.0235 ms, mean +0.0190, sd 0.0604, range -0.114..+0.180, all faster in 9/24 rounds
+all - base: median -0.0510 ms, mean -0.0498, sd 0.0796, range -0.243..+0.094, all faster in 18/24 rounds
+== rot-empty-m pairs
+i - base: median -0.0605 ms, mean -0.0579, sd 0.0444, range -0.150..+0.048, i faster in 28/32 rounds
+i_ii - i: median -0.0100 ms, mean -0.0151, sd 0.0511, range -0.138..+0.070, i_ii faster in 18/32 rounds
+all - i_ii: median -0.0030 ms, mean -0.0007, sd 0.0608, range -0.157..+0.183, all faster in 17/32 rounds
+all - i: median -0.0145 ms, mean -0.0158, sd 0.0471, range -0.129..+0.068, all faster in 21/32 rounds
+all - base: median -0.0755 ms, mean -0.0737, sd 0.0420, range -0.141..+0.042, all faster in 30/32 rounds
+== il-empty-m pairs
+i - base: median -0.0310 ms, mean -0.0311, sd 0.0088, range -0.047..-0.017, i faster in 12/12 rounds
+ii - base: median -0.0110 ms, mean -0.0107, sd 0.0092, range -0.024..+0.006, ii faster in 10/12 rounds
+iii - base: median -0.0110 ms, mean -0.0153, sd 0.0118, range -0.036..+0.000, iii faster in 11/12 rounds
+i_ii - i: median -0.0015 ms, mean -0.0006, sd 0.0098, range -0.017..+0.015, i_ii faster in 6/12 rounds
+all - i_ii: median -0.0250 ms, mean -0.0260, sd 0.0127, range -0.053..-0.002, all faster in 12/12 rounds
+all - i: median -0.0250 ms, mean -0.0266, sd 0.0086, range -0.044..-0.014, all faster in 12/12 rounds
+all - base: median -0.0565 ms, mean -0.0577, sd 0.0093, range -0.078..-0.044, all faster in 12/12 rounds
+== il2-empty-m pairs
+i - base: median -0.0350 ms, mean -0.0387, sd 0.0119, range -0.060..-0.018, i faster in 15/15 rounds
+i_ii - i: median -0.0210 ms, mean -0.0206, sd 0.0119, range -0.045..+0.004, i_ii faster in 14/15 rounds
+i_iii - i: median -0.0290 ms, mean -0.0321, sd 0.0126, range -0.065..-0.017, i_iii faster in 15/15 rounds
+all - i_ii: median -0.0140 ms, mean -0.0173, sd 0.0138, range -0.046..+0.004, all faster in 13/15 rounds
+all - i_iii: median -0.0060 ms, mean -0.0059, sd 0.0109, range -0.025..+0.012, all faster in 10/15 rounds
+all - i: median -0.0350 ms, mean -0.0379, sd 0.0127, range -0.075..-0.019, all faster in 15/15 rounds
+all - base: median -0.0760 ms, mean -0.0767, sd 0.0086, range -0.093..-0.062, all faster in 15/15 rounds
+== il-gates pairs
+i - base: median -0.0620 ms, mean -0.0589, sd 0.0132, range -0.090..-0.033, i faster in 15/15 rounds
+i_ii - i: median -0.0240 ms, mean -0.0281, sd 0.0118, range -0.051..-0.013, i_ii faster in 15/15 rounds
+i_iii - i: median -0.0350 ms, mean -0.0351, sd 0.0128, range -0.058..-0.015, i_iii faster in 15/15 rounds
+all - i_ii: median -0.0200 ms, mean -0.0206, sd 0.0108, range -0.041..-0.006, all faster in 15/15 rounds
+all - i_iii: median -0.0160 ms, mean -0.0136, sd 0.0056, range -0.022..-0.001, all faster in 15/15 rounds
+all - i: median -0.0450 ms, mean -0.0487, sd 0.0100, range -0.070..-0.033, all faster in 15/15 rounds
+all - base: median -0.1050 ms, mean -0.1075, sd 0.0118, range -0.128..-0.091, all faster in 15/15 rounds

@@ -1068,6 +1068,10 @@ pub(crate) fn build_runtime_worker_with_capability_miss_budget(
 
 /// Build a `WorkerRuntimeConfig` with the standard test defaults.
 ///
+/// Each claim takes one row (`claim_batch_max: None`). A default worker
+/// claims in batches. `claim_batch_db_tests` and the suites that start from
+/// `WorkerConfig::default()` cover that path.
+///
 /// Some tests inspect the `Result` of `Worker::new`, such as the issue #699
 /// worker-startup rate-limit validation tests. They pass a registry directly,
 /// without the `.expect(...)` that `build_runtime_worker*` applies.
@@ -1090,6 +1094,7 @@ pub(crate) fn runtime_config(
         max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
         claim_slots_per_shard: None,
         claim_batch_max: None,
+        claim_lean: true,
         poll_interval: Duration::from_millis(25),
         shutdown_timeout: Duration::from_secs(1),
         cancellation_grace_period: Duration::from_secs(1),
@@ -2152,6 +2157,7 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
                 max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 claim_slots_per_shard: None,
                 claim_batch_max: None,
+                claim_lean: true,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -2399,6 +2405,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
                 max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 claim_slots_per_shard: None,
                 claim_batch_max: None,
+                claim_lean: true,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -2574,6 +2581,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
                 max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 claim_slots_per_shard: None,
                 claim_batch_max: None,
+                claim_lean: true,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -2721,6 +2729,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
                 max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 claim_slots_per_shard: None,
                 claim_batch_max: None,
+                claim_lean: true,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -2904,6 +2913,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
                 max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 claim_slots_per_shard: None,
                 claim_batch_max: None,
+                claim_lean: true,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -3152,6 +3162,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                 max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 claim_slots_per_shard: None,
                 claim_batch_max: None,
+                claim_lean: true,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -3425,6 +3436,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 claim_slots_per_shard: None,
                 claim_batch_max: None,
+                claim_lean: true,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -3628,6 +3640,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                 max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 claim_slots_per_shard: None,
                 claim_batch_max: None,
+                claim_lean: true,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -8191,6 +8204,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
                 max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 claim_slots_per_shard: None,
                 claim_batch_max: None,
+                claim_lean: true,
                 poll_interval: Duration::from_millis(100),
                 shutdown_timeout: Duration::from_secs(2),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -8429,6 +8443,7 @@ async fn workflow_schedule_pause_and_resume() {
                 max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 claim_slots_per_shard: None,
                 claim_batch_max: None,
+                claim_lean: true,
                 poll_interval: Duration::from_millis(100),
                 shutdown_timeout: Duration::from_secs(2),
                 cancellation_grace_period: Duration::from_secs(1),

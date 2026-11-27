@@ -83,6 +83,26 @@ pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
 /// [`WorkerConfig::with_max_concurrent_claims`].
 pub const DEFAULT_MAX_CONCURRENT_CLAIMS: usize = 2;
 
+/// Default cap on the rows that one claim statement takes: 8.
+///
+/// A claim loop takes its share of the free slots in one statement, up to
+/// this cap. The share is the smallest share of the free permits of each
+/// kind over the claim loops. A batch then rounds down to 2, 4 or 8 rows.
+///
+/// So the cap changes a batch only where a share reaches 8. On a small or
+/// busy worker the share rarely passes 4. Its batches stay as small as at a
+/// cap of 4, and its throughput is the same within noise. A worker with
+/// many free slots forms batches of 8, and it is faster. The hazards that
+/// grow with the cap grow only where batches of 8 form. They are the rows
+/// that a claim in flight locks and the crash strikes of a batch. So are the
+/// cached batch plans and the burst of one worker. A loop rounds its share
+/// down to a batch size before it takes permits. So the permits that a
+/// claim holds also grow only where batches of 8 form.
+///
+/// `docs/performance-claim-batch.md` has the paired runs of a cap of 4 and
+/// a cap of 8. [`WorkerConfig::with_claim_batch_max`] sets another cap.
+pub const DEFAULT_CLAIM_BATCH_MAX: u8 = 8;
+
 /// Default interval of the database gauge samplers: 15 s (issue #2668).
 ///
 /// Each sampler reads the database on every worker. Prometheus scrapes a
@@ -3935,6 +3955,11 @@ pub struct StickyRoutingConfig {
 pub const DEFAULT_OWNER_DISK_CACHE_MIN_EVENTS: usize = 100;
 
 /// Worker concurrency and queue configuration.
+///
+/// Each boolean is an independent switch of one feature. The switches are
+/// not the states of one machine, so the excessive-bools lint does not
+/// apply.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
     /// Queues this worker polls. Defaults to `["default"]`.
@@ -3991,8 +4016,14 @@ pub struct WorkerConfig {
     pub claim_slots_per_shard: Option<std::num::NonZeroU16>,
     /// The most rows that one claim statement takes.
     ///
-    /// Default: `None`, one row per claim. See [`Self::with_claim_batch_max`].
+    /// Default: [`DEFAULT_CLAIM_BATCH_MAX`] (8). `None` takes one row per
+    /// claim. See [`Self::with_claim_batch_max`].
     pub claim_batch_max: Option<std::num::NonZeroU8>,
+    /// Whether a claim of one row sends the lean claim statement first. A
+    /// batch claim sends no lean statement.
+    ///
+    /// Default: `true`. See [`Self::with_claim_lean`].
+    pub claim_lean: bool,
     /// The drain budget on shutdown or on a remote drain without a deadline.
     ///
     /// Default: [`DEFAULT_SHUTDOWN_TIMEOUT`] (25 s). Keep it at least 5 s
@@ -4582,7 +4613,8 @@ impl Default for WorkerConfig {
             max_concurrent_activities: 50,
             max_concurrent_claims: DEFAULT_MAX_CONCURRENT_CLAIMS,
             claim_slots_per_shard: None,
-            claim_batch_max: None,
+            claim_batch_max: std::num::NonZeroU8::new(DEFAULT_CLAIM_BATCH_MAX),
+            claim_lean: true,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
             workflow_cache_size: 1000,
             resident_workflows: true,
@@ -5257,19 +5289,29 @@ impl WorkerConfig {
 
     /// Let one claim statement take up to `rows` rows.
     ///
-    /// A claim loop then takes up to its share of the free slots in one
-    /// statement: 2, 4 or 8 rows. Queue weights, fairness keys, priority
-    /// ageing and an owned workflow claim keep one row per claim. So do an
-    /// adaptive limit, a cost hold and a dispatch channel. `0` and `1` set
-    /// `None`, one row per claim.
+    /// The batch claim is on by default, with a cap of
+    /// [`DEFAULT_CLAIM_BATCH_MAX`] rows. A claim loop takes up to its share
+    /// of the free slots in one statement: 2, 4 or 8 rows. A value above 8
+    /// claims 8 rows at most. Queue weights, fairness keys, priority ageing
+    /// and an owned workflow claim keep one row per claim. So do an adaptive
+    /// limit, a cost hold and a dispatch channel.
+    ///
+    /// `with_claim_batch_max(4)` keeps the earlier cap of 4 rows. It bounds
+    /// the rows that one claim locks and the burst that one worker takes.
+    /// `with_claim_batch_max(1)` turns the batch claim off. `0` and `1` set
+    /// `None`, one row per claim. Use it to compare the two, or to rule the
+    /// batch claim out of a problem.
     ///
     /// # Example
     ///
     /// ```rust
-    /// use autumn_harvest::builder::WorkerConfig;
+    /// use autumn_harvest::builder::{DEFAULT_CLAIM_BATCH_MAX, WorkerConfig};
     ///
-    /// let config = WorkerConfig::default().with_claim_batch_max(8);
-    /// assert_eq!(config.claim_batch_max.map(std::num::NonZeroU8::get), Some(8));
+    /// let rows = |config: WorkerConfig| config.claim_batch_max.map(std::num::NonZeroU8::get);
+    /// assert_eq!(rows(WorkerConfig::default()), Some(DEFAULT_CLAIM_BATCH_MAX));
+    /// assert_eq!(rows(WorkerConfig::default()), Some(8));
+    /// assert_eq!(rows(WorkerConfig::default().with_claim_batch_max(4)), Some(4));
+    /// assert_eq!(rows(WorkerConfig::default().with_claim_batch_max(1)), None);
     /// ```
     #[must_use]
     pub const fn with_claim_batch_max(mut self, rows: u8) -> Self {
@@ -5278,6 +5320,45 @@ impl WorkerConfig {
         } else {
             std::num::NonZeroU8::new(rows)
         };
+        self
+    }
+
+    /// Turn the lean claim statement on or off. It is on by default.
+    ///
+    /// Only a claim of one row sends the lean statement. A batch claim sends
+    /// none, and the batch claim is on by default. See
+    /// [`Self::with_claim_batch_max`].
+    ///
+    /// The lean statement is a smaller form of the default claim. It reads
+    /// the rows at the head of the polled queues. It is exact when none of
+    /// them has a concurrency key, a rate-limit key, a build pin or a
+    /// capability requirement. When its window holds a row and it locks
+    /// none, it claims no row and changes no row. The causes are a row with
+    /// one of those features, a parked row of a paused or expired run, and
+    /// rows that peer claims hold. The claim then sends the usual statement
+    /// in the same transaction. Each claim loop then sends the usual
+    /// statement first for its next claims. Each such lean statement adds 4
+    /// claims to that skip, up to 64. Each lean statement that takes a row
+    /// takes 1 claim off the next skip.
+    ///
+    /// Both statements take the same row, so the switch changes cost only.
+    /// With `false`, each claim sends the usual statement first. Use `false`
+    /// to compare the two, or to rule the lean statement out of a problem.
+    /// A claim with priority ageing, fairness keys or a batch sends no lean
+    /// statement with either value.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// assert!(WorkerConfig::default().claim_lean);
+    /// let config = WorkerConfig::default().with_claim_lean(false);
+    /// assert!(!config.claim_lean);
+    /// ```
+    #[must_use]
+    pub const fn with_claim_lean(mut self, on: bool) -> Self {
+        self.claim_lean = on;
         self
     }
 
@@ -5832,15 +5913,38 @@ mod tests {
     }
 
     #[test]
-    fn claim_batch_max_defaults_off_and_one_row_is_off() {
+    fn claim_batch_max_is_on_by_default_and_one_row_is_off() {
         let rows = |config: WorkerConfig| config.claim_batch_max.map(std::num::NonZeroU8::get);
-        assert_eq!(rows(WorkerConfig::default()), None);
+        assert_eq!(DEFAULT_CLAIM_BATCH_MAX, 8);
         assert_eq!(
-            rows(WorkerConfig::default().with_claim_batch_max(8)),
-            Some(8)
+            rows(WorkerConfig::default()),
+            Some(DEFAULT_CLAIM_BATCH_MAX),
+            "the batch claim is on by default"
+        );
+        assert_eq!(
+            rows(WorkerConfig::default().with_claim_batch_max(4)),
+            Some(4),
+            "four keeps the earlier default"
+        );
+        assert_eq!(
+            rows(WorkerConfig::default().with_claim_batch_max(2)),
+            Some(2)
         );
         assert_eq!(rows(WorkerConfig::default().with_claim_batch_max(1)), None);
         assert_eq!(rows(WorkerConfig::default().with_claim_batch_max(0)), None);
+        assert_eq!(
+            rows(WorkerConfig::default().with_claim_batch_max(200)),
+            Some(200),
+            "the field keeps a value above 8, and a claim takes 8 rows at most"
+        );
+    }
+
+    #[test]
+    fn the_lean_claim_is_on_by_default_and_the_switch_turns_it_off() {
+        assert!(WorkerConfig::default().claim_lean);
+        let off = WorkerConfig::default().with_claim_lean(false);
+        assert!(!off.claim_lean);
+        assert!(off.with_claim_lean(true).claim_lean);
     }
 
     #[test]
