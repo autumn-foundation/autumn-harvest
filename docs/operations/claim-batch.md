@@ -162,22 +162,22 @@ workflow permits, 16 activity permits and two claim loops. No share passes
 first default was 4.
 
 **A cap of 8 against a cap of 4.** More rounds gave the bench worker more
-slots, with two claim loops. The median throughput of a cap of 8 over a cap
-of 4:
+slots, with two claim loops. The median of the six per-round ratios of a
+cap of 8 over a cap of 4:
 
 | worker slots, workflow / activity | workflows in flight | cap of 8 over cap of 4 | rounds faster | rows per batch statement, cap of 4 to cap of 8 |
 |:--|--:|--:|--:|--:|
-| 20 / 50, the default | 80 | 0.98x | 2 of 6 | 3.37 to 3.34 |
+| 20 / 50, the default | 80 | 0.98x | 2 of 6 | 3.37 to 3.34, batch and window together |
 | 20 / 50, the default | 160 | 0.99x | 3 of 6 | not taken |
 | 64 / 128 | 256 | 1.16x | 6 of 6 | 3.92 to 7.63 |
 
-On the default worker the share rarely passes 4, so a cap of 8 forms the
-same batches and measures the same within noise. On the 64 / 128 worker it
-forms batches of 8 and is faster. That is why the default is 8. There the
-cap-of-8 arm held 206 to 212 of 256 workflows in flight, under the 90% gate
-of the bench, so its rate understates it. The census of the default worker
-counts the window statements with the batch statements, because both texts
-carry `claim_window_fallback`.
+On the default worker the share rarely passes 4. So its rows per statement
+stay about the same, and a cap of 8 measures the same within noise. On the
+64 / 128 worker it forms batches of 8 and is faster. That is why the
+default is 8. There the cap-of-8 arm held 206 to 212 of 256 workflows in
+flight, under the 90% gate of the bench, so its rate understates it. The
+census of the default worker counts the window and batch statements
+together. Both texts carry `claim_window_fallback`.
 
 **Against the window-first claim.** An older run compared a cap of 8 with
 one row per claim, before the lean statement existed. The median rose from
@@ -242,8 +242,8 @@ few free permits per loop.
   wait it holds the row locks of the other rows of the batch. That is up
   to 7 rows at the default cap and 3 at a cap of 4. A peer claim skips
   those rows. Their `started_at` is the start of the claim transaction, so
-  their start-to-close and heartbeat clocks run during the wait. The claim transactions of the peers on the
-  same bucket bound the wait.
+  their start-to-close and heartbeat clocks run during the wait. The claim
+  transactions of the peers on the same bucket bound the wait.
 - **A crash right after a claim gives a strike to each row of the batch.**
   The reclaim gives one crash strike to each `RUNNING` row of a dead
   worker, started or not. That is not new, and it covers every running row
@@ -256,9 +256,9 @@ few free permits per loop.
   claim locks 1. So fewer claims in flight can hold a whole head of one
   kind: 4 at the default cap of 8, and 8 at a cap of 4. The next claim then
   falls back to the full statement and takes one row at most. On a deep
-  head of one kind with several workers, more claims can fall back. On the bench,
-  with one worker and the knob at 8, full statements rose from 4 to 19 per
-  run. No fleet run has measured this.
+  head of one kind with several workers, more claims can fall back. On the
+  bench, with one worker and the knob at 8, full statements rose from 4 to
+  19 per run. No fleet run has measured this.
 - **A claim that finds one row costs more than the lean single claim.** A
   batch statement of 4 costs about 1.09 times a window statement: 1.104 ms
   against 1.014 ms. A batch statement of 8 costs about 1.19 times a window
@@ -295,10 +295,10 @@ The size of a batch plan is not measured. A batch text derives from the
 window text, so its plan is at least as large as a window plan.
 [Lean claim](claim-lean.md#memory) puts a window plan at about 1.4 MB to
 2.0 MB on PostgreSQL 16. By that estimate, a default worker adds 13 MB to
-18 MB per connection in the worst case. That is 9 plans of 1.4 MB to
-2.0 MB. A claim with a DR fence can double it. `with_claim_batch_max(4)` caps it at
-8 MB to 12 MB, and `with_claim_batch_max(1)` keeps a connection from
-building them.
+18 MB per connection, 9 plans of 1.4 MB to 2.0 MB. A claim with a DR fence
+adds a second set, up to 25 MB to 36 MB in all. `with_claim_batch_max(4)`
+caps it at 8 MB to 12 MB, or 17 MB to 24 MB with a fence.
+`with_claim_batch_max(1)` keeps a connection from building them.
 
 ## See also
 

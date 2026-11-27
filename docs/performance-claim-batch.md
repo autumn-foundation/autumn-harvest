@@ -48,10 +48,12 @@ kind over the claim loops, capped at the default. So the cap changes a
 batch only where a share reaches 8. On a worker whose share rarely passes
 4, a cap of 8 forms batches no larger than a cap of 4 does. It measures the
 same within noise there. On a worker with many free slots it forms batches
-of 8, and it is faster. The hazards that grow with the cap grow only where
+of 8, and it is faster. Most hazards that grow with the cap grow only where
 batches of 8 form. Two of them are the rows that a claim in flight locks
-and the crash strikes of a batch. The others are the permits that a claim
-holds, the cached batch plans of a connection and the burst of one worker.
+and the crash strikes of a batch. Two more are the cached batch plans of a
+connection and the burst of one worker. The permits that a claim holds grow
+where a share passes 4. A loop holds its share, up to 8 per kind, and gives
+back the rest after the claim.
 
 The first default was 4. The end-to-end bench worker has 8 workflow
 permits, 16 activity permits and 2 claim loops, so its share never passes
@@ -119,11 +121,14 @@ These rounds ran the same cell with three arms: the lean single claim
 rotated rounds of one binary, with two claim loops. The medians are in
 workflows/s.
 
-| worker slots, workflow / activity | in flight | lean single claim | cap of 4 | cap of 8 | cap of 8 over cap of 4 | rows per batch statement, cap of 4 to cap of 8 |
+| worker slots, workflow / activity | in flight | lean single claim | cap of 4 | cap of 8 | cap of 8 over cap of 4, median of the per-round ratios | rows per batch statement, cap of 4 to cap of 8 |
 |:--|--:|--:|--:|--:|--:|--:|
-| 20 / 50 | 80 | 114.4 | 157.5 | 154.7 | 0.98, 8 faster in 2 of 6 | 3.37 to 3.34 |
+| 20 / 50 | 80 | 114.4 | 157.5 | 154.7 | 0.98, 8 faster in 2 of 6 | 3.37 to 3.34, batch and window together |
 | 20 / 50 | 160 | 111.5 | 158.7 | 152.5 | 0.99, 8 faster in 3 of 6 | not taken |
 | 64 / 128 | 256 | 110.3 | 159.8 | 186.1 | 1.16, 8 faster in 6 of 6 | 3.92 to 7.63 |
+
+Each ratio is the median of the six per-round ratios, so it can differ from
+the ratio of the medians.
 
 On the 20 / 50 worker, a cap of 4 gives 1.38 times the lean single claim at
 80 in flight and 1.42 times at 160. It gives 1.45 times on the 64 / 128
@@ -131,8 +136,8 @@ worker. A cap of 8 gives 1.70 times the lean single claim there.
 
 **Rows per statement.** One `pg_stat_statements` census per cap counts the
 rows of the batch statements. On the 20 / 50 worker, a statement returns
-3.37 rows at a cap of 4 and 3.34 rows at a cap of 8. Its share
-rarely passes 4, so the batches stay small. On the 64 / 128 worker, a batch
+3.37 rows at a cap of 4 and 3.34 rows at a cap of 8. Its share rarely
+passes 4, so the batches stay small. On the 64 / 128 worker, a batch
 statement returns 3.92 rows at a cap of 4 and 7.63 rows at a cap of 8. Its
 calls fall from 2,580 to 1,325 for about the same rows. The census
 normalizes the `LIMIT` of a batch text to a bind. So it cannot split the
@@ -148,8 +153,8 @@ passed the gate. [Paired runs](performance-claim-window-split.md#paired-runs)
 explains why the gate fails when workflows get faster.
 
 The raw files are in `docs/perf-artifacts/claim-batch-default/`.
-`cap-20x50-80.txt`,
-`cap-20x50-160.txt` and `cap-64x128-256.txt` hold the rounds.
+`cap-20x50-80.txt`, `cap-20x50-160.txt` and `cap-64x128-256.txt` hold the
+rounds.
 `census-20x50-80.txt` and `census-64x128-256.txt` hold the census of each
 cap. `worker-slots.patch` is a scratch patch to the bench that reads
 `SCRATCH_WF_SLOTS` and `SCRATCH_ACT_SLOTS`. It is not part of the tree.
@@ -207,7 +212,7 @@ kind had a single free permit.
 A default worker has 20 workflow and 50 activity permits and two claim
 loops. Its idle claim loop has a share of 10 rows, so it asks for the cap
 of 8. Under load its share rarely passes 4: the census of
-[Cap of 8](#cap-of-8) has 3.34 rows per batch statement.
+[Cap of 8](#cap-of-8) has 3.34 rows per batch or window statement.
 
 ## Measurements
 

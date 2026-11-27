@@ -92,11 +92,12 @@ pub const DEFAULT_MAX_CONCURRENT_CLAIMS: usize = 2;
 /// So the cap changes a batch only where a share reaches 8. On a small or
 /// busy worker the share rarely passes 4. Its batches stay as small as at a
 /// cap of 4, and its throughput is the same within noise. A worker with
-/// many free slots forms batches of 8, and it is faster. The hazards that
-/// grow with the cap grow only where batches of 8 form. Such a hazard is a
-/// row that a claim in flight locks, or a crash strike of a batch. So is a
-/// permit that a claim holds, a cached batch plan, or the burst that one
-/// worker can take.
+/// many free slots forms batches of 8, and it is faster. Most hazards that
+/// grow with the cap grow only where batches of 8 form. They are the rows
+/// that a claim in flight locks and the crash strikes of a batch. So are the
+/// cached batch plans and the burst of one worker. The permits that a claim
+/// holds grow where a share passes 4. A loop holds its share, up to 8 per
+/// kind, and gives back the rest after the claim.
 ///
 /// `docs/performance-claim-batch.md` has the paired runs of a cap of 4 and
 /// a cap of 8. [`WorkerConfig::with_claim_batch_max`] sets another cap.

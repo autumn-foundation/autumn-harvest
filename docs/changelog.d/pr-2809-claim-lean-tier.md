@@ -75,16 +75,17 @@ The batch claim of issue #2693 is now on by default.
 `WorkerConfig::default()` sets `claim_batch_max` to the new public const
 `builder::DEFAULT_CLAIM_BATCH_MAX`, 8 rows. `worker` re-exports the const.
 A claim loop takes up to its share of the free slots in one statement, 2, 4
-or 8 rows. A batch claim sends no lean statement. So the lean statement of the
-entry above serves the claims of one row.
+or 8 rows. A batch claim sends no lean statement. So the lean statement of
+the entry above serves the claims of one row.
 
 - **The cap and why.** The batch size is the smallest share of the free
   permits per kind over the claim loops, capped at the default. On a worker
   whose share rarely passes 4, a cap of 8 forms batches no larger than a
   cap of 4 does. It measures the same within noise there. A worker with many
-  free slots forms batches of 8, and it is faster. The hazards that grow
-  with the cap grow only where batches of 8 form. The worker has no backlog
-  gate and no slow start.
+  free slots forms batches of 8, and it is faster. Most hazards that grow
+  with the cap grow only where batches of 8 form. The permits that a claim
+  holds grow where a share passes 4. The worker has no backlog gate and no
+  slow start.
 - **Switch.** `with_claim_batch_max(1)` keeps one row per claim, and so
   does `0`. `with_claim_batch_max(4)` keeps the smaller cap of 4 rows. A
   value above 8 still claims 8 rows at most, and the field keeps the value
@@ -127,13 +128,13 @@ entry above serves the claims of one row.
 - **Known limits.** One worker can take a burst that single claims spread
   over the fleet: up to 16 rows in two statements on a default worker. A
   batch can wait on the bucket lock of a rate-limit key in first place. It
-  then holds the row locks of up to 7 other rows. A crash right after a claim
-  gives one crash strike to each row of the batch, up to 8 rows. A claim in
-  flight locks up to 8 rows of the seek window. A claim loop holds up to 8
-  permits of each kind across a claim. Each pooled connection can cache 9
-  more claim plans. `with_claim_batch_max(4)` keeps the bounds of a cap of
-  4, and caches 6 plans. `docs/operations/claim-batch.md` states each
-  limit.
+  then holds the row locks of up to 7 other rows. A crash right after a
+  claim gives one crash strike to each row of the batch, up to 8 rows. A
+  claim in flight locks up to 8 rows of the seek window. A claim loop holds
+  up to 8 permits of each kind across a claim. Each pooled connection can
+  cache 9 more claim plans, or 18 with a DR fence. `with_claim_batch_max(4)`
+  keeps the bounds of a cap of 4, and caches 6 plans, or 12 with a fence.
+  `docs/operations/claim-batch.md` states each limit.
 - **Supersedes.** `CHANGELOG.md` `[0.11.0]` says of claim slots and the
   batch claim: "Both are off by default." `docs/shipped-work.md` heads the
   entry of issue #2693 "Batch claim, off by default", and it says to add
@@ -173,11 +174,11 @@ queue where every row has a concurrency key. One batch statement costs
 Measured for the cap of 8: the same section, part "Cap of 8". Each worker
 has two claim loops. Take a worker with 20 workflow and 50 activity slots.
 There a cap of 8 gives 0.98 times the throughput of a cap of 4 at 80 in
-flight. It gives 0.99 times at 160, within noise. A statement returns 3.37
-rows at a cap of 4 and 3.34 at a cap of 8 there. Take a worker with 64
-workflow and 128 activity slots, at 256 in flight. There a cap of 8 gives
-1.16 times the throughput of a cap of 4, in 6 of 6 rounds. Its batch
-statements return
-7.63 rows, against 3.92. Its arm held under the 90% in-flight gate of
-`e2e_bench`, so its rate understates it. The raw files are in
+flight. It gives 0.99 times at 160, within noise. A batch or window
+statement returns 3.37 rows at a cap of 4 and 3.34 at a cap of 8 there. Take
+a worker with 64 workflow and 128 activity slots, at 256 in flight. There a
+cap of 8 gives 1.16 times the throughput of a cap of 4, in 6 of 6 rounds.
+Its batch statements return 7.63 rows, against 3.92. Its arm held under the
+90% in-flight gate of `e2e_bench`, so its rate understates it. Each ratio is
+the median of the six per-round ratios. The raw files are in
 `docs/perf-artifacts/claim-batch-default/`.
