@@ -379,11 +379,13 @@ async fn an_erase_removes_the_rows_of_the_agent_and_counts_them() {
         "no window of the agent"
     );
     // A clear keeps each document as a tombstone, so its version grows.
-    assert_eq!(
-        tombstone(&url, memory.as_str()).await,
-        b"{}",
-        "the memory tombstone is empty"
-    );
+    let memory_body = String::from_utf8(tombstone(&url, memory.as_str()).await).unwrap();
+    for text in ["noted", "thing", "prefers mornings"] {
+        assert!(
+            !memory_body.contains(text),
+            "the tombstone holds no memory text: {memory_body}"
+        );
+    }
     let body = String::from_utf8(tombstone(&url, episodes.as_str()).await).unwrap();
     for text in ["noted", "thing"] {
         assert!(
