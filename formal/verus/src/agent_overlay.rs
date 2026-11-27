@@ -277,7 +277,7 @@ pub proof fn theorem_a_result_stays_under_the_ceilings(
     tools: Set<int>,
 )
     ensures
-        apply(p, o, c, registry, tools).is_some() ==> {
+        apply(p, o, c, registry, tools).is_some() ==> ({
             let q = apply(p, o, c, registry, tools).unwrap();
             &&& within(Some(q.max_steps), c.max_steps)
             &&& within(q.max_total_tokens, c.max_total_tokens)
@@ -290,7 +290,7 @@ pub proof fn theorem_a_result_stays_under_the_ceilings(
             &&& q.rest == p.rest
             &&& q.guidance.subset_of(tools)
             &&& o.guidance.subset_of(q.guidance)
-        },
+        }),
 {
 }
 
@@ -303,7 +303,7 @@ pub proof fn theorem_default_ceilings_only_narrow(
     tools: Set<int>,
 )
     ensures
-        apply(p, o, from_profile(p), registry, tools).is_some() ==> {
+        apply(p, o, from_profile(p), registry, tools).is_some() ==> ({
             let q = apply(p, o, from_profile(p), registry, tools).unwrap();
             &&& q.max_steps <= p.max_steps
             &&& within(q.max_total_tokens, p.max_total_tokens)
@@ -312,7 +312,7 @@ pub proof fn theorem_default_ceilings_only_narrow(
             &&& name(q.model) == name(p.model)
             &&& q.allowed == p.allowed
             &&& q.rest == p.rest
-        },
+        }),
 {
     theorem_a_result_stays_under_the_ceilings(p, o, from_profile(p), registry, tools);
 }

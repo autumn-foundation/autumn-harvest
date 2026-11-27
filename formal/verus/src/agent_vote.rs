@@ -297,11 +297,11 @@ proof fn lemma_remove(s: Seq<(u32, Option<u32>)>, i: int, key: u32)
     requires
         0 <= i < s.len(),
     ensures
-        votes_of(s, key) == votes_of(s.remove(i), key) + if s[i].1 == Some(key) {
+        votes_of(s, key) == votes_of(s.remove(i), key) + (if s[i].1 == Some(key) {
             1nat
         } else {
             0nat
-        },
+        }),
         first_of(s, key) == first_step(first_of(s.remove(i), key), s[i], key),
     decreases s.len(),
 {

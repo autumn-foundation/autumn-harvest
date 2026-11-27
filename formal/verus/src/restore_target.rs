@@ -542,11 +542,11 @@ proof fn lemma_restore_then_direct<T>(w: World<T>, target: T, to: nat, ok: bool,
     ensures
         inv(restore_then_direct(w, target, to, ok, again)),
         restore_then_direct(w, target, to, ok, again).run is Idle,
-        restore_then_direct(w, target, to, ok, again).want == if ok {
+        restore_then_direct(w, target, to, ok, again).want == (if ok {
             None::<T>
         } else {
             Some(target)
-        },
+        }),
 {
     let asked = step(w, Step::Ask { target });
     theorem_each_step_keeps_the_invariant(w, Step::Ask { target });
