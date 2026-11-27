@@ -190,13 +190,13 @@ impl TapeReport {
         } else {
             inside()
                 .find(|s| s.transition == Some(CircuitTransition::Tripped))
-                .map(|s| s.at - outage.start)
+                .map(|s| s.at.saturating_sub(outage.start))
         };
         let recovery_lag = if self.open_before(outage.end) {
             self.steps
                 .iter()
                 .find(|s| s.at >= outage.end && s.transition == Some(CircuitTransition::Closed))
-                .map(|s| s.at - outage.end)
+                .map(|s| s.at.saturating_sub(outage.end))
         } else {
             Some(Duration::ZERO)
         };
@@ -417,8 +417,11 @@ mod tests {
 
     #[test]
     fn steady_calls_handles_edges() {
-        assert!(steady_calls(Duration::ZERO, s(10), Duration::ZERO).is_empty());
-        assert!(steady_calls(s(5), s(5), s(1)).is_empty());
+        assert_eq!(
+            steady_calls(Duration::ZERO, s(10), Duration::ZERO),
+            Vec::<Duration>::new()
+        );
+        assert_eq!(steady_calls(s(5), s(5), s(1)), Vec::<Duration>::new());
         assert_eq!(steady_calls(s(1), s(4), s(1)), vec![s(1), s(2), s(3)]);
     }
 }
