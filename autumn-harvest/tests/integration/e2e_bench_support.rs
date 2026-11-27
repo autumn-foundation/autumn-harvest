@@ -324,12 +324,21 @@ pub fn claim_batch_override(raw: Option<&str>) -> Option<std::num::NonZeroU8> {
 /// report of a run with one row per claim then differ in their headers.
 ///
 /// A claim statement takes 2, 4 or 8 rows, so the label rounds a cap down
-/// to one of them, as the claim does.
+/// to one of them, as `queue::ClaimBatch::at_most` does. This file also
+/// builds with no `db` feature, so it does not name that type.
 #[must_use]
 pub fn rows_per_claim_label(raw: Option<&str>) -> String {
-    claim_batch_override(raw)
-        .and_then(|rows| autumn_harvest::queue::ClaimBatch::at_most(usize::from(rows.get())))
-        .map_or_else(|| "1".to_owned(), |batch| format!("up to {}", batch.rows()))
+    claim_batch_override(raw).map_or_else(
+        || "1".to_owned(),
+        |cap| {
+            let rows = match cap.get() {
+                8.. => 8,
+                4..=7 => 4,
+                _ => 2,
+            };
+            format!("up to {rows}")
+        },
+    )
 }
 
 /// Set to `0` or `off` to turn the lean claim statement off. Unset keeps
