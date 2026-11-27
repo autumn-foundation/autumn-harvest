@@ -1,0 +1,10 @@
+# Claim statements of one run at 80 in flight, 20 workflow and 50 activity slots.
+# form | calls | rows | exec_ms | rows per call. The batch rows are counted as window: both texts carry claim_window_fallback.
+## cap 4
+full | 3 | 2 | 3.2 | 0.67
+lean | 79 | 79 | 84.8 | 1.00
+window | 2982 | 10038 | 4167.7 | 3.37
+## cap 8
+full | 5 | 1 | 11.4 | 0.20
+lean | 51 | 51 | 48.0 | 1.00
+window | 3010 | 10065 | 4233.2 | 3.34

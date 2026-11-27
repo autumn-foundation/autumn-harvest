@@ -1,0 +1,8 @@
+# Claim statements of one run at 256 in flight, 64 workflow and 128 activity slots.
+# form | calls | rows | rows per call
+## cap 4
+batch | 2580 | 10119 | 3.92
+full | 7 | 5 | 0.71
+## cap 8
+batch | 1325 | 10108 | 7.63
+full | 7 | 4 | 0.57
