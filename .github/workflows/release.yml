@@ -175,7 +175,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: cargo-auditable@0.7.7,cargo-cyclonedx@0.5.9
       - name: Build with cargo auditable
@@ -603,7 +603,7 @@ jobs:
           persist-credentials: false
       # `validate` has checked that CHANGELOG.md has a section for the tag.
       - name: Install git-cliff
-        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: git-cliff
       # The notes name the image by digest, the form to pin.
