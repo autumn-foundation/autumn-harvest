@@ -11,6 +11,7 @@ pub mod claim_batched_seek_and_refine;
 pub mod classify_dhat_allocations;
 pub mod concurrency_key_claim;
 pub mod deep_backlog_ledger;
+pub mod event_batch_fire_scan;
 pub mod external_outbox_scan;
 pub mod external_outbox_scan_matrix;
 pub mod history_bloat;
@@ -46,6 +47,8 @@ pub enum Command {
     ConcurrencyKeyClaim(concurrency_key_claim::Args),
     /// Port of `autumn-harvest/scripts/deep_backlog_ledger_repro.sh`.
     DeepBacklogLedger(deep_backlog_ledger::Args),
+    /// The Ledger harness of the unsharded event-batch due-row read.
+    EventBatchFireScan(event_batch_fire_scan::Args),
     /// Port of `autumn-harvest/scripts/external_outbox_scan_matrix.sh`.
     ExternalOutboxScanMatrix(external_outbox_scan_matrix::Args),
     /// Port of `autumn-harvest/scripts/external_outbox_scan_perf_repro.sh`.
@@ -93,6 +96,7 @@ pub fn run(command: Command) -> Result<ExitCode> {
         Command::ClaimBatchedSeekAndRefine(args) => claim_batched_seek_and_refine::run(args),
         Command::ConcurrencyKeyClaim(args) => concurrency_key_claim::run(args),
         Command::DeepBacklogLedger(args) => deep_backlog_ledger::run(args),
+        Command::EventBatchFireScan(args) => event_batch_fire_scan::run(args),
         Command::ExternalOutboxScanMatrix(args) => external_outbox_scan_matrix::run(args),
         Command::ExternalOutboxScan(args) => external_outbox_scan::run(args),
         Command::HistoryCeilingClaim(args) => history_ceiling_claim::run(args),

@@ -139,6 +139,7 @@ An audit also needs a row in [`docs/audits/README.md`](audits/README.md).
 | `cargo xtask perf claim-batched-seek-and-refine` | `xtask/src/perf/claim_batched_seek_and_refine.rs` | `autumn-harvest/scripts/claim_batched_seek_and_refine_perf_repro.sh` |
 | `cargo xtask perf concurrency-key-claim` | `xtask/src/perf/concurrency_key_claim.rs` | `autumn-harvest/scripts/concurrency_key_claim_perf_repro.sh` |
 | `cargo xtask perf deep-backlog-ledger` | `xtask/src/perf/deep_backlog_ledger.rs` | `autumn-harvest/scripts/deep_backlog_ledger_repro.sh` |
+| `cargo xtask perf event-batch-fire-scan` | `xtask/src/perf/event_batch_fire_scan.rs` | none (new command) |
 | `cargo xtask perf external-outbox-scan-matrix` | `xtask/src/perf/external_outbox_scan_matrix.rs` | `autumn-harvest/scripts/external_outbox_scan_matrix.sh` |
 | `cargo xtask perf external-outbox-scan` | `xtask/src/perf/external_outbox_scan.rs` | `autumn-harvest/scripts/external_outbox_scan_perf_repro.sh` |
 | `cargo xtask perf llm-spend-tenant-window` | `xtask/src/perf/llm_spend_tenant_window.rs` | none (new command) |

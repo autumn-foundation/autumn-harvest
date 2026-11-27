@@ -1,0 +1,195 @@
+-- without index, 1000 open batches --
+item|value
+open batches|1000
+due batches|25
+batches over 50 events|58
+rows of batch_wf_0|370
+heap pages|173
+toast pages|84
+dead tuples|500
+live tuples|1000
+fired in the tick|25
+
+-- without index, 1000 open batches: one scanner tick that fires 25 batches, then 200 admissions --
+-- workload total: 6418 buffers, 1029 calls, 798799 WAL bytes, 0 temp blocks written --
+
+-- top 10 by buffers --
+calls|shared_blks_hit|shared_blks_read|total_buffers|pct_buffers|pct_calls|temp_blks_written|wal_bytes|rows|query
+200|2643|0|2643|41.2|19.4|0|392651|200|INSERT INTO harvest_event_batches (id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id, created
+25|962|0|962|15.0|2.4|0|65262|25|INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4)
+25|917|0|917|14.3|2.4|0|58848|25|INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "priority", "max_attempts", "sch
+19|841|0|841|13.1|1.8|0|151223|19|INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "shard_id", "input", "parent_id", "queue_name", "execution_timeout", "deadline_
+26|732|0|732|11.4|2.5|0|103815|25|SELECT id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id FROM harvest_event_batches WHERE fir
+25|142|0|142|2.2|2.4|0|8441|25|DELETE FROM harvest_event_batches WHERE id = $1
+6|131|0|131|2.0|0.6|0|18559|6|INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "shard_id", "input", "parent_id", "queue_name", "execution_timeout", "deadline_
+25|50|0|50|0.8|2.4|0|0|0|SELECT id, queue_name, build_id, deployment_name, created_at, updated_at, target_build_id, ramp_percent FROM harvest_build_policies WHERE queue_name = $1
+226|0|0|0|0.0|22.0|0|0|0|BEGIN
+226|0|0|0|0.0|22.0|0|0|0|COMMIT
+
+-- top 10 by calls --
+calls|shared_blks_hit|shared_blks_read|total_buffers|pct_buffers|pct_calls|temp_blks_written|wal_bytes|rows|query
+226|0|0|0|0.0|22.0|0|0|0|BEGIN
+226|0|0|0|0.0|22.0|0|0|0|COMMIT
+200|2643|0|2643|41.2|19.4|0|392651|200|INSERT INTO harvest_event_batches (id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id, created
+50|0|0|0|0.0|4.9|0|0|0|RELEASE SAVEPOINT diesel_savepoint_2
+50|0|0|0|0.0|4.9|0|0|0|SAVEPOINT diesel_savepoint_2
+50|0|0|0|0.0|4.9|0|0|50|SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)
+26|732|0|732|11.4|2.5|0|103815|25|SELECT id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id FROM harvest_event_batches WHERE fir
+25|142|0|142|2.2|2.4|0|8441|25|DELETE FROM harvest_event_batches WHERE id = $1
+25|962|0|962|15.0|2.4|0|65262|25|INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4)
+25|917|0|917|14.3|2.4|0|58848|25|INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "priority", "max_attempts", "sch
+
+-- top 10 by WAL bytes --
+calls|shared_blks_hit|shared_blks_read|total_buffers|pct_buffers|pct_calls|temp_blks_written|wal_bytes|rows|query
+200|2643|0|2643|41.2|19.4|0|392651|200|INSERT INTO harvest_event_batches (id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id, created
+19|841|0|841|13.1|1.8|0|151223|19|INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "shard_id", "input", "parent_id", "queue_name", "execution_timeout", "deadline_
+26|732|0|732|11.4|2.5|0|103815|25|SELECT id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id FROM harvest_event_batches WHERE fir
+25|962|0|962|15.0|2.4|0|65262|25|INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4)
+25|917|0|917|14.3|2.4|0|58848|25|INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "priority", "max_attempts", "sch
+6|131|0|131|2.0|0.6|0|18559|6|INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "shard_id", "input", "parent_id", "queue_name", "execution_timeout", "deadline_
+25|142|0|142|2.2|2.4|0|8441|25|DELETE FROM harvest_event_batches WHERE id = $1
+
+-- pg_stat_user_indexes, harvest_event_batches --
+indexrelname|idx_scan|size_bytes
+harvest_event_batches_pkey|26|81920
+harvest_event_batches_unique_key|200|98304
+idx_harvest_event_batches_shard_fire_at|28|73728
+
+-- pg_stat_user_tables + pg_statio_user_tables, tables the workload touched --
+relname|seq_scan|seq_tup_read|idx_scan|idx_tup_fetch|n_live_tup|n_dead_tup|heap_blks|idx_blks|toast_blks
+harvest_event_batches|4|4075|254|608|75|85|2368|1871|247
+harvest_workflow_executions|0|0|100|50|25|0|154|694|7
+harvest_task_queue|0|0|0|0|25|0|56|243|7
+harvest_events|0|0|0|0|25|0|54|135|7
+harvest_build_policies|0|0|25|0|0|0|0|62|0
+
+-- without index, 10000 open batches --
+item|value
+open batches|10000
+due batches|213
+batches over 50 events|551
+rows of batch_wf_0|3631
+heap pages|1743
+toast pages|794
+dead tuples|5000
+live tuples|10000
+fired in the tick|213
+
+-- without index, 10000 open batches: one scanner tick that fires 213 batches, then 200 admissions --
+-- workload total: 62810 buffers, 4225 calls, 1638482 WAL bytes, 0 temp blocks written --
+
+-- top 10 by buffers --
+calls|shared_blks_hit|shared_blks_read|total_buffers|pct_buffers|pct_calls|temp_blks_written|wal_bytes|rows|query
+214|47095|0|47095|75.0|5.1|0|16860|213|SELECT id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id FROM harvest_event_batches WHERE fir
+213|3884|0|3884|6.2|5.0|0|458194|213|INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "priority", "max_attempts", "sch
+213|3289|0|3289|5.2|5.0|0|408823|213|INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4)
+159|3240|0|3240|5.2|3.8|0|384945|159|INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "shard_id", "input", "parent_id", "queue_name", "execution_timeout", "deadline_
+200|2736|0|2736|4.4|4.7|0|220848|200|INSERT INTO harvest_event_batches (id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id, created
+213|1216|0|1216|1.9|5.0|0|15120|213|DELETE FROM harvest_event_batches WHERE id = $1
+54|924|0|924|1.5|1.3|0|133692|54|INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "shard_id", "input", "parent_id", "queue_name", "execution_timeout", "deadline_
+213|426|0|426|0.7|5.0|0|0|0|SELECT id, queue_name, build_id, deployment_name, created_at, updated_at, target_build_id, ramp_percent FROM harvest_build_policies WHERE queue_name = $1
+426|0|0|0|0.0|10.1|0|0|0|RELEASE SAVEPOINT diesel_savepoint_2
+426|0|0|0|0.0|10.1|0|0|0|SAVEPOINT diesel_savepoint_2
+
+-- top 10 by calls --
+calls|shared_blks_hit|shared_blks_read|total_buffers|pct_buffers|pct_calls|temp_blks_written|wal_bytes|rows|query
+426|0|0|0|0.0|10.1|0|0|0|RELEASE SAVEPOINT diesel_savepoint_2
+426|0|0|0|0.0|10.1|0|0|0|SAVEPOINT diesel_savepoint_2
+426|0|0|0|0.0|10.1|0|0|426|SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)
+414|0|0|0|0.0|9.8|0|0|0|BEGIN
+414|0|0|0|0.0|9.8|0|0|0|COMMIT
+214|47095|0|47095|75.0|5.1|0|16860|213|SELECT id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id FROM harvest_event_batches WHERE fir
+213|1216|0|1216|1.9|5.0|0|15120|213|DELETE FROM harvest_event_batches WHERE id = $1
+213|3289|0|3289|5.2|5.0|0|408823|213|INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4)
+213|3884|0|3884|6.2|5.0|0|458194|213|INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "priority", "max_attempts", "sch
+213|0|0|0|0.0|5.0|0|0|0|RELEASE SAVEPOINT diesel_savepoint_1
+
+-- top 10 by WAL bytes --
+calls|shared_blks_hit|shared_blks_read|total_buffers|pct_buffers|pct_calls|temp_blks_written|wal_bytes|rows|query
+213|3884|0|3884|6.2|5.0|0|458194|213|INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "priority", "max_attempts", "sch
+213|3289|0|3289|5.2|5.0|0|408823|213|INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4)
+159|3240|0|3240|5.2|3.8|0|384945|159|INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "shard_id", "input", "parent_id", "queue_name", "execution_timeout", "deadline_
+200|2736|0|2736|4.4|4.7|0|220848|200|INSERT INTO harvest_event_batches (id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id, created
+54|924|0|924|1.5|1.3|0|133692|54|INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "shard_id", "input", "parent_id", "queue_name", "execution_timeout", "deadline_
+214|47095|0|47095|75.0|5.1|0|16860|213|SELECT id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id FROM harvest_event_batches WHERE fir
+213|1216|0|1216|1.9|5.0|0|15120|213|DELETE FROM harvest_event_batches WHERE id = $1
+
+-- pg_stat_user_indexes, harvest_event_batches --
+indexrelname|idx_scan|size_bytes
+harvest_event_batches_pkey|214|647168
+harvest_event_batches_unique_key|200|704512
+idx_harvest_event_batches_shard_fire_at|216|614400
+
+-- pg_stat_user_tables + pg_statio_user_tables, tables the workload touched --
+relname|seq_scan|seq_tup_read|idx_scan|idx_tup_fetch|n_live_tup|n_dead_tup|heap_blks|idx_blks|toast_blks
+harvest_event_batches|4|39887|630|23638|83|219|40010|18459|1701
+harvest_workflow_executions|0|0|852|426|213|0|1354|3637|95
+harvest_task_queue|0|0|0|0|213|0|500|2025|95
+harvest_events|0|0|0|0|213|0|494|1075|103
+harvest_build_policies|0|0|213|0|0|0|0|438|0
+
+-- without index, 100000 open batches --
+item|value
+open batches|100000
+due batches|1982
+batches over 50 events|5264
+rows of batch_wf_0|36571
+heap pages|17577
+toast pages|7729
+dead tuples|50000
+live tuples|100000
+fired in the tick|1982
+
+-- without index, 100000 open batches: one scanner tick that fires 1982 batches, then 200 admissions --
+-- workload total: 3384147 buffers, 34298 calls, 13472449 WAL bytes, 0 temp blocks written --
+
+-- top 10 by buffers --
+calls|shared_blks_hit|shared_blks_read|total_buffers|pct_buffers|pct_calls|temp_blks_written|wal_bytes|rows|query
+1983|3228259|14|3228273|95.4|5.8|0|156791|1982|SELECT id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id FROM harvest_event_batches WHERE fir
+1982|48628|16|48644|1.4|5.8|0|4261830|1982|INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "priority", "max_attempts", "sch
+1393|36237|43|36280|1.1|4.1|0|3432005|1393|INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "shard_id", "input", "parent_id", "queue_name", "execution_timeout", "deadline_
+1982|35634|42|35676|1.1|5.8|0|3779489|1982|INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4)
+589|14940|1|14941|0.4|1.7|0|1483773|589|INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "shard_id", "input", "parent_id", "queue_name", "execution_timeout", "deadline_
+1982|12389|659|13048|0.4|5.8|0|134568|1982|DELETE FROM harvest_event_batches WHERE id = $1
+1982|3964|0|3964|0.1|5.8|0|0|0|SELECT id, queue_name, build_id, deployment_name, created_at, updated_at, target_build_id, ramp_percent FROM harvest_build_policies WHERE queue_name = $1
+200|3230|91|3321|0.1|0.6|0|223993|200|INSERT INTO harvest_event_batches (id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id, created
+3964|0|0|0|0.0|11.6|0|0|0|RELEASE SAVEPOINT diesel_savepoint_2
+3964|0|0|0|0.0|11.6|0|0|0|SAVEPOINT diesel_savepoint_2
+
+-- top 10 by calls --
+calls|shared_blks_hit|shared_blks_read|total_buffers|pct_buffers|pct_calls|temp_blks_written|wal_bytes|rows|query
+3964|0|0|0|0.0|11.6|0|0|0|RELEASE SAVEPOINT diesel_savepoint_2
+3964|0|0|0|0.0|11.6|0|0|0|SAVEPOINT diesel_savepoint_2
+3964|0|0|0|0.0|11.6|0|0|3964|SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)
+2183|0|0|0|0.0|6.4|0|0|0|BEGIN
+2183|0|0|0|0.0|6.4|0|0|0|COMMIT
+1983|3228259|14|3228273|95.4|5.8|0|156791|1982|SELECT id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id FROM harvest_event_batches WHERE fir
+1982|12389|659|13048|0.4|5.8|0|134568|1982|DELETE FROM harvest_event_batches WHERE id = $1
+1982|35634|42|35676|1.1|5.8|0|3779489|1982|INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4)
+1982|48628|16|48644|1.4|5.8|0|4261830|1982|INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "priority", "max_attempts", "sch
+1982|0|0|0|0.0|5.8|0|0|0|RELEASE SAVEPOINT diesel_savepoint_1
+
+-- top 10 by WAL bytes --
+calls|shared_blks_hit|shared_blks_read|total_buffers|pct_buffers|pct_calls|temp_blks_written|wal_bytes|rows|query
+1982|48628|16|48644|1.4|5.8|0|4261830|1982|INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "priority", "max_attempts", "sch
+1982|35634|42|35676|1.1|5.8|0|3779489|1982|INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4)
+1393|36237|43|36280|1.1|4.1|0|3432005|1393|INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "shard_id", "input", "parent_id", "queue_name", "execution_timeout", "deadline_
+589|14940|1|14941|0.4|1.7|0|1483773|589|INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "shard_id", "input", "parent_id", "queue_name", "execution_timeout", "deadline_
+200|3230|91|3321|0.1|0.6|0|223993|200|INSERT INTO harvest_event_batches (id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id, created
+1983|3228259|14|3228273|95.4|5.8|0|156791|1982|SELECT id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id FROM harvest_event_batches WHERE fir
+1982|12389|659|13048|0.4|5.8|0|134568|1982|DELETE FROM harvest_event_batches WHERE id = $1
+
+-- pg_stat_user_indexes, harvest_event_batches --
+indexrelname|idx_scan|size_bytes
+harvest_event_batches_pkey|1983|6332416
+harvest_event_batches_unique_key|200|7192576
+idx_harvest_event_batches_shard_fire_at|1985|4988928
+
+-- pg_stat_user_tables + pg_statio_user_tables, tables the workload touched --
+relname|seq_scan|seq_tup_read|idx_scan|idx_tup_fetch|n_live_tup|n_dead_tup|heap_blks|idx_blks|toast_blks
+harvest_event_batches|4|398118|4168|1971307|58|2062|2103038|1215988|15811
+harvest_workflow_executions|0|0|7928|3964|1991|0|13237|52361|739
+harvest_task_queue|0|0|0|0|1993|0|5626|33615|739
+harvest_events|0|0|0|0|1989|0|5339|18619|792
+harvest_build_policies|0|0|1982|0|0|0|0|3976|0
+

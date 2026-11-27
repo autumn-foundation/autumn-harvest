@@ -1,0 +1,84 @@
+-- without index, 1000 open batches: plan shape --
+Limit
+  ->  LockRows
+        ->  Sort
+              Sort Key: fire_at
+              ->  Index Scan using idx_harvest_event_batches_shard_fire_at on harvest_event_batches
+                    Index Cond: (fire_at <= '2026-11-27 18:00:21.573278+00'::timestamp with time zone)
+
+-- without index, 1000 open batches: the first due read of the tick --
+Limit  (cost=75.03..75.04 rows=1 width=880) (actual time=0.088..0.089 rows=1 loops=1)
+  Output: id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id, ctid
+  Buffers: shared hit=44
+  ->  LockRows  (cost=75.03..75.29 rows=21 width=880) (actual time=0.087..0.088 rows=1 loops=1)
+        Output: id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id, ctid
+        Buffers: shared hit=44
+        ->  Sort  (cost=75.03..75.08 rows=21 width=880) (actual time=0.081..0.081 rows=1 loops=1)
+              Output: id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id, ctid
+              Sort Key: harvest_event_batches.fire_at
+              Sort Method: quicksort  Memory: 51kB
+              Buffers: shared hit=43
+              ->  Index Scan using idx_harvest_event_batches_shard_fire_at on public.harvest_event_batches  (cost=0.28..74.92 rows=21 width=880) (actual time=0.012..0.059 rows=25 loops=1)
+                    Output: id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id, ctid
+                    Index Cond: (harvest_event_batches.fire_at <= '2026-11-27 18:00:21.57485+00'::timestamp with time zone)
+                    Buffers: shared hit=43
+Query Identifier: 8173435785175597351
+Planning Time: 0.060 ms
+Execution Time: 0.107 ms
+
+-- without index, 10000 open batches: plan shape --
+Limit
+  ->  LockRows
+        ->  Sort
+              Sort Key: fire_at
+              ->  Index Scan using idx_harvest_event_batches_shard_fire_at on harvest_event_batches
+                    Index Cond: (fire_at <= '2026-11-27 18:00:27.726297+00'::timestamp with time zone)
+
+-- without index, 10000 open batches: the first due read of the tick --
+Limit  (cost=739.80..739.81 rows=1 width=888) (actual time=0.605..0.606 rows=1 loops=1)
+  Output: id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id, ctid
+  Buffers: shared hit=353
+  ->  LockRows  (cost=739.80..742.36 rows=205 width=888) (actual time=0.604..0.605 rows=1 loops=1)
+        Output: id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id, ctid
+        Buffers: shared hit=353
+        ->  Sort  (cost=739.80..740.31 rows=205 width=888) (actual time=0.597..0.597 rows=1 loops=1)
+              Output: id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id, ctid
+              Sort Key: harvest_event_batches.fire_at
+              Sort Method: quicksort  Memory: 210kB
+              Buffers: shared hit=352
+              ->  Index Scan using idx_harvest_event_batches_shard_fire_at on public.harvest_event_batches  (cost=0.29..738.77 rows=205 width=888) (actual time=0.011..0.460 rows=213 loops=1)
+                    Output: id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id, ctid
+                    Index Cond: (harvest_event_batches.fire_at <= '2026-11-27 18:00:27.727892+00'::timestamp with time zone)
+                    Buffers: shared hit=352
+Query Identifier: 8173435785175597351
+Planning Time: 0.049 ms
+Execution Time: 0.644 ms
+
+-- without index, 100000 open batches: plan shape --
+Limit
+  ->  LockRows
+        ->  Sort
+              Sort Key: fire_at
+              ->  Index Scan using idx_harvest_event_batches_shard_fire_at on harvest_event_batches
+                    Index Cond: (fire_at <= '2026-11-27 18:00:52.994368+00'::timestamp with time zone)
+
+-- without index, 100000 open batches: the first due read of the tick --
+Limit  (cost=6833.52..6833.53 rows=1 width=890) (actual time=6.484..6.485 rows=1 loops=1)
+  Output: id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id, ctid
+  Buffers: shared hit=2583 read=78
+  ->  LockRows  (cost=6833.52..6859.33 rows=2065 width=890) (actual time=6.483..6.484 rows=1 loops=1)
+        Output: id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id, ctid
+        Buffers: shared hit=2583 read=78
+        ->  Sort  (cost=6833.52..6838.68 rows=2065 width=890) (actual time=6.471..6.472 rows=1 loops=1)
+              Output: id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id, ctid
+              Sort Key: harvest_event_batches.fire_at
+              Sort Method: quicksort  Memory: 1825kB
+              Buffers: shared hit=2582 read=78
+              ->  Index Scan using idx_harvest_event_batches_shard_fire_at on public.harvest_event_batches  (cost=0.42..6823.19 rows=2065 width=890) (actual time=0.013..5.212 rows=1982 loops=1)
+                    Output: id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id, ctid
+                    Index Cond: (harvest_event_batches.fire_at <= '2026-11-27 18:00:52.996728+00'::timestamp with time zone)
+                    Buffers: shared hit=2582 read=78
+Query Identifier: 8173435785175597351
+Planning Time: 0.047 ms
+Execution Time: 6.507 ms
+

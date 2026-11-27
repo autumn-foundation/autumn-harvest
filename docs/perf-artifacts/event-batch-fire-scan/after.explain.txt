@@ -1,0 +1,63 @@
+-- with index, 1000 open batches: plan shape --
+Limit
+  ->  LockRows
+        ->  Index Scan using idx_harvest_event_batches_fire_at on harvest_event_batches
+              Index Cond: (fire_at <= '2026-11-27 18:01:30.799867+00'::timestamp with time zone)
+
+-- with index, 1000 open batches: the first due read of the tick --
+Limit  (cost=0.28..4.30 rows=1 width=880) (actual time=0.021..0.022 rows=1 loops=1)
+  Output: id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id, ctid
+  Buffers: shared hit=4
+  ->  LockRows  (cost=0.28..84.84 rows=21 width=880) (actual time=0.021..0.021 rows=1 loops=1)
+        Output: id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id, ctid
+        Buffers: shared hit=4
+        ->  Index Scan using idx_harvest_event_batches_fire_at on public.harvest_event_batches  (cost=0.28..84.63 rows=21 width=880) (actual time=0.012..0.012 rows=1 loops=1)
+              Output: id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id, ctid
+              Index Cond: (harvest_event_batches.fire_at <= '2026-11-27 18:01:30.802238+00'::timestamp with time zone)
+              Buffers: shared hit=3
+Query Identifier: 8173435785175597351
+Planning Time: 0.064 ms
+Execution Time: 0.039 ms
+
+-- with index, 10000 open batches: plan shape --
+Limit
+  ->  LockRows
+        ->  Index Scan using idx_harvest_event_batches_fire_at on harvest_event_batches
+              Index Cond: (fire_at <= '2026-11-27 18:01:36.781786+00'::timestamp with time zone)
+
+-- with index, 10000 open batches: the first due read of the tick --
+Limit  (cost=0.29..4.11 rows=1 width=888) (actual time=0.023..0.024 rows=1 loops=1)
+  Output: id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id, ctid
+  Buffers: shared hit=5
+  ->  LockRows  (cost=0.29..785.33 rows=205 width=888) (actual time=0.022..0.022 rows=1 loops=1)
+        Output: id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id, ctid
+        Buffers: shared hit=5
+        ->  Index Scan using idx_harvest_event_batches_fire_at on public.harvest_event_batches  (cost=0.29..783.28 rows=205 width=888) (actual time=0.015..0.015 rows=1 loops=1)
+              Output: id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id, ctid
+              Index Cond: (harvest_event_batches.fire_at <= '2026-11-27 18:01:36.783465+00'::timestamp with time zone)
+              Buffers: shared hit=4
+Query Identifier: 8173435785175597351
+Planning Time: 0.062 ms
+Execution Time: 0.041 ms
+
+-- with index, 100000 open batches: plan shape --
+Limit
+  ->  LockRows
+        ->  Index Scan using idx_harvest_event_batches_fire_at on harvest_event_batches
+              Index Cond: (fire_at <= '2026-11-27 18:02:03.398331+00'::timestamp with time zone)
+
+-- with index, 100000 open batches: the first due read of the tick --
+Limit  (cost=0.42..4.25 rows=1 width=894) (actual time=0.030..0.031 rows=1 loops=1)
+  Output: id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id, ctid
+  Buffers: shared hit=5
+  ->  LockRows  (cost=0.42..7925.33 rows=2070 width=894) (actual time=0.029..0.030 rows=1 loops=1)
+        Output: id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id, ctid
+        Buffers: shared hit=5
+        ->  Index Scan using idx_harvest_event_batches_fire_at on public.harvest_event_batches  (cost=0.42..7904.63 rows=2070 width=894) (actual time=0.020..0.020 rows=1 loops=1)
+              Output: id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, fire_at, max_size, shard_id, ctid
+              Index Cond: (harvest_event_batches.fire_at <= '2026-11-27 18:02:03.401455+00'::timestamp with time zone)
+              Buffers: shared hit=4
+Query Identifier: 8173435785175597351
+Planning Time: 0.081 ms
+Execution Time: 0.056 ms
+
