@@ -61139,17 +61139,22 @@ mod tests {
             shape,
             (20, 50, 2, Some(crate::builder::DEFAULT_CLAIM_BATCH_MAX))
         );
-        assert_eq!(crate::builder::DEFAULT_CLAIM_BATCH_MAX, 4);
+        assert_eq!(crate::builder::DEFAULT_CLAIM_BATCH_MAX, 8);
         assert_eq!(
             worker.claim_batch_rows(false),
-            4,
+            8,
             "a share of ten workflow permits, capped at the default"
         );
         assert_eq!(
             worker.claim_batch_rows(true),
-            4,
+            8,
             "a share of twenty-five activity permits, capped at the default"
         );
+
+        let (shape, worker) = build(WorkerConfig::default().with_claim_batch_max(4));
+        assert_eq!(shape.3, Some(4), "four keeps the earlier cap");
+        assert_eq!(worker.claim_batch_rows(false), 4);
+        assert_eq!(worker.claim_batch_rows(true), 4);
 
         let (shape, worker) = build(WorkerConfig::default().with_claim_batch_max(1));
         assert_eq!(shape.3, None, "one row turns the batch off");

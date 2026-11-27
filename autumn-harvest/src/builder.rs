@@ -83,14 +83,24 @@ pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
 /// [`WorkerConfig::with_max_concurrent_claims`].
 pub const DEFAULT_MAX_CONCURRENT_CLAIMS: usize = 2;
 
-/// Default cap on the rows that one claim statement takes: 4.
+/// Default cap on the rows that one claim statement takes: 8.
 ///
 /// A claim loop takes its share of the free slots in one statement, up to
-/// this cap. On the end-to-end bench, 4 is the largest batch that a claim
-/// formed. Its worker has 8 workflow permits, 16 activity permits and 2
-/// claim loops, so a claim of both kinds never has a share above 4. See
-/// [`WorkerConfig::with_claim_batch_max`].
-pub const DEFAULT_CLAIM_BATCH_MAX: u8 = 4;
+/// this cap. The share is the smallest share of the free permits of each
+/// kind over the claim loops. A batch then rounds down to 2, 4 or 8 rows.
+///
+/// So the cap changes a batch only where a share reaches 8. On a small or
+/// busy worker the share rarely passes 4. Its batches stay as small as at a
+/// cap of 4, and its throughput is the same within noise. A worker with
+/// many free slots forms batches of 8, and it is faster. The hazards that
+/// grow with the cap grow only where batches of 8 form. Such a hazard is a
+/// row that a claim in flight locks, or a crash strike of a batch. So is a
+/// permit that a claim holds, a cached batch plan, or the burst that one
+/// worker can take.
+///
+/// `docs/performance-claim-batch.md` has the paired runs of a cap of 4 and
+/// a cap of 8. [`WorkerConfig::with_claim_batch_max`] sets another cap.
+pub const DEFAULT_CLAIM_BATCH_MAX: u8 = 8;
 
 /// Default interval of the database gauge samplers: 15 s (issue #2668).
 ///
@@ -4005,7 +4015,7 @@ pub struct WorkerConfig {
     pub claim_slots_per_shard: Option<std::num::NonZeroU16>,
     /// The most rows that one claim statement takes.
     ///
-    /// Default: [`DEFAULT_CLAIM_BATCH_MAX`] (4). `None` takes one row per
+    /// Default: [`DEFAULT_CLAIM_BATCH_MAX`] (8). `None` takes one row per
     /// claim. See [`Self::with_claim_batch_max`].
     pub claim_batch_max: Option<std::num::NonZeroU8>,
     /// Whether a claim of one row sends the lean claim statement first. A
@@ -5285,6 +5295,8 @@ impl WorkerConfig {
     /// and an owned workflow claim keep one row per claim. So do an adaptive
     /// limit, a cost hold and a dispatch channel.
     ///
+    /// `with_claim_batch_max(4)` keeps the earlier cap of 4 rows. It bounds
+    /// the rows that one claim locks and the burst that one worker takes.
     /// `with_claim_batch_max(1)` turns the batch claim off. `0` and `1` set
     /// `None`, one row per claim. Use it to compare the two, or to rule the
     /// batch claim out of a problem.
@@ -5296,7 +5308,8 @@ impl WorkerConfig {
     ///
     /// let rows = |config: WorkerConfig| config.claim_batch_max.map(std::num::NonZeroU8::get);
     /// assert_eq!(rows(WorkerConfig::default()), Some(DEFAULT_CLAIM_BATCH_MAX));
-    /// assert_eq!(rows(WorkerConfig::default().with_claim_batch_max(8)), Some(8));
+    /// assert_eq!(rows(WorkerConfig::default()), Some(8));
+    /// assert_eq!(rows(WorkerConfig::default().with_claim_batch_max(4)), Some(4));
     /// assert_eq!(rows(WorkerConfig::default().with_claim_batch_max(1)), None);
     /// ```
     #[must_use]
@@ -5901,15 +5914,16 @@ mod tests {
     #[test]
     fn claim_batch_max_is_on_by_default_and_one_row_is_off() {
         let rows = |config: WorkerConfig| config.claim_batch_max.map(std::num::NonZeroU8::get);
-        assert_eq!(DEFAULT_CLAIM_BATCH_MAX, 4);
+        assert_eq!(DEFAULT_CLAIM_BATCH_MAX, 8);
         assert_eq!(
             rows(WorkerConfig::default()),
             Some(DEFAULT_CLAIM_BATCH_MAX),
             "the batch claim is on by default"
         );
         assert_eq!(
-            rows(WorkerConfig::default().with_claim_batch_max(8)),
-            Some(8)
+            rows(WorkerConfig::default().with_claim_batch_max(4)),
+            Some(4),
+            "four keeps the earlier default"
         );
         assert_eq!(
             rows(WorkerConfig::default().with_claim_batch_max(2)),

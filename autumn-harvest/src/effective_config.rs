@@ -1188,8 +1188,13 @@ mod tests {
             "the view reports the default batch"
         );
         assert_eq!(
-            view(&WorkerConfig::default().with_claim_batch_max(8)),
-            Some(8)
+            view(&WorkerConfig::default()),
+            Some(8),
+            "the default batch is eight rows"
+        );
+        assert_eq!(
+            view(&WorkerConfig::default().with_claim_batch_max(4)),
+            Some(4)
         );
         assert_eq!(view(&WorkerConfig::default().with_claim_batch_max(1)), None);
     }

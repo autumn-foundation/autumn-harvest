@@ -63,7 +63,8 @@ more row locks than it did with one row per claim. A claim reads a seek
 window of 32 rows from a queue head. When the claims in flight lock each
 row of a window, the next claim falls back to the full statement. Keep the
 slots times the batch cap at or under 32 to keep the claims on one deep
-head in the window. A batch cap of 4 gives 8 slots.
+head in the window. The default batch cap of 8 gives 4 slots. A cap of 4
+gives 8 slots.
 
 ## See also
 

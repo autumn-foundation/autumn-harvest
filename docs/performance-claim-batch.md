@@ -6,7 +6,7 @@ from 32 to 128 workflows in flight. `WorkerConfig::with_claim_batch_max(n)`
 lets one statement take up to `n` rows, in batches of 2, 4 or 8.
 
 The batch claim shipped off by default. It is now on by default with a cap
-of 4 rows. See [On by default](#on-by-default). The operator guide is
+of 8 rows. See [On by default](#on-by-default). The operator guide is
 [Batch claim](operations/claim-batch.md).
 
 > **This is a reference measurement, not an SLO.** It comes from one 4-core
@@ -26,7 +26,10 @@ of 4 rows. See [On by default](#on-by-default). The operator guide is
 * **Against the lean single claim, a cap of 4 gives 1.07 to 1.09 times the
   throughput** at 4, 32 and 64 workflows in flight, over six rotated rounds
   of each level.
-* **The batch claim is on by default, with a cap of 4 rows**
+* **A cap of 8 gives 1.16 times the throughput of a cap of 4** in 6 of 6
+  rounds. The worker has 64 workflow and 128 activity slots. On a default
+  worker a cap of 8 measures the same as a cap of 4, within noise.
+* **The batch claim is on by default, with a cap of 8 rows**
   (`builder::DEFAULT_CLAIM_BATCH_MAX`). `with_claim_batch_max(1)` turns it
   off. Queue weights, fairness keys, priority ageing, owned workflow
   claims, adaptive limits, cost holds and dispatch channels keep one row
@@ -35,15 +38,25 @@ of 4 rows. See [On by default](#on-by-default). The operator guide is
 ## On by default
 
 **The decision.** `WorkerConfig::default()` sets `claim_batch_max` to
-`DEFAULT_CLAIM_BATCH_MAX`, 4 rows. `with_claim_batch_max(1)` keeps one row
-per claim. `with_claim_batch_max(8)` raises the cap, and a value above 8
-still claims 8 rows at most. The worker has no backlog gate and no slow
-start: a claim loop asks for its share on each claim.
+`DEFAULT_CLAIM_BATCH_MAX`, 8 rows. `with_claim_batch_max(4)` keeps the
+earlier cap of 4 rows. `with_claim_batch_max(1)` keeps one row per claim. A
+value above 8 still claims 8 rows at most. The worker has no backlog gate
+and no slow start: a claim loop asks for its share on each claim.
 
-**Why 4.** 4 is the largest batch that the end-to-end bench formed. Its
-worker has 8 workflow permits, 16 activity permits and 2 claim loops, so a
-share never passes 4. The evidence below therefore covers a cap of 4. It
-says nothing about a batch of 8 rows.
+**Why 8.** The batch size is the smallest share of the free permits per
+kind over the claim loops, capped at the default. So the cap changes a
+batch only where a share reaches 8. On a worker whose share rarely passes
+4, a cap of 8 forms batches no larger than a cap of 4 does. It measures the
+same within noise there. On a worker with many free slots it forms batches
+of 8, and it is faster. The hazards that grow with the cap grow only where
+batches of 8 form. Two of them are the rows that a claim in flight locks
+and the crash strikes of a batch. The others are the permits that a claim
+holds, the cached batch plans of a connection and the burst of one worker.
+
+The first default was 4. The end-to-end bench worker has 8 workflow
+permits, 16 activity permits and 2 claim loops, so its share never passes
+4. The rounds below at 4, 32 and 64 in flight therefore cover a cap of 4.
+[Cap of 8](#cap-of-8) has the rounds on workers with more slots.
 
 **The measurement.** The lean claim statement is newer than the first
 measurement of this page. A batch claim sends no lean statement. So the
@@ -58,7 +71,7 @@ the default on. Each load level has six rotated rounds of one binary.
 | 32 | 1.07x | 6 of 6 |
 | 64 | 1.07x | 6 of 6 |
 
-Caps of 2 and 8 measure the same as 4, within noise.
+Caps of 2 and 8 measure the same as 4, within noise, on that worker.
 
 **Low load.** A claim that finds one row costs more as a batch statement
 than as a lean statement. The cell at 4 workflows in flight is the low-load
@@ -98,6 +111,49 @@ case.
   when the state has no keyed row.
 * `a_default_worker_claims_a_backlog_in_batches_and_one_row_turns_it_off`
   runs a worker from `WorkerConfig::default()` on a backlog.
+
+### Cap of 8
+
+These rounds ran the same cell with three arms: the lean single claim
+(`HARVEST_BENCH_CLAIM_BATCH=1`), a cap of 4 and a cap of 8. Each row has six
+rotated rounds of one binary, with two claim loops. The medians are in
+workflows/s.
+
+| worker slots, workflow / activity | in flight | lean single claim | cap of 4 | cap of 8 | cap of 8 over cap of 4 | rows per batch statement, cap of 4 to cap of 8 |
+|:--|--:|--:|--:|--:|--:|--:|
+| 20 / 50 | 80 | 114.4 | 157.5 | 154.7 | 0.98, 8 faster in 2 of 6 | 3.37 to 3.34 |
+| 20 / 50 | 160 | 111.5 | 158.7 | 152.5 | 0.99, 8 faster in 3 of 6 | not taken |
+| 64 / 128 | 256 | 110.3 | 159.8 | 186.1 | 1.16, 8 faster in 6 of 6 | 3.92 to 7.63 |
+
+On the 20 / 50 worker, a cap of 4 gives 1.38 times the lean single claim at
+80 in flight and 1.42 times at 160. It gives 1.45 times on the 64 / 128
+worker. A cap of 8 gives 1.70 times the lean single claim there.
+
+**Rows per statement.** One `pg_stat_statements` census per cap counts the
+rows of the batch statements. On the 20 / 50 worker, a statement returns
+3.37 rows at a cap of 4 and 3.34 rows at a cap of 8. Its share
+rarely passes 4, so the batches stay small. On the 64 / 128 worker, a batch
+statement returns 3.92 rows at a cap of 4 and 7.63 rows at a cap of 8. Its
+calls fall from 2,580 to 1,325 for about the same rows. The census
+normalizes the `LIMIT` of a batch text to a bind. So it cannot split the
+calls by batch size, only give rows per statement. The 20 / 50 census
+counts the batch and window statements together, because both texts carry
+`claim_window_fallback`. So its figures are rows per statement of the two
+forms.
+
+**The in-flight gate.** On the 64 / 128 worker the cap-of-8 arm held 206 to
+212 of 256 workflows in flight. That is under the 90% gate of `e2e_bench`,
+so its rate understates it. The arms of a cap of 4 and of the lean claim
+passed the gate. [Paired runs](performance-claim-window-split.md#paired-runs)
+explains why the gate fails when workflows get faster.
+
+The raw files are in `docs/perf-artifacts/claim-batch-default/`.
+`cap-20x50-80.txt`,
+`cap-20x50-160.txt` and `cap-64x128-256.txt` hold the rounds.
+`census-20x50-80.txt` and `census-64x128-256.txt` hold the census of each
+cap. `worker-slots.patch` is a scratch patch to the bench that reads
+`SCRATCH_WF_SLOTS` and `SCRATCH_ACT_SLOTS`. It is not part of the tree.
+`paired.sh` runs the rounds.
 
 ## How a batch claims
 
@@ -149,7 +205,9 @@ so most batches hold 2 or 4 rows. In the census, batch statements return
 kind had a single free permit.
 
 A default worker has 20 workflow and 50 activity permits and two claim
-loops. Its idle claim loop has a share of 10 rows, so it asks for the cap.
+loops. Its idle claim loop has a share of 10 rows, so it asks for the cap
+of 8. Under load its share rarely passes 4: the census of
+[Cap of 8](#cap-of-8) has 3.34 rows per batch statement.
 
 ## Measurements
 

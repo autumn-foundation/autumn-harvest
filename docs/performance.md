@@ -77,10 +77,12 @@ saturated-activity gate.
   See [the lean claim tier](performance-claim-lean-tier.md) and
   [Lean claim](operations/claim-lean.md).
 * **A claim loop takes its share of the free slots in one statement**
-  (`claim_batch_max`, on by default). A batch claim sends no lean form.
-  Against the lean single claim, the default cap gives 1.07 to 1.09 times
+  (`claim_batch_max`, on by default, cap 8). A batch claim sends no lean
+  form. Against the lean single claim, a cap of 4 gives 1.07 to 1.09 times
   the throughput of the `throughput` cell at 4, 32 and 64 workflows in
-  flight. See [the batch claim](performance-claim-batch.md) and
+  flight. A cap of 8 gives 1.16 times a cap of 4 on a worker with 64
+  workflow and 128 activity slots. It measures the same within noise on a
+  default worker. See [the batch claim](performance-claim-batch.md) and
   [Batch claim](operations/claim-batch.md).
 * **A worker now runs up to `max_concurrent_claims` claims at once (default
   2).** One serial loop kept 0.94 claims in flight and capped throughput. On

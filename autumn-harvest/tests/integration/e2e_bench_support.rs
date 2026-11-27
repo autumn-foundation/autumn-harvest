@@ -2145,6 +2145,11 @@ mod tests {
             rows_per_claim_label(Some("default")),
             format!("up to {}", autumn_harvest::builder::DEFAULT_CLAIM_BATCH_MAX)
         );
+        assert_eq!(
+            rows_per_claim_label(Some("default")),
+            "up to 8",
+            "the default word reads the default cap of 8"
+        );
     }
 
     #[test]
