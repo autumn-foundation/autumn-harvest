@@ -59,9 +59,9 @@ workload, tracking top-level statements. Without the index:
 
 | open batches | due rows fired | due-read buffers | share of workload buffers | share of calls |
 |--:|--:|--:|--:|--:|
-| 1,000 | 25 | 732 | 12.1% | 2.5% |
-| 10,000 | 213 | 47,095 | 75.4% | 5.1% |
-| 100,000 | 1,982 | 3,228,269 | 95.4% | 5.8% |
+| 1,000 | 25 | 732 | 11.4% | 2.5% |
+| 10,000 | 213 | 47,095 | 75.0% | 5.1% |
+| 100,000 | 1,982 | 3,228,273 | 95.4% | 5.8% |
 
 At 10,000 and 100,000 rows the due read is the first statement by buffers. The
 next three at 100,000 rows are the start-path inserts into
@@ -76,7 +76,7 @@ is in the plan, not in the statement count. No statement wrote a temp block.
 
 ```text
 Limit (actual rows=1 loops=1)
-  Buffers: shared hit=2607 read=54
+  Buffers: shared hit=2583 read=78
   ->  LockRows (actual rows=1 loops=1)
         ->  Sort (actual rows=1 loops=1)
               Sort Key: harvest_event_batches.fire_at
@@ -133,9 +133,9 @@ for 3 ms. A second apply accepts the index that is already there.
 
 | open batches | due-read buffers/call | due-read buffers | workload buffers | change |
 |--:|--:|--:|--:|--:|
-| 1,000 | 28.2 → 5.8 | 732 → 150 | 6,069 → 5,888 | −3.0% |
-| 10,000 | 220.1 → 5.9 | 47,095 → 1,263 | 62,454 → 17,182 | −72.5% |
-| 100,000 | 1,628.0 → 11.4 | 3,228,269 → 22,678 | 3,382,982 → 178,128 | −94.7% |
+| 1,000 | 28.2 → 5.8 | 732 → 150 | 6,418 → 6,239 | −2.8% |
+| 10,000 | 220.1 → 5.9 | 47,095 → 1,263 | 62,810 → 17,540 | −72.1% |
+| 100,000 | 1,628.0 → 11.4 | 3,228,273 → 22,678 | 3,384,147 → 178,487 | −94.7% |
 
 | counter, 100,000 open batches | without | with |
 |---|--:|--:|
@@ -147,8 +147,10 @@ for 3 ms. A second apply accepts the index that is already there.
 
 The statement count does not change. The tick still fires one row per
 transaction. The read cost per fire grows with the due backlog without the
-index, and stays flat with it. Two runs of the baseline gave 3,382,980 and
-3,382,982 workload buffers.
+index, and stays flat with it. Three runs of the baseline gave 3,382,980,
+3,382,982 and 3,384,147 workload buffers. The third run is the published one.
+It is the first with appends that match their batch type (see below), so its
+admissions touch a few more pages.
 
 With the index, the read still costs 11.4 buffers per fire at 100,000 rows,
 against 5.8 at 1,000. Each fire deletes its row. The next read steps over the
@@ -157,7 +159,7 @@ them dead.
 
 ✅ **Equivalence.** Each arm records the started runs in fire order, by
 `created_at`, with type, workflow id and an `md5` of the input. It also
-records each batch row left after the admissions, by key, with its size and
+records each batch row left after the admissions, by type and key, with its size and
 `md5` digests of the payload and the start options. Each fire commits its
 own transaction, so `created_at` orders the runs. The capture asserts that
 both arms match at each size.
@@ -186,11 +188,17 @@ built before the seed, so inserts and updates shaped it. A fresh build on a
 
 | open batches | upsert WAL bytes, 200 calls | upsert buffers, 200 calls |
 |--:|--:|--:|
-| 1,000 | 154,790 → 171,484 | 2,294 → 2,697 |
-| 10,000 | 146,485 → 163,475 | 2,380 → 2,942 |
-| 100,000 | 154,002 → 167,096 | 2,989 → 3,734 |
+| 1,000 | 392,651 → 246,053 | 2,643 → 3,046 |
+| 10,000 | 220,848 → 237,838 | 2,736 → 3,298 |
+| 100,000 | 223,993 → 237,087 | 3,321 → 4,066 |
 
-That is about 84 more WAL bytes and 2 to 4 more buffers for each admission. An
+Each set of 200 holds 100 appends to open batches and 100 new batches. The
+capture asserts the row count that this mix leaves. At 10,000 and 100,000
+rows, that is 65 to 85 more WAL bytes and 3 to 4 more buffers for each
+admission. The 1,000-row WAL pair is not usable. Its `without` arm ran first
+after a server restart, so its writes carry the full-page images of the
+first change after a checkpoint. WAL bytes depend on the checkpoint timing,
+and buffers do not. The buffer delta at 1,000 rows is 2 for each admission. An
 append changes `buffered_payloads`, and `fire_at` is already in an index. So
 the new index does not stop a heap-only update. The fire path deletes the
 row, and a delete writes no index entry.
@@ -204,7 +212,8 @@ HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
 ```
 
 This writes the artifacts in `docs/perf-artifacts/event-batch-fire-scan/`.
-The equivalence check runs in CI:
+The equivalence check runs in CI. Without `HARVEST_TEST_DATABASE_URL` it
+starts its own Postgres container:
 
 ```sh
 cargo test -p autumn-harvest --features db,testing --test integration -- \

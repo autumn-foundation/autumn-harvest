@@ -43,6 +43,10 @@ use autumn_harvest::debounce::DebounceStartOptions;
 use autumn_harvest::event_batch::{AdmitBatchParams, admit_batched_start, fire_due_event_batches};
 use autumn_harvest::telemetry::NoOpMetrics;
 
+use testcontainers::{ContainerAsync, ImageExt};
+use testcontainers_modules::postgres::Postgres;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
 use crate::throwaway_db::ThrowawayDb;
 
 /// The candidate index. The migration builds the same definition.
@@ -304,9 +308,15 @@ async fn explain_due(conn: &mut AsyncPgConnection, form: &str) -> String {
 }
 
 /// Admit one start through the public batch path.
-async fn admit(conn: &mut AsyncPgConnection, batch_key: &str, workflow_id: &str, event: usize) {
+async fn admit(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    batch_key: &str,
+    workflow_id: &str,
+    event: usize,
+) {
     let params = AdmitBatchParams {
-        workflow_name: "batch_wf_0".to_string(),
+        workflow_name: workflow_name.to_string(),
         batch_key: batch_key.to_string(),
         workflow_id: workflow_id.to_string(),
         queue_name: "batches".to_string(),
@@ -322,16 +332,45 @@ async fn admit(conn: &mut AsyncPgConnection, batch_key: &str, workflow_id: &str,
 }
 
 /// One migrated template and the admin URL of its server.
+///
+/// The fields drop in order, so the template database goes before its
+/// container.
 struct Template {
     admin_url: String,
     db: ThrowawayDb,
+    _container: Option<ContainerAsync<Postgres>>,
 }
 
-/// Create the template, or `None` when no server is configured.
+/// Create the template on the `HARVEST_TEST_DATABASE_URL` server. Without
+/// that variable, start a Postgres container, as the other event-batch
+/// suites do. Returns `None` only when neither is available.
 async fn template(prefix: &str) -> Option<Template> {
-    let admin_url = std::env::var("HARVEST_TEST_DATABASE_URL").ok()?;
+    let (admin_url, container) = if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
+        (url, None)
+    } else {
+        let container = match Postgres::default().with_tag("16").start().await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("no Postgres container: {e}");
+                return None;
+            }
+        };
+        let host = container.get_host().await.expect("container host");
+        let port = container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("container port");
+        (
+            format!("postgresql://postgres:postgres@{host}:{port}/postgres"),
+            Some(container),
+        )
+    };
     let db = ThrowawayDb::create_on(&admin_url, prefix).await;
-    Some(Template { admin_url, db })
+    Some(Template {
+        admin_url,
+        db,
+        _container: container,
+    })
 }
 
 /// Copy the template into a new database for one arm, with or without the
@@ -396,7 +435,7 @@ fn split_ties(runs: &[String]) -> (Vec<String>, Vec<String>) {
 #[tokio::test]
 async fn event_batch_fire_index_does_not_change_what_fires() {
     let Some(t) = template("ebfire_edge_tpl").await else {
-        eprintln!("SKIP: HARVEST_TEST_DATABASE_URL is unset");
+        eprintln!("SKIP: no HARVEST_TEST_DATABASE_URL and no Postgres container");
         return;
     };
     let without = fire_edge_arm(&t, false).await;
@@ -612,7 +651,7 @@ async fn capture_arm(t: &Template, size: i64, with_index: bool) -> (Outcome, Str
     let append_keys = lines(
         &mut conn,
         &format!(
-            "SELECT batch_key AS item FROM harvest_event_batches
+            "SELECT workflow_name || '|' || batch_key AS item FROM harvest_event_batches
              WHERE fire_at > now() AND jsonb_array_length(buffered_payloads) < 50
              ORDER BY id LIMIT {}",
             ADMISSIONS / 2
@@ -639,18 +678,29 @@ async fn capture_arm(t: &Template, size: i64, with_index: bool) -> (Outcome, Str
     let fired = fire_due_event_batches(&mut conn, &None, &[], &NoOpMetrics)
         .await
         .expect("fire the due batches");
-    for (i, key) in append_keys.iter().enumerate() {
-        admit(&mut conn, key, &format!("unused-{i}"), i).await;
+    // Each append names the workflow type of its batch, since a batch is
+    // keyed on the type and the key together.
+    for (i, target) in append_keys.iter().enumerate() {
+        let (workflow_name, key) = target.split_once('|').expect("type|key");
+        admit(&mut conn, workflow_name, key, &format!("unused-{i}"), i).await;
     }
     for i in 0..ADMISSIONS / 2 {
-        admit(
-            &mut conn,
-            &format!("new-key-{i}"),
-            &format!("new-run-{i}"),
-            i,
-        )
-        .await;
+        let key = format!("new-key-{i}");
+        admit(&mut conn, "batch_wf_0", &key, &format!("new-run-{i}"), i).await;
     }
+    // Each fired row leaves, each append keeps its row, and each new key adds one.
+    let left = lines(
+        &mut conn,
+        "SELECT COUNT(*)::TEXT AS item FROM harvest_event_batches",
+    )
+    .await;
+    let fired_rows = i64::try_from(fired).expect("a small count");
+    let opened = i64::try_from(ADMISSIONS / 2).expect("a small count");
+    assert_eq!(
+        left,
+        [(size - fired_rows + opened).to_string()],
+        "the admissions must append to {opened} batches and open {opened} new ones"
+    );
 
     // The cumulative statistics flush at the end of a transaction, at most
     // once a second, so wait before the snapshot.
@@ -669,7 +719,7 @@ async fn capture_arm(t: &Template, size: i64, with_index: bool) -> (Outcome, Str
 #[ignore = "evidence capture: seeds up to 100,000 open batches, six times"]
 async fn zz_capture_event_batch_fire_scan_evidence() {
     let Some(t) = template("ebfire_cap_tpl").await else {
-        eprintln!("SKIP: HARVEST_TEST_DATABASE_URL is unset; nothing captured");
+        eprintln!("SKIP: no HARVEST_TEST_DATABASE_URL and no Postgres container; nothing captured");
         return;
     };
     {
