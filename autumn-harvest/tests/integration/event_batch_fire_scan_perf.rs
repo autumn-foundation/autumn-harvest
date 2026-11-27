@@ -406,7 +406,10 @@ async fn event_batch_fire_index_does_not_change_what_fires() {
     assert_eq!(without.left.len(), 2, "the two rows not yet due stay");
     let (order_without, ties_without) = split_ties(&without.runs);
     let (order_with, ties_with) = split_ties(&with.runs);
-    assert_eq!(order_without, order_with, "the untied fire order must agree");
+    assert_eq!(
+        order_without, order_with,
+        "the untied fire order must agree"
+    );
     assert_eq!(ties_without, ties_with, "the tied rows must all fire");
     assert_eq!(ties_with.len(), 3);
     // The fire order follows `fire_at`, over every shard id.
@@ -527,7 +530,10 @@ async fn statement_snapshot(conn: &mut AsyncPgConnection, label: &str, fired: us
     .load(conn)
     .await
     .expect("pg_stat_statements snapshot");
-    assert!(!stats.is_empty(), "pg_stat_statements has no row for {label}");
+    assert!(
+        !stats.is_empty(),
+        "pg_stat_statements has no row for {label}"
+    );
     let buffers: i64 = stats.iter().map(|s| s.total_buffers).sum();
     let calls: i64 = stats.iter().map(|s| s.calls).sum();
     let wal: i64 = stats.iter().map(|s| s.wal_bytes).sum();
@@ -590,14 +596,15 @@ async fn capture_arm(t: &Template, size: i64, with_index: bool) -> (Outcome, Str
     )
     .await
     .expect("seed the fixture");
+    // The tuple counts flush at most once a second, so wait for them.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    conn.batch_execute("SELECT pg_stat_force_next_flush()")
+        .await
+        .expect("flush the table statistics");
     let mut summary = fixture_summary(&mut conn, &label).await;
     let plan = assert_plan(&mut conn, with_index).await;
     let mut explain = format!("-- {label}: plan shape --\n{plan}\n");
-    let analyzed = explain_due(
-        &mut conn,
-        "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS)",
-    )
-    .await;
+    let analyzed = explain_due(&mut conn, "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS)").await;
     let _ = write!(
         explain,
         "-- {label}: the first due read of the tick --\n{analyzed}\n"
@@ -612,7 +619,11 @@ async fn capture_arm(t: &Template, size: i64, with_index: bool) -> (Outcome, Str
         ),
     )
     .await;
-    assert_eq!(append_keys.len(), ADMISSIONS / 2, "enough open batches to append to");
+    assert_eq!(
+        append_keys.len(),
+        ADMISSIONS / 2,
+        "enough open batches to append to"
+    );
 
     diesel::sql_query(
         "SELECT pg_stat_statements_reset(0, \
@@ -632,7 +643,13 @@ async fn capture_arm(t: &Template, size: i64, with_index: bool) -> (Outcome, Str
         admit(&mut conn, key, &format!("unused-{i}"), i).await;
     }
     for i in 0..ADMISSIONS / 2 {
-        admit(&mut conn, &format!("new-key-{i}"), &format!("new-run-{i}"), i).await;
+        admit(
+            &mut conn,
+            &format!("new-key-{i}"),
+            &format!("new-run-{i}"),
+            i,
+        )
+        .await;
     }
 
     // The cumulative statistics flush at the end of a transaction, at most
@@ -708,12 +725,23 @@ async fn zz_capture_event_batch_fire_scan_evidence() {
         );
         let digest = format!(
             "{:x}",
-            fnv_digest(&format!("{}\n{}", with.runs.join("\n"), with.left.join("\n")))
+            fnv_digest(&format!(
+                "{}\n{}",
+                with.runs.join("\n"),
+                with.left.join("\n")
+            ))
         );
-        let _ = writeln!(rows, "{size}|{}|{}|{digest}", with.runs.len(), with.left.len());
+        let _ = writeln!(
+            rows,
+            "{size}|{}|{}|{digest}",
+            with.runs.len(),
+            with.left.len()
+        );
     }
     std::fs::write(out_dir.join("result-rows.txt"), &rows).expect("write the result rows");
-    eprintln!("equivalence confirmed: both arms fire the same runs in the same order at every size");
+    eprintln!(
+        "equivalence confirmed: both arms fire the same runs in the same order at every size"
+    );
     eprintln!("== done. Artifacts in {} ==", out_dir.display());
 }
 

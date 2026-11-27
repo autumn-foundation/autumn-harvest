@@ -1,0 +1,4 @@
+size|runs started|rows left|outcome digest
+1000|25|1134|ddd3e0054db61c79
+10000|213|9946|ece7ffaa59c45a54
+100000|1982|98177|8a773ec755025be1
