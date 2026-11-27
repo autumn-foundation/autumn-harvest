@@ -1,4 +1,4 @@
-## Ledger: the unsharded event-batch scanner reads its next due row by index (PR #0000)
+## Ledger: the unsharded event-batch scanner reads its next due row by index (PR #2813)
 
 `event_batch::fire_due_on_conn` fires one due batch per transaction. Its
 unsharded read filtered on `fire_at <= $1` and ordered on `fire_at`. The
