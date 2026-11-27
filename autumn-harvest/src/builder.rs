@@ -88,7 +88,7 @@ pub const DEFAULT_MAX_CONCURRENT_CLAIMS: usize = 2;
 /// A claim loop takes its share of the free slots in one statement, up to
 /// this cap. On the end-to-end bench, 4 is the largest batch that a claim
 /// formed. Its worker has 8 workflow permits, 16 activity permits and 2
-/// claim loops, so no share passes 4. See
+/// claim loops, so a claim of both kinds never has a share above 4. See
 /// [`WorkerConfig::with_claim_batch_max`].
 pub const DEFAULT_CLAIM_BATCH_MAX: u8 = 4;
 

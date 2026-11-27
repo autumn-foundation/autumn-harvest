@@ -17780,14 +17780,6 @@ fn ineligible_activities(
     Ok(ineligible_activities)
 }
 
-/// The activity names that a claim must skip (issue #1836).
-///
-/// These are the names with unmet requirements, plus the types at their
-/// adaptive limit. A saturated type carries
-/// [`queue::SATURATED_ACTIVITY_MARKER`], so the claim skips it even on a row
-/// with capability requirements. `held` holds the types that a cost signal
-/// holds (autumn#1720). They carry the marker already. The common case has
-/// no saturated type and no held type, and allocates nothing.
 /// The permits per kind for one claim of `loops` claim loops.
 ///
 /// A kind with no free permit takes no part, since the claim does not admit
@@ -17840,6 +17832,14 @@ fn batch_claim_kind<'a>(task_types: impl IntoIterator<Item = &'a str>) -> ClaimK
     }
 }
 
+/// The activity names that a claim must skip (issue #1836).
+///
+/// These are the names with unmet requirements, plus the types at their
+/// adaptive limit. A saturated type carries
+/// [`queue::SATURATED_ACTIVITY_MARKER`], so the claim skips it even on a row
+/// with capability requirements. `held` holds the types that a cost signal
+/// holds (autumn#1720). They carry the marker already. The common case has
+/// no saturated type and no held type, and allocates nothing.
 fn claim_exclusions<'a>(
     ineligible: &'a [String],
     held: &[String],
@@ -37020,8 +37020,8 @@ fn owner_take_backoff(poll: Duration, misses: u32) -> Duration {
 
 /// What one owner take returned (issue #2255).
 enum OwnerTake {
-    /// The take claimed the row. The permit goes to its dispatch.
-    Taken(Box<TaskQueueItem>, tokio::sync::OwnedSemaphorePermit),
+    /// The take claimed the row. The held permit goes to its dispatch.
+    Taken(Box<TaskQueueItem>, PollPermits),
     /// No row was `PENDING` and due, or a gate refused it.
     Empty,
     /// The take failed.
@@ -37076,6 +37076,9 @@ const fn decider_gate(admission: PollAdmission) -> PollAdmission {
 /// a held permit. A slot tuner shrink therefore cannot leave a claimed row
 /// without a permit while its timeout runs. Each claimed row's permit moves
 /// into its spawned task. The other permits go back when this value drops.
+///
+/// An owner take holds its one workflow permit in such a value too (issue
+/// #2255). So the permit of a take in flight counts as a poll permit.
 ///
 /// No task runs on a held permit, so it is not a slot in use. `held` counts
 /// the held permits for the slot readers. This value counts its permits
@@ -37140,6 +37143,18 @@ impl PollPermits {
             activity: take(TaskType::Activity, SlotType::Activity, activity),
             held: held.clone(),
         }
+    }
+
+    /// Take the one workflow permit of an owner take (issue #2255). `None`
+    /// when the workflow pool has no free permit.
+    fn for_owner_take(
+        workflow: &Arc<Semaphore>,
+        activity: &Arc<Semaphore>,
+        held: &crate::slot_tuner::PollHeldPermits,
+    ) -> Option<Self> {
+        let only = PollAdmission::Only(crate::queue::TaskType::Workflow);
+        let permits = Self::acquire_up_to(only, workflow, activity, 1, held);
+        (permits.rows() == 1).then_some(permits)
     }
 
     /// What the held permits allow this poll to claim.
@@ -42951,8 +42966,13 @@ impl Worker {
                     let Some((exec, key)) = state.pop(now) else {
                         break;
                     };
-                    let Ok(permit) = Arc::clone(&self.workflow_semaphore).try_acquire_owned()
-                    else {
+                    // A take holds its permit as a poll does, so the slot
+                    // readers do not count it as a task.
+                    let Some(held) = PollPermits::for_owner_take(
+                        &self.workflow_semaphore,
+                        &self.activity_semaphore,
+                        &self.poll_held,
+                    ) else {
                         state.insert(exec, key);
                         blocked = true;
                         break;
@@ -42960,10 +42980,7 @@ impl Worker {
                     state.in_flight.insert(exec);
                     let owned = Arc::clone(&owned);
                     events.push(Box::pin(async move {
-                        DeciderEvent::Taken(
-                            exec,
-                            self.owner_take(target, exec, &owned, permit).await,
-                        )
+                        DeciderEvent::Taken(exec, self.owner_take(target, exec, &owned, held).await)
                     }));
                 }
                 state.end_pass();
@@ -43032,14 +43049,15 @@ impl Worker {
 
     /// One owner take of the workflow task of `exec` (issue #2255).
     ///
-    /// The permit stays with a claimed row. It frees when the take finds no
-    /// row.
+    /// `held` holds the one workflow permit of the take. It stays with a
+    /// claimed row, and it frees when the take finds no row. Until the
+    /// dispatch takes it, it counts as a permit that a poll holds.
     async fn owner_take(
         &self,
         target: &DeciderTarget<'_>,
         exec: uuid::Uuid,
         owned: &queue::OwnedClaim,
-        permit: tokio::sync::OwnedSemaphorePermit,
+        held: PollPermits,
     ) -> OwnerTake {
         let started = std::time::Instant::now();
         let mut conn = match self
@@ -43087,7 +43105,7 @@ impl Worker {
                 .record_owner_take_duration(kind, *label, elapsed);
         }
         match taken {
-            Ok(Some(task)) => OwnerTake::Taken(Box::new(task), permit),
+            Ok(Some(task)) => OwnerTake::Taken(Box::new(task), held),
             Ok(None) => OwnerTake::Empty,
             Err(error) => OwnerTake::Failed(error),
         }
@@ -43144,7 +43162,7 @@ impl Worker {
                     );
                 }
             }
-            DeciderEvent::Taken(exec, OwnerTake::Taken(task, permit)) => {
+            DeciderEvent::Taken(exec, OwnerTake::Taken(task, mut held)) => {
                 state.took(exec);
                 tracing::debug!(
                     task_id = %task.id,
@@ -43154,7 +43172,9 @@ impl Worker {
                 if let Some(shard) = target.shard {
                     self.record_shard_dispatched_many(shard, 1);
                 }
-                self.dispatch_task(*task, target.pool, target.shard, None, Some(permit), None);
+                // The task holds the permit from here, so it is a slot in use.
+                let permit = held.take(&task.task_type);
+                self.dispatch_task(*task, target.pool, target.shard, None, permit, None);
             }
             DeciderEvent::Taken(exec, OwnerTake::Empty) => {
                 state.missed(exec, now);
@@ -60737,6 +60757,46 @@ mod tests {
         assert_eq!(poll.release(), (0, 0));
         drop(poll);
         assert_eq!(count(), (0, 0), "a drop after a release takes off nothing");
+    }
+
+    /// An owner take holds one workflow permit and no activity permit. The
+    /// count holds that permit until the dispatch takes it, or until the take
+    /// ends with no row.
+    #[allow(clippy::significant_drop_tightening)]
+    #[test]
+    fn an_owner_take_counts_its_one_workflow_permit_until_the_dispatch() {
+        use crate::queue::TaskType;
+        let workflow = Arc::new(Semaphore::new(2));
+        let activity = Arc::new(Semaphore::new(2));
+        let held = crate::slot_tuner::PollHeldPermits::default();
+        let count = || (held.held(SlotType::Workflow), held.held(SlotType::Activity));
+        let take = || PollPermits::for_owner_take(&workflow, &activity, &held);
+
+        // A take that finds no row gives its permit back.
+        let miss = take().expect("a free workflow permit");
+        assert_eq!(miss.rows(), 1);
+        assert_eq!(count(), (1, 0));
+        assert_eq!(activity.available_permits(), 2);
+        drop(miss);
+        assert_eq!(count(), (0, 0));
+        assert_eq!(workflow.available_permits(), 2);
+
+        // A take that claims its row hands the permit to the dispatch.
+        let mut hit = take().expect("a free workflow permit");
+        let permit = hit.take(TaskType::Workflow.as_str());
+        assert!(permit.is_some());
+        assert_eq!(count(), (0, 0), "the task holds the permit");
+        drop(hit);
+        assert_eq!(workflow.available_permits(), 1);
+
+        // A take on a full pool holds nothing, so the decider waits.
+        let last = take().expect("a free workflow permit");
+        assert_eq!(count(), (1, 0));
+        assert!(take().is_none(), "the pool is full");
+        assert_eq!(count(), (1, 0), "a refused take adds no count");
+        drop((last, permit));
+        assert_eq!(count(), (0, 0));
+        assert_eq!(workflow.available_permits(), 2);
     }
 
     /// Records each sample of the slot gauges.

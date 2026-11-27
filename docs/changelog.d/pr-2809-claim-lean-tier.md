@@ -100,10 +100,11 @@ entry above serves the claims of one row.
   `harvest.worker.slots_in_use`, `SlotObservations::in_use` and
   `harvest_workers.in_flight_count` then count the slots that a task holds.
   An idle worker reads 0. `slots_in_use + slots_available` still equals the
-  target. A reading keeps the larger of two reads of the count around the
-  semaphore read. So a moving poll can hide a task for one sample, and it
-  never reads as a task. Admission does not change: the semaphores decide
-  what a poll may claim.
+  target. A reading takes the count, then the semaphore, and it reads both
+  again when a poll changed the count between the two. So a moving poll can
+  hide a task for one sample, and it never reads as a task. An owner take
+  of the owner decider holds its workflow permit in the same count.
+  Admission does not change: the semaphores decide what a poll may claim.
 - **Public API.** `workers::compute_in_flight` takes a fifth argument,
   `&PollHeldPermits`. `workers::spawn_worker_heartbeat` takes a last
   argument, a `PollHeldPermits`. `slot_tuner::TunedSlot` gains the public

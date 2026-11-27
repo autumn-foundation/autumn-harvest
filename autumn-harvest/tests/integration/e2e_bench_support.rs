@@ -322,9 +322,14 @@ pub fn claim_batch_override(raw: Option<&str>) -> Option<std::num::NonZeroU8> {
 ///
 /// `raw` is the [`CLAIM_BATCH_ENV_VAR`] value. A report of a batch run and a
 /// report of a run with one row per claim then differ in their headers.
+///
+/// A claim statement takes 2, 4 or 8 rows, so the label rounds a cap down
+/// to one of them, as the claim does.
 #[must_use]
 pub fn rows_per_claim_label(raw: Option<&str>) -> String {
-    claim_batch_override(raw).map_or_else(|| "1".to_owned(), |rows| format!("up to {rows}"))
+    claim_batch_override(raw)
+        .and_then(|rows| autumn_harvest::queue::ClaimBatch::at_most(usize::from(rows.get())))
+        .map_or_else(|| "1".to_owned(), |batch| format!("up to {}", batch.rows()))
 }
 
 /// Set to `0` or `off` to turn the lean claim statement off. Unset keeps
@@ -2102,7 +2107,21 @@ mod tests {
         assert_eq!(rows(Some("4")), Some(4));
         assert_eq!(rows(Some("8")), Some(8));
         assert_eq!(rows(Some(" 4 ")), Some(4));
-        assert_eq!(rows_per_claim_label(Some("8")), "up to 8");
+        // A cap rounds down to 2, 4 or 8 rows, as the claim does.
+        for (cap, label) in [
+            ("2", "up to 2"),
+            ("3", "up to 2"),
+            ("4", "up to 4"),
+            ("5", "up to 4"),
+            ("6", "up to 4"),
+            ("7", "up to 4"),
+            ("8", "up to 8"),
+            ("9", "up to 8"),
+            ("200", "up to 8"),
+            ("255", "up to 8"),
+        ] {
+            assert_eq!(rows_per_claim_label(Some(cap)), label, "a cap of {cap}");
+        }
 
         let worker_default = autumn_harvest::builder::WorkerConfig::default().claim_batch_max;
         assert_eq!(

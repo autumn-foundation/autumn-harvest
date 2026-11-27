@@ -388,18 +388,22 @@ pub fn validate_band(min_slots: usize, max_slots: usize, configured_max: usize) 
 ///
 /// A poll counts its permits before it takes them, and it takes them off
 /// the count after it returns them. So the count is never below the permits
-/// that polls hold. See [`Self::reading`] for the read side.
+/// that polls hold. Each change of a count also adds one to `moves`. See
+/// [`Self::reading`] for the read side.
 #[derive(Debug, Clone, Default)]
 pub struct PollHeldPermits {
     workflow: Arc<AtomicUsize>,
     activity: Arc<AtomicUsize>,
+    /// The changes of either count so far. A reader compares two reads of
+    /// it, so it sees a change that falls between them.
+    moves: Arc<AtomicUsize>,
 }
 
 impl PollHeldPermits {
     /// The permits of `slot_type` that polls hold now.
     #[must_use]
     pub fn held(&self, slot_type: SlotType) -> usize {
-        self.cell(slot_type).load(Ordering::Relaxed)
+        self.cell(slot_type).load(Ordering::SeqCst)
     }
 
     /// One reading of a pool for [`slots_in_use`]: `(available,
@@ -407,31 +411,66 @@ impl PollHeldPermits {
     ///
     /// `available_permits` reads the semaphore of the pool. The semaphore
     /// and the count are two cells, so no read sees both at one instant.
-    /// This reads the count before and after the semaphore, and keeps the
-    /// larger count. A poll that takes or returns its permits between the
-    /// reads then never reads as a task. For a moment it can hide a task
-    /// instead.
+    /// This reads the count, then the semaphore. It reads both again when a
+    /// poll changed a count between the two, so `available_permits` can run
+    /// more than once.
+    ///
+    /// A permit that a poll holds at the semaphore read is then in the
+    /// count. The poll counted it, and bumped `moves`, before it took it. So
+    /// a permit of a poll never reads as a task. For a moment the reading
+    /// can hide a task instead. A poll counts a permit shortly before it
+    /// takes it, and shortly after it hands it to a task.
+    ///
+    /// The loop ends. A new pass needs a change of a count during the last
+    /// pass. The changes come in short bursts with no await between them.
+    /// `acquire_up_to` makes an add and a sub for each kind. A batch makes a
+    /// sub for each row that it dispatches, then one for each kind that it
+    /// gives back. An owner pass makes one add for each take. After a burst,
+    /// the poll awaits a database round trip or its task. A pass of this loop
+    /// is a few atomic loads, so it reads again only while a burst overlaps it.
+    ///
+    /// The count and `moves` use `SeqCst`. The proof needs one order over
+    /// the writes of a poll and the reads of a reader, on two cells.
     #[must_use]
     pub fn reading(
         &self,
         slot_type: SlotType,
-        available_permits: impl FnOnce() -> usize,
+        available_permits: impl Fn() -> usize,
     ) -> (usize, usize) {
-        let before = self.held(slot_type);
-        let available = available_permits();
-        (available, before.max(self.held(slot_type)))
+        loop {
+            let moves = self.moves.load(Ordering::SeqCst);
+            let held = self.held(slot_type);
+            let available = available_permits();
+            if self.moves.load(Ordering::SeqCst) == moves {
+                return (available, held);
+            }
+        }
     }
 
     /// Count `permits` more held permits of `slot_type`.
+    ///
+    /// Call it before the permits are taken. The count changes first and
+    /// `moves` second. So a reader that sees a taken permit also sees its
+    /// count, or it sees `moves` change and reads again.
     #[cfg_attr(not(feature = "db"), allow(dead_code))]
     pub(crate) fn add(&self, slot_type: SlotType, permits: usize) {
-        self.cell(slot_type).fetch_add(permits, Ordering::Relaxed);
+        if permits == 0 {
+            return;
+        }
+        self.cell(slot_type).fetch_add(permits, Ordering::SeqCst);
+        self.moves.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Count `permits` fewer held permits of `slot_type`.
+    ///
+    /// Call it after the permits went back, or after a task took them.
     #[cfg_attr(not(feature = "db"), allow(dead_code))]
     pub(crate) fn sub(&self, slot_type: SlotType, permits: usize) {
-        self.cell(slot_type).fetch_sub(permits, Ordering::Relaxed);
+        if permits == 0 {
+            return;
+        }
+        self.cell(slot_type).fetch_sub(permits, Ordering::SeqCst);
+        self.moves.fetch_add(1, Ordering::SeqCst);
     }
 
     fn cell(&self, slot_type: SlotType) -> &AtomicUsize {
@@ -1270,31 +1309,133 @@ mod tests {
         assert_eq!(held.held(SlotType::Activity), 2);
     }
 
-    /// A poll can take or return its permits between the two reads of a
-    /// reader. The reading keeps the larger count, so those permits never
-    /// read as tasks.
+    /// A poll takes its permits between the count read and the semaphore
+    /// read of a reader. The reader sees the change and reads again, so the
+    /// permits do not read as tasks.
     #[test]
-    fn a_reading_keeps_the_larger_count_around_the_semaphore_read() {
+    fn a_reading_reads_again_when_a_poll_takes_its_permits_during_it() {
         let held = PollHeldPermits::default();
         assert_eq!(held.reading(SlotType::Activity, || 20), (20, 0));
 
-        // A poll counts four permits and takes them during the read.
+        let passes = std::cell::Cell::new(0_u32);
         let taken = held.reading(SlotType::Activity, || {
-            held.add(SlotType::Activity, 4);
+            passes.set(passes.get() + 1);
+            if passes.get() == 1 {
+                held.add(SlotType::Activity, 4);
+            }
             16
         });
+        assert_eq!(passes.get(), 2, "the change costs one more pass");
         assert_eq!(taken, (16, 4));
         assert_eq!(slots_in_use(20, taken.0, taken.1), 0);
+    }
 
-        // The poll returns them after the semaphore read, before the second
-        // read of the count.
-        let returned = held.reading(SlotType::Activity, || {
-            held.sub(SlotType::Activity, 4);
-            16
+    /// A whole poll runs between the two reads of the count that an older
+    /// reading compared: it counts, takes, returns and uncounts. Both reads
+    /// of the count gave 0, and the taken permits read as tasks. The reader
+    /// now sees the two changes and reads again.
+    #[test]
+    fn a_reading_reads_again_when_a_whole_poll_runs_during_it() {
+        let held = PollHeldPermits::default();
+        let passes = std::cell::Cell::new(0_u32);
+        let reading = held.reading(SlotType::Workflow, || {
+            passes.set(passes.get() + 1);
+            if passes.get() == 1 {
+                // The semaphore read falls inside the hold of the poll.
+                held.add(SlotType::Workflow, 4);
+                held.sub(SlotType::Workflow, 4);
+                return 6;
+            }
+            10
         });
-        assert_eq!(returned, (16, 4));
-        assert_eq!(slots_in_use(20, returned.0, returned.1), 0);
-        assert_eq!(held.reading(SlotType::Activity, || 20), (20, 0));
+        assert_eq!(passes.get(), 2);
+        assert_eq!(reading, (10, 0));
+        assert_eq!(slots_in_use(10, reading.0, reading.1), 0);
+    }
+
+    /// A second poll takes its permits during a reading, while a first poll
+    /// holds its own. The reader reads again and counts the permits of both.
+    #[test]
+    fn a_reading_counts_a_poll_that_moves_beside_one_that_holds() {
+        let held = PollHeldPermits::default();
+        held.add(SlotType::Activity, 4);
+        let passes = std::cell::Cell::new(0_u32);
+        let reading = held.reading(SlotType::Activity, || {
+            passes.set(passes.get() + 1);
+            if passes.get() == 1 {
+                held.add(SlotType::Activity, 4);
+            }
+            12
+        });
+        assert_eq!(passes.get(), 2);
+        assert_eq!(reading, (12, 8));
+        assert_eq!(slots_in_use(20, reading.0, reading.1), 0);
+        held.sub(SlotType::Activity, 4);
+        assert_eq!(held.reading(SlotType::Activity, || 16), (16, 4));
+    }
+
+    /// A change of no permit is no change, so a reader does not read again.
+    #[test]
+    fn a_change_of_no_permit_costs_a_reader_no_pass() {
+        let held = PollHeldPermits::default();
+        let passes = std::cell::Cell::new(0_u32);
+        let reading = held.reading(SlotType::Workflow, || {
+            passes.set(passes.get() + 1);
+            held.add(SlotType::Workflow, 0);
+            held.sub(SlotType::Workflow, 0);
+            7
+        });
+        assert_eq!((passes.get(), reading), (1, (7, 0)));
+    }
+
+    /// Polls take and return permits on other threads while a reader takes
+    /// readings. No task runs, so each reading must show no slot in use.
+    ///
+    /// The threads change the count with no pause, far more often than real
+    /// polls do. Each reading must still end.
+    #[test]
+    fn concurrent_polls_never_read_as_tasks_and_each_reading_ends() {
+        const TOTAL: usize = 16;
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(TOTAL));
+        let held = PollHeldPermits::default();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let moved = std::sync::atomic::AtomicU64::new(0);
+        let poll = || {
+            let mut rounds = 0_u64;
+            while !stop.load(Ordering::Relaxed) {
+                held.add(SlotType::Workflow, 4);
+                let permit = Arc::clone(&semaphore).try_acquire_many_owned(4).ok();
+                let took = permit.is_some();
+                drop(permit);
+                held.sub(SlotType::Workflow, 4);
+                rounds += u64::from(took);
+                moved.fetch_add(1, Ordering::Relaxed);
+            }
+            rounds
+        };
+        let rounds: u64 = std::thread::scope(|scope| {
+            let polls = [(); 3].map(|()| scope.spawn(poll));
+            // The readings must overlap the rounds of the polls. A new thread
+            // can wait for a slice of the scheduler before it runs.
+            let mut readings = 0_u32;
+            while readings < 50_000 || moved.load(Ordering::Relaxed) < 10_000 {
+                let (available, by_polls) =
+                    held.reading(SlotType::Workflow, || semaphore.available_permits());
+                assert_eq!(
+                    slots_in_use(TOTAL, available, by_polls),
+                    0,
+                    "{available} available, {by_polls} held by polls"
+                );
+                readings += 1;
+            }
+            stop.store(true, Ordering::Relaxed);
+            polls
+                .into_iter()
+                .map(|poll| poll.join().expect("a poll thread"))
+                .sum()
+        });
+        assert!(rounds > 0, "the polls ran");
+        assert_eq!(held.held(SlotType::Workflow), 0);
     }
 
     #[test]

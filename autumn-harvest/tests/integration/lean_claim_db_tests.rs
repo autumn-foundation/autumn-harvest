@@ -449,6 +449,11 @@ async fn runs_of(conn: &mut AsyncPgConnection, marker: &str) -> i64 {
     .n
 }
 
+/// The full statements that `conn` sent since it connected.
+pub(crate) async fn full_statements(conn: &mut AsyncPgConnection) -> i64 {
+    runs_of(conn, FULL_MARKER).await
+}
+
 /// The claim forms that `conn` sent since it connected.
 async fn forms(conn: &mut AsyncPgConnection) -> Forms {
     let batch = runs_of(conn, BATCH_MARKER).await;

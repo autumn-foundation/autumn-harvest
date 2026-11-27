@@ -352,9 +352,11 @@ async fn tuner_grows_under_load_and_drains_cleanly() {
     let mut conn = AsyncPgConnection::establish(&db_url)
         .await
         .expect("connect");
+    // Fresh ids, so a second run on one database starts new workflows.
+    let run = uuid::Uuid::new_v4().simple();
     let mut exec_ids = Vec::new();
     for i in 0..24 {
-        exec_ids.push(start_workflow_on(&mut conn, &format!("slot-tuner-grow-{i}")).await);
+        exec_ids.push(start_workflow_on(&mut conn, &format!("slot-tuner-grow-{run}-{i}")).await);
     }
 
     // Poll the recorded activity slot_target samples until we observe growth
@@ -376,7 +378,7 @@ async fn tuner_grows_under_load_and_drains_cleanly() {
     while max_activity_target() <= 4 && tokio::time::Instant::now() < deadline {
         if tokio::time::Instant::now() >= next_batch && exec_ids.len() < 96 {
             for _ in 0..4 {
-                let id = format!("slot-tuner-grow-{}", exec_ids.len());
+                let id = format!("slot-tuner-grow-{run}-{}", exec_ids.len());
                 exec_ids.push(start_workflow_on(&mut conn, &id).await);
             }
             next_batch += Duration::from_millis(250);
@@ -464,7 +466,9 @@ async fn an_idle_tuned_worker_with_batch_claims_shows_no_slot_in_use() {
         );
     }
 
-    let exec_id = start_workflow(&db_url, "slot-tuner-batch-1").await;
+    // A fresh id, so a second run on one database starts a new workflow.
+    let workflow_id = format!("slot-tuner-batch-{}", uuid::Uuid::new_v4().simple());
+    let exec_id = start_workflow(&db_url, &workflow_id).await;
     wait_for_state(&db_url, exec_id, "COMPLETED").await;
     worker.shutdown();
     worker_task
@@ -499,7 +503,9 @@ async fn tuner_unset_is_inert() {
         worker_ref.run(&pool_for_run).await;
     });
 
-    let exec_id = start_workflow(&db_url, "slot-tuner-inert-1").await;
+    // A fresh id, so a second run on one database starts a new workflow.
+    let workflow_id = format!("slot-tuner-inert-{}", uuid::Uuid::new_v4().simple());
+    let exec_id = start_workflow(&db_url, &workflow_id).await;
     wait_for_state(&db_url, exec_id, "COMPLETED").await;
 
     // Give any (unexpected) tuner loop a few sampler intervals to have fired
