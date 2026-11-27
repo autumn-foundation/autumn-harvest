@@ -196,6 +196,8 @@ mod e2e_bench_support;
 #[cfg(feature = "db")]
 mod entity_state_db_tests;
 mod entity_tests;
+#[cfg(feature = "db")]
+mod event_batch_fire_scan_perf;
 mod event_batch_tests;
 mod event_partitioning_tests;
 mod executor_span_tests;
