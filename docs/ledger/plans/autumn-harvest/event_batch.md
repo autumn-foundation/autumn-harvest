@@ -41,7 +41,7 @@ Statements: 3. Tables with no usable index: none.
 
 | # | Statement | Access |
 |---|---|---|
-| 1 | `SELECT id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, f...` | `harvest_event_batches`: Bitmap Heap Scan on `idx_harvest_event_batches_shard_fire_at` |
+| 1 | `SELECT id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, f...` | `harvest_event_batches`: Index Scan on `idx_harvest_event_batches_fire_at` |
 | 2 | `SELECT id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, start_options, f...` | `harvest_event_batches`: Index Scan on `idx_harvest_event_batches_shard_fire_at` |
 | 3 | `SELECT to_regclass('harvest_event_batches') IS NOT NULL AS present` | no table |
 

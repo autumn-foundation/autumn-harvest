@@ -1,0 +1,39 @@
+-- table: harvest_event_batches, prototype copy
+  rows  | heap_pages 
+--------+------------
+ 100000 |       1809
+(1 row)
+
+Time: 0.222 ms
+Time: 0.162 ms
+Time: 74.285 ms
+-- locks held by the up migration before COMMIT
+       relation        |   mode    | granted 
+-----------------------+-----------+---------
+ harvest_event_batches | ShareLock | t
+(1 row)
+
+-- index after up
+                  index                  | indisvalid | size_bytes 
+-----------------------------------------+------------+------------
+ harvest_event_batches_pkey              | t          |    4399104
+ harvest_event_batches_unique_key        | t          |    4775936
+ idx_harvest_event_batches_fire_at       | t          |     737280
+ idx_harvest_event_batches_shard_fire_at | t          |    1056768
+(4 rows)
+
+-- up again (idempotent, prebuilt index accepted)
+Time: 0.057 ms
+Time: 0.074 ms
+Time: 2.624 ms
+-- locks held by the down migration before COMMIT
+       relation        |        mode         | granted 
+-----------------------+---------------------+---------
+ harvest_event_batches | AccessExclusiveLock | t
+(1 row)
+
+ fire_at_index_left 
+--------------------
+                  0
+(1 row)
+

@@ -384,11 +384,11 @@ async fn fire_edge_arm(t: &Template, with_index: bool) -> Outcome {
 
 /// Drop the tied rows from a fire order, and return them sorted.
 fn split_ties(runs: &[String]) -> (Vec<String>, Vec<String>) {
-    let tied = ["|edge-5|", "|edge-6|", "|edge-7|"];
+    let tied_ids = ["|edge-5|", "|edge-6|", "|edge-7|"];
     let (mut ties, rest): (Vec<String>, Vec<String>) = runs
         .iter()
         .cloned()
-        .partition(|r| tied.iter().any(|t| r.contains(t)));
+        .partition(|r| tied_ids.iter().any(|t| r.contains(t)));
     ties.sort();
     (rest, ties)
 }

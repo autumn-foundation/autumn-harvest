@@ -3207,3 +3207,9 @@ standalone note rather than part of the claim-path attribution table above:
   workflow end paid it. An index on `waiter_exec_id` makes it one probe. At
   100,000 waiter rows, the read takes 1,872 → 6 buffers, and the workload
   takes 55.7% fewer buffers.
+* [`docs/performance-event-batch-fire-scan.md`](performance-event-batch-fire-scan.md)
+  — the unsharded event-batch scanner fires one due batch per transaction.
+  Its read had no index in `fire_at` order, so each fire read and sorted every
+  due row. An index on `fire_at` makes it one probe. At 100,000 open batches,
+  the read takes 1,628 → 11 buffers per fire, and the workload takes 94.7%
+  fewer buffers.

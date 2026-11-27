@@ -21,7 +21,7 @@ driver = "per_tick"
 backend = ["postgres"]
 kind = ["read"]
 tables = ["harvest_event_batches"]
-measured = "unmeasured"
+measured = "docs/performance-event-batch-fire-scan.md"
 plan = "docs/ledger/plans/autumn-harvest/event_batch.md"
 
 ["list_pending_event_batches"]
