@@ -43487,12 +43487,15 @@ impl Worker {
         }
     }
 
-    /// The permits per kind that one claim may hold: its share of the free
-    /// permits, capped at [`WorkerRuntimeConfig::claim_batch_max`]. `1` when
-    /// a claim must take one row.
+    /// The permits per kind that one claim may hold. It is the share of the
+    /// free permits, capped at [`WorkerRuntimeConfig::claim_batch_max`]. It
+    /// then rounds down to a batch size of 2, 4 or 8. It is `1` when a claim
+    /// must take one row.
     ///
     /// Each claim loop takes its share, so one loop does not hold the
-    /// permits of a peer loop across its claim.
+    /// permits of a peer loop across its claim. A batch claims 2, 4 or 8
+    /// rows, so a share of 5 claims 4. The loop then takes 4 permits, not 5.
+    /// A permit that no row can use stays free for the peer loop.
     fn claim_batch_rows(&self, activities_only: bool) -> usize {
         let Some(max) = self.config.claim_batch_max else {
             return 1;
@@ -43514,12 +43517,13 @@ impl Worker {
         };
         let activity =
             Self::free_permits(&self.activity_semaphore, &self.dispatch_reserved_activity);
-        claim_batch_share(
+        let share = claim_batch_share(
             workflow,
             activity,
             self.config.max_concurrent_claims,
             usize::from(max.get()).min(queue::ClaimBatch::Eight.rows()),
-        )
+        );
+        queue::ClaimBatch::at_most(share).map_or(1, queue::ClaimBatch::rows)
     }
 
     /// One batch claim of [`Self::poll_once_as`]. Each claimed row takes one
@@ -61082,9 +61086,16 @@ mod tests {
         let on = |cfg: &mut WorkerRuntimeConfig| cfg.claim_batch_max = std::num::NonZeroU8::new(8);
         assert_eq!(
             build(on).claim_batch_rows(false),
-            5,
-            "half of ten workflow permits"
+            4,
+            "half of ten workflow permits is 5, and a batch of 5 rows claims 4"
         );
+        // A loop holds no permit that its batch cannot use. A share of 3
+        // claims a batch of 2, so the loop takes 2.
+        let six = |cfg: &mut WorkerRuntimeConfig| {
+            cfg.max_concurrent_workflows = 6;
+            cfg.claim_batch_max = std::num::NonZeroU8::new(8);
+        };
+        assert_eq!(build(six).claim_batch_rows(false), 2, "half of six");
         assert_eq!(
             build(on).claim_batch_rows(true),
             8,

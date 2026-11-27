@@ -82,10 +82,10 @@ the entry above serves the claims of one row.
   permits per kind over the claim loops, capped at the default. On a worker
   whose share rarely passes 4, a cap of 8 forms batches no larger than a
   cap of 4 does. It measures the same within noise there. A worker with many
-  free slots forms batches of 8, and it is faster. Most hazards that grow
-  with the cap grow only where batches of 8 form. The permits that a claim
-  holds grow where a share passes 4. The worker has no backlog gate and no
-  slow start.
+  free slots forms batches of 8, and it is faster. The hazards that grow
+  with the cap grow only where batches of 8 form. A loop rounds its share
+  down to 2, 4 or 8 before it takes permits, so it holds no permit that its
+  batch cannot use. The worker has no backlog gate and no slow start.
 - **Switch.** `with_claim_batch_max(1)` keeps one row per claim, and so
   does `0`. `with_claim_batch_max(4)` keeps the smaller cap of 4 rows. A
   value above 8 still claims 8 rows at most, and the field keeps the value

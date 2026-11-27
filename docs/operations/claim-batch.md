@@ -42,8 +42,9 @@ assert_eq!(rows(WorkerConfig::default().with_claim_batch_max(4)), Some(4));
 Each claim loop takes its share of the free permits of each kind that it
 may claim. The share is the free permits over `max_concurrent_claims`,
 rounded up. The batch is the smallest share over those kinds, capped at
-`claim_batch_max`. It then rounds down to 2, 4 or 8. A share under 2 sends
-the single claim.
+`claim_batch_max`. It then rounds down to 2, 4 or 8, before the loop takes
+its permits. So a share of 6 takes 4 permits of each kind and claims 4
+rows. A share under 2 sends the single claim.
 
 A default worker has 20 workflow permits, 50 activity permits and two claim
 loops. Its idle claim loop has a share of 10 rows, so it asks for 8 rows,

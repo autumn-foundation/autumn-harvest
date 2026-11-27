@@ -48,12 +48,12 @@ kind over the claim loops, capped at the default. So the cap changes a
 batch only where a share reaches 8. On a worker whose share rarely passes
 4, a cap of 8 forms batches no larger than a cap of 4 does. It measures the
 same within noise there. On a worker with many free slots it forms batches
-of 8, and it is faster. Most hazards that grow with the cap grow only where
+of 8, and it is faster. The hazards that grow with the cap grow only where
 batches of 8 form. Two of them are the rows that a claim in flight locks
 and the crash strikes of a batch. Two more are the cached batch plans of a
-connection and the burst of one worker. The permits that a claim holds grow
-where a share passes 4. A loop holds its share, up to 8 per kind, and gives
-back the rest after the claim.
+connection and the burst of one worker. A loop rounds its share down to 2,
+4 or 8 before it takes permits. So the permits that a claim holds also grow
+only where batches of 8 form.
 
 The first default was 4. The end-to-end bench worker has 8 workflow
 permits, 16 activity permits and 2 claim loops, so its share never passes
