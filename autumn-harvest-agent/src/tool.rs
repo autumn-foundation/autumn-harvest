@@ -4,6 +4,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use crate::error::AgentError;
 use crate::message::{RunId, SessionId, ToolDefinition};
@@ -55,7 +56,7 @@ impl std::fmt::Display for ToolEffect {
 /// that was in flight at a crash runs again, and the key lets the tool see
 /// that. The step is in the key because a provider can reuse a call id in a
 /// later step.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ToolContext {
     /// The run that made the call.
     pub run_id: RunId,
@@ -71,6 +72,24 @@ pub struct ToolContext {
     /// call, when the call succeeds. A read-only run saves nothing, so a call
     /// that changes the workspace there returns an error (issue #2692).
     pub workspace: Option<WorkspaceHandle>,
+    /// Cancellation of the activity that owns this call.
+    pub cancel: CancellationToken,
+    /// Absolute deadline of the activity attempt, if one is set.
+    pub deadline: Option<std::time::Instant>,
+}
+
+impl Default for ToolContext {
+    fn default() -> Self {
+        Self {
+            run_id: RunId::new(""),
+            call_id: String::new(),
+            session_id: None,
+            step: 0,
+            workspace: None,
+            cancel: CancellationToken::new(),
+            deadline: None,
+        }
+    }
 }
 
 /// A function the agent may call.
@@ -305,6 +324,7 @@ mod tests {
             session_id: None,
             step: 0,
             workspace: None,
+            ..ToolContext::default()
         };
         assert_eq!(tool.execute(json!({}), &ctx).await.unwrap(), json!("r/c"));
         assert_eq!(Tool::effect(&tool), ToolEffect::ReadOnly);

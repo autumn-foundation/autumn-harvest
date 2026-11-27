@@ -1055,7 +1055,7 @@ impl AgentHarness {
         tenant: CacheTenant,
         prepare: impl FnMut(&mut Vec<ContentPart>),
     ) -> Result<ModelTurn, String> {
-        self.model_turn_timed_in(request, tenant, prepare, None, Timestamp::now())
+        self.model_turn_timed_in(request, tenant, prepare, None, Timestamp::now(), None)
             .await
             .map(|(turn, _latency)| turn)
     }
@@ -1072,6 +1072,9 @@ impl AgentHarness {
     ///
     /// `now` is the clock of the runtime. The mesh budget window uses it, so
     /// it agrees with the clock of the ledger rows (issue #2272).
+    ///
+    /// `budget_context` checks run and tenant caps only before a live call,
+    /// never before a free cache hit.
     pub(crate) async fn model_turn_timed_in(
         &self,
         request: ModelTurnRequest,
@@ -1079,6 +1082,7 @@ impl AgentHarness {
         prepare: impl FnMut(&mut Vec<ContentPart>),
         publish: Option<&(dyn Fn(&LiveEvent) + Send + Sync)>,
         now: Timestamp,
+        budget_context: Option<&autumn_harvest::context::ActivityContext>,
     ) -> Result<(ModelTurn, Option<Duration>), String> {
         let span = tracing::info_span!(
             "agent_model_turn",
@@ -1087,7 +1091,7 @@ impl AgentHarness {
         if let Some(agent) = &request.agent {
             span.record("gen_ai.agent.name", agent.as_str());
         }
-        self.model_turn_spanned(request, tenant, prepare, publish, now)
+        self.model_turn_spanned(request, tenant, prepare, publish, now, budget_context)
             .instrument(span)
             .await
     }
@@ -1127,6 +1131,7 @@ impl AgentHarness {
         mut prepare: impl FnMut(&mut Vec<ContentPart>),
         publish: Option<&(dyn Fn(&LiveEvent) + Send + Sync)>,
         now: Timestamp,
+        budget_context: Option<&autumn_harvest::context::ActivityContext>,
     ) -> Result<(ModelTurn, Option<Duration>), String> {
         let live = Live {
             run_id: request.run_id.clone(),
@@ -1135,7 +1140,6 @@ impl AgentHarness {
             sink: self.live.as_deref(),
         };
         let client = self.model(request.model.as_deref())?;
-        self.check_mesh_budget(request.mesh.as_deref(), now).await?;
         let mut request = request;
         let messages = self.window(&mut request).await?;
         let (builtins, tools) = self.turn_tools(&request);
@@ -1170,6 +1174,10 @@ impl AgentHarness {
                     ..response
                 }
             } else {
+                if let Some(ctx) = budget_context {
+                    self.check_budget(|| ctx.check_llm_budget()).await?;
+                }
+                self.check_mesh_budget(request.mesh.as_deref(), now).await?;
                 let started = std::time::Instant::now();
                 let response = if live.is_on() {
                     self.stream_model(client.as_ref(), &chat, &live).await?
@@ -1543,6 +1551,17 @@ impl AgentHarness {
     /// This method returns `Ok` for every tool outcome. The `Result` matches
     /// the activity signature.
     pub async fn tool_call(&self, request: ToolCallRequest) -> Result<ToolOutcome, String> {
+        self.tool_call_with_control(request, tokio_util::sync::CancellationToken::new(), None)
+            .await
+    }
+
+    /// Run a call with the owning activity's cancellation and deadline.
+    pub(crate) async fn tool_call_with_control(
+        &self,
+        request: ToolCallRequest,
+        cancel: tokio_util::sync::CancellationToken,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<ToolOutcome, String> {
         let call = request.call;
         let mut builtins = self.builtins_labelled(
             request.memory_scope.as_ref(),
@@ -1615,6 +1634,8 @@ impl AgentHarness {
             session_id: request.session_id,
             step: request.step,
             workspace: handle.clone(),
+            cancel,
+            deadline,
         };
         let execution = tool.execute(call.arguments, &ctx);
         Ok(

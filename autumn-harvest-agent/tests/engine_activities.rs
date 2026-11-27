@@ -580,6 +580,76 @@ async fn a_cache_hit_records_no_ledger_call() {
 }
 
 #[tokio::test]
+async fn a_cache_hit_at_the_mesh_budget_cap_is_free_but_a_miss_is_refused() {
+    use autumn_harvest_agent::mesh_control::{MESH_BUDGET_EXCEEDED, Spend};
+    use autumn_harvest_agent::{BoxFuture, MeshBudget, MeshSpend};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Debug, Default)]
+    struct SpendSource(AtomicBool);
+
+    impl MeshSpend for SpendSource {
+        fn spent<'a>(
+            &'a self,
+            _mesh: &'a str,
+            _since: autumn_harvest::time::Timestamp,
+        ) -> BoxFuture<'a, Result<Spend, AgentError>> {
+            let spent = self.0.load(Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(if spent {
+                    Spend {
+                        tokens: 3,
+                        cost_usd_micros: 9,
+                    }
+                } else {
+                    Spend::default()
+                })
+            })
+        }
+    }
+
+    for budget in [
+        MeshBudget::daily("support").max_tokens(3),
+        MeshBudget::daily("support").max_cost_usd_micros(9),
+    ] {
+        let model = ScriptedModel::new(vec![answer("cached", 3)]);
+        let spend = Arc::new(SpendSource::default());
+        let store = Arc::new(MemStore::default());
+        let harness = AgentHarness::new(Arc::new(PricedModel(model.clone())))
+            .mesh_budget(budget)
+            .mesh_spend(spend.clone())
+            .response_cache(response_cache(&store));
+        let request = ModelTurnRequest {
+            mesh: Some("support".into()),
+            ..turn_request()
+        };
+        let first = harness.model_turn(request.clone()).await.unwrap();
+        assert_eq!(first.cost_usd_micros, Some(9));
+        spend.0.store(true, Ordering::SeqCst);
+
+        let hit = harness.model_turn(request.clone()).await.unwrap();
+        assert!(hit.cache_hit);
+        assert_eq!(hit.text(), "cached");
+        assert_eq!(hit.usage, TokenUsage::default());
+        assert_eq!(hit.cost_usd_micros, None);
+
+        let miss = ModelTurnRequest {
+            messages: vec![ChatMessage::text(ChatRole::User, "uncached")],
+            ..request
+        };
+        let failure = harness.model_turn(miss).await.unwrap_err();
+        let failure = parse_typed_payload(&failure).unwrap();
+        assert_eq!(failure.error_type, MESH_BUDGET_EXCEEDED);
+        assert!(failure.non_retryable);
+        assert_eq!(
+            model.calls(),
+            1,
+            "a budget refusal must not call the provider"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_model_with_no_name_or_price_records_an_unpriced_unknown_call() {
     let model = ScriptedModel::new(vec![calls(&[], 5)]);
     let ctx = with_harness(AgentHarness::new(model));

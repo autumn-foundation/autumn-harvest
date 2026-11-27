@@ -313,6 +313,7 @@ mod tests {
             session_id: None,
             step: 0,
             workspace: None,
+            ..ToolContext::default()
         };
         let ran = futures::executor::block_on(SkillTool.execute(json!({}), &ctx));
         assert!(ran.is_err());

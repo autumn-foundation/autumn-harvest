@@ -422,6 +422,62 @@ impl SqliteReader {
         crate::llm_ledger::rows_between(&self.conn, from, until)
     }
 
+    /// Sum ledger spend for executions with a matching search attribute.
+    ///
+    /// Rows at or after `since` count, with no upper time bound. Missing ledger
+    /// tables and missing search attributes contribute no spend. Totals
+    /// saturate at the largest signed 64-bit integer, as on Postgres.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the filter is invalid or the query fails.
+    pub fn llm_ledger_spend_for_search_attr(
+        &self,
+        key: &str,
+        value: &Value,
+        since: Timestamp,
+    ) -> SqliteResult<autumn_harvest::llm_ledger::LedgerTotal> {
+        let mut params = Vec::new();
+        let attr = search_attr_term(&mut params, "e.search_attrs", key, value)?;
+        if !crate::llm_ledger::table_exists(&self.conn)?
+            || !present_columns(&self.conn)?.contains(&"search_attrs")
+        {
+            return Ok(autumn_harvest::llm_ledger::LedgerTotal::default());
+        }
+
+        // Ledger timestamps have millisecond precision. Round up so a
+        // fractional millisecond does not include an earlier stored row.
+        let nanos = since.as_nanosecond();
+        let millis = nanos.div_euclid(1_000_000) + i128::from(nanos.rem_euclid(1_000_000) != 0);
+        let time = bind(
+            &mut params,
+            Param::Integer(i64::try_from(millis).unwrap_or(i64::MAX)),
+        );
+        // Splitting each value before summing avoids SQLite's integer SUM
+        // overflow for totals above i64::MAX, without floating-point rounding.
+        let sql = format!(
+            "SELECT COALESCE(SUM((l.input_tokens + l.output_tokens) / 1000000), 0), \
+                    COALESCE(SUM((l.input_tokens + l.output_tokens) % 1000000), 0), \
+                    COALESCE(SUM(l.cost_usd_micros / 1000000), 0), \
+                    COALESCE(SUM(l.cost_usd_micros % 1000000), 0) \
+             FROM harvest_llm_ledger l JOIN harvest_executions e ON e.exec_id = l.exec_id \
+             WHERE {attr} AND l.recorded_at >= {time}"
+        );
+        let mut statement = self.conn.prepare(&sql)?;
+        let bound: Vec<&dyn ToSql> = params.iter().map(|p| p as &dyn ToSql).collect();
+        let (token_whole, token_rem, cost_whole, cost_rem): (i64, i64, i64, i64) = statement
+            .query_row(bound.as_slice(), |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?;
+        let total = |whole: i64, rem: i64| {
+            u64::try_from(whole.saturating_mul(1_000_000).saturating_add(rem)).unwrap_or(0)
+        };
+        Ok(autumn_harvest::llm_ledger::LedgerTotal {
+            tokens: total(token_whole, token_rem),
+            cost_usd_micros: total(cost_whole, cost_rem),
+        })
+    }
+
     /// Every stored schedule, by workflow name (issue #2471). See
     /// [`SqliteRuntime::list_schedules`](crate::SqliteRuntime::list_schedules).
     ///

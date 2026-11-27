@@ -3608,7 +3608,6 @@ pub async fn agent_model_turn(
     request: ModelTurnRequest,
 ) -> Result<ModelTurn, String> {
     let harness = harness(ctx)?;
-    harness.check_budget(|| ctx.check_llm_budget()).await?;
     let tenant = cache_tenant(ctx, harness, &request).await;
     let model = request.model.clone();
     // Live text goes to the progress channel of the run. Nothing is stored.
@@ -3624,6 +3623,7 @@ pub async fn agent_model_turn(
             |_content| {},
             Some(&publish),
             autumn_harvest::time::Timestamp::now(),
+            Some(ctx),
         )
         .await?;
     if let Some(latency) = latency {
@@ -3725,7 +3725,25 @@ pub async fn agent_tool_call(
     ctx: &ActivityContext,
     request: ToolCallRequest,
 ) -> Result<ToolOutcome, String> {
-    harness(ctx)?.tool_call(request).await
+    let now = std::time::Instant::now();
+    let deadline = ctx.time_remaining().and_then(|left| now.checked_add(left));
+    let cancel = tokio_util::sync::CancellationToken::new();
+    if ctx.is_cancelled() {
+        cancel.cancel();
+    }
+    let _heartbeat = ctx.start_auto_heartbeat_default().ok();
+    let call = harness(ctx)?.tool_call_with_control(request, cancel.clone(), deadline);
+    tokio::pin!(call);
+    loop {
+        tokio::select! {
+            result = &mut call => return result,
+            () = tokio::time::sleep(Duration::from_millis(100)) => {
+                if ctx.is_cancelled() {
+                    cancel.cancel();
+                }
+            }
+        }
+    }
 }
 
 /// The memory snapshot of one segment, as an activity.

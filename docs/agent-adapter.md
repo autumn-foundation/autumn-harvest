@@ -679,8 +679,9 @@ count the whole prompt, cached tokens included. Some providers report the
 cached tokens apart, so add them to `input_tokens` in your `AgentModel`.
 
 A response cache hit calls no model. It spends no tokens and records no
-row. The budget check still runs before the cache lookup, so a spent cap
-refuses a turn that the cache could answer.
+row, so it can answer even when a run, tenant or mesh budget is spent.
+The budget checks run only before a live model call, including a fallback
+when a cached turn exceeds the result cap.
 
 A failed spend read retries the turn, and uses one of its four attempts.
 The turn calls no model before the check passes, so the retry pays nothing.
