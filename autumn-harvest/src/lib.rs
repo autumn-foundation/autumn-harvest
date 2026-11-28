@@ -269,6 +269,8 @@ pub mod chaos;
 /// Per-activity circuit breaker that stops dispatch during downstream
 /// outages (issues #369, #1809).
 pub mod circuit_breaker;
+/// Circuit breaker outage forecast: trips, probes and the recovery lag.
+pub mod circuit_forecast;
 /// Payload-codec key rotation and the lazy re-encryption sweep (issue #948).
 ///
 /// Home of **sanctioned in-place mutation exception #3** — see the module docs
