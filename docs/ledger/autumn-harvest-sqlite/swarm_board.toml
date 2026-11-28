@@ -1,0 +1,120 @@
+# Ledger profiles for `autumn-harvest-sqlite/src/swarm_board.rs`. See `docs/ledger/README.md`.
+
+["SqliteSwarmBoard::append_post"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read", "write"]
+tables = ["harvest_swarm_counters", "harvest_swarm_posts"]
+measured = "unmeasured"
+
+["SqliteSwarmBoard::commit_merge"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_swarm_counters", "harvest_swarm_items", "harvest_swarm_mains", "harvest_swarm_merges"]
+measured = "unmeasured"
+
+["SqliteSwarmBoard::count_held"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_swarm_items"]
+measured = "unmeasured"
+
+["SqliteSwarmBoard::insert_item"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_swarm_items"]
+measured = "unmeasured"
+
+["SqliteSwarmBoard::item"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_swarm_items"]
+measured = "unmeasured"
+
+["SqliteSwarmBoard::items"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_swarm_items"]
+measured = "unmeasured"
+
+["SqliteSwarmBoard::merges"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_swarm_merges"]
+measured = "unmeasured"
+
+["SqliteSwarmBoard::posts"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_swarm_posts"]
+measured = "unmeasured"
+
+["SqliteSwarmBoard::prepare"]
+driver = "setup"
+backend = ["sqlite"]
+kind = ["read"]
+tables = []
+measured = "unmeasured"
+
+["SqliteSwarmBoard::seed_main"]
+driver = "setup"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_swarm_mains"]
+measured = "unmeasured"
+
+["apply_schema"]
+driver = "setup"
+backend = ["sqlite"]
+kind = ["ddl", "read"]
+tables = ["harvest_swarm_counters", "harvest_swarm_items", "harvest_swarm_mains", "harvest_swarm_merges", "harvest_swarm_posts"]
+measured = "unmeasured"
+
+["bump"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read", "write"]
+tables = ["harvest_swarm_counters"]
+measured = "unmeasured"
+
+["insert_merge_in"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read", "write"]
+tables = ["harvest_swarm_merges"]
+measured = "unmeasured"
+
+["main_in"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_swarm_mains"]
+measured = "unmeasured"
+
+["merge_by_key_in"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_swarm_merges"]
+measured = "unmeasured"
+
+["post_by_key"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["read"]
+tables = ["harvest_swarm_posts"]
+measured = "unmeasured"
+
+["swap_in"]
+driver = "per_request"
+backend = ["sqlite"]
+kind = ["write"]
+tables = ["harvest_swarm_items"]
+measured = "unmeasured"

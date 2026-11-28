@@ -855,6 +855,7 @@ mod runtime;
 mod schedule;
 mod schema;
 mod store;
+mod swarm_board;
 mod update;
 mod visibility;
 mod wake;
@@ -900,6 +901,8 @@ pub use crate::runtime::{
 };
 pub use crate::schedule::{ScheduleOverride, ScheduleSummary, ScheduleTrigger};
 pub use crate::store::ActivityAttempt;
+#[doc(hidden)]
+pub use crate::swarm_board::SqliteSwarmBoard;
 pub use crate::visibility::{
     DEFAULT_LIST_LIMIT, ExecutionDescription, ExecutionFilter, ExecutionPage, ExecutionSummary,
     ListCursor, MAX_FILTER_TERMS, MAX_LIST_LIMIT, SqliteReader, Stored,

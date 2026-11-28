@@ -687,6 +687,8 @@ pub mod signal;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod store;
+/// The rows of the board of an agent swarm (issue #2814).
+pub mod swarm_board;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod timeout;

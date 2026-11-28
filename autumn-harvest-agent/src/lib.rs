@@ -37,7 +37,9 @@
 //!
 //! The [`mesh`] module lets a run delegate a task to a [`Peer`]. A
 //! [`Mandate`] bounds the delegation tree. The [`flow`] module gates a
-//! dangerous sequence of tool calls with [`FlowRules`].
+//! dangerous sequence of tool calls with [`FlowRules`]. The [`swarm`]
+//! module runs many durable agents as flat peers on one board (issue
+//! #2814). Its merge gate takes a change only when it beats main.
 //!
 //! The crate depends on the core engine only, with no default features. It
 //! has no Autumn plugin dependency.
@@ -135,6 +137,7 @@ pub mod skill;
 pub mod sqlite;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub mod stores;
+pub mod swarm;
 pub mod sweep_tool;
 pub mod tool;
 pub mod transcript;
@@ -249,7 +252,7 @@ pub use workspace::{
     WorkspaceHandle, WorkspaceMount, WorkspaceRef, WorkspaceStore,
 };
 
-/// Compiles each Rust fence in the two agent guides as a doctest (issue #2482).
+/// Compiles each Rust fence in the agent guides as a doctest (issue #2482).
 ///
 /// A fence that drifts from the public API fails `cargo test --doc`. Each
 /// fence must compile, so a reader can copy it as written. The guard suite
@@ -269,4 +272,7 @@ mod guide_snippets {
 
     #[doc = include_str!("../../docs/agent-mesh.md")]
     struct AgentMeshGuide;
+
+    #[doc = include_str!("../../docs/agent-swarm.md")]
+    struct AgentSwarmGuide;
 }

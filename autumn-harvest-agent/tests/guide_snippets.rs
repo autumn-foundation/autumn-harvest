@@ -1,7 +1,8 @@
-//! Guards the doctest harness of the two agent guides (issue #2482).
+//! Guards the doctest harness of the agent guides (issue #2482).
 //!
 //! The harness is `guide_snippets` in `src/lib.rs`. It compiles each Rust
-//! fence of `docs/agent-adapter.md` and `docs/agent-mesh.md`. These guards
+//! fence of `docs/agent-adapter.md`, `docs/agent-mesh.md` and
+//! `docs/agent-swarm.md`. These guards
 //! fail when a fence escapes the harness, when the harness goes away, or
 //! when the CI step stops running it.
 
@@ -9,9 +10,10 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// The guides that the harness compiles, with the item that includes each.
-const GUIDES: [(&str, &str); 2] = [
+const GUIDES: [(&str, &str); 3] = [
     ("docs/agent-adapter.md", "struct AgentAdapterGuide;"),
     ("docs/agent-mesh.md", "struct AgentMeshGuide;"),
+    ("docs/agent-swarm.md", "struct AgentSwarmGuide;"),
 ];
 
 /// The doctest filter of the CI step. It is the name of the harness module.

@@ -197,7 +197,15 @@ name = "agent_workspace"
 required-features = ["sqlite"]
 
 [[test]]
+name = "swarm"
+required-features = ["sqlite"]
+
+[[test]]
 name = "overlay_store_postgres"
+required-features = ["postgres"]
+
+[[test]]
+name = "swarm_store_postgres"
 required-features = ["postgres"]
 
 [[test]]

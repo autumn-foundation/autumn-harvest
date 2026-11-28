@@ -234,6 +234,18 @@ resolved ceilings of the recorded read. Only `auto_adopt` writes an
 `auto` actor, and the store enforces the stricter of the run policy and
 its current policy. The SQLite store has the same guards.
 
+### The swarm logs are append-only (issue #2814)
+
+A swarm member reads the posts of its board after a cursor, and the merge
+log is the audit of each gate verdict. So a post and a verdict never change.
+Do not add code that updates `harvest_swarm_posts` or
+`harvest_swarm_merges`. The trigger `harvest_swarm_guard_immutable` refuses
+each `UPDATE` on Postgres. The SQLite board has the same guards, and also
+refuses `INSERT OR REPLACE`. A post and a verdict take their `seq` under
+the lock of their `harvest_swarm_counters` row, so a cursor never skips one.
+Keep that lock in each new writer. A claim fence compares holder and epoch,
+never the lease end, as the decision owner fence does.
+
 ### Decision owner fence (issue #2249)
 
 [ADR 0009](docs/adr/0009-decision-owner.md) defines owner mode. Issue #2251

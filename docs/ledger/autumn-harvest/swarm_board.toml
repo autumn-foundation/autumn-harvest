@@ -1,0 +1,113 @@
+# Ledger profiles for `autumn-harvest/src/swarm_board.rs`. See `docs/ledger/README.md`.
+
+["pg::append_swarm_post"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_swarm_counters", "harvest_swarm_posts"]
+measured = "unmeasured"
+
+["pg::commit_swarm_merge"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_swarm_counters", "harvest_swarm_items", "harvest_swarm_mains", "harvest_swarm_merges"]
+measured = "unmeasured"
+
+["pg::count_swarm_held"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_swarm_items"]
+measured = "unmeasured"
+
+["pg::insert_merge"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read", "write"]
+tables = ["harvest_swarm_counters", "harvest_swarm_merges"]
+measured = "unmeasured"
+
+["pg::insert_swarm_item"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_swarm_items"]
+measured = "unmeasured"
+
+["pg::lock_main"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_swarm_mains"]
+measured = "unmeasured"
+
+["pg::move_main"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_swarm_mains"]
+measured = "unmeasured"
+
+["pg::post_by_key"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_swarm_posts"]
+measured = "unmeasured"
+
+["pg::seed_swarm_main"]
+driver = "setup"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_swarm_mains"]
+measured = "unmeasured"
+
+["pg::swap_swarm_item"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["write"]
+tables = ["harvest_swarm_items"]
+measured = "unmeasured"
+
+["pg::swarm_item"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_swarm_items"]
+measured = "unmeasured"
+
+["pg::swarm_items"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_swarm_items"]
+measured = "unmeasured"
+
+["pg::swarm_main"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_swarm_mains"]
+measured = "unmeasured"
+
+["pg::swarm_merge_by_key"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_swarm_merges"]
+measured = "unmeasured"
+
+["pg::swarm_merges"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_swarm_merges"]
+measured = "unmeasured"
+
+["pg::swarm_posts"]
+driver = "per_request"
+backend = ["postgres"]
+kind = ["read"]
+tables = ["harvest_swarm_posts"]
+measured = "unmeasured"
