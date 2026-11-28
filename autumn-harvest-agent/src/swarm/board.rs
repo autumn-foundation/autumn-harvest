@@ -477,7 +477,9 @@ impl Swarm {
     /// A take checks out the current main and records it as the base. A
     /// member that already holds the item keeps its epoch. Its lease is
     /// renewed, and its base is checked out again. So a claim that runs
-    /// again after a crash leaves the same files.
+    /// again after a crash leaves the same files. A take counts the items of
+    /// the member again after its write. A take that sees the cap broken
+    /// gives its item back and returns [`ClaimRefusal::AtCap`].
     ///
     /// # Errors
     ///
@@ -542,6 +544,21 @@ impl Swarm {
                 }
             };
             if self.store.swap_item(self.name(), row.rev, &next).await? {
+                let took = !(mine && status == ItemStatus::Claimed);
+                if took && self.over_cap(member).await? {
+                    // Another take by the same member landed after the
+                    // count. The take that sees the cap broken gives its
+                    // item back. Each racing take does so, so the member
+                    // never keeps more than the cap.
+                    // A fence refusal means that the item already left the
+                    // member, which keeps the cap too.
+                    let _released = self.release(member, item, next.epoch).await?;
+                    let item = self.require_item(item).await?;
+                    return Ok(ClaimOutcome::Refused {
+                        refusal: ClaimRefusal::AtCap,
+                        item,
+                    });
+                }
                 self.check_out(workspace, &base)?;
                 let stored = ItemRow {
                     rev: row.rev.saturating_add(1),
@@ -555,6 +572,12 @@ impl Swarm {
             }
         }
         Err(SwarmError::Contended(format!("item {item}")))
+    }
+
+    /// Whether `member` holds more items than the cap, after a take.
+    async fn over_cap(&self, member: &str) -> Result<bool, SwarmError> {
+        let held = self.store.count_held(self.name(), member).await?;
+        Ok(held > u64::from(self.policy.claim_cap()))
     }
 
     /// Run `change` on `item` when the fence passes for `member` at
@@ -831,17 +854,29 @@ impl Swarm {
         )))
     }
 
-    /// After a merge, check the merged files out into `workspace`.
+    /// After a merge, check the current main out into `workspace`.
+    ///
+    /// The current main holds the merge, because each later merge keeps
+    /// each change of main. A prune can delete the snapshot of an older
+    /// verdict, so a replayed verdict never loads it. A prune can also move
+    /// past the main that a read saw, so the read tries again.
     async fn check_out_verdict(
         &self,
         verdict: &MergeRow,
         workspace: &mut Workspace,
     ) -> Result<(), SwarmError> {
-        if let Some(snapshot) = &verdict.snapshot {
-            let files = self.load(&parse_ref(snapshot)?).await?;
-            self.check_out(workspace, &files)?;
+        if verdict.merged_version.is_none() {
+            return Ok(());
         }
-        Ok(())
+        let mut last = None;
+        for _ in 0..MAX_SWAPS {
+            match self.main_files().await {
+                Ok((_, files)) => return self.check_out(workspace, &files),
+                Err(err @ SwarmError::Workspace(_)) => last = Some(err),
+                Err(err) => return Err(err),
+            }
+        }
+        Err(last.unwrap_or_else(|| SwarmError::Contended("main".to_owned())))
     }
 
     /// Delete the main snapshots that nothing needs. Returns the count.

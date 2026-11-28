@@ -87,6 +87,8 @@ recorded payload changes, so every old history replays the same.
 | R12 | A prune deletes the base of a live claim. | A prune keeps the base of each claimed item. A suite case submits from such a base. |
 | R13 | A name injects text into a scope or a key. | Swarm, item, lane and channel names have 1 to 64 characters from `a-z`, `0-9`, `_` and `-`. A member id has no control character. |
 | R14 | A long eval blocks a worker. | The tool timeout bounds the call. The guide says to run a long eval in a service. |
+| R15 | Two concurrent takes by one member both pass the cap, because each counts before the other writes. | A take counts again after its write. A take that sees the cap broken releases its item and returns `at_cap`. Each racing take does so, so the member keeps no more than the cap. `a_raced_take_over_the_cap_gives_its_item_back` (Codex review on #2815). |
+| R16 | A prune deletes the snapshot of a merge, and a replay of its verdict then fails. | A replayed or fresh merge checks out the current main, which holds the merge. `gate_prune_keeps_live_bases` replays a pruned merge (Codex review on #2815). |
 
 ### 0.4 Decisions
 
@@ -126,7 +128,8 @@ recorded payload changes, so every old history replays the same.
 | AC7 | Posts and verdicts are append-only, and a cursor skips none. | `sqlite_refuses_a_rewrite_of_a_post_or_a_verdict`, `postgres_refuses_a_rewrite_of_a_post_or_a_verdict`, `concurrent_posts_take_distinct_seq_values` |
 | AC8 | The scores stay hidden unless the operator reveals them. | `the_tools_run_a_claim_to_a_merge_and_hide_the_scores`, `an_operator_can_reveal_the_scores` |
 | AC9 | Two durable agents share one board and one gate on SQLite. | `two_durable_agents_share_a_board_and_the_gate` |
-| AC10 | A prune keeps the live bases and the snapshots a gate can commit. | `gate_prune_keeps_live_bases` |
+| AC10 | A prune keeps the live bases and the snapshots a gate can commit, and a replay after a prune works. | `gate_prune_keeps_live_bases` |
+| AC11 | A member never keeps more items than the cap, also under a race. | `a_raced_take_over_the_cap_gives_its_item_back` |
 
 ## 2. Tests
 

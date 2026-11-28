@@ -788,6 +788,23 @@ async fn gate_prune_keeps_live_bases(store: &Store) {
         keys.iter()
             .any(|key| key.starts_with(&format!("{:016x}", 3)))
     );
+    let mut replay = Workspace::default();
+    let first = fx
+        .swarm
+        .submit("coder/c1", "one", 1, "p1", &mut replay)
+        .await
+        .unwrap();
+    assert_eq!(
+        first.verdict,
+        Verdict::Merged.as_str(),
+        "a replay after a prune works"
+    );
+    assert_eq!(text(&replay, "a").as_deref(), Some("good"));
+    assert_eq!(
+        text(&replay, "b").as_deref(),
+        Some("good"),
+        "a replay checks out the current main"
+    );
     ws3.write("c", "good").unwrap();
     let row = fx
         .swarm

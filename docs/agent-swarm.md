@@ -141,7 +141,7 @@ the eval hidden: a member that sees the eval fits its work to the eval.
 | Field | Default | Meaning |
 |---|---|---|
 | `lease` | 30 minutes | How long a claim holds without a renew. |
-| `max_claims` | 1 | How many items one member holds at a time. |
+| `max_claims` | 1 | How many items one member holds at a time. A take that finds the cap broken after its write, by a concurrent take of the same member, gives its item back with `at_cap`. |
 | `bar` | `Bar::Improve { margin: 0 }` | A merge must beat main by more than `margin` score units. `Bar::NoRegression` takes a tie. |
 | `reveal_scores` | `false` | Whether a verdict shows the scores to the member. |
 | `root` | empty | The workspace folder that holds the files of main. Empty is the whole workspace. |
@@ -188,7 +188,9 @@ A submit runs these steps:
    gate merges again onto the newer main and scores again. After
    `max_attempts` it logs `contended`.
 
-A merge checks the new main out into the workspace of the member. A
+A merge checks the current main out into the workspace of the member. A
+replayed verdict does the same. The current main holds the merge, so a
+replay works after `Swarm::prune` deleted the snapshot of the merge. A
 `rejected` or `conflict` verdict keeps the claim and the files, so the member
 can improve its change and submit again.
 

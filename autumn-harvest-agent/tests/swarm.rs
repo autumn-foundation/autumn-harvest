@@ -16,12 +16,14 @@ use std::sync::Arc;
 
 use autumn_harvest::payload_codec::PayloadCodecs;
 use autumn_harvest_agent::swarm::{
-    BOARD_TOOL, CLAIM_TOOL, InMemorySwarmStore, NewItem, POST_TOOL, RELEASE_TOOL, RENEW_TOOL,
-    SUBMIT_TOOL, SqliteSwarmStore, Swarm, SwarmId, SwarmPolicy, SwarmTools,
+    BOARD_TOOL, CLAIM_TOOL, ClaimOutcome, ClaimRefusal, CommitOutcome, InMemorySwarmStore,
+    ItemQuery, ItemRow, MainRow, MergeCommit, MergeRow, NewItem, NewPost, POST_TOOL, PostRow,
+    RELEASE_TOOL, RENEW_TOOL, SUBMIT_TOOL, SqliteSwarmStore, Swarm, SwarmError, SwarmId,
+    SwarmPolicy, SwarmStore, SwarmTools,
 };
 use autumn_harvest_agent::{
-    AgentHarness, AgentId, AgentOp, AgentProfile, AgentState, ChatRole, ContentPart, FnTool,
-    InMemoryWorkspaceBlobs, RunId, SessionId, Tool, ToolContext, ToolEffect, Workspace,
+    AgentHarness, AgentId, AgentOp, AgentProfile, AgentState, BoxFuture, ChatRole, ContentPart,
+    FnTool, InMemoryWorkspaceBlobs, RunId, SessionId, Tool, ToolContext, ToolEffect, Workspace,
     WorkspaceHandle, WorkspaceStore, sqlite,
 };
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
@@ -413,4 +415,169 @@ async fn two_durable_agents_share_a_board_and_the_gate() {
     );
     let posts = shared.posts(Some("answers"), 0, 10).await.unwrap();
     assert_eq!(posts[0].author, "coder/bob");
+}
+
+/// A store that lands a second take by the same member after the count of
+/// a claim, as a concurrent claim would.
+#[derive(Debug, Default)]
+struct RacingStore {
+    inner: InMemorySwarmStore,
+    raced: std::sync::atomic::AtomicBool,
+}
+
+impl SwarmStore for RacingStore {
+    fn seed_main<'a>(
+        &'a self,
+        s: &'a str,
+        m: &'a MainRow,
+    ) -> BoxFuture<'a, Result<bool, SwarmError>> {
+        self.inner.seed_main(s, m)
+    }
+
+    fn main<'a>(&'a self, s: &'a str) -> BoxFuture<'a, Result<Option<MainRow>, SwarmError>> {
+        self.inner.main(s)
+    }
+
+    fn insert_item<'a>(
+        &'a self,
+        s: &'a str,
+        r: &'a ItemRow,
+    ) -> BoxFuture<'a, Result<bool, SwarmError>> {
+        self.inner.insert_item(s, r)
+    }
+
+    fn item<'a>(
+        &'a self,
+        s: &'a str,
+        i: &'a str,
+    ) -> BoxFuture<'a, Result<Option<ItemRow>, SwarmError>> {
+        self.inner.item(s, i)
+    }
+
+    fn items<'a>(
+        &'a self,
+        s: &'a str,
+        q: ItemQuery<'a>,
+    ) -> BoxFuture<'a, Result<Vec<ItemRow>, SwarmError>> {
+        self.inner.items(s, q)
+    }
+
+    fn count_held<'a>(
+        &'a self,
+        s: &'a str,
+        holder: &'a str,
+    ) -> BoxFuture<'a, Result<u64, SwarmError>> {
+        Box::pin(async move {
+            let held = self.inner.count_held(s, holder).await?;
+            if !self.raced.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let row = self.inner.item(s, "two").await?.unwrap();
+                let taken = ItemRow {
+                    status: "claimed".to_owned(),
+                    holder: Some(holder.to_owned()),
+                    epoch: 1,
+                    lease_until_ms: i64::MAX,
+                    ..row.clone()
+                };
+                assert!(self.inner.swap_item(s, row.rev, &taken).await?);
+            }
+            Ok(held)
+        })
+    }
+
+    fn swap_item<'a>(
+        &'a self,
+        s: &'a str,
+        rev: u64,
+        n: &'a ItemRow,
+    ) -> BoxFuture<'a, Result<bool, SwarmError>> {
+        self.inner.swap_item(s, rev, n)
+    }
+
+    fn append_post<'a>(
+        &'a self,
+        s: &'a str,
+        p: NewPost<'a>,
+    ) -> BoxFuture<'a, Result<PostRow, SwarmError>> {
+        self.inner.append_post(s, p)
+    }
+
+    fn posts<'a>(
+        &'a self,
+        s: &'a str,
+        channel: Option<&'a str>,
+        after: u64,
+        limit: u32,
+    ) -> BoxFuture<'a, Result<Vec<PostRow>, SwarmError>> {
+        self.inner.posts(s, channel, after, limit)
+    }
+
+    fn record_verdict<'a>(
+        &'a self,
+        s: &'a str,
+        r: &'a MergeRow,
+    ) -> BoxFuture<'a, Result<MergeRow, SwarmError>> {
+        self.inner.record_verdict(s, r)
+    }
+
+    fn merge_by_key<'a>(
+        &'a self,
+        s: &'a str,
+        k: &'a str,
+    ) -> BoxFuture<'a, Result<Option<MergeRow>, SwarmError>> {
+        self.inner.merge_by_key(s, k)
+    }
+
+    fn merges<'a>(
+        &'a self,
+        s: &'a str,
+        after: u64,
+        limit: u32,
+    ) -> BoxFuture<'a, Result<Vec<MergeRow>, SwarmError>> {
+        self.inner.merges(s, after, limit)
+    }
+
+    fn commit_merge<'a>(
+        &'a self,
+        s: &'a str,
+        c: &'a MergeCommit,
+    ) -> BoxFuture<'a, Result<CommitOutcome, SwarmError>> {
+        self.inner.commit_merge(s, c)
+    }
+}
+
+/// Regression: two takes by one member that race past the count keep no
+/// more than the cap. The take that sees the cap broken gives its item back.
+#[tokio::test]
+async fn a_raced_take_over_the_cap_gives_its_item_back() {
+    let store = Arc::new(RacingStore::default());
+    let workspaces = Arc::new(WorkspaceStore::new(
+        Arc::new(InMemoryWorkspaceBlobs::default()),
+        PayloadCodecs::default(),
+    ));
+    let shared = Swarm::new(
+        SwarmId::new("race").unwrap(),
+        store.clone(),
+        workspaces,
+        Arc::new(CountJudge::default()),
+    );
+    shared.seed(&files(&[("a.txt", "plain")])).await.unwrap();
+    for id in ["one", "two"] {
+        shared
+            .add_item(&NewItem::new(id, "answers", "t", "b"), "ops")
+            .await
+            .unwrap();
+    }
+    let mut ws = Workspace::default();
+    let outcome = shared.claim("coder/c1", "one", &mut ws).await.unwrap();
+    let ClaimOutcome::Refused { refusal, item } = outcome else {
+        panic!("the raced take must give its item back, got {outcome:?}");
+    };
+    assert_eq!(refusal, ClaimRefusal::AtCap);
+    assert_eq!((item.status.as_str(), item.epoch), ("open", 1));
+    assert_eq!(
+        ws,
+        Workspace::default(),
+        "a refused take checks out nothing"
+    );
+    assert_eq!(store.inner.count_held("race", "coder/c1").await.unwrap(), 1);
 }
