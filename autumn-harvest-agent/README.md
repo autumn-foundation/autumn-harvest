@@ -37,6 +37,12 @@ and budget (issue #2269). A mandate bounds the delegation tree, and flow rules
 gate a dangerous sequence of tool calls. See
 [`docs/agent-mesh.md`](../docs/agent-mesh.md).
 
+Many durable agents can also work on one goal as flat peers (issue #2814).
+The `swarm` module gives them a shared board, claims fenced by an epoch, and a
+merge gate. The gate takes a change into the shared main only when it beats
+main on an eval that the agents never see. See
+[`docs/agent-swarm.md`](../docs/agent-swarm.md).
+
 A crash costs at most the one step that was in flight. The crate depends on
 the core engine only. It has no Autumn plugin and no `autumn-web` dependency.
 An app implements `AgentModel` for its provider.
