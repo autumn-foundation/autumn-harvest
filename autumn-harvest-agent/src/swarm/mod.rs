@@ -86,6 +86,9 @@ pub const DEFAULT_LEASE: Duration = Duration::from_mins(30);
 /// the first follows a merge of another member.
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 8;
 
+/// The default grace of a prune: 15 minutes. The tool timeout is 10.
+pub const DEFAULT_PRUNE_GRACE: Duration = Duration::from_mins(15);
+
 /// The prefix of the workspace scope of the main snapshots of a swarm.
 pub const MAIN_SCOPE_PREFIX: &str = "swarm:";
 
@@ -244,6 +247,10 @@ pub struct SwarmPolicy {
     pub root: String,
     /// The most merge attempts of one submit. 0 counts as 1.
     pub max_attempts: u32,
+    /// How long a newer main must hold before a prune deletes an older
+    /// snapshot. Keep it longer than the tool timeout, so a claim in flight
+    /// writes its base before a prune can delete it.
+    pub prune_grace: Duration,
 }
 
 impl Default for SwarmPolicy {
@@ -255,6 +262,7 @@ impl Default for SwarmPolicy {
             reveal_scores: false,
             root: String::new(),
             max_attempts: DEFAULT_MAX_ATTEMPTS,
+            prune_grace: DEFAULT_PRUNE_GRACE,
         }
     }
 }

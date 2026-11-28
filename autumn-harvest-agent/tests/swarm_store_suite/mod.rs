@@ -53,6 +53,7 @@ pub async fn run_all(store: &Store) {
     gate_logs_a_judge_failure(store).await;
     gate_closed_items_refuse(store).await;
     gate_prune_keeps_live_bases(store).await;
+    gate_keep_heals_a_lost_base(store).await;
     gate_posts_read_after_a_cursor(store).await;
 }
 
@@ -776,6 +777,12 @@ async fn gate_prune_keeps_live_bases(store: &Store) {
     assert_eq!(fx.blobs.list(&scope).await.unwrap().len(), 3);
     assert_eq!(
         fx.swarm.prune().await.unwrap(),
+        0,
+        "a claim in flight can still name each version inside the grace"
+    );
+    fx.clock.advance(SignedDuration::from_mins(16));
+    assert_eq!(
+        fx.swarm.prune().await.unwrap(),
         1,
         "only version 2 is unused"
     );
@@ -816,6 +823,46 @@ async fn gate_prune_keeps_live_bases(store: &Store) {
         Verdict::Merged.as_str(),
         "the base of a live claim stays"
     );
+}
+
+async fn gate_keep_heals_a_lost_base(store: &Store) {
+    use autumn_harvest_agent::WorkspaceBlobs as _;
+
+    let fx = fixture(store, SwarmPolicy::default(), &[("a", "plain")]).await;
+    let scope = fx.swarm.id().main_scope();
+    add(&fx, "four").await;
+    add(&fx, "five").await;
+    let (mut ws4, mut ws5) = (Workspace::default(), Workspace::default());
+    let four = claimed(fx.swarm.claim("coder/c4", "four", &mut ws4).await.unwrap());
+    claimed(fx.swarm.claim("coder/c5", "five", &mut ws5).await.unwrap());
+    ws5.write("d", "good").unwrap();
+    fx.swarm
+        .submit("coder/c5", "five", 1, "p5", &mut ws5)
+        .await
+        .unwrap();
+    let base_key = fx
+        .blobs
+        .list(&scope)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|key| key.starts_with(&format!("{:016x}", four.base_version)))
+        .unwrap();
+    assert!(
+        fx.blobs.delete(&scope, &base_key).await.unwrap(),
+        "a late delete of the base"
+    );
+    let ClaimOutcome::Kept(healed) = fx.swarm.claim("coder/c4", "four", &mut ws4).await.unwrap()
+    else {
+        panic!("the holder keeps its claim");
+    };
+    let main = fx.swarm.main().await.unwrap().unwrap();
+    assert_eq!(
+        (healed.epoch, healed.base_version),
+        (four.epoch, main.version),
+        "a keep with a lost base takes the current main"
+    );
+    assert_eq!(text(&ws4, "d").as_deref(), Some("good"));
 }
 
 async fn gate_posts_read_after_a_cursor(store: &Store) {

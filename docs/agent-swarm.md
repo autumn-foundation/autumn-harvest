@@ -146,6 +146,7 @@ the eval hidden: a member that sees the eval fits its work to the eval.
 | `reveal_scores` | `false` | Whether a verdict shows the scores to the member. |
 | `root` | empty | The workspace folder that holds the files of main. Empty is the whole workspace. |
 | `max_attempts` | 8 | How many times one submit tries again after another merge moved main. |
+| `prune_grace` | 15 minutes | How long a newer main must hold before `Swarm::prune` deletes an older snapshot. Keep it longer than the tool timeout. |
 
 ## 5. The tools
 
@@ -231,8 +232,12 @@ SQLite, `SqliteSwarmStore::open` creates the tables.
 
 Main keeps one snapshot per version. `Swarm::prune` deletes the snapshots
 that nothing needs: not the current main, and not the base of a claimed
-item. It never deletes a snapshot at or above the current main version,
-because a gate in flight can still commit it.
+item. It deletes a snapshot only when a newer main has held for
+`prune_grace`. A claim reads main and then writes its item within one tool
+call, so a claim in flight has written its base before a prune can delete
+it. A gate in flight saves above the main that it read, so a prune never
+deletes it either. If a base is lost all the same, a second claim of the item
+by its holder takes the current main as its new base.
 
 ## 9. Hosts that sleep
 

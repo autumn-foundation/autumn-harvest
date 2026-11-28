@@ -88,6 +88,7 @@ recorded payload changes, so every old history replays the same.
 | R13 | A name injects text into a scope or a key. | Swarm, item, lane and channel names have 1 to 64 characters from `a-z`, `0-9`, `_` and `-`. A member id has no control character. |
 | R14 | A long eval blocks a worker. | The tool timeout bounds the call. The guide says to run a long eval in a service. |
 | R15 | Two concurrent takes by one member both pass the cap, because each counts before the other writes. | A take counts again after its write. A take that sees the cap broken releases its item and returns `at_cap`. Each racing take does so, so the member keeps no more than the cap. `a_raced_take_over_the_cap_gives_its_item_back` (Codex review on #2815). |
+| R17 | A claim reads main, a merge and a prune run, and the claim then writes a base that the prune deleted. | A prune deletes a snapshot only after a newer main has held for `prune_grace`, which is longer than the tool timeout. A keep with a lost base takes the current main. `gate_prune_keeps_live_bases` (Codex review on #2815). |
 | R16 | A prune deletes the snapshot of a merge, and a replay of its verdict then fails. | A replayed or fresh merge checks out the current main, which holds the merge. `gate_prune_keeps_live_bases` replays a pruned merge (Codex review on #2815). |
 
 ### 0.4 Decisions

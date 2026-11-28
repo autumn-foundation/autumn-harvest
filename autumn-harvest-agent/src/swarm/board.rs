@@ -518,15 +518,32 @@ impl Swarm {
                 ClaimDecision::Refuse(refusal) => {
                     return Ok(ClaimOutcome::Refused { refusal, item: row });
                 }
-                ClaimDecision::Keep => {
-                    let base = self.load(&parse_ref(&row.base_snapshot)?).await?;
-                    let next = ItemRow {
-                        lease_until_ms: lease,
-                        updated_at_ms: now,
-                        ..row.clone()
-                    };
-                    (next, base)
-                }
+                ClaimDecision::Keep => match self.load(&parse_ref(&row.base_snapshot)?).await {
+                    Ok(base) => {
+                        let next = ItemRow {
+                            lease_until_ms: lease,
+                            updated_at_ms: now,
+                            ..row.clone()
+                        };
+                        (next, base)
+                    }
+                    // The base is gone, for example after a late write of a
+                    // stale attempt. A keep drops the changes of the member
+                    // all the same, so it takes the current main as the base.
+                    Err(SwarmError::Workspace(_)) => {
+                        let main = self.require_main().await?;
+                        let base = self.load(&parse_ref(&main.snapshot)?).await?;
+                        let next = ItemRow {
+                            lease_until_ms: lease,
+                            base_version: main.version,
+                            base_snapshot: main.snapshot.clone(),
+                            updated_at_ms: now,
+                            ..row.clone()
+                        };
+                        (next, base)
+                    }
+                    Err(err) => return Err(err),
+                },
                 ClaimDecision::Take { epoch } => {
                     let main = self.require_main().await?;
                     let base = self.load(&parse_ref(&main.snapshot)?).await?;
@@ -879,20 +896,56 @@ impl Swarm {
         Err(last.unwrap_or_else(|| SwarmError::Contended("main".to_owned())))
     }
 
+    /// The main version that was current at `cutoff_ms`, at most `current`.
+    ///
+    /// It reads the merge log: the last merge at or before the cutoff made
+    /// that version. With no such merge, it is version 1.
+    async fn version_at(&self, cutoff_ms: i64, current: u64) -> Result<u64, SwarmError> {
+        let mut version = 1;
+        let mut after = 0;
+        loop {
+            let page = self
+                .store
+                .merges(self.name(), after, super::MAX_READ)
+                .await?;
+            for row in &page {
+                if let Some(merged) = row.merged_version
+                    && row.created_at_ms <= cutoff_ms
+                {
+                    version = version.max(merged);
+                }
+            }
+            match page.last() {
+                Some(last) => after = last.seq,
+                None => return Ok(version.min(current)),
+            }
+        }
+    }
+
     /// Delete the main snapshots that nothing needs. Returns the count.
     ///
     /// A snapshot stays when it is the current main or the base of a
-    /// claimed item. A snapshot at or above the current main version stays
-    /// too. A gate in flight saves above the main that it read. So the
-    /// bound never deletes a snapshot that a commit can still name.
+    /// claimed item. A snapshot at or above the floor stays too. The floor
+    /// is the main version that was current one [`SwarmPolicy::prune_grace`]
+    /// ago. So a snapshot goes only after a newer main has held for the
+    /// grace.
+    ///
+    /// The grace protects a claim in flight. A claim reads main, then
+    /// writes its item with that main as its base. A tool call ends within
+    /// the tool timeout, and the grace is longer. So a claim that read an
+    /// old main has written its item before this scan. A gate in flight
+    /// saves above the main that it read, so the floor never reaches it.
     ///
     /// # Errors
     ///
     /// Returns an error when a store fails.
     pub async fn prune(&self) -> Result<u64, SwarmError> {
+        let grace_ms = i64::try_from(self.policy.prune_grace.as_millis()).unwrap_or(i64::MAX);
+        let cutoff = self.now_ms().saturating_sub(grace_ms);
         let Some(main) = self.store.main(self.name()).await? else {
             return Ok(0);
         };
+        let floor_version = self.version_at(cutoff, main.version).await?;
         let mut keep = std::collections::BTreeSet::new();
         keep.insert(parse_ref(&main.snapshot)?.key());
         let mut after: Option<String> = None;
@@ -919,7 +972,7 @@ impl Swarm {
         }
         let scope = self.id.main_scope();
         let blobs = self.workspaces.blobs();
-        let floor = format!("{:016x}", main.version);
+        let floor = format!("{floor_version:016x}");
         let mut deleted = 0_u64;
         for key in blobs
             .list(&scope)
